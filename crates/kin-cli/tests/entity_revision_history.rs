@@ -248,4 +248,158 @@ fn blame_reports_both_revisions_across_a_mixed_add_remove_change() {
         rendered.contains("Signature: fn alpha(v2)"),
         "blame reports the state at the requested head:\n{rendered}"
     );
+    assert!(
+        rendered.contains("Replace the beta helper with gamma")
+            && !rendered.contains("The body is not a subject line."),
+        "each blame row carries the subject line only, as history's does:\n{rendered}"
+    );
+}
+
+/// Two functions named `alpha` in two files, each with its own history.
+struct TwinHistory {
+    graph: kin_db::InMemoryGraph,
+    head: SemanticChangeId,
+    lib_alpha: EntityId,
+    other_alpha: EntityId,
+    lib_changes: [SemanticChangeId; 2],
+    other_change: SemanticChangeId,
+}
+
+fn twin_history() -> TwinHistory {
+    let graph = kin_db::InMemoryGraph::new();
+    let lib_alpha = EntityId::new();
+    let other_alpha = EntityId::new();
+    let mut other_v1 = entity(other_alpha, "alpha", 7);
+    other_v1.file_origin = Some(FilePathId::new("src/other.rs"));
+
+    let add_lib = change(
+        Vec::new(),
+        "Add alpha to lib",
+        vec![EntityDelta::Added {
+            new: entity(lib_alpha, "alpha", 1),
+        }],
+    );
+    let add_other = change(
+        vec![add_lib.id],
+        "Add alpha to other",
+        vec![EntityDelta::Added { new: other_v1 }],
+    );
+    let revise_lib = change(
+        vec![add_other.id],
+        "Revise lib alpha",
+        vec![EntityDelta::Modified {
+            old: entity(lib_alpha, "alpha", 1),
+            new: entity(lib_alpha, "alpha", 2),
+        }],
+    );
+    for entry in [&add_lib, &add_other, &revise_lib] {
+        graph.create_change(entry).expect("store change");
+    }
+
+    TwinHistory {
+        graph,
+        head: revise_lib.id,
+        lib_alpha,
+        other_alpha,
+        lib_changes: [add_lib.id, revise_lib.id],
+        other_change: add_other.id,
+    }
+}
+
+/// At a ref, blame and history resolve a name the way every read command does:
+/// twins answer about the first by the one ranking rule and list every candidate
+/// by id, a pin reaches the twin it names and only that twin's revisions, and a
+/// pin that excludes every twin is refused naming them, never called absent.
+#[test]
+fn blame_and_history_at_a_ref_pin_one_twin_and_list_the_others() {
+    let fixture = twin_history();
+    let head = format!("kin:{}", fixture.head);
+    let history = |entity: &str| {
+        execute_history_request(
+            &absent_binding(),
+            &fixture.graph,
+            &HistoryRequest {
+                entity: entity.to_string(),
+                reference: Some(head.clone()),
+                all_revisions: false,
+            },
+        )
+    };
+
+    let unpinned = history("alpha").expect("twins answer").lines;
+    assert!(
+        unpinned[0].contains("@ src/lib.rs"),
+        "an unpinned name answers about the first twin by path: {unpinned:#?}"
+    );
+    assert!(
+        unpinned
+            .iter()
+            .any(|line| line.contains("'alpha' names 2 entities")),
+        "the answer must say it chose: {unpinned:#?}"
+    );
+    for id in [fixture.lib_alpha, fixture.other_alpha] {
+        assert!(
+            unpinned.iter().any(|line| line.contains(&id.to_string())),
+            "every candidate is listed by id: {unpinned:#?}"
+        );
+    }
+
+    let pinned = history("alpha@src/other.rs")
+        .expect("a pinned twin answers")
+        .lines;
+    assert!(
+        pinned[0].contains("@ src/other.rs"),
+        "the pin reaches src/other.rs's twin: {pinned:#?}"
+    );
+    let rows = &pinned[1..];
+    assert!(
+        rows.iter()
+            .any(|line| line.contains(&abbreviated(&fixture.other_change))),
+        "the pinned twin's own revision is listed: {pinned:#?}"
+    );
+    for change_id in &fixture.lib_changes {
+        assert!(
+            !rows
+                .iter()
+                .any(|line| line.contains(&abbreviated(change_id))),
+            "only the pinned twin's revisions are listed: {pinned:#?}"
+        );
+    }
+    assert!(
+        !pinned.iter().any(|line| line.contains("names 2 entities")),
+        "a pinned answer made no choice: {pinned:#?}"
+    );
+
+    let blame = execute_blame_request(
+        &absent_binding(),
+        &fixture.graph,
+        &BlameRequest {
+            entity: "alpha#function@src/other.rs".to_string(),
+            reference: Some(head.clone()),
+            all_revisions: false,
+        },
+    )
+    .expect("a pinned twin answers blame")
+    .lines
+    .join("\n");
+    assert!(
+        blame
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("@ src/other.rs"),
+        "{blame}"
+    );
+    assert!(blame.contains("1 version(s) found."), "{blame}");
+
+    let error = history("alpha@src/nowhere.rs")
+        .expect_err("a pin that excludes every twin is refused, not answered");
+    let refusal = kin_cli::commands::ref_lookup::entity_query_refusal(&error)
+        .expect("the refusal is typed so the daemon answers it as the caller's news");
+    assert!(!refusal.absent, "the name reaches two entities: {error:#}");
+    let message = error.to_string();
+    assert!(
+        message.contains("src/lib.rs") && message.contains("src/other.rs"),
+        "the refusal names every twin the pin excluded: {message}"
+    );
 }

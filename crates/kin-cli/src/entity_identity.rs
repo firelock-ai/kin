@@ -223,16 +223,25 @@ pub fn rank_candidates_by(
 
 /// Whether another entity calls, imports or references `entity`.
 fn has_dependents<G: GraphStore>(graph: &G, entity: &Entity) -> Result<bool> {
-    let own = GraphNodeId::Entity(entity.id);
     Ok(graph
         .get_all_relations_for_entity(&entity.id)?
         .iter()
-        .any(|relation| {
-            relation.dst == own
-                && relation.src != own
-                && relation.src.as_entity().is_some()
-                && DEPENDENT_RELATION_KINDS.contains(&relation.kind)
-        }))
+        .any(|relation| depended_on_by(relation) == Some(entity.id)))
+}
+
+/// The entity a relation makes something others depend on: the target of a
+/// call, import or reference from another entity, or `None`.
+///
+/// The one test behind [`rank_candidates`], so a ranking over a state replayed
+/// at a historical ref reads dependents exactly as a ranking over the live graph
+/// does.
+pub fn depended_on_by(relation: &kin_model::relation::Relation) -> Option<EntityId> {
+    let GraphNodeId::Entity(target) = relation.dst else {
+        return None;
+    };
+    (matches!(relation.src, GraphNodeId::Entity(source) if source != target)
+        && DEPENDENT_RELATION_KINDS.contains(&relation.kind))
+    .then_some(target)
 }
 
 /// How a query met the name of what it resolved to.
@@ -303,9 +312,21 @@ pub fn resolve_entity<G: GraphStore>(
     query: &str,
     flags: &IdentityQualifiers,
 ) -> Result<EntityResolution> {
-    let reference = merge_pins(parse_query(graph, query)?, flags)?;
+    let trimmed = query.trim();
+    let reference = merge_pins(
+        split_pins(trimmed, || {
+            Ok(graph
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(trimmed.to_string()),
+                    ..Default::default()
+                })?
+                .iter()
+                .any(|entity| entity.name == trimmed))
+        })?,
+        flags,
+    )?;
     let name = reference.name.trim().to_string();
-    let (mut name_matches, name_match) = if let Ok(uuid) = uuid::Uuid::parse_str(&name) {
+    let (name_matches, name_match) = if let Ok(uuid) = uuid::Uuid::parse_str(&name) {
         (
             graph.get_entity(&EntityId(uuid))?.into_iter().collect(),
             NameMatch::Id,
@@ -313,14 +334,81 @@ pub fn resolve_entity<G: GraphStore>(
     } else {
         gather_by_name(graph, &name)?
     };
+    finish_resolution(reference, name_matches, name_match, |entity| {
+        has_dependents(graph, entity)
+    })
+}
+
+/// [`resolve_entity`] over entities that live outside a store, such as a state
+/// replayed at a historical ref: the same pins, the same narrowing and the same
+/// ranking, with the dependents test supplied by the caller.
+///
+/// A name reaches the entities whose names contain it, ignoring case, or the
+/// ones a leading or trailing `*` admits, which is what the store's name index
+/// answers with. The generics and qualified-leaf retries `kin trace` adds belong
+/// to the live graph's index and are not repeated over a replayed state.
+pub fn resolve_entity_among<'a>(
+    entities: impl IntoIterator<Item = &'a Entity>,
+    query: &str,
+    flags: &IdentityQualifiers,
+    has_dependents: impl FnMut(&Entity) -> Result<bool>,
+) -> Result<EntityResolution> {
+    let entities: Vec<&Entity> = entities.into_iter().collect();
+    let trimmed = query.trim();
+    let reference = merge_pins(
+        split_pins(trimmed, || {
+            Ok(entities.iter().any(|entity| entity.name == trimmed))
+        })?,
+        flags,
+    )?;
+    let name = reference.name.trim().to_string();
+    let (name_matches, name_match) = if let Ok(uuid) = uuid::Uuid::parse_str(&name) {
+        let id = EntityId(uuid);
+        (
+            entities
+                .iter()
+                .filter(|entity| entity.id == id)
+                .map(|entity| (*entity).clone())
+                .collect(),
+            NameMatch::Id,
+        )
+    } else if name.is_empty() {
+        (Vec::new(), NameMatch::Partial)
+    } else {
+        let folded = name.to_lowercase();
+        let glob = name.starts_with('*') || name.ends_with('*');
+        let reached = entities
+            .iter()
+            .filter(|entity| !kin_index::is_external_reference_target(entity))
+            .filter(|entity| {
+                if glob {
+                    glob_matches(&entity.name, &name)
+                } else {
+                    entity.name.to_lowercase().contains(&folded)
+                }
+            })
+            .map(|entity| (*entity).clone())
+            .collect();
+        narrow_by_name(reached, &name)
+    };
+    finish_resolution(reference, name_matches, name_match, has_dependents)
+}
+
+/// Pin, then rank, what a name reached: the tail every resolution shares.
+fn finish_resolution(
+    reference: EntityRef,
+    mut name_matches: Vec<Entity>,
+    name_match: NameMatch,
+    mut has_dependents: impl FnMut(&Entity) -> Result<bool>,
+) -> Result<EntityResolution> {
     let mut candidates = name_matches.clone();
     apply_qualifiers(&mut candidates, &reference.qualifiers);
     crate::entity_ref::apply_line(&mut candidates, reference.line);
-    rank_candidates(graph, &mut candidates)?;
+    rank_candidates_by(&mut candidates, &mut has_dependents)?;
     if candidates.is_empty() {
         // Only a miss lists these, and it lists them in the order the rule would
         // have chosen them.
-        rank_candidates(graph, &mut name_matches)?;
+        rank_candidates_by(&mut name_matches, &mut has_dependents)?;
     }
     Ok(EntityResolution {
         reference,
@@ -334,23 +422,13 @@ pub fn resolve_entity<G: GraphStore>(
 ///
 /// The raw token is tried as an entity name first, so a name that itself
 /// carries `@` or `#` resolves as that name rather than being split into a pin.
-fn parse_query<G: GraphStore>(graph: &G, query: &str) -> Result<EntityRef> {
-    let trimmed = query.trim();
+/// `raw_is_a_name` is asked only when the token carries one of them.
+fn split_pins(trimmed: &str, raw_is_a_name: impl FnOnce() -> Result<bool>) -> Result<EntityRef> {
     let bare = || EntityRef {
         name: trimmed.to_string(),
         ..EntityRef::default()
     };
-    if !(trimmed.contains('@') || trimmed.contains('#')) {
-        return Ok(bare());
-    }
-    let raw_is_a_name = graph
-        .query_entities(&EntityFilter {
-            name_pattern: Some(trimmed.to_string()),
-            ..Default::default()
-        })?
-        .iter()
-        .any(|entity| entity.name == trimmed);
-    if raw_is_a_name {
+    if !(trimmed.contains('@') || trimmed.contains('#')) || raw_is_a_name()? {
         return Ok(bare());
     }
     let parsed = crate::entity_ref::parse_entity_ref(trimmed);
@@ -405,13 +483,19 @@ fn gather_by_name<G: GraphStore>(graph: &G, name: &str) -> Result<(Vec<Entity>, 
             })
             .collect();
     }
+    Ok(narrow_by_name(matches, name))
+}
+
+/// Narrow what a name reached to its exact matches, then to its case-folded
+/// ones, when the name is some entity's whole name.
+fn narrow_by_name(matches: Vec<Entity>, name: &str) -> (Vec<Entity>, NameMatch) {
     let exact: Vec<Entity> = matches
         .iter()
         .filter(|entity| entity.name == name)
         .cloned()
         .collect();
     if !exact.is_empty() {
-        return Ok((exact, NameMatch::Exact));
+        return (exact, NameMatch::Exact);
     }
     let folded: Vec<Entity> = matches
         .iter()
@@ -419,9 +503,9 @@ fn gather_by_name<G: GraphStore>(graph: &G, name: &str) -> Result<(Vec<Entity>, 
         .cloned()
         .collect();
     if !folded.is_empty() {
-        return Ok((folded, NameMatch::CaseInsensitive));
+        return (folded, NameMatch::CaseInsensitive);
     }
-    Ok((matches, NameMatch::Partial))
+    (matches, NameMatch::Partial)
 }
 
 /// A leading `*` matches a suffix and a trailing one a prefix, ignoring case.
@@ -462,6 +546,12 @@ impl PinSpelling {
 /// One row per candidate: its kind, where it is, and its id, which pins it
 /// exactly in every command.
 pub fn candidate_rows<G: GraphStore>(graph: &G, candidates: &[Entity]) -> Vec<String> {
+    candidate_rows_by(candidates, |candidate| entity_location(graph, candidate))
+}
+
+/// [`candidate_rows`] with the location supplied by the caller, for candidates
+/// read from a replayed state whose tree is not the live graph's.
+pub fn candidate_rows_by(candidates: &[Entity], locate: impl Fn(&Entity) -> String) -> Vec<String> {
     let mut rows: Vec<String> = candidates
         .iter()
         .take(MAX_LISTED_CANDIDATES)
@@ -469,7 +559,7 @@ pub fn candidate_rows<G: GraphStore>(graph: &G, candidates: &[Entity]) -> Vec<St
             format!(
                 "  {:<9} {}  {}",
                 kin_review::StableEntityIdentity::from_entity(candidate).kind,
-                entity_location(graph, candidate),
+                locate(candidate),
                 candidate.id
             )
         })
@@ -494,6 +584,17 @@ pub fn choice_note<G: GraphStore>(
     resolution: &EntityResolution,
     spelling: PinSpelling,
 ) -> Vec<String> {
+    choice_note_by(resolution, spelling, |candidate| {
+        entity_location(graph, candidate)
+    })
+}
+
+/// [`choice_note`] with the location supplied by the caller.
+pub fn choice_note_by(
+    resolution: &EntityResolution,
+    spelling: PinSpelling,
+    locate: impl Fn(&Entity) -> String,
+) -> Vec<String> {
     if resolution.addressed_by_id() || resolution.candidates.len() < 2 {
         return Vec::new();
     }
@@ -502,7 +603,7 @@ pub fn choice_note<G: GraphStore>(
         resolution.reference.name,
         resolution.candidates.len()
     )];
-    lines.extend(candidate_rows(graph, &resolution.candidates));
+    lines.extend(candidate_rows_by(&resolution.candidates, locate));
     lines.push(format!("note: ranked {RANKING_RULE}."));
     let next = kin_review::StableEntityIdentity::from_entity(&resolution.candidates[1]);
     let file = if next.file.is_empty() {
@@ -519,13 +620,21 @@ pub fn choice_note<G: GraphStore>(
 
 /// The answer when a partial name reaches several entities.
 pub fn pin_request_lines<G: GraphStore>(graph: &G, resolution: &EntityResolution) -> Vec<String> {
+    pin_request_lines_by(resolution, |candidate| entity_location(graph, candidate))
+}
+
+/// [`pin_request_lines`] with the location supplied by the caller.
+pub fn pin_request_lines_by(
+    resolution: &EntityResolution,
+    locate: impl Fn(&Entity) -> String,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "No entity is named '{}' exactly, and it is part of the names of {} entities, so there \
          is no one entity to answer about:",
         resolution.reference.name,
         resolution.candidates.len()
     )];
-    lines.extend(candidate_rows(graph, &resolution.candidates));
+    lines.extend(candidate_rows_by(&resolution.candidates, locate));
     lines.push(
         "hint: re-run with one of the names above, or pass its id. Pins narrow a name; they \
          cannot make a partial name exact."
@@ -537,6 +646,14 @@ pub fn pin_request_lines<G: GraphStore>(graph: &G, resolution: &EntityResolution
 /// The answer when the name resolves and the pins exclude every entity it
 /// reaches. The entity is in the graph, so saying it is absent would be false.
 pub fn pin_miss_lines<G: GraphStore>(graph: &G, resolution: &EntityResolution) -> Vec<String> {
+    pin_miss_lines_by(resolution, |candidate| entity_location(graph, candidate))
+}
+
+/// [`pin_miss_lines`] with the location supplied by the caller.
+pub fn pin_miss_lines_by(
+    resolution: &EntityResolution,
+    locate: impl Fn(&Entity) -> String,
+) -> Vec<String> {
     let name = &resolution.reference.name;
     let mut pins = resolution.reference.qualifiers.labels();
     if let Some(line) = resolution.reference.line {
@@ -550,7 +667,7 @@ pub fn pin_miss_lines<G: GraphStore>(graph: &G, resolution: &EntityResolution) -
             if count == 1 { "y" } else { "ies" }
         ),
     ];
-    lines.extend(candidate_rows(graph, &resolution.name_matches));
+    lines.extend(candidate_rows_by(&resolution.name_matches, locate));
     lines.push("hint: pin one of the entities above, or pass its id.".to_string());
     lines
 }
@@ -662,9 +779,33 @@ impl EntityPointer {
 /// Read an entity's pointer out of the graph. Graph reads only: the check
 /// compares two digests the graph already holds and never opens the file.
 pub fn entity_pointer<G: GraphStore>(graph: &G, entity: &Entity) -> EntityPointer {
+    pointer_against(entity, |file| {
+        graph
+            .get_tree_entry(file)
+            .ok()
+            .flatten()
+            .and_then(|entry| entry.blob_identity())
+    })
+}
+
+/// [`entity_pointer`] for an entity read from a state replayed at a historical
+/// ref, checked against that state's tree, so a line printed for the ref is
+/// vouched for by the bytes the ref holds rather than by today's.
+pub fn entity_pointer_in_tree(tree: &kin_model::ResolvedTree, entity: &Entity) -> EntityPointer {
+    pointer_against(entity, |file| {
+        let path = kin_model::RepoPath::from_utf8(file.0.clone()).ok()?;
+        tree.artifact_at_path(&path)
+            .and_then(|artifact| artifact.entry.blob_identity())
+    })
+}
+
+fn pointer_against(
+    entity: &Entity,
+    blob_at: impl FnOnce(&kin_model::FilePathId) -> Option<kin_model::Hash256>,
+) -> EntityPointer {
     let path = entity.file_origin.as_ref().map(|file| file.0.clone());
     let line = kin_mcp::handlers::common::entity_presentation_start_line(entity);
-    let stale = line.is_some() && span_is_stale(graph, entity);
+    let stale = line.is_some() && span_is_stale(entity, blob_at);
     EntityPointer {
         path,
         line: if stale { None } else { line },
@@ -681,14 +822,14 @@ pub fn entity_pointer<G: GraphStore>(graph: &G, entity: &Entity) -> EntityPointe
 /// a guess. The comparison is kin-mcp's `span_source_coherence`, the rule
 /// `get_entity_source` already refuses a stale span by, so the two surfaces
 /// cannot disagree about which spans are stale.
-fn span_is_stale<G: GraphStore>(graph: &G, entity: &Entity) -> bool {
+fn span_is_stale(
+    entity: &Entity,
+    blob_at: impl FnOnce(&kin_model::FilePathId) -> Option<kin_model::Hash256>,
+) -> bool {
     let Some(file) = entity.file_origin.as_ref() else {
         return false;
     };
-    let Ok(Some(entry)) = graph.get_tree_entry(file) else {
-        return false;
-    };
-    let Some(blob) = entry.blob_identity() else {
+    let Some(blob) = blob_at(file) else {
         return false;
     };
     kin_mcp::handlers::common::span_source_coherence(entity, &blob, &file.0).is_err()

@@ -618,8 +618,15 @@ enum Command {
     },
     /// Show entity history
     History {
-        /// Entity name or ID
+        /// Entity name or ID. A name with twins can carry its pin:
+        /// `Name@file`, `Name@file:line`, `Name#kind`
         entity: String,
+        /// Exact repo-relative file of the entity, when its name has twins
+        #[arg(long)]
+        file: Option<String>,
+        /// Exact entity kind (for example: function), when its name has twins
+        #[arg(long)]
+        kind: Option<String>,
         /// Resolve history against a specific ref.
         /// Accepts `HEAD`, `HEAD~N`, branch names, `branch:<name>`,
         /// imported Git commits as `git:<sha>` or bare 40-hex SHAs,
@@ -793,8 +800,15 @@ enum Command {
     },
     /// Show blame (version history) for an entity
     Blame {
-        /// Entity name or ID
+        /// Entity name or ID. A name with twins can carry its pin:
+        /// `Name@file`, `Name@file:line`, `Name#kind`
         entity: String,
+        /// Exact repo-relative file of the entity, when its name has twins
+        #[arg(long)]
+        file: Option<String>,
+        /// Exact entity kind (for example: function), when its name has twins
+        #[arg(long)]
+        kind: Option<String>,
         /// Resolve blame against a specific ref.
         /// Accepts `HEAD`, `HEAD~N`, branch names, `branch:<name>`,
         /// imported Git commits as `git:<sha>` or bare 40-hex SHAs,
@@ -3641,9 +3655,20 @@ fn run() -> Result<()> {
                 }
                 Command::History {
                     entity,
+                    file,
+                    kind,
                     reference,
                     all_revisions,
-                } => commands::history::run(entity, reference, all_revisions).await,
+                } => {
+                    // The flags are the `Name#kind@path` pin every resolver
+                    // reads, so the daemon sees one spelling.
+                    let entity = kin_cli::entity_ref::compose_entity_ref(
+                        &entity,
+                        file.as_deref(),
+                        kind.as_deref(),
+                    );
+                    commands::history::run(entity, reference, all_revisions).await
+                }
                 Command::HostedPublication { action } => {
                     // The exit status carries the outcome a caller branches on,
                     // the way `kin init` reports an unattested conversion: a
@@ -3782,9 +3807,20 @@ fn run() -> Result<()> {
                 },
                 Command::Blame {
                     entity,
+                    file,
+                    kind,
                     reference,
                     all_revisions,
-                } => commands::blame::run(entity, reference, all_revisions).await,
+                } => {
+                    // The flags are the `Name#kind@path` pin every resolver
+                    // reads, so the daemon sees one spelling.
+                    let entity = kin_cli::entity_ref::compose_entity_ref(
+                        &entity,
+                        file.as_deref(),
+                        kind.as_deref(),
+                    );
+                    commands::blame::run(entity, reference, all_revisions).await
+                }
                 Command::Agent { action } => {
                     // The agent loop is blocking, and a blocking HTTP client builds and
                     // drops its own runtime. Dropping one inside an async context panics,

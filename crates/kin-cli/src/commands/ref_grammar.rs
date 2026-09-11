@@ -60,35 +60,60 @@ const AMBIGUITY_PREVIEW: usize = 4;
 pub(crate) const UNRESOLVABLE: &str =
     "is not a ref, a semantic change or its unique prefix, an imported Git object, or HEAD";
 
-/// Repository authority, opened only if an arm of the grammar asks for it.
+/// Repository authority, reached only if an arm of the grammar asks for it.
 ///
 /// The two callers arrive differently and the difference is load-bearing.
 /// `kin diff` already holds an open lease, so re-opening would be waste. `kin
-/// blame --ref` holds only a binding, and `explicit_semantic_change_and_parent_
-/// hops_need_no_file_or_git_fallback` pins the property that a `kin:<id>` or
-/// `change:<id>` selector resolves from the graph alone: an explicit semantic
-/// change is graph-owned truth and reaching for the authority envelope to
-/// confirm it would be a file-first fallback on a path that does not need one.
+/// blame` and `kin history` hold a [`RequestRepositoryAuthority`]: the daemon's
+/// shared arm, which hands over the authority it keeps for the current
+/// publication, or a binding a one-shot caller opens for itself.
+/// `explicit_semantic_change_and_parent_hops_need_no_file_or_git_fallback` pins
+/// the property that a `kin:<id>` or `change:<id>` selector resolves from the
+/// graph alone: an explicit semantic change is graph-owned truth and reaching
+/// for the authority envelope to confirm it would be a file-first fallback on a
+/// path that does not need one.
 ///
 /// Opening eagerly here is what broke that test, and the test was right.
+///
+/// [`RequestRepositoryAuthority`]: super::repository_authority::RequestRepositoryAuthority
 pub(crate) enum Authority<'a> {
     Held {
         lease: &'a kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
         workspace_id: &'a WorkspaceId,
     },
     Deferred {
-        binding: &'a kin_core::LocalRepositoryAuthorityBinding,
+        source: &'a super::repository_authority::RequestRepositoryAuthority,
         opened: std::cell::OnceCell<OpenedAuthority>,
     },
 }
 
-/// An authority this module opened itself, kept alive beside its lease.
+/// An authority this module reached for, kept alive beside its lease.
 pub(crate) struct OpenedAuthority {
     lease: kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
     workspace_id: WorkspaceId,
     // Held so the manager outlives the lease taken from it, rather than relying
     // on the lease's Arc alone.
-    _authority: super::repository_authority::ActiveRepositoryAuthority,
+    _authority: std::sync::Arc<super::repository_authority::ActiveRepositoryAuthority>,
+    cost: AuthorityOpen,
+}
+
+/// What reaching repository authority cost the thread that resolved a selector.
+///
+/// Measured where the authority is handed over rather than inferred afterwards,
+/// because the two ways of getting one differ by the size of the store: a server
+/// that already holds the current publication hands it over at once, and a
+/// whole-store open re-verifies every persisted body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthorityOpen {
+    /// How long handing the authority over took.
+    pub(crate) waited: std::time::Duration,
+    /// Whether this thread performed a whole-store open to get it, read off the
+    /// per-thread counter the tests bound, rather than being handed one that was
+    /// already open.
+    pub(crate) opened_here: bool,
+    /// Whether the authority came from a server that keeps it for its current
+    /// publication, so an open paid for here is not paid again by the next read.
+    pub(crate) shared: bool,
 }
 
 impl<'a> Authority<'a> {
@@ -102,10 +127,23 @@ impl<'a> Authority<'a> {
         }
     }
 
-    pub(crate) fn deferred(binding: &'a kin_core::LocalRepositoryAuthorityBinding) -> Self {
+    pub(crate) fn deferred(
+        source: &'a super::repository_authority::RequestRepositoryAuthority,
+    ) -> Self {
         Self::Deferred {
-            binding,
+            source,
             opened: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// What reaching the authority cost, when an arm of the grammar needed it.
+    ///
+    /// `None` for a lease the caller already held, and for a selector the graph
+    /// answered alone, since neither reached for anything.
+    pub(crate) fn open_cost(&self) -> Option<AuthorityOpen> {
+        match self {
+            Self::Held { .. } => None,
+            Self::Deferred { opened, .. } => opened.get().map(|held| held.cost),
         }
     }
 
@@ -121,22 +159,31 @@ impl<'a> Authority<'a> {
                 lease,
                 workspace_id,
             } => Ok((lease, workspace_id)),
-            Self::Deferred { binding, opened } => {
+            Self::Deferred { source, opened } => {
                 if opened.get().is_none() {
-                    let authority =
-                        super::repository_authority::ActiveRepositoryAuthority::open(binding)
-                            .map_err(|error| {
-                                ref_error(
+                    let opens_before =
+                        super::repository_authority::repository_authority_opens_on_this_thread();
+                    let started = std::time::Instant::now();
+                    let authority = source.open().map_err(|error| {
+                        ref_error(
                             original,
                             format!("this repository's authority could not be opened: {error:#}"),
                         )
-                            })?;
+                    })?;
+                    let cost = AuthorityOpen {
+                        waited: started.elapsed(),
+                        opened_here:
+                            super::repository_authority::repository_authority_opens_on_this_thread()
+                                > opens_before,
+                        shared: source.is_shared(),
+                    };
                     let lease = authority.manager().read_authority();
                     let workspace_id = authority.workspace_id.clone();
                     let _ = opened.set(OpenedAuthority {
                         lease,
                         workspace_id,
                         _authority: authority,
+                        cost,
                     });
                 }
                 let held = opened

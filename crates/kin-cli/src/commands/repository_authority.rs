@@ -240,6 +240,12 @@ impl RequestRepositoryAuthority {
         &self.binding
     }
 
+    /// Whether a server resolves this authority for the publication a request
+    /// reads at, so an open paid for here is kept for the requests after it.
+    pub fn is_shared(&self) -> bool {
+        self.shared.is_some()
+    }
+
     /// The open authority to read this command from.
     ///
     /// Reuses the caller's open when there is one, and otherwise performs the
