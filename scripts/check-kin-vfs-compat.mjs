@@ -174,17 +174,27 @@ export function lockPackages(text) {
     }));
 }
 
+// Kin's side of the comparison is the kin-vfs-core Kin BUILDS WITH, wherever it
+// comes from. It used to come only from the registry; since the crate moved into
+// `crates/kin-vfs-core` it has no `source` line at all, the same shape a
+// workspace member has in any lock. Both are accepted here, and the question the
+// gate asks is unchanged: the shipped kin-vfs binaries are still built from the
+// pinned kin-vfs checkout, and if that checkout builds a different kin-vfs-core
+// than Kin does, the release goes red after the tag exists. Only the pinned side
+// keeps the strict `source === null` rule, because that lock is the kin-vfs
+// repository's own and its member entry is the one being compared.
 export function compareVfsCore(kinLock, pinnedLock) {
   const resolved = lockPackages(kinLock).filter(
-    (pkg) => pkg.name === VFS_CORE && pkg.source?.startsWith('sparse+'),
+    (pkg) => pkg.name === VFS_CORE
+      && (pkg.source === null || pkg.source.startsWith('sparse+')),
   );
   const pinned = lockPackages(pinnedLock).filter(
     (pkg) => pkg.name === VFS_CORE && pkg.source === null,
   );
   if (resolved.length !== 1 || pinned.length !== 1) {
     throw new Error(
-      `expected one registry Kin ${VFS_CORE} and one pinned local ${VFS_CORE}; ` +
-      `found ${resolved.length} and ${pinned.length}`,
+      `expected one Kin ${VFS_CORE}, from the registry or from this workspace, ` +
+      `and one pinned local ${VFS_CORE}; found ${resolved.length} and ${pinned.length}`,
     );
   }
   if (resolved[0].version !== pinned[0].version) {
