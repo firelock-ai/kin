@@ -714,10 +714,12 @@ indentation on top of it, so a nested method or function goes back unchanged. Th
 is a byte-exact prefix match against the file's own indentation run, so copy the file's \
 whitespace rather than re-indenting; a body opening with spaces where the file uses tabs \
 (or with a different width) is spliced verbatim and lands on top of the file's \
-indentation. Note also that source rendered by get_entity_source and \
-get_context_pack.focal_entity.body is capped at 40 lines or 2400 characters and marks \
-the cut with \"... [truncated]\": a body that came back truncated is not the entity's \
-full source and must not be staged as-is. The entity is \
+indentation. Note also that source rendered inside search results, context packs and \
+trace steps is capped at 40 lines or 2400 characters and marks the cut with \
+\"... [truncated]\": a body that came back truncated is not the entity's full source, \
+and staging one is refused rather than committed. get_entity_source serves an entity's \
+complete span and applies no line or character cap of its own, so read the body there \
+before you send it. The entity is \
 resolved fail-closed server-side and on \
 commit the graph-to-file projection writes the body into the entity's working-directory \
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
@@ -755,6 +757,14 @@ pub async fn handle_transaction_stage<G: GraphStore>(
     // both daemon and in-process modes.
     crate::session::validate_staged_operations(&operations)
         .map_err(crate::error::McpError::InvalidParams)?;
+
+    // A body Kin cut short is not the entity's source, and the paragraph above
+    // in this tool's own description has always said so. Enforced here so the
+    // promise is construction rather than instruction, and refused before the
+    // forward so the daemon and in-process modes answer identically.
+    if let Err(error) = reject_truncated_bodies(&operations) {
+        return Ok(ToolCallResult::error(error));
+    }
 
     // A new-source-file path is shape-valid at this point but may already be
     // tracked; only the graph knows that, so it is checked here rather than in
@@ -1364,6 +1374,313 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     });
     let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// The token Kin appends where it cuts a rendered body short.
+///
+/// `clip_rendered_text_with_cap` writes `"... [truncated]"`, and that is the
+/// spelling a source body carries. The constant holds only the bracketed part
+/// because the ellipsis before it is not stable across the codebase: the
+/// daemon delegate already writes the same token after a Unicode ellipsis when
+/// it cuts an error body (`daemon_delegate.rs`). Keying on the ellipsis would
+/// make this guard depend on which renderer produced the text, which is the one
+/// thing the caller cannot tell us.
+const TRUNCATION_MARKER: &str = "[truncated]";
+
+/// Refuse any staged operation whose `body` is text Kin itself cut short.
+///
+/// An entity response's `source_excerpt`, a context pack's body and a trace
+/// step's body are all clipped at [`MCP_SOURCE_MAX_LINES`] lines or
+/// [`MCP_SOURCE_MAX_CHARS`] characters, and the clip is marked. Staging what
+/// came back is the one mistake an agent makes without noticing: the text is
+/// syntactically plausible, and the commit path replaces the entity's whole
+/// span with whatever arrives, so the rest of the function is simply gone and
+/// the receipt still says `committed`.
+///
+/// The stage tool description has said such a body "must not be staged as-is"
+/// since the shape shipped. That is instruction. This is construction, and it
+/// runs on both write surfaces (`kin_transaction_stage` and `kin_mutate`) so
+/// neither can be the one that lets it through.
+///
+/// Matched on a body whose trailing text IS the marker, never on one that
+/// merely contains it. Kin's own source carries the literal token (the CLI's
+/// trace renderer writes it), and refusing to edit those entities would be a
+/// false positive with no way around it.
+fn reject_truncated_bodies(operations: &[McpMutationOperation]) -> std::result::Result<(), String> {
+    for (idx, op) in operations.iter().enumerate() {
+        let Some(body) = op.body.as_deref() else {
+            continue;
+        };
+        if !body.trim_end().ends_with(TRUNCATION_MARKER) {
+            continue;
+        }
+        let target = op.target.trim();
+        let target = if target.is_empty() {
+            "(unnamed)"
+        } else {
+            target
+        };
+        return Err(format!(
+            "operation #{idx} ('{}'): `body` for target '{target}' ends in \
+             \"{TRUNCATION_MARKER}\", so it is text Kin cut short rather than the entity's full \
+             source. Bodies rendered inside search results, context packs and trace steps are \
+             capped at {MCP_SOURCE_MAX_LINES} lines or {MCP_SOURCE_MAX_CHARS} characters and the \
+             cut is marked; committing that text would replace the entity's whole span with the \
+             part that fit. get_entity_source is the read that serves an entity's complete span \
+             and applies no line or character cap of its own. Read the body there, then send \
+             that.",
+            op.verb,
+        ));
+    }
+    Ok(())
+}
+
+/// The change message a `kin_mutate` call asked for, if it asked for one.
+///
+/// Trimmed, and an all-whitespace summary is read as no summary rather than as
+/// a request for a blank subject line. Absent, the commit records exactly what
+/// it recorded before this argument existed, so a caller that sends nothing
+/// sees no change at all.
+pub(super) fn commit_message_argument(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    let summary = arguments
+        .get("summary")
+        .and_then(serde_json::Value::as_str)?
+        .trim();
+    (!summary.is_empty()).then(|| summary.to_string())
+}
+
+pub const MUTATE_DESC: &str = "\
+Atomically validate and commit a batch of graph mutations in a single call. Automatically \
+manages transaction lifecycle (begin, validation, commit, and abort-on-refusal) so an agent \
+does not need multi-step transaction ceremonies. Provide an operations array with mutation \
+verbs ('create', 'update', 'delete') and payloads, and an optional `summary` that becomes the \
+recorded change message instead of the bare transaction line. On success returns a compact \
+receipt with status, ops_applied, change_id, and modified_files. Every refusal comes back as a \
+tool error you can read and retry from, never as a protocol fault: a malformed operations array, \
+a body Kin cut short, a failed validation and a refused commit all return the structured reason, \
+and a refused commit leaves no transaction behind.";
+
+pub async fn handle_mutate<G: GraphStore>(
+    arguments: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<ToolCallResult> {
+    let Some(ops_val) = arguments.get("operations") else {
+        return Ok(ToolCallResult::error(
+            "Missing required parameter: 'operations' array is required for kin_mutate.",
+        ));
+    };
+
+    // Every refusal below is a tool error, not a protocol error. The caller is a
+    // model that just wrote this argument, and the whole point of the one-shot
+    // is that a rejected attempt is retryable from what came back: a JSON-RPC
+    // fault leaves the client to decide whether the model ever sees the reason,
+    // while `is_error` puts it in the transcript the next turn reads. The
+    // missing-`operations` case above has always answered this way; parse and
+    // validate now match it.
+    let parsed = match crate::session::parse_staged_operations(ops_val) {
+        Ok(parsed) => parsed,
+        Err(error) => return Ok(ToolCallResult::error(error)),
+    };
+    if let Err(error) = crate::session::validate_staged_operations(&parsed) {
+        return Ok(ToolCallResult::error(error));
+    }
+    if let Err(error) = reject_truncated_bodies(&parsed) {
+        return Ok(ToolCallResult::error(error));
+    }
+
+    // In daemon mode the local registry is not the authority. The daemon owns
+    // sessions and resolves a transaction against one it holds, so reaching into
+    // the local registry here, or inventing a session in it, produces an id the
+    // daemon has never heard of; `kin_transaction_begin` then refuses one call
+    // later with a message about a session rather than about the argument that
+    // was actually missing. Say the true thing at the call that can still be
+    // fixed, and name the tool that produces the id.
+    let named_session = arguments
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if session_authority_mode.uses_daemon() && named_session.is_none() {
+        return Ok(ToolCallResult::error(
+            "Missing required parameter: 'session_id'. This server's sessions are owned by the \
+             Kin daemon, so a mutation names the session it belongs to. Call kin_session_start \
+             first and pass the session_id it returns; an agent harness that already holds the \
+             session fills this in for you.",
+        ));
+    }
+    let session_id = match named_session {
+        Some(s) => s.to_string(),
+        None => {
+            if let Some(s) = sessions.list_agent_sessions().first() {
+                s.session_id.to_string()
+            } else {
+                let s = sessions.start_agent_session(
+                    "kin",
+                    "kin_agent",
+                    kin_model::session::SessionTransport::Mcp,
+                    None,
+                    std::path::PathBuf::from("."),
+                    kin_model::session::SessionCapabilities {
+                        can_write: true,
+                        can_commit: true,
+                        ..Default::default()
+                    },
+                );
+                s.session_id.to_string()
+            }
+        }
+    };
+
+    let scope = arguments
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("repository")
+        .to_string();
+
+    let request_id = arguments
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    if session_authority_mode.uses_daemon() {
+        let begin_args = HashMap::from([
+            ("session_id".to_string(), serde_json::json!(session_id)),
+            ("scope".to_string(), serde_json::json!(scope)),
+        ]);
+        let begin_res =
+            match crate::daemon_delegate::forward_tool_call("kin_transaction_begin", &begin_args)
+                .await
+            {
+                Ok(Some(res)) => res,
+                Ok(None) if session_authority_mode.requires_daemon() => {
+                    return Ok(daemon_required_unavailable("transaction begin"));
+                }
+                Ok(None) => {
+                    return Ok(ToolCallResult::error(
+                        "Daemon returned empty response for kin_transaction_begin",
+                    ))
+                }
+                Err(err) => return Ok(ToolCallResult::error(err)),
+            };
+
+        if begin_res.is_error == Some(true) {
+            return Ok(begin_res);
+        }
+
+        let tx_id = begin_res
+            .content
+            .first()
+            .and_then(|c| match c {
+                crate::types::ContentBlock::Text { text } => {
+                    serde_json::from_str::<serde_json::Value>(text).ok()
+                }
+            })
+            .and_then(|v| {
+                v.get("transaction_id")
+                    .or_else(|| v.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+
+        let Some(tx_id) = tx_id else {
+            return Ok(ToolCallResult::error(
+                "Failed to extract transaction_id from begin response",
+            ));
+        };
+
+        let mut commit_args = HashMap::from([
+            ("transaction_id".to_string(), serde_json::json!(tx_id)),
+            ("session_id".to_string(), serde_json::json!(session_id)),
+            ("operations".to_string(), ops_val.clone()),
+        ]);
+        // `message`, not `description`. `description` is already the name of the
+        // per-operation field, and the daemon reads `message` off the commit
+        // call as the change message a human will read in history. Sending the
+        // summary under the other name is how it used to be dropped silently:
+        // nothing consumed it, and every change still read "MCP transaction
+        // <id>".
+        if let Some(summary) = commit_message_argument(arguments) {
+            commit_args.insert("message".to_string(), serde_json::json!(summary));
+        }
+
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_commit", &commit_args)
+            .await
+        {
+            Ok(Some(mut value)) => {
+                if value.is_error == Some(true) {
+                    let abort_args = HashMap::from([
+                        ("transaction_id".to_string(), serde_json::json!(tx_id)),
+                        ("session_id".to_string(), serde_json::json!(session_id)),
+                    ]);
+                    let _ = crate::daemon_delegate::forward_tool_call(
+                        "kin_transaction_abort",
+                        &abort_args,
+                    )
+                    .await;
+                } else if let Some(req_id) = request_id {
+                    if let Some(crate::types::ContentBlock::Text { text }) =
+                        value.content.first_mut()
+                    {
+                        if let Ok(mut map) = serde_json::from_str::<serde_json::Value>(text) {
+                            if let Some(obj) = map.as_object_mut() {
+                                obj.insert("request_id".to_string(), serde_json::json!(req_id));
+                                *text = serde_json::to_string_pretty(&obj)
+                                    .unwrap_or_else(|_| text.clone());
+                            }
+                        }
+                    }
+                }
+                return Ok(value);
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction commit"));
+            }
+            Ok(None) => {
+                return Ok(ToolCallResult::error(
+                    "Daemon returned empty response for commit",
+                ))
+            }
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    // In-process offline mode:
+    let tx = match sessions.begin_transaction(&session_id, &scope) {
+        Ok(t) => t,
+        Err(err) => return Ok(ToolCallResult::error(err)),
+    };
+    let tx_id = tx.transaction_id.clone();
+    let mut commit_args = HashMap::from([
+        ("transaction_id".to_string(), serde_json::json!(tx_id)),
+        ("session_id".to_string(), serde_json::json!(session_id)),
+        ("operations".to_string(), ops_val.clone()),
+    ]);
+    if let Some(summary) = commit_message_argument(arguments) {
+        commit_args.insert("message".to_string(), serde_json::json!(summary));
+    }
+    let mut res =
+        handle_transaction_commit(&commit_args, store, sessions, session_authority_mode).await?;
+    if res.is_error == Some(true) {
+        let abort_args = HashMap::from([
+            ("transaction_id".to_string(), serde_json::json!(tx_id)),
+            ("session_id".to_string(), serde_json::json!(session_id)),
+        ]);
+        let _ = handle_transaction_abort(&abort_args, sessions, session_authority_mode).await;
+    } else if let Some(req_id) = request_id {
+        if let Some(crate::types::ContentBlock::Text { text }) = res.content.first_mut() {
+            if let Ok(mut map) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(obj) = map.as_object_mut() {
+                    obj.insert("request_id".to_string(), serde_json::json!(req_id));
+                    *text = serde_json::to_string_pretty(&obj).unwrap_or_else(|_| text.clone());
+                }
+            }
+        }
+    }
+    Ok(res)
 }
 
 pub const TRANSACTION_ABORT_DESC: &str = "\

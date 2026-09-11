@@ -16,7 +16,7 @@ without writing first, so neither could see the composition. This suite runs the
 binaries end to end: `kin init`, `kin agent run` against a scripted chat endpoint, and a
 direct `kin mcp start` session to read the result back.
 
-Five checks, one repository, run in order:
+Six checks, one repository, run in order:
 
   edit_lands            an `edit_file` on a tracked function commits: the run exits 0,
                         the file holds the new text, `get_entity_source` answers with the
@@ -29,6 +29,14 @@ Five checks, one repository, run in order:
   refused_create_is_clean
                         a `write_file` over a tracked path is refused, the tracked file
                         keeps its text, and the refused content comes back to the model
+  pure_kin_mutate_lands the same binary under `KIN_AGENT_PURE_KIN`, whose belt carries no
+                        `edit_file` and no `write_file` at all: one `kin_mutate` naming the
+                        ENTITY commits, the file and `get_entity_source` carry it,
+                        durability reads `recorded`, the run records
+                        `entities_changed` and no file, the call went out under a session
+                        the harness supplied (the model never sees `kin_session_start`),
+                        and `kin log` carries the agent's own summary rather than the bare
+                        transaction line
   edit_survives_a_daemon_restart
                         the repository's daemon is stopped after the agent's session opens
                         and before its first edit, as an unattended update did in the
@@ -99,6 +107,17 @@ RESTART_FIND = "pub fn other() -> u8 {\n    4\n}"
 RESTART_REPLACE = "/// The other value.\npub fn other() -> u8 {\n    0x2b\n}"
 RESTART_MARKER = "0x2b"
 
+# The pure-Kin check's own file and entity. Its own, and not one of the four
+# above, because the checks run in order against one repository and an entity a
+# neighbour has already moved cannot tell a failure of this path from a failure
+# of that one.
+MUTABLE_RS = "pub fn mutable() -> u8 {\n    7\n}\n"
+MUTATE_BODY = "/// Set through Kin by an agent with no file tools.\npub fn mutable() -> u8 {\n    0x2c\n}"
+MUTATE_MARKER = "0x2c"
+# The sentence the agent names for its own change. Distinctive, because the
+# assertion is that history carries THIS and not the bare transaction line.
+MUTATE_SUMMARY = "Raise mutable to 0x2c"
+
 
 def run(cmd, cwd=None, env=None, timeout=600):
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
@@ -155,6 +174,77 @@ def grade_edit_lands(rc, disk, source_payload, status_payload):
     if problems:
         return FAIL, "; ".join(problems)
     return PASS, "the edit committed: disk, get_entity_source and durability agree"
+
+
+def mutate_rows(trace):
+    """Every `kin_mutate` call the run made, as the trace recorded it."""
+    return [row for row in (trace or []) if row.get("tool") == "kin_mutate"]
+
+
+def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace, result,
+                                messages):
+    """A belt with no file tools commits by naming the entity, and says what it did.
+
+    Five things have to be true together, and each one has been separately true
+    while the composition was broken. The change reaches disk and the graph, the
+    way any commit must. The run records the ENTITY it changed and no file,
+    because on this belt there is no file tool to record. The mutate call
+    carries a session_id the model never saw, since kin_session_start is
+    harness-owned and a call without one is refused by a daemon that owns
+    sessions. And history carries the agent's own sentence rather than the bare
+    transaction line.
+
+    The session assertion is the one this check exists for. Two hermetic suites
+    covered the halves: kin-agent's tests run against a scripted MCP server that
+    has no daemon and no session authority, and kin-mcp's run in-process where
+    its own registry IS the authority. Neither could see that the fallback
+    between them invents an id the daemon has never heard of.
+    """
+    if rc is None or disk is None or source_payload is None or status_payload is None:
+        return UNREADABLE, "the run or its read-back produced nothing to grade"
+    if trace is None or result is None or messages is None:
+        return UNREADABLE, "the run's trace, result record or change log was unreadable"
+    problems = []
+    if rc != 0:
+        problems.append("kin agent run exited %s, not 0" % rc)
+    if MUTATE_MARKER not in disk:
+        problems.append("the file on disk does not carry the mutation")
+    if not mentions(source_payload, MUTATE_MARKER):
+        problems.append("get_entity_source still answers with the old body")
+    state = durability_state(status_payload)
+    if state != "recorded":
+        problems.append("durability reads %r, not 'recorded'" % state)
+
+    calls = mutate_rows(trace)
+    if not calls:
+        problems.append("the run made no kin_mutate call at all")
+    else:
+        errored = [row for row in calls if row.get("is_error")]
+        if errored:
+            problems.append("kin_mutate came back an error: %s"
+                            % json.dumps(errored[0])[:300])
+        unsessioned = [row for row in calls
+                       if not ((row.get("args") or {}).get("session_id") or "").strip()]
+        if unsessioned:
+            problems.append("a kin_mutate went out with no session_id, which a daemon that "
+                            "owns sessions refuses; the harness must supply its own")
+
+    agent = (result.get("kin_agent") or {})
+    if agent.get("entities_changed") != ["mutable"]:
+        problems.append("the run recorded entities_changed=%r, not ['mutable']"
+                        % (agent.get("entities_changed"),))
+    if agent.get("files_changed"):
+        problems.append("a belt with no file tools recorded files_changed=%r"
+                        % (agent.get("files_changed"),))
+
+    if not any(message and message.startswith(MUTATE_SUMMARY) for message in messages):
+        problems.append("no recorded change message opens with %r; the newest are %r"
+                        % (MUTATE_SUMMARY, messages[:2]))
+
+    if problems:
+        return FAIL, "; ".join(problems)
+    return PASS, ("a Kin-only belt committed by naming the entity, under a session the harness "
+                  "supplied, and history carries the agent's own sentence")
 
 
 def grade_refused_edit_is_clean(rc, disk_before, disk_after, tool_result):
@@ -370,6 +460,7 @@ class Suite(object):
         self._setup_error = None
         self._runs = 0
         self.last_trace = None
+        self.last_result = None
 
     def git(self, cwd, args):
         # The caller's global and system git config stay out of the fixture: a hooks
@@ -397,6 +488,7 @@ class Suite(object):
         try:
             os.makedirs(os.path.join(path, "src"))
             for relative, body in (("src/lib.rs", LIB_RS), ("src/other.rs", OTHER_RS),
+                                   ("src/mutable.rs", MUTABLE_RS),
                                    ("README.md", README),
                                    ("Cargo.toml", '[package]\nname = "agentwrite"\n'
                                                   'version = "0.1.0"\nedition = "2021"\n')):
@@ -421,22 +513,28 @@ class Suite(object):
         with open(path) as handle:
             return handle.read()
 
-    def agent(self, script, before_first=None):
+    def agent(self, script, before_first=None, env_extra=None):
         """Run `kin agent run` through one scripted conversation.
 
         Returns the exit code and the last tool result the model was sent, and keeps the
-        run's kin-trace rows on `last_trace`.
+        run's kin-trace rows on `last_trace` and its result record on `last_result`.
+
+        `env_extra` is what lets one check run the same binary with a different
+        belt: `KIN_AGENT_PURE_KIN` decides whether edit_file and write_file exist
+        at all, and it is read per process, so the only way to grade both belts
+        is to run the binary twice.
         """
         self._runs += 1
         out = os.path.join(self.workdir, "run-%d" % self._runs)
         endpoint = Endpoint(script, before_first=before_first)
+        env = dict(self.env, **(env_extra or {}))
         try:
             rc, stdout, stderr = run([self.kin, "agent", "run", "--task",
                                       "Make the change the conversation asks for.",
                                       "--model", "scripted", "--base-url", endpoint.base_url,
                                       "--repo", self.repo(), "--out", out,
                                       "--max-tool-calls", "4", "--deadline", "600"],
-                                     cwd=self.workdir, env=self.env, timeout=900)
+                                     cwd=self.workdir, env=env, timeout=900)
         finally:
             endpoint.close()
         if self.verbose:
@@ -455,7 +553,38 @@ class Suite(object):
         if os.path.exists(trace):
             with open(trace) as handle:
                 self.last_trace = [json.loads(line) for line in handle if line.strip()]
+        self.last_result = None
+        result = os.path.join(out, "result.json")
+        if os.path.exists(result):
+            with open(result) as handle:
+                self.last_result = json.load(handle)
         return rc, tool_result
+
+    def change_messages(self, count=3):
+        """The subjects of the most recent changes, newest first.
+
+        Read with `kin log`, which resolves its repository from the working
+        directory, because the recorded message is the one thing an agent's own
+        run record cannot tell you: it is written by the daemon on the far side
+        of the commit.
+        """
+        rc, out, err = run([self.kin, "log", "-n", str(count), "--json"],
+                           cwd=self.repo(), env=self.env, timeout=180)
+        if rc != 0:
+            return None
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            return None
+        # `LogReport` keys its rows `entries` and each carries `message`
+        # (crates/kin-cli/src/commands/log.rs), and that shape is held by a
+        # crate test of its own. Read it outright rather than guessing among
+        # alternatives, so a report that changed shape reads as unreadable here
+        # instead of as an absent message.
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            return None
+        return [entry.get("message") for entry in entries if isinstance(entry, dict)]
 
     def mcp(self):
         return Mcp([self.kin, "mcp", "start", "--repo", self.repo()], self.env, self.workdir)
@@ -563,6 +692,37 @@ def check_refused_create_is_clean(suite):
     return Result("refused_create_is_clean", verdict, "%s %s" % (TICKET, detail))
 
 
+def check_pure_kin_mutate_lands(suite):
+    """Drive the belt the founder asked for: Kin tools, and nothing else.
+
+    `KIN_AGENT_PURE_KIN` is read per process, so this is the same binary run a
+    second time rather than a flag on the call. The scripted model calls
+    `mcp__kin__kin_mutate` by the name the belt exposes, names the entity rather
+    than a path, and passes the change message as `summary`.
+    """
+    rc, _ = suite.agent(
+        [completion("Raising mutable through Kin.", "mcp__kin__kin_mutate",
+                    {"operations": [{"verb": "update", "target": "mutable",
+                                     "body": MUTATE_BODY,
+                                     "description": "raise mutable to 0x2c"}],
+                     "summary": MUTATE_SUMMARY}),
+         completion("mutable now returns 0x2c.")],
+        env_extra={"KIN_AGENT_PURE_KIN": "1"})
+    trace, result = suite.last_trace, suite.last_result
+    messages = suite.change_messages()
+    session = suite.mcp()
+    try:
+        listed = session.call("list_file_entities", {"path": "src/mutable.rs", "limit": 50})
+        focal = entity_id(listed, "mutable")
+        source = session.call("get_entity_source", {"entity_id": focal}) if focal else None
+        status = session.call("kin_graph_status", {})
+    finally:
+        session.close()
+    verdict, detail = grade_pure_kin_mutate_lands(rc, suite.read("src/mutable.rs"), source,
+                                                  status, trace, result, messages)
+    return Result("pure_kin_mutate_lands", verdict, "%s %s" % (TICKET, detail))
+
+
 def check_edit_survives_a_daemon_restart(suite):
     stop = []
     rc, _ = suite.agent([completion("Documenting other.", "edit_file",
@@ -589,6 +749,7 @@ CHECKS = [
     ("refused_edit_is_clean", check_refused_edit_is_clean),
     ("create_lands", check_create_lands),
     ("refused_create_is_clean", check_refused_create_is_clean),
+    ("pure_kin_mutate_lands", check_pure_kin_mutate_lands),
     # Last, because it stops the daemon every earlier check ran against.
     ("edit_survives_a_daemon_restart", check_edit_survives_a_daemon_restart),
 ]
@@ -653,6 +814,46 @@ def self_test():
            grade_refused_create_is_clean(6, README, OVERWRITE_BODY, handed_back)[0], FAIL)
     expect("refused create without its content",
            grade_refused_create_is_clean(6, README, README, "did not publish it")[0], FAIL)
+
+    mutated = MUTATE_BODY + "\n"
+    mutated_source = {"source": MUTATE_BODY, "_kin": {}}
+    stale_source = {"source": MUTABLE_RS, "_kin": {}}
+    sessioned = [{"tool": "kin_mutate", "is_error": False,
+                  "args": {"session_id": "s1", "summary": MUTATE_SUMMARY,
+                           "operations": [{"verb": "update", "target": "mutable"}]}}]
+    unsessioned = [{"tool": "kin_mutate", "is_error": False,
+                    "args": {"summary": MUTATE_SUMMARY,
+                             "operations": [{"verb": "update", "target": "mutable"}]}}]
+    kin_only = {"kin_agent": {"entities_changed": ["mutable"], "files_changed": []}}
+    said_it = [MUTATE_SUMMARY + "\n\nMCP transaction 0000", "MCP transaction 0001"]
+    said_nothing = ["MCP transaction 0000", "MCP transaction 0001"]
+
+    expect("pure-kin mutate lands",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
+                                       kin_only, said_it)[0], PASS)
+    # The one this check exists for: the halves were green while the
+    # composition was not, so a mutate that goes out unsessioned must be a
+    # failure here and not merely a note.
+    expect("pure-kin mutate went out with no session",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, unsessioned,
+                                       kin_only, said_it)[0], FAIL)
+    expect("pure-kin mutate recorded only the transaction line",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
+                                       kin_only, said_nothing)[0], FAIL)
+    expect("pure-kin mutate changed nothing in the graph",
+           grade_pure_kin_mutate_lands(0, mutated, stale_source, recorded, sessioned,
+                                       kin_only, said_it)[0], FAIL)
+    expect("pure-kin run recorded a file it has no tool to change",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
+                                       {"kin_agent": {"entities_changed": ["mutable"],
+                                                      "files_changed": ["src/mutable.rs"]}},
+                                       said_it)[0], FAIL)
+    expect("pure-kin mutate made no mutate call",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, [],
+                                       kin_only, said_it)[0], FAIL)
+    expect("pure-kin mutate with no log to read",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
+                                       kin_only, None)[0], UNREADABLE)
 
     stopped = (0, "the daemon on port 1 stopped")
     other_edited = OTHER_RS.replace(RESTART_FIND, RESTART_REPLACE)

@@ -207,6 +207,9 @@ async fn dispatch_tool_call<G: GraphStore>(
             sessions::handle_transaction_commit(arguments, store, sessions, session_authority_mode)
                 .await
         }
+        "kin_mutate" => {
+            sessions::handle_mutate(arguments, store, sessions, session_authority_mode).await
+        }
         "kin_transaction_abort" => {
             sessions::handle_transaction_abort(arguments, sessions, session_authority_mode).await
         }
@@ -6058,6 +6061,385 @@ mod tests {
             sessions.get_transaction(&tx_id).unwrap().state,
             "active",
             "delegation must not terminalize the transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mutate_atomic_validation_and_execution() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+
+        // 1. Missing operations parameter returns structured error
+        let args = HashMap::new();
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(tool_result_text(&res).contains("operations"));
+
+        // 2. Atomic inline entity update in one call
+        let entity = placement_free_entity("AtomicEntity");
+        store.upsert_entity(&entity).unwrap();
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("atomic documentation".into());
+
+        let mutate_args = HashMap::from([
+            (
+                "operations".to_string(),
+                serde_json::json!([
+                    {
+                        "verb": "update",
+                        "target": entity.id.to_string(),
+                        "description": "update entity docs",
+                        "payload": {
+                            "Entity": updated,
+                        }
+                    }
+                ]),
+            ),
+            (
+                "summary".to_string(),
+                serde_json::json!("atomic mutation test"),
+            ),
+        ]);
+        let res = sessions::handle_mutate(
+            &mutate_args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.is_error,
+            None,
+            "failed with: {}",
+            tool_result_text(&res)
+        );
+        let text = tool_result_text(&res);
+        assert!(text.contains("committed") || text.contains("applied") || text.contains("receipt"));
+    }
+
+    /// A payload-less entity update carrying the body and nothing else.
+    ///
+    /// The shape the belt actually sends: an agent knows the entity and the new
+    /// source, not Kin's entity struct.
+    fn body_update_operations(target: &str, body: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "verb": "update",
+            "target": target,
+            "body": body,
+            "description": "replace the entity body",
+        }])
+    }
+
+    /// A malformed operations array comes back as a tool error, never as a
+    /// protocol fault.
+    ///
+    /// The caller is a model that just wrote this argument, and the one-shot is
+    /// only worth having if a rejected attempt is retryable from what came
+    /// back. `is_error` puts the reason in the transcript the next turn reads; a
+    /// JSON-RPC fault leaves the client to decide whether the model ever sees
+    /// it, and the shape this replaced propagated `Err(InvalidParams)` from
+    /// parse and validate while answering the missing-argument case with
+    /// `is_error`, so which one a caller got depended on which mistake it made.
+    #[tokio::test]
+    async fn handle_mutate_answers_a_malformed_operations_array_with_a_tool_error() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+
+        // Not an array at all.
+        let args = HashMap::from([(
+            "operations".to_string(),
+            serde_json::json!({ "verb": "update" }),
+        )]);
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .expect("a malformed argument is a tool error, not an Err");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            tool_result_text(&res).contains("array"),
+            "{}",
+            tool_result_text(&res)
+        );
+
+        // An array whose element names a field Kin does not model. `content` is
+        // the one a caller reaches for before it reaches for `body`, and
+        // dropping it silently is indistinguishable from a commit that carried
+        // no source.
+        let args = HashMap::from([(
+            "operations".to_string(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": "Widget",
+                "content": "pub fn widget() {}",
+                "description": "edit",
+            }]),
+        )]);
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .expect("a malformed element is a tool error, not an Err");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            tool_result_text(&res).contains("'content'"),
+            "{}",
+            tool_result_text(&res)
+        );
+
+        // A known field with an unknown verb, which is what validation rather
+        // than parsing refuses. Both legs used to propagate an Err.
+        let args = HashMap::from([(
+            "operations".to_string(),
+            serde_json::json!([{
+                "verb": "frobnicate",
+                "target": "Widget",
+                "body": "pub fn widget() {}",
+                "description": "edit",
+            }]),
+        )]);
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .expect("a rejected verb is a tool error, not an Err");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            tool_result_text(&res).contains("frobnicate"),
+            "{}",
+            tool_result_text(&res)
+        );
+    }
+
+    /// A body Kin itself cut short is refused by both write surfaces.
+    ///
+    /// Search results, context packs and trace steps clip a rendered body at 40
+    /// lines or 2400 characters and mark the cut. An agent that stages what came
+    /// back replaces the entity's whole span with the part that fit, and the
+    /// receipt still says committed, so nothing downstream can tell. The stage
+    /// tool description has warned about this since the shape shipped; a
+    /// description is instruction, and this is the construction.
+    #[tokio::test]
+    async fn both_write_surfaces_refuse_a_body_kin_cut_short() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let entity = placement_free_entity("ClippedEntity");
+        store.upsert_entity(&entity).unwrap();
+
+        let clipped = "pub fn clipped() -> u8 {\n    let a = 1;\n... [truncated]";
+        let args = HashMap::from([(
+            "operations".to_string(),
+            body_update_operations(&entity.id.to_string(), clipped),
+        )]);
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = tool_result_text(&res);
+        assert!(
+            text.contains("[truncated]") && text.contains("get_entity_source"),
+            "the refusal names the marker and where to read the whole body: {text}"
+        );
+
+        // The same body through the other write surface. A guard on one of two
+        // doors is not a guard.
+        let transaction = sessions
+            .begin_transaction(
+                &sessions
+                    .start_agent_session(
+                        "kin",
+                        "kin_agent",
+                        kin_model::session::SessionTransport::Mcp,
+                        None,
+                        std::path::PathBuf::from("."),
+                        kin_model::session::SessionCapabilities {
+                            can_write: true,
+                            can_commit: true,
+                            ..Default::default()
+                        },
+                    )
+                    .session_id
+                    .to_string(),
+                "repository",
+            )
+            .unwrap();
+        let stage_args = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                body_update_operations(&entity.id.to_string(), clipped),
+            ),
+        ]);
+        let res = sessions::handle_transaction_stage(
+            &stage_args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            tool_result_text(&res).contains("[truncated]"),
+            "{}",
+            tool_result_text(&res)
+        );
+    }
+
+    /// In daemon mode a mutation names its session or is refused for that.
+    ///
+    /// The local registry is not the authority there, so the fallback that
+    /// reads it, and the one that invents a session in it, both produce an id
+    /// the daemon has never heard of. `kin_transaction_begin` then refuses one
+    /// call later with a message about a session rather than about the argument
+    /// that was missing, which sends a caller looking in the wrong place. The
+    /// offline path keeps the fallback, since there the registry IS the
+    /// authority.
+    #[tokio::test]
+    async fn a_daemon_mode_mutate_without_a_session_is_refused_by_name() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([(
+            "operations".to_string(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": "Widget",
+                "body": "pub fn widget() {}",
+                "description": "edit",
+            }]),
+        )]);
+
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::DaemonRequired,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = tool_result_text(&res);
+        assert!(
+            text.contains("session_id") && text.contains("kin_session_start"),
+            "the refusal names the argument and the tool that produces it: {text}"
+        );
+        assert!(
+            sessions.list_agent_sessions().is_empty(),
+            "a refused mutate leaves no invented session behind"
+        );
+
+        // The control: the same call offline, where the local registry is the
+        // authority, still resolves a session for itself. Without this the
+        // assertion above would pass just as well against a mutate that had
+        // stopped resolving sessions at all.
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !tool_result_text(&res).contains("kin_session_start"),
+            "offline resolves its own session: {}",
+            tool_result_text(&res)
+        );
+        assert!(
+            !sessions.list_agent_sessions().is_empty(),
+            "offline started the session it needed"
+        );
+    }
+
+    /// What `kin_mutate` forwards as the commit's change message.
+    ///
+    /// The sending half of the pair whose receiving half is
+    /// `a_commit_records_the_message_its_caller_named` in kin-daemon's
+    /// `mcp_commit`. A client that always sends the field and sometimes has
+    /// nothing to put in it must not publish a change whose subject is blank
+    /// and whose first readable line is a transaction id, which is worse than
+    /// the line it replaced.
+    #[test]
+    fn the_commit_message_a_mutate_forwards_is_trimmed_and_never_blank() {
+        let named = HashMap::from([(
+            "summary".to_string(),
+            serde_json::json!("  Return two from value \n"),
+        )]);
+        assert_eq!(
+            sessions::commit_message_argument(&named).as_deref(),
+            Some("Return two from value")
+        );
+
+        let blank = HashMap::from([("summary".to_string(), serde_json::json!("   \n  "))]);
+        assert_eq!(sessions::commit_message_argument(&blank), None);
+
+        let absent: HashMap<String, serde_json::Value> = HashMap::new();
+        assert_eq!(sessions::commit_message_argument(&absent), None);
+
+        // Not a string is not a message. A caller that sends a number gets the
+        // message it would have got by sending nothing, rather than "42".
+        let wrong_type = HashMap::from([("summary".to_string(), serde_json::json!(42))]);
+        assert_eq!(sessions::commit_message_argument(&wrong_type), None);
+    }
+
+    /// The discriminating control: a body that merely CONTAINS the marker is
+    /// not a clipped body.
+    ///
+    /// Kin's own source carries the literal token, because the CLI's trace
+    /// renderer writes it, so a `contains` check would refuse to edit exactly
+    /// the entities that implement clipping and leave the agent no way around
+    /// it. This body goes past the truncation guard and is refused further down
+    /// for its own reason (the in-process path cannot project a source body),
+    /// which is what proves the guard did not fire.
+    #[tokio::test]
+    async fn a_body_that_merely_mentions_the_marker_passes_the_truncation_guard() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let entity = placement_free_entity("RendererEntity");
+        store.upsert_entity(&entity).unwrap();
+
+        let mentions = "pub fn clip(out: &mut String) {\n    out.push_str(\"... [truncated]\");\n}";
+        let args = HashMap::from([(
+            "operations".to_string(),
+            body_update_operations(&entity.id.to_string(), mentions),
+        )]);
+        let res = sessions::handle_mutate(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        let text = tool_result_text(&res);
+        assert!(
+            !text.contains("is text Kin cut short"),
+            "the truncation guard must not fire on a body that merely mentions the marker: {text}"
         );
     }
 
