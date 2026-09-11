@@ -94,7 +94,11 @@ pub struct NativeCommitPlan {
     previous_tree: kin_model::ResolvedTree,
     target_tree: kin_model::ResolvedTree,
     source_hashes: Vec<Hash256>,
-    authority: RepositoryAuthorityManager<LocalFileBackend>,
+    /// The authority this plan read, still open, which the publication then
+    /// commits through. Shared rather than owned, so a daemon can plan against
+    /// the authority it already holds for the current publication instead of
+    /// opening the whole store again.
+    authority: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
 }
 
 #[derive(Debug)]
@@ -1271,6 +1275,7 @@ pub(crate) fn plan_native_amend(
         None,
         Some(amend),
         SemanticCurrency::DaemonMaintained,
+        None,
     )
 }
 
@@ -1298,6 +1303,7 @@ pub(crate) fn plan_native_commit(
         None,
         None,
         SemanticCurrency::DaemonMaintained,
+        None,
     )
 }
 
@@ -1331,6 +1337,7 @@ pub(crate) fn plan_native_commit_from_base(
         Some(&base.roots),
         None,
         SemanticCurrency::AuthoritySnapshot,
+        None,
     )
 }
 
@@ -1362,6 +1369,7 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
     authored_files: &BTreeSet<RepoPath>,
     message: &dyn Fn(&[RepoPath]) -> String,
     base: &NativeCommitBase,
+    held: Option<Arc<RepositoryAuthorityManager<LocalFileBackend>>>,
 ) -> Result<NativeCommitPlan> {
     plan_native_commit_inner(
         graph,
@@ -1375,6 +1383,7 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
         Some(&base.roots),
         None,
         SemanticCurrency::AuthoritySnapshot,
+        held,
     )
 }
 
@@ -1787,6 +1796,7 @@ fn plan_native_commit_inner(
     expected_roots: Option<&RootBundle>,
     amend: Option<&NativeAmend>,
     currency: SemanticCurrency,
+    held: Option<Arc<RepositoryAuthorityManager<LocalFileBackend>>>,
 ) -> Result<NativeCommitPlan> {
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
@@ -1810,8 +1820,14 @@ fn plan_native_commit_inner(
     // That shape is shared with every phase already named in this function and
     // is not changed here; it is written down so a reader of a live trace does
     // not read the label as tightly as the durations.
-    let authority = crate::mcp_commit::timed_commit_phase("plan_open_authority", || {
-        authority_context.open().map_err(DaemonError::Graph)
+    // A caller that already holds the authority for the current publication
+    // hands it in and this phase costs nothing; otherwise it is one open.
+    let authority = crate::mcp_commit::timed_commit_phase("plan_open_authority", || match held {
+        Some(held) => Ok(held),
+        None => authority_context
+            .open()
+            .map(Arc::new)
+            .map_err(DaemonError::Graph),
     })?;
     let lease = authority.read_authority();
     if expected_roots.is_some_and(|expected| expected != lease.roots()) {
@@ -2198,8 +2214,17 @@ fn plan_native_commit_inner(
 pub(crate) fn load_native_commit_base(
     authority_context: &LocalRepositoryAuthorityContext,
 ) -> Result<NativeCommitBase> {
-    let workspace_id = authority_context.workspace_id();
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    load_native_commit_base_from(&authority, authority_context.workspace_id())
+}
+
+/// [`load_native_commit_base`] against an authority the caller already holds,
+/// so a daemon reads its commit base from the authority it holds for the
+/// current publication instead of opening the whole store for it.
+pub(crate) fn load_native_commit_base_from(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    workspace_id: WorkspaceId,
+) -> Result<NativeCommitBase> {
     let lease = authority.read_authority();
     let workspace = lease
         .metadata()

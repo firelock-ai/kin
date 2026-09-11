@@ -29,9 +29,9 @@ use crate::local_repository_authority::{
     require_fresh_daemon_workspace, LocalRepositoryAuthorityContext,
 };
 use crate::repository_commit::{
-    commit_native_plan_with_authored_projection, load_native_commit_base, load_native_source_blob,
-    plan_native_commit_from_base_declaring_carry, recover_native_commit, NativeCommitBase,
-    NativeCommitResult,
+    commit_native_plan_with_authored_projection, load_native_commit_base_from,
+    load_native_source_blob, plan_native_commit_from_base_declaring_carry, recover_native_commit,
+    NativeCommitBase, NativeCommitResult,
 };
 use crate::state::DaemonState;
 
@@ -537,8 +537,18 @@ fn commit_exact_transaction_inner(
             .map_err(|error| format!("persist receipt-less committing reset: {error}"))?;
     }
 
-    let base = timed_commit_phase("load_commit_base", || {
-        load_native_commit_base(&authority_context)
+    // The base, the plan and the publication all read and commit through the
+    // authority the daemon holds for the current publication, so a commit pays
+    // no whole-store open of its own when the daemon already holds one, and one
+    // when the record has moved since.
+    let (held_authority, base) = timed_commit_phase("load_commit_base", || {
+        crate::api::held_repository_authority(state)
+            .map_err(|(_, message)| message)
+            .and_then(|authority| {
+                load_native_commit_base_from(&authority, authority_context.workspace_id())
+                    .map(|base| (authority, base))
+                    .map_err(|error| error.to_string())
+            })
     })
     .map_err(|error| format!("load exact MCP commit base: {error}"))?;
     require_bound_authority_revision(state, &base, &transaction_id)?;
@@ -546,6 +556,7 @@ fn commit_exact_transaction_inner(
         plan_exact_transaction(
             state,
             &authority_context,
+            &held_authority,
             &transaction,
             &actor,
             operation_id,
@@ -1144,6 +1155,7 @@ fn semantic_workspace_matches(left: &kin_db::InMemoryGraph, right: &kin_db::InMe
 fn plan_exact_transaction(
     state: &DaemonState,
     authority_context: &LocalRepositoryAuthorityContext,
+    held_authority: &Arc<kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>>,
     transaction: &kin_mcp::McpTransaction,
     actor: &CommitActor,
     operation_id: OperationId,
@@ -1522,6 +1534,7 @@ fn plan_exact_transaction(
             &authored_files,
             &|carried| commit_message(&transaction.transaction_id, carried),
             base,
+            Some(Arc::clone(held_authority)),
         )
         .map_err(|error| format!("plan exact MCP repository commit: {error}"))
     };
@@ -2874,8 +2887,16 @@ fn finalize_committed_transaction(
         None => (Vec::new(), None),
     };
     let authority_context = authority_context(state)?;
+    // Through the held resolver: the commit moved the record, so this is the
+    // one fresh open the publication costs, and it is installed under the new
+    // label for every reader after it rather than paid and dropped here.
     let authority = timed_finalize_step("reload_repository_authority", || {
-        load_native_commit_base(&authority_context)
+        crate::api::held_repository_authority(state)
+            .map_err(|(_, message)| message)
+            .and_then(|held| {
+                load_native_commit_base_from(&held, authority_context.workspace_id())
+                    .map_err(|error| error.to_string())
+            })
     })
     .map_err(|error| format!("reload committed MCP repository authority: {error}"))?;
     // A resume has no plan and still owes the same answer, so it recovers the
@@ -4053,6 +4074,46 @@ pub(crate) mod tests {
         assert!(
             after.graph.get_entity(&value.id).unwrap().is_some(),
             "the documented entity keeps its identity"
+        );
+    }
+
+    /// One exact MCP commit pays no whole-store open of its own when the daemon already
+    /// holds the authority for the current publication.
+    ///
+    /// Its base, its plan and its publication read and commit through that one held
+    /// authority. The only open is the finalize's, because the commit moved
+    /// `authority.json`: it is the one fresh load the new publication costs, and the
+    /// readers after the commit borrow it. Before, the base and the plan each opened
+    /// the whole store and the finalize opened it a third time without keeping it.
+    #[test]
+    fn an_exact_commit_reads_and_commits_through_the_held_authority() {
+        let (_dir, state) = test_state();
+        install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        // Hold the current publication first, so the count below is the commit's.
+        crate::api::held_repository_authority(&state).unwrap();
+        let before = kin_core::authority_opens();
+
+        let sessions = test_sessions();
+        let result = replace_and_commit(&state, &sessions, "src/lib.rs", DOCUMENTED_RS);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "the commit must land for its open count to mean anything: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "an exact commit must read its base and plan through the held authority and pay \
+             only the finalize's one fresh load for the publication it made"
+        );
+
+        crate::api::cached_authority_admission(&state).unwrap();
+        crate::api::held_repository_authority(&state).unwrap();
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "the readers after the commit must borrow the finalize's load, not pay their own"
         );
     }
 
