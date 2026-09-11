@@ -4,9 +4,10 @@
 //! The agent loop.
 
 use crate::belt::{self, Belt, LocalTool, Route};
+use crate::context::{self, ContextMeter};
 use crate::mcp::{McpClient, McpError, McpTool, ToolOutcome};
 use crate::parse::{self, Turn};
-use crate::provider::{Provider, ProviderError, Usage};
+use crate::provider::{Completion, Provider, ProviderError, Usage};
 use crate::transcript::{now_iso, TranscriptWriter};
 use crate::{AgentConfig, ExitStatus, RunOutcome};
 use serde_json::{json, Map, Value};
@@ -110,6 +111,12 @@ struct Counters {
     repairs: u32,
     unsafe_absence_events: u32,
     unreadable_results: u32,
+    /// Results cut to the per-result ceiling before the model saw them.
+    clipped_results: u32,
+    /// Results the conversation could not hold, replaced by a note saying so.
+    withheld_results: u32,
+    /// Calls in a turn's batch that were never run because a budget was spent part way.
+    skipped_calls: u32,
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
@@ -129,6 +136,9 @@ impl Counters {
             repairs: 0,
             unsafe_absence_events: 0,
             unreadable_results: 0,
+            clipped_results: 0,
+            withheld_results: 0,
+            skipped_calls: 0,
             turns: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -159,10 +169,11 @@ impl Counters {
         }))
     }
 
-    fn to_json(&self, exit_code: i32, stop_reason: &str) -> Value {
+    fn to_json(&self, exit_code: i32, stop: &Stop) -> Value {
         json!({
             "exit_code": exit_code,
-            "stop_reason": stop_reason,
+            "stop_reason": stop.reason,
+            "stop_detail": stop.detail,
             "tool_calls": self.tool_calls,
             "kin_calls": self.kin_calls,
             "local_calls": self.local_calls,
@@ -171,9 +182,57 @@ impl Counters {
             "repairs": self.repairs,
             "unsafe_absence_events": self.unsafe_absence_events,
             "unreadable_results": self.unreadable_results,
+            "clipped_results": self.clipped_results,
+            "withheld_results": self.withheld_results,
+            "skipped_calls": self.skipped_calls,
             "files_changed": self.edits,
         })
     }
+}
+
+/// Why a run stopped, as the result record states it.
+struct Stop {
+    status: ExitStatus,
+    /// A short stable token an analyzer can match on.
+    reason: String,
+    /// The same reason in a sentence, with the numbers that decided it.
+    detail: Option<String>,
+}
+
+impl Stop {
+    fn new(status: ExitStatus, reason: &str, detail: Option<String>) -> Self {
+        Stop {
+            status,
+            reason: reason.to_string(),
+            detail,
+        }
+    }
+
+    fn deadline(config: &AgentConfig, when: &str) -> Self {
+        Stop::new(
+            ExitStatus::Deadline,
+            "deadline",
+            Some(format!(
+                "the run reached its {} s deadline {when}",
+                config.deadline.as_secs()
+            )),
+        )
+    }
+}
+
+/// The budgets that end a run with a forced, tool-free final answer.
+#[derive(Clone, Copy)]
+enum Spent {
+    ToolCalls,
+    Context,
+}
+
+/// Why a turn got no completion.
+enum EndpointStop {
+    /// The run's deadline passed before the endpoint answered.
+    Deadline { waited: Duration },
+    /// The endpoint failed in its own right.
+    Failed(ProviderError),
 }
 
 /// Run one task to completion.
@@ -183,10 +242,17 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     let mut writer = TranscriptWriter::create(&config.out_dir, &session_id)?;
     let mut counters = Counters::new();
 
+    // Every wait in the run, the endpoint's included, is measured against this one instant.
+    let deadline_at = started + config.deadline;
+    let result_ceiling = config.result_ceiling();
+
     let agent_meta = json!({
         "base_url": config.provider.base_url,
         "max_tool_calls": config.max_tool_calls,
         "deadline_s": config.deadline.as_secs(),
+        "context_tokens": config.context.tokens,
+        "context_source": config.context.source.label(),
+        "max_result_bytes": result_ceiling,
         "tool_profile": config.tool_profile.clone().unwrap_or_else(|| "server-default".into()),
         "policy": "no-shell-no-file-search",
         "mcp_command": config.mcp_command.join(" "),
@@ -221,8 +287,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                 return finish(
                     writer,
                     &config,
-                    ExitStatus::McpError,
-                    "the MCP server did not start",
+                    Stop::new(ExitStatus::McpError, "the MCP server did not start", None),
                     &message,
                     counters,
                     started,
@@ -245,8 +310,11 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                 return finish(
                     writer,
                     &config,
-                    ExitStatus::McpError,
-                    "the MCP server did not list its tools",
+                    Stop::new(
+                        ExitStatus::McpError,
+                        "the MCP server did not list its tools",
+                        None,
+                    ),
                     &message,
                     counters,
                     started,
@@ -333,6 +401,12 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
              you were given and call the one belonging to the repository you mean. {note}"
         ));
     }
+    // The first request carries the system prompt, the task and every tool spec, and the
+    // meter reads their size until the endpoint reports a count of its own.
+    let baseline_bytes = system_prompt.len()
+        + config.task.len()
+        + serde_json::to_vec(&specs).map_or(0, |bytes| bytes.len());
+    let mut meter = ContextMeter::new(config.context, baseline_bytes as u64);
     let mut messages = vec![
         json!({ "role": "system", "content": system_prompt }),
         json!({ "role": "user", "content": config.task }),
@@ -341,29 +415,47 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     let mut next_tool_id = 0u64;
     let mut consecutive_unusable = 0u32;
     let mut surfaced_degraded = false;
+    // Set when a result was withheld because the conversation could not hold it.
+    let mut context_note: Option<String> = None;
     let mut final_text = String::new();
-    let mut status = ExitStatus::Success;
-    let mut stop_reason = "final_answer".to_string();
+    let mut stop = Stop::new(ExitStatus::Success, "final_answer", None);
 
     loop {
-        if started.elapsed() >= config.deadline {
-            status = ExitStatus::Deadline;
-            stop_reason = "wall_deadline".into();
+        if Instant::now() >= deadline_at {
+            stop = Stop::deadline(&config, "before the next turn");
             break;
         }
-        if counters.tool_calls >= config.max_tool_calls {
-            // The budget is spent. Ask for an answer with nothing to call, so the run ends
+        let spent = if counters.tool_calls >= config.max_tool_calls {
+            Some(Spent::ToolCalls)
+        } else if context_note.is_some() || !meter.has_room_for_a_turn() {
+            Some(Spent::Context)
+        } else {
+            None
+        };
+        if let Some(spent) = spent {
+            // A budget is spent. Ask for an answer with nothing to call, so the run ends
             // with what the model actually learned rather than with silence.
-            messages.push(json!({
-                "role": "user",
-                "content": format!(
-                    "You have used your budget of {} tool calls. Do not call any more tools. \
-                     Answer now in plain text with what you have learned, and say plainly what \
-                     you were not able to determine.",
-                    config.max_tool_calls
-                ),
-            }));
-            match complete_with_retry(&provider, &messages, &[], &mut counters) {
+            let (spent_stop, prompt) = budget_stop(
+                spent,
+                &config,
+                &meter,
+                context_note.as_deref(),
+                counters.turns,
+            );
+            stop = spent_stop;
+            if matches!(spent, Spent::Context) && counters.turns == 0 {
+                // The first request alone does not fit, so nothing was learned to ask for.
+                break;
+            }
+            if !meter.fits_a_final_request(prompt.len() as u64) {
+                final_text = "(no final answer: the conversation no longer fits the model's \
+                              context window)"
+                    .to_string();
+                break;
+            }
+            meter.add(prompt.len() as u64);
+            messages.push(json!({ "role": "user", "content": prompt }));
+            match complete_with_retry(&provider, &messages, &[], &mut counters, deadline_at) {
                 Ok(completion) => {
                     counters.absorb(&completion.usage);
                     let turn = parse::parse_choice(&completion.choice, belt.names());
@@ -382,26 +474,42 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                     )?;
                     final_text = text;
                 }
-                Err(err) => {
+                Err(EndpointStop::Deadline { waited }) => {
+                    stop = Stop::deadline(
+                        &config,
+                        &format!("while waiting {} s for the final answer", waited.as_secs()),
+                    );
+                }
+                Err(EndpointStop::Failed(err)) => {
                     final_text = format!("(no final answer: {err})");
                 }
             }
-            status = ExitStatus::CapReached;
-            stop_reason = "tool_call_cap".into();
             break;
         }
 
-        let completion = match complete_with_retry(&provider, &messages, &specs, &mut counters) {
-            Ok(completion) => completion,
-            Err(err) => {
-                status = ExitStatus::EndpointError;
-                stop_reason = "endpoint_unreachable".into();
-                final_text = err.to_string();
-                break;
-            }
-        };
+        let completion =
+            match complete_with_retry(&provider, &messages, &specs, &mut counters, deadline_at) {
+                Ok(completion) => completion,
+                Err(EndpointStop::Deadline { waited }) => {
+                    stop = Stop::deadline(
+                        &config,
+                        &format!("while waiting {} s on the endpoint", waited.as_secs()),
+                    );
+                    break;
+                }
+                Err(EndpointStop::Failed(err)) => {
+                    stop = Stop::new(
+                        ExitStatus::EndpointError,
+                        "endpoint_unreachable",
+                        Some(err.to_string()),
+                    );
+                    final_text = err.to_string();
+                    break;
+                }
+            };
         counters.absorb(&completion.usage);
         counters.turns += 1;
+        meter.anchor(&completion.usage, message_bytes(&completion.choice));
         let turn = parse::parse_choice(&completion.choice, belt.names());
 
         match turn {
@@ -414,8 +522,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                     completion.usage.to_json(),
                 )?;
                 final_text = text;
-                status = ExitStatus::Success;
-                stop_reason = "final_answer".into();
+                stop = Stop::new(ExitStatus::Success, "final_answer", None);
                 break;
             }
             Turn::Unusable { reason, text } => {
@@ -434,24 +541,26 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                     "attempt": consecutive_unusable,
                 }))?;
                 if consecutive_unusable >= MAX_CONSECUTIVE_UNUSABLE {
-                    status = ExitStatus::EndpointError;
                     // Named apart from an unreachable endpoint on purpose: a model that
                     // cannot hold the tool protocol is a model failure, and a run that
                     // died this way must never be scored as a task the toolset failed.
-                    stop_reason = "model_format_failure".into();
+                    stop = Stop::new(
+                        ExitStatus::EndpointError,
+                        "model_format_failure",
+                        Some(reason.clone()),
+                    );
                     final_text = text;
                     break;
                 }
                 counters.repairs += 1;
+                let repair = format!(
+                    "That turn could not be used: {reason}. Either call one tool using the \
+                     tool-calling format, or answer in plain text. Do not describe a tool \
+                     call in prose."
+                );
+                meter.add(repair.len() as u64);
                 messages.push(json!({ "role": "assistant", "content": text }));
-                messages.push(json!({
-                    "role": "user",
-                    "content": format!(
-                        "That turn could not be used: {reason}. Either call one tool using the \
-                         tool-calling format, or answer in plain text. Do not describe a tool \
-                         call in prose."
-                    ),
-                }));
+                messages.push(json!({ "role": "user", "content": repair }));
                 continue;
             }
             Turn::ToolCalls { text, mut calls } => {
@@ -487,8 +596,47 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                 }));
 
                 for call in &calls {
+                    // A budget spent part way through a batch runs nothing more of it, and
+                    // every call still gets an answer so the conversation stays well formed.
+                    let skipped_because = if counters.tool_calls >= config.max_tool_calls {
+                        Some(format!(
+                            "this run's budget of {} tool calls is spent",
+                            config.max_tool_calls
+                        ))
+                    } else if context_note.is_some() {
+                        Some("the conversation has reached the model's context window".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(why) = skipped_because {
+                        counters.skipped_calls += 1;
+                        let text = format!(
+                            "[kin agent] This call was not run: {why}. Answer with what you \
+                             have learned."
+                        );
+                        writer.trace(json!({
+                            "tool_use_id": call.id,
+                            "surface": "policy",
+                            "tool": call.name,
+                            "args": redact_content(&call.arguments),
+                            "policy": "skipped",
+                            "reason": why,
+                            "is_error": true,
+                        }))?;
+                        writer.tool_result(&call.id, &text, true)?;
+                        meter.add(text.len() as u64);
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": text,
+                        }));
+                        continue;
+                    }
                     counters.tool_calls += 1;
                     let route = belt.route(&call.name);
+                    // A local tool's answer says whether a change landed, which the model must
+                    // hear, and it is small; only a Kin answer is ever withheld for size.
+                    let from_kin = matches!(route, Route::Kin { .. });
                     let (result_text, is_error) = match route {
                         Route::Refused(message) => {
                             counters.refused_calls += 1;
@@ -550,24 +698,42 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 "transport_error": err.to_string(),
                                             }))?;
                                             writer.tool_result(&call.id, &err.to_string(), true)?;
-                                            status = ExitStatus::McpError;
-                                            stop_reason = "mcp_transport".into();
                                             final_text = err.to_string();
                                             return finish(
                                                 writer,
                                                 &config,
-                                                status,
-                                                &stop_reason,
+                                                Stop::new(
+                                                    ExitStatus::McpError,
+                                                    "mcp_transport",
+                                                    Some(err.to_string()),
+                                                ),
                                                 &final_text,
                                                 counters,
                                                 started,
-                                                None,
+                                                Some(&meter),
                                             );
                                         }
-                                        Ok(outcome) => {
+                                        Ok(mut outcome) => {
                                             counters.kin_calls += 1;
                                             if outcome.unreadable {
                                                 counters.unreadable_results += 1;
+                                            }
+                                            // Cut before the notes are appended, so what Kin
+                                            // said about its own answer is never the part cut.
+                                            let result_bytes = outcome.text.len();
+                                            let mut shown_bytes = result_bytes;
+                                            if result_bytes > result_ceiling {
+                                                counters.clipped_results += 1;
+                                                let advice = context::how_to_ask_for_less(
+                                                    belt.schema_for(&call.name).as_ref(),
+                                                );
+                                                let shown = context::clip_result(
+                                                    std::mem::take(&mut outcome.text),
+                                                    result_ceiling,
+                                                    &advice,
+                                                );
+                                                shown_bytes = shown.shown_bytes;
+                                                outcome.text = shown.text;
                                             }
                                             let annotated = annotate(
                                                 &outcome,
@@ -587,6 +753,8 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 "envelope": outcome.envelope_summary(),
                                                 "negative": negative_summary(&outcome),
                                                 "unreadable": outcome.unreadable,
+                                                "result_bytes": result_bytes,
+                                                "shown_bytes": shown_bytes,
                                             }))?;
                                             (annotated, outcome.is_error)
                                         }
@@ -803,20 +971,49 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                         }
                     };
 
+                    // A result the conversation cannot hold is withheld and the model told so,
+                    // rather than sent for the endpoint to cut the conversation to fit.
+                    let (result_text, is_error) =
+                        if from_kin && !meter.fits(result_text.len() as u64) {
+                            counters.withheld_results += 1;
+                            let window = meter.window();
+                            context_note = Some(format!(
+                                "a {}-byte result from {} would have left less than the {} \
+                                 tokens kept for the answer in the model's {}-token window \
+                                 ({}), so it was withheld",
+                                result_text.len(),
+                                call.name,
+                                meter.reserve(),
+                                window.tokens,
+                                window.source.label()
+                            ));
+                            writer.trace(json!({
+                                "tool_use_id": call.id,
+                                "surface": "policy",
+                                "tool": call.name,
+                                "policy": "withheld",
+                                "result_bytes": result_text.len(),
+                                "context": meter.to_json(),
+                                "is_error": true,
+                            }))?;
+                            (context::withheld_note(result_text.len(), &meter), true)
+                        } else {
+                            (result_text, is_error)
+                        };
                     writer.tool_result(&call.id, &result_text, is_error)?;
+                    meter.add(result_text.len() as u64);
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call.id,
                         "content": result_text,
                     }));
 
-                    if started.elapsed() >= config.deadline {
-                        status = ExitStatus::Deadline;
-                        stop_reason = "wall_deadline".into();
+                    if Instant::now() >= deadline_at {
+                        stop = Stop::deadline(&config, "after a tool call");
                         break;
                     }
                 }
-                if matches!(status, ExitStatus::Deadline) {
+                if stop.status == ExitStatus::Deadline {
                     break;
                 }
             }
@@ -829,13 +1026,78 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     finish(
         writer,
         &config,
-        status,
-        &stop_reason,
+        stop,
         &final_text,
         counters,
         started,
-        None,
+        Some(&meter),
     )
+}
+
+/// The stop a spent budget ends the run with, and the message that asks for the answer.
+fn budget_stop(
+    spent: Spent,
+    config: &AgentConfig,
+    meter: &ContextMeter,
+    withheld: Option<&str>,
+    turns: u32,
+) -> (Stop, String) {
+    const ASK: &str = "Do not call any more tools. Answer now in plain text with what you have \
+                       learned, and say plainly what you were not able to determine.";
+    match spent {
+        Spent::ToolCalls => (
+            Stop::new(
+                ExitStatus::CapReached,
+                "tool_call_cap",
+                Some(format!(
+                    "the run used its budget of {} tool calls",
+                    config.max_tool_calls
+                )),
+            ),
+            format!(
+                "You have used your budget of {} tool calls. {ASK}",
+                config.max_tool_calls
+            ),
+        ),
+        Spent::Context => {
+            let window = meter.window();
+            let detail = match withheld {
+                Some(withheld) => withheld.to_string(),
+                None if turns == 0 => format!(
+                    "the first request needs about {} tokens, which leaves less than the {} kept \
+                     for the answer in the model's {}-token window ({})",
+                    meter.used(),
+                    meter.reserve(),
+                    window.tokens,
+                    window.source.label()
+                ),
+                None => format!(
+                    "the conversation holds about {} of the model's {} tokens ({}), which \
+                     leaves less than the {} kept for the answer",
+                    meter.used(),
+                    window.tokens,
+                    window.source.label(),
+                    meter.reserve()
+                ),
+            };
+            (
+                Stop::new(ExitStatus::ContextBudget, "context_budget", Some(detail)),
+                format!(
+                    "This conversation has reached the model's context window: it holds about \
+                     {} of {} tokens. {ASK}",
+                    meter.used(),
+                    window.tokens
+                ),
+            )
+        }
+    }
+}
+
+/// What one answer adds to the conversation, in bytes, for the budget.
+fn message_bytes(choice: &Value) -> u64 {
+    choice
+        .get("message")
+        .map_or(0, |message| message.to_string().len()) as u64
 }
 
 /// Append what Kin said about its own answer, so an untrusted absence cannot be read as
@@ -928,20 +1190,41 @@ fn check_arguments(belt: &Belt, name: &str, arguments: &Value) -> Result<(), Str
     }
 }
 
+/// Ask the endpoint for one turn, inside what is left of the run's deadline.
+///
+/// Every attempt carries the remaining budget as its timeout, and a retry never starts once
+/// the budget is gone, so a slow endpoint ends the wait at the deadline rather than
+/// stretching the run by a full request timeout per attempt. A failure that lands after the
+/// deadline is the deadline's, whatever the transport said.
 fn complete_with_retry(
     provider: &Provider,
     messages: &[Value],
     tools: &[Value],
     counters: &mut Counters,
-) -> Result<crate::provider::Completion, ProviderError> {
+    deadline_at: Instant,
+) -> Result<Completion, EndpointStop> {
+    let began = Instant::now();
     let mut last: Option<ProviderError> = None;
     for attempt in 0..ENDPOINT_ATTEMPTS {
-        match provider.complete(messages, tools) {
-            Ok(completion) => {
-                counters.api_ms += completion.api_ms;
-                return Ok(completion);
-            }
+        let remaining = deadline_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(EndpointStop::Deadline {
+                waited: began.elapsed(),
+            });
+        }
+        let limit = remaining.min(provider.config().request_timeout);
+        let asked = Instant::now();
+        let outcome = provider.complete_within(messages, tools, limit);
+        // Time spent waiting is endpoint time whether or not an answer came back.
+        counters.api_ms += asked.elapsed().as_millis();
+        match outcome {
+            Ok(completion) => return Ok(completion),
             Err(err) => {
+                if Instant::now() >= deadline_at {
+                    return Err(EndpointStop::Deadline {
+                        waited: began.elapsed(),
+                    });
+                }
                 // A rejected request will be rejected again; only a transport hiccup is
                 // worth a second try.
                 let retryable = matches!(err, ProviderError::Transport { .. });
@@ -949,11 +1232,15 @@ fn complete_with_retry(
                 if !retryable || attempt + 1 == ENDPOINT_ATTEMPTS {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
+                let pause = Duration::from_millis(500 * (attempt as u64 + 1))
+                    .min(deadline_at.saturating_duration_since(Instant::now()));
+                std::thread::sleep(pause);
             }
         }
     }
-    Err(last.expect("at least one attempt was made"))
+    Err(EndpointStop::Failed(
+        last.expect("at least one attempt was made"),
+    ))
 }
 
 fn start_kin_session(
@@ -1422,26 +1709,29 @@ fn truncate(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect::<String>() + "..."
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish(
     mut writer: TranscriptWriter,
     config: &AgentConfig,
-    status: ExitStatus,
-    stop_reason: &str,
+    stop: Stop,
     final_text: &str,
     counters: Counters,
     started: Instant,
-    _reserved: Option<()>,
+    meter: Option<&ContextMeter>,
 ) -> anyhow::Result<RunOutcome> {
     // A run that wrote files repository authority never published landed nothing, whatever
     // the model's closing paragraph says. Downgrading here rather than at each exit path
     // means no future exit can forget it. A run that stopped for its own reason keeps that
     // reason, which is more specific than this one.
-    let status = if status == ExitStatus::Success && counters.unpublished_changes > 0 {
+    let status = if stop.status == ExitStatus::Success && counters.unpublished_changes > 0 {
         ExitStatus::ChangesUnpublished
     } else {
-        status
+        stop.status
     };
+    let mut agent = counters.to_json(status.code(), &stop);
+    agent["max_result_bytes"] = json!(config.result_ceiling());
+    // The budget as it stood when the run stopped, so a context stop can be read against
+    // the numbers that decided it.
+    agent["context"] = meter.map_or(Value::Null, ContextMeter::to_json);
     let record = writer.result(
         status.subtype(),
         status != ExitStatus::Success,
@@ -1450,7 +1740,7 @@ fn finish(
         counters.api_ms,
         final_text,
         counters.usage_json(),
-        counters.to_json(status.code(), stop_reason),
+        agent,
     )?;
     std::fs::write(
         config.out_dir.join("result.json"),

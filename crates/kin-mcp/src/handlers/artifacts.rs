@@ -23,10 +23,11 @@ pub const ARTIFACT_LIST_DESC: &str = "\
 List the exact graph-owned repository artifacts at one semantic change. This is the \
 repository-membership surface: it includes code and every non-code tracked object such as \
 Docker Compose files, Dockerfiles, lockfiles, configuration, binary assets, unsupported \
-languages, symlinks, executable files, and gitlinks. Paths are returned as canonical \
-lowercase `bytes_hex` objects; `path_label` is presentation-only and \
-`path_label_lossy` says whether replacement characters were required. Identity comes from \
-`artifact_id`, never from a path. Content-addressed ids are lowercase hex strings: each \
+languages, symlinks, executable files, and gitlinks. Each row names its path once: \
+`path_label` is the exact path whenever `path_label_lossy` is false, and only a path whose \
+bytes are not valid UTF-8 also carries the byte-exact `path` as a lowercase `bytes_hex` \
+object. Identity comes from `artifact_id`, never from a path, and it is what \
+`kin_artifact_read` takes to read a listed row. Content-addressed ids are lowercase hex strings: each \
 entry's blob `hash`, a symlink's `target_blob`, and the response's `source_change_id`, so a \
 value this returns can be passed straight back into `kin_artifact_read`'s \
 `source_change_id` or compared against what `kin log` prints. A gitlink is the one \
@@ -123,6 +124,36 @@ impl From<&ResolvedArtifact> for ArtifactWire {
             artifact_id: artifact.artifact_id,
             path: artifact.path.clone(),
             path_label,
+            path_label_lossy,
+            entry: artifact.entry.into(),
+        }
+    }
+}
+
+/// One row of `kin_artifact_list`, which names its path once.
+///
+/// A path whose bytes are UTF-8 is spelled exactly by `path_label`, so carrying the
+/// byte-exact `bytes_hex` form beside it doubled the path on every row, at twice the path's
+/// length, in a listing an agent reads whole. The byte-exact form stays only where the label
+/// cannot spell the bytes, which is exactly when `path_label_lossy` is true. `artifact_id`
+/// is on every row, and it is the handle `kin_artifact_read` takes.
+#[derive(Debug, Serialize)]
+struct ArtifactRowWire {
+    artifact_id: ArtifactId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<RepoPath>,
+    path_label: String,
+    path_label_lossy: bool,
+    entry: TreeEntryWire,
+}
+
+impl From<&ResolvedArtifact> for ArtifactRowWire {
+    fn from(artifact: &ResolvedArtifact) -> Self {
+        let path_label_lossy = artifact.path.as_utf8().is_none();
+        Self {
+            artifact_id: artifact.artifact_id,
+            path: path_label_lossy.then(|| artifact.path.clone()),
+            path_label: String::from_utf8_lossy(artifact.path.as_bytes()).into_owned(),
             path_label_lossy,
             entry: artifact.entry.into(),
         }
@@ -278,7 +309,7 @@ pub fn handle_artifact_list<G: GraphStore>(
         .artifacts_by_path()
         .skip(offset)
         .take(limit)
-        .map(ArtifactWire::from)
+        .map(ArtifactRowWire::from)
         .collect::<Vec<_>>();
     let returned = artifacts.len();
     let result = serde_json::json!({
@@ -501,6 +532,43 @@ mod tests {
                 "the variant tag must be unchanged: {model} vs {wire}"
             );
         }
+    }
+
+    /// A listed row spells a UTF-8 path once, by its label, and keeps the
+    /// byte-exact form only for a path the label cannot spell.
+    #[test]
+    fn a_listed_row_names_its_path_once() {
+        let plain = serde_json::to_value(ArtifactRowWire::from(&artifact_with(TreeEntry::Blob {
+            hash: Hash256::from_bytes([4; 32]),
+            executable: false,
+        })))
+        .expect("a row serializes");
+        assert_eq!(plain["path_label"], serde_json::json!("AGENTS.md"));
+        assert_eq!(plain["path_label_lossy"], serde_json::json!(false));
+        assert!(
+            plain.get("path").is_none(),
+            "a UTF-8 path is already spelled exactly by its label: {plain}"
+        );
+        assert!(plain["artifact_id"].is_string(), "{plain}");
+
+        // The control: a path with no UTF-8 spelling keeps its only lossless form.
+        let raw_path = RepoPath::from_bytes(b"assets/\xffpayload.bin".to_vec())
+            .expect("a byte-exact repo path");
+        let lossy = serde_json::to_value(ArtifactRowWire::from(&ResolvedArtifact::new(
+            ArtifactId::new(),
+            raw_path.clone(),
+            TreeEntry::Blob {
+                hash: Hash256::from_bytes([5; 32]),
+                executable: false,
+            },
+        )))
+        .expect("a row serializes");
+        assert_eq!(lossy["path_label_lossy"], serde_json::json!(true));
+        assert_eq!(
+            lossy["path"],
+            serde_json::to_value(&raw_path).expect("the path serializes"),
+            "a lossy label must keep the byte-exact path: {lossy}"
+        );
     }
 
     /// The defect the ticket leads with: `kin_artifact_read`'s own

@@ -609,6 +609,74 @@ fn base_urls_normalize_to_one_endpoint() {
 }
 
 #[test]
+fn the_context_window_is_read_off_each_server_shape_that_names_one() {
+    use crate::provider::{
+        context_from_lmstudio_model, context_from_lmstudio_models, context_from_model_list,
+    };
+    // vLLM names the served window on its OpenAI-compatible list, OpenRouter names the
+    // model's, and an entry for another model says nothing about this one.
+    let vllm = json!({ "data": [
+        { "id": "other", "max_model_len": 4096 },
+        { "id": "qwen", "max_model_len": 32768 }
+    ]});
+    assert_eq!(context_from_model_list(&vllm, "qwen"), Some(32_768));
+    let openrouter = json!({ "data": [{ "id": "x/y", "context_length": 200000.0 }] });
+    assert_eq!(context_from_model_list(&openrouter, "x/y"), Some(200_000));
+    // LM Studio's compatible list names nothing, which must read as nothing.
+    let bare = json!({ "data": [{ "id": "qwen/qwen3.8-27b", "object": "model" }] });
+    assert_eq!(context_from_model_list(&bare, "qwen/qwen3.8-27b"), None);
+
+    // LM Studio's own list: the loaded instance's context, the smallest when there are two,
+    // and an instance addressed by its own id counts on its own.
+    let lmstudio = json!({ "models": [
+        { "key": "qwen/qwen3.8-27b", "max_context_length": 262144, "loaded_instances": [
+            { "id": "qwen/qwen3.8-27b", "config": { "context_length": 131072 } },
+            { "id": "qwen/qwen3.8-27b:2", "config": { "context_length": 65536 } }
+        ]},
+        { "key": "gpt-oss-20b", "max_context_length": 131072, "loaded_instances": [] }
+    ]});
+    assert_eq!(
+        context_from_lmstudio_models(&lmstudio, "qwen/qwen3.8-27b"),
+        Some(65_536)
+    );
+    assert_eq!(
+        context_from_lmstudio_models(&lmstudio, "qwen/qwen3.8-27b:2"),
+        Some(65_536)
+    );
+    // A model that is not loaded has a maximum and no window, and the maximum is never used.
+    assert_eq!(context_from_lmstudio_models(&lmstudio, "gpt-oss-20b"), None);
+    assert_eq!(
+        context_from_lmstudio_model(&json!({ "max_context_length": 131072 })),
+        None
+    );
+    assert_eq!(
+        context_from_lmstudio_model(&json!({ "loaded_context_length": 8192 })),
+        Some(8_192)
+    );
+    // A zero is not a window.
+    assert_eq!(
+        context_from_model_list(
+            &json!({ "data": [{ "id": "z", "context_length": 0 }] }),
+            "z"
+        ),
+        None
+    );
+}
+
+#[test]
+fn the_origin_is_the_server_root_beside_the_compatible_api() {
+    use crate::provider::ProviderConfig;
+    let config = ProviderConfig {
+        base_url: ProviderConfig::normalize_base_url("http://127.0.0.1:1234"),
+        model: "m".into(),
+        api_key: None,
+        temperature: None,
+        request_timeout: std::time::Duration::from_secs(1),
+    };
+    assert_eq!(config.origin(), "http://127.0.0.1:1234");
+}
+
+#[test]
 fn a_named_api_key_variable_that_is_unset_fails_loudly() {
     use crate::provider::ProviderConfig;
     // Silently sending no key would surface later as a 401 that reads like a bad model id.

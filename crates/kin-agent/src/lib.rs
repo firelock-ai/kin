@@ -15,6 +15,7 @@
 //! permission layer, which is what makes it hold on every model rather than on one CLI.
 
 pub mod belt;
+pub mod context;
 pub mod mcp;
 pub mod parse;
 pub mod provider;
@@ -24,6 +25,7 @@ pub mod transcript;
 #[cfg(test)]
 mod tests;
 
+pub use context::{ContextSource, ContextWindow};
 pub use provider::{Provider, ProviderConfig, ProviderError};
 pub use run::{run, DEFAULT_SYSTEM_PROMPT};
 
@@ -44,6 +46,10 @@ pub enum ExitStatus {
     /// The run produced changes that repository authority never published. The task text
     /// may read like a success, but nothing landed, so this must never pool with Success.
     ChangesUnpublished,
+    /// The conversation reached the model's context window, so the agent was asked for its
+    /// answer before the next request could overflow it. A budget spent, like the tool-call
+    /// cap, but a different budget, so it is named apart.
+    ContextBudget,
 }
 
 impl ExitStatus {
@@ -56,6 +62,7 @@ impl ExitStatus {
             ExitStatus::EndpointError => 4,
             ExitStatus::McpError => 5,
             ExitStatus::ChangesUnpublished => 6,
+            ExitStatus::ContextBudget => 7,
         }
     }
 
@@ -68,6 +75,7 @@ impl ExitStatus {
             ExitStatus::EndpointError => "endpoint_error",
             ExitStatus::McpError => "mcp_error",
             ExitStatus::ChangesUnpublished => "changes_unpublished",
+            ExitStatus::ContextBudget => "context_budget",
         }
     }
 }
@@ -100,11 +108,23 @@ pub struct AgentConfig {
     pub extra_servers: Vec<ServerSpec>,
     pub mcp_timeout: Duration,
     pub max_tool_calls: u32,
+    /// The whole run's wall-clock budget, including every wait on the endpoint.
     pub deadline: Duration,
+    /// The model's context window. Every request the loop sends stays inside it.
+    pub context: ContextWindow,
+    /// The most bytes of one tool result the model is sent. `None` derives the ceiling from
+    /// the context window.
+    pub max_result_bytes: Option<usize>,
     pub tool_profile: Option<String>,
 }
 
 impl AgentConfig {
+    /// The most bytes of one tool result this run sends to the model.
+    pub fn result_ceiling(&self) -> usize {
+        self.max_result_bytes
+            .unwrap_or_else(|| self.context.default_result_ceiling())
+    }
+
     /// Every server this run attaches, primary first.
     pub fn servers(&self) -> Vec<ServerSpec> {
         let mut servers = vec![ServerSpec {
@@ -134,6 +154,11 @@ pub const DEFAULT_DEADLINE_S: u64 = 900;
 /// graph build behind the first call is normal and killing it would report a Kin failure
 /// that was really a harness impatience.
 pub const DEFAULT_MCP_TIMEOUT_S: u64 = 300;
-/// Default per-request timeout for one chat completion, in seconds. Local models on a
-/// laptop are slow, and a short timeout here reads as an endpoint failure.
+/// The longest one chat completion may wait, in seconds. Local models on a laptop are slow,
+/// and a short timeout here reads as an endpoint failure. The run's deadline cuts any wait
+/// shorter than this, so a slow endpoint cannot carry a run past it.
 pub const DEFAULT_REQUEST_TIMEOUT_S: u64 = 600;
+/// The context window a run budgets for when neither the operator nor the endpoint names one.
+/// Small on purpose: a budget that is too small stops a run early and says so, while one that
+/// is too large lets the endpoint cut the conversation without a word.
+pub const DEFAULT_CONTEXT_TOKENS: u64 = 32_768;

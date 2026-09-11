@@ -114,6 +114,59 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
     }])
 }
 
+/// A completion whose usage is the endpoint's own count, for driving the context budget.
+fn completion_with_usage(
+    content: &str,
+    tool_calls: Option<Value>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Value {
+    let mut response = completion(content, tool_calls);
+    response["usage"] = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    });
+    response
+}
+
+/// Answer one GET by path from a fixed table, 404 for anything else, and record the path,
+/// the way a server that keeps its own API beside the compatible one answers.
+fn serve_route(
+    mut stream: TcpStream,
+    routes: &[(String, Value)],
+    seen: &std::sync::Mutex<Vec<String>>,
+) {
+    let Ok(clone) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(clone);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+        return;
+    }
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim_end().is_empty() {
+            break;
+        }
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    seen.lock().unwrap().push(path.clone());
+    let (status, body) = match routes.iter().find(|(route, _)| *route == path) {
+        Some((_, body)) => ("200 OK", body.to_string()),
+        None => ("404 Not Found", "{}".to_string()),
+    };
+    let http = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(http.as_bytes());
+}
+
 /// Write a scripted MCP stdio server that speaks the real wire shapes: an `initialize`
 /// reply, a `tools/list` carrying the session and transaction tools, and tool results
 /// whose payload sits inside `content[0].text` with a `_kin` envelope.
@@ -151,6 +204,9 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "kin_transaction_abort", "description": "Abort a transaction.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "kin_artifact_list", "description": "List repository artifacts.",
+     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"},
+                                                     "offset": {"type": "integer"}}}},
 ]
 
 ENVELOPE = {"envelope_version": "1", "runtime": "RepoDaemon",
@@ -158,13 +214,23 @@ ENVELOPE = {"envelope_version": "1", "runtime": "RepoDaemon",
             "semantic_coverage": 0.91, "degraded": []}
 
 
-def payload(obj, is_error=False):
-    return {"content": [{"type": "text", "text": json.dumps(obj)}], "isError": is_error}
+def payload(obj, is_error=False, indent=None):
+    return {"content": [{"type": "text", "text": json.dumps(obj, indent=indent)}],
+            "isError": is_error}
 
 
 def call(name, args):
     with open(LOG, "a") as fh:
         fh.write(json.dumps({"tool": name, "args": args}) + "\n")
+    if name == "kin_artifact_list":
+        # Pretty-printed with one row per artifact, like the real server, so a listing
+        # asked for a large limit is large for the same reason the real one is.
+        limit = int(args.get("limit", 200))
+        rows = [{"artifact_id": "00000000-0000-4000-8000-%012d" % i,
+                 "path_label": "crates/module_%04d/src/file_%04d.rs" % (i, i),
+                 "path_label_lossy": False} for i in range(limit)]
+        return payload({"artifact_count": 5000, "offset": 0, "returned": limit,
+                        "artifacts": rows, "_kin": ENVELOPE}, indent=2)
     if name == "semantic_locate":
         if args.get("query") == "nothing at all":
             return payload({"results": [], "_kin": ENVELOPE,
@@ -299,6 +365,11 @@ fn config(repo: &Path, out: &Path, base_url: &str, mcp_command: Vec<String>) -> 
         mcp_timeout: Duration::from_secs(60),
         max_tool_calls: 10,
         deadline: Duration::from_secs(120),
+        context: kin_agent::ContextWindow {
+            tokens: 131_072,
+            source: kin_agent::ContextSource::Flag,
+        },
+        max_result_bytes: None,
         tool_profile: None,
     }
 }
@@ -1437,6 +1508,347 @@ fn the_tool_call_cap_forces_a_tool_free_final_answer_and_exits_two() {
     assert!(
         last.get("tools").is_none(),
         "the forced final turn must offer no tools"
+    );
+}
+
+/// A batch that crosses the tool-call budget runs only what the budget allows. The rest are
+/// answered as not run, so the conversation stays well formed, and the run ends on the cap.
+#[test]
+fn a_batch_that_crosses_the_tool_call_budget_runs_only_what_the_budget_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let three = json!(["a", "b", "c"]
+        .iter()
+        .enumerate()
+        .map(|(index, query)| json!({
+            "id": format!("c{index}"),
+            "type": "function",
+            "function": {
+                "name": "mcp__kin__semantic_locate",
+                "arguments": json!({ "query": query }).to_string(),
+            }
+        }))
+        .collect::<Vec<_>>());
+    let endpoint = FakeEndpoint::start(vec![
+        completion("", Some(three)),
+        completion("Two lookups were enough.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(&repo, &out, &base_url, mcp_command(&server, &log));
+    cfg.max_tool_calls = 2;
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+
+    assert_eq!(outcome.status, ExitStatus::CapReached);
+    let locates = mcp_log(&log)
+        .iter()
+        .filter(|call| call["tool"] == "semantic_locate")
+        .count();
+    assert_eq!(locates, 2, "only the calls inside the budget may reach Kin");
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(
+        view.tool_results.len(),
+        3,
+        "every call in the batch is answered"
+    );
+    let (_, skipped, is_error) = &view.tool_results[2];
+    assert!(*is_error, "a call that never ran is not a result");
+    assert!(
+        skipped.contains("was not run") && skipped.contains("budget of 2 tool calls"),
+        "the model must be told why the call did not run: {skipped}"
+    );
+    assert_eq!(view.result["kin_agent"]["tool_calls"], 2);
+    assert_eq!(view.result["kin_agent"]["skipped_calls"], 1);
+    assert_eq!(view.result["kin_agent"]["stop_reason"], "tool_call_cap");
+    let requests = endpoint.requests();
+    assert!(
+        requests.last().unwrap().get("tools").is_none(),
+        "the forced final turn must offer no tools"
+    );
+}
+
+/// A result larger than the per-result ceiling reaches the model cut, with a note that names
+/// its size, the ceiling and the arguments that page it, and the transcript records what the
+/// model saw.
+#[test]
+fn an_oversized_result_is_cut_to_the_ceiling_with_a_note_naming_size_ceiling_and_paging() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Listing everything.",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__kin_artifact_list",
+                json!({ "limit": 1000 }),
+            )),
+        ),
+        completion("There are many artifacts.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(&repo, &out, &base_url, mcp_command(&server, &log));
+    cfg.max_result_bytes = Some(8_192);
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    let trace = read_jsonl(&outcome.trace_path);
+    let row = trace
+        .iter()
+        .find(|row| row["tool"] == "kin_artifact_list" && row["surface"] == "kin")
+        .expect("the Kin call is traced");
+    let result_bytes = row["result_bytes"].as_u64().unwrap();
+    let shown_bytes = row["shown_bytes"].as_u64().unwrap();
+    assert!(
+        result_bytes > 100_000,
+        "the fixture listing must be large: {result_bytes}"
+    );
+    assert!(
+        shown_bytes <= 8_192,
+        "no more than the ceiling may be shown: {shown_bytes}"
+    );
+
+    // What the model received is what the next request carried.
+    let requests = endpoint.requests();
+    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        observation.len() < 8_192 + 1_024,
+        "the observation must be the cut text, not {} bytes",
+        observation.len()
+    );
+    let tail = &observation[observation.len().saturating_sub(700)..];
+    for needle in [
+        format!("It is {result_bytes} bytes"),
+        "at most 8192 bytes".to_string(),
+        "smaller `limit`".to_string(),
+        "with `offset`".to_string(),
+    ] {
+        assert!(
+            observation.contains(&needle),
+            "the note must say {needle:?}: {tail}"
+        );
+    }
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(
+        view.tool_results[0].1, observation,
+        "the transcript records what the model saw, not what the tool produced"
+    );
+    assert_eq!(view.result["kin_agent"]["clipped_results"], 1);
+    assert_eq!(view.result["kin_agent"]["max_result_bytes"], 8_192);
+}
+
+/// A result the conversation cannot hold is withheld with a note, and the run asks for its
+/// final answer with nothing to call instead of sending a request larger than the window.
+#[test]
+fn a_result_the_window_cannot_hold_is_withheld_and_the_run_ends_on_its_context_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // The endpoint counts 3,020 tokens after the first turn, so in a 4,096-token window with
+    // 1,024 kept for the answer no listing of any size fits.
+    let endpoint = FakeEndpoint::start(vec![
+        completion_with_usage(
+            "Listing.",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__kin_artifact_list",
+                json!({ "limit": 50 }),
+            )),
+            3_000,
+            20,
+        ),
+        completion("Answering from what I have.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(&repo, &out, &base_url, mcp_command(&server, &log));
+    cfg.context = kin_agent::ContextWindow {
+        tokens: 4_096,
+        source: kin_agent::ContextSource::Flag,
+    };
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+
+    assert_eq!(outcome.status, ExitStatus::ContextBudget);
+    assert_eq!(outcome.status.code(), 7);
+    assert_eq!(outcome.final_text, "Answering from what I have.");
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.result["subtype"], "context_budget");
+    assert_eq!(view.result["kin_agent"]["stop_reason"], "context_budget");
+    let detail = view.result["kin_agent"]["stop_detail"].as_str().unwrap();
+    assert!(
+        detail.contains("withheld") && detail.contains("4096-token window"),
+        "the stop must say what was withheld and against which window: {detail}"
+    );
+    assert_eq!(view.result["kin_agent"]["withheld_results"], 1);
+    assert_eq!(view.result["kin_agent"]["context"]["window_tokens"], 4_096);
+    assert_eq!(
+        view.result["kin_agent"]["context"]["anchored_on_endpoint_count"],
+        true
+    );
+
+    let requests = endpoint.requests();
+    assert_eq!(requests.len(), 2);
+    let last = &requests[1];
+    assert!(
+        last.get("tools").is_none(),
+        "the final request offers nothing to call"
+    );
+    let tool_message = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("the withheld call is still answered");
+    let content = tool_message["content"].as_str().unwrap();
+    assert!(content.contains("was not sent"), "{content}");
+    assert!(
+        !content.contains("path_label"),
+        "no withheld row may reach the model: {content}"
+    );
+}
+
+/// A window too small for even the first request stops the run before anything is sent,
+/// and says how many tokens that request needs.
+#[test]
+fn a_window_too_small_for_the_first_request_stops_before_anything_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(Vec::new());
+    let base_url = endpoint.base_url.clone();
+
+    let mut cfg = config(&repo, &out, &base_url, mcp_command(&server, &log));
+    cfg.context = kin_agent::ContextWindow {
+        tokens: 1_100,
+        source: kin_agent::ContextSource::Default,
+    };
+    let outcome = kin_agent::run(cfg).expect("the run completes");
+
+    assert_eq!(outcome.status, ExitStatus::ContextBudget);
+    let detail = outcome.result["kin_agent"]["stop_detail"].as_str().unwrap();
+    assert!(
+        detail.contains("the first request needs about") && detail.contains("(default)"),
+        "the stop must say the first request does not fit, and whose window it was: {detail}"
+    );
+    assert!(
+        endpoint.requests().is_empty(),
+        "nothing may be sent that cannot fit the window"
+    );
+}
+
+/// An endpoint slower than the run's deadline is abandoned at the deadline, and the run says
+/// so, rather than holding the run for a full request timeout.
+#[test]
+fn a_slow_endpoint_is_abandoned_at_the_deadline_and_the_run_says_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // It answers, but only after the run's deadline and well inside its request timeout, the
+    // way a local model re-reading a long prompt does.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(Duration::from_secs(15));
+            let _ = serve_one(stream, &completion("Too late.", None));
+        }
+    });
+
+    let mut cfg = config(
+        &repo,
+        &out,
+        &format!("http://127.0.0.1:{port}/v1"),
+        mcp_command(&server, &log),
+    );
+    cfg.deadline = Duration::from_secs(2);
+    let began = std::time::Instant::now();
+    let outcome = kin_agent::run(cfg).expect("the run returns");
+    let elapsed = began.elapsed();
+
+    assert_eq!(outcome.status, ExitStatus::Deadline);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the wait must end at the deadline, not after {elapsed:?}"
+    );
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.result["subtype"], "deadline");
+    assert_eq!(view.result["kin_agent"]["stop_reason"], "deadline");
+    let detail = view.result["kin_agent"]["stop_detail"].as_str().unwrap();
+    assert!(
+        detail.contains("2 s deadline") && detail.contains("on the endpoint"),
+        "the stop must say the deadline cut an endpoint wait: {detail}"
+    );
+}
+
+/// The window a run budgets for is the one LM Studio reports for the LOADED model, read off
+/// its own API when the compatible model list names none, and never the model's maximum.
+#[test]
+fn the_context_window_is_discovered_from_lm_studio_s_own_api() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let routes: Vec<(String, Value)> = vec![
+        (
+            "/v1/models".to_string(),
+            json!({ "object": "list", "data": [{ "id": "qwen/qwen3.8-27b", "object": "model" }] }),
+        ),
+        (
+            "/api/v1/models".to_string(),
+            json!({ "models": [{
+                "key": "qwen/qwen3.8-27b",
+                "max_context_length": 262144,
+                "loaded_instances": [
+                    { "id": "qwen/qwen3.8-27b", "config": { "context_length": 131072 } }
+                ]
+            }]}),
+        ),
+    ];
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_by_server = seen.clone();
+    std::thread::spawn(move || {
+        for _ in 0..3 {
+            let Ok((stream, _)) = listener.accept() else {
+                break;
+            };
+            serve_route(stream, &routes, &seen_by_server);
+        }
+    });
+
+    let provider = kin_agent::Provider::new(ProviderConfig {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        model: "qwen/qwen3.8-27b".into(),
+        api_key: None,
+        temperature: None,
+        request_timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    assert_eq!(provider.discover_context_window(), Some(131_072));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["/v1/models".to_string(), "/api/v1/models".to_string()],
+        "the compatible list is asked first and the loaded window ends the search"
     );
 }
 
