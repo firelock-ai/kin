@@ -470,6 +470,11 @@ struct LinkContext<'a> {
     entity_by_file_name: HashMap<(&'a str, &'a str), EntityId>,
     entity_by_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
     entity_by_bare_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
+    /// Owner-qualified entity id -> the type it hangs off, reduced to the bare
+    /// segment a qualified call writes (see [`owner_type_segment`]). Lets the
+    /// qualified-suffix tier keep the owner a call named instead of matching
+    /// the leaf alone.
+    entity_owner_segment_by_id: HashMap<EntityId, &'a str>,
     entity_kind_by_id: HashMap<EntityId, EntityKind>,
     /// Parser-reported language for every entity. Blind name/locality
     /// inference must fail closed when either side is absent and may only
@@ -588,6 +593,7 @@ fn build_link_context<'a>(
         entity_by_file_name,
         entity_by_name,
         entity_by_bare_name,
+        entity_owner_segment_by_id,
         entity_kind_by_id,
         entity_language_by_id,
         entity_arity_by_id,
@@ -604,6 +610,7 @@ fn build_link_context<'a>(
         let mut entity_by_file_name: HashMap<(&str, &str), EntityId> = HashMap::new();
         let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_by_bare_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
+        let mut entity_owner_segment_by_id: HashMap<EntityId, &str> = HashMap::new();
         let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
         let mut entity_language_by_id: HashMap<EntityId, LanguageId> = HashMap::new();
         let mut entity_arity_by_id: HashMap<EntityId, ArityBounds> = HashMap::new();
@@ -639,6 +646,9 @@ fn build_link_context<'a>(
                     .entry(bare_name)
                     .or_default()
                     .push((file_path, entity.id));
+                if let Some((owner, _)) = entity_owner_path(&entity.name) {
+                    entity_owner_segment_by_id.insert(entity.id, owner_type_segment(owner));
+                }
             }
 
             if let Some(bounds) = callee_arity_bounds(entity) {
@@ -657,6 +667,7 @@ fn build_link_context<'a>(
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
+            entity_owner_segment_by_id,
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id,
@@ -728,6 +739,7 @@ fn build_link_context<'a>(
         entity_by_file_name,
         entity_by_name,
         entity_by_bare_name,
+        entity_owner_segment_by_id,
         entity_kind_by_id,
         entity_language_by_id,
         entity_arity_by_id,
@@ -1552,6 +1564,7 @@ fn resolve_one_file(
                 rel.dst_name.as_str(),
                 file.file_path.as_str(),
                 call_arity,
+                src_id,
                 ctx,
             ) {
                 accumulate_relation(
@@ -2566,6 +2579,7 @@ fn resolve_qualified_suffix(
     dst_name: &str,
     current_file: &str,
     arg_count: Option<usize>,
+    src_id: EntityId,
     ctx: &LinkContext<'_>,
 ) -> Vec<EntityId> {
     let segments: Vec<&str> = dst_name.split("::").collect();
@@ -2603,21 +2617,43 @@ fn resolve_qualified_suffix(
         _ => {}
     }
 
-    // Tier 2: bare leaf. Free functions live in `entity_by_name` under `last`;
-    // methods live in `entity_by_bare_name` under `last`. Union both, then fan
-    // out to every distinct cross-file target up to the cap so overload sets and
-    // amalgamated duplicate definitions all link instead of dropping the edge.
+    // Tier 2: the bare leaf, still read against the owner the call wrote.
+    // Free functions live in `entity_by_name` under `last` and stay candidates
+    // unless the owner is a type (see `QualifiedCallOwner::admits_free_items`).
+    // A member lives in `entity_by_bare_name` under `last` and is a candidate
+    // only when its own owner is the one the path names: `GraphNodeId::Entity`
+    // reaches `GraphNodeId`'s variant and never the `Entity` variant of some
+    // other enum, however few of those the repository holds. The survivors then
+    // fan out to every distinct cross-file target up to the cap, so overload
+    // sets and amalgamated duplicate definitions still all link.
+    let owner = QualifiedCallOwner::written(
+        segments[segments.len() - 2],
+        ctx.import_map.get(current_file),
+        ctx.entity_language_by_id.get(&src_id).copied(),
+    );
     let mut leaf_targets: HashSet<EntityId> = HashSet::new();
-    distinct_cross_file_targets(
-        ctx.entity_by_name.get(last),
-        current_file,
-        &mut leaf_targets,
-    );
-    distinct_cross_file_targets(
-        ctx.entity_by_bare_name.get(last),
-        current_file,
-        &mut leaf_targets,
-    );
+    if owner.admits_free_items() {
+        distinct_cross_file_targets(
+            ctx.entity_by_name.get(last),
+            current_file,
+            &mut leaf_targets,
+        );
+    }
+    for &(fp, id) in ctx.entity_by_bare_name.get(last).into_iter().flatten() {
+        if fp != current_file
+            && ctx
+                .entity_owner_segment_by_id
+                .get(&id)
+                .is_some_and(|segment| owner.names(segment))
+        {
+            leaf_targets.insert(id);
+        }
+    }
+    // Everything this tier links is inferred from a name, so it takes the same
+    // language gate every other name tier applies.
+    leaf_targets.retain(|&dst_id| {
+        blind_inference_target_allowed(src_id, dst_id, &ctx.entity_language_by_id)
+    });
     let leaf_targets = prune_ids_by_arity(leaf_targets, arg_count, &ctx.entity_arity_by_id);
     match leaf_targets.len() {
         0 => Vec::new(),
@@ -2634,6 +2670,100 @@ fn resolve_qualified_suffix(
     }
 }
 
+/// The owner a qualified call wrote, as the qualified-suffix tiers compare it.
+struct QualifiedCallOwner<'a> {
+    /// The path segment before the leaf: `Widget` in `crate::model::Widget::make`.
+    written: &'a str,
+    /// The name that segment imports when this file binds it under another
+    /// one, so `use crate::model::Widget as W;` lets `W::make` name `Widget`.
+    imported: Option<&'a str>,
+    /// Whether the owner is a Rust type rather than a module.
+    type_path: bool,
+}
+
+impl<'a> QualifiedCallOwner<'a> {
+    fn written(
+        segment: &'a str,
+        file_imports: Option<&HashMap<&'a str, (&'a str, &'a str)>>,
+        caller_language: Option<LanguageId>,
+    ) -> Self {
+        let imported = file_imports
+            .and_then(|imports| imports.get(segment))
+            .map(|&(_, original)| owner_type_segment(original))
+            .filter(|original| *original != segment);
+        let resolved = imported.unwrap_or(segment);
+        Self {
+            written: segment,
+            imported,
+            type_path: caller_language == Some(LanguageId::Rust)
+                && resolved.starts_with(|c: char| c.is_ascii_uppercase()),
+        }
+    }
+
+    /// Whether a member whose owner reduces to `owner_segment` is one this path
+    /// can name.
+    fn names(&self, owner_segment: &str) -> bool {
+        owner_segment == self.written || self.imported == Some(owner_segment)
+    }
+
+    /// Whether a free item named like the leaf can be what the call reaches.
+    ///
+    /// A module path reaches one (`crate::work::run`, `impact::analyze_impact`).
+    /// A Rust type path never does: Rust spells modules in snake_case and types,
+    /// traits and enums in UpperCamelCase, so `Hash256::from_bytes` names an
+    /// associated item of `Hash256` and no free `from_bytes` anywhere. Other
+    /// languages keep reading the leaf, because a C++ namespace is often
+    /// capitalized (`Catch::Main` names a free function).
+    fn admits_free_items(&self) -> bool {
+        !self.type_path
+    }
+}
+
+/// The type an owner-qualified entity hangs off, reduced to the segment a
+/// qualified call writes for it.
+///
+/// A call names its owner by one path segment (`Widget` in
+/// `crate::model::Widget::make`), while the adapters record an impl's owner the
+/// way the source spelled it: with generic arguments
+/// (`AuthorityPublication<S, P>::reconcile_pending`), under a path
+/// (`crate::storage::change_map::ChangeMap::lineage_change`), or behind a
+/// reference (`&'a mut ChangeMap::into_iter`). Comparing the two needs both
+/// reduced to the type's own last segment. An owner this cannot reduce comes
+/// back as it was and matches no written owner, which leaves the call unlinked
+/// rather than guessed.
+fn owner_type_segment(owner: &str) -> &str {
+    let mut owner = owner.trim();
+    while let Some(rest) = owner.strip_prefix('&') {
+        owner = rest.trim_start();
+        if let Some(lifetime) = owner.strip_prefix('\'') {
+            owner = lifetime
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest)
+                .trim_start();
+        }
+        if let Some(rest) = owner.strip_prefix("mut ") {
+            owner = rest.trim_start();
+        }
+    }
+    if owner.ends_with('>') {
+        let mut depth = 0usize;
+        for (index, byte) in owner.bytes().enumerate().rev() {
+            match byte {
+                b'>' => depth += 1,
+                b'<' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        owner = owner[..index].trim_end();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    bare_entity_name(owner)
+}
+
 /// Incremental-linker counterpart of [`resolve_qualified_suffix`], kept in exact
 /// resolution parity with it: the type-qualified suffix (`Type::method`) resolves
 /// a single target or stops on ambiguity, and the bare leaf unions the
@@ -2644,6 +2774,8 @@ fn resolve_qualified_suffix_incremental(
     dst_name: &str,
     current_file: &str,
     arg_count: Option<usize>,
+    src_id: EntityId,
+    file_imports: Option<&HashMap<&str, (&str, &str)>>,
     linker: &IncrementalLinker,
 ) -> Vec<EntityId> {
     let segments: Vec<&str> = dst_name.split("::").collect();
@@ -2677,25 +2809,40 @@ fn resolve_qualified_suffix_incremental(
         _ => {}
     }
 
-    // Tier 2: bare leaf. Free functions live in `entity_by_name` under `last`;
-    // methods live in `entity_by_bare_name` under `last`. Union both so the
-    // incremental linker resolves the same leaf targets as the batch resolver,
-    // then fan out to every distinct cross-file target up to the cap.
+    // Tier 2: the bare leaf, read against the owner the call wrote exactly as
+    // the batch resolver reads it: free functions from `entity_by_name` unless
+    // the owner is a type, members from `entity_by_bare_name` only when their
+    // own owner is the one the path names, and the language gate on all of it.
+    let owner = QualifiedCallOwner::written(
+        segments[segments.len() - 2],
+        file_imports,
+        linker.entity_language_by_id.get(&src_id).copied(),
+    );
     let mut leaf_targets: HashSet<EntityId> = HashSet::new();
-    if let Some(cands) = linker.entity_by_name.get(last) {
-        for (fp, id) in cands {
-            if fp != current_file {
-                leaf_targets.insert(*id);
+    if owner.admits_free_items() {
+        if let Some(cands) = linker.entity_by_name.get(last) {
+            for (fp, id) in cands {
+                if fp != current_file {
+                    leaf_targets.insert(*id);
+                }
             }
         }
     }
     if let Some(cands) = linker.entity_by_bare_name.get(last) {
         for (fp, id) in cands {
-            if fp != current_file {
+            if fp != current_file
+                && linker
+                    .entity_owner_segment_by_id
+                    .get(id)
+                    .is_some_and(|segment| owner.names(segment))
+            {
                 leaf_targets.insert(*id);
             }
         }
     }
+    leaf_targets.retain(|&dst_id| {
+        blind_inference_target_allowed(src_id, dst_id, &linker.entity_language_by_id)
+    });
     let leaf_targets = prune_ids_by_arity(leaf_targets, arg_count, &linker.entity_arity_by_id);
     match leaf_targets.len() {
         0 => Vec::new(),
@@ -5670,6 +5817,11 @@ pub struct IncrementalLinker {
     /// Backs the incremental (c2) receiver-method resolution, mirroring the
     /// batch linker's `entity_by_bare_name`.
     pub entity_by_bare_name: HashMap<String, Vec<(String, EntityId)>>,
+    /// owner-qualified entity id -> its owner reduced to the segment a qualified
+    /// call writes, mirroring the batch linker's `entity_owner_segment_by_id`.
+    /// Derived from `entity_by_name`, so a checkpoint does not store it and a
+    /// restore rebuilds it.
+    pub entity_owner_segment_by_id: HashMap<EntityId, String>,
     /// entity_id -> kind
     pub entity_kind_by_id: HashMap<EntityId, EntityKind>,
     /// entity_id -> parser-reported language. Blind name/locality inference is
@@ -5736,7 +5888,7 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 7;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 8;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -5787,6 +5939,7 @@ impl IncrementalLinker {
             entity_by_file_name: HashMap::new(),
             entity_by_name: HashMap::new(),
             entity_by_bare_name: HashMap::new(),
+            entity_owner_segment_by_id: HashMap::new(),
             entity_kind_by_id: HashMap::new(),
             entity_language_by_id: HashMap::new(),
             entity_arity_by_id: HashMap::new(),
@@ -5806,6 +5959,8 @@ impl IncrementalLinker {
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
+            // Derived from `entity_by_name`; `from_checkpoint_v1` rebuilds it.
+            entity_owner_segment_by_id: _,
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id,
@@ -5977,11 +6132,27 @@ impl IncrementalLinker {
             );
         }
 
+        let entity_by_name = checkpoint_hash_map(entity_by_name, "entity_by_name")?;
+        // Every owner-qualified name the index holds already names its owner, so
+        // the owner index is rebuilt here rather than stored in the checkpoint.
+        let entity_owner_segment_by_id = entity_by_name
+            .iter()
+            .filter_map(|(name, candidates)| {
+                entity_owner_path(name).map(|(owner, _)| (owner_type_segment(owner), candidates))
+            })
+            .flat_map(|(segment, candidates)| {
+                candidates
+                    .iter()
+                    .map(move |(_, id)| (*id, segment.to_string()))
+            })
+            .collect();
+
         Ok(Self {
             artifact_ids,
             entity_by_file_name,
-            entity_by_name: checkpoint_hash_map(entity_by_name, "entity_by_name")?,
+            entity_by_name,
             entity_by_bare_name: checkpoint_hash_map(entity_by_bare_name, "entity_by_bare_name")?,
+            entity_owner_segment_by_id,
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id: checkpoint_hash_map(entity_arity_by_id, "entity_arity_by_id")?,
@@ -6027,7 +6198,13 @@ impl IncrementalLinker {
             }
         }
 
-        self.entities_by_file.remove(file_path);
+        // Every entity the file held, not only the ones that won a name slot
+        // above, so an owner entry never outlives the entity it describes.
+        if let Some(entities) = self.entities_by_file.remove(file_path) {
+            for (entity_id, _) in &entities {
+                self.entity_owner_segment_by_id.remove(entity_id);
+            }
+        }
         self.include_targets_by_file.remove(file_path);
         self.class_bases_by_file.remove(file_path);
     }
@@ -6111,6 +6288,10 @@ impl IncrementalLinker {
                     .entry(bare.to_string())
                     .or_default()
                     .push((file_path.to_string(), entity.id));
+                if let Some((owner, _)) = entity_owner_path(&entity.name) {
+                    self.entity_owner_segment_by_id
+                        .insert(entity.id, owner_type_segment(owner).to_string());
+                }
             }
 
             file_entities_list.push((entity.id, entity.visibility));
@@ -7011,6 +7192,8 @@ fn resolve_one_file_incremental(
                 &rel.dst_name,
                 &file.file_path,
                 call_arity,
+                src_id,
+                import_map.get(file.file_path.as_str()),
                 linker,
             );
             if !qualified_targets.is_empty() {
@@ -11232,6 +11415,264 @@ void f();
             0,
             "above the cap the qualified leaf stays unresolved"
         );
+    }
+
+    // The qualified-suffix tier keeps the owner a call wrote. `GraphNodeId::Entity`
+    // names a variant of kin-model's `GraphNodeId`; reading only its leaf linked
+    // every such call to each unrelated repository enum that also had an `Entity`
+    // variant, which is how six different enums became the six densest nodes of
+    // one repository's graph. Every fixture below runs through both linkers.
+
+    fn rust_variant(name: &str, file_path: &str) -> Entity {
+        let mut e = make_method_entity(name, file_path);
+        e.kind = EntityKind::EnumVariant;
+        e
+    }
+
+    fn link_both_ways(files: &[FileParseData]) -> [(&'static str, Vec<Relation>); 2] {
+        let mut linker = IncrementalLinker::new();
+        for file in files {
+            linker.add_file(
+                &file.file_path,
+                admitted_artifact_id(&file.file_path),
+                &file.entities,
+            );
+        }
+        [
+            ("batch", link_cross_file(files)),
+            ("incremental", link_cross_file_incremental(files, &linker)),
+        ]
+    }
+
+    fn parse_data(
+        path: &str,
+        entities: Vec<Entity>,
+        relations: Vec<ExtractedRelation>,
+    ) -> FileParseData {
+        FileParseData {
+            file_path: path.to_string(),
+            entities,
+            relations,
+            imports: vec![],
+        }
+    }
+
+    #[test]
+    fn a_qualified_call_never_links_a_same_leaf_member_of_another_owner() {
+        let caller = rust_fn("check_entity_collision", "src/verify.rs");
+        let search = rust_variant("SearchRecord::Entity", "src/search.rs");
+        let verify = rust_variant("VerifyAction::Entity", "src/actions.rs");
+        let files = vec![
+            parse_data(
+                "src/verify.rs",
+                vec![caller.clone()],
+                vec![calls_relation(
+                    "check_entity_collision",
+                    "GraphNodeId::Entity",
+                )],
+            ),
+            parse_data("src/search.rs", vec![search.clone()], vec![]),
+            parse_data("src/actions.rs", vec![verify.clone()], vec![]),
+        ];
+
+        for (linker, result) in link_both_ways(&files) {
+            for variant in [&search, &verify] {
+                assert!(
+                    find_calls_edge(&result, &caller, variant).is_none(),
+                    "{linker}: `GraphNodeId::Entity` names GraphNodeId's variant, not {}",
+                    variant.name
+                );
+            }
+            assert!(
+                result.iter().all(|r| r.kind != RelationKind::Calls),
+                "{linker}: a call through an owner this repository does not hold is an honest miss, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_call_still_links_the_member_of_the_owner_it_names() {
+        // The positive control for the test above: the owner reduction has to
+        // let a call through, or refusing every member would pass it too. The
+        // entity's owner carries generic arguments, so neither the exact name
+        // nor the type-qualified suffix reaches it and only the owner rule can.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let method = make_method_entity("Widget<T>::make", "src/model.rs");
+        let other = make_method_entity("Gadget::make", "src/gadget.rs");
+        let files = vec![
+            parse_data(
+                "src/caller.rs",
+                vec![caller.clone()],
+                vec![calls_relation("caller", "crate::model::Widget::make")],
+            ),
+            parse_data("src/model.rs", vec![method.clone()], vec![]),
+            parse_data("src/gadget.rs", vec![other.clone()], vec![]),
+        ];
+
+        for (linker, result) in link_both_ways(&files) {
+            let edge = find_calls_edge(&result, &caller, &method).unwrap_or_else(|| {
+                panic!("{linker}: `crate::model::Widget::make` names `Widget<T>::make`, got {result:?}")
+            });
+            assert_eq!(edge.confidence, QUALIFIED_SUFFIX_CONFIDENCE, "{linker}");
+            assert!(
+                find_calls_edge(&result, &caller, &other).is_none(),
+                "{linker}: `Gadget::make` shares the leaf and not the owner"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_call_through_a_renamed_import_names_the_imported_owner() {
+        // `use crate::model::Widget as W;` makes `W::make` name `Widget`'s
+        // member, which the written segment alone does not spell.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let method = make_method_entity("Widget<T>::make", "src/model.rs");
+        let mut caller_file = parse_data(
+            "src/caller.rs",
+            vec![caller.clone()],
+            vec![calls_relation("caller", "W::make")],
+        );
+        caller_file.imports = vec![FileImport {
+            site: synthetic_import_site(),
+            module_path: "crate::model".to_string(),
+            specifiers: vec![kin_parser::ImportedName {
+                local_name: "W".to_string(),
+                original_name: Some("Widget".to_string()),
+                is_default: false,
+            }],
+        }];
+        let files = vec![
+            caller_file,
+            parse_data("src/model.rs", vec![method.clone()], vec![]),
+        ];
+
+        for (linker, result) in link_both_ways(&files) {
+            assert!(
+                find_calls_edge(&result, &caller, &method).is_some(),
+                "{linker}: `W::make` under `use ... Widget as W` names `Widget<T>::make`, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rust_type_path_never_links_a_free_function_named_like_its_leaf() {
+        // `Hash256::from_bytes` is an associated function of `Hash256`. A free
+        // `from_bytes` elsewhere is not what it calls, while `util::from_bytes`,
+        // a module path, is.
+        let decode = rust_fn("decode", "src/decode.rs");
+        let load = rust_fn("load", "src/decode.rs");
+        let free = rust_fn("from_bytes", "src/util.rs");
+        let files = vec![
+            parse_data(
+                "src/decode.rs",
+                vec![decode.clone(), load.clone()],
+                vec![
+                    calls_relation("decode", "Hash256::from_bytes"),
+                    calls_relation("load", "util::from_bytes"),
+                ],
+            ),
+            parse_data("src/util.rs", vec![free.clone()], vec![]),
+        ];
+
+        for (linker, result) in link_both_ways(&files) {
+            assert!(
+                find_calls_edge(&result, &decode, &free).is_none(),
+                "{linker}: `Hash256::from_bytes` is not a call of a free `from_bytes`"
+            );
+            assert!(
+                find_calls_edge(&result, &load, &free).is_some(),
+                "{linker}: `util::from_bytes` names the free function, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_leaf_never_links_across_unrelated_languages() {
+        // Tier 2 is name inference, so it answers to the same language gate as
+        // every other name tier: a Rust path does not call a TypeScript function.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let script = make_entity("run", "web/run.ts");
+        let files = vec![
+            parse_data(
+                "src/caller.rs",
+                vec![caller.clone()],
+                vec![calls_relation("caller", "crate::somewhere::run")],
+            ),
+            parse_data("web/run.ts", vec![script.clone()], vec![]),
+        ];
+
+        for (linker, result) in link_both_ways(&files) {
+            assert!(
+                find_calls_edge(&result, &caller, &script).is_none(),
+                "{linker}: a Rust call linked a TypeScript function by name alone"
+            );
+        }
+    }
+
+    #[test]
+    fn an_owner_reduces_to_the_segment_a_call_writes() {
+        // Owner spellings read off a real Rust store, plus the fail-closed case.
+        for (owner, segment) in [
+            ("Widget", "Widget"),
+            ("Widget<T>", "Widget"),
+            ("AuthorityPublication<S, P>", "AuthorityPublication"),
+            ("FrozenLocalBodyBackend<'_>", "FrozenLocalBodyBackend"),
+            ("crate::storage::change_map::ChangeMap", "ChangeMap"),
+            (
+                "hashbrown::HashMap<SemanticChangeId, SemanticChange>",
+                "HashMap",
+            ),
+            ("&'a mut ChangeMap", "ChangeMap"),
+            ("&mut Graph<N>", "Graph"),
+            ("Outer<Inner<T>>", "Outer"),
+            ("Box<dyn Fn() -> Foo>", "Box<dyn Fn() -> Foo>"),
+        ] {
+            assert_eq!(owner_type_segment(owner), segment, "{owner}");
+        }
+    }
+
+    #[test]
+    fn a_restored_linker_rebuilds_the_owner_index_and_a_removed_file_clears_it() {
+        let method = make_method_entity("Widget<T>::make", "src/model.rs");
+        let variant = rust_variant("SearchRecord::Entity", "src/search.rs");
+        let free = rust_fn("run", "src/work.rs");
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "src/model.rs",
+            admitted_artifact_id("src/model.rs"),
+            std::slice::from_ref(&method),
+        );
+        linker.add_file(
+            "src/search.rs",
+            admitted_artifact_id("src/search.rs"),
+            std::slice::from_ref(&variant),
+        );
+        linker.add_file(
+            "src/work.rs",
+            admitted_artifact_id("src/work.rs"),
+            std::slice::from_ref(&free),
+        );
+        assert_eq!(
+            linker
+                .entity_owner_segment_by_id
+                .get(&method.id)
+                .map(String::as_str),
+            Some("Widget")
+        );
+        assert!(
+            !linker.entity_owner_segment_by_id.contains_key(&free.id),
+            "a free function has no owner to record"
+        );
+
+        let restored = IncrementalLinker::from_checkpoint_v1(linker.to_checkpoint_v1()).unwrap();
+        assert_eq!(
+            restored.entity_owner_segment_by_id, linker.entity_owner_segment_by_id,
+            "the checkpoint does not store the owner index, so a restore must rebuild it whole"
+        );
+
+        linker.remove_file("src/model.rs");
+        assert!(!linker.entity_owner_segment_by_id.contains_key(&method.id));
+        assert!(linker.entity_owner_segment_by_id.contains_key(&variant.id));
     }
 
     #[test]
