@@ -1082,7 +1082,11 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                     // -- is that function's, so the two cannot drift apart by being edited
                     // separately.
                     let reference_kinds = default_reference_kinds();
-                    let reference_rows = collect_graph_reference_rows(
+                    // Membership only: the pack ships ids and edges for its
+                    // dependents and never a caller's body, so reading one per
+                    // caller spent a hosted request's whole source allowance on
+                    // bytes nobody receives.
+                    let reference_rows = collect_graph_reference_members(
                         store,
                         &entity_id,
                         &reference_kinds,
@@ -1401,6 +1405,7 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
             );
         }
 
+        disclose_withheld_source_reads(&mut result, fields);
         disclose_projection_bodies(&mut result);
         loop {
             let rendered = serialize_with_measured_tokens(&mut result)?;
@@ -1712,6 +1717,7 @@ fn render_multi_context<G: GraphStore>(
         );
     }
 
+    disclose_withheld_source_reads(&mut result, fields);
     disclose_projection_bodies(&mut result);
     Ok(result)
 }

@@ -284,8 +284,10 @@ impl RequestRepositoryAuthority {
             return Ok(Arc::clone(bytes));
         }
         if state.remaining_reads == 0 || state.remaining_bytes == 0 {
-            return Err(McpError::Context(format!(
-                "graph authority gap: hosted source projection budget was exhausted before blob {digest}"
+            // Typed rather than spelled as an authority gap: the repository is
+            // fine and this request's allowance is spent, which no retry clears.
+            return Err(McpError::SourceBudgetExhausted(format!(
+                "this request's source allowance was spent before blob {digest}"
             )));
         }
         let max_bytes = budget.max_blob_bytes.min(state.remaining_bytes);
@@ -671,10 +673,20 @@ impl ActiveRepositoryAuthority {
     ) -> Result<Vec<u8>> {
         self.manager
             .load_source_blob_bounded(&self.repository_id, digest, max_bytes)
-            .map_err(|error| {
-                McpError::Context(format!(
+            .map_err(|error| match error {
+                // A body larger than this request may read is the request's
+                // bound answering, not the repository failing.
+                kin_db::KinDbError::SourceBlobReadLimitExceeded {
+                    actual_bytes,
+                    max_bytes,
+                    ..
+                } => McpError::SourceBudgetExhausted(format!(
+                    "blob {digest} is {actual_bytes} bytes, over the {max_bytes}-byte per-blob \
+                     allowance this request reads under"
+                )),
+                error => McpError::Context(format!(
                     "graph authority gap: cannot load immutable source blob {digest}: {error}"
-                ))
+                )),
             })?
             .ok_or_else(|| {
                 McpError::Context(format!(

@@ -1316,6 +1316,162 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     relation_kinds: &[RelationKind],
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<Vec<ReferenceRow>> {
+    collect_reference_rows(
+        store,
+        entity_id,
+        relation_kinds,
+        repository_authority,
+        ReferenceBodies::Project,
+    )
+}
+
+/// The same rows as [`collect_graph_reference_rows`], without the bodies.
+///
+/// For a surface that uses the rows for who reaches `entity_id` and never
+/// serializes a caller's body. Membership is decided exactly as the projecting
+/// form decides it, including the skip of a caller the current workspace no
+/// longer carries, but from the held tree alone, so the answer costs no source
+/// read however many callers there are. A hosted request's source allowance
+/// would otherwise be spent on bodies nobody ships, and the entity the most
+/// code calls is the one that runs out first.
+pub fn collect_graph_reference_members<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    relation_kinds: &[RelationKind],
+    repository_authority: Option<&RequestRepositoryAuthority>,
+) -> Result<Vec<ReferenceRow>> {
+    collect_reference_rows(
+        store,
+        entity_id,
+        relation_kinds,
+        repository_authority,
+        ReferenceBodies::Omit,
+    )
+}
+
+/// Whether a reference row projects its caller's body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReferenceBodies {
+    Project,
+    Omit,
+}
+
+/// The snippet a reference row carries, or `None` when the caller is absent
+/// from the current workspace and the row is skipped.
+fn reference_row_snippet<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    bodies: ReferenceBodies,
+) -> Result<Option<Option<String>>> {
+    match bodies {
+        ReferenceBodies::Project => {
+            match read_bounded_entity_snippet_held(held, entity, EntitySourceScope::WorkspaceHead) {
+                Ok(snippet) => Ok(Some(snippet)),
+                Err(error) if is_absent_at_generation(&error) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        ReferenceBodies::Omit => {
+            Ok(entity_present_at_workspace_head_held(held, entity)?.then_some(None))
+        }
+    }
+}
+
+/// Whether the workspace this request reads at still carries `entity`'s file,
+/// answered from the held tree without reading any body.
+///
+/// The membership half of the head read [`read_entity_source_excerpt_detailed_held`]
+/// performs: the same origin and span checks and the same tree lookup, so a
+/// caller that read would skip as absent is skipped here too, and one it would
+/// refuse as a gap is refused here too. What it leaves out is everything after
+/// the lookup, which exists to vouch for bytes, and nothing here serves bytes.
+/// An entity with no span or no file origin has nothing to look up and counts
+/// as present, the same reading the projection gives it.
+pub fn entity_present_at_workspace_head_held<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+) -> Result<bool> {
+    let (Some(recorded_span), Some(recorded_origin)) =
+        (entity.span.as_ref(), entity.file_origin.as_ref())
+    else {
+        return Ok(true);
+    };
+    if &recorded_span.file != recorded_origin {
+        return Err(graph_source_gap(format!(
+            "entity {} has divergent file_origin '{}' and span file '{}'",
+            entity.id, recorded_origin.0, recorded_span.file.0
+        )));
+    }
+    let path = RepoPath::from_utf8(recorded_origin.0.clone()).map_err(|error| {
+        graph_source_gap(format!(
+            "entity {} has an invalid repository path '{}': {error}",
+            entity.id, recorded_origin.0
+        ))
+    })?;
+    Ok(held
+        .workspace_sample()?
+        .tree
+        .artifact_at_path(&path)
+        .is_some())
+}
+
+/// The row field that says a body was withheld at the hosted source allowance.
+pub const BODY_WITHHELD_FIELD: &str = "body_withheld";
+
+/// The degradation reason hosted surfaces publish for a read the request's
+/// source allowance refused.
+pub const HOSTED_SOURCE_READ_CAP_REASON: &str = "hosted_source_read_cap";
+
+/// Publish in `degradations` that this answer withheld bodies at the hosted
+/// source allowance, when any row it rendered says so.
+///
+/// The row already names what it lacks; this is the one aggregate the verdict
+/// reads, so a pack that shipped a signature where a body was asked for says so
+/// in `_kin.verdict` rather than reading as complete. It derives from the rows,
+/// the one producer of that fact, instead of keeping a second count.
+pub fn disclose_withheld_source_reads(
+    result: &mut serde_json::Value,
+    fields: &ContextSourceFields,
+) {
+    let withheld = fields
+        .borrow()
+        .values()
+        .filter(|row| {
+            row.get(BODY_WITHHELD_FIELD)
+                .and_then(serde_json::Value::as_str)
+                == Some(HOSTED_SOURCE_READ_CAP_REASON)
+        })
+        .count();
+    if withheld == 0 {
+        return;
+    }
+    let entry = serde_json::json!({
+        "component": "entity_source",
+        "reason": HOSTED_SOURCE_READ_CAP_REASON,
+        "detail": format!(
+            "{withheld} body read(s) refused at this request's hosted source allowance: the \
+             allowance was spent, or the file is larger than its per-blob ceiling; those rows \
+             carry a signature and say what they withheld"
+        ),
+        "remediation": "ask for a narrower pack, or read the withheld body directly where a \
+                        surface serves it",
+    });
+    match result
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(list) => list.push(entry),
+        None => result["degradations"] = serde_json::json!([entry]),
+    }
+}
+
+fn collect_reference_rows<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    relation_kinds: &[RelationKind],
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    bodies: ReferenceBodies,
+) -> Result<Vec<ReferenceRow>> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<EntityId, ReferenceRow> = HashMap::new();
     // Spans a row's edges carried that named some other file, counted so an
@@ -1360,14 +1516,8 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         // reported as one. Failing the whole reference set over it -- the shape
         // this had -- made `find_references` unusable on any repository that
         // ever deleted a file.
-        let snippet = match read_bounded_entity_snippet_held(
-            &held,
-            &entity,
-            EntitySourceScope::WorkspaceHead,
-        ) {
-            Ok(snippet) => snippet,
-            Err(error) if is_absent_at_generation(&error) => continue,
-            Err(error) => return Err(error),
+        let Some(snippet) = reference_row_snippet(&held, &entity, bodies)? else {
+            continue;
         };
         let entry = grouped
             .entry(source_entity_id)
@@ -1474,14 +1624,8 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             else {
                 continue;
             };
-            let snippet = match read_bounded_entity_snippet_held(
-                &held,
-                &entity,
-                EntitySourceScope::WorkspaceHead,
-            ) {
-                Ok(snippet) => snippet,
-                Err(error) if is_absent_at_generation(&error) => continue,
-                Err(error) => return Err(error),
+            let Some(snippet) = reference_row_snippet(&held, &entity, bodies)? else {
+                continue;
             };
             let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
             let entry = grouped
@@ -2517,12 +2661,21 @@ fn resolve_entity_source_authority<G: GraphStore>(
             span_source_coherence(entity, &hash, &recorded_origin.0)?
         }
     };
-    let bytes = held.load_source_blob(authority, hash).map_err(|error| {
-        graph_source_gap(format!(
-            "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
-            entity.id, current_artifact.artifact_id
-        ))
-    })?;
+    let bytes = held
+        .load_source_blob(authority, hash)
+        .map_err(|error| match error {
+            // The request's allowance refused this read. That is a bound, so it
+            // stays typed and a surface can withhold this one body instead of
+            // failing the whole answer as if the repository were unreadable.
+            McpError::SourceBudgetExhausted(detail) => McpError::SourceBudgetExhausted(format!(
+                "entity {} artifact {:?}: {detail}",
+                entity.id, current_artifact.artifact_id
+            )),
+            error => graph_source_gap(format!(
+                "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
+                entity.id, current_artifact.artifact_id
+            )),
+        })?;
     if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
         return Err(graph_source_gap(format!(
             "entity {} span {}..{} is invalid for artifact {:?} ({} bytes)",
@@ -2657,6 +2810,22 @@ impl<G: GraphStore> kin_context::ContextProjectionProvider for ContextSourceProv
                 return Ok(kin_context::BodyCandidate::Unavailable {
                     reason: error.to_string(),
                 })
+            }
+            // The request's source allowance refused this read. The body is
+            // withheld rather than missing: the row keeps its signature and says
+            // so, and `disclose_withheld_source_reads` publishes the aggregate.
+            Err(McpError::SourceBudgetExhausted(detail)) => {
+                self.fields
+                    .borrow_mut()
+                    .entry(entity.id)
+                    .or_default()
+                    .insert(
+                        BODY_WITHHELD_FIELD.into(),
+                        serde_json::json!(HOSTED_SOURCE_READ_CAP_REASON),
+                    );
+                return Ok(kin_context::BodyCandidate::Unavailable {
+                    reason: format!("body withheld at the hosted source allowance: {detail}"),
+                });
             }
             Err(error) => return Err(kin_context::ContextError::Other(error.to_string())),
         };

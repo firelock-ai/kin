@@ -34,6 +34,14 @@ pub enum McpError {
     #[error("entity absent at workspace generation: {0}")]
     WorkspaceAbsent(String),
 
+    /// This request's hosted source allowance (its reads, its bytes, or one
+    /// blob's size against the per-blob ceiling) ran out before the read.
+    /// Deterministic for the request as made: a retry cannot clear it, a
+    /// narrower request can, and a surface that can answer without the body
+    /// should say what it withheld instead of failing.
+    #[error("hosted source projection budget exhausted: {0}")]
+    SourceBudgetExhausted(String),
+
     #[error("review error: {0}")]
     Review(String),
 
