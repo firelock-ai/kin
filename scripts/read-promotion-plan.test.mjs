@@ -21,8 +21,8 @@ import {
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kin-promotion-'));
 
 const HELD_BODY = `${PENDING_MARKER}
-> **First-contact proof pending.** This release cleared the machine preflight on its
-> own bytes.
+> This release passed the automated preflight on the exact bytes it ships. The
+> first-install checks that measure what a new user meets have not run for it yet.
 
 ## What changed
 
@@ -64,7 +64,7 @@ test('renderAlarm writes the body and returns the decision with its title', () =
 
 test('stripPendingNotice removes the block this chain wrote and nothing else', () => {
   const stripped = stripPendingNotice(HELD_BODY);
-  assert.doesNotMatch(stripped, /First-contact proof pending/);
+  assert.doesNotMatch(stripped, /automated preflight/);
   assert.doesNotMatch(stripped, new RegExp(PENDING_MARKER.replace(/[-[\]{}()*+?.,\\^$|#]/g, '\\$&')));
   // The human's own notes survive. A strip that took the whole body would lose
   // the release notes, which is a worse failure than leaving the notice.
@@ -92,7 +92,7 @@ test('stripPendingNotice returns the original body byte for byte', () => {
   // Exactly the shape release.yml writes: the marker, the quoted block, one
   // blank line, then the release notes as they were.
   const notes = '## Notes\n\n> a quote the author wrote\n';
-  const written = `${PENDING_MARKER}\n> **First-contact proof pending.** one\n> two\n\n${notes}`;
+  const written = `${PENDING_MARKER}\n> one\n> two\n\n${notes}`;
   assert.equal(stripPendingNotice(written), notes);
 });
 
@@ -128,7 +128,7 @@ test('stripPendingNotice strips the notice release.yml actually writes', () => {
   // fixture that never built.
   assert.ok(body.length >= 2, `extracted ${body.length} notice line(s) from release.yml`);
   assert.ok(
-    body.some((line) => line.includes('First-contact proof pending')),
+    body.some((line) => line.includes('automated preflight')),
     `the extracted block is not the notice: ${JSON.stringify(body)}`,
   );
 

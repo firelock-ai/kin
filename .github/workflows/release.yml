@@ -2658,12 +2658,19 @@ jobs:
           # and the notice interpolates it, so the grep above and the text below
           # cannot drift into an idempotency check that never matches. There is
           # no other expansion in this text.
+          #
+          # Two plain lines, and they stay a quoted block on purpose. The marker
+          # is an HTML comment, so a reader never sees it while every watcher
+          # still keys on it: release-promote.yml greps the body for it and
+          # scripts/release-promotion-plan.mjs exports it as PENDING_MARKER.
+          # stripPendingNotice removes the marker line and then every following
+          # line that is a quote or blank, so a summary written as anything but
+          # a quoted block would survive the strip and go on claiming a pending
+          # proof after the proof landed.
           cat > "$RUNNER_TEMP/release-body.md" <<NOTE
           ${marker}
-          > **First-contact proof pending.** This release cleared the machine preflight on its
-          > own bytes. It has NOT been through the stranger arms (green, brown, vcs) that
-          > measure what a first-time user actually meets. It ships and is promoted anyway,
-          > so this notice is how you tell it apart from a release that was measured.
+          > This release passed the automated preflight on the exact bytes it ships. The
+          > first-install checks that measure what a new user meets have not run for it yet.
 
           NOTE
           printf '%s\n' "$body" >> "$RUNNER_TEMP/release-body.md"
