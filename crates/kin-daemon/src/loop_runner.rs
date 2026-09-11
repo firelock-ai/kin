@@ -2067,6 +2067,26 @@ struct AdmissionHoldState {
     marks: RepositoryMarks,
 }
 
+/// One tick of a round that is standing down, whatever the reason.
+///
+/// Both stand-down paths in the loop go through here, and that is the whole
+/// point of it existing: the standing publish below must not be droppable from
+/// one path while the other keeps it. The empty-queue branch paid for exactly
+/// that on 2026-08-29, when a daemon nobody was editing against published no
+/// standing from this loop at all and the record stopped advancing for the life
+/// of the daemon. A HELD daemon is a worse version of the same case, because it
+/// is the one a reader is actively trying to understand: it is holding
+/// gigabytes, refusing to admit, and the record of what it holds is the thing
+/// they came for.
+///
+/// The publisher checks the interval before it reads any pressure, so a held
+/// round costs one lock and one `Instant::elapsed` on the twenty-nine of every
+/// thirty seconds where the answer would be thrown away.
+fn stand_down_tick(state: &DaemonState, pass: &crate::background_work::BackgroundPass) {
+    pass.idle();
+    crate::daemon::publish_footprint_standing_on_idle_tick(state);
+}
+
 /// Whether this round must stand down for the hold the last failure set.
 ///
 /// Pure over the two facts that decide it, for the same reason
@@ -2081,13 +2101,32 @@ struct AdmissionHoldState {
 /// the next one.
 ///
 /// **A hold is interruptible, and this is the half that makes it safe.** The
-/// refusal is a property of the store, so the store changing underneath is
-/// exactly the event that could clear it: a commit landing, a checkout
-/// completing, an operator repairing the working copy. A hold that ignored that
-/// would trade a hot loop for a daemon that ignores its user for up to five
-/// minutes after every wedge, which is a worse product than the one being
-/// fixed. So the marks are compared as well as the clock, and a store that
-/// moved retries on the very next tick.
+/// refusal is a property of the store, so the store changing underneath is what
+/// could clear it, and the marks name exactly which changes those are: anything
+/// that advances the repository generation or the daemon's graph mutation
+/// counter. A commit does, a checkout does, and an explicit admission through
+/// the seam does. A hold that ignored them would trade a hot loop for a daemon
+/// that ignores its user for up to five minutes after every wedge, which is a
+/// worse product than the one being fixed, so the marks are compared as well as
+/// the clock and a store that moved retries on the very next tick.
+///
+/// The two halves of the hold can disagree for one tick, and the marks are why
+/// that is harmless. A commit or an explicit admission calls
+/// `record_admission_success`, which clears the PUBLISHED hold, while this
+/// loop's own local state is untouched until its next tick. Both of those paths
+/// publish a tree, so both advance a mark, so the very next tick reads the hold
+/// as broken and clears the local state before attempting. The disagreement is
+/// therefore bounded by one poll interval, 100 ms at the default, and it falls
+/// on the safe side: the surface says the loop is not holding slightly before
+/// the loop stops holding, never the reverse.
+///
+/// What the marks deliberately do NOT cover is an operator editing the working
+/// copy. Those edits reach the loop as watcher events, and the admission that
+/// would turn them into a moved mark is the very thing being held, so nothing
+/// about them can break the hold early. That is why the ceiling exists and why
+/// it is five minutes rather than an hour: a repair the daemon cannot see is
+/// picked up when the clock runs out, and the clock is the only thing that
+/// picks it up.
 fn admission_is_held(
     hold: Option<AdmissionHoldState>,
     now: Instant,
@@ -3452,7 +3491,6 @@ pub async fn run_loop_armed(
             // deferred clock above is a separate reading and why this state is
             // reported as `waiting_deferred` rather than `idle` whenever the
             // retry lane still holds something.
-            pass.idle();
             // Publish the standing before returning to the top, because the
             // publish at the end of this tick is below the `continue` and a
             // quiet store never reaches it. Measured on 2026-08-29: a daemon
@@ -3466,10 +3504,10 @@ pub async fn run_loop_armed(
             // matters, because the reader wanting it is deciding whether this
             // machine can serve the store at all.
             //
-            // The callee checks the interval before it reads any pressure, so
-            // this costs one lock and one `Instant::elapsed` on the twenty-nine
-            // of every thirty seconds where the answer would be thrown away.
-            crate::daemon::publish_footprint_standing_on_idle_tick(&state);
+            // Shared with the admission-hold branch below through
+            // `stand_down_tick`, so neither stand-down path can lose the
+            // publish on its own.
+            stand_down_tick(&state, &pass);
 
             // No events — sleep briefly then check again.
             tokio::select! {
@@ -3550,7 +3588,15 @@ pub async fn run_loop_armed(
             // bookkeeping: the supervisor parks a pass that spends a working
             // stretch without advancing, and a hold read as a working stretch
             // would have this change park the loop it exists to calm.
-            pass.idle();
+            //
+            // Through the shared tick, so the footprint standing keeps being
+            // published while the loop is held. Without it a held daemon with a
+            // non-empty queue reaches neither the idle publish above nor the
+            // working publish below, and the record of what it is holding stops
+            // advancing for the length of the hold. That is the 2026-08-29 class
+            // arriving by a new route, on the one daemon whose standing a reader
+            // most wants.
+            stand_down_tick(&state, &pass);
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = cancel.changed() => {
@@ -7883,6 +7929,47 @@ mod tests {
         assert!(
             !admission_is_held(hold(now - Duration::from_secs(1)), now, marks),
             "a hold that elapsed must not keep standing rounds down"
+        );
+    }
+
+    /// A round that stands down still publishes what the daemon is holding.
+    ///
+    /// This is the arm the strong-tier review of this change asked for, and the
+    /// case it is about is the held one. A held daemon with a non-empty queue
+    /// reaches neither the empty-queue publish nor the working publish, so
+    /// without the shared tick its footprint record stops advancing for the
+    /// length of the hold. That is the 2026-08-29 class on the one daemon whose
+    /// standing a reader most wants, because it is holding gigabytes and
+    /// refusing to admit.
+    ///
+    /// Graded against a real store rather than a predicate, because the property
+    /// is that a record reaches disk. Breaking `stand_down_tick` by dropping its
+    /// publish reds this and nothing else.
+    #[test]
+    fn a_round_that_stands_down_publishes_the_footprint_standing() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let state = open_test_state(&repo);
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_RECONCILE);
+        assert!(
+            kin_core::memory_pressure::DaemonFootprint::read(state.layout.root()).is_none(),
+            "a store that has never published must start with no record, or this test cannot \
+             tell a publish from a leftover"
+        );
+
+        stand_down_tick(&state, &pass);
+
+        let published = kin_core::memory_pressure::DaemonFootprint::read(state.layout.root())
+            .expect("a round that stood down must have published a standing");
+        assert_eq!(
+            published.pid,
+            std::process::id(),
+            "the record must be this process's own standing, not an inherited one"
+        );
+        assert!(
+            published.budget_bytes > 0,
+            "a standing with no budget states nothing about what the daemon is allowed to hold"
         );
     }
 
