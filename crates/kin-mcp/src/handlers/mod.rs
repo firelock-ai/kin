@@ -6376,6 +6376,187 @@ mod tests {
         );
     }
 
+    type Scripted = std::result::Result<Option<ToolCallResult>, String>;
+    type Recorded =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, HashMap<String, serde_json::Value>)>>>;
+
+    /// A forwarder that records every call and answers begin with `tx-1` and the
+    /// commit and the abort from the two scripts, standing in for the daemon.
+    fn scripted_forward(
+        calls: Recorded,
+        commit: fn() -> Scripted,
+        abort: fn() -> Scripted,
+    ) -> impl Fn(&'static str, HashMap<String, serde_json::Value>) -> std::future::Ready<Scripted>
+    {
+        move |name, args| {
+            calls.lock().unwrap().push((name.to_string(), args));
+            std::future::ready(match name {
+                "kin_transaction_begin" => {
+                    Ok(Some(ToolCallResult::text(r#"{"transaction_id":"tx-1"}"#)))
+                }
+                "kin_transaction_commit" => commit(),
+                "kin_transaction_abort" => abort(),
+                other => Err(format!("unexpected forward {other}")),
+            })
+        }
+    }
+
+    fn sessioned_mutate() -> HashMap<String, serde_json::Value> {
+        HashMap::from([
+            (
+                "session_id".to_string(),
+                serde_json::json!("11111111-1111-4111-8111-111111111111"),
+            ),
+            (
+                "operations".to_string(),
+                body_update_operations("Widget", "pub fn widget() {}"),
+            ),
+        ])
+    }
+
+    fn forwarded(calls: &Recorded) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// A commit the daemon refuses is aborted, and the abort names the transaction.
+    ///
+    /// The control first: a commit that lands is NOT followed by an abort, so
+    /// the assertion below is about the refusal and not about every commit.
+    #[tokio::test]
+    async fn a_refused_mutate_commit_is_aborted_and_a_landed_one_is_not() {
+        let landed: Recorded = Default::default();
+        let res = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                landed.clone(),
+                || Ok(Some(ToolCallResult::text(r#"{"status":"committed"}"#))),
+                || Ok(Some(ToolCallResult::text("{}"))),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, None, "{}", tool_result_text(&res));
+        assert_eq!(
+            forwarded(&landed),
+            ["kin_transaction_begin", "kin_transaction_commit"]
+        );
+
+        let refused: Recorded = Default::default();
+        let res = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                refused.clone(),
+                || Ok(Some(ToolCallResult::error("commit refused: stale base"))),
+                || Ok(Some(ToolCallResult::text(r#"{"state":"aborted"}"#))),
+            ),
+        )
+        .await
+        .unwrap();
+        let text = tool_result_text(&res);
+        assert_eq!(res.is_error, Some(true), "{text}");
+        assert!(text.contains("commit refused: stale base"), "{text}");
+        assert!(
+            !text.contains("still open"),
+            "a clean abort leaves nothing open: {text}"
+        );
+        assert_eq!(
+            forwarded(&refused),
+            [
+                "kin_transaction_begin",
+                "kin_transaction_commit",
+                "kin_transaction_abort"
+            ]
+        );
+        assert_eq!(refused.lock().unwrap()[2].1["transaction_id"], "tx-1");
+    }
+
+    /// The two arms where the commit never answered at all are aborted too.
+    ///
+    /// A transport error and a daemon that has gone both leave the caller not
+    /// knowing whether anything landed, which is exactly when a transaction must
+    /// not be left behind silently.
+    #[tokio::test]
+    async fn a_mutate_whose_commit_never_answered_is_aborted_on_both_arms() {
+        let transport: Recorded = Default::default();
+        let res = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                transport.clone(),
+                || Err("connection reset by peer".to_string()),
+                || Ok(Some(ToolCallResult::text("{}"))),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(tool_result_text(&res).contains("connection reset by peer"));
+        assert_eq!(
+            forwarded(&transport).last().map(String::as_str),
+            Some("kin_transaction_abort")
+        );
+
+        let gone: Recorded = Default::default();
+        let res = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                gone.clone(),
+                || Ok(None),
+                || Ok(Some(ToolCallResult::text("{}"))),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert_eq!(
+            forwarded(&gone).last().map(String::as_str),
+            Some("kin_transaction_abort")
+        );
+    }
+
+    /// An abort that is refused, or cannot reach the daemon, names what it left open.
+    #[tokio::test]
+    async fn an_abort_that_fails_names_the_transaction_it_left_open() {
+        let fenced: Recorded = Default::default();
+        let res = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                fenced,
+                || Err("timed out".to_string()),
+                || {
+                    Ok(Some(ToolCallResult::error(
+                        "transaction tx-1 is fenced for publication",
+                    )))
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let text = tool_result_text(&res);
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            text.contains("tx-1") && text.contains("still open") && text.contains("fenced"),
+            "{text}"
+        );
+
+        let unreachable: Recorded = Default::default();
+        let res = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(unreachable, || Ok(None), || Ok(None)),
+        )
+        .await
+        .unwrap();
+        let text = tool_result_text(&res);
+        assert!(
+            text.contains("tx-1") && text.contains("still open"),
+            "{text}"
+        );
+    }
+
     /// What `kin_mutate` forwards as the commit's change message.
     ///
     /// The sending half of the pair whose receiving half is
@@ -6440,6 +6621,14 @@ mod tests {
         assert!(
             !text.contains("is text Kin cut short"),
             "the truncation guard must not fire on a body that merely mentions the marker: {text}"
+        );
+        // And the refusal it does get is the in-process source-body refusal, so
+        // an unrelated failure further up cannot pass for the guard staying out
+        // of the way.
+        assert_eq!(res.is_error, Some(true), "{text}");
+        assert!(
+            text.contains("source_body_requires_daemon_commit"),
+            "the body went past the guard and was refused for its own reason: {text}"
         );
     }
 

@@ -1459,8 +1459,9 @@ verbs ('create', 'update', 'delete') and payloads, and an optional `summary` tha
 recorded change message instead of the bare transaction line. On success returns a compact \
 receipt with status, ops_applied, change_id, and modified_files. Every refusal comes back as a \
 tool error you can read and retry from, never as a protocol fault: a malformed operations array, \
-a body Kin cut short, a failed validation and a refused commit all return the structured reason, \
-and a refused commit leaves no transaction behind.";
+a body Kin cut short, a failed validation and a refused commit all return the structured reason. \
+A commit that fails to land is aborted; if the abort cannot run because the daemon cannot be \
+reached, or is refused, the answer names the transaction left open.";
 
 /// Decode and check the operations a `kin_mutate` call carries.
 ///
@@ -1556,6 +1557,30 @@ fn carry_request_id(result: &mut ToolCallResult, request_id: Option<&str>) {
 pub async fn mutate_through_daemon(
     arguments: &HashMap<String, serde_json::Value>,
 ) -> Result<ToolCallResult> {
+    mutate_through(
+        arguments,
+        |name: &'static str, args: HashMap<String, serde_json::Value>| async move {
+            crate::daemon_delegate::forward_tool_call(name, &args).await
+        },
+    )
+    .await
+}
+
+/// The body of [`mutate_through_daemon`], with the forward call injected.
+///
+/// Injected rather than called directly because the three ways a commit can
+/// fail to land (the daemon refuses it, the daemon is gone, the transport
+/// breaks) each have to be followed by an abort, and the only way to prove
+/// that for all three is to script them and watch for the abort. The public
+/// wrapper passes the real delegate; the tests pass a recorder.
+pub(super) async fn mutate_through<F, Fut>(
+    arguments: &HashMap<String, serde_json::Value>,
+    forward: F,
+) -> Result<ToolCallResult>
+where
+    F: Fn(&'static str, HashMap<String, serde_json::Value>) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Option<ToolCallResult>, String>>,
+{
     let ops_val = match checked_mutate_operations(arguments) {
         Ok(ops_val) => ops_val,
         Err(refusal) => return Ok(refusal),
@@ -1578,13 +1603,11 @@ pub async fn mutate_through_daemon(
         ("session_id".to_string(), serde_json::json!(session_id)),
         ("scope".to_string(), serde_json::json!(scope)),
     ]);
-    let begin_res =
-        match crate::daemon_delegate::forward_tool_call("kin_transaction_begin", &begin_args).await
-        {
-            Ok(Some(res)) => res,
-            Ok(None) => return Ok(daemon_required_unavailable("transaction begin")),
-            Err(err) => return Ok(ToolCallResult::error(err)),
-        };
+    let begin_res = match forward("kin_transaction_begin", begin_args).await {
+        Ok(Some(res)) => res,
+        Ok(None) => return Ok(daemon_required_unavailable("transaction begin")),
+        Err(err) => return Ok(ToolCallResult::error(err)),
+    };
     if begin_res.is_error == Some(true) {
         return Ok(begin_res);
     }
@@ -1624,23 +1647,70 @@ pub async fn mutate_through_daemon(
         commit_args.insert("message".to_string(), serde_json::json!(summary));
     }
 
-    match crate::daemon_delegate::forward_tool_call("kin_transaction_commit", &commit_args).await {
-        Ok(Some(mut value)) => {
-            if value.is_error == Some(true) {
-                let abort_args = HashMap::from([
-                    ("transaction_id".to_string(), serde_json::json!(tx_id)),
-                    ("session_id".to_string(), serde_json::json!(session_id)),
-                ]);
-                let _ =
-                    crate::daemon_delegate::forward_tool_call("kin_transaction_abort", &abort_args)
-                        .await;
-            } else {
-                carry_request_id(&mut value, request_id.as_deref());
-            }
-            Ok(value)
+    // Every way the commit can fail to land is followed by the same abort: the
+    // daemon refused it, the daemon was gone, or the transport broke. Only a
+    // commit that answered without an error is left alone.
+    let mut refusal = match forward("kin_transaction_commit", commit_args).await {
+        Ok(Some(mut value)) if value.is_error != Some(true) => {
+            carry_request_id(&mut value, request_id.as_deref());
+            return Ok(value);
         }
-        Ok(None) => Ok(daemon_required_unavailable("transaction commit")),
-        Err(err) => Ok(ToolCallResult::error(err)),
+        Ok(Some(value)) => value,
+        Ok(None) => daemon_required_unavailable("transaction commit"),
+        Err(err) => ToolCallResult::error(err),
+    };
+    let abort_args = HashMap::from([
+        ("transaction_id".to_string(), serde_json::json!(tx_id)),
+        ("session_id".to_string(), serde_json::json!(session_id)),
+    ]);
+    let left_open = match forward("kin_transaction_abort", abort_args).await {
+        Ok(Some(abort)) if abort.is_error != Some(true) => None,
+        Ok(Some(abort)) => Some(tool_text(&abort)),
+        Ok(None) => Some("the daemon could not be reached to abort it".to_string()),
+        Err(err) => Some(err),
+    };
+    if let Some(why) = left_open {
+        note_open_transaction(&mut refusal, &tx_id, &why);
+    }
+    Ok(refusal)
+}
+
+/// Every text block of a tool result, joined, for quoting inside another.
+fn tool_text(result: &ToolCallResult) -> String {
+    result
+        .content
+        .iter()
+        .map(|block| match block {
+            crate::types::ContentBlock::Text { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Say, on a failed mutation's own answer, that its transaction is still open.
+///
+/// Joined onto the answer's FIRST text block, because that is the block every
+/// reader reads: a second block is invisible to any client that takes
+/// `content[0]` as the answer, which is the common reading and the one this
+/// crate's own tests use. Refusals here are already prose with a JSON line
+/// inside, so text after them reads the same way. The alternative this replaced
+/// was `let _ =`, which dropped a failed abort on the floor and left the caller
+/// believing a transaction it could no longer see had been cleaned up.
+fn note_open_transaction(result: &mut ToolCallResult, tx_id: &str, why: &str) {
+    result.is_error = Some(true);
+    let note = format!(
+        "kin_mutate could not abort transaction {tx_id} after its commit failed ({why}), so that \
+         transaction is still open. Once the daemon answers, re-send kin_transaction_commit for \
+         {tx_id} to resume it or kin_transaction_abort to discard it."
+    );
+    match result.content.first_mut() {
+        Some(crate::types::ContentBlock::Text { text }) => {
+            text.push_str("\n\n");
+            text.push_str(&note);
+        }
+        None => result
+            .content
+            .push(crate::types::ContentBlock::Text { text: note }),
     }
 }
 
@@ -1711,18 +1781,35 @@ pub async fn handle_mutate<G: GraphStore>(
     if let Some(summary) = commit_message_argument(arguments) {
         commit_args.insert("message".to_string(), serde_json::json!(summary));
     }
-    let mut res =
-        handle_transaction_commit(&commit_args, store, sessions, session_authority_mode).await?;
-    if res.is_error == Some(true) {
-        let abort_args = HashMap::from([
-            ("transaction_id".to_string(), serde_json::json!(tx_id)),
-            ("session_id".to_string(), serde_json::json!(session_id)),
-        ]);
-        let _ = handle_transaction_abort(&abort_args, sessions, session_authority_mode).await;
-    } else {
-        carry_request_id(&mut res, request_id.as_deref());
+    let mut refusal = match handle_transaction_commit(
+        &commit_args,
+        store,
+        sessions,
+        session_authority_mode,
+    )
+    .await
+    {
+        Ok(mut res) if res.is_error != Some(true) => {
+            carry_request_id(&mut res, request_id.as_deref());
+            return Ok(res);
+        }
+        Ok(res) => res,
+        Err(err) => ToolCallResult::error(err.to_string()),
+    };
+    let abort_args = HashMap::from([
+        ("transaction_id".to_string(), serde_json::json!(tx_id)),
+        ("session_id".to_string(), serde_json::json!(session_id)),
+    ]);
+    let left_open =
+        match handle_transaction_abort(&abort_args, sessions, session_authority_mode).await {
+            Ok(abort) if abort.is_error != Some(true) => None,
+            Ok(abort) => Some(tool_text(&abort)),
+            Err(err) => Some(err.to_string()),
+        };
+    if let Some(why) = left_open {
+        note_open_transaction(&mut refusal, &tx_id, &why);
     }
-    Ok(res)
+    Ok(refusal)
 }
 
 pub const TRANSACTION_ABORT_DESC: &str = "\

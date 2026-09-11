@@ -1216,7 +1216,7 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "request_id": {
                             "type": "string",
-                            "description": "Optional client request UUID for idempotent retries"
+                            "description": "Optional client request id, carried into the receipt so you can match the answer to your call; nothing deduplicates on it"
                         },
                         "summary": {
                             "type": "string",

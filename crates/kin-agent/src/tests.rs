@@ -201,7 +201,7 @@ fn well_formed_arguments_are_not_reported_as_malformed() {
 }
 
 fn test_belt() -> Belt {
-    Belt::new(vec![kin_tool(0, "semantic_locate", None)])
+    Belt::with_file_tools(vec![kin_tool(0, "semantic_locate", None)])
 }
 
 /// One belt entry as a run would build it: bare name from the server, exposed name from
@@ -401,6 +401,41 @@ fn the_pure_kin_switch_reads_booleans_the_way_the_env_registry_does() {
     );
 }
 
+/// The built-in prompt describes only the write tools the belt actually carries.
+///
+/// A prompt naming a tool the belt lacks is a false instruction: under
+/// `--tool-profile agent-query` no `kin_mutate` is served, and a model told to
+/// call it spends its turns being refused.
+#[test]
+fn the_system_prompt_names_only_the_write_tools_the_belt_carries() {
+    let mutate = kin_tool(0, "kin_mutate", None);
+    let locate = kin_tool(0, "semantic_locate", None);
+
+    let entity =
+        crate::run::system_prompt_for(&Belt::pure_kin(vec![mutate.clone(), locate.clone()]));
+    assert!(entity.contains("mcp__kin__kin_mutate") && entity.contains("name the entity"));
+
+    let files = crate::run::system_prompt_for(&Belt::with_file_tools(vec![locate.clone()]));
+    assert!(files.contains("edit_file") && files.contains("write_file"));
+    assert!(!files.contains("kin_mutate"), "{files}");
+
+    let read_only = crate::run::system_prompt_for(&Belt::pure_kin(vec![locate.clone()]));
+    assert!(
+        read_only.contains("no tool that changes code"),
+        "{read_only}"
+    );
+    assert!(
+        !read_only.contains("kin_mutate") && !read_only.contains("edit_file"),
+        "{read_only}"
+    );
+
+    // Every shape keeps the shared head and tail, so only the one paragraph moved.
+    for prompt in [&entity, &files, &read_only] {
+        assert!(prompt.contains("Kin is your only way to look at the repository"));
+        assert!(prompt.contains("Work in small steps"));
+    }
+}
+
 /// The harness supplies the session `kin_mutate` needs and the model cannot see.
 ///
 /// `kin_session_start` is harness-owned, so the model never learns the session
@@ -460,7 +495,7 @@ fn a_second_repository_of_the_same_name_gets_its_own_label() {
 
 #[test]
 fn tool_prefixes_separate_two_servers_and_a_bare_name_names_both() {
-    let belt = Belt::new(vec![
+    let belt = Belt::with_file_tools(vec![
         kin_tool(0, "semantic_locate", Some("alpha")),
         kin_tool(1, "semantic_locate", Some("beta")),
     ]);

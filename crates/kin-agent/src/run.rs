@@ -57,6 +57,66 @@ graph, and a change to it is a change to an entity.
 Work in small steps. Call one or two tools, read what came back, then decide. When you have \
 the answer, say it in plain text without calling a tool.";
 
+/// Where the code-changing paragraph of [`DEFAULT_SYSTEM_PROMPT`] starts and ends.
+const CHANGE_PARAGRAPH_START: &str = "To change code, name the entity";
+const CHANGE_PARAGRAPH_END: &str = "Work in small steps.";
+
+/// The code-changing paragraph for a belt with file tools and no `kin_mutate`.
+const FILE_TOOLS_PARAGRAPH: &str = "\
+To change code, use edit_file for a surgical change to an existing file and write_file to \
+create a new one. Read the exact current text through Kin first so your edit matches byte \
+for byte. You never open, stage or commit a transaction yourself, and those tools are not \
+on your belt on purpose. The harness does it around every call you make: a file you create \
+with write_file is staged as Kin's create operation, carrying the repository-relative path \
+and the full body, and committed with provenance naming this agent. An edit to a file Kin \
+already tracks is staged as Kin's replace operation, carrying that path and the file's \
+complete new text as your edit left it, and committed the same way.
+
+Your tools are the mcp__kin__ ones named above plus edit_file and write_file. You have no \
+others.
+
+";
+
+/// The code-changing paragraph for a belt that carries no write tool at all.
+const READ_ONLY_PARAGRAPH: &str = "\
+This run carries no tool that changes code. Answer from what Kin tells you, and when the \
+task needs a change, say exactly what the change is instead of making it.
+
+Your tools are the mcp__kin__ ones named above. You have no others.
+
+";
+
+/// The built-in system prompt for this belt.
+///
+/// The paragraph about changing code has to describe the write tools the model
+/// actually has, because a prompt that names a tool the belt does not carry is a
+/// false instruction: under `--tool-profile agent-query` the server serves no
+/// `kin_mutate`, and a model told to call it spends its turns being refused.
+/// `kin_mutate` on the belt keeps the entity paragraph; file tools without it get
+/// the file paragraph; a belt with neither is told the run is read-only.
+pub fn system_prompt_for(belt: &Belt) -> String {
+    if belt.has_kin_tool("kin_mutate") {
+        return DEFAULT_SYSTEM_PROMPT.to_string();
+    }
+    let (Some(start), Some(end)) = (
+        DEFAULT_SYSTEM_PROMPT.find(CHANGE_PARAGRAPH_START),
+        DEFAULT_SYSTEM_PROMPT.find(CHANGE_PARAGRAPH_END),
+    ) else {
+        return DEFAULT_SYSTEM_PROMPT.to_string();
+    };
+    let paragraph = if belt.has_file_tools() {
+        FILE_TOOLS_PARAGRAPH
+    } else {
+        READ_ONLY_PARAGRAPH
+    };
+    format!(
+        "{}{}{}",
+        &DEFAULT_SYSTEM_PROMPT[..start],
+        paragraph,
+        &DEFAULT_SYSTEM_PROMPT[end..]
+    )
+}
+
 /// One attached graph server and the repository it serves.
 ///
 /// A run holds one of these per repository. Everything that has to reach a particular
@@ -470,7 +530,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     let mut system_prompt = config
         .system_prompt
         .clone()
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        .unwrap_or_else(|| system_prompt_for(&belt));
     // The repository roots are a fact about this run that the model cannot infer, and
     // without them it cannot address the second repository at all, so the note is appended
     // to an operator-supplied prompt as well as to the built-in one.

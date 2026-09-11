@@ -180,6 +180,11 @@ impl Belt {
         self.file_tools
     }
 
+    /// Whether a Kin tool, named as its server declares it, is on this belt.
+    pub fn has_kin_tool(&self, bare: &str) -> bool {
+        self.kin_tools.iter().any(|tool| tool.bare == bare)
+    }
+
     /// Every callable name, which is also what the text-shape parsers match against.
     pub fn names(&self) -> &BTreeSet<String> {
         &self.names
