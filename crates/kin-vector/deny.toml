@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# cargo-deny configuration for the kin-vector crate.
+# Checks: advisories, licenses, bans, sources.
+# Run locally: cargo deny check
+#
+# Mirrors the kin-infer / kin workspace policy so the ecosystem shares one license
+# allow-list and advisory posture. Without this file cargo-deny falls back to
+# deny-by-default and rejects every dependency license (the SAST "licenses FAILED"
+# seen on wit-bindgen / zmij / every other transitive crate) — which is why SAST
+# was red on every kin-vector commit.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# --- Advisory database (replaces standalone cargo-audit) ---
+[advisories]
+# Ignore specific advisories that cannot be resolved yet. Each entry must have a
+# reason. Inherited from the shared workspace posture; these transitive,
+# build-time-only "unmaintained" notices may not appear in kin-vector's leaner
+# graph, in which case the entries are simply unused.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained — transitive build-time only; no fix available, no vuln" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix 0.4.0 unmaintained — transitive build-time only; no fix available, no vuln" },
+]
+
+# --- License policy ---
+[licenses]
+# kin-vector is Apache-2.0. All transitive dependencies must use compatible
+# licenses. List mirrors the kin-infer allow-list so the ecosystem is uniform.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
+
+# --- Crate bans ---
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# --- Source provenance ---
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = ["firelock-ai"]

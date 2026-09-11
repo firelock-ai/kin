@@ -1,0 +1,5 @@
+# Pinned so local toolchains match CI exactly. Bump DELIBERATELY together with
+# the CI clippy allow-list (see ci.yml) — never by @stable drift.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

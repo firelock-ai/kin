@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Scheduled Failure Alarm
+
+# `windows-nightly.yml` runs on a cron, so nothing turns red where anyone is
+# looking when it breaks. Without this, moving the Windows leg to a schedule
+# would not make it cheaper, it would retire it: a red scheduled run only
+# reaches somebody who was already looking for it.
+#
+# The shared implementation opens one issue per failing scheduled workflow,
+# escalates the consecutive count in that same issue rather than filing another,
+# and closes it on the next scheduled success.
+#
+# This watches only the nightly workflow, whose sole trigger is the schedule, so
+# there is no event filter here to get wrong. The shared workflow filters on the
+# run event as well, which is belt and braces rather than the only guard.
+
+on:
+  workflow_run:
+    workflows: ["Windows Authority (nightly)"]
+    types: [completed]
+
+permissions:
+  # Both scopes, not just `issues: write`. Declaring a `permissions:` block
+  # sets every unlisted scope to `none`, and a called workflow never holds more
+  # than its caller granted, so omitting `contents: read` leaves the shared
+  # alarm unable to check out the helper it runs. GitHub reports that when it
+  # loads the workflow, before any job starts and with no job log to read.
+  contents: read
+  issues: write
+
+# Pinned past v0.1.32 on purpose. The alarm first shipped in v0.1.32 declaring
+# `permissions: issues: write` alone, which sets every other scope to `none` and
+# leaves the job without the scope its own checkout step needs. v0.1.33 restores
+# it, verified at the tag rather than assumed:
+#
+#   gh api "repos/firelock-ai/kin-actions/contents/.github/workflows/\
+# scheduled-failure-alarm.yml?ref=v0.1.33" --jq '.content' \
+#     | base64 -d | grep -A6 '^permissions:'
+#
+# prints `contents: read`; the same read at `?ref=v0.1.32` prints only
+# `issues: write`, and at `?ref=v0.1.31` the path 404s, so the check can say no.
+# The ref goes in the query string. `gh api` has no `--ref` flag and rejects it.
+jobs:
+  alarm:
+    uses: firelock-ai/kin-actions/.github/workflows/scheduled-failure-alarm.yml@v0.1.33
