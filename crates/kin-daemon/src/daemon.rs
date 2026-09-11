@@ -937,7 +937,7 @@ pub(crate) async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
             );
         } else {
             info!("final persistence flush on shutdown");
-            if let Err(e) = save_snapshot_blocking(Arc::clone(state)).await {
+            if let Err(e) = timed_flush(state).await {
                 error!(error = %e, "shutdown save failed");
             } else {
                 state.mark_clean();
@@ -1091,6 +1091,13 @@ async fn retry_deferred_vector_checkpoint(
 // next liveness probe. Owner death costs at most one OWNER_WATCH_CHECK_INTERVAL of
 // detection on top of the same bound: ~27s from owner exit to process gone,
 // with no signal ever sent.
+//
+// A persistence flush already in flight is the one thing a stop may decline to
+// wait for. Step 2 reads the persistence loop's flush clock, and when the last
+// timed flush says the one in flight cannot finish before the watchdog's grace
+// runs out, the process records that in its store and ends there, the way the
+// watchdog would at the grace: the flush is lost either way, so waiting would
+// only make the stop as long as the grace.
 //
 // Both grace periods are configurable — KIN_DAEMON_SHUTDOWN_GRACE_SECS and
 // KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS — so a caller with a tighter cleanup
@@ -1558,6 +1565,126 @@ async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<()> {
         .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))?
 }
 
+/// The shortest persistence flush worth timing, and the least a flush in
+/// flight runs before a stop judges it.
+///
+/// Flush durations are bimodal. Measured on a 3.5 GiB store, flushes that never
+/// open authority took 0 to 244 ms and flushes that open it twice took 95 to
+/// 148 s, and three of the short kind ran in the second before a long one a
+/// stop then found in flight. Timing every flush would have let a 0 ms flush
+/// stand as the estimate for that long one. A flush under a second never makes
+/// a stop long, so it neither sets the estimate nor is judged by it.
+const FLUSH_TIMING_FLOOR: Duration = Duration::from_secs(1);
+
+/// How often a stop reads the persistence loop's flush clock again while it
+/// waits on that loop.
+const FLUSH_JUDGEMENT_POLL: Duration = Duration::from_millis(100);
+
+/// What a stop can know about the persistence loop's flushes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistenceFlushReading {
+    /// When the flush running now began, if one is.
+    pub in_flight_since: Option<Instant>,
+    /// How long the last flush of at least [`FLUSH_TIMING_FLOOR`] took.
+    pub last_elapsed: Option<Duration>,
+}
+
+/// Read the persistence loop's flush clock.
+pub(crate) fn persistence_flush_reading(state: &DaemonState) -> PersistenceFlushReading {
+    let in_flight_since = *state
+        .flush_in_flight_since
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last_ms = state
+        .last_flush_elapsed_ms
+        .load(std::sync::atomic::Ordering::SeqCst);
+    PersistenceFlushReading {
+        in_flight_since,
+        last_elapsed: (last_ms > 0).then_some(Duration::from_millis(last_ms)),
+    }
+}
+
+fn set_flush_in_flight(state: &DaemonState, since: Option<Instant>) {
+    *state
+        .flush_in_flight_since
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = since;
+}
+
+/// One persistence flush, timed where a stop can read it.
+///
+/// Every flush the persistence loop runs goes through here, the periodic ones
+/// and the one its shutdown arm runs, so a stop sees whichever is in flight.
+async fn timed_flush(state: &Arc<DaemonState>) -> Result<Duration> {
+    let start = Instant::now();
+    set_flush_in_flight(state, Some(start));
+    #[cfg(test)]
+    pause_flush_for_test(state).await;
+    let outcome = save_snapshot_blocking(Arc::clone(state)).await;
+    let elapsed = start.elapsed();
+    set_flush_in_flight(state, None);
+    if outcome.is_ok() {
+        record_flush_elapsed(state, elapsed);
+    }
+    outcome.map(|()| elapsed)
+}
+
+/// Keep a finished flush's duration for the next stop to judge by, when it ran
+/// long enough to be the kind a stop waits on.
+fn record_flush_elapsed(state: &DaemonState, elapsed: Duration) {
+    if elapsed >= FLUSH_TIMING_FLOOR {
+        state.last_flush_elapsed_ms.store(
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+/// A pause a flush takes once it is marked in flight, for the one daemon state
+/// a test names, so a test can watch a flush in flight without a store large
+/// enough to make it slow. Keyed by the state's address, so no other test's
+/// flush waits on it.
+#[cfg(test)]
+static FLUSH_PAUSE_FOR_TEST: std::sync::Mutex<Option<(usize, Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn pause_flush_for_test(state: &DaemonState) {
+    let owner = state as *const DaemonState as usize;
+    let named = *FLUSH_PAUSE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((named_state, pause)) = named {
+        if named_state == owner {
+            tokio::time::sleep(pause).await;
+        }
+    }
+}
+
+/// Whether the flush in flight at a stop cannot finish before the escalation
+/// grace runs out, going by how long the last timed flush took.
+///
+/// A flush's cost is the store's size rather than the size of the change, so
+/// the last one is the estimate. With no flush in flight, no timed flush to go
+/// by, or a flush that has not yet run [`FLUSH_TIMING_FLOOR`], nothing is judged
+/// unfinishable and the stop waits as it always has.
+fn flush_outruns_grace(
+    reading: PersistenceFlushReading,
+    now: Instant,
+    grace_ends: Instant,
+) -> bool {
+    let (Some(since), Some(last)) = (reading.in_flight_since, reading.last_elapsed) else {
+        return false;
+    };
+    if now.saturating_duration_since(since) < FLUSH_TIMING_FLOOR {
+        return false;
+    }
+    match since.checked_add(last) {
+        Some(expected_end) => expected_end > grace_ends,
+        None => true,
+    }
+}
+
 /// How often the owner-death watchdog checks whether the owning process is
 /// still alive. A `kill(pid, 0)` every couple of seconds is a single cheap
 /// syscall, so this is set for detection latency rather than to save work.
@@ -1849,13 +1976,14 @@ fn shutdown_signalled(is_shutdown: bool, cancel: bool, os_requested: bool) -> bo
 /// site keeps reading `DaemonState` while a test can model the runtime whose
 /// propagation task never runs at all.
 ///
-/// `store_root` is the store this daemon serves, where a force exit records
-/// that the daemon ended itself; the supervisor serves none and passes `None`.
+/// `store` is the store this daemon serves, where a force exit records that the
+/// daemon ended itself and names any persistence flush it cut short; the
+/// supervisor serves none and passes `None`.
 pub fn spawn_shutdown_escalation_watchdog<F>(
     is_shutdown: F,
     cancel: tokio::sync::watch::Receiver<bool>,
     grace: Duration,
-    store_root: Option<std::path::PathBuf>,
+    store: Option<WatchdogStore>,
 ) where
     F: Fn() -> bool + Send + 'static,
 {
@@ -1877,41 +2005,138 @@ pub fn spawn_shutdown_escalation_watchdog<F>(
             );
             // Said in the store before the exit, so the serving record this
             // exit leaves behind reads as the self-termination it is.
-            if let Some(store_root) = store_root.as_deref() {
-                record_watchdog_self_termination(store_root, grace);
-            }
-            std::process::exit(0);
+            end_this_daemon(store.map(|store| {
+                let flush = (store.flush)();
+                (store.root, watchdog_self_termination(grace, flush))
+            }));
         })
     {
         warn!(error = %error, "failed to spawn shutdown-escalation watchdog");
     }
 }
 
-/// Record, in the store this daemon served, that it ended itself.
+/// The store a daemon's escalation watchdog records a force exit in, and how it
+/// reads the persistence flush that exit may cut short.
+pub struct WatchdogStore {
+    /// The store's `.kin` root.
+    pub root: std::path::PathBuf,
+    /// The persistence loop's flush clock, read at the moment of the exit.
+    pub flush: Box<dyn Fn() -> PersistenceFlushReading + Send>,
+}
+
+/// Why a daemon is ending itself, in the words its death note carries.
+struct SelfTermination {
+    killed_by: &'static str,
+    reason: String,
+    in_flight: Option<String>,
+}
+
+/// The note the escalation watchdog leaves when the grace runs out.
+fn watchdog_self_termination(grace: Duration, flush: PersistenceFlushReading) -> SelfTermination {
+    SelfTermination {
+        killed_by: "kin-daemon shutdown watchdog",
+        reason: format!(
+            "graceful shutdown did not finish inside its {}s grace, so the daemon ended \
+             itself; its final persistence flush may not have completed",
+            grace.as_secs()
+        ),
+        in_flight: describe_flush_in_flight(flush, Instant::now()),
+    }
+}
+
+/// The note a stop leaves when it does not wait for a flush that cannot finish.
+fn unfinishable_flush_self_termination(
+    grace: Duration,
+    flush: PersistenceFlushReading,
+) -> SelfTermination {
+    SelfTermination {
+        killed_by: "kin-daemon shutdown",
+        reason: format!(
+            "the persistence flush in flight at the stop would not finish inside the {}s \
+             grace, going by how long the last timed flush took, so the daemon ended itself \
+             at once instead of waiting it out; the next start re-derives what that flush \
+             had not published",
+            grace.as_secs()
+        ),
+        in_flight: describe_flush_in_flight(flush, Instant::now()),
+    }
+}
+
+/// One clause naming the persistence flush a daemon was running when it ended,
+/// dated the way the note itself is, for the note's `in_flight`.
+fn describe_flush_in_flight(flush: PersistenceFlushReading, now: Instant) -> Option<String> {
+    let since = flush.in_flight_since?;
+    let running = now.saturating_duration_since(since);
+    let began = chrono::Utc::now()
+        - chrono::Duration::from_std(running).unwrap_or_else(|_| chrono::Duration::zero());
+    let began = began.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    Some(match flush.last_elapsed {
+        Some(last) => format!(
+            "a persistence flush that began at {began} and had run {} s; the last timed \
+             flush took {} s",
+            running.as_secs(),
+            last.as_secs()
+        ),
+        None => format!(
+            "a persistence flush that began at {began} and had run {} s, with no earlier \
+             timed flush to judge it by",
+            running.as_secs()
+        ),
+    })
+}
+
+/// Record, in the store this daemon served, that it ended itself and why.
 ///
-/// The force exit skips the path that retires the serving record, so without
-/// this the next start finds that record beside a dead pid and books an
+/// A daemon that ends itself skips the path that retires its serving record, so
+/// without this the next start finds that record beside a dead pid and books an
 /// unattributed kill, and `kin init` exits 7 over a daemon that stopped on its
 /// own schedule. Measured twice on a 3.5 GiB scratch store: the final flush
 /// outran the 25 s grace both times, and the next start recorded `"kills":1`
 /// for the first. A death note naming this pid is what both readers of that
 /// record, the settlement at the next start and `kin init`'s read-only peek,
-/// already honour.
-pub fn record_watchdog_self_termination(kin_root: &std::path::Path, grace: Duration) {
+/// already honour. Both ways a daemon ends itself write it here, so one reader
+/// parses both.
+fn record_self_termination(kin_root: &std::path::Path, ending: SelfTermination) {
     kin_daemon_spawn::write_daemon_death_note(
         kin_root,
         &kin_daemon_spawn::DaemonDeathNote {
             pid: std::process::id(),
-            killed_by: "kin-daemon shutdown watchdog".to_string(),
-            reason: format!(
-                "graceful shutdown did not finish inside its {}s grace, so the daemon ended \
-                 itself; its final persistence flush may not have completed",
-                grace.as_secs()
-            ),
-            in_flight: None,
+            killed_by: ending.killed_by.to_string(),
+            reason: ending.reason,
+            in_flight: ending.in_flight,
             at: chrono::Utc::now().to_rfc3339(),
         },
     );
+}
+
+/// End this process now, first saying why in the store it served when there is
+/// one.
+///
+/// The exit is what releases the store lock, and nothing before it does, so a
+/// successor cannot take the store while a flush this cut short is still
+/// writing.
+fn end_this_daemon(ending: Option<(std::path::PathBuf, SelfTermination)>) -> ! {
+    if let Some((kin_root, ending)) = ending {
+        record_self_termination(&kin_root, ending);
+    }
+    #[cfg(test)]
+    pause_before_exit_for_test();
+    std::process::exit(0);
+}
+
+/// How long a test worker holds its exit once its note is written, so a test
+/// can look at the store while the process is between its decision and its end.
+#[cfg(test)]
+const PAUSE_BEFORE_EXIT_FOR_TEST: &str = "KINTEST_PAUSE_BEFORE_EXIT_MS";
+
+#[cfg(test)]
+fn pause_before_exit_for_test() {
+    let pause = std::env::var(PAUSE_BEFORE_EXIT_FOR_TEST)
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok());
+    if let Some(ms) = pause {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
 }
 
 /// Is the process with this PID still alive?
@@ -4950,6 +5175,7 @@ pub async fn run_with_authority_on(
     // healthy daemon.
     install_shutdown_signal_handler();
     let escalation_state = Arc::clone(&state);
+    let flush_state = Arc::clone(&state);
     spawn_shutdown_escalation_watchdog(
         move || {
             escalation_state
@@ -4958,7 +5184,10 @@ pub async fn run_with_authority_on(
         },
         cancel_rx.clone(),
         shutdown_escalation_grace(),
-        Some(state.layout.root().to_path_buf()),
+        Some(WatchdogStore {
+            root: state.layout.root().to_path_buf(),
+            flush: Box::new(move || persistence_flush_reading(&flush_state)),
+        }),
     );
 
     // Spawn the orphan session sweeper (Phase 7).
@@ -5099,9 +5328,8 @@ pub async fn run_with_authority_on(
             );
 
             if should_flush {
-                let start = std::time::Instant::now();
-                match save_snapshot_blocking(Arc::clone(&persist_state)).await {
-                    Ok(()) => {
+                match timed_flush(&persist_state).await {
+                    Ok(elapsed) => {
                         persist_state.mark_clean();
                         if consecutive_failures > 0 {
                             info!(
@@ -5112,7 +5340,7 @@ pub async fn run_with_authority_on(
                         consecutive_failures = 0;
                         current_interval = base_interval;
                         info!(
-                            elapsed_ms = start.elapsed().as_millis(),
+                            elapsed_ms = elapsed.as_millis(),
                             "background persistence flush complete"
                         );
                     }
@@ -6301,6 +6529,7 @@ pub async fn run_with_authority_on(
         supervisor_handle,
         lsp_handle,
         cancel_tx,
+        &state,
     )
     .await;
 
@@ -6343,6 +6572,7 @@ async fn select_with_signals(
     supervisor_handle: tokio::task::JoinHandle<()>,
     lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
+    state: &Arc<DaemonState>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(DaemonError::Io)?;
@@ -6417,6 +6647,10 @@ async fn select_with_signals(
         }
     };
 
+    // The escalation watchdog's grace began when the stop was signalled, so a
+    // flush in flight is judged against the same end.
+    let grace_ends = Instant::now().checked_add(shutdown_escalation_grace());
+
     // Before `drain_handles`, and so before the final persistence flush that
     // kin#994 gave its own budget and drains ahead of everything else. Order is
     // the whole point twice over. A sweep publishes into the graph, so letting
@@ -6434,6 +6668,8 @@ async fn select_with_signals(
         (completed != CompletedTask::Idle).then_some(idle_handle),
         Some(persist_handle),
         Some(supervisor_handle),
+        state,
+        grace_ends,
     )
     .await;
     result
@@ -6496,6 +6732,8 @@ async fn drain_handles(
     idle_handle: Option<tokio::task::JoinHandle<()>>,
     persist_handle: Option<tokio::task::JoinHandle<()>>,
     supervisor_handle: Option<tokio::task::JoinHandle<()>>,
+    state: &DaemonState,
+    grace_ends: Option<Instant>,
 ) {
     let drain_timeout = Duration::from_secs(10);
     info!("draining task handles before cleanup...");
@@ -6516,7 +6754,13 @@ async fn drain_handles(
     // a ceiling on waiting rather than an amount of waiting: time is spent here
     // only when there is work to lose, which is exactly when spending it is
     // right.
-    let persistence = drain_persistence(persist_handle, shutdown_flush_budget()).await;
+    let persistence = drain_persistence(
+        persist_handle,
+        shutdown_flush_budget(),
+        || persistence_flush_reading(state),
+        grace_ends,
+    )
+    .await;
 
     let mut drain_tasks = Vec::new();
 
@@ -6565,6 +6809,25 @@ async fn drain_handles(
              re-derived or lost. Raise KIN_DAEMON_SHUTDOWN_FLUSH_SECS if this store needs longer."
         );
     }
+    if let PersistenceDrain::OutrunsGrace(flush) = persistence {
+        // The escalation watchdog would end the process before this flush could
+        // finish, so waiting for it only makes the stop as long as the grace.
+        // It ends here, with the store lock still held. Returning would let the
+        // run release the lock while this flush is still writing, and runtime
+        // teardown would keep the process alive beside a successor that took it.
+        warn!(
+            grace_s = shutdown_escalation_grace().as_secs(),
+            running_ms = ?flush.in_flight_since.map(|since| since.elapsed().as_millis()),
+            last_flush_ms = ?flush.last_elapsed.map(|last| last.as_millis()),
+            "a persistence flush in flight at shutdown cannot finish inside the escalation \
+             grace, going by how long the last timed flush took; the daemon ends now, with a \
+             note in its store, instead of waiting for the watchdog"
+        );
+        end_this_daemon(Some((
+            state.layout.root().to_path_buf(),
+            unfinishable_flush_self_termination(shutdown_escalation_grace(), flush),
+        )));
+    }
 }
 
 /// How long shutdown waits for the final persistence flush.
@@ -6587,6 +6850,9 @@ enum PersistenceDrain {
     Completed,
     /// It outlived its budget and shutdown proceeded without it.
     Abandoned,
+    /// A flush was in flight that the last timed flush says cannot finish
+    /// before the escalation grace ends, so shutdown did not wait for it.
+    OutrunsGrace(PersistenceFlushReading),
 }
 
 /// Wait for the persistence task, bounded, and report which happened.
@@ -6594,23 +6860,46 @@ enum PersistenceDrain {
 /// Split out so the budget's behaviour can be tested in both directions: that a
 /// flush finishing inside the budget is not delayed by it, and that one
 /// outliving it returns at the budget rather than hanging shutdown forever.
+///
+/// While it waits it reads the persistence loop's flush clock, because the
+/// escalation watchdog rather than this budget is what ends the process. A
+/// flush that would still be running at `grace_ends` is lost either way, and
+/// waiting for it only makes the stop as long as the grace. It reads the clock
+/// again every [`FLUSH_JUDGEMENT_POLL`], since the task's shutdown arm can start
+/// a flush of its own after the stop began.
 async fn drain_persistence(
     handle: Option<tokio::task::JoinHandle<()>>,
     budget: Duration,
+    flush: impl Fn() -> PersistenceFlushReading,
+    grace_ends: Option<Instant>,
 ) -> PersistenceDrain {
-    let Some(handle) = handle else {
+    let Some(mut handle) = handle else {
         return PersistenceDrain::NotRunning;
     };
-    match tokio::time::timeout(budget, handle).await {
-        Ok(Ok(())) => {
-            info!(task = "persistence", "task drained");
-            PersistenceDrain::Completed
+    let budget_ends = Instant::now().checked_add(budget);
+    loop {
+        let reading = flush();
+        let now = Instant::now();
+        if grace_ends.is_some_and(|ends| flush_outruns_grace(reading, now, ends)) {
+            return PersistenceDrain::OutrunsGrace(reading);
         }
-        Ok(Err(error)) => {
-            warn!(task = "persistence", %error, "task panicked during drain");
-            PersistenceDrain::Abandoned
+        let left = budget_ends.map_or(FLUSH_JUDGEMENT_POLL, |ends| {
+            ends.saturating_duration_since(now)
+        });
+        if left.is_zero() {
+            return PersistenceDrain::Abandoned;
         }
-        Err(_) => PersistenceDrain::Abandoned,
+        match tokio::time::timeout(left.min(FLUSH_JUDGEMENT_POLL), &mut handle).await {
+            Ok(Ok(())) => {
+                info!(task = "persistence", "task drained");
+                return PersistenceDrain::Completed;
+            }
+            Ok(Err(error)) => {
+                warn!(task = "persistence", %error, "task panicked during drain");
+                return PersistenceDrain::Abandoned;
+            }
+            Err(_) => {}
+        }
     }
 }
 
@@ -6625,6 +6914,7 @@ async fn select_with_signals(
     supervisor_handle: tokio::task::JoinHandle<()>,
     lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
+    state: &Arc<DaemonState>,
 ) -> Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum CompletedTask {
@@ -6691,6 +6981,10 @@ async fn select_with_signals(
         }
     };
 
+    // The escalation watchdog's grace began when the stop was signalled, so a
+    // flush in flight is judged against the same end.
+    let grace_ends = Instant::now().checked_add(shutdown_escalation_grace());
+
     // Before `drain_handles`, and so before the final persistence flush that
     // kin#994 gave its own budget and drains ahead of everything else. Order is
     // the whole point twice over. A sweep publishes into the graph, so letting
@@ -6708,6 +7002,8 @@ async fn select_with_signals(
         (completed != CompletedTask::Idle).then_some(idle_handle),
         Some(persist_handle),
         Some(supervisor_handle),
+        state,
+        grace_ends,
     )
     .await;
     result
@@ -7271,7 +7567,16 @@ mod tests {
             || true,
             cancel,
             std::time::Duration::from_millis(100),
-            Some(root),
+            Some(super::WatchdogStore {
+                root,
+                // A flush three seconds in when the grace runs out, so the note
+                // has one to name.
+                flush: Box::new(|| super::PersistenceFlushReading {
+                    in_flight_since: std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(3)),
+                    last_elapsed: Some(std::time::Duration::from_secs(100)),
+                }),
+            }),
         );
         std::thread::sleep(std::time::Duration::from_secs(20));
         panic!("the shutdown watchdog should have ended this process");
@@ -7317,12 +7622,312 @@ mod tests {
             "the note names the process the serving record names"
         );
         assert!(note.killed_by.contains("watchdog"), "{}", note.summary());
+        assert_note_names_a_dated_flush(&note, "the last timed flush took 100 s");
         assert!(
             kin_daemon_spawn::peek_unwatched_daemon_death(root.path()).is_none(),
             "a daemon that ended itself was read as killed"
         );
         assert!(kin_daemon_spawn::settle_unwatched_daemon_death(root.path()).is_none());
         assert!(kin_daemon_spawn::read_daemon_kill_record(root.path()).is_none());
+    }
+
+    /// A death note in the shape both self-terminations share: dated, and
+    /// naming the flush in flight with the time it began.
+    fn assert_note_names_a_dated_flush(note: &kin_daemon_spawn::DaemonDeathNote, estimate: &str) {
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&note.at).is_ok(),
+            "the note is dated: {}",
+            note.summary()
+        );
+        let work = note
+            .in_flight
+            .as_deref()
+            .unwrap_or_else(|| panic!("the note names the flush in flight: {}", note.summary()));
+        let began = work
+            .strip_prefix("a persistence flush that began at ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("the note says when the flush began: {work}"));
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(began).is_ok(),
+            "the flush's start is dated: {work}"
+        );
+        assert!(work.contains(estimate), "{work}");
+    }
+
+    /// The repository the unfinishable-flush worker below serves.
+    const UNFINISHABLE_FLUSH_WORKER_REPO: &str = "KINTEST_UNFINISHABLE_FLUSH_WORKER_REPO";
+
+    /// The worker half of the case below, inert in an ordinary run.
+    ///
+    /// Run on its own with the variable set, it opens a daemon state on a fresh
+    /// store, takes the store lock the way a daemon does, publishes a serving
+    /// record for its own process, marks a flush in flight two seconds in whose
+    /// predecessor took 100 s, and drains shutdown over a persistence task that
+    /// never finishes, with 25 s of grace left. The drain is what ends it. If
+    /// the drain ever returns instead, the worker does what the rest of a
+    /// daemon's shutdown would: it releases the store lock and stays alive the
+    /// way runtime teardown keeps a process alive for a blocking flush.
+    #[test]
+    fn unfinishable_flush_worker() {
+        let Some(repo) = std::env::var_os(UNFINISHABLE_FLUSH_WORKER_REPO) else {
+            return;
+        };
+        let init = kin_core::init(std::path::Path::new(&repo)).unwrap();
+        let state = super::DaemonState::open(init.layout).unwrap();
+        let root = state.layout.root().to_path_buf();
+        let lock = crate::lifecycle::acquire_singleton_lock(&root)
+            .unwrap()
+            .expect("a fresh store's lock is free");
+        kin_daemon_spawn::publish_serving_daemon(&root, std::process::id());
+        super::set_flush_in_flight(
+            &state,
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(2)),
+        );
+        super::record_flush_elapsed(&state, std::time::Duration::from_secs(100));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let flush = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+            super::drain_handles(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(flush),
+                None,
+                &state,
+                std::time::Instant::now().checked_add(std::time::Duration::from_secs(25)),
+            )
+            .await;
+        });
+        drop(lock);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    /// A stop over a flush that cannot finish inside the grace ends at once,
+    /// holds the store lock until the process is gone, and leaves a note.
+    ///
+    /// On the three measured stops that overran (0.7.12, a 3.5 GiB store), a
+    /// flush was in flight that the last timed flush put 75 to 108 s past the
+    /// grace, and each stop waited 25.5 to 25.6 s for the watchdog to end a flush
+    /// it could never finish. The worker above is a real process: its drain has
+    /// to decide not to wait, record why, and end, and it has to hold the store
+    /// lock from that decision to its exit, because the abandoned flush is still
+    /// writing and a successor that took the lock could open the store under it.
+    /// Its note has the watchdog note's shape and reads as a daemon ending
+    /// itself, not as a kill.
+    ///
+    /// Breaking it: wait for every flush, and the worker ends with no note;
+    /// return instead of exiting, and the lock is free while the worker lives;
+    /// leave the flush out of the note, and the note no longer names it.
+    #[test]
+    fn a_stop_over_a_flush_that_cannot_finish_ends_holding_the_store_lock() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().join(".kin");
+        let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::tests::unfinishable_flush_worker",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(UNFINISHABLE_FLUSH_WORKER_REPO, repo.path())
+            // Long enough to look at the lock between the note and the exit.
+            .env(super::PAUSE_BEFORE_EXIT_FOR_TEST, "3000")
+            // A drain that waited on the flush would sit out this budget.
+            .env("KIN_DAEMON_SHUTDOWN_FLUSH_SECS", "5")
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let note = loop {
+            if let Some(note) = kin_daemon_spawn::read_daemon_death_note(&root) {
+                break note;
+            }
+            if let Some(status) = worker.try_wait().unwrap() {
+                panic!("the worker ended ({status:?}) without recording why");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never recorded an ending"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        // From the note to the exit, the store lock stays with the worker. Each
+        // probe is one try that does not wait, the way a starting daemon asks
+        // first; the standard acquire retries long enough to outwait the worker.
+        let window = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < window {
+            assert!(
+                worker.try_wait().unwrap().is_none(),
+                "the worker has to be between its note and its exit for the probe to mean anything"
+            );
+            let probe =
+                crate::lifecycle::acquire_singleton_lock_within(&root, std::time::Duration::ZERO)
+                    .unwrap();
+            assert!(
+                probe.is_none(),
+                "the store lock was free while the process that abandoned a flush still ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let status = worker.wait().unwrap();
+        assert!(
+            status.success(),
+            "the drain ends the worker with exit 0: {status:?}"
+        );
+        assert!(
+            crate::lifecycle::acquire_singleton_lock(&root)
+                .unwrap()
+                .is_some(),
+            "the exit releases the store lock"
+        );
+
+        let serving = kin_daemon_spawn::read_serving_daemon(&root)
+            .expect("ending at once leaves the serving record, which the note has to explain");
+        assert_eq!(
+            note.pid, serving.pid,
+            "the note names the process the serving record names"
+        );
+        assert_eq!(note.killed_by, "kin-daemon shutdown", "{}", note.summary());
+        assert_note_names_a_dated_flush(&note, "the last timed flush took 100 s");
+        assert!(
+            kin_daemon_spawn::peek_unwatched_daemon_death(&root).is_none(),
+            "a daemon that ended itself at a stop was read as killed"
+        );
+        assert!(kin_daemon_spawn::settle_unwatched_daemon_death(&root).is_none());
+        assert!(kin_daemon_spawn::read_daemon_kill_record(&root).is_none());
+    }
+
+    /// Clears the flush pause a test set, even when the test fails.
+    struct FlushPause;
+
+    impl Drop for FlushPause {
+        fn drop(&mut self) {
+            *super::FLUSH_PAUSE_FOR_TEST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    /// A flush is in flight while it runs and timed when it ends, from a second
+    /// up.
+    ///
+    /// A stop can judge only what the persistence loop wrote down, and both of
+    /// that loop's flushes, the periodic one and its shutdown arm's, go through
+    /// `timed_flush`. Driven here through the shutdown arm on a real store: a
+    /// flush quicker than a second leaves nothing behind, and one held past a
+    /// second is in flight while it runs and timed after.
+    ///
+    /// Breaking it: skip the in-flight mark, and the running flush is invisible;
+    /// time every flush, and the quick one becomes the estimate.
+    #[tokio::test]
+    async fn a_flush_is_in_flight_while_it_runs_and_timed_when_it_ends() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = std::sync::Arc::new(super::DaemonState::open(init.layout).unwrap());
+
+        state.mark_dirty();
+        let quick = std::time::Instant::now();
+        super::run_shutdown_persistence(&state).await;
+        let quick = quick.elapsed();
+        let reading = super::persistence_flush_reading(&state);
+        assert_eq!(
+            reading.in_flight_since, None,
+            "a finished flush is no longer in flight"
+        );
+        // Only a flush that really took under a second can be asked to leave no
+        // estimate; a slow runner can take longer over an empty store.
+        if quick < std::time::Duration::from_millis(900) {
+            assert_eq!(
+                reading.last_elapsed, None,
+                "a flush quicker than a second is not kept as the estimate"
+            );
+        }
+
+        let _pause = FlushPause;
+        *super::FLUSH_PAUSE_FOR_TEST.lock().unwrap() = Some((
+            std::sync::Arc::as_ptr(&state) as usize,
+            std::time::Duration::from_millis(1_200),
+        ));
+        state.mark_dirty();
+        let flushing = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move { super::run_shutdown_persistence(&state).await }
+        });
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut in_flight = None;
+        while in_flight.is_none() && std::time::Instant::now() < give_up {
+            in_flight = super::persistence_flush_reading(&state).in_flight_since;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            in_flight.is_some(),
+            "a running flush must be visible to a stop"
+        );
+        flushing.await.unwrap();
+        let reading = super::persistence_flush_reading(&state);
+        assert_eq!(
+            reading.in_flight_since, None,
+            "a finished flush is no longer in flight"
+        );
+        assert!(
+            reading
+                .last_elapsed
+                .is_some_and(|last| last >= std::time::Duration::from_millis(1_200)),
+            "a flush of a second or more is kept as the estimate: {reading:?}"
+        );
+    }
+
+    /// Run 2's tail, replayed through the recording and the judgement.
+    ///
+    /// Measured before that stop: a 124,791 ms flush, then three of 244, 0 and
+    /// 0 ms, then a long one that had run 8.1 s when SIGTERM came. Timing every
+    /// flush leaves 0 ms as the estimate, the judgement has nothing to go by, and
+    /// the stop waits out the grace as it did then. Timing from a second up keeps
+    /// the long flush as the estimate and ends the stop at once.
+    ///
+    /// Breaking it: time every flush, and the drain sits out its budget.
+    #[tokio::test]
+    async fn run_twos_tail_is_judged_by_its_long_flush() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = super::DaemonState::open(init.layout).unwrap();
+        for ms in [124_791, 244, 0, 0] {
+            super::record_flush_elapsed(&state, std::time::Duration::from_millis(ms));
+        }
+        let stop = std::time::Instant::now();
+        super::set_flush_in_flight(
+            &state,
+            stop.checked_sub(std::time::Duration::from_millis(8_098)),
+        );
+        let flush = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+        let outcome = super::drain_persistence(
+            Some(flush),
+            std::time::Duration::from_secs(3),
+            || super::persistence_flush_reading(&state),
+            stop.checked_add(std::time::Duration::from_secs(25)),
+        )
+        .await;
+        assert!(
+            matches!(outcome, super::PersistenceDrain::OutrunsGrace(_)),
+            "run 2's stop must not wait on a flush its long predecessor says cannot finish: \
+             {outcome:?}"
+        );
+        assert!(
+            stop.elapsed() < std::time::Duration::from_secs(1),
+            "and it decides at once"
+        );
+        assert_eq!(
+            super::persistence_flush_reading(&state).last_elapsed,
+            Some(std::time::Duration::from_millis(124_791)),
+            "the sub-second flushes after it must not replace the long one as the estimate"
+        );
     }
 
     /// A file whose queries partly failed is still never marked, and it no
@@ -8484,7 +9089,13 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let started = std::time::Instant::now();
-        let outcome = super::drain_persistence(Some(handle), Duration::from_millis(80)).await;
+        let outcome = super::drain_persistence(
+            Some(handle),
+            Duration::from_millis(80),
+            super::PersistenceFlushReading::default,
+            None,
+        )
+        .await;
         assert_eq!(
             outcome,
             super::PersistenceDrain::Abandoned,
@@ -8508,7 +9119,13 @@ mod tests {
     async fn a_fast_shutdown_is_not_delayed_by_a_generous_budget() {
         let handle = tokio::spawn(async {});
         let started = std::time::Instant::now();
-        let outcome = super::drain_persistence(Some(handle), Duration::from_secs(300)).await;
+        let outcome = super::drain_persistence(
+            Some(handle),
+            Duration::from_secs(300),
+            super::PersistenceFlushReading::default,
+            None,
+        )
+        .await;
         assert_eq!(outcome, super::PersistenceDrain::Completed);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -8516,9 +9133,155 @@ mod tests {
              budget is"
         );
         assert_eq!(
-            super::drain_persistence(None, Duration::from_secs(300)).await,
+            super::drain_persistence(
+                None,
+                Duration::from_secs(300),
+                super::PersistenceFlushReading::default,
+                None,
+            )
+            .await,
             super::PersistenceDrain::NotRunning,
             "no persistence task at all is not an abandonment"
+        );
+    }
+
+    /// The rule on the measured stops, and on the cases it must leave alone.
+    ///
+    /// From the 0.7.12 runs on a 3.5 GiB store: how long the flush in flight
+    /// had run when SIGTERM came, and how long the last timed flush took. Each
+    /// of the three would have ended 75 to 108 s past a 25 s grace.
+    ///
+    /// Breaking it: judge nothing and the three are waited for; judge before a
+    /// second and the young flush is; judge an untimed one and it is lost.
+    #[test]
+    fn the_measured_overruns_are_judged_unfinishable() {
+        let stop = std::time::Instant::now();
+        let grace_ends = stop + std::time::Duration::from_secs(25);
+        let reading = |running_ms: u64, last_ms: Option<u64>| super::PersistenceFlushReading {
+            in_flight_since: stop.checked_sub(std::time::Duration::from_millis(running_ms)),
+            last_elapsed: last_ms.map(std::time::Duration::from_millis),
+        };
+        for (run, running_ms, last_ms) in [
+            ("dirty", 1_250, 100_852),
+            ("run 1", 14_579, 147_615),
+            ("run 2", 8_098, 124_791),
+        ] {
+            assert!(
+                super::flush_outruns_grace(reading(running_ms, Some(last_ms)), stop, grace_ends),
+                "{run}: a flush that cannot finish inside the grace must not be waited for"
+            );
+        }
+        assert!(
+            !super::flush_outruns_grace(reading(90_000, Some(100_000)), stop, grace_ends),
+            "a flush due 10 s from now is waited for"
+        );
+        assert!(
+            !super::flush_outruns_grace(reading(10_000, None), stop, grace_ends),
+            "with no timed flush to go by, the stop waits as it always has"
+        );
+        assert!(
+            !super::flush_outruns_grace(reading(300, Some(100_000)), stop, grace_ends),
+            "a flush under a second old is not judged yet"
+        );
+        assert!(
+            !super::flush_outruns_grace(
+                super::PersistenceFlushReading::default(),
+                stop,
+                grace_ends
+            ),
+            "no flush in flight, nothing to judge"
+        );
+    }
+
+    /// A flush that cannot finish inside the grace is not waited for.
+    ///
+    /// Breaking it: judge nothing, and the drain sits out its budget.
+    #[tokio::test]
+    async fn a_flush_that_cannot_finish_inside_the_grace_is_not_waited_for() {
+        let flush = tokio::spawn(tokio::time::sleep(Duration::from_secs(30)));
+        let stop = std::time::Instant::now();
+        let reading = super::PersistenceFlushReading {
+            in_flight_since: stop.checked_sub(Duration::from_secs(2)),
+            last_elapsed: Some(Duration::from_secs(100)),
+        };
+        let outcome = super::drain_persistence(
+            Some(flush),
+            Duration::from_secs(3),
+            || reading,
+            stop.checked_add(Duration::from_secs(25)),
+        )
+        .await;
+        assert_eq!(outcome, super::PersistenceDrain::OutrunsGrace(reading));
+        assert!(
+            stop.elapsed() < Duration::from_secs(1),
+            "the stop decides at once rather than waiting"
+        );
+    }
+
+    /// A flush that can finish inside the grace is waited for, and so is one
+    /// with no timed flush to judge it by.
+    ///
+    /// Breaking it: judge either unfinishable, and a flush that would have been
+    /// durable is lost.
+    #[tokio::test]
+    async fn a_flush_that_can_finish_inside_the_grace_is_waited_for() {
+        let stop = std::time::Instant::now();
+        let grace_ends = stop.checked_add(Duration::from_secs(25));
+        let due = super::PersistenceFlushReading {
+            in_flight_since: stop.checked_sub(Duration::from_millis(1_500)),
+            last_elapsed: Some(Duration::from_secs(2)),
+        };
+        let untimed = super::PersistenceFlushReading {
+            in_flight_since: stop.checked_sub(Duration::from_secs(5)),
+            last_elapsed: None,
+        };
+        for (case, reading) in [("due inside the grace", due), ("untimed", untimed)] {
+            let flush = tokio::spawn(tokio::time::sleep(Duration::from_millis(400)));
+            let outcome = super::drain_persistence(
+                Some(flush),
+                Duration::from_secs(300),
+                || reading,
+                grace_ends,
+            )
+            .await;
+            assert_eq!(outcome, super::PersistenceDrain::Completed, "{case}");
+        }
+    }
+
+    /// A flush the stop's own shutdown arm starts after the drain began is
+    /// judged too.
+    ///
+    /// Breaking it: judge only what was in flight when the drain began, and the
+    /// drain sits out its budget.
+    #[tokio::test]
+    async fn a_flush_started_after_the_stop_is_judged_too() {
+        let flush = tokio::spawn(tokio::time::sleep(Duration::from_secs(30)));
+        let reading = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PersistenceFlushReading::default(),
+        ));
+        let starts = std::sync::Arc::clone(&reading);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            *starts.lock().unwrap() = super::PersistenceFlushReading {
+                in_flight_since: Some(std::time::Instant::now()),
+                last_elapsed: Some(Duration::from_secs(100)),
+            };
+        });
+        let stop = std::time::Instant::now();
+        let outcome = super::drain_persistence(
+            Some(flush),
+            Duration::from_secs(5),
+            || *reading.lock().unwrap(),
+            stop.checked_add(Duration::from_secs(25)),
+        )
+        .await;
+        assert!(
+            matches!(outcome, super::PersistenceDrain::OutrunsGrace(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            stop.elapsed() < Duration::from_secs(3),
+            "judged a second after it began, not at the budget"
         );
     }
 
