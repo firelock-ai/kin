@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use kin_model::provenance::ApprovalDecision;
 use kin_model::{ChangeStore, ProvenanceStore, ReviewStore};
+use kin_review::write::{PlannedReviewEvent, ReviewGroup, ReviewTargetMissing, ReviewWrite};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
@@ -32,32 +33,50 @@ pub enum ReviewRequest {
         base: String,
         head: String,
         description: Option<String>,
+        /// The actor label the caller acts as. The CLI sends its own, so the
+        /// daemon records who asked rather than who started the daemon; a
+        /// caller that sends none is recorded under the daemon's label. The
+        /// same field on every mutation below means the same thing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
     Decide {
         review_id: String,
         state: String,
         comment: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
     Note {
         review_id: String,
         body: String,
         scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
     Discuss {
         review_id: String,
         body: String,
         scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
     Reply {
         discussion_id: String,
         body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
     Resolve {
         discussion_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
     Assign {
         review_id: String,
         reviewer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
     List {
         state: Option<String>,
@@ -81,6 +100,23 @@ impl std::fmt::Display for ReviewNotFound {
 }
 
 impl std::error::Error for ReviewNotFound {}
+
+impl ReviewRequest {
+    /// Whether this request writes review state, which only the daemon's
+    /// review writer may do.
+    pub fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::Create { .. }
+                | Self::Decide { .. }
+                | Self::Note { .. }
+                | Self::Discuss { .. }
+                | Self::Reply { .. }
+                | Self::Resolve { .. }
+                | Self::Assign { .. }
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewResponse {
@@ -206,38 +242,16 @@ pub async fn execute_review_request(
             )?,
             mutated: false,
         }),
-        ReviewRequest::Create {
-            title,
-            base,
-            head,
-            description,
-        } => create_review_with_graph(graph, title, base, head, description),
-        ReviewRequest::Decide {
-            review_id,
-            state,
-            comment,
-        } => decide_review_with_graph(graph, review_id, state, comment),
-        ReviewRequest::Note {
-            review_id,
-            body,
-            scope,
-        } => add_note_with_graph(graph, review_id, body, scope),
-        ReviewRequest::Discuss {
-            review_id,
-            body,
-            scope,
-        } => start_discussion_with_graph(graph, review_id, body, scope),
-        ReviewRequest::Reply {
-            discussion_id,
-            body,
-        } => reply_discussion_with_graph(graph, discussion_id, body),
-        ReviewRequest::Resolve { discussion_id } => {
-            resolve_discussion_with_graph(graph, discussion_id)
-        }
-        ReviewRequest::Assign {
-            review_id,
-            reviewer,
-        } => assign_reviewer_with_graph(graph, review_id, reviewer),
+        ReviewRequest::Create { .. }
+        | ReviewRequest::Decide { .. }
+        | ReviewRequest::Note { .. }
+        | ReviewRequest::Discuss { .. }
+        | ReviewRequest::Reply { .. }
+        | ReviewRequest::Resolve { .. }
+        | ReviewRequest::Assign { .. } => anyhow::bail!(
+            "review mutations are repository writes: plan them with plan_review_mutation and \
+             commit them through the daemon's review writer"
+        ),
         ReviewRequest::List { state } => list_reviews_with_graph(graph, state),
         ReviewRequest::Show { review_id } => show_review_with_graph(graph, review_id),
     }
@@ -593,9 +607,9 @@ fn parse_change_ids(change_csv: &str) -> Result<Vec<kin_model::SemanticChangeId>
         .collect()
 }
 
-// ── Review mutation subcommands (Phase 11) ──
-// These depend on kin_model::review types being added by a teammate.
-// Structurally complete; will compile once kin-model review types land.
+// ── Review mutation subcommands ──
+// Each asks the daemon, which plans the event against its live graph, commits
+// the records to repository authority, and only then answers.
 
 pub async fn shadow_report(
     base: String,
@@ -631,68 +645,70 @@ pub async fn create_review(
             base,
             head,
             description,
+            actor: Some(crate::provenance::current_actor_label()),
         })
         .await?,
     );
     Ok(())
 }
 
-fn create_review_with_graph(
-    graph: &kin_db::InMemoryGraph,
+fn plan_create(
     title: String,
     base: String,
     head: String,
     description: Option<String>,
-) -> Result<ReviewExecution> {
+    actor: Option<String>,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
     use kin_model::review::{
         Review, ReviewCompletionState, ReviewDecisionState, ReviewId, ReviewNote, ReviewNoteId,
     };
     use kin_model::timestamp::Timestamp;
 
+    let (actor_label, identity) = acting_as(actor);
     let now = Timestamp::now();
+    let review_id = ReviewId::new();
+    let notes = description
+        .filter(|body| !body.trim().is_empty())
+        .map(|body| ReviewNote {
+            note_id: ReviewNoteId::new(),
+            review_id,
+            body,
+            scope: None,
+            authored_by: identity.clone(),
+            created_at: now.clone(),
+        })
+        .into_iter()
+        .collect();
     let review = Review {
-        review_id: ReviewId::new(),
+        review_id,
         title: title.clone(),
         base_ref: base.clone(),
         head_ref: head.clone(),
         state: ReviewDecisionState::Pending,
         completion: ReviewCompletionState::InReview,
         scopes: vec![],
-        created_by: kin_model::IdentityRef::human("cli-user"),
+        created_by: identity,
         created_at: now.clone(),
-        updated_at: now.clone(),
+        updated_at: now,
     };
-
-    graph.create_review(&review)?;
-    if let Some(body) = description.filter(|body| !body.trim().is_empty()) {
-        let note = ReviewNote {
-            note_id: ReviewNoteId::new(),
-            review_id: review.review_id,
-            body,
-            scope: None,
-            authored_by: kin_model::IdentityRef::human("cli-user"),
-            created_at: now,
-        };
-        graph.add_review_note(&note)?;
-    }
-    crate::provenance::record_cli_audit_event(
-        graph,
-        "review.create",
-        None,
-        Some(format!(
-            "review_id={}; title={}; base={}; head={}",
-            review.review_id, title, base, head
-        )),
-    )?;
-    Ok(ReviewExecution {
-        response: ReviewResponse {
+    Ok(PlannedReviewEvent {
+        action: "review.create",
+        review_id,
+        details: format!("review_id={review_id}; title={title}; base={base}; head={head}"),
+        actor_label,
+        answer: ReviewResponse {
             text: format!(
                 "Created review {}\n  Title: {}\n  Base: {} -> Head: {}\n",
-                review.review_id, title, base, head
+                review_id, title, base, head
             ),
             json: None,
         },
-        mutated: true,
+        refs: Some((base, head)),
+        write: ReviewWrite {
+            review: Some(review),
+            notes,
+            ..ReviewWrite::default()
+        },
     })
 }
 
@@ -706,22 +722,24 @@ pub async fn decide_review(
             review_id,
             state,
             comment,
+            actor: Some(crate::provenance::current_actor_label()),
         })
         .await?,
     );
     Ok(())
 }
 
-fn decide_review_with_graph(
+fn plan_decide(
     graph: &kin_db::InMemoryGraph,
     review_id: String,
     state: String,
     comment: Option<String>,
-) -> Result<ReviewExecution> {
-    use kin_model::review::{ReviewDecision, ReviewDecisionState, ReviewId};
+    actor: Option<String>,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
+    use kin_model::review::{ReviewDecision, ReviewDecisionState};
     use kin_model::timestamp::Timestamp;
 
-    let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
+    let rid = parse_review_id(&review_id)?;
     let decision_state = match state.to_lowercase().as_str() {
         "approved" | "approve" => ReviewDecisionState::Approved,
         "needs_work" | "needs-work" => ReviewDecisionState::NeedsWork,
@@ -731,27 +749,40 @@ fn decide_review_with_graph(
             state
         ),
     };
+    let mut review = existing_review(graph, rid)?;
+    let (actor_label, identity) = acting_as(actor);
 
     let decision = ReviewDecision {
         state: decision_state,
         comment: comment.filter(|value| !value.trim().is_empty()),
-        reviewer: kin_model::IdentityRef::human("cli-user"),
+        reviewer: identity,
         decided_at: Timestamp::now(),
     };
-
-    graph.add_review_decision(&rid, &decision)?;
-    crate::provenance::record_cli_audit_event(
-        graph,
-        "review.decide",
-        None,
-        Some(format!("review_id={}; decision={}", review_id, state)),
-    )?;
-    Ok(ReviewExecution {
-        response: ReviewResponse {
+    // The decision is history and the review's state is where it stands now, so
+    // one event moves both. Without this an approved review reads pending on
+    // every surface that prints its state.
+    review.state = decision_state;
+    review.updated_at = decision.decided_at.clone();
+    let mut history = graph.get_review_decisions(&rid)?;
+    history.push(decision);
+    Ok(PlannedReviewEvent {
+        action: "review.decide",
+        review_id: rid,
+        details: format!("review_id={review_id}; decision={state}"),
+        actor_label,
+        refs: None,
+        answer: ReviewResponse {
             text: format!("Recorded decision '{}' on review {}\n", state, review_id),
             json: None,
         },
-        mutated: true,
+        write: ReviewWrite {
+            review: Some(review),
+            decisions: Some(ReviewGroup {
+                review_id: rid,
+                entries: history,
+            }),
+            ..ReviewWrite::default()
+        },
     })
 }
 
@@ -761,43 +792,54 @@ pub async fn add_note(review_id: String, body: String, scope: Option<String>) ->
             review_id,
             body,
             scope,
+            actor: Some(crate::provenance::current_actor_label()),
         })
         .await?,
     );
     Ok(())
 }
 
-fn add_note_with_graph(
+fn plan_note(
     graph: &kin_db::InMemoryGraph,
     review_id: String,
     body: String,
     scope: Option<String>,
-) -> Result<ReviewExecution> {
-    use kin_model::review::{ReviewId, ReviewNote, ReviewNoteId};
+    actor: Option<String>,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
+    use kin_model::review::{ReviewNote, ReviewNoteId};
     use kin_model::timestamp::Timestamp;
 
     let scope = scope
         .as_deref()
         .map(crate::commands::work::parse_work_scope)
         .transpose()?;
-    let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
+    let rid = parse_review_id(&review_id)?;
+    existing_review(graph, rid)?;
+    let (actor_label, identity) = acting_as(actor);
     let note = ReviewNote {
         note_id: ReviewNoteId::new(),
         review_id: rid,
-        body: body.clone(),
+        body,
         scope: scope.clone(),
-        authored_by: kin_model::IdentityRef::human("cli-user"),
+        authored_by: identity,
         created_at: Timestamp::now(),
     };
 
-    graph.add_review_note(&note)?;
     let mut text = format!("Added note {} to review {}\n", note.note_id, review_id);
     if let Some(s) = scope {
         writeln!(text, "  Scope: {}", s)?;
     }
-    Ok(ReviewExecution {
-        response: ReviewResponse { text, json: None },
-        mutated: true,
+    Ok(PlannedReviewEvent {
+        action: "review.note",
+        review_id: rid,
+        details: format!("review_id={review_id}; note_id={}", note.note_id),
+        actor_label,
+        refs: None,
+        answer: ReviewResponse { text, json: None },
+        write: ReviewWrite {
+            notes: vec![note],
+            ..ReviewWrite::default()
+        },
     })
 }
 
@@ -811,20 +853,22 @@ pub async fn start_discussion(
             review_id,
             body,
             scope,
+            actor: Some(crate::provenance::current_actor_label()),
         })
         .await?,
     );
     Ok(())
 }
 
-fn start_discussion_with_graph(
+fn plan_discuss(
     graph: &kin_db::InMemoryGraph,
     review_id: String,
     body: String,
     scope: Option<String>,
-) -> Result<ReviewExecution> {
+    actor: Option<String>,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
     use kin_model::review::{
-        ReviewComment, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewId,
+        ReviewComment, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState,
     };
     use kin_model::timestamp::Timestamp;
 
@@ -832,21 +876,23 @@ fn start_discussion_with_graph(
         .as_deref()
         .map(crate::commands::work::parse_work_scope)
         .transpose()?;
-    let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
+    let rid = parse_review_id(&review_id)?;
+    existing_review(graph, rid)?;
+    let (actor_label, identity) = acting_as(actor);
+    let now = Timestamp::now();
     let discussion = ReviewDiscussion {
         discussion_id: ReviewDiscussionId::new(),
         review_id: rid,
         scope: scope.clone(),
         state: ReviewDiscussionState::Open,
         comments: vec![ReviewComment {
-            body: body.clone(),
-            authored_by: kin_model::IdentityRef::human("cli-user"),
-            created_at: Timestamp::now(),
+            body,
+            authored_by: identity,
+            created_at: now.clone(),
         }],
-        created_at: Timestamp::now(),
+        created_at: now,
     };
 
-    graph.create_review_discussion(&discussion)?;
     let mut text = format!(
         "Started discussion {} on review {}",
         discussion.discussion_id, review_id
@@ -855,9 +901,20 @@ fn start_discussion_with_graph(
     if let Some(s) = scope {
         writeln!(text, "  Scope: {}", s)?;
     }
-    Ok(ReviewExecution {
-        response: ReviewResponse { text, json: None },
-        mutated: true,
+    Ok(PlannedReviewEvent {
+        action: "review.discuss",
+        review_id: rid,
+        details: format!(
+            "review_id={review_id}; discussion_id={}",
+            discussion.discussion_id
+        ),
+        actor_label,
+        refs: None,
+        answer: ReviewResponse { text, json: None },
+        write: ReviewWrite {
+            discussions: vec![discussion],
+            ..ReviewWrite::default()
+        },
     })
 }
 
@@ -866,56 +923,91 @@ pub async fn reply_discussion(discussion_id: String, body: String) -> Result<()>
         run_daemon_review(&ReviewRequest::Reply {
             discussion_id,
             body,
+            actor: Some(crate::provenance::current_actor_label()),
         })
         .await?,
     );
     Ok(())
 }
 
-fn reply_discussion_with_graph(
+fn plan_reply(
     graph: &kin_db::InMemoryGraph,
     discussion_id: String,
     body: String,
-) -> Result<ReviewExecution> {
+    actor: Option<String>,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
     use kin_model::review::{ReviewComment, ReviewDiscussionId};
     use kin_model::timestamp::Timestamp;
 
     let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
-    let comment = ReviewComment {
-        body: body.clone(),
-        authored_by: kin_model::IdentityRef::human("cli-user"),
+    let mut discussion = existing_discussion(graph, did)?;
+    let (actor_label, identity) = acting_as(actor);
+    discussion.comments.push(ReviewComment {
+        body,
+        authored_by: identity,
         created_at: Timestamp::now(),
-    };
-
-    graph.add_discussion_comment(&did, &comment)?;
-    Ok(ReviewExecution {
-        response: ReviewResponse {
+    });
+    Ok(PlannedReviewEvent {
+        action: "review.reply",
+        review_id: discussion.review_id,
+        details: format!("discussion_id={discussion_id}"),
+        actor_label,
+        refs: None,
+        answer: ReviewResponse {
             text: format!("Replied to discussion {}\n", discussion_id),
             json: None,
         },
-        mutated: true,
+        write: ReviewWrite {
+            discussions: vec![discussion],
+            ..ReviewWrite::default()
+        },
     })
 }
 
 pub async fn resolve_discussion(discussion_id: String) -> Result<()> {
-    print_review_response(run_daemon_review(&ReviewRequest::Resolve { discussion_id }).await?);
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Resolve {
+            discussion_id,
+            actor: Some(crate::provenance::current_actor_label()),
+        })
+        .await?,
+    );
     Ok(())
 }
 
-fn resolve_discussion_with_graph(
+fn plan_resolve(
     graph: &kin_db::InMemoryGraph,
     discussion_id: String,
-) -> Result<ReviewExecution> {
+    actor: Option<String>,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
     use kin_model::review::{ReviewDiscussionId, ReviewDiscussionState};
 
     let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
-    graph.set_discussion_state(&did, ReviewDiscussionState::Resolved)?;
-    Ok(ReviewExecution {
-        response: ReviewResponse {
+    let mut discussion = existing_discussion(graph, did)?;
+    let (actor_label, _identity) = acting_as(actor);
+    let review_id = discussion.review_id;
+    // A thread that is already resolved changes nothing, so nothing is written
+    // and no transaction is spent on it.
+    let write = if discussion.state == ReviewDiscussionState::Resolved {
+        ReviewWrite::default()
+    } else {
+        discussion.state = ReviewDiscussionState::Resolved;
+        ReviewWrite {
+            discussions: vec![discussion],
+            ..ReviewWrite::default()
+        }
+    };
+    Ok(PlannedReviewEvent {
+        action: "review.resolve",
+        review_id,
+        details: format!("discussion_id={discussion_id}"),
+        actor_label,
+        refs: None,
+        answer: ReviewResponse {
             text: format!("Resolved discussion {}\n", discussion_id),
             json: None,
         },
-        mutated: true,
+        write,
     })
 }
 
@@ -924,36 +1016,187 @@ pub async fn assign_reviewer(review_id: String, reviewer: String) -> Result<()> 
         run_daemon_review(&ReviewRequest::Assign {
             review_id,
             reviewer,
+            actor: Some(crate::provenance::current_actor_label()),
         })
         .await?,
     );
     Ok(())
 }
 
-fn assign_reviewer_with_graph(
+fn plan_assign(
     graph: &kin_db::InMemoryGraph,
     review_id: String,
     reviewer: String,
-) -> Result<ReviewExecution> {
-    use kin_model::review::{ReviewAssignment, ReviewId};
+    actor: Option<String>,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
+    use kin_model::review::ReviewAssignment;
     use kin_model::timestamp::Timestamp;
 
-    let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
-    let assignment = ReviewAssignment {
+    let rid = parse_review_id(&review_id)?;
+    existing_review(graph, rid)?;
+    let (actor_label, identity) = acting_as(actor);
+    let mut entries = graph.get_review_assignments(&rid)?;
+    entries.push(ReviewAssignment {
         review_id: rid,
         reviewer: kin_model::IdentityRef::human(&reviewer),
         assigned_at: Timestamp::now(),
-        assigned_by: kin_model::IdentityRef::human("cli-user"),
-    };
-
-    graph.assign_reviewer(&assignment)?;
-    Ok(ReviewExecution {
-        response: ReviewResponse {
+        assigned_by: identity,
+    });
+    Ok(PlannedReviewEvent {
+        action: "review.assign",
+        review_id: rid,
+        details: format!("review_id={review_id}; reviewer={reviewer}"),
+        actor_label,
+        refs: None,
+        answer: ReviewResponse {
             text: format!("Assigned {} to review {}\n", reviewer, review_id),
             json: None,
         },
-        mutated: true,
+        write: ReviewWrite {
+            assignments: Some(ReviewGroup {
+                review_id: rid,
+                entries,
+            }),
+            ..ReviewWrite::default()
+        },
     })
+}
+
+/// Plan one review mutation against `graph` without writing anything.
+///
+/// Review state is repository authority. The daemon's review writer commits the
+/// planned records as one collaboration-only transaction and only then applies
+/// them to its live graph, so a review answers after a restart exactly as it
+/// did before one. This is the half that needs only the request and the graph.
+pub fn plan_review_mutation(
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+) -> Result<PlannedReviewEvent<ReviewResponse>> {
+    match request {
+        ReviewRequest::Create {
+            title,
+            base,
+            head,
+            description,
+            actor,
+        } => plan_create(title, base, head, description, actor),
+        ReviewRequest::Decide {
+            review_id,
+            state,
+            comment,
+            actor,
+        } => plan_decide(graph, review_id, state, comment, actor),
+        ReviewRequest::Note {
+            review_id,
+            body,
+            scope,
+            actor,
+        } => plan_note(graph, review_id, body, scope, actor),
+        ReviewRequest::Discuss {
+            review_id,
+            body,
+            scope,
+            actor,
+        } => plan_discuss(graph, review_id, body, scope, actor),
+        ReviewRequest::Reply {
+            discussion_id,
+            body,
+            actor,
+        } => plan_reply(graph, discussion_id, body, actor),
+        ReviewRequest::Resolve {
+            discussion_id,
+            actor,
+        } => plan_resolve(graph, discussion_id, actor),
+        ReviewRequest::Assign {
+            review_id,
+            reviewer,
+            actor,
+        } => plan_assign(graph, review_id, reviewer, actor),
+        ReviewRequest::Run { .. }
+        | ReviewRequest::Shadow { .. }
+        | ReviewRequest::List { .. }
+        | ReviewRequest::Show { .. } => {
+            anyhow::bail!("this review request reads review state and writes nothing")
+        }
+    }
+}
+
+/// The changes a review's base and head refs resolve to under `lease`, as audit
+/// detail.
+///
+/// Recorded when a review is created, so its provenance still names the exact
+/// changes it was opened against after either ref moves. A ref that resolves to
+/// nothing, such as the `working-tree` an MCP caller may name, is recorded as
+/// unresolved rather than failing the write. Read from the lease the writer
+/// already holds, so it costs no second authority open.
+pub fn review_ref_provenance(
+    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+    workspace_id: &kin_model::WorkspaceId,
+    graph: &kin_db::InMemoryGraph,
+    base: &str,
+    head: &str,
+) -> String {
+    let authority = crate::commands::ref_grammar::Authority::held(lease, workspace_id);
+    let resolve = |reference: &str| {
+        crate::commands::ref_grammar::resolve(&authority, graph, reference)
+            .map(|resolved| resolved.change_id.to_string())
+            .unwrap_or_else(|_| "unresolved".to_string())
+    };
+    format!(
+        "base_change={}; head_change={}",
+        resolve(base),
+        resolve(head)
+    )
+}
+
+/// The label and identity a review event acts as: the caller's own when it sent
+/// one, this process's otherwise.
+fn acting_as(actor: Option<String>) -> (String, kin_model::IdentityRef) {
+    let label = actor
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(crate::provenance::current_actor_label);
+    let identity = crate::provenance::identity_for_label(&label);
+    (label, identity)
+}
+
+fn parse_review_id(review_id: &str) -> Result<kin_model::review::ReviewId> {
+    Ok(kin_model::review::ReviewId(uuid::Uuid::parse_str(
+        review_id,
+    )?))
+}
+
+fn existing_review(
+    graph: &kin_db::InMemoryGraph,
+    review_id: kin_model::review::ReviewId,
+) -> Result<kin_model::review::Review> {
+    graph
+        .get_review(&review_id)?
+        .ok_or_else(|| anyhow::Error::new(ReviewNotFound(review_id.to_string())))
+}
+
+/// The discussion with `discussion_id`, found through the reviews that hold
+/// discussions, since the store answers discussions by review.
+fn existing_discussion(
+    graph: &kin_db::InMemoryGraph,
+    discussion_id: kin_model::review::ReviewDiscussionId,
+) -> Result<kin_model::review::ReviewDiscussion> {
+    let every_review = kin_model::review::ReviewFilter {
+        states: None,
+        reviewer: None,
+    };
+    for review in graph.list_reviews(&every_review)? {
+        let found = graph
+            .get_review_discussions(&review.review_id)?
+            .into_iter()
+            .find(|discussion| discussion.discussion_id == discussion_id);
+        if let Some(discussion) = found {
+            return Ok(discussion);
+        }
+    }
+    Err(anyhow::Error::new(ReviewTargetMissing(format!(
+        "review discussion not found: {discussion_id}"
+    ))))
 }
 
 pub async fn list_reviews(state: Option<String>) -> Result<()> {
@@ -1130,7 +1373,6 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
 mod tests {
     use super::*;
     use kin_db::LocalFileBackend;
-    use kin_model::ProvenanceStore;
     use kin_model::{RepositoryId, WorkspaceId};
     use std::sync::Arc;
 
@@ -1150,61 +1392,178 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_review_records_audit_event() {
-        let graph = kin_db::InMemoryGraph::new();
+    fn create_request(actor: &str) -> ReviewRequest {
+        ReviewRequest::Create {
+            title: "Fix login".into(),
+            base: "main".into(),
+            head: "feature/login".into(),
+            description: Some("body edit".into()),
+            actor: Some(actor.into()),
+        }
+    }
 
-        create_review_with_graph(
+    /// Planning a review writes nothing and states everything the writer needs:
+    /// the records, the audit action and its details, the refs to resolve, and
+    /// who is acting.
+    #[test]
+    fn planning_a_review_writes_nothing_and_names_its_refs() {
+        let graph = kin_db::InMemoryGraph::new();
+        let planned = plan_review_mutation(&graph, create_request("troy")).unwrap();
+
+        assert_eq!(planned.action, "review.create");
+        assert!(planned.records_audit_event());
+        assert!(
+            planned.details.contains("base=main") && planned.details.contains("head=feature/login"),
+            "audit details should carry review refs: {}",
+            planned.details
+        );
+        assert_eq!(
+            planned.refs,
+            Some(("main".to_string(), "feature/login".to_string()))
+        );
+        assert_eq!(planned.actor_label, "troy");
+        let review = planned
+            .write
+            .review
+            .as_ref()
+            .expect("a create writes the review");
+        assert_eq!(review.created_by, kin_model::IdentityRef::human("troy"));
+        assert_eq!(
+            planned.write.notes.len(),
+            1,
+            "the description is the review's first note"
+        );
+        planned
+            .write
+            .to_delta()
+            .expect("a planned create is a valid collaboration delta");
+        assert!(
+            graph
+                .list_reviews(&kin_model::review::ReviewFilter::default())
+                .unwrap()
+                .is_empty(),
+            "planning must not write"
+        );
+        assert!(planned
+            .answer
+            .text
+            .starts_with(&format!("Created review {}", planned.review_id)));
+    }
+
+    /// A decision moves the review's state and carries the whole history.
+    ///
+    /// Falsify by dropping the state assignment in `plan_decide`: the review then
+    /// reads pending after an approval, which is what every read printed before.
+    #[test]
+    fn a_planned_decision_moves_the_review_and_carries_its_history() {
+        use kin_model::review::ReviewDecisionState;
+
+        let graph = kin_db::InMemoryGraph::new();
+        let created = plan_review_mutation(&graph, create_request("troy")).unwrap();
+        created.write.apply_to(&graph).unwrap();
+        let review_id = created.review_id.to_string();
+
+        let first = plan_review_mutation(
             &graph,
-            "Fix login".into(),
-            "main".into(),
-            "feature/login".into(),
-            Some("body edit".into()),
+            ReviewRequest::Decide {
+                review_id: review_id.clone(),
+                state: "needs_work".into(),
+                comment: None,
+                actor: Some("alice".into()),
+            },
+        )
+        .unwrap();
+        first.write.apply_to(&graph).unwrap();
+        let second = plan_review_mutation(
+            &graph,
+            ReviewRequest::Decide {
+                review_id,
+                state: "approved".into(),
+                comment: Some("ship it".into()),
+                actor: Some("bob".into()),
+            },
         )
         .unwrap();
 
-        let events = graph.query_audit_events(None, 10).unwrap();
-        assert_eq!(events.len(), 1, "review create must record one audit event");
-        assert_eq!(events[0].action, "review.create");
-        let details = events[0].details.as_deref().unwrap_or_default();
-        assert!(
-            details.contains("base=main") && details.contains("head=feature/login"),
-            "audit details should carry review refs: {details}"
+        assert_eq!(second.action, "review.decide");
+        assert_eq!(
+            second.write.review.as_ref().unwrap().state,
+            ReviewDecisionState::Approved
+        );
+        let history = &second.write.decisions.as_ref().unwrap().entries;
+        assert_eq!(
+            history
+                .iter()
+                .map(|decision| decision.state)
+                .collect::<Vec<_>>(),
+            vec![
+                ReviewDecisionState::NeedsWork,
+                ReviewDecisionState::Approved
+            ]
+        );
+        second.write.apply_to(&graph).unwrap();
+        assert_eq!(
+            graph.get_review(&created.review_id).unwrap().unwrap().state,
+            ReviewDecisionState::Approved
         );
     }
 
+    /// Resolving a resolved thread plans an empty write, so the writer spends no
+    /// transaction on it.
     #[test]
-    fn decide_review_records_audit_event() {
+    fn resolving_a_resolved_discussion_writes_nothing() {
         let graph = kin_db::InMemoryGraph::new();
-
-        let execution = create_review_with_graph(
+        let created = plan_review_mutation(&graph, create_request("troy")).unwrap();
+        created.write.apply_to(&graph).unwrap();
+        let discuss = plan_review_mutation(
             &graph,
-            "Fix login".into(),
-            "main".into(),
-            "feature/login".into(),
-            None,
+            ReviewRequest::Discuss {
+                review_id: created.review_id.to_string(),
+                body: "why this shape?".into(),
+                scope: None,
+                actor: None,
+            },
         )
         .unwrap();
-        // Recover the review id from the create response text.
-        let review_id = execution
-            .response
-            .text
-            .lines()
-            .find_map(|line| line.strip_prefix("Created review "))
-            .map(|s| s.trim().to_string())
-            .expect("review id in create response");
+        discuss.write.apply_to(&graph).unwrap();
+        let discussion_id = discuss.write.discussions[0].discussion_id.to_string();
 
-        decide_review_with_graph(&graph, review_id, "approved".into(), None).unwrap();
-
-        let events = graph.query_audit_events(None, 10).unwrap();
-        assert_eq!(
-            events.len(),
-            2,
-            "create + decide must each record an audit event"
+        let resolve = || {
+            plan_review_mutation(
+                &graph,
+                ReviewRequest::Resolve {
+                    discussion_id: discussion_id.clone(),
+                    actor: None,
+                },
+            )
+            .unwrap()
+        };
+        let first = resolve();
+        assert!(!first.write.is_empty());
+        first.write.apply_to(&graph).unwrap();
+        assert!(
+            resolve().write.is_empty(),
+            "a resolved thread has nothing left to resolve"
         );
-        // query_audit_events returns most-recent first.
-        assert_eq!(events[0].action, "review.decide");
-        assert_eq!(events[1].action, "review.create");
+    }
+
+    /// A mutation never runs through the read executor, which has no repository
+    /// authority to commit it to.
+    #[tokio::test]
+    async fn the_read_executor_refuses_a_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let graph = kin_db::InMemoryGraph::new();
+
+        let error =
+            execute_review_request(&absent_binding(&layout), &graph, create_request("troy"))
+                .await
+                .expect_err("a mutation must not execute without the review writer");
+        assert!(error.to_string().contains("review writer"), "{error}");
+        assert!(graph
+            .list_reviews(&kin_model::review::ReviewFilter::default())
+            .unwrap()
+            .is_empty());
     }
 
     /// A query for raw Git commits that were never imported must fail from
