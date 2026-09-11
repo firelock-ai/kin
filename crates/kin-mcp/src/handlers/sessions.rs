@@ -1462,63 +1462,217 @@ tool error you can read and retry from, never as a protocol fault: a malformed o
 a body Kin cut short, a failed validation and a refused commit all return the structured reason, \
 and a refused commit leaves no transaction behind.";
 
+/// Decode and check the operations a `kin_mutate` call carries.
+///
+/// Shared by both routes so the belt gets one contract whatever is serving it,
+/// and returning the refusal rather than an `Err` because every refusal here is
+/// a tool error: the caller is a model that just wrote this argument, and the
+/// one-shot is only worth having if a rejected attempt is retryable from what
+/// came back. A JSON-RPC fault leaves the client to decide whether the model
+/// ever sees the reason, while `is_error` puts it in the transcript the next
+/// turn reads.
+fn checked_mutate_operations(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<&serde_json::Value, ToolCallResult> {
+    let Some(ops_val) = arguments.get("operations") else {
+        return Err(ToolCallResult::error(
+            "Missing required parameter: 'operations' array is required for kin_mutate.",
+        ));
+    };
+    let parsed = crate::session::parse_staged_operations(ops_val).map_err(ToolCallResult::error)?;
+    crate::session::validate_staged_operations(&parsed).map_err(ToolCallResult::error)?;
+    reject_truncated_bodies(&parsed).map_err(ToolCallResult::error)?;
+    Ok(ops_val)
+}
+
+/// The session a daemon-owned mutation belongs to, or the refusal that names it.
+///
+/// The daemon owns sessions and resolves a transaction against one it holds, so
+/// there is nothing here to fall back to: a session invented locally is an id
+/// the daemon has never heard of, and `kin_transaction_begin` refuses it one
+/// call later with a message about a session rather than about the argument
+/// that was actually missing. Say the true thing at the call that can still be
+/// fixed, and name the tool that produces the id.
+fn required_session(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<String, ToolCallResult> {
+    arguments
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ToolCallResult::error(
+                "Missing required parameter: 'session_id'. This server's sessions are owned by \
+                 the Kin daemon, so a mutation names the session it belongs to. Call \
+                 kin_session_start first and pass the session_id it returns; an agent harness \
+                 that already holds the session fills this in for you.",
+            )
+        })
+}
+
+/// Stamp the caller's own request id into a receipt it can match its retry against.
+fn carry_request_id(result: &mut ToolCallResult, request_id: Option<&str>) {
+    let Some(request_id) = request_id else {
+        return;
+    };
+    let Some(crate::types::ContentBlock::Text { text }) = result.content.first_mut() else {
+        return;
+    };
+    let Ok(mut map) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if let Some(obj) = map.as_object_mut() {
+        obj.insert("request_id".to_string(), serde_json::json!(request_id));
+        *text = serde_json::to_string_pretty(&obj).unwrap_or_else(|_| text.clone());
+    }
+}
+
+/// `kin_mutate` against a daemon that owns repository authority, with no graph
+/// store of its own.
+///
+/// Expanded HERE, on the near side of the forward, and that placement is the
+/// whole point rather than a convenience. In a daemon-backed deployment the MCP
+/// server forwards every tool call it does not answer itself, and the daemon
+/// runs what arrives through `handlers::handle_tool_call` under
+/// `SessionAuthorityMode::OfflineFallback`, because inside the daemon its own
+/// registry IS the authority. A `kin_mutate` that travelled whole would
+/// therefore reach `handle_mutate` with `uses_daemon()` FALSE, take the
+/// in-process branch, and be refused by it: that path has no projection and
+/// correctly declines a source body rather than reporting a success that
+/// discarded it. Meanwhile the daemon routes exactly one name,
+/// `kin_transaction_commit`, to its exact-commit path.
+///
+/// So the one-shot is expanded before the forward, and what crosses to the
+/// daemon is a begin and a commit by those names. The commit carries the
+/// operations inline, which `kin_transaction_commit` has always accepted, and
+/// it carries a `transaction_id`, which is what the daemon's transaction
+/// coordination preflight keys on. A one-shot expanded on the far side would
+/// have had neither.
+///
+/// A refused commit is aborted rather than left open, so a caller that retries
+/// is not accumulating transactions it never asked for.
+pub async fn mutate_through_daemon(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<ToolCallResult> {
+    let ops_val = match checked_mutate_operations(arguments) {
+        Ok(ops_val) => ops_val,
+        Err(refusal) => return Ok(refusal),
+    };
+    let session_id = match required_session(arguments) {
+        Ok(session_id) => session_id,
+        Err(refusal) => return Ok(refusal),
+    };
+    let scope = arguments
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("repository")
+        .to_string();
+    let request_id = arguments
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let begin_args = HashMap::from([
+        ("session_id".to_string(), serde_json::json!(session_id)),
+        ("scope".to_string(), serde_json::json!(scope)),
+    ]);
+    let begin_res =
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_begin", &begin_args).await
+        {
+            Ok(Some(res)) => res,
+            Ok(None) => return Ok(daemon_required_unavailable("transaction begin")),
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        };
+    if begin_res.is_error == Some(true) {
+        return Ok(begin_res);
+    }
+
+    let tx_id = begin_res
+        .content
+        .first()
+        .and_then(|block| match block {
+            crate::types::ContentBlock::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).ok()
+            }
+        })
+        .and_then(|value| {
+            value
+                .get("transaction_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let Some(tx_id) = tx_id else {
+        return Ok(ToolCallResult::error(
+            "kin_transaction_begin answered without a transaction_id, so this mutation has no \
+             transaction to commit. Nothing was applied.",
+        ));
+    };
+
+    let mut commit_args = HashMap::from([
+        ("transaction_id".to_string(), serde_json::json!(tx_id)),
+        ("session_id".to_string(), serde_json::json!(session_id)),
+        ("operations".to_string(), ops_val.clone()),
+    ]);
+    // `message`, not `description`. `description` is already the name of the
+    // per-operation field, and the daemon reads `message` off the commit call as
+    // the change message a human will read in history. Sending the summary under
+    // the other name is how it used to be dropped silently: nothing consumed it,
+    // and every change still read "MCP transaction <id>".
+    if let Some(summary) = commit_message_argument(arguments) {
+        commit_args.insert("message".to_string(), serde_json::json!(summary));
+    }
+
+    match crate::daemon_delegate::forward_tool_call("kin_transaction_commit", &commit_args).await {
+        Ok(Some(mut value)) => {
+            if value.is_error == Some(true) {
+                let abort_args = HashMap::from([
+                    ("transaction_id".to_string(), serde_json::json!(tx_id)),
+                    ("session_id".to_string(), serde_json::json!(session_id)),
+                ]);
+                let _ =
+                    crate::daemon_delegate::forward_tool_call("kin_transaction_abort", &abort_args)
+                        .await;
+            } else {
+                carry_request_id(&mut value, request_id.as_deref());
+            }
+            Ok(value)
+        }
+        Ok(None) => Ok(daemon_required_unavailable("transaction commit")),
+        Err(err) => Ok(ToolCallResult::error(err)),
+    }
+}
+
 pub async fn handle_mutate<G: GraphStore>(
     arguments: &HashMap<String, serde_json::Value>,
     store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
-    let Some(ops_val) = arguments.get("operations") else {
-        return Ok(ToolCallResult::error(
-            "Missing required parameter: 'operations' array is required for kin_mutate.",
-        ));
-    };
-
-    // Every refusal below is a tool error, not a protocol error. The caller is a
-    // model that just wrote this argument, and the whole point of the one-shot
-    // is that a rejected attempt is retryable from what came back: a JSON-RPC
-    // fault leaves the client to decide whether the model ever sees the reason,
-    // while `is_error` puts it in the transcript the next turn reads. The
-    // missing-`operations` case above has always answered this way; parse and
-    // validate now match it.
-    let parsed = match crate::session::parse_staged_operations(ops_val) {
-        Ok(parsed) => parsed,
-        Err(error) => return Ok(ToolCallResult::error(error)),
-    };
-    if let Err(error) = crate::session::validate_staged_operations(&parsed) {
-        return Ok(ToolCallResult::error(error));
-    }
-    if let Err(error) = reject_truncated_bodies(&parsed) {
-        return Ok(ToolCallResult::error(error));
+    if session_authority_mode.uses_daemon() {
+        return mutate_through_daemon(arguments).await;
     }
 
-    // In daemon mode the local registry is not the authority. The daemon owns
-    // sessions and resolves a transaction against one it holds, so reaching into
-    // the local registry here, or inventing a session in it, produces an id the
-    // daemon has never heard of; `kin_transaction_begin` then refuses one call
-    // later with a message about a session rather than about the argument that
-    // was actually missing. Say the true thing at the call that can still be
-    // fixed, and name the tool that produces the id.
-    let named_session = arguments
+    let ops_val = match checked_mutate_operations(arguments) {
+        Ok(ops_val) => ops_val,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    // Offline, the local registry IS the authority, so a caller that names no
+    // session gets one rather than a refusal: there is no other party whose
+    // idea of a session this could disagree with.
+    let session_id = match arguments
         .get("session_id")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if session_authority_mode.uses_daemon() && named_session.is_none() {
-        return Ok(ToolCallResult::error(
-            "Missing required parameter: 'session_id'. This server's sessions are owned by the \
-             Kin daemon, so a mutation names the session it belongs to. Call kin_session_start \
-             first and pass the session_id it returns; an agent harness that already holds the \
-             session fills this in for you.",
-        ));
-    }
-    let session_id = match named_session {
-        Some(s) => s.to_string(),
-        None => {
-            if let Some(s) = sessions.list_agent_sessions().first() {
-                s.session_id.to_string()
-            } else {
-                let s = sessions.start_agent_session(
+        .filter(|value| !value.is_empty())
+    {
+        Some(session_id) => session_id.to_string(),
+        None => match sessions.list_agent_sessions().first() {
+            Some(existing) => existing.session_id.to_string(),
+            None => sessions
+                .start_agent_session(
                     "kin",
                     "kin_agent",
                     kin_model::session::SessionTransport::Mcp,
@@ -1529,128 +1683,23 @@ pub async fn handle_mutate<G: GraphStore>(
                         can_commit: true,
                         ..Default::default()
                     },
-                );
-                s.session_id.to_string()
-            }
-        }
+                )
+                .session_id
+                .to_string(),
+        },
     };
-
     let scope = arguments
         .get("scope")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("repository")
         .to_string();
-
     let request_id = arguments
         .get("request_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
 
-    if session_authority_mode.uses_daemon() {
-        let begin_args = HashMap::from([
-            ("session_id".to_string(), serde_json::json!(session_id)),
-            ("scope".to_string(), serde_json::json!(scope)),
-        ]);
-        let begin_res =
-            match crate::daemon_delegate::forward_tool_call("kin_transaction_begin", &begin_args)
-                .await
-            {
-                Ok(Some(res)) => res,
-                Ok(None) if session_authority_mode.requires_daemon() => {
-                    return Ok(daemon_required_unavailable("transaction begin"));
-                }
-                Ok(None) => {
-                    return Ok(ToolCallResult::error(
-                        "Daemon returned empty response for kin_transaction_begin",
-                    ))
-                }
-                Err(err) => return Ok(ToolCallResult::error(err)),
-            };
-
-        if begin_res.is_error == Some(true) {
-            return Ok(begin_res);
-        }
-
-        let tx_id = begin_res
-            .content
-            .first()
-            .and_then(|c| match c {
-                crate::types::ContentBlock::Text { text } => {
-                    serde_json::from_str::<serde_json::Value>(text).ok()
-                }
-            })
-            .and_then(|v| {
-                v.get("transaction_id")
-                    .or_else(|| v.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            });
-
-        let Some(tx_id) = tx_id else {
-            return Ok(ToolCallResult::error(
-                "Failed to extract transaction_id from begin response",
-            ));
-        };
-
-        let mut commit_args = HashMap::from([
-            ("transaction_id".to_string(), serde_json::json!(tx_id)),
-            ("session_id".to_string(), serde_json::json!(session_id)),
-            ("operations".to_string(), ops_val.clone()),
-        ]);
-        // `message`, not `description`. `description` is already the name of the
-        // per-operation field, and the daemon reads `message` off the commit
-        // call as the change message a human will read in history. Sending the
-        // summary under the other name is how it used to be dropped silently:
-        // nothing consumed it, and every change still read "MCP transaction
-        // <id>".
-        if let Some(summary) = commit_message_argument(arguments) {
-            commit_args.insert("message".to_string(), serde_json::json!(summary));
-        }
-
-        match crate::daemon_delegate::forward_tool_call("kin_transaction_commit", &commit_args)
-            .await
-        {
-            Ok(Some(mut value)) => {
-                if value.is_error == Some(true) {
-                    let abort_args = HashMap::from([
-                        ("transaction_id".to_string(), serde_json::json!(tx_id)),
-                        ("session_id".to_string(), serde_json::json!(session_id)),
-                    ]);
-                    let _ = crate::daemon_delegate::forward_tool_call(
-                        "kin_transaction_abort",
-                        &abort_args,
-                    )
-                    .await;
-                } else if let Some(req_id) = request_id {
-                    if let Some(crate::types::ContentBlock::Text { text }) =
-                        value.content.first_mut()
-                    {
-                        if let Ok(mut map) = serde_json::from_str::<serde_json::Value>(text) {
-                            if let Some(obj) = map.as_object_mut() {
-                                obj.insert("request_id".to_string(), serde_json::json!(req_id));
-                                *text = serde_json::to_string_pretty(&obj)
-                                    .unwrap_or_else(|_| text.clone());
-                            }
-                        }
-                    }
-                }
-                return Ok(value);
-            }
-            Ok(None) if session_authority_mode.requires_daemon() => {
-                return Ok(daemon_required_unavailable("transaction commit"));
-            }
-            Ok(None) => {
-                return Ok(ToolCallResult::error(
-                    "Daemon returned empty response for commit",
-                ))
-            }
-            Err(err) => return Ok(ToolCallResult::error(err)),
-        }
-    }
-
-    // In-process offline mode:
     let tx = match sessions.begin_transaction(&session_id, &scope) {
-        Ok(t) => t,
+        Ok(tx) => tx,
         Err(err) => return Ok(ToolCallResult::error(err)),
     };
     let tx_id = tx.transaction_id.clone();
@@ -1670,15 +1719,8 @@ pub async fn handle_mutate<G: GraphStore>(
             ("session_id".to_string(), serde_json::json!(session_id)),
         ]);
         let _ = handle_transaction_abort(&abort_args, sessions, session_authority_mode).await;
-    } else if let Some(req_id) = request_id {
-        if let Some(crate::types::ContentBlock::Text { text }) = res.content.first_mut() {
-            if let Ok(mut map) = serde_json::from_str::<serde_json::Value>(text) {
-                if let Some(obj) = map.as_object_mut() {
-                    obj.insert("request_id".to_string(), serde_json::json!(req_id));
-                    *text = serde_json::to_string_pretty(&obj).unwrap_or_else(|_| text.clone());
-                }
-            }
-        }
+    } else {
+        carry_request_id(&mut res, request_id.as_deref());
     }
     Ok(res)
 }

@@ -374,6 +374,33 @@ fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
     );
 }
 
+/// `KIN_AGENT_PURE_KIN` means what kin-core's env registry says a boolean means.
+///
+/// Read through the pure function rather than the process environment, because
+/// tests share one process and a test that sets an environment variable races
+/// every other test that reads it.
+#[test]
+fn the_pure_kin_switch_reads_booleans_the_way_the_env_registry_does() {
+    for on in ["1", "true", "yes", "on", "TRUE", " On "] {
+        assert!(
+            belt::pure_kin_requested(Some(on)),
+            "{on:?} should lock the belt"
+        );
+    }
+    // The case this replaced: the old reading treated everything except `0`
+    // and `false` as on, so an operator who wrote `off` got the locked belt.
+    for off in ["0", "false", "no", "off", "OFF", "", "maybe"] {
+        assert!(
+            !belt::pure_kin_requested(Some(off)),
+            "{off:?} should leave the full belt"
+        );
+    }
+    assert!(
+        !belt::pure_kin_requested(None),
+        "unset leaves the full belt"
+    );
+}
+
 /// The harness supplies the session `kin_mutate` needs and the model cannot see.
 ///
 /// `kin_session_start` is harness-owned, so the model never learns the session

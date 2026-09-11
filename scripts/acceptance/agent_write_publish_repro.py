@@ -237,8 +237,12 @@ def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace,
         problems.append("a belt with no file tools recorded files_changed=%r"
                         % (agent.get("files_changed"),))
 
-    if not any(message and message.startswith(MUTATE_SUMMARY) for message in messages):
-        problems.append("no recorded change message opens with %r; the newest are %r"
+    # Read for the sentence anywhere in the message, not only as its first line.
+    # A commit that folds admitted working-tree content puts the fold in the
+    # subject and the caller's words in the body, and whether earlier checks in
+    # this suite left anything pending is not what this check is about.
+    if not any(message and MUTATE_SUMMARY in message for message in messages):
+        problems.append("no recorded change message carries %r; the newest are %r"
                         % (MUTATE_SUMMARY, messages[:2]))
 
     if problems:
@@ -826,6 +830,12 @@ def self_test():
                              "operations": [{"verb": "update", "target": "mutable"}]}}]
     kin_only = {"kin_agent": {"entities_changed": ["mutable"], "files_changed": []}}
     said_it = [MUTATE_SUMMARY + "\n\nMCP transaction 0000", "MCP transaction 0001"]
+    # The same sentence where a commit that folded pending working-tree content
+    # puts it: the subject declares the fold and the caller's words open the
+    # body. Whether an earlier check in this suite left anything pending is not
+    # what this check is about, so both shapes have to read as "it said it".
+    said_it_under_a_fold = ["MCP transaction 0000 (also admitted 1 pending working-tree file)"
+                            "\n\n" + MUTATE_SUMMARY + "\n\nThe workspace already held ..."]
     said_nothing = ["MCP transaction 0000", "MCP transaction 0001"]
 
     expect("pure-kin mutate lands",
@@ -837,6 +847,9 @@ def self_test():
     expect("pure-kin mutate went out with no session",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, unsessioned,
                                        kin_only, said_it)[0], FAIL)
+    expect("pure-kin mutate said it under a fold",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
+                                       kin_only, said_it_under_a_fold)[0], PASS)
     expect("pure-kin mutate recorded only the transaction line",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
                                        kin_only, said_nothing)[0], FAIL)

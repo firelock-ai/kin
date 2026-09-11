@@ -1416,6 +1416,35 @@ async fn handle_tools_call_daemon(
         return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
     }
 
+    // `kin_mutate` is expanded here rather than forwarded, and that is a
+    // correctness requirement rather than an optimisation.
+    //
+    // Everything below this point is handed to the daemon under the name the
+    // caller used, and the daemon runs what arrives through
+    // `handlers::handle_tool_call` with `SessionAuthorityMode::OfflineFallback`,
+    // because inside the daemon its own registry IS the authority. A forwarded
+    // `kin_mutate` therefore reaches `handle_mutate` with `uses_daemon()` FALSE
+    // and takes the in-process branch, whose commit has no projection and
+    // correctly refuses a source body rather than reporting a success that
+    // discarded it. And the daemon routes exactly one name,
+    // `kin_transaction_commit`, to its exact-commit path, so a one-shot under
+    // any other name never reaches it at all.
+    //
+    // Expanding on this side sends a begin and a commit under the names the
+    // daemon matches, with the operations inline on the commit, which
+    // `kin_transaction_commit` has always accepted, and with a
+    // `transaction_id`, which is what the daemon's transaction coordination
+    // preflight keys on. A one-shot expanded on the far side would have had
+    // neither.
+    if call_params.name == "kin_mutate" {
+        let result = crate::handlers::sessions::mutate_through_daemon(&call_params.arguments)
+            .await
+            .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
+        let enveloped =
+            envelope::finalize_bounded(result, Envelope::daemon(), &call_params.name, &budget);
+        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
+    }
+
     // Graph status carries its own selected-graph coverage observation. Mark
     // the beginning before forwarding so a refusal published during the call
     // cannot be discharged by counters that may have preceded it.
@@ -2594,6 +2623,83 @@ mod tests {
                 .unwrap_or_default()
                 .contains("not enabled in this MCP profile"),
             "the profile filter stopped refusing withheld tools: {refused:#?}"
+        );
+    }
+
+    /// A mutation is expanded by this binary on the daemon route, not forwarded.
+    ///
+    /// This is the one that cost a debugging session. Everything the daemon
+    /// route does not special-case is handed to the daemon under the name the
+    /// caller used, and the daemon runs what arrives under
+    /// `SessionAuthorityMode::OfflineFallback`, because inside the daemon its
+    /// own registry IS the authority. A forwarded `kin_mutate` therefore reaches
+    /// `handle_mutate` with `uses_daemon()` FALSE, takes the in-process branch,
+    /// and is refused by a commit path that has no projection. The daemon routes
+    /// exactly one name to its exact-commit path, `kin_transaction_commit`, so a
+    /// one-shot under any other name never reaches it.
+    ///
+    /// There is no daemon in this test, which is what makes the two answers
+    /// distinguishable: the local expansion refuses for its own missing
+    /// `session_id` before it ever reaches the wire, and a call that did reach
+    /// the wire comes back as the daemon being unavailable.
+    #[tokio::test]
+    async fn a_mutation_is_expanded_locally_on_the_daemon_route() {
+        let config = McpServerConfig::default();
+
+        let unsessioned = process_daemon_message(
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"kin_mutate",
+               "arguments":{"operations":[{"verb":"update","target":"Widget",
+               "body":"pub fn widget() {}","description":"edit"}]}}}"#,
+            &config,
+        )
+        .await
+        .unwrap()
+        .result
+        .expect("the mutation call is answered");
+        let text = unsessioned["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("session_id") && text.contains("kin_session_start"),
+            "a locally expanded mutate refuses for its own missing session before the wire; \
+             a forwarded one could not have produced this: {text}"
+        );
+
+        // The discriminating half. With a session named, the expansion has
+        // nothing left to refuse of its own and goes on to forward its begin.
+        // Without this, the assertion above would pass just as well against an
+        // expansion that refused everything.
+        //
+        // What the wire then says is deliberately not asserted. This test runs
+        // wherever the checkout sits, and whether a daemon answers depends on
+        // whether a store exists above that directory, which is a fact about the
+        // machine rather than about this route. The assertion that carries the
+        // guard is the one above: only a locally expanded mutate names
+        // `kin_session_start`, and a forwarded one cannot, under any daemon.
+        let sessioned = process_daemon_message(
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"kin_mutate",
+               "arguments":{"session_id":"11111111-1111-4111-8111-111111111111",
+               "operations":[{"verb":"update","target":"Widget",
+               "body":"pub fn widget() {}","description":"edit"}]}}}"#,
+            &config,
+        )
+        .await
+        .unwrap()
+        .result
+        .expect("the mutation call is answered");
+        let text = sessioned["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !text.contains("kin_session_start"),
+            "a named session was refused as missing: {text}"
+        );
+        assert_eq!(
+            sessioned.get("isError"),
+            Some(&serde_json::json!(true)),
+            "a mutation with no daemon behind it still has to fail: {sessioned:#?}"
         );
     }
 

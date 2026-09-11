@@ -115,6 +115,28 @@ pub struct Belt {
     file_tools: bool,
 }
 
+/// The values `KIN_AGENT_PURE_KIN` reads as on.
+///
+/// Exactly the set kin-core's env registry accepts as true for a `Kind::Bool`
+/// (`BOOL_TRUE` in `kin-core/src/env_registry.rs`, where this variable is
+/// registered), trimmed and case-folded the same way, so the switch means one
+/// thing across the product. Mirrored rather than imported because kin-agent
+/// takes no kin-core dependency, and a second, looser reading is what this
+/// replaced: it treated everything except `0` and `false` as on, so
+/// `KIN_AGENT_PURE_KIN=off` locked the belt, which is the opposite of what the
+/// word says and what the registry's validator would tell the operator.
+const PURE_KIN_TRUE: [&str; 4] = ["1", "true", "yes", "on"];
+
+/// Whether a `KIN_AGENT_PURE_KIN` value asks for the pure Kin belt.
+///
+/// Unset and every value outside the registry's true set read as off, which
+/// leaves the full belt. A value that is neither true nor false by the
+/// registry's reading is still reported by its startup validation, so a typo
+/// is surfaced there rather than guessed at here.
+pub fn pure_kin_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| PURE_KIN_TRUE.contains(&value.trim().to_ascii_lowercase().as_str()))
+}
+
 impl Belt {
     /// Build the belt from what the MCP servers declared. If pure Kin mode is
     /// active (via KIN_AGENT_PURE_KIN env var), local file tools are omitted.
@@ -133,11 +155,9 @@ impl Belt {
         Self::with_local_tools(kin_tools, true)
     }
 
-    /// Whether pure Kin mode is requested via environment.
+    /// Whether this process asked for a pure Kin belt, through `KIN_AGENT_PURE_KIN`.
     pub fn pure_kin_default() -> bool {
-        std::env::var("KIN_AGENT_PURE_KIN")
-            .map(|v| v != "0" && v != "false")
-            .unwrap_or(false)
+        pure_kin_requested(std::env::var("KIN_AGENT_PURE_KIN").ok().as_deref())
     }
 
     /// Build the belt with or without local file tools.
