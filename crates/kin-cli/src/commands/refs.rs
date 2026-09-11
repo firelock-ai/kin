@@ -1616,24 +1616,36 @@ mod tests {
                 .unwrap();
         }
 
-        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
-            "initialized": true,
-            "graph_loaded": true,
-            "graph_entity_count": 3,
-            "graph_generation": 1,
-            "embed_worker_failed": true,
-        }));
-        let response = build_refs_response(
-            &layout,
-            &graph,
-            &RefsRequest {
-                entity: "orphan".to_string(),
-                kind: "all".to_string(),
-            },
-            &degraded,
-        )
-        .expect("refs response");
-        let rendered = response.lines.join("\n");
+        // A held language-server sweep: a flag that describes the relations
+        // refs reads, so it still bounds this answer.
+        let degraded = kin_mcp::Envelope::daemon()
+            .with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "graph_entity_count": 3,
+                "graph_generation": 1,
+            }))
+            .with_memory_pressure(Some(&kin_core::memory_pressure::PressureRefusal {
+                work: "lsp-sweep".to_string(),
+                level: "critical".to_string(),
+                reason: "host memory pressure is critical".to_string(),
+                at_unix: 0,
+            }));
+        let answer = |envelope: &kin_mcp::Envelope| {
+            build_refs_response(
+                &layout,
+                &graph,
+                &RefsRequest {
+                    entity: "orphan".to_string(),
+                    kind: "all".to_string(),
+                },
+                envelope,
+            )
+            .expect("refs response")
+            .lines
+            .join("\n")
+        };
+        let rendered = answer(&degraded);
 
         assert!(
             !rendered.contains("holds no cross-file"),
@@ -1645,8 +1657,24 @@ mod tests {
             "a degraded daemon is a real gap and must still be spoken: {rendered}"
         );
         assert!(
-            rendered.contains("embed_worker_failed"),
+            rendered.contains("memory_pressure"),
             "and it must name the signal the verdict disclosed: {rendered}"
+        );
+
+        // The other direction. A stopped embedding worker describes vectors,
+        // which refs never reads, so it no longer puts this answer in doubt.
+        let vectors_only = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let rendered = answer(&vectors_only);
+        assert!(!rendered.contains("holds no cross-file"), "{rendered}");
+        assert!(
+            !rendered.contains("Kin cannot rule out references it did not see"),
+            "a flag that describes vectors must not bound an answer read off relations: {rendered}"
         );
     }
 

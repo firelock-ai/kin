@@ -20497,13 +20497,15 @@ mod tests {
 
     #[test]
     fn the_impact_envelope_carries_the_daemons_degraded_signals() {
+        // A withheld mass deletion: a flag this build does not scope, so it
+        // bounds every answer, including one read off relations.
         let health = serde_json::json!({
             "initialized": true,
             "graph_loaded": true,
             "graph_entity_count": 3,
             "graph_generation": 7,
-            "embed_worker_failed": true,
-            "mass_deletion_blocked": false,
+            "embed_worker_failed": false,
+            "mass_deletion_blocked": true,
         });
         let envelope = kin_mcp::Envelope::daemon().with_health(&health);
 
@@ -20540,7 +20542,7 @@ mod tests {
                 .as_array()
                 .is_some_and(|signals| signals
                     .iter()
-                    .any(|signal| signal.as_str() == Some("embed_worker_failed"))),
+                    .any(|signal| signal.as_str() == Some("mass_deletion_blocked"))),
             "the signal must reach the verdict the CLI renders: {negative}"
         );
 
@@ -20560,6 +20562,34 @@ mod tests {
             negative["safe_to_conclude_absent"],
             serde_json::json!(true),
             "an undegraded daemon must still certify: {negative}"
+        );
+
+        // The other direction, and the disclosure with it. A stopped embedding
+        // worker describes vectors, which impact never reads, so the same
+        // answer certifies while the signal still reaches the verdict.
+        let vectors_only = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 7,
+            "embed_worker_failed": true,
+            "mass_deletion_blocked": false,
+        }));
+        let negative =
+            kin_mcp::negative::negative_for("impact_analysis", &payload, &vectors_only, &[])
+                .expect("impact_analysis always qualifies");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            serde_json::json!(true),
+            "a flag that describes vectors must not bound an answer read off relations: {negative}"
+        );
+        assert!(
+            negative["degraded_signals"]
+                .as_array()
+                .is_some_and(|signals| signals
+                    .iter()
+                    .any(|signal| signal.as_str() == Some("embed_worker_failed"))),
+            "the signal still reaches the verdict where it does not bound it: {negative}"
         );
     }
 
@@ -49094,8 +49124,12 @@ mod tests {
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // A withheld mass deletion: a flag this build does not scope, so it
+        // bounds every answer this route serves, including one read off
+        // relations. The health snapshot carries it and the embedding flag and
+        // nothing else, which is why the arm below uses the other one.
         state
-            .embed_worker_failed
+            .mass_deletion_blocked
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let response = router(Arc::clone(&state))
@@ -49127,9 +49161,55 @@ mod tests {
              thinner snapshot leaves this line out entirely: {rendered}"
         );
         assert!(
-            rendered.contains("embed_worker_failed"),
+            rendered.contains("mass_deletion_blocked"),
             "the line names the signal the verdict disclosed rather than inventing a cause: \
              {rendered}"
+        );
+
+        // The other direction, through the same route. A stopped embedding
+        // worker describes vectors, which impact never reads, so the rendered
+        // verdict no longer refuses and the payload still discloses the flag.
+        state
+            .mass_deletion_blocked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/impact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "entity": "orphan", "depth": 3 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::impact::ImpactResponse =
+            serde_json::from_slice(&body).unwrap();
+        let rendered = result.lines.join("\n");
+        assert!(
+            rendered.contains("No local downstream impact found."),
+            "the orphan still reports no impact: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Kin cannot rule out dependents"),
+            "a flag that describes vectors must not bound an answer read off relations: {rendered}"
+        );
+        let verdict = result
+            .negative
+            .as_ref()
+            .expect("an empty impact answer publishes its verdict");
+        assert!(
+            verdict["degraded_signals"]
+                .as_array()
+                .is_some_and(|signals| signals.contains(&serde_json::json!("embed_worker_failed"))),
+            "the flag stays disclosed where it does not bound: {verdict}"
         );
     }
 

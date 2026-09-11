@@ -985,13 +985,21 @@ mod tests {
             .upsert_relation(&make_call_relation_with(&live, &caller, 0.9))
             .unwrap();
 
-        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
-            "initialized": true,
-            "graph_loaded": true,
-            "graph_entity_count": 2,
-            "graph_generation": 1,
-            "embed_worker_failed": true,
-        }));
+        // A held language-server sweep: a flag that describes the relations the
+        // scan reads, so it still puts the clean line in doubt.
+        let degraded = kin_mcp::Envelope::daemon()
+            .with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "graph_entity_count": 2,
+                "graph_generation": 1,
+            }))
+            .with_memory_pressure(Some(&kin_core::memory_pressure::PressureRefusal {
+                work: "lsp-sweep".to_string(),
+                level: "critical".to_string(),
+                reason: "host memory pressure is critical".to_string(),
+                at_unix: 0,
+            }));
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
         let response =
@@ -1006,6 +1014,24 @@ mod tests {
             output.contains("Kin cannot rule out unreachable entities it did not see"),
             "a clean scan off a degraded daemon must say the substrate was in doubt, and must \
              use ITS OWN noun rather than impact's 'dependents': {output}"
+        );
+
+        // The other direction. A stopped embedding worker describes vectors,
+        // which the scan never reads, so the clean line stands unqualified.
+        let vectors_only = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let response =
+            build_dead_code_report(&vectors_only, &graph, &Default::default(), &coverage).unwrap();
+        let output = response.lines.join("\n");
+        assert!(output.contains("No dead code found."), "{output}");
+        assert!(
+            !output.contains("Kin cannot rule out unreachable entities it did not see"),
+            "a flag that describes vectors must not put a relation scan in doubt: {output}"
         );
     }
 
