@@ -3910,19 +3910,39 @@ impl SweepTally {
     }
 }
 
+/// Whether one file's language-server passes in this sweep completed with no
+/// failed and no over-budget query.
+///
+/// Decided per file, from the tally's two failure counters as they stood before
+/// and after that file's passes. A file whose definitions pass ran over its
+/// budget, or whose per-entity queries failed, may hold incomplete relations, so
+/// it is not marked and the next sweep retries it.
+fn file_passes_completed(
+    tally: &SweepTally,
+    query_failures_before: usize,
+    definitions_over_budget_before: usize,
+) -> bool {
+    tally.query_failures == query_failures_before
+        && tally.definitions_over_budget == definitions_over_budget_before
+}
+
+/// Record `files` as durably enriched, when this sweep's write was durable.
+///
+/// `files` holds only the files whose passes completed ([`file_passes_completed`]).
+/// A failed query used to refuse the marker for the whole pass, so one failed
+/// call in one file sent every later daemon back over every file: on a 72-file
+/// store the pass published its relations, refused the marker, and the next
+/// daemon walked all 72 files again for about four minutes. The caller holds the
+/// files that failed back instead, and a pass whose write did not reach disk
+/// still marks nothing.
 fn mark_completed_sweep_files(
     state: &DaemonState,
     files: &[String],
     epoch: u64,
-    tally: &SweepTally,
     relations: EnrichmentWrite,
     published: bool,
 ) -> bool {
-    // A published subset cannot certify query arms that failed or timed out.
-    if tally.query_failures > 0
-        || tally.definitions_over_budget > 0
-        || !sweep_marker_is_durable(relations, published)
-    {
+    if !sweep_marker_is_durable(relations, published) {
         return false;
     }
     mark_files_enriched(state, files, epoch);
@@ -5598,6 +5618,9 @@ pub async fn run_with_authority_on(
                             .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut tally = SweepTally::default();
                         let mut enriched_this_sweep: Vec<String> = Vec::new();
+                        // Files the sweep finished whose queries failed or ran over
+                        // budget: counted enriched, never marked, retried next pass.
+                        let mut held_back_this_sweep: Vec<String> = Vec::new();
                         let file_definitions_budget = lsp_file_definitions_budget();
                         let mut total_relations = EnrichmentWrite::default();
                         // Languages whose server refused to start, remembered for
@@ -5856,6 +5879,8 @@ pub async fn run_with_authority_on(
 
                             // File-level enrichment: query definition at every identifier
                             // to capture ALL relationships (40-50x more than per-entity).
+                            let query_failures_before = tally.query_failures;
+                            let definitions_over_budget_before = tally.definitions_over_budget;
                             let file_result = file_definitions_within_budget(
                                 kin_lsp::file_enrichment::enrich_file_definitions(
                                     server,
@@ -5911,7 +5936,15 @@ pub async fn run_with_authority_on(
                                 .await;
 
                             tally.enriched += 1;
-                            enriched_this_sweep.push(file_id.0.clone());
+                            if file_passes_completed(
+                                &tally,
+                                query_failures_before,
+                                definitions_over_budget_before,
+                            ) {
+                                enriched_this_sweep.push(file_id.0.clone());
+                            } else {
+                                held_back_this_sweep.push(file_id.0.clone());
+                            }
                             lsp_state.lsp_sweep_files_done.store(
                                 tally.files_processed() as u64,
                                 std::sync::atomic::Ordering::SeqCst,
@@ -6058,19 +6091,28 @@ pub async fn run_with_authority_on(
                         // divergence means a file was counted enriched without
                         // being recorded, or recorded without being counted.
                         // Either way the marker would stop describing the sweep.
-                        if enriched_this_sweep.len() != tally.enriched {
+                        if enriched_this_sweep.len() + held_back_this_sweep.len() != tally.enriched
+                        {
                             warn!(
                                 recorded = enriched_this_sweep.len(),
+                                held_back = held_back_this_sweep.len(),
                                 counted = tally.enriched,
-                                "the enriched-file set and the enriched count disagree; the \
+                                "the enriched-file sets and the enriched count disagree; the \
                                  marker no longer describes this sweep"
+                            );
+                        }
+                        if let Some(first) = held_back_this_sweep.first() {
+                            warn!(
+                                files = held_back_this_sweep.len(),
+                                first = %first,
+                                "not recording these files as enriched: a language-server query \
+                                 failed or ran over its budget for them, so the next sweep retries them"
                             );
                         }
                         if !mark_completed_sweep_files(
                             &lsp_state,
                             &enriched_this_sweep,
                             marker_epoch,
-                            &tally,
                             total_relations,
                             published,
                         ) {
@@ -7283,44 +7325,68 @@ mod tests {
         assert!(kin_daemon_spawn::read_daemon_kill_record(root.path()).is_none());
     }
 
+    /// A file whose queries partly failed is still never marked, and it no
+    /// longer takes the rest of the pass down with it.
+    ///
+    /// Three files through one pass: one completes, one has a per-entity query
+    /// fail, one's definitions pass runs over its budget. Only the first is
+    /// marked, so the next daemon skips it and retries the other two. A write
+    /// that did not reach disk marks nothing, the completed file included.
     #[test]
-    fn partial_query_success_does_not_persist_a_skip_marker() {
+    fn a_file_whose_query_failed_is_held_back_and_the_rest_are_marked() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let state = super::DaemonState::open(init.layout.clone()).unwrap();
-        let files = vec!["pkg/sessions.py".to_string()];
-        let published = super::EnrichmentWrite {
-            published: 1,
-            offered: 1,
+        let written = super::EnrichmentWrite {
+            published: 2,
+            offered: 2,
             vector_stale: 0,
         };
         let epoch = super::current_marker_epoch(&state);
-        let mut tally = super::SweepTally {
-            enriched: 1,
-            query_failures: 1,
-            ..Default::default()
-        };
+
+        let mut tally = super::SweepTally::default();
+        let mut completed = Vec::new();
+        let mut held_back = Vec::new();
+        for (file, failed_queries, over_budget) in [
+            ("pkg/models.py", 0, 0),
+            ("pkg/sessions.py", 1, 0),
+            ("pkg/adapters.py", 0, 1),
+        ] {
+            let before = (tally.query_failures, tally.definitions_over_budget);
+            tally.query_failures += failed_queries;
+            tally.definitions_over_budget += over_budget;
+            tally.enriched += 1;
+            if super::file_passes_completed(&tally, before.0, before.1) {
+                completed.push(file.to_string());
+            } else {
+                held_back.push(file.to_string());
+            }
+        }
+        assert_eq!(completed, vec!["pkg/models.py".to_string()]);
+        assert_eq!(
+            held_back,
+            vec!["pkg/sessions.py".to_string(), "pkg/adapters.py".to_string()]
+        );
+
         assert!(!super::mark_completed_sweep_files(
-            &state, &files, epoch, &tally, published, true
-        ));
-        assert!(!state.lsp_enriched_files.lock().unwrap().contains(&files[0]));
-        assert!(!super::lsp_enriched_marker_path(&state).exists());
-        tally.query_failures = 0;
-        tally.definitions_over_budget = 1;
-        assert!(!super::mark_completed_sweep_files(
-            &state, &files, epoch, &tally, published, true
+            &state, &completed, epoch, written, false
         ));
         assert!(!super::lsp_enriched_marker_path(&state).exists());
-        tally.definitions_over_budget = 0;
+
         assert!(super::mark_completed_sweep_files(
-            &state, &files, epoch, &tally, published, true
+            &state, &completed, epoch, written, true
         ));
-        assert!(state.lsp_enriched_files.lock().unwrap().contains(&files[0]));
+        let marked = state.lsp_enriched_files.lock().unwrap().clone();
+        assert!(marked.contains("pkg/models.py"), "{marked:?}");
+        assert!(
+            !marked.contains("pkg/sessions.py") && !marked.contains("pkg/adapters.py"),
+            "{marked:?}"
+        );
         let saved: Vec<String> = serde_json::from_slice(
             &std::fs::read(super::lsp_enriched_marker_path(&state)).unwrap(),
         )
         .unwrap();
-        assert_eq!(saved, files);
+        assert_eq!(saved, completed);
     }
 
     #[test]
