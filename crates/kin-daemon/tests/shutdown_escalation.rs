@@ -262,6 +262,8 @@ fn graceful_daemon_shutdown_worker() {
         || false,
         cancel_rx,
         kin_daemon::daemon::shutdown_escalation_grace(),
+        // These workers grade the escalation itself, so no store records it.
+        None,
     );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -308,6 +310,8 @@ fn saturated_daemon_shutdown_worker() {
         || false,
         cancel_rx,
         kin_daemon::daemon::shutdown_escalation_grace(),
+        // These workers grade the escalation itself, so no store records it.
+        None,
     );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
