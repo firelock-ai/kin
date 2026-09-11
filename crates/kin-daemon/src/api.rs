@@ -13689,6 +13689,15 @@ fn repo_scoped_handler_failure(error: kin_mcp::McpError) -> RepoScopedMcpFailure
             "invalid_semantic_tool_call",
             false,
         ),
+        // This request's own source allowance is spent, or a body is larger than
+        // its per-blob ceiling. The repository is fine and the same request
+        // cannot succeed on a retry, so it is neither retryable nor a 503; a
+        // narrower request can succeed, which makes it the caller's lever.
+        kin_mcp::McpError::SourceBudgetExhausted(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "source_budget_exhausted",
+            false,
+        ),
         kin_mcp::McpError::GraphStore(_)
         | kin_mcp::McpError::Io(_)
         | kin_mcp::McpError::Json(_)
@@ -24272,6 +24281,30 @@ mod tests {
         message: &str,
         symbols: &[(&str, &str, &str)],
     ) -> (SemanticChangeId, Vec<EntityId>) {
+        let chain: Vec<(usize, usize)> = (1..symbols.len()).map(|i| (i - 1, i)).collect();
+        publish_hosted_semantic_change_with_calls(
+            storage,
+            repository_id,
+            previous,
+            operation,
+            message,
+            symbols,
+            &chain,
+        )
+    }
+
+    /// [`publish_hosted_semantic_change`] with its `Calls` edges named by
+    /// symbol index instead of chained, for a fixture whose graph shape is the
+    /// point of the test.
+    fn publish_hosted_semantic_change_with_calls(
+        storage: &FsPath,
+        repository_id: &RepositoryId,
+        previous: Option<SemanticChangeId>,
+        operation: u128,
+        message: &str,
+        symbols: &[(&str, &str, &str)],
+        calls: &[(usize, usize)],
+    ) -> (SemanticChangeId, Vec<EntityId>) {
         use kin_model::{
             compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
             AdmissionPolicyDelta, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation,
@@ -24320,14 +24353,14 @@ mod tests {
                 ),
             });
         }
-        let relation_deltas = entities
-            .windows(2)
-            .map(|pair| kin_model::RelationDelta::Added {
+        let relation_deltas = calls
+            .iter()
+            .map(|&(src, dst)| kin_model::RelationDelta::Added {
                 new: kin_model::Relation {
                     id: kin_model::RelationId::new(),
                     kind: RelationKind::Calls,
-                    src: GraphNodeId::Entity(pair[0]),
-                    dst: GraphNodeId::Entity(pair[1]),
+                    src: GraphNodeId::Entity(entities[src]),
+                    dst: GraphNodeId::Entity(entities[dst]),
                     confidence: 1.0,
                     origin: kin_model::RelationOrigin::Parsed,
                     created_in: None,
@@ -27907,6 +27940,203 @@ mod tests {
             "{failed}"
         );
         assert_eq!(failed["error"]["retryable"], true, "{failed}");
+    }
+
+    /// P1: a context pack on the focal the most code calls must answer, and must
+    /// not spend the request's source allowance on caller bodies it never ships.
+    ///
+    /// Forty callers in forty files, with the arguments the hosted inspector
+    /// sends. The pack used to read one body per caller to decide who its
+    /// dependents were, so the 33rd caller file spent the 32-read allowance and
+    /// the whole pack answered 503 retryable: the most-called entity in a
+    /// repository was the one entity whose context could never be read.
+    #[tokio::test]
+    async fn a_hosted_context_pack_names_every_caller_without_reading_their_bodies() {
+        const CALLERS: usize = 40;
+        let repo_id = format!("repo-scoped-pack-fanin-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, faults, backend_dir) =
+            hosted_state_with_backend_dir("repo-mcp-pack-fanin", &repo_id, &[]);
+        let names: Vec<String> = std::iter::once("fanin_target".to_string())
+            .chain((0..CALLERS).map(|index| format!("fanin_caller_{index}")))
+            .collect();
+        let paths: Vec<String> = std::iter::once("src/target.rs".to_string())
+            .chain((0..CALLERS).map(|index| format!("src/callers/c{index}.rs")))
+            .collect();
+        let bodies: Vec<String> = names
+            .iter()
+            .map(|name| format!("fn {name}() {{}}\n"))
+            .collect();
+        let symbols: Vec<(&str, &str, &str)> = (0..names.len())
+            .map(|index| {
+                (
+                    names[index].as_str(),
+                    paths[index].as_str(),
+                    bodies[index].as_str(),
+                )
+            })
+            .collect();
+        let calls: Vec<(usize, usize)> = (1..=CALLERS).map(|caller| (caller, 0)).collect();
+        let (_, entities) = publish_hosted_semantic_change_with_calls(
+            &backend_dir,
+            &repository_id,
+            None,
+            0xb301,
+            "publish fan-in fixture",
+            &symbols,
+            &calls,
+        );
+        let target = entities[0];
+        let app = router(Arc::clone(&state));
+
+        // Warm the view first, so the authority open's own reads are not
+        // counted against the pack.
+        let (status, _, warm) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_id,
+            "semantic_locate",
+            json!({ "query": "fanin_target", "include_snippet": false }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{warm}");
+        let baseline_reads = faults.blob_read_ceilings().len();
+
+        let (status, _, body) = call_repo_mcp_tool(
+            app,
+            &repo_id,
+            "get_context_pack",
+            json!({
+                "entity_id": target.to_string(),
+                "compact": true,
+                "max_response_chars": 60_000
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the most-called entity's pack must answer: {body}"
+        );
+        let pack = successful_repo_mcp_payload(body);
+        assert_eq!(
+            pack["dependency_selection"]["certified_dependents"], CALLERS,
+            "{pack}"
+        );
+        let returned = pack["dependents"].as_array().map_or(0, Vec::len);
+        let withheld = pack["dependents_withheld"].as_u64().unwrap_or(0) as usize;
+        assert_eq!(
+            returned + withheld,
+            CALLERS,
+            "every caller is returned or counted as withheld: {pack}"
+        );
+        let reads = faults.blob_read_ceilings().len() - baseline_reads;
+        assert!(
+            reads <= 1,
+            "a pack names its dependents from edges and the tree, so it reads at most the \
+             focal's own body; it read {reads}"
+        );
+    }
+
+    /// P1: a focal whose file is larger than the request's per-blob allowance
+    /// answers with its body withheld and says so, never a bare 503.
+    #[tokio::test]
+    async fn a_hosted_context_pack_on_an_oversized_file_withholds_the_body_and_says_so() {
+        let repo_id = format!("repo-scoped-pack-oversize-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _faults, backend_dir) =
+            hosted_state_with_backend_dir("repo-mcp-pack-oversize", &repo_id, &[]);
+        // The file is sized from the allowance this request will actually get,
+        // so it is over the per-blob ceiling whatever the constants say, while a
+        // 10,000-character budget still leaves the response room for a pack.
+        let request_budget = kin_mcp::budget::ResponseBudget::from_arguments(&HashMap::from([(
+            "max_chars".to_string(),
+            json!(10_000),
+        )]))
+        .less_envelope_reserve();
+        let (per_blob, _total, _reads) = repo_scoped_source_projection_limits(&request_budget);
+        let mut oversized = String::from("fn oversized_focal() {}\n");
+        while (oversized.len() as u64) <= per_blob + 64 * 1024 {
+            oversized.push_str("// padding that takes this file past the per-blob allowance\n");
+        }
+        let (_, entities) = publish_hosted_semantic_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0xb302,
+            "publish oversize fixture",
+            &[
+                ("oversized_focal", "src/oversized.rs", oversized.as_str()),
+                (
+                    "oversized_callee",
+                    "src/callee.rs",
+                    "fn oversized_callee() {}\n",
+                ),
+            ],
+        );
+        let focal = entities[0];
+        let app = router(Arc::clone(&state));
+
+        let (status, _, body) = call_repo_mcp_tool(
+            app,
+            &repo_id,
+            "get_context_pack",
+            json!({
+                "entity_id": focal.to_string(),
+                "compact": true,
+                "max_chars": 10_000
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a file over the per-blob allowance is the request's bound, not an outage: {body}"
+        );
+        let result: kin_mcp::ToolCallResult =
+            serde_json::from_value(body["result"].clone()).unwrap();
+        let kin_mcp::ContentBlock::Text { text } = result.content.first().unwrap();
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "the pack answered with a tool error: {text}"
+        );
+        let pack: serde_json::Value = serde_json::from_str(text).unwrap();
+        let degradations = pack["degradations"].as_array().cloned().unwrap_or_default();
+        assert!(
+            degradations.iter().any(|degradation| {
+                degradation["component"] == "entity_source"
+                    && degradation["reason"] == "hosted_source_read_cap"
+            }),
+            "the withheld body is disclosed where the verdict reads it: {pack}"
+        );
+        assert_eq!(
+            pack["focal_entity"]["body_withheld"], "hosted_source_read_cap",
+            "the row says what it lacks: {pack}"
+        );
+    }
+
+    /// A spent source allowance is the request's bound, which a narrower request
+    /// can meet and no retry of the same one can, so it is never a retryable 503.
+    #[test]
+    fn a_spent_source_allowance_is_the_requests_bound_not_a_retryable_outage() {
+        let spent = repo_scoped_handler_failure(kin_mcp::McpError::SourceBudgetExhausted(
+            "blob abc is 300000 bytes, over the 262144-byte per-blob allowance".into(),
+        ));
+        assert_eq!(spent.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(spent.code, "source_budget_exhausted");
+        assert!(
+            !spent.retryable,
+            "no retry of the same request can clear a spent allowance"
+        );
+        // The control: a real authority gap keeps its retryable 503.
+        let gap = repo_scoped_handler_failure(kin_mcp::McpError::Context(
+            "graph authority gap: cannot load immutable source blob abc".into(),
+        ));
+        assert_eq!(gap.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(gap.retryable);
     }
 
     /// The classifier the route above depends on, and the control that must

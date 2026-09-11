@@ -7893,6 +7893,94 @@ mod tests {
     /// The assertion that matters is that the LIVE callers come back. A test
     /// that only asserted the call no longer errors would also pass if the fix
     /// dropped every row.
+    /// The membership form names the same callers the projecting form does,
+    /// skips the same caller history deleted, and carries no body for any of
+    /// them. The context pack reads its dependents this way because it never
+    /// ships a caller's body.
+    #[test]
+    fn a_membership_read_names_the_same_callers_without_their_bodies() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_trace_source_registry();
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        const LIVE_CALLERS: usize = 3;
+        let mut store = EmptyStore::default();
+        let install = |store: &mut EmptyStore, name: &str| -> Entity {
+            let content = format!("export function {name}() {{ return \"{name}\"; }}\n");
+            let hash = blob_store.write(content.as_bytes()).unwrap();
+            let file_id = FilePathId::new(format!("src/{name}.ts"));
+            store.file_hashes.insert(file_id.clone(), hash);
+            let entity = whole_file_entity(&file_id, &content, Some(hash));
+            store.insert_test_entity(entity.clone());
+            entity
+        };
+        let target = install(&mut store, "target");
+        for index in 0..LIVE_CALLERS {
+            let caller = install(&mut store, &format!("caller{index}"));
+            store.insert_test_calls_relation(&caller, &target);
+        }
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let deleted_content = "export function deleted_caller() { return 0; }\n";
+        let deleted_hash = blob_store.write(deleted_content.as_bytes()).unwrap();
+        let deleted = whole_file_entity(
+            &FilePathId::new("src/deleted_caller.ts"),
+            deleted_content,
+            Some(deleted_hash),
+        );
+        store.insert_test_entity(deleted.clone());
+        store.insert_test_calls_relation(&deleted, &target);
+
+        let authority = test_repository_authority(dir.path());
+        let projected = collect_graph_reference_rows(
+            &store,
+            &target.id,
+            &[RelationKind::Calls],
+            Some(&authority),
+        )
+        .unwrap();
+        let members = collect_graph_reference_members(
+            &store,
+            &target.id,
+            &[RelationKind::Calls],
+            Some(&authority),
+        )
+        .unwrap();
+
+        let ids = |rows: &[ReferenceRow]| {
+            let mut ids: Vec<Option<String>> =
+                rows.iter().map(|row| row.entity_id.clone()).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(members.len(), LIVE_CALLERS, "{members:?}");
+        assert_eq!(
+            ids(&members),
+            ids(&projected),
+            "the two forms must agree on who reaches the target"
+        );
+        assert!(
+            members.iter().all(|row| row.snippet.is_none()),
+            "the membership form reads no body: {members:?}"
+        );
+        assert!(
+            projected.iter().all(|row| row.snippet.is_some()),
+            "the control: the projecting form still carries every body"
+        );
+        assert!(
+            !members
+                .iter()
+                .any(|row| row.file_path.as_deref() == Some("src/deleted_caller.ts")),
+            "a caller the current workspace does not contain is skipped here too: {members:?}"
+        );
+    }
+
     #[test]
     fn a_reference_set_survives_a_caller_whose_file_history_deleted() {
         let _lock = ENV_MUTEX
