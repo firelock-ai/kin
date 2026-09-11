@@ -683,3 +683,37 @@ fn a_named_api_key_variable_that_is_unset_fails_loudly() {
     assert!(ProviderConfig::api_key_from_env(Some("KIN_AGENT_KEY_THAT_IS_NOT_SET")).is_err());
     assert_eq!(ProviderConfig::api_key_from_env(None).unwrap(), None);
 }
+
+/// The heartbeat cadence comes from the window the session reply itself names, at its top
+/// level or one level down, and a reply that names none, or zero, gets no cadence at all.
+#[test]
+fn a_session_reply_names_its_idle_window_or_none() {
+    use crate::mcp::ToolOutcome;
+    use crate::run::session_idle_timeout;
+    use std::time::Duration;
+    let reply = |text: &str| ToolOutcome {
+        text: text.to_string(),
+        is_error: false,
+        envelope: None,
+        negative: None,
+        unreadable: false,
+        wall_ms: 0,
+    };
+    assert_eq!(
+        session_idle_timeout(&reply(r#"{"session_id": "s", "idle_timeout_secs": 1800}"#)),
+        Some(Duration::from_secs(1800))
+    );
+    assert_eq!(
+        session_idle_timeout(&reply(
+            r#"{"session": {"session_id": "s", "idle_timeout_secs": 90}}"#
+        )),
+        Some(Duration::from_secs(90))
+    );
+    // An in-process session reports no window, and a zero is not one.
+    assert_eq!(session_idle_timeout(&reply(r#"{"session_id": "s"}"#)), None);
+    assert_eq!(
+        session_idle_timeout(&reply(r#"{"session_id": "s", "idle_timeout_secs": 0}"#)),
+        None
+    );
+    assert_eq!(session_idle_timeout(&reply("not json")), None);
+}
