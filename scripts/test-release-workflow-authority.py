@@ -745,6 +745,15 @@ CI_JOB_DISPLAY_NAMES = {
     # check that is not green by name, and ruleset 19746451 is what would make it
     # additionally block a merge through GitHub's own UI.
     "mcp-surface-contract": "MCP surface contract",
+    # Every Kin library tested on its own minimal features and packaged, on
+    # every event. A workspace unifies features, so a library can be healthy
+    # here and broken for the consumer who depends on it alone; `feature-tests`
+    # runs the same minimal-feature legs on macOS but only on a push to main,
+    # which is a landing too late. Like `mcp-surface-contract` it publishes no
+    # required context and claims none: `bin/kin-lane merge land` refuses on any
+    # check that is not green by name, and a ruleset is what would make it
+    # additionally block a merge through GitHub's own UI.
+    "library-packages": "Library packages",
     # The inert pull-request producer of the two expanded `Check & Test` names.
     # It covered documentation-only diffs alone until FIR-2815 moved the ubuntu
     # and macOS suites off the pull-request path; it now covers every pull

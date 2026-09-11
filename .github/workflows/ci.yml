@@ -1804,6 +1804,94 @@ jobs:
   # graded per commit and nothing cancels it. `release-tag.yml` still refuses to
   # mint a sha whose nine required checks are not green, so the proof did not
   # move, only the moment it is paid for.
+  # Every Kin library, graded the way a stranger consumes it.
+  #
+  # A workspace unifies features, so a library can look healthy in the full
+  # build while the consumer who depends on it alone never enables what it
+  # needs: kin-cli's manifest documents that case. It can also drift out of
+  # packageable shape, and nothing else here would say so until a release tried
+  # to publish it.
+  #
+  # So each library is tested on its own MINIMAL features and packaged, on every
+  # event. `feature-tests` runs the same minimal-feature legs on macOS, but only
+  # on a push to main, which is a landing too late for a pull request that
+  # breaks one.
+  #
+  # `--no-verify` on purpose. `cargo package` rewrites a path dependency to its
+  # registry version, so a library whose sibling is at a version nobody has
+  # published yet cannot be verified in isolation here. This step grades the
+  # manifest and the file list, which is the half a pull request can see; full
+  # verification against the registry happens in dependency order at publication
+  # time, and a packaging failure is never answered by publishing something
+  # first to make it pass.
+  #
+  # The list is DERIVED from the root manifest rather than written here. A Kin
+  # library is a `[workspace.dependencies]` entry carrying both a `path` and a
+  # `registry`, which is exactly what makes it developed here and published
+  # from here, so a library added to the workspace is covered by this job on the
+  # commit that adds it. A derivation that resolves to nothing would grade
+  # nothing and exit 0, so the floor below refuses that.
+  library-packages:
+    name: Library packages
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          add-rust-environment-hash-key: false
+          shared-key: check
+          save-if: false
+
+      - name: Read the Kin libraries out of the root manifest
+        run: |
+          set -euo pipefail
+          python3 - <<'LIBS' > "$RUNNER_TEMP/libraries.txt"
+          import tomllib
+          root = tomllib.load(open("Cargo.toml", "rb"))
+          deps = root["workspace"]["dependencies"]
+          for name, spec in sorted(deps.items()):
+              if isinstance(spec, dict) and "path" in spec and "registry" in spec:
+                  print(name)
+          LIBS
+          count="$(wc -l < "$RUNNER_TEMP/libraries.txt" | tr -d ' ')"
+          if [ "$count" -lt 4 ]; then
+            echo "::error title=No Kin libraries resolved::read $count from the root manifest"
+            echo "Every leg below iterates this list, so an empty or short one" >&2
+            echo "would grade nothing and report success." >&2
+            exit 1
+          fi
+          echo "$count libraries: $(tr '\n' ' ' < "$RUNNER_TEMP/libraries.txt")"
+
+      - name: Test each library on its own minimal features
+        run: |
+          set -euo pipefail
+          while IFS= read -r crate; do
+            echo "::group::cargo test -p $crate --no-default-features"
+            cargo test -p "$crate" --no-default-features --lib --tests --locked
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/libraries.txt"
+
+      - name: Package each library
+        run: |
+          set -euo pipefail
+          while IFS= read -r crate; do
+            echo "::group::cargo package -p $crate --no-verify"
+            cargo package -p "$crate" --no-verify --locked
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/libraries.txt"
+
   check-pr-fast-path:
     name: Check & Test
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
@@ -2876,6 +2964,33 @@ jobs:
       # `cargo test` rather than the `cargo nextest run` the steps above use.
       # It is the authority when the two runners disagree, and it covers the
       # package's doctests in the same pass instead of needing a second step.
+      # The Kin libraries on their own minimal features, on both operating
+      # systems. `library-packages` runs the ubuntu leg of this on every pull
+      # request, which is where a break has to be seen; this is the macOS half,
+      # and macOS is where kin-vector's aarch64 NEON kernel actually compiles.
+      # The list is read from the root manifest for the reason that job records.
+      - name: Test each Kin library on its own minimal features
+        run: |
+          set -euo pipefail
+          python3 - <<'LIBS' > "$RUNNER_TEMP/libraries.txt"
+          import tomllib
+          root = tomllib.load(open("Cargo.toml", "rb"))
+          deps = root["workspace"]["dependencies"]
+          for name, spec in sorted(deps.items()):
+              if isinstance(spec, dict) and "path" in spec and "registry" in spec:
+                  print(name)
+          LIBS
+          count="$(wc -l < "$RUNNER_TEMP/libraries.txt" | tr -d ' ')"
+          if [ "$count" -lt 4 ]; then
+            echo "::error title=No Kin libraries resolved::read $count from the root manifest"
+            exit 1
+          fi
+          while IFS= read -r crate; do
+            echo "::group::cargo test -p $crate --no-default-features"
+            cargo test -p "$crate" --no-default-features --lib --tests --locked
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/libraries.txt"
+
       - name: Test featureless kin-cli
         run: cargo test -p kin-cli --no-default-features --lib --tests --locked
 
