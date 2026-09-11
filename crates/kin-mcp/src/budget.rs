@@ -1282,6 +1282,77 @@ pub(crate) fn collection_rows(payload: &Value, key: &str) -> usize {
         .map_or(0, Vec::len)
 }
 
+/// The budgeted tools whose responses carry a `next_cursor`, and so the tools
+/// whose withheld rows a caller can be handed a way back to.
+///
+/// Two producers mint one today: the daemon's locate route
+/// (`kin-daemon/src/api.rs`, a [`LocateCursor`]) and the file enumeration
+/// (`crate::handlers::file_entities`, a `PageCursor`). Every other budgeted tool
+/// answers one question in one response, so a cut there is recoverable only by
+/// asking a smaller question, which is what the remediation says.
+///
+/// [`repage_primary_after_cut`] must carry an arm for each name here, and
+/// `every_paged_tool_has_a_repage_arm` fails if it does not. A third paged tool
+/// added without an arm silently reintroduces FIR-3554: the rows go, the cursor
+/// does not move, and nothing in the response says the remainder became
+/// unreachable.
+const PAGED_TOOLS: [&str; 2] = ["semantic_locate", FILE_ENTITIES_TOOL];
+
+/// Re-point a paged tool's cursor after the ladder withheld a suffix of the
+/// primary collection, so the rows this response dropped stay reachable.
+///
+/// Returns whether the response now carries a cursor that reaches them. `false`
+/// means the caller has to be told so, which the remediation beside the call
+/// does, rather than being handed a token that skips past what it lost.
+///
+/// The two paged tools rebase differently because their cursors mean different
+/// things. A locate cursor names a held ranking and an absolute offset into it,
+/// so the recovery is to move that offset back by exactly the suffix withheld.
+/// A file-enumeration cursor names a path and an absolute offset into a stable
+/// ordered list, so the recovery is to recompute the offset from what this page
+/// actually served, which works identically whether the handler had minted a
+/// cursor or the page was the file's last one before the cut.
+fn repage_primary_after_cut(
+    payload: &mut Value,
+    tool: &str,
+    locate_cursor: Option<&mut LocateCursor>,
+    withheld: usize,
+    kept: usize,
+) -> bool {
+    if withheld == 0 || kept == 0 {
+        return false;
+    }
+    match tool {
+        "semantic_locate" => {
+            let Some(cursor) = locate_cursor else {
+                return false;
+            };
+            if !cursor.rebase_after_withheld(withheld, kept) {
+                return false;
+            }
+            payload["next_cursor"] = Value::String(cursor.encode());
+            true
+        }
+        FILE_ENTITIES_TOOL => {
+            let Some(token) =
+                crate::handlers::file_entities::PageCursor::after_withheld(payload, kept)
+            else {
+                return false;
+            };
+            payload["next_cursor"] = Value::String(token);
+            // The count beside the rows, which the handler decided before this
+            // cut existed. Left alone it reports the page the handler planned
+            // rather than the one that shipped, so a caller comparing
+            // `returned` against `total_in_file` reads a page as larger than
+            // the array it can see. The elision says how many went and why;
+            // this keeps the plain count honest.
+            payload["returned"] = json!(kept);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Run the ladder over one payload, recording what it cost in `accounting`.
 ///
 /// Split from [`enforce`] so the size the response ships at is measured on one
@@ -1499,12 +1570,8 @@ fn run_ladder(
             if Some(*key) == primary {
                 primary_withheld = withheld;
                 let kept = found.saturating_sub(withheld);
-                if let Some(cursor) = locate_cursor.as_mut() {
-                    if cursor.rebase_after_withheld(withheld, kept) {
-                        payload["next_cursor"] = Value::String(cursor.encode());
-                        cursor_rebased = true;
-                    }
-                }
+                cursor_rebased =
+                    repage_primary_after_cut(payload, tool, locate_cursor.as_mut(), withheld, kept);
             }
         }
         if measure(payload) <= target {
@@ -1533,10 +1600,18 @@ fn run_ladder(
             remediations.push(format!(
                 "re-issue with `page_size: {kept}` and follow `next_cursor`"
             ));
-        } else if tool == "semantic_locate" && primary_withheld > 0 && locate_cursor.is_none() {
-            // Naming a cursor here would be a recovery the response cannot
-            // provide. The two things that do reach the withheld rows are a
-            // larger ceiling and a narrower question, and the caller owns both.
+        } else if PAGED_TOOLS.contains(&tool) && primary_withheld > 0 {
+            // A paged tool whose cursor could not be re-pointed. Naming a cursor
+            // here would be a recovery the response cannot provide. The two
+            // things that do reach the withheld rows are a larger ceiling and a
+            // narrower question, and the caller owns both.
+            //
+            // Keyed on the paged set rather than on `semantic_locate` alone,
+            // because the sentence is about what a cursor can and cannot reach
+            // and every paged tool can arrive here. It used to name locate by
+            // hand, so the one other tool that mints a cursor fell through to
+            // the generic advice below and never said that the rows it dropped
+            // had become unreachable.
             //
             // The budget knob is named only while it can still move: a caller
             // already at the ceiling, or one whose answer does not fit under
@@ -3079,6 +3154,123 @@ mod tests {
             json!(40),
             "the full ranking size is still reported"
         );
+    }
+
+    /// One page of `crate::handlers::file_entities`, in the shape that handler
+    /// serves, with no `next_cursor`: the page the walk ends on.
+    ///
+    /// That is the page FIR-3554 is about. A cut here used to leave the caller
+    /// holding rows it could not finish, because there was no cursor to move and
+    /// nothing minted one.
+    fn file_entities_final_page(rows: usize, offset: usize, total: usize, body: usize) -> Value {
+        let entities: Vec<Value> = (0..rows)
+            .map(|index| {
+                json!({
+                    "id": format!("00000000-0000-4000-8000-{:012}", offset + index),
+                    "name": format!("entity{}", offset + index),
+                    "kind": "function",
+                    "language": "rust",
+                    "role": "source",
+                    "visibility": "public",
+                    "signature": "x".repeat(body),
+                    "start_line": 1,
+                    "end_line": 2,
+                })
+            })
+            .collect();
+        json!({
+            "path": "src/lib.rs",
+            "entities": entities,
+            "returned": rows,
+            "total_in_file": total,
+            "page_size": rows,
+            "offset": offset,
+            "next_cursor": Value::Null,
+            "truncated": false,
+        })
+    }
+
+    /// FIR-3554, the half the budget owns. A page cut by the character ceiling
+    /// must hand back a cursor that reaches what it dropped, even when the page
+    /// arrived with none because it was the file's last.
+    ///
+    /// Before this, `repage_primary_after_cut` ran for `semantic_locate` alone,
+    /// so a file enumeration lost its tail and was told to narrow `page_size`,
+    /// which asks a different question instead of finishing this one.
+    #[test]
+    fn a_budget_cut_on_a_file_enumeration_mints_a_reachable_cursor() {
+        let mut payload = file_entities_final_page(40, 200, 240, 600);
+        let budget = ResponseBudget {
+            max_chars: 6_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, FILE_ENTITIES_TOOL, &budget).expect("budgeted");
+        let kept = payload["entities"].as_array().expect("entities").len();
+        assert!(
+            kept < 40,
+            "the ceiling has to bite for this to test anything"
+        );
+        assert!(kept > 0, "a bound is not a refusal");
+        let token = payload["next_cursor"]
+            .as_str()
+            .expect("a cut page carries the cursor to its remainder");
+        let cursor = crate::handlers::file_entities::PageCursor::decode(token)
+            .expect("the minted token is this tool's own cursor");
+        assert_eq!(
+            cursor.offset,
+            200 + kept,
+            "the cursor must name the first row this response did not serve"
+        );
+        assert_eq!(cursor.path, "src/lib.rs");
+        assert_eq!(cursor.total, 240);
+        assert_eq!(
+            payload["returned"],
+            json!(kept),
+            "`returned` must count the rows that shipped, not the ones planned"
+        );
+        assert_eq!(payload["truncated"], json!(true));
+    }
+
+    /// Every name in [`PAGED_TOOLS`] reaches an arm that actually re-points a
+    /// cursor, and a tool outside the list reaches none.
+    ///
+    /// The list and the arms are two places one fact is written. A third paged
+    /// tool added to the list without an arm, or given an arm that cannot mint,
+    /// puts FIR-3554 back silently: the rows go and the cursor stays put.
+    #[test]
+    fn every_paged_tool_has_a_repage_arm() {
+        for tool in PAGED_TOOLS {
+            let (mut payload, mut locate) = match tool {
+                "semantic_locate" => (
+                    locate_payload(40, 300),
+                    Some(LocateCursor {
+                        key: "ranking".to_string(),
+                        page: 1,
+                        next_offset: Some(40),
+                        page_size: Some(40),
+                    }),
+                ),
+                FILE_ENTITIES_TOOL => (file_entities_final_page(40, 200, 240, 600), None),
+                other => panic!("{other} is in PAGED_TOOLS with no case here"),
+            };
+            assert!(
+                repage_primary_after_cut(&mut payload, tool, locate.as_mut(), 30, 10),
+                "{tool} is listed as paged but could not re-point its cursor"
+            );
+            assert!(
+                payload["next_cursor"]
+                    .as_str()
+                    .is_some_and(|t| !t.is_empty()),
+                "{tool} reported a re-point and left no cursor"
+            );
+        }
+
+        let mut unpaged = json!({"results": [1, 2, 3], "next_cursor": Value::Null});
+        assert!(
+            !repage_primary_after_cut(&mut unpaged, "semantic_search", None, 2, 1),
+            "an unpaged tool must not be handed a cursor it never mints"
+        );
+        assert_eq!(unpaged["next_cursor"], Value::Null);
     }
 
     fn cosine_locate_payload(hits: usize) -> Value {
