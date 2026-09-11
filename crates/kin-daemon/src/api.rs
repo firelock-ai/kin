@@ -1618,6 +1618,11 @@ fn default_true() -> bool {
 pub struct RepoEntitiesResponse {
     pub repo_id: String,
     pub entities: Vec<RepoEntityEntry>,
+    /// Entities the filter matched before the window, present only when the
+    /// caller asked for a window. Without it a paging reader cannot tell a last
+    /// page from a full one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
 }
 
 /// Repo file listing response.
@@ -1678,12 +1683,30 @@ pub struct RepoHistoryEntry {
 }
 
 /// A single entity entry returned from the multi-repo search.
+///
+/// Everything past `file_path` is optional and absent unless the caller asked
+/// for it, so a reader of this row keeps reading it unchanged.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoEntityEntry {
     pub id: String,
     pub name: String,
     pub kind: String,
     pub file_path: Option<String>,
+    /// Distinct undirected (neighbour, kind) pairs, the graph export's own
+    /// definition of degree, so a list and a picture of one repository agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degree: Option<usize>,
+    /// Distinct entities that reach this one over a call, an import or a
+    /// reference, self excluded and receiver-name guesses excluded: the set the
+    /// reference surface certifies, and the number importance orders by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependents: Option<usize>,
+    /// The declaration as the graph recorded it, collapsed to one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// The first line of the entity's doc summary, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Provenance hash chain step — one level in the Merkle DAG proof lineage.
@@ -1740,10 +1763,26 @@ pub struct ProvenanceBrokenChain {
 }
 
 /// Query parameters for multi-repo entity search.
+///
+/// A request that names none of the optional ones gets the response this route
+/// has always served, in the order it has always served it.
 #[derive(Debug, Deserialize)]
 struct RepoEntitiesQuery {
     #[serde(default)]
     query: Option<String>,
+    /// `importance` puts what most of the repository depends on first. Absent
+    /// keeps the graph's own order.
+    #[serde(default)]
+    order: Option<String>,
+    /// Rows to return, from `offset`. Absent returns every matching row.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Rows to skip before the window. Absent starts at the first row.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Comma-separated optional row fields: `ranking`, `signature`, `summary`.
+    #[serde(default)]
+    include: Option<String>,
 }
 
 /// The current API version number, returned in the `X-Kin-API-Version` header.
@@ -17241,35 +17280,253 @@ async fn repo_health(
     }))
 }
 
-/// GET /repos/{repo_id}/entities?query=X — search entities in a specific repo's graph.
+/// GET /repos/{repo_id}/entities: the entities of one repository's graph.
+///
+/// `query` narrows by name as it always has. `order=importance` puts what the
+/// rest of the repository most depends on first, `limit` and `offset` window the
+/// result, and `include` adds the ranking numbers, the signature and the doc
+/// summary to each row. A request that names none of those is answered exactly
+/// as before: every matching entity, in the graph's own order, four fields to a
+/// row, which is what keeps a reader of today's shape reading it unchanged.
 async fn repo_entities(
     Path(repo_id): Path<String>,
     Query(params): Query<RepoEntitiesQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
     let graph = repo_scoped_graph(&state, &repo_id).await?;
+    let order = RepoEntityOrder::parse(params.order.as_deref())?;
+    let fields = RepoEntityFields::parse(params.include.as_deref())?;
+    let window = repo_entity_window(params.limit, params.offset)?;
+    let query = params.query.clone();
+    let repo = repo_id.clone();
 
-    let filter = kin_model::EntityFilter {
-        name_pattern: params.query.clone(),
-        ..Default::default()
-    };
-
-    let entities = graph.query_entities(&filter).map_err(internal_error)?;
-
-    let entries: Vec<RepoEntityEntry> = entities
-        .into_iter()
-        .map(|e| RepoEntityEntry {
-            id: e.id.to_string(),
-            name: e.name.clone(),
-            kind: format!("{:?}", e.kind),
-            file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+    // Ranking reads every entity's relations, which is real CPU work at
+    // repository scale, so it runs off the request thread for the reason the
+    // graph export's projection does: one caller's ranking must not stall every
+    // other request this runtime is serving.
+    tokio::task::spawn_blocking(move || {
+        let filter = kin_model::EntityFilter {
+            name_pattern: query,
+            ..Default::default()
+        };
+        let mut matched = graph.query_entities(&filter)?;
+        let ranks = if order == RepoEntityOrder::Importance || fields.ranking {
+            Some(repo_entity_ranks(graph.as_ref())?)
+        } else {
+            None
+        };
+        if let (RepoEntityOrder::Importance, Some(ranks)) = (order, ranks.as_ref()) {
+            matched.sort_by(|left, right| {
+                let (left_rank, right_rank) = (entity_rank(ranks, left), entity_rank(ranks, right));
+                right_rank
+                    .dependents
+                    .cmp(&left_rank.dependents)
+                    .then_with(|| right_rank.degree.cmp(&left_rank.degree))
+                    .then_with(|| left.name.cmp(&right.name))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        // The population this window was cut from, so a reader of one page can
+        // tell a last page from a full one. Absent when no window was asked for,
+        // where the rows are the population.
+        let total = window.map(|_| matched.len());
+        let rows: Vec<kin_model::Entity> = match window {
+            Some((offset, limit)) => matched.into_iter().skip(offset).take(limit).collect(),
+            None => matched,
+        };
+        let entries = rows
+            .into_iter()
+            .map(|entity| {
+                let rank = ranks.as_ref().map(|ranks| entity_rank(ranks, &entity));
+                RepoEntityEntry {
+                    id: entity.id.to_string(),
+                    name: entity.name.clone(),
+                    kind: format!("{:?}", entity.kind),
+                    file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
+                    degree: rank.map(|rank| rank.degree),
+                    dependents: rank.map(|rank| rank.dependents),
+                    signature: fields
+                        .signature
+                        .then(|| one_line(&entity.signature))
+                        .flatten(),
+                    summary: fields
+                        .summary
+                        .then(|| entity.doc_summary.as_deref().and_then(one_line))
+                        .flatten(),
+                }
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(RepoEntitiesResponse {
+            repo_id: repo,
+            entities: entries,
+            total,
         })
-        .collect();
+    })
+    .await
+    .map_err(internal_error)?
+    .map(Json)
+    .map_err(internal_error)
+}
 
-    Ok(Json(RepoEntitiesResponse {
-        repo_id,
-        entities: entries,
-    }))
+/// How a caller asked the entity list to be ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoEntityOrder {
+    /// The graph's own order: entity id, or name rank when `query` narrowed it.
+    Graph,
+    /// What the repository most depends on first.
+    Importance,
+}
+
+impl RepoEntityOrder {
+    /// Refuse an order this route cannot serve rather than quietly answering in
+    /// another one. A caller that asked to be ranked and was not would publish
+    /// the unranked list as ranked.
+    fn parse(raw: Option<&str>) -> std::result::Result<Self, (StatusCode, String)> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(Self::Graph),
+            Some("importance") => Ok(Self::Importance),
+            Some(other) => Err((
+                StatusCode::BAD_REQUEST,
+                format!("order must be 'importance' when given; got '{other}'"),
+            )),
+        }
+    }
+}
+
+/// The optional row fields a caller asked for.
+#[derive(Debug, Clone, Copy, Default)]
+struct RepoEntityFields {
+    ranking: bool,
+    signature: bool,
+    summary: bool,
+}
+
+impl RepoEntityFields {
+    fn parse(raw: Option<&str>) -> std::result::Result<Self, (StatusCode, String)> {
+        let mut fields = Self::default();
+        for name in raw
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            match name {
+                "ranking" => fields.ranking = true,
+                "signature" => fields.signature = true,
+                "summary" => fields.summary = true,
+                other => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "include accepts 'ranking', 'signature' and 'summary'; got '{other}'"
+                        ),
+                    ))
+                }
+            }
+        }
+        Ok(fields)
+    }
+}
+
+/// The `(offset, limit)` a caller asked for, and `None` for the whole list.
+///
+/// A zero limit is refused rather than clamped, for the reason every other
+/// bounded read on these routes refuses it: clamping answers a request for
+/// nothing with a page, and the caller cannot tell the cap from its own request.
+fn repo_entity_window(
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> std::result::Result<Option<(usize, usize)>, (StatusCode, String)> {
+    match (limit, offset) {
+        (None, None) => Ok(None),
+        (Some(0), _) => Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be at least 1; leave it out to read the whole list".to_string(),
+        )),
+        (limit, offset) => Ok(Some((offset.unwrap_or(0), limit.unwrap_or(usize::MAX)))),
+    }
+}
+
+/// One entity's place in its graph.
+#[derive(Debug, Clone, Copy, Default)]
+struct RepoEntityRank {
+    degree: usize,
+    dependents: usize,
+}
+
+fn entity_rank(
+    ranks: &HashMap<EntityId, RepoEntityRank>,
+    entity: &kin_model::Entity,
+) -> RepoEntityRank {
+    ranks.get(&entity.id).copied().unwrap_or_default()
+}
+
+/// Degree and certified dependents for every entity of one graph, in one pass.
+///
+/// `degree` is the graph export's own definition, distinct undirected
+/// (neighbour, kind) pairs among entity-to-entity edges, so the list and the
+/// picture of one repository cannot disagree about how connected a thing is.
+///
+/// `dependents` is the other half, and the one importance orders by, because
+/// degree alone ranks a long test function that calls fifty things above the
+/// function fifty things call. It counts distinct entities that reach this one
+/// over a call, an import or a reference, excluding the entity itself and
+/// excluding receiver-name guesses, which is exactly the set the reference
+/// surface certifies: those guesses bind `x.clone()` to every method named
+/// `clone` in the repository, and counting them would rank the guess.
+fn repo_entity_ranks(
+    graph: &kin_db::InMemoryGraph,
+) -> anyhow::Result<HashMap<EntityId, RepoEntityRank>> {
+    let entities = graph.list_all_entities()?;
+    let known: HashSet<EntityId> = entities.iter().map(|entity| entity.id).collect();
+    let reference_kinds = kin_mcp::handlers::common::default_reference_kinds();
+    let mut edges: HashSet<(EntityId, EntityId, kin_model::RelationKind)> = HashSet::new();
+    let mut dependents: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
+    for entity in &entities {
+        for relation in graph.get_all_relations_for_entity(&entity.id)? {
+            let (Some(source), Some(destination)) =
+                (relation.src.as_entity(), relation.dst.as_entity())
+            else {
+                continue;
+            };
+            if !known.contains(&source) || !known.contains(&destination) {
+                continue;
+            }
+            let pair = if source <= destination {
+                (source, destination)
+            } else {
+                (destination, source)
+            };
+            edges.insert((pair.0, pair.1, relation.kind));
+            // Counted from the destination's own walk, so each edge is read
+            // once however many entities report it.
+            if destination == entity.id
+                && source != destination
+                && reference_kinds.contains(&relation.kind)
+                && !kin_index::resolution::is_receiver_name_guess(&relation)
+            {
+                dependents.entry(destination).or_default().insert(source);
+            }
+        }
+    }
+    let mut ranks: HashMap<EntityId, RepoEntityRank> = HashMap::new();
+    for (source, destination, _kind) in &edges {
+        ranks.entry(*source).or_default().degree += 1;
+        ranks.entry(*destination).or_default().degree += 1;
+    }
+    for (entity_id, reaching) in dependents {
+        ranks.entry(entity_id).or_default().dependents = reaching.len();
+    }
+    Ok(ranks)
+}
+
+/// One line of text, whitespace collapsed, or `None` when there is none.
+///
+/// A signature the parser recorded across several lines is still one
+/// declaration, and a row that carries it as such is what a list can render.
+fn one_line(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
 }
 
 /// GET /repos/{repo_id}/files — list the default ref's exact repository tree.
@@ -43993,6 +44250,244 @@ mod tests {
     /// is `/repos/{repo_id}/entities`, which carries no relations at all, so a
     /// renderer has nothing to draw an edge from except the file each entity
     /// happens to sit in.
+    /// A graph with the shape ranking exists for: one entity the repository
+    /// depends on, one that depends on plenty and that nothing needs, and one
+    /// that only a receiver-name guess reaches.
+    ///
+    /// `noisy` carries the higher degree of the two, which is exactly why degree
+    /// alone cannot order this list: it is the long test function that calls
+    /// five things, and nothing calls it.
+    async fn ranked_entities_state() -> (Arc<DaemonState>, String) {
+        let state = test_state();
+        let repo_id = advertised_repo_id(Arc::clone(&state)).await;
+        let hub = test_entity("hub", "src/hub.py");
+        state.graph.upsert_entity(&hub).unwrap();
+        for index in 0..3 {
+            let caller = test_entity(&format!("caller_{index}"), &format!("src/c{index}.py"));
+            state.graph.upsert_entity(&caller).unwrap();
+            link(&state, &caller, &hub, kin_model::RelationKind::Calls);
+        }
+        let noisy = test_entity("noisy", "src/noisy.py");
+        state.graph.upsert_entity(&noisy).unwrap();
+        for index in 0..5 {
+            let callee = test_entity(&format!("callee_{index}"), &format!("src/t{index}.py"));
+            state.graph.upsert_entity(&callee).unwrap();
+            link(&state, &noisy, &callee, kin_model::RelationKind::Calls);
+        }
+        let guessed = test_entity("guessed", "src/guessed.py");
+        let guesser = test_entity("guesser", "src/guesser.py");
+        state.graph.upsert_entity(&guessed).unwrap();
+        state.graph.upsert_entity(&guesser).unwrap();
+        // A receiver-name guess, at the confidence the linker's fan-out tier
+        // stamps, which is what `is_receiver_name_guess` reads.
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: GraphNodeId::Entity(guesser.id),
+                dst: GraphNodeId::Entity(guessed.id),
+                confidence: kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+                origin: kin_model::RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        (state, repo_id)
+    }
+
+    async fn ranked_entities(
+        state: Arc<DaemonState>,
+        repo_id: &str,
+        query: &str,
+    ) -> (StatusCode, RepoEntitiesResponse) {
+        let (status, body) = repo_route(state, &format!("/repos/{repo_id}/entities?{query}")).await;
+        if status != StatusCode::OK {
+            return (
+                status,
+                RepoEntitiesResponse {
+                    repo_id: repo_id.to_string(),
+                    entities: Vec::new(),
+                    total: None,
+                },
+            );
+        }
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// P1: a request that asks for nothing new gets the response this route has
+    /// always served, field for field. Everything ranking added is opt-in, and a
+    /// consumer reading today's four fields must keep reading them.
+    #[tokio::test]
+    async fn a_repo_entity_list_answers_exactly_as_before_when_nothing_is_asked_of_it() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let (status, body) = repo_route(state, &format!("/repos/{repo_id}/entities")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut top: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        top.sort_unstable();
+        assert_eq!(
+            top,
+            ["entities", "repo_id"],
+            "a default answer carries no window and no ranking: {payload}"
+        );
+        for row in payload["entities"].as_array().unwrap() {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["file_path", "id", "kind", "name"], "{row}");
+        }
+    }
+
+    /// P1: importance leads with what the repository depends on, not with what
+    /// is merely busy.
+    #[tokio::test]
+    async fn a_repo_entity_list_ordered_by_importance_leads_with_what_the_repository_depends_on() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let (status, payload) =
+            ranked_entities(state, &repo_id, "order=importance&include=ranking").await;
+        assert_eq!(status, StatusCode::OK);
+        let first = &payload.entities[0];
+        assert_eq!(first.name, "hub", "the entity three others call leads");
+        assert_eq!(first.dependents, Some(3));
+        assert_eq!(first.degree, Some(3));
+        let noisy = payload
+            .entities
+            .iter()
+            .find(|entity| entity.name == "noisy")
+            .expect("the busy entity is still in the list");
+        assert_eq!(
+            noisy.dependents,
+            Some(0),
+            "nothing depends on it however much it calls"
+        );
+        assert_eq!(
+            noisy.degree,
+            Some(5),
+            "and its degree is the higher of the two"
+        );
+    }
+
+    /// P1: a name-only receiver guess is a candidate, not a dependent. Counting
+    /// one would rank the guess: it binds `x.clone()` to every method named
+    /// `clone` in the repository.
+    #[tokio::test]
+    async fn a_repo_entity_list_does_not_count_a_receiver_name_guess_as_a_dependent() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let (status, payload) =
+            ranked_entities(state, &repo_id, "include=ranking&query=guessed").await;
+        assert_eq!(status, StatusCode::OK);
+        let guessed = payload
+            .entities
+            .iter()
+            .find(|entity| entity.name == "guessed")
+            .expect("the guessed entity is in the list");
+        assert_eq!(
+            guessed.dependents,
+            Some(0),
+            "the guess does not certify a dependent"
+        );
+        assert_eq!(
+            guessed.degree,
+            Some(1),
+            "the control: the edge is still there and still counts toward degree"
+        );
+    }
+
+    /// The list and the picture of one repository must not disagree about how
+    /// connected a thing is, so the list's degree is the export's degree for
+    /// every entity of a fixture, not just for one.
+    #[tokio::test]
+    async fn a_repo_entity_lists_degree_is_the_graph_exports_degree() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let export = repo_export_payload(Arc::clone(&state), &repo_id, "limit=0").await;
+        let (status, payload) = ranked_entities(state, &repo_id, "include=ranking").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: HashMap<String, Option<usize>> = payload
+            .entities
+            .iter()
+            .map(|entity| (entity.id.clone(), entity.degree))
+            .collect();
+        assert_eq!(
+            listed.len(),
+            export.nodes.len(),
+            "both surfaces answer for the same entities"
+        );
+        assert!(
+            export.nodes.iter().any(|node| node.degree > 0),
+            "a fixture where every degree is zero would compare nothing"
+        );
+        for node in &export.nodes {
+            assert_eq!(
+                listed.get(&node.id).copied().flatten(),
+                Some(node.degree),
+                "degree disagrees for {}",
+                node.name
+            );
+        }
+    }
+
+    /// An order this route cannot serve, and a window of nothing, are refused
+    /// rather than answered in some other way: a caller that asked to be ranked
+    /// and was not would publish the unranked list as ranked.
+    #[tokio::test]
+    async fn a_repo_entity_list_refuses_an_order_it_cannot_serve_and_a_zero_limit() {
+        let (state, repo_id) = ranked_entities_state().await;
+        for query in ["order=alphabetical", "limit=0", "include=colour"] {
+            let (status, _) = repo_route(
+                Arc::clone(&state),
+                &format!("/repos/{repo_id}/entities?{query}"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "'{query}' must be refused, not quietly ignored"
+            );
+        }
+        // The control: the same route without those answers as before.
+        let (status, _) = repo_route(state, &format!("/repos/{repo_id}/entities")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A window says what it was cut from, or a reader of one page cannot tell a
+    /// last page from a full one.
+    #[tokio::test]
+    async fn a_repo_entity_window_says_what_it_was_cut_from() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let (_, whole) = ranked_entities(Arc::clone(&state), &repo_id, "order=importance").await;
+        let (status, window) =
+            ranked_entities(state, &repo_id, "order=importance&limit=2&offset=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(window.entities.len(), 2);
+        assert_eq!(
+            window.total,
+            Some(whole.entities.len()),
+            "the window reports the population it was cut from"
+        );
+        assert_eq!(whole.total, None, "and the whole list carries no window");
+        let names: Vec<&str> = window
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        let expected: Vec<&str> = whole.entities[1..3]
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(names, expected, "the window is that slice of the order");
+    }
+
     #[tokio::test]
     async fn a_repo_scoped_export_draws_the_named_repositorys_relations() {
         let state = test_state();
