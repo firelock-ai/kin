@@ -530,6 +530,11 @@ fn registered_tools() -> ToolsListResult {
                             "type": "string",
                             "pattern": "^[0-9a-f]{64}$",
                             "description": "Exact semantic change ID. Defaults to the current branch head."
+                        },
+                        "include_bytes": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Also return content_base64 for a UTF-8 body. Non-UTF-8 bytes always come as base64."
                         }
                     },
                     "anyOf": [

@@ -249,7 +249,7 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
         ),
         (
             "kin_artifact_read",
-            "Read one tracked file's exact bytes by artifact_id or repo-relative path, as base64 and, when valid UTF-8, as text. Call it for a file the parsers made no entities for, which a locate hit's artifact_path means.",
+            "Read one tracked file's exact content by artifact_id or repo-relative path: text when valid UTF-8, else base64. Call it for a file the parsers made no entities for, which a locate hit's artifact_path means.",
         ),
         (
             "kin_graph_status",

@@ -40,8 +40,10 @@ pub const ARTIFACT_READ_DESC: &str = "\
 Read one exact graph-owned repository artifact by stable `artifact_id` or by `path`: the \
 repository-relative string `kin_artifact_list` prints as `path_label` (a leading `/` is \
 tolerated), or the byte-exact `{\"bytes_hex\": ...}` object for a path whose bytes are not \
-valid UTF-8. Blob and symlink bytes are returned losslessly as base64 and, only when \
-valid UTF-8, as `text_utf8`. Gitlinks return their external object identity, as the \
+valid UTF-8. A blob or symlink body comes back as `text_utf8` when its bytes are valid \
+UTF-8, which is lossless for them, and as base64 in `content_base64` when they are not; \
+pass `include_bytes: true` for the base64 of a UTF-8 body too. Gitlinks return their \
+external object identity, as the \
 algorithm-tagged `git_object_id` plus a printable `git_object_id_hex`, and have no \
 repository-owned body. Content-addressed hashes are lowercase hex strings, including the \
 returned `source_change_id`, which is exactly the form this tool's own `source_change_id` \
@@ -400,6 +402,10 @@ pub fn handle_artifact_read<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let selection = resolve_tree_selection(args, store, repository_authority)?;
     let artifact = select_artifact(args, &selection.tree)?;
+    let include_bytes = args
+        .get("include_bytes")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let mut result = serde_json::json!({
         "source_change_id": source_change_id_hex(selection.source_change_id),
         "artifact": ArtifactWire::from(artifact),
@@ -430,11 +436,7 @@ pub fn handle_artifact_read<G: GraphStore>(
                 TreeEntry::Gitlink { .. } => unreachable!(),
             });
             result["content_length"] = serde_json::json!(bytes.len());
-            result["content_base64"] =
-                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                result["text_utf8"] = serde_json::json!(text);
-            }
+            put_body(&mut result, &bytes, include_bytes);
         }
     }
 
@@ -443,10 +445,77 @@ pub fn handle_artifact_read<G: GraphStore>(
     ))
 }
 
+/// The body of a read. Bytes that are valid UTF-8 travel once, as `text_utf8`, which is the
+/// lossless form of those same bytes. Bytes that are not travel as `content_base64`, and a
+/// caller that asks with `include_bytes` gets the base64 of a UTF-8 body as well. Sent both
+/// ways, a UTF-8 body was a four-thirds copy of itself that serialized first, because the
+/// keys serialize sorted, so a reader cut at a byte ceiling got the encoding and no text.
+fn put_body(result: &mut serde_json::Value, bytes: &[u8], include_bytes: bool) {
+    let text = std::str::from_utf8(bytes).ok();
+    if text.is_none() || include_bytes {
+        result["content_base64"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    if let Some(text) = text {
+        result["text_utf8"] = serde_json::json!(text);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kin_model::ids::Hash256;
+
+    /// A UTF-8 body travels once, as text, so a reader that cuts the result at a byte
+    /// ceiling still gets the file's first lines rather than an encoding of them. The cut
+    /// here is what `kin agent` sends at a 32768-token window, 12,288 bytes, on a body the
+    /// size of the source file its local-model run read. Bytes that are not UTF-8 still
+    /// travel losslessly as base64, and a caller that asks for bytes gets both.
+    #[test]
+    fn a_utf8_body_travels_as_text_that_survives_a_byte_ceiling() {
+        let body: String = (0..600)
+            .map(|line| format!("pub fn line_{line:04}() -> usize {{ {line} }}\n"))
+            .collect();
+        assert!(
+            body.len() > 20_000,
+            "a body the size of the one that was cut"
+        );
+        let read = |bytes: &[u8], include_bytes: bool| {
+            let mut result = serde_json::json!({
+                "source_change_id": "ab".repeat(32),
+                "artifact": {"artifact_id": ArtifactId::new(), "path_label": "src/belt.rs"},
+                "content_kind": "blob",
+                "content_length": bytes.len(),
+            });
+            put_body(&mut result, bytes, include_bytes);
+            result
+        };
+
+        let text_only = read(body.as_bytes(), false);
+        assert!(text_only.get("content_base64").is_none());
+        assert_eq!(text_only["text_utf8"], body);
+        let served = serde_json::to_string_pretty(&text_only).unwrap();
+        let clipped = &served[..12_288];
+        assert!(
+            clipped.contains("pub fn line_0000() -> usize { 0 }"),
+            "the first 12,288 bytes must carry the file's first line"
+        );
+        assert!(!clipped.contains("content_base64"));
+
+        let both = read(body.as_bytes(), true);
+        assert_eq!(
+            both["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(body.as_bytes())
+        );
+        assert_eq!(both["text_utf8"], body);
+
+        let raw = read(b"\x00\xffKIN", false);
+        assert_eq!(
+            raw["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x00\xffKIN")
+        );
+        assert!(raw.get("text_utf8").is_none());
+    }
 
     fn artifact_with(entry: TreeEntry) -> ResolvedArtifact {
         ResolvedArtifact::new(

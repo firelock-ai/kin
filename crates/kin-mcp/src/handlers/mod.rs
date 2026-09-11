@@ -6553,14 +6553,35 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(
-            compose["content_base64"],
-            base64::engine::general_purpose::STANDARD.encode(compose_bytes)
-        );
+        // A UTF-8 body travels once, as text; its base64 comes only when asked for.
+        assert!(compose.get("content_base64").is_none());
         assert_eq!(
             compose["text_utf8"],
             std::str::from_utf8(compose_bytes).unwrap()
         );
+        let compose_with_bytes = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(compose_id).unwrap(),
+                    ),
+                    ("include_bytes".into(), serde_json::json!(true)),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            compose_with_bytes["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(compose_bytes)
+        );
+        assert_eq!(compose_with_bytes["text_utf8"], compose["text_utf8"]);
         assert_ne!(compose["text_utf8"], "filesystem fallback must never win\n");
         // The spelling an agent reads off the listing, with the leading slash a
         // model tends to add, reads the same artifact.
@@ -6623,9 +6644,10 @@ mod tests {
         );
         assert_eq!(executable["artifact"]["entry"]["executable"], true);
         assert_eq!(
-            executable["content_base64"],
-            base64::engine::general_purpose::STANDARD.encode(executable_bytes)
+            executable["text_utf8"],
+            std::str::from_utf8(executable_bytes).unwrap()
         );
+        assert!(executable.get("content_base64").is_none());
 
         let symlink = tool_result_json(
             artifacts::handle_artifact_read(
@@ -6851,10 +6873,8 @@ mod tests {
             read_after_rename["artifact"]["path"],
             serde_json::to_value(&renamed_path).unwrap()
         );
-        assert_eq!(
-            read_after_rename["content_base64"],
-            base64::engine::general_purpose::STANDARD.encode(content.as_bytes())
-        );
+        assert_eq!(read_after_rename["text_utf8"], content);
+        assert!(read_after_rename.get("content_base64").is_none());
 
         let replacement_id = kin_model::ArtifactId::new();
         let reuse = exact_test_change(
