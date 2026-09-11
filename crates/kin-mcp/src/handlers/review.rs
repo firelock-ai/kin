@@ -941,17 +941,31 @@ fn plan_review_assign<G: GraphStore>(
     existing_review(store, &review_id)?;
     let assigned_at = Timestamp::now();
 
+    // The stored set, which is an add log: it only grows, a removal is recorded
+    // as its own event, and a review's reviewers are derived from the two.
     let mut entries = store
         .get_review_assignments(&review_id)
         .map_err(|e| McpError::Other(e.to_string()))?;
-    entries.extend(reviewers.iter().map(|reviewer| ReviewAssignment {
-        review_id,
-        reviewer: kin_model::IdentityRef::human(reviewer.clone()),
-        assigned_at: assigned_at.clone(),
-        assigned_by: assigner.clone(),
-    }));
+    let assigned: Vec<ReviewAssignment> = reviewers
+        .iter()
+        .map(|reviewer| ReviewAssignment {
+            review_id,
+            reviewer: kin_model::IdentityRef::human(reviewer.clone()),
+            assigned_at: assigned_at.clone(),
+            assigned_by: assigner.clone(),
+        })
+        .collect();
+    let tags: Vec<_> = assigned
+        .iter()
+        .map(kin_review::assignments::AssignmentTag::of)
+        .collect();
+    entries.extend(assigned);
 
-    let details = format!("review_id={review_id}; reviewers={}", reviewers.join(","));
+    let details = format!(
+        "review_id={review_id}; reviewers={}; {}",
+        reviewers.join(","),
+        kin_review::assignments::tag_details(&tags)
+    );
     let result = serde_json::json!({
         "review_id": review_id.to_string(),
         "reviewers": reviewers,
@@ -993,32 +1007,33 @@ fn plan_review_unassign<G: GraphStore>(
     let reviewer = get_string_param(args, "reviewer")?;
     existing_review(store, &review_id)?;
 
-    let live = store
-        .get_review_assignments(&review_id)
+    // The reviewers this review has, so removing someone already removed
+    // records nothing a second time.
+    let live = kin_review::assignments::current_assignments(store, &review_id)
         .map_err(|e| McpError::Other(e.to_string()))?;
-    let remaining: Vec<_> = live
-        .iter()
-        .filter(|assignment| assignment.reviewer.name != reviewer)
-        .cloned()
+    let removed: Vec<_> = live
+        .into_iter()
+        .filter(|assignment| assignment.reviewer.name == reviewer)
         .collect();
-    let write = if remaining.len() == live.len() {
-        // Not assigned, so there is nothing to remove.
+    let tags: Vec<_> = removed
+        .iter()
+        .map(kin_review::assignments::AssignmentTag::of)
+        .collect();
+    let write = if removed.is_empty() {
+        // Not assigned, so there is nothing to remove and nothing to record.
         ReviewWrite::default()
-    } else if remaining.is_empty() {
-        // A collaboration delta upserts a review's whole assignment set and
-        // refuses an empty one, so the last reviewer's removal has no durable
-        // form. Refused by name rather than applied to the live graph alone,
-        // where it would come back at the next restart.
-        return Err(McpError::InvalidParams(format!(
-            "cannot remove {reviewer}, the last reviewer of review {review_id}: repository \
-             authority cannot yet record a review with no reviewers, so assign another reviewer \
-             first"
-        )));
     } else {
+        // The removal is the audit event this write carries, which the review
+        // writer records for a write that carries records. It is not a smaller
+        // set: the set is an add log, a delta refuses an empty one, and shrinking
+        // it would leave a later re-assignment of the same reviewer unable to
+        // reach the live graph. So the set is written unchanged.
         ReviewWrite {
             assignments: Some(ReviewGroup {
                 review_id,
-                entries: remaining,
+                entries: store
+                    .get_review_assignments(&review_id)
+                    .map_err(|e| McpError::Other(e.to_string()))?,
             }),
             ..ReviewWrite::default()
         }
@@ -1031,9 +1046,12 @@ fn plan_review_unassign<G: GraphStore>(
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(PlannedReviewEvent {
-        action: "review.unassign",
+        action: kin_review::assignments::UNASSIGN_ACTION,
         review_id,
-        details: format!("review_id={review_id}; reviewer={reviewer}"),
+        details: format!(
+            "review_id={review_id}; reviewer={reviewer}; {}",
+            kin_review::assignments::tag_details(&tags)
+        ),
         actor_label: "mcp-client".to_string(),
         refs: None,
         write,
@@ -1088,11 +1106,29 @@ pub fn plan_review_mutation<G: GraphStore>(
 
 /// Apply a planned review write straight to `store`, for a caller with no
 /// repository authority behind it.
+///
+/// Nothing here records the audit event the daemon's review writer records, and
+/// a removal is proven by that event. Most removals are also expressed by the
+/// set they leave, so they land either way. The one that is not is a review's
+/// last reviewer, whose removal leaves a set a collaboration delta cannot carry:
+/// on this path it would leave no trace at all, so it is refused by name rather
+/// than answered as done.
 fn apply_planned<G: GraphStore>(planned: PlannedReviewTool, store: &G) -> Result<ToolCallResult> {
     planned
         .write
         .apply_to(store)
         .map_err(|error| McpError::Other(error.to_string()))?;
+    // A removal is an audit event, and this path records none, because nothing
+    // here holds repository authority. Its graph is its whole state, so the
+    // reviewer comes off that graph directly, which is what this surface did
+    // before removals were recorded at all.
+    if planned.action == kin_review::assignments::UNASSIGN_ACTION {
+        for tag in kin_review::assignments::tags_in_details(&planned.details) {
+            store
+                .remove_reviewer(&planned.review_id, &tag.reviewer)
+                .map_err(|error| McpError::Other(error.to_string()))?;
+        }
+    }
     Ok(planned.answer)
 }
 

@@ -2247,11 +2247,45 @@ mod tests {
             "certified"
         );
 
+        // An outstanding sweep stays visible on every answer and bounds only
+        // the relation answers it feeds. This one ranks vectors over whole
+        // embeddings, so it certifies and names the refusal it considered.
+        let held_sweep = finalized_empty_locate_with_pressure("lsp-sweep", Some(coverage(0, 9, 9)));
+        assert_eq!(
+            held_sweep[ENVELOPE_KEY]["degraded"]["memory_pressure"], true,
+            "a held sweep stays visible: {held_sweep}"
+        );
+        assert!(
+            held_sweep["negative"]["degraded_signals"]
+                .as_array()
+                .expect("negative degradation labels")
+                .iter()
+                .any(|label| label.as_str() == Some("memory_pressure")),
+            "a held sweep reaches the response-level negative: {held_sweep}"
+        );
+        assert_eq!(
+            held_sweep["negative"]["trust"], "authoritative",
+            "a held sweep does not bound a vector ranking: {held_sweep}"
+        );
+        assert!(
+            held_sweep["negative"]["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(
+                    "the disclosed signals [memory_pressure] were considered and are not \
+                     load-bearing for this claim"
+                ),
+            "{held_sweep}"
+        );
+        assert_eq!(
+            held_sweep[ENVELOPE_KEY]["verdict"]["inputs"]["absence_gate"],
+            "certified"
+        );
+
         for (work, observed) in [
             ("embed-batch", Some(coverage(1, 9, 9))),
             ("embed-batch", Some(coverage(0, 8, 9))),
             ("embed-batch", None),
-            ("lsp-sweep", Some(coverage(0, 9, 9))),
             ("future-heavy-work", Some(coverage(0, 9, 9))),
         ] {
             let response = finalized_empty_locate_with_pressure(work, observed);

@@ -53,7 +53,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::envelope::{Envelope, NegativeClass};
+use crate::envelope::{AbsenceSubstrate, Envelope, NegativeClass};
 
 /// Reserved, additive top-level key under which a retrieval tool's
 /// confidence-qualified negative is attached, beside the `_kin` envelope.
@@ -373,6 +373,23 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
 /// completeness signal follow from that declaration.
 pub(crate) fn negative_class_for(tool: &str) -> Option<NegativeClass> {
     spec_for(tool).map(|spec| spec.class)
+}
+
+/// What `tool`'s absence reads, which decides the degraded flags that bound it.
+///
+/// Only the tools that read something other than relations are named, because
+/// relations is the substrate the most flags describe: a structural tool left
+/// off this list is bounded by every flag a relation answer is, which is the
+/// safe way for a new tool to start.
+fn absence_substrate(tool: &str, class: NegativeClass) -> AbsenceSubstrate {
+    match (class, tool) {
+        (NegativeClass::Semantic, _) => AbsenceSubstrate::Vectors,
+        (NegativeClass::Structural, FILE_ENTITIES_TOOL | "semantic_search") => {
+            AbsenceSubstrate::EntityIndex
+        }
+        (NegativeClass::Structural, "entity_history") => AbsenceSubstrate::History,
+        (NegativeClass::Structural, _) => AbsenceSubstrate::Relations,
+    }
 }
 
 /// The cross-file edge classes each tool's ABSENCE claim depends on: the
@@ -2496,7 +2513,8 @@ pub fn negative_for(
         return None;
     }
 
-    let (mut trustworthy, trust_reason) = envelope.negative_trust(spec.class);
+    let (mut trustworthy, trust_reason) =
+        envelope.negative_trust(spec.class, absence_substrate(tool, spec.class));
     let mut trust_reason = trust_reason.to_string();
 
     // The coverage gate leads every other gap because it is the one that can
@@ -3030,7 +3048,10 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         return None;
     }
 
-    let (mut trustworthy, trust_reason) = envelope.negative_trust(NegativeClass::Structural);
+    // A name that resolves to nothing is a claim about the entity index, so
+    // only a flag that bounds the entity index bounds it.
+    let (mut trustworthy, trust_reason) =
+        envelope.negative_trust(NegativeClass::Structural, AbsenceSubstrate::EntityIndex);
     let mut trust_reason = trust_reason.to_string();
 
     // A graph holding no entities answers every name identically, so a miss
@@ -5558,11 +5579,12 @@ mod tests {
 
     #[test]
     fn find_references_degraded_is_inconclusive() {
-        // The degraded gate is class-independent: it short-circuits before the
-        // structural graph check.
+        // A flag that bounds every substrate short-circuits before the
+        // structural graph check. A withheld mass deletion is one: the graph
+        // itself may not hold what the working copy does.
         let mut env = structural_ready_envelope();
         env.degraded = Degraded {
-            embed_worker_failed: Some(true),
+            mass_deletion_blocked: Some(true),
             ..Degraded::default()
         };
         // One coverage shortfall on purpose, so the second half of the
@@ -5578,9 +5600,368 @@ mod tests {
             .contains("degraded"));
         assert_eq!(
             negative["degraded_signals"],
-            json!(["embed_worker_failed", "edge_coverage:imports_absent"]),
+            json!(["mass_deletion_blocked", "edge_coverage:imports_absent"]),
             "the daemon's flag leads, and the answer's own coverage shortfalls follow \
              it rather than being dropped"
+        );
+    }
+
+    /// A memory-pressure refusal of `work`, the record a daemon writes when it
+    /// holds that work back.
+    fn pressure_refusal(work: &str) -> kin_core::memory_pressure::PressureRefusal {
+        kin_core::memory_pressure::PressureRefusal {
+            work: work.to_string(),
+            level: "critical".to_string(),
+            reason: "host memory pressure is critical".to_string(),
+            at_unix: 4_800,
+        }
+    }
+
+    /// How a certified answer names a flag it considered that does not bound
+    /// it. The certified reason is the only one a scoped-out flag may appear
+    /// in, because an inconclusive reason lists only what limits the answer.
+    fn considered(label: &str) -> String {
+        format!(
+            "; the disclosed signals [{label}] were considered and are not load-bearing for this \
+             claim"
+        )
+    }
+
+    fn empty_ranking() -> Value {
+        json!({ "query": "auth", "results": [], "total_ranked": 0 })
+    }
+
+    /// An embed-batch refusal holds background embedding back, which leaves
+    /// vectors where they are and changes nothing a relation walk or the entity
+    /// index reads. Measured on a kin-db scratch store, that refusal alone made
+    /// two exact caller sets and a file enumeration inconclusive. It bounds the
+    /// vector answer, and the others certify while naming it.
+    #[test]
+    fn an_embed_batch_refusal_bounds_vector_answers_and_no_other() {
+        let refusal = pressure_refusal("embed-batch");
+
+        let references = negative_for(
+            "find_references",
+            &authoritative_empty_references("function"),
+            &structural_ready_envelope().with_memory_pressure(Some(&refusal)),
+        )
+        .expect("empty references yields a negative");
+        assert_eq!(
+            references["safe_to_conclude_absent"],
+            json!(true),
+            "{references}"
+        );
+        assert!(
+            references["trust_reason"]
+                .as_str()
+                .unwrap()
+                .ends_with(&considered("memory_pressure")),
+            "{references}"
+        );
+
+        let search = negative_for(
+            "semantic_search",
+            &empty_search_page(scope_with_a_measured_class(Some(12))),
+            &structural_ready_envelope().with_memory_pressure(Some(&refusal)),
+        )
+        .expect("an empty search yields a negative");
+        assert_eq!(search["safe_to_conclude_absent"], json!(true), "{search}");
+        assert!(
+            search["trust_reason"]
+                .as_str()
+                .unwrap()
+                .ends_with(&considered("memory_pressure")),
+            "{search}"
+        );
+
+        let locate = negative_for(
+            "semantic_locate",
+            &empty_ranking(),
+            &semantic_authoritative_envelope().with_memory_pressure(Some(&refusal)),
+        )
+        .expect("an empty ranking yields a negative");
+        assert_eq!(locate["safe_to_conclude_absent"], json!(false), "{locate}");
+        assert!(
+            locate["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("degraded:"),
+            "{locate}"
+        );
+
+        let degraded = Envelope::daemon()
+            .with_memory_pressure(Some(&refusal))
+            .degraded;
+        assert!(!degraded.bounds(AbsenceSubstrate::History));
+    }
+
+    /// An lsp-sweep refusal holds the language-server sweep back, which leaves
+    /// cross-file relations at what is durable. It keeps bounding relation
+    /// answers, for a reason that is about them, and no longer bounds the
+    /// entity index or the vector ranking.
+    #[test]
+    fn an_lsp_sweep_refusal_bounds_relation_answers_and_no_other() {
+        let refusal = pressure_refusal("lsp-sweep");
+
+        let references = negative_for(
+            "find_references",
+            &authoritative_empty_references("function"),
+            &structural_ready_envelope().with_memory_pressure(Some(&refusal)),
+        )
+        .expect("empty references yields a negative");
+        assert_eq!(
+            references["safe_to_conclude_absent"],
+            json!(false),
+            "{references}"
+        );
+        assert!(
+            references["trust_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("degraded:"),
+            "{references}"
+        );
+
+        let search = negative_for(
+            "semantic_search",
+            &empty_search_page(scope_with_a_measured_class(Some(12))),
+            &structural_ready_envelope().with_memory_pressure(Some(&refusal)),
+        )
+        .expect("an empty search yields a negative");
+        assert_eq!(search["safe_to_conclude_absent"], json!(true), "{search}");
+        assert!(
+            search["trust_reason"]
+                .as_str()
+                .unwrap()
+                .ends_with(&considered("memory_pressure")),
+            "{search}"
+        );
+
+        let locate = negative_for(
+            "semantic_locate",
+            &empty_ranking(),
+            &semantic_authoritative_envelope().with_memory_pressure(Some(&refusal)),
+        )
+        .expect("an empty ranking yields a negative");
+        assert_eq!(locate["safe_to_conclude_absent"], json!(true), "{locate}");
+        assert!(
+            locate["trust_reason"]
+                .as_str()
+                .unwrap()
+                .ends_with(&considered("memory_pressure")),
+            "{locate}"
+        );
+
+        let degraded = Envelope::daemon()
+            .with_memory_pressure(Some(&refusal))
+            .degraded;
+        assert!(!degraded.bounds(AbsenceSubstrate::History));
+    }
+
+    /// A stopped embedding worker and a store with no vector sidecar both
+    /// describe vectors, and bound the vector answer alone.
+    #[test]
+    fn the_embedding_flags_bound_vector_answers_and_no_other() {
+        for degraded in [
+            Degraded {
+                embed_worker_failed: Some(true),
+                ..Degraded::default()
+            },
+            Degraded {
+                embed_persistence_unavailable: Some(true),
+                ..Degraded::default()
+            },
+        ] {
+            let label = degraded.active_labels()[0];
+
+            let mut structural = structural_ready_envelope();
+            structural.degraded = degraded.clone();
+            let references = negative_for(
+                "find_references",
+                &authoritative_empty_references("function"),
+                &structural,
+            )
+            .expect("empty references yields a negative");
+            assert_eq!(
+                references["safe_to_conclude_absent"],
+                json!(true),
+                "{label}: {references}"
+            );
+            assert!(
+                references["trust_reason"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&considered(label)),
+                "{label}: {references}"
+            );
+
+            let mut semantic = semantic_authoritative_envelope();
+            semantic.degraded = degraded.clone();
+            let locate = negative_for("semantic_locate", &empty_ranking(), &semantic)
+                .expect("an empty ranking yields a negative");
+            assert_eq!(
+                locate["safe_to_conclude_absent"],
+                json!(false),
+                "{label}: {locate}"
+            );
+            assert!(
+                locate["trust_reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("degraded:"),
+                "{label}: {locate}"
+            );
+
+            assert!(!degraded.bounds(AbsenceSubstrate::EntityIndex), "{label}");
+            assert!(!degraded.bounds(AbsenceSubstrate::History), "{label}");
+        }
+    }
+
+    /// Scoping is opt-in per flag, never the fallback. A refusal of work this
+    /// build does not scope, a refusal read back from the wire with no work
+    /// recorded, and a flag with no scope of its own each keep bounding every
+    /// answer.
+    #[test]
+    fn a_refusal_of_unnamed_work_or_an_unlisted_flag_bounds_every_answer() {
+        let mut standing: Vec<(String, Degraded)> = ["ambient-admission", "future-heavy-work"]
+            .into_iter()
+            .map(|work| {
+                (
+                    format!("a refusal of {work}"),
+                    Envelope::daemon()
+                        .with_memory_pressure(Some(&pressure_refusal(work)))
+                        .degraded,
+                )
+            })
+            .collect();
+        standing.push((
+            "a refusal with no recorded work".to_string(),
+            Degraded {
+                memory_pressure: Some(true),
+                ..Degraded::default()
+            },
+        ));
+        standing.push((
+            "a suspended sweep".to_string(),
+            Degraded {
+                sweep_suspended: Some(true),
+                ..Degraded::default()
+            },
+        ));
+        standing.push((
+            "a hydration gap".to_string(),
+            Degraded {
+                hydration_semantics_stale: Some(true),
+                ..Degraded::default()
+            },
+        ));
+
+        for (what, degraded) in standing {
+            for substrate in [
+                AbsenceSubstrate::Vectors,
+                AbsenceSubstrate::EntityIndex,
+                AbsenceSubstrate::Relations,
+                AbsenceSubstrate::History,
+            ] {
+                assert!(
+                    degraded.bounds(substrate),
+                    "{what} must bound {substrate:?}"
+                );
+            }
+
+            let mut structural = structural_ready_envelope();
+            structural.degraded = degraded.clone();
+            for (tool, payload) in [
+                (
+                    "find_references",
+                    authoritative_empty_references("function"),
+                ),
+                (
+                    "semantic_search",
+                    empty_search_page(scope_with_a_measured_class(Some(12))),
+                ),
+            ] {
+                let negative = negative_for(tool, &payload, &structural)
+                    .expect("an empty answer yields a negative");
+                assert_eq!(
+                    negative["safe_to_conclude_absent"],
+                    json!(false),
+                    "{what} on {tool}: {negative}"
+                );
+                assert!(
+                    negative["trust_reason"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("degraded:"),
+                    "{what} on {tool}: {negative}"
+                );
+            }
+
+            let mut semantic = semantic_authoritative_envelope();
+            semantic.degraded = degraded;
+            let locate = negative_for("semantic_locate", &empty_ranking(), &semantic)
+                .expect("an empty ranking yields a negative");
+            assert_eq!(
+                locate["safe_to_conclude_absent"],
+                json!(false),
+                "{what}: {locate}"
+            );
+        }
+    }
+
+    /// A flag scoped out of an answer that something else limits stays in every
+    /// place a reader looks for disclosure, and out of the one place that lists
+    /// what limits the answer: `trust_reason` on an inconclusive answer is that
+    /// list, and the one verdict's limiting factor is built from it.
+    #[test]
+    fn a_scoped_out_flag_stays_disclosed_where_something_else_limits_the_answer() {
+        let envelope = Envelope::daemon()
+            .with_health(&json!({
+                "reconciliation_status": "reconciling",
+                "graph_loaded": true,
+            }))
+            .with_memory_pressure(Some(&pressure_refusal("embed-batch")));
+        let payload = authoritative_empty_references("function");
+        let negative = negative_for("find_references", &payload, &envelope)
+            .expect("empty references yields a negative");
+        assert_eq!(negative["trust"], json!("inconclusive"), "{negative}");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("graph_uninitialized"),
+            "the graph gate is what limits this answer: {reason}"
+        );
+        assert!(
+            !reason.contains("memory_pressure") && !reason.contains("degraded:"),
+            "an inconclusive reason lists only what limits the answer: {reason}"
+        );
+        assert!(
+            negative["degraded_signals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("memory_pressure")),
+            "{negative}"
+        );
+        assert!(
+            negative["advice"]
+                .as_str()
+                .unwrap()
+                .contains("memory_pressure"),
+            "{negative}"
+        );
+
+        let verdict = crate::verdict::Verdict::compute(
+            "find_references",
+            &payload,
+            &envelope,
+            Some(&negative),
+        )
+        .expect("a qualified answer carries a verdict")
+        .to_value();
+        let factor = verdict["limiting_factor"].as_str().unwrap_or_default();
+        assert!(factor.contains("graph_uninitialized"), "{verdict}");
+        assert!(
+            !factor.contains("memory_pressure") && !factor.contains("degraded:"),
+            "a flag that does not bound the answer never reads as its limit: {verdict}"
         );
     }
 
@@ -6096,7 +6477,7 @@ mod tests {
     fn neighborhood_gap_keeps_the_substrate_reason_beside_it() {
         let mut env = structural_ready_envelope();
         env.degraded = Degraded {
-            embed_worker_failed: Some(true),
+            mass_deletion_blocked: Some(true),
             ..Degraded::default()
         };
         let mut payload = neighborhood_payload("both", 0);

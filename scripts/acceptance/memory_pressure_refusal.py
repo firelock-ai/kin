@@ -624,11 +624,20 @@ def names_a_death(text):
     # `daemon_loss_explanation` and the kill record's own summary. Listed rather
     # than guessed at, because a grader matching a phrase nothing emits passes
     # every build.
+    #
+    # "without retiring" is the vocabulary for an ending nothing observed: no
+    # signal and no memory attribution, which is what every macOS host and every
+    # uncapped Linux one records. It is listed because this grader was passing
+    # such a sentence on the incidental "is gone" inside "its exit signal is
+    # gone", which is a phrase about the signal rather than about the daemon, so
+    # a reword of that sub-clause would have turned a real death into a silent
+    # miss.
     return any(phrase in text for phrase in (
         "is gone",
         "was terminated",
         "killed",
         "stopped beating",
+        "without retiring",
     ))
 
 
@@ -762,16 +771,31 @@ def enrichment_line(text):
     return None
 
 
-def enrichment_names_a_kill(line):
-    """Whether the enrichment line says a daemon serving this store was killed.
+# The half every clause about a dead daemon carries, in either vocabulary. It
+# matches `DEATH_CLAUSE_STEM` in `crates/kin-cli/src/daemon_death.rs`, which the
+# product renders every one of those clauses from.
+DEATH_CLAUSE_STEM = "a daemon serving this store"
+
+
+def enrichment_names_a_death(line):
+    """Whether the enrichment line says a daemon of this store died.
 
     "Completion not attested" is true of every store, which is exactly why it
     hid this one: the counts, the presence and the caveat were identical to a
     store whose enrichment simply had not been certified yet. Both halves are
     required, because the caveat alone is what the defect looked like.
+
+    The death half is read off the stem both clauses share rather than off the
+    word "killed". This grader asked for "killed" and the product then gained a
+    second, more careful clause for an ending nothing observed, which is what
+    this check's own SIGKILL produces on a host with no cgroup accounting: the
+    record carries no signal and no attribution, so the product says the daemon
+    "ended without retiring" rather than claiming a kill nothing saw. The check
+    then reported the product as having stopped naming deaths on the build that
+    had started naming them precisely.
     """
     line = line or ""
-    return "completion not attested" in line and "killed" in line
+    return "completion not attested" in line and DEATH_CLAUSE_STEM in line
 
 
 GRADERS = {
@@ -784,7 +808,7 @@ GRADERS = {
     "reason_names_the_budget": reason_names_the_budget,
     "status_publishes_the_standing": status_publishes_the_standing,
     "offers_the_idle_window": offers_the_idle_window,
-    "enrichment_names_a_kill": enrichment_names_a_kill,
+    "enrichment_names_a_death": enrichment_names_a_death,
     "row_reports_a_kill": row_reports_a_kill,
     "footprint_child_verdict": footprint_child_verdict,
     "contemporaneous_reading": contemporaneous_reading,
@@ -1864,9 +1888,16 @@ def check_9(suite):
     reader has no signal at all.
 
     The claim the fix may make is joint and not causal: this store's enrichment
-    is unattested AND a daemon serving it was killed. Whether that kill is what
+    is unattested AND a daemon serving it died. Whether that death is what
     stopped the enrichment is not something the record establishes, so the check
     does not ask for it.
+
+    Nor does it ask for one wording. The kill below is a SIGKILL this check
+    sends, and on a host that publishes no memory accounting the store's record
+    carries no signal and no attribution, so the product says that daemon
+    "ended without retiring" rather than claiming a kill nothing saw. Both are
+    this store naming a daemon of its own that died, which is what the reader
+    had no signal of at all, and the grader reads the stem they share.
 
     `kin status` is the surface probed because it is the durable one and it can
     be asked again. `kin init` renders the same clause from the same function
@@ -1875,7 +1906,7 @@ def check_9(suite):
     """
     result = Result(
         "9", TICKET_DEATH,
-        "an unattested enrichment names the daemon kill behind it, or names none",
+        "an unattested enrichment names the daemon death behind it, or names none",
     )
 
     # The control first, so a build that named a kill unconditionally fails here
@@ -1887,10 +1918,10 @@ def check_9(suite):
         result.unknown("this build's `kin status` carries no durable enrichment line: %s"
                        % tail(out, 700))
         return result
-    if enrichment_names_a_kill(line):
+    if enrichment_names_a_death(line):
         result.bad("a store that has lost no daemon reports one anyway: %s" % line)
     else:
-        result.ok("a store that has lost no daemon names no kill")
+        result.ok("a store that has lost no daemon names no death")
 
     repo = suite.fixture("killedenrich")
     rc, out = suite.restart_daemon(repo, pressure="nominal")
@@ -1917,8 +1948,8 @@ def check_9(suite):
         result.unknown("this build's `kin status` carries no durable enrichment line after "
                        "the kill: %s" % tail(out, 700))
         return result
-    if enrichment_names_a_kill(line):
-        result.ok("the enrichment line names the kill beside its counts")
+    if enrichment_names_a_death(line):
+        result.ok("the enrichment line names the daemon's death beside its counts")
     else:
         result.bad("the enrichment of a store whose daemon was killed reads exactly like one "
                    "that was merely never certified: %s" % line)
@@ -2805,6 +2836,12 @@ def self_test():
         (True, "the daemon serving this repository (pid 41) is gone; it was committing"),
         (True, "a daemon serving this store was killed 1 time(s)"),
         (True, "the daemon serving this repository was terminated while the request was in flight"),
+        # An ending nothing observed. It used to be accepted only by accident,
+        # on the "is gone" inside "its exit signal is gone", so the phrase about
+        # the daemon rather than about the signal is what carries it now.
+        (True, "a daemon serving this store ended 4 time(s) since 2026-09-11 20:42Z without "
+               "retiring its serving record, with nothing waiting on it, so how it ended is "
+               "not known"),
         # The measured sentence, which is the thing this grader must reject.
         (False, "the kin daemon at http://127.0.0.1:39767 stopped answering while the lsp "
                 "sweep status request was in flight; it exits after its idle window, so "
@@ -2857,21 +2894,28 @@ def self_test():
         (True, "Durable semantic enrichment: present (1058 entities, 2016 relations, 6731 "
                "changes at authority generation 1, workspace generation 1; completion not "
                "attested, and a daemon serving this store was killed)"),
+        # The second vocabulary, for an ending nothing observed. This is the
+        # line check 9's own SIGKILL produces on a host with no cgroup
+        # accounting, and the line this grader used to reject, reporting the
+        # product red for saying something more careful than "killed".
+        (True, "Durable semantic enrichment: present (6 entities, 6 relations, 1 changes at "
+               "authority generation 2, workspace generation 1; completion not attested, and "
+               "a daemon serving this store ended without retiring)"),
         # The measured line, which is the one this grader must reject.
         (False, "Durable semantic enrichment: present (1058 entities, 2016 relations, 6731 "
                 "changes at authority generation 1, workspace generation 1; completion not "
                 "attested)"),
         # A line that dropped the caveat is not a fix either: the counts are
-        # still unattested, and a reader told only about a kill loses that.
+        # still unattested, and a reader told only about a death loses that.
         (False, "Durable semantic enrichment: present (1058 entities; a daemon serving this "
                 "store was killed)"),
         (False, ""),
         (False, None),
     ]
     for want, line in enrichment_cases:
-        got = enrichment_names_a_kill(line)
+        got = enrichment_names_a_death(line)
         if got != want:
-            failures.append("enrichment_names_a_kill(%r) = %s, wanted %s" % (line, got, want))
+            failures.append("enrichment_names_a_death(%r) = %s, wanted %s" % (line, got, want))
 
     kill_row_cases = [
         (True, {"status": "degraded",

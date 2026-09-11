@@ -108,8 +108,20 @@ impl<A> PlannedReviewEvent<A> {
     /// Whether the writer records an audit event for this action. Creating a
     /// review and deciding one do; notes and comments carry their own author and
     /// time.
+    ///
+    /// Assigning and removing a reviewer do too, and for a second reason: a
+    /// removal has no other durable form. A delta upserts a review's whole
+    /// assignment set and refuses an empty one, so the event is what proves a
+    /// removal happened, and [`crate::assignments`] derives a review's reviewers
+    /// from the set and those events together.
     pub fn records_audit_event(&self) -> bool {
-        matches!(self.action, "review.create" | "review.decide")
+        matches!(
+            self.action,
+            "review.create"
+                | "review.decide"
+                | crate::assignments::ASSIGN_ACTION
+                | crate::assignments::UNASSIGN_ACTION
+        )
     }
 }
 

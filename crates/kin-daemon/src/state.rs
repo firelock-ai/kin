@@ -3787,6 +3787,14 @@ pub(crate) fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
     current.saturating_mul(4) < baseline
 }
 
+// Workspace graphs the flush has materialized out of authority on this thread.
+// Read through `DaemonState::flush_workspace_graph_builds`, which carries the
+// reason it exists.
+#[cfg(test)]
+thread_local! {
+    static FLUSH_WORKSPACE_GRAPH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl DaemonState {
     /// Workspace identity pinned when this local daemon opened repository
     /// authority. Mutation routes must use this instead of reparsing a mutable
@@ -11449,6 +11457,20 @@ impl DaemonState {
         Ok(index_path)
     }
 
+    /// Workspace graphs this thread's flushes have materialized out of
+    /// authority.
+    ///
+    /// A flush that publishes nothing must not build one. The build is
+    /// O(graph), and on a store whose workspace carries a semantic overlay it
+    /// is also what rewrites the prepared workspace artifact, 1,752,126,377
+    /// bytes on the store lane daemonlifeb measured. Per thread for the reason
+    /// the authority-open counters are: a test owns its thread, so a concurrent
+    /// test can neither inflate nor deflate another's reading.
+    #[cfg(test)]
+    fn flush_workspace_graph_builds() -> usize {
+        FLUSH_WORKSPACE_GRAPH_BUILDS.with(std::cell::Cell::get)
+    }
+
     /// The daemon's one held repository authority for the current publication.
     ///
     /// Borrowed rather than opened: an open decodes the complete persisted
@@ -11468,6 +11490,11 @@ impl DaemonState {
     /// Prove the derived graph still matches workspace authority at this
     /// generation, publish the language-server relations authority does not
     /// hold yet, and report the generation the workspace ends at.
+    ///
+    /// The order is load-bearing. The tree proof reads the workspace's exact
+    /// persisted tree out of the authority envelope, the decision to publish is
+    /// taken from the live graph, and authority's workspace graph is
+    /// materialized only when there is a relation to publish.
     ///
     /// Language-server relations are the one part of this derived graph that
     /// nothing rebuilds. Parser reconciliation re-derives its own output from
@@ -11524,6 +11551,38 @@ impl DaemonState {
                     self.cached_repo_id
                 )))
             })?;
+        let roots = lease.roots().clone();
+
+        // The live tree is proved against the workspace's own persisted tree
+        // rather than against a materialized workspace graph. Materialization
+        // asserts the two are equal on its way out, so this is the same proof,
+        // and it costs nothing: a flush with nothing to publish no longer
+        // builds the workspace graph at all, which on a store whose workspace
+        // carries a semantic overlay is where the prepared artifact gets
+        // rewritten whole.
+        let live_tree = self.graph.resolved_tree();
+        if live_tree != workspace.tree {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "refusing to acknowledge derived graph state at repository generation {expected_generation}: live exact tree does not match workspace authority"
+                ),
+            )));
+        }
+
+        let live_snapshot = self.graph.to_snapshot();
+        // Whether there is anything to publish is decided from the live graph
+        // alone. This publication carries language-server relations and nothing
+        // else, so a live graph holding none cannot produce a delta, and asking
+        // authority to materialize its workspace graph to learn that was the
+        // whole cost of an idle flush.
+        if !live_snapshot
+            .relations
+            .values()
+            .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
+        {
+            return Ok(expected_generation);
+        }
+
         let authority_snapshot = lease
             .workspace_graph_snapshot(&workspace_id)
             .map_err(DaemonError::from)?
@@ -11533,22 +11592,13 @@ impl DaemonState {
                     self.cached_repo_id
                 )))
             })?;
-        let roots = lease.roots().clone();
+        #[cfg(test)]
+        FLUSH_WORKSPACE_GRAPH_BUILDS.with(|builds| builds.set(builds.get() + 1));
         // The lease is a read of this authority and the commit below goes
         // through the authority itself, so the read ends here and the open
         // does not.
         drop(lease);
 
-        let live_tree = self.graph.resolved_tree();
-        if live_tree != authority_snapshot.resolved_tree {
-            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                format!(
-                    "refusing to acknowledge derived graph state at repository generation {expected_generation}: live exact tree does not match workspace authority"
-                ),
-            )));
-        }
-
-        let live_snapshot = self.graph.to_snapshot();
         let (semantic_delta, unpublishable) =
             Self::language_server_enrichment_delta(&live_snapshot, &authority_snapshot)?;
         if unpublishable > 0 {
@@ -20156,6 +20206,55 @@ mod tests {
             1,
             "one publication is one whole-store open: the flush loads it, and its finalize and \
              the readers after it borrow that load"
+        );
+    }
+
+    /// A flush with nothing to publish does not materialize authority's
+    /// workspace graph.
+    ///
+    /// The build is O(graph), and on a store whose workspace carries a semantic
+    /// overlay it is also what rewrites the prepared workspace artifact, so an
+    /// idle flush used to pay the largest thing in the pass to discover it had
+    /// nothing to do.
+    #[test]
+    fn a_flush_with_nothing_to_publish_does_not_build_the_workspace_graph() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+
+        let before = DaemonState::flush_workspace_graph_builds();
+        state
+            .save_snapshot()
+            .expect("a flush with nothing to publish succeeds");
+        assert_eq!(
+            DaemonState::flush_workspace_graph_builds(),
+            before,
+            "a flush with no language-server relation to publish must not build authority's \
+             workspace graph to find that out"
+        );
+
+        // Non-vacuity: with one relation to publish, the same flush does build
+        // it, so the count above is not a counter that cannot move.
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        state
+            .graph
+            .upsert_relation(&language_server_relation(
+                &caller,
+                &callee,
+                kin_model::RelationOrigin::Lsp,
+            ))
+            .unwrap();
+        state
+            .save_snapshot()
+            .expect("the flush publishes the language-server relation");
+        assert_eq!(
+            DaemonState::flush_workspace_graph_builds(),
+            before + 1,
+            "a flush that publishes must build the workspace graph it diffs against"
         );
     }
 
