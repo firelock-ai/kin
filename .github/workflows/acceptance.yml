@@ -307,6 +307,13 @@ jobs:
       - name: Falsify the working-copy freshness graders
         run: python3 scripts/acceptance/working_copy_freshness_repro.py --self-test
 
+      # FIR-3550. Kin's own agent could not land an edit: its edit_file wrote the file
+      # first, and the commit held every tracked path to the prior tree, so the agent's
+      # own bytes read as drift. Each grader is driven against the outcome that broke and
+      # the one the product owes, with no binary.
+      - name: Falsify the agent write graders
+        run: python3 scripts/acceptance/agent_write_publish_repro.py --self-test
+
       # The graders here separate a true sentence from a misleading one, and the
       # two look identical from outside: every verdict this suite grades was
       # right about the graph. So each grader is driven against the literal
@@ -1025,6 +1032,31 @@ jobs:
             echo "::warning title=Working-copy freshness acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Agent write acceptance suite (verdict comes from the gate step)
+        id: agentwrite
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/agent_write_publish_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/agent_write.json \
+            --verbose >acceptance/agent_write.log 2>&1 || rc=$?
+          cat acceptance/agent_write.log
+          {
+            echo "### Agent write acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/agent_write.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Agent write acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: VCS read-surface acceptance suite (verdict comes from the gate step)
         id: vcsreadsurfaces
         if: always()
@@ -1360,6 +1392,7 @@ jobs:
             --report mcp_spawn=acceptance/mcp_spawn.json \
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
+            --report agent_write=acceptance/agent_write.json \
             --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
             --report ref_grammar=acceptance/ref_grammar.json \
             --report diff_content=acceptance/diff_content.json \
