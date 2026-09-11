@@ -3354,6 +3354,13 @@ pub struct DaemonState {
     deferred_vector_checkpoint: std::sync::Mutex<Option<String>>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
+    /// When the persistence loop's current flush began, `None` between
+    /// flushes. Written by that loop in `daemon.rs`; a stop reads it to decide
+    /// whether a flush in flight can finish inside the escalation grace.
+    pub flush_in_flight_since: std::sync::Mutex<Option<Instant>>,
+    /// How long the persistence loop's last flush of a second or more took, 0
+    /// until one has. Written beside `flush_in_flight_since`.
+    pub last_flush_elapsed_ms: AtomicU64,
     /// When the graph was last mutated (`mark_dirty`). The background
     /// persistence task debounces its idle flush on this clock — quiet since
     /// the last MUTATION — which is distinct from `last_save` (how long dirty
@@ -5641,6 +5648,8 @@ impl DaemonState {
             #[cfg(feature = "embeddings")]
             deferred_vector_checkpoint: std::sync::Mutex::new(None),
             last_save: std::sync::Mutex::new(Instant::now()),
+            flush_in_flight_since: std::sync::Mutex::new(None),
+            last_flush_elapsed_ms: AtomicU64::new(0),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
             background_embed_paused: AtomicBool::new(false),
@@ -6031,6 +6040,8 @@ impl DaemonState {
             #[cfg(feature = "embeddings")]
             deferred_vector_checkpoint: std::sync::Mutex::new(None),
             last_save: std::sync::Mutex::new(Instant::now()),
+            flush_in_flight_since: std::sync::Mutex::new(None),
+            last_flush_elapsed_ms: AtomicU64::new(0),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
             background_embed_paused: AtomicBool::new(false),
