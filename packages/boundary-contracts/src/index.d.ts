@@ -127,7 +127,7 @@ export interface RepoScopedSemanticToolError {
 
 export type ActorKind = "human" | "agent" | "system";
 export type EvidenceStatus = "complete" | "partial" | "missing";
-export type ReviewRisk = "low" | "medium" | "high" | "not_assessed";
+export type ReviewRisk = "low" | "medium" | "high" | "critical" | "not_assessed";
 export type ReviewAuthority = "graph" | "overlay";
 export type ReviewPlane = "repo-local" | "hosted-managed";
 export type ReviewProvenance = "graph" | "overlay" | "system-generated";

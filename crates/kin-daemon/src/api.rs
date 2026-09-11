@@ -26392,6 +26392,8 @@ mod tests {
                 REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
                 REPO_SCOPED_BLOB_CAPABILITY.to_string(),
                 REPO_SCOPED_COMPARE_CAPABILITY.to_string(),
+                REPO_SCOPED_REVIEWS_CAPABILITY.to_string(),
+                REPO_SCOPED_SEMANTIC_DIFF_CAPABILITY.to_string(),
             ]
         );
 

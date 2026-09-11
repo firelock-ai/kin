@@ -1055,12 +1055,15 @@ test('a semantic diff risk level is one the daemon emits, critical and not_asses
   }
 
   // A hosted list row carries no assessed risk and no computed count, so the
-  // queue item's risk can say not_assessed and its count can be null.
+  // queue item's risk can say not_assessed and its count can be null. A client
+  // takes an assessed review's risk from the semantic diff, whose overall_risk
+  // can be critical, so the queue item carries every level the daemon emits.
   const reviewRisk = declarations.match(/export type ReviewRisk = ([^;]+);/);
   assert.ok(reviewRisk, 'ReviewRisk must be declared in index.d.ts');
-  assert.ok(
-    [...reviewRisk[1].matchAll(/"([a-z_]+)"/g)].map((match) => match[1]).includes(notAssessed[1]),
-    `ReviewRisk must carry ${notAssessed[1]}`
+  assert.deepEqual(
+    [...reviewRisk[1].matchAll(/"([a-z_]+)"/g)].map((match) => match[1]).sort(),
+    emitted,
+    'ReviewRisk must carry every level the daemon emits, critical and not_assessed included'
   );
   const queueItem = declarations.match(/export interface ReviewQueueItem \{([\s\S]*?)\n\}/);
   assert.ok(queueItem, 'ReviewQueueItem must be declared in index.d.ts');
