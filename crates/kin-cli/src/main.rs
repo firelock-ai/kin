@@ -556,11 +556,21 @@ enum Command {
     /// Show upstream callers/importers/references for an entity
     Refs {
         /// Entity name or ID. Required unless --bulk-json + --entities is provided.
+        /// A name with twins can carry its pin: `Name@file`, `Name@file:line`,
+        /// `Name#kind`
         #[arg(required_unless_present = "bulk_json")]
         entity: Option<String>,
         /// Filter relation kinds: all, calls, imports, or references (or Any for bulk mode)
         #[arg(long, default_value = "all")]
         kind: String,
+        /// Exact repo-relative file of the entity, when its name has twins
+        #[arg(long, conflicts_with = "bulk_json")]
+        file: Option<String>,
+        /// Exact entity kind (for example: function or method), when its name
+        /// has twins. `--kind` filters relation kinds here, so the entity's own
+        /// kind takes this flag
+        #[arg(long, conflicts_with = "bulk_json")]
+        entity_kind: Option<String>,
         /// Bulk mode: classify many entities by reachability in one daemon call.
         /// Outputs JSON to stdout. Requires --entities.
         #[arg(long, default_value_t = false, requires = "entities")]
@@ -1674,24 +1684,45 @@ enum GraphAction {
     },
     /// Look up an entity by name and show its relations
     Inspect {
-        /// Entity name or UUID to inspect
+        /// Entity name or UUID to inspect. A name can carry its pin:
+        /// `Name@file`, `Name@file:line`, `Name#kind`
         name: String,
+        /// Keep only the entities in this exact repo-relative file
+        #[arg(long)]
+        file: Option<String>,
+        /// Keep only entities of this exact kind (for example: function)
+        #[arg(long)]
+        kind: Option<String>,
         /// Output machine-readable JSON ({lines, error}); missing entities exit 0 with structured error.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// Print the exact implementation body for an entity
     Source {
-        /// Entity name or ID
+        /// Entity name or ID. A name with twins can carry its pin:
+        /// `Name@file`, `Name@file:line`, `Name#kind`
         entity: String,
+        /// Exact repo-relative file of the entity, when its name has twins
+        #[arg(long)]
+        file: Option<String>,
+        /// Exact entity kind (for example: function), when its name has twins
+        #[arg(long)]
+        kind: Option<String>,
         /// Output machine-readable JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// Alias for source: print the exact implementation body for an entity
     Body {
-        /// Entity name or ID
+        /// Entity name or ID. A name with twins can carry its pin:
+        /// `Name@file`, `Name@file:line`, `Name#kind`
         entity: String,
+        /// Exact repo-relative file of the entity, when its name has twins
+        #[arg(long)]
+        file: Option<String>,
+        /// Exact entity kind (for example: function), when its name has twins
+        #[arg(long)]
+        kind: Option<String>,
         /// Output machine-readable JSON
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -3486,6 +3517,8 @@ fn run() -> Result<()> {
                 Command::Refs {
                     entity,
                     kind,
+                    file,
+                    entity_kind,
                     bulk_json,
                     entities,
                     compact,
@@ -3501,6 +3534,13 @@ fn run() -> Result<()> {
                         commands::refs::run_bulk(entities, kind, effective_compact).await
                     } else {
                         let entity = entity.expect("clap requires an entity without --bulk-json");
+                        // The flags are the `Name#kind@path` pin every resolver
+                        // reads, so the daemon sees one spelling.
+                        let entity = kin_cli::entity_ref::compose_entity_ref(
+                            &entity,
+                            file.as_deref(),
+                            entity_kind.as_deref(),
+                        );
                         commands::refs::run(entity, kind).await
                     }
                 }
@@ -4054,13 +4094,47 @@ fn run() -> Result<()> {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
                     GraphAction::Materialize { json } => commands::graph::materialize(json).await,
-                    GraphAction::Inspect { name, json } => {
+                    // The flags are the `Name#kind@path` pin every resolver
+                    // reads, so the daemon sees one spelling.
+                    GraphAction::Inspect {
+                        name,
+                        file,
+                        kind,
+                        json,
+                    } => {
+                        let name = kin_cli::entity_ref::compose_entity_ref(
+                            &name,
+                            file.as_deref(),
+                            kind.as_deref(),
+                        );
                         commands::graph::inspect(name, json).await
                     }
-                    GraphAction::Source { entity, json } => {
+                    GraphAction::Source {
+                        entity,
+                        file,
+                        kind,
+                        json,
+                    } => {
+                        let entity = kin_cli::entity_ref::compose_entity_ref(
+                            &entity,
+                            file.as_deref(),
+                            kind.as_deref(),
+                        );
                         commands::graph::source(entity, json).await
                     }
-                    GraphAction::Body { entity, json } => commands::graph::body(entity, json).await,
+                    GraphAction::Body {
+                        entity,
+                        file,
+                        kind,
+                        json,
+                    } => {
+                        let entity = kin_cli::entity_ref::compose_entity_ref(
+                            &entity,
+                            file.as_deref(),
+                            kind.as_deref(),
+                        );
+                        commands::graph::body(entity, json).await
+                    }
                     GraphAction::Export {
                         limit,
                         kinds,

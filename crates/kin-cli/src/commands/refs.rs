@@ -192,56 +192,68 @@ pub fn build_refs_response(
     envelope: &kin_mcp::Envelope,
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
-    let addressed_by_id = uuid::Uuid::parse_str(request.entity.trim()).ok();
-    let target = if let Some(uuid) = addressed_by_id {
-        graph.get_entity(&EntityId(uuid))?
-    } else {
-        // `select_best_entity` scores name quality, export status, kind and
-        // reference counts, all of which tie for a prototype and its definition,
-        // so on a C repository it answered about the header (FIR-3071). The
-        // ranked answer stands unless it is a declaration whose definition the
-        // same name also reaches, which is the one case its key cannot decide.
-        entity_ranking::select_best_entity(graph, &request.entity)?.map(|entity| {
-            let filter = kin_model::EntityFilter {
-                name_pattern: Some(entity.name.clone()),
-                ..Default::default()
-            };
-            let pool = graph.query_entities(&filter).unwrap_or_default();
-            kin_core::prefer_definition_among_same_name(entity, &pool)
-        })
-    };
-    // `None` means the focal was pinned by id, which is the rule the shared
-    // producer switches on. Kept beside the resolution so the two cannot drift.
-    let resolved_by_name = if addressed_by_id.is_some() {
-        None
-    } else {
-        Some(request.entity.trim())
-    };
-    let Some(target) = target else {
+    // The one resolver every read command shares (FIR-3505). The ranker this
+    // replaced tied every twin on name, kind and callers, so it answered about
+    // whichever one the store listed first, and nothing said a choice was made.
+    let resolution = crate::entity_identity::resolve_entity(
+        graph,
+        &request.entity,
+        &crate::entity_identity::IdentityQualifiers::default(),
+    )?;
+    let refusal = if resolution.name_matches.is_empty() {
         // Not an absence claim about references: the focal never resolved, so
         // nothing was walked and there is no coverage question to answer. A
         // verdict here would qualify a lookup failure as if it were a finding.
-        let lines = refs_not_found_guidance(&request.entity);
+        Some(refs_not_found_guidance(&resolution.reference.name))
+    } else if resolution.pin_excluded_all() {
+        Some(crate::entity_identity::pin_miss_lines(graph, &resolution))
+    } else if resolution.needs_a_pin() {
+        Some(crate::entity_identity::pin_request_lines(
+            graph,
+            &resolution,
+        ))
+    } else {
+        None
+    };
+    if let Some(lines) = refusal {
         return Ok(RefsResponse {
             error: Some(lines.join("\n")),
             lines,
             negative: None,
         });
+    }
+    let target = resolution.chosen().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "resolving '{}' produced no candidate",
+            resolution.reference.name
+        )
+    })?;
+    // `None` means the focal was pinned by id, which is the rule the shared
+    // producer switches on. Kept beside the resolution so the two cannot drift.
+    let resolved_by_name = if resolution.addressed_by_id() {
+        None
+    } else {
+        Some(resolution.reference.name.as_str())
     };
     let target = &target;
 
     let refs = collect_references(graph, target, &relation_kinds)?;
-    let target_path = target
-        .file_origin
-        .as_ref()
-        .map(|f| display_read_path(layout, &f.0))
+    let target_path = declaration_neighbors::entity_location(graph, target)
+        .map(|location| display_read_path(layout, &location))
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut lines = Vec::new();
     lines.push(format!(
         "References to '{}' -> {} ({:?}) @ {}",
-        request.entity, target.name, target.kind, target_path
+        resolution.reference.name, target.name, target.kind, target_path
     ));
+    let choice = crate::entity_identity::choice_note(
+        graph,
+        &resolution,
+        crate::entity_identity::PinSpelling::FileEntityKind,
+    );
+    let listed_candidates = !choice.is_empty();
+    lines.extend(choice);
 
     if refs.is_empty() {
         lines.push(format!(
@@ -261,7 +273,12 @@ pub fn build_refs_response(
             envelope,
         ));
         let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
-        lines.extend(empty_result_context(target, &neighbors));
+        // The candidate note above already named every same-name identity, so
+        // the sibling listing would only repeat it.
+        lines.extend(empty_result_context(target, &neighbors, !listed_candidates));
+        if let Some(note) = crate::entity_identity::stale_span_note(&lines) {
+            lines.push(note);
+        }
         return Ok(RefsResponse {
             lines,
             negative,
@@ -285,9 +302,10 @@ pub fn build_refs_response(
             .as_deref()
             .map(|path| display_read_path(layout, path))
             .unwrap_or_else(|| "unknown".to_string());
-        let location = match entry.start_line {
-            Some(line) => format!("{file_path}:{line}"),
-            None => file_path,
+        let location = match (entry.start_line, entry.span_stale) {
+            (_, true) => format!("{file_path} {}", crate::entity_identity::STALE_SPAN_MARK),
+            (Some(line), false) => format!("{file_path}:{line}"),
+            (None, false) => file_path,
         };
         lines.push(format!(
             "  {} @ {} [{}] ({}) {}",
@@ -349,6 +367,9 @@ pub fn build_refs_response(
     // bill. Stamping a coverage verdict on a non-empty answer is the FIR-2404
     // failure in its opposite costume, which this rollout's positive control
     // exists to catch.
+    if let Some(note) = crate::entity_identity::stale_span_note(&lines) {
+        lines.push(note);
+    }
     Ok(RefsResponse {
         lines,
         negative: None,
@@ -501,6 +522,7 @@ fn reference_sites_label(entry: &ReferenceEntry) -> String {
 fn empty_result_context(
     target: &Entity,
     neighbors: &declaration_neighbors::DeclarationNeighbors,
+    list_siblings: bool,
 ) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -535,7 +557,7 @@ fn empty_result_context(
         lines.push(format!("  try: kin refs {}", first.name));
     }
 
-    if !neighbors.siblings.is_empty() {
+    if list_siblings && !neighbors.siblings.is_empty() {
         lines.push(format!(
             "{} other graph identit{} the name '{}':",
             neighbors.siblings.len(),
@@ -826,8 +848,12 @@ pub(crate) struct ReferenceEntry {
     pub(crate) file_path: Option<String>,
     /// 1-based, as every `file:line` an agent pastes into an editor is.
     /// `None` for an entity the graph carries no span for, because reporting a
-    /// line for one would be a fabricated position.
+    /// line for one would be a fabricated position, and `None` when the span
+    /// is stale, for the same reason.
     start_line: Option<u32>,
+    /// The caller's span was measured against an older version of its file
+    /// than the graph holds, so the row prints the path marked stale.
+    span_stale: bool,
     /// 1-based lines of the reference sites inside this caller, ascending and
     /// deduplicated. Read from the same relation evidence and through the same
     /// helper `find_references` uses, because two surfaces answering "where"
@@ -975,11 +1001,13 @@ pub(crate) fn collect_graph_references(
         } else {
             Some(ReferenceLinesAbsent::NoEvidenceSpan)
         };
+        let pointer = crate::entity_identity::entity_pointer(graph, &entity);
         references.push(ReferenceEntry {
             entity_id: source_id,
             name: entity.name.clone(),
             file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
-            start_line: kin_mcp::handlers::common::entity_presentation_start_line(&entity),
+            start_line: pointer.line,
+            span_stale: pointer.stale,
             reference_lines,
             reference_lines_absent,
             relation_kinds: source_kinds,

@@ -465,6 +465,7 @@ fn build_trace_lines_with_graph(
     // single prompt with nothing marking the difference (FIR-3071).
     if !resolution.addressed_by_id {
         lines.extend(crate::entity_identity::twin_note(
+            graph,
             entity,
             target,
             &resolution.candidates,
@@ -997,7 +998,12 @@ fn resolve_trace_target(
     crate::entity_identity::apply_qualifiers(&mut candidates, &qualifiers);
     if candidates.is_empty() {
         return Err(anyhow::Error::new(TraceMiss {
-            lines: trace_qualifier_miss_guidance(entity, &qualifiers.labels(), &name_candidates),
+            lines: trace_qualifier_miss_guidance(
+                graph,
+                entity,
+                &qualifiers.labels(),
+                &name_candidates,
+            ),
         }));
     }
 
@@ -1034,6 +1040,7 @@ fn trace_id_not_found_guidance(entity: &str) -> Vec<String> {
 /// so the next command is a copy of one of these lines. Same shape `kin impact`
 /// already uses for the same case.
 fn trace_qualifier_miss_guidance(
+    graph: &impl GraphStore,
     entity: &str,
     qualifiers: &[String],
     candidates: &[Entity],
@@ -1057,7 +1064,7 @@ fn trace_qualifier_miss_guidance(
             "  {} ({}) @ {}",
             candidate.name,
             kin_review::StableEntityIdentity::from_entity(candidate).kind,
-            crate::entity_identity::entity_location(candidate)
+            crate::entity_identity::entity_location(graph, candidate)
         ));
     }
     if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(

@@ -74,14 +74,19 @@ pub struct CandidateIdentity {
     pub name: String,
     pub kind: String,
     pub location: String,
+    /// The id that pins this candidate exactly in every command. Defaulted so
+    /// an answer from an older daemon, which sends none, still parses.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entity_id: String,
 }
 
 impl CandidateIdentity {
-    fn from_entity(entity: &kin_model::Entity) -> Self {
+    fn from_entity(graph: &kin_db::InMemoryGraph, entity: &kin_model::Entity) -> Self {
         Self {
             name: entity.name.clone(),
             kind: format!("{:?}", entity.kind),
-            location: entity_location(entity).unwrap_or_else(|| "unknown".to_string()),
+            location: entity_location(graph, entity).unwrap_or_else(|| "unknown".to_string()),
+            entity_id: entity.id.to_string(),
         }
     }
 }
@@ -156,18 +161,30 @@ pub async fn build_impact_response(
     request: &ImpactRequest,
     envelope: &kin_mcp::Envelope,
 ) -> Result<ImpactResponse> {
-    let ResolvedEntities {
-        mut matches,
-        mut name_matches,
-        exact_name,
-    } = resolve_entities(graph, request)?;
-    let stable_order = |left: &kin_model::Entity, right: &kin_model::Entity| {
+    // One resolver for every read command (FIR-3505): the typed qualifiers and
+    // any `Name#kind@path:line` suffix merge into one pin, and the answer is the
+    // entity the shared ranking puts first.
+    let resolution = crate::entity_identity::resolve_entity(
+        graph,
+        &request.entity,
+        &crate::entity_identity::IdentityQualifiers {
+            file: request.file.clone(),
+            kind: request.kind.clone(),
+            signature: request.signature.clone(),
+        },
+    )?;
+    // An id names one entity as surely as an exact name does, so a structured
+    // caller that passed one is not refused as ambiguous.
+    let exact_name = resolution.exact_name() || resolution.addressed_by_id();
+    let matches = &resolution.candidates;
+    // The structured listing keeps its identity order, which is what a caller
+    // comparing two answers diffs; the answer itself is chosen by the ranking.
+    let mut name_matches = resolution.name_matches.clone();
+    name_matches.sort_by(|left, right| {
         kin_review::StableEntityIdentity::from_entity(left)
             .cmp(&kin_review::StableEntityIdentity::from_entity(right))
             .then_with(|| left.id.cmp(&right.id))
-    };
-    matches.sort_by(stable_order);
-    name_matches.sort_by(stable_order);
+    });
 
     let mut query = ImpactQuery {
         entity: request.entity.clone(),
@@ -180,19 +197,23 @@ pub async fn build_impact_response(
     if name_matches.len() > 1 || matches.is_empty() {
         query.name_candidates = name_matches
             .iter()
-            .map(CandidateIdentity::from_entity)
+            .map(|entity| CandidateIdentity::from_entity(graph, entity))
             .collect();
     }
 
     if matches.is_empty() {
-        let qualifiers = active_qualifiers(request);
+        let name = resolution.reference.name.as_str();
+        let mut qualifiers = resolution.reference.qualifiers.labels();
+        if let Some(line) = resolution.reference.line {
+            qualifiers.push(format!("line {line}"));
+        }
         // A name that resolves to nothing at all is a genuine miss. A name that
         // resolves and is then filtered out by the qualifiers is not, and must
         // not be reported as one.
         let lines = if name_matches.is_empty() || qualifiers.is_empty() {
-            impact_not_found_guidance(&request.entity)
+            impact_not_found_guidance(name)
         } else {
-            let members_in_scope = match request.file.as_deref() {
+            let members_in_scope = match resolution.reference.qualifiers.file.as_deref() {
                 Some(file) => crate::commands::declaration_neighbors::collect(
                     graph,
                     &name_matches[0],
@@ -203,12 +224,7 @@ pub async fn build_impact_response(
                 .collect(),
                 None => Vec::new(),
             };
-            qualifier_miss_guidance(
-                &request.entity,
-                &qualifiers,
-                &name_matches,
-                &members_in_scope,
-            )
+            qualifier_miss_guidance(graph, name, &qualifiers, &name_matches, &members_in_scope)
         };
         return Ok(ImpactResponse {
             lines,
@@ -227,7 +243,7 @@ pub async fn build_impact_response(
     // next instead of being told the graph holds nothing (FIR-2478).
     if request.require_unique && (matches.len() != 1 || !exact_name) {
         return Ok(ImpactResponse {
-            lines: ambiguous_resolution_guidance(&request.entity, exact_name, &matches),
+            lines: ambiguous_resolution_guidance(graph, &request.entity, exact_name, matches),
             schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
             resolution: "ambiguous".to_string(),
             query,
@@ -236,44 +252,36 @@ pub async fn build_impact_response(
         });
     }
 
-    prefer_entities_owning_incoming_relations(graph, &mut matches)?;
+    // A partial name reaching several entities names none of them, so the
+    // person at a terminal is asked which one, the way a structured caller is,
+    // rather than handed an analysis of whichever sorted first.
+    if resolution.needs_a_pin() {
+        return Ok(ImpactResponse {
+            lines: crate::entity_identity::pin_request_lines(graph, &resolution),
+            schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
+            resolution: "ambiguous".to_string(),
+            query,
+            ranked: None,
+            negative: None,
+        });
+    }
 
     let target = &matches[0];
-    let target_at = entity_location(target)
+    let target_at = entity_location(graph, target)
         .map(|loc| format!(" @ {loc}"))
         .unwrap_or_default();
     let mut lines = vec![format!(
         "Impact analysis for '{}' ({:?}){}:",
         target.name, target.kind, target_at
     )];
-    if matches.len() > 1 {
-        lines.push(format!(
-            "  Note: {} matches; showing the deterministic first match. Use --json with --file/--kind/--signature for fail-closed resolution.",
-            matches.len()
-        ));
-        // Naming the identities that were passed over is what lets a reader tell
-        // an answer about the wrong node from an answer about a node with
-        // nothing to report.
-        lines.push("  Other matches:".to_string());
-        for other in matches
-            .iter()
-            .skip(1)
-            .take(crate::commands::declaration_neighbors::MAX_LISTED)
-        {
-            lines.push(format!(
-                "    - {} ({:?}) @ {}",
-                other.name,
-                other.kind,
-                entity_location(other).unwrap_or_else(|| "unknown".to_string())
-            ));
-        }
-        if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
-            crate::commands::declaration_neighbors::MAX_LISTED,
-            matches.len() - 1,
-        ) {
-            lines.push(format!("    {more}"));
-        }
-    }
+    // Naming the identities that were passed over, and the rule that passed
+    // over them, is what lets a reader tell an answer about the wrong node from
+    // an answer about a node with nothing to report.
+    lines.extend(crate::entity_identity::choice_note(
+        graph,
+        &resolution,
+        crate::entity_identity::PinSpelling::FileKind,
+    ));
 
     // One depth for both walks. `rank_impact` bounds itself at
     // `IMPACT_MAX_DEPTH` and says nothing about it, so a deeper request used to
@@ -314,11 +322,15 @@ pub async fn build_impact_response(
                     format!("  {hop} hops:")
                 });
             }
-            let at = entity_location(entity)
+            let at = entity_location(graph, entity)
                 .map(|loc| format!(" @ {loc}"))
                 .unwrap_or_default();
             lines.push(format!("    - {} ({:?}){}", entity.name, entity.kind, at));
         }
+    }
+
+    if let Some(note) = crate::entity_identity::stale_span_note(&lines) {
+        lines.push(note);
     }
 
     let ranked = if request.require_unique {
@@ -334,43 +346,6 @@ pub async fn build_impact_response(
         ranked,
         negative,
     })
-}
-
-/// Move the identities that own incoming relations to the front, preserving the
-/// deterministic order within each group.
-///
-/// When one name covers several graph identities, only some of them are what
-/// impact analysis is about. A re-export, a forward declaration, or a test
-/// fixture sharing the name carries no dependents, and answering for it prints
-/// an empty result that is indistinguishable from a subject nothing depends on.
-/// The identity that owns incoming edges is the one the question was about.
-///
-/// A tie leaves the order untouched, so a set where nothing carries edges still
-/// resolves to the same deterministic first match it always did. That is what
-/// keeps this from being a reshuffle dressed as a preference.
-fn prefer_entities_owning_incoming_relations(
-    graph: &kin_db::InMemoryGraph,
-    matches: &mut [kin_model::Entity],
-) -> Result<()> {
-    if matches.len() < 2 {
-        return Ok(());
-    }
-    let mut owns_incoming = std::collections::HashSet::new();
-    for entity in matches.iter() {
-        if !graph
-            .get_all_relations_for_entity(&entity.id)?
-            .into_iter()
-            .any(|relation| {
-                relation.dst == GraphNodeId::Entity(entity.id)
-                    && relation.src != GraphNodeId::Entity(entity.id)
-            })
-        {
-            continue;
-        }
-        owns_incoming.insert(entity.id);
-    }
-    matches.sort_by_key(|entity| !owns_incoming.contains(&entity.id));
-    Ok(())
 }
 
 /// The relation kinds a member's dependent count is read over.
@@ -594,61 +569,6 @@ fn downstream_impact_by_hop<G: ImpactWalkGraph>(
     Ok(reached)
 }
 
-/// What a query resolved to, at both stages of resolution.
-///
-/// The two are kept apart so a qualifier that narrows the set to nothing can be
-/// reported as the filter miss it is. Collapsing them is what let
-/// `kin impact Error --file src/error.rs` answer "Entity 'Error' not found in
-/// this repo's graph" about an entity the unfiltered lookup had just found.
-struct ResolvedEntities {
-    /// After `--file`, `--kind`, and `--signature`.
-    matches: Vec<kin_model::Entity>,
-    /// Before them: what the name alone resolves to.
-    name_matches: Vec<kin_model::Entity>,
-    /// Whether the query is some entity's name exactly, rather than a fragment
-    /// of it. A structured caller resolves only on an exact name, so this is
-    /// what separates "the graph holds nothing by that name" from "the name you
-    /// gave is part of several entities' names".
-    exact_name: bool,
-}
-
-/// Resolve this request's entity through the one resolver every read command
-/// shares.
-///
-/// The rules here used to live in this function alone, which is why `kin trace`
-/// and `kin xref` could not read an id and no command but this one could take
-/// `--file` (FIR-3071). They now live in [`crate::entity_identity`]; this stays
-/// as the thin adapter between `ImpactRequest` and that resolver.
-fn resolve_entities(
-    graph: &kin_db::InMemoryGraph,
-    request: &ImpactRequest,
-) -> Result<ResolvedEntities> {
-    let resolved = crate::entity_identity::resolve_identity(
-        graph,
-        &request.entity,
-        &crate::entity_identity::IdentityQualifiers {
-            file: request.file.clone(),
-            kind: request.kind.clone(),
-            signature: request.signature.clone(),
-        },
-    )?;
-    Ok(ResolvedEntities {
-        matches: resolved.matches,
-        name_matches: resolved.name_matches,
-        exact_name: resolved.exact_name,
-    })
-}
-
-/// The qualifiers a request carried, spelled the way the user passed them.
-fn active_qualifiers(request: &ImpactRequest) -> Vec<String> {
-    crate::entity_identity::IdentityQualifiers {
-        file: request.file.clone(),
-        kind: request.kind.clone(),
-        signature: request.signature.clone(),
-    }
-    .labels()
-}
-
 /// The answer when a name resolves but the identity qualifiers exclude every
 /// match.
 ///
@@ -657,6 +577,7 @@ fn active_qualifiers(request: &ImpactRequest) -> Vec<String> {
 /// Report the miss as a miss and name what the name alone does resolve to, so
 /// the next command is a copy of one of these lines.
 fn qualifier_miss_guidance(
+    graph: &kin_db::InMemoryGraph,
     entity: &str,
     qualifiers: &[String],
     candidates: &[kin_model::Entity],
@@ -681,7 +602,7 @@ fn qualifier_miss_guidance(
             "  {} ({:?}) @ {}",
             candidate.name,
             candidate.kind,
-            entity_location(candidate).unwrap_or_else(|| "unknown".to_string())
+            entity_location(graph, candidate).unwrap_or_else(|| "unknown".to_string())
         ));
     }
     if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
@@ -715,12 +636,13 @@ fn qualifier_miss_guidance(
     lines
 }
 
-/// `path:line` for an entity, or just the path when the graph carries no span.
+/// `path:line` for an entity, just the path when the graph carries no span, or
+/// the path marked stale when the span describes an older version of the file.
 ///
 /// Location is projection metadata for the human reading the listing; the
 /// analysis itself is keyed on graph identity, never on paths.
-fn entity_location(entity: &kin_model::Entity) -> Option<String> {
-    crate::commands::declaration_neighbors::entity_location(entity)
+fn entity_location(graph: &kin_db::InMemoryGraph, entity: &kin_model::Entity) -> Option<String> {
+    crate::commands::declaration_neighbors::entity_location(graph, entity)
 }
 
 /// The answer when a structured caller's query does not name exactly one
@@ -736,6 +658,7 @@ fn entity_location(entity: &kin_model::Entity) -> Option<String> {
 /// contract as absent (FIR-2478). That case is answered by naming the
 /// identities, because the next command is a copy of one of these lines.
 fn ambiguous_resolution_guidance(
+    graph: &kin_db::InMemoryGraph,
     entity: &str,
     exact_name: bool,
     matches: &[kin_model::Entity],
@@ -762,7 +685,7 @@ fn ambiguous_resolution_guidance(
             "  {} ({:?}) @ {}",
             candidate.name,
             candidate.kind,
-            entity_location(candidate).unwrap_or_else(|| "unknown".to_string())
+            entity_location(graph, candidate).unwrap_or_else(|| "unknown".to_string())
         ));
     }
     if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(

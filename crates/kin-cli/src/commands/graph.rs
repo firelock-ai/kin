@@ -1511,19 +1511,59 @@ fn build_graph_inspect_response(
     name: &str,
 ) -> Result<GraphCommandResponse> {
     let entities = graph.list_all_entities()?;
-    let matches: Vec<_> = if let Ok(uuid) = uuid::Uuid::parse_str(name.trim()) {
+    // Inspect lists every entity a name reaches, so it keeps its own gather (an
+    // exact name, or a `.name` suffix). A `#kind@path:line` suffix narrows that
+    // list with the pins every read command applies, and the list is ordered by
+    // the rule every read command chooses with. The raw token is tried as a name
+    // first, so a name carrying `@` or `#` is never split into a pin.
+    let trimmed = name.trim();
+    let reference = if entities.iter().any(|entity| entity.name == trimmed)
+        || !(trimmed.contains('@') || trimmed.contains('#'))
+    {
+        crate::entity_ref::EntityRef {
+            name: trimmed.to_string(),
+            ..Default::default()
+        }
+    } else {
+        crate::entity_ref::parse_entity_ref(trimmed)
+    };
+    let lookup = reference.name.as_str();
+    let mut matches: Vec<_> = if let Ok(uuid) = uuid::Uuid::parse_str(lookup) {
         graph.get_entity(&EntityId(uuid))?.into_iter().collect()
     } else {
         entities
             .into_iter()
-            .filter(|e| e.name == name || e.name.ends_with(&format!(".{}", name)))
+            .filter(|e| e.name == lookup || e.name.ends_with(&format!(".{}", lookup)))
             .collect()
     };
+    let name_reached_something = !matches.is_empty();
+    crate::entity_identity::apply_qualifiers(&mut matches, &reference.qualifiers);
+    crate::entity_ref::apply_line(&mut matches, reference.line);
+    crate::entity_identity::rank_candidates(graph, &mut matches)?;
 
     if matches.is_empty() {
+        // A pin that excluded every entity the name reaches is a filter miss,
+        // never an absent entity.
+        let (lines, error) = if name_reached_something {
+            let pin = reference.pin_note().unwrap_or_default();
+            (
+                vec![
+                    format!("No entity named '{lookup}' matches the pin {pin}."),
+                    format!(
+                        "hint: `kin graph inspect {lookup}` lists every entity with that name."
+                    ),
+                ],
+                format!("no entity named '{lookup}' matches the pin {pin}"),
+            )
+        } else {
+            (
+                graph_entity_not_found_lines(name),
+                format!("no entity found matching '{}'", name),
+            )
+        };
         return Ok(GraphCommandResponse {
-            lines: graph_entity_not_found_lines(name),
-            error: Some(format!("no entity found matching '{}'", name)),
+            lines,
+            error: Some(error),
             source: None,
             reference_edge_coverage: None,
             relation_census: None,
@@ -1541,8 +1581,16 @@ fn build_graph_inspect_response(
             lines.push(format!("  File: {}", fo.0));
         }
         if let Some(ref span) = entity.span {
-            let (start_line, end_line) = presentation_span_lines(span);
-            lines.push(format!("  Span: lines {start_line}-{end_line}"));
+            if crate::entity_identity::entity_pointer(graph, &entity).stale {
+                lines.push(format!(
+                    "  Span: {} (recorded against an older version of this file than the graph \
+                     holds, so its lines are not printed)",
+                    crate::entity_identity::STALE_SPAN_MARK
+                ));
+            } else {
+                let (start_line, end_line) = presentation_span_lines(span);
+                lines.push(format!("  Span: lines {start_line}-{end_line}"));
+            }
         }
         lines.push(format!("  Signature: {}", entity.signature));
         if let Some(ref doc) = entity.doc_summary {
@@ -1694,24 +1742,32 @@ pub fn build_entity_source_outcome(
             ));
         }
     };
+    entity_source_outcome(repository_authority, graph, &entity)
+}
 
+/// The source outcome for an entity the caller already resolved.
+fn entity_source_outcome(
+    repository_authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    entity: &Entity,
+) -> Result<EntitySourceOutcome> {
     // A structurally sourceless entity (no file origin or no span) is a valid ID
-    // with nothing to return — reported as `NoSource`, not as the genuine
-    // extraction error below (which signals corrupt spans or unavailable blobs).
+    // with nothing to return, reported as `NoSource` rather than as the genuine
+    // extraction error below, which signals corrupt spans or unavailable blobs.
     if entity.file_origin.is_none() {
         return Ok(EntitySourceOutcome::NoSource(entity_no_source_message(
-            &entity,
+            entity,
             "the entity has no file origin",
         )));
     }
     if entity.span.is_none() {
         return Ok(EntitySourceOutcome::NoSource(entity_no_source_message(
-            &entity,
+            entity,
             "the entity has no source span",
         )));
     }
 
-    let record = graph_source_record(repository_authority, graph, &entity)?;
+    let record = graph_source_record(repository_authority, graph, entity)?;
     Ok(EntitySourceOutcome::Found(record))
 }
 
@@ -1720,17 +1776,55 @@ pub fn build_graph_source_response(
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<GraphCommandResponse> {
-    match build_entity_source_outcome(repository_authority, graph, entity_query)? {
+    // `kin graph source` resolves through the resolver every read command
+    // shares, so it answers about the entity `kin refs` and `kin impact` answer
+    // about. The daemon's MCP source tool keeps `build_entity_source_outcome`.
+    let resolution = crate::entity_identity::resolve_entity(
+        graph,
+        entity_query,
+        &crate::entity_identity::IdentityQualifiers::default(),
+    )?;
+    let refusal = if resolution.pin_excluded_all() {
+        Some(crate::entity_identity::pin_miss_lines(graph, &resolution))
+    } else if resolution.needs_a_pin() {
+        Some(crate::entity_identity::pin_request_lines(
+            graph,
+            &resolution,
+        ))
+    } else {
+        None
+    };
+    if let Some(lines) = refusal {
+        return Ok(GraphCommandResponse {
+            error: Some(lines.join("\n")),
+            lines,
+            source: None,
+            reference_edge_coverage: None,
+            relation_census: None,
+            graph_section: None,
+        });
+    }
+    let outcome = match resolution.chosen() {
+        Some(entity) => entity_source_outcome(repository_authority, graph, entity)?,
+        None => EntitySourceOutcome::NotFound(entity_source_not_found_message(entity_query)),
+    };
+    let choice = crate::entity_identity::choice_note(
+        graph,
+        &resolution,
+        crate::entity_identity::PinSpelling::FileKind,
+    );
+    match outcome {
         EntitySourceOutcome::Found(record) => {
             let mut lines = vec![
                 format!(
                     "Entity source for '{}' -> {} ({})",
-                    entity_query, record.name, record.kind
+                    resolution.reference.name, record.name, record.kind
                 ),
                 format!("ID: {}", record.id),
                 format!("File: {}", record.file_path),
                 format!("Lines: {}-{}", record.start_line, record.end_line),
             ];
+            lines.extend(choice);
             if !record.signature.is_empty() {
                 lines.push(format!("Signature: {}", record.signature));
             }
