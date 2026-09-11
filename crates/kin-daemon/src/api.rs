@@ -19269,13 +19269,69 @@ fn parse_scope(scope: &str) -> Result<IntentScope, (StatusCode, String)> {
             rest, "contract",
         )?)));
     }
-    if let Some(rest) = scope.strip_prefix("file:") {
+    // `artifact:` is how a work or annotation scope spells the same thing, so a
+    // caller who writes it here means a path too.
+    if let Some(rest) = scope
+        .strip_prefix("file:")
+        .or_else(|| scope.strip_prefix("artifact:"))
+    {
+        if rest.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("scope {scope:?} names no path"),
+            ));
+        }
         return Ok(IntentScope::Artifact(FilePathId::new(rest)));
     }
     if let Ok(uuid) = Uuid::parse_str(scope) {
         return Ok(IntentScope::Entity(EntityId(uuid)));
     }
-    Ok(IntentScope::Artifact(FilePathId::new(scope)))
+    // Anything else is refused rather than read as a path. An intent's scope is
+    // its lock, and a path lock taken from a mistyped entity id would collide
+    // with every agent in that file for nothing anyone asked for.
+    Err((
+        StatusCode::BAD_REQUEST,
+        kin_mcp::handlers::common::unrecognized_scope_message(
+            scope,
+            kin_mcp::handlers::common::INTENT_SCOPE_FORMS,
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod scope_grammar_tests {
+    use super::*;
+
+    /// An intent scope is written in one of the documented spellings, and
+    /// anything else is refused rather than read as a path.
+    #[test]
+    fn an_unspelled_scope_is_refused_and_every_spelling_resolves() {
+        let (status, message) =
+            parse_scope("src/main.rs").expect_err("a bare path is refused, not locked");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("artifact:<path>"), "{message}");
+
+        for spelled in ["file:src/main.rs", "artifact:src/main.rs"] {
+            match parse_scope(spelled) {
+                Ok(IntentScope::Artifact(path)) => assert_eq!(path.0, "src/main.rs"),
+                other => panic!("{spelled} resolved to {other:?}"),
+            }
+        }
+        let id = Uuid::new_v4();
+        for spelled in [format!("entity:{id}"), id.to_string()] {
+            assert!(
+                matches!(
+                    parse_scope(&spelled),
+                    Ok(IntentScope::Entity(EntityId(found))) if found == id
+                ),
+                "{spelled}"
+            );
+        }
+        assert!(
+            parse_scope("file:").is_err(),
+            "a path scope must name a path"
+        );
+    }
 }
 
 fn parse_session_id(value: &str) -> Result<SessionId, (StatusCode, String)> {

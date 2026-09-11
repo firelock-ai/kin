@@ -1228,7 +1228,17 @@ fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> Option<Sessi
 
 fn scope_to_string(value: &serde_json::Value) -> Result<String, String> {
     if let Some(scope) = value.as_str() {
-        return Ok(scope.to_string());
+        // Forwarded verbatim to the daemon's intent parser, so it is checked
+        // here against the spellings that parser accepts, and this route gives
+        // the daemon's own MCP route's answer for the same input.
+        return if is_spelled_intent_scope(scope) {
+            Ok(scope.to_string())
+        } else {
+            Err(crate::handlers::common::unrecognized_scope_message(
+                scope,
+                crate::handlers::common::INTENT_SCOPE_FORMS,
+            ))
+        };
     }
     let Some(obj) = value.as_object() else {
         return Err(
@@ -1249,6 +1259,20 @@ fn scope_to_string(value: &serde_json::Value) -> Result<String, String> {
         "invalid scope: expected string, {\"Entity\":\"uuid\"}, {\"Contract\":\"uuid\"}, or {\"Artifact\":\"path\"}"
             .to_string(),
     )
+}
+
+/// Whether a string is written in one of the intent-scope spellings the
+/// daemon's parser accepts. The value after a prefix is not validated here: a
+/// malformed UUID after `entity:` is the daemon's to refuse, in its own words.
+fn is_spelled_intent_scope(scope: &str) -> bool {
+    ["entity:", "contract:", "file:", "artifact:"]
+        .iter()
+        .any(|prefix| {
+            scope
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty())
+        })
+        || uuid::Uuid::parse_str(scope).is_ok()
 }
 
 fn scope_strings(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String>, String> {
@@ -4339,9 +4363,59 @@ mod tests {
     // ── Scope request-building (forwarded session/intent tools) ──────────────
 
     #[test]
-    fn scope_to_string_accepts_bare_string() {
-        let value = serde_json::json!("file:src/main.rs");
-        assert_eq!(scope_to_string(&value).unwrap(), "file:src/main.rs");
+    fn scope_to_string_passes_a_spelled_string_through() {
+        for spelled in [
+            "file:src/main.rs",
+            "artifact:src/main.rs",
+            "entity:00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000001",
+        ] {
+            assert_eq!(
+                scope_to_string(&serde_json::json!(spelled)).unwrap(),
+                spelled
+            );
+        }
+    }
+
+    #[test]
+    fn scope_to_string_refuses_an_unspelled_string() {
+        for unspelled in ["src/main.rs", "main", "file:", "artifact:"] {
+            let error = scope_to_string(&serde_json::json!(unspelled)).unwrap_err();
+            assert!(error.contains("unrecognized scope"), "{unspelled}: {error}");
+        }
+    }
+
+    /// The stdio route to `kin_register_intent` and `kin_check_traffic` refuses a
+    /// scope in none of the documented spellings before anything is forwarded,
+    /// so it gives the answer the daemon's own MCP route gives for the same
+    /// input rather than taking a path lock.
+    #[tokio::test]
+    async fn the_stdio_intent_route_refuses_an_unspelled_scope_before_forwarding() {
+        let mut register = HashMap::new();
+        register.insert(
+            "session_id".to_string(),
+            serde_json::json!("00000000-0000-4000-8000-000000000001"),
+        );
+        register.insert(
+            "task_description".to_string(),
+            serde_json::json!("edit one function"),
+        );
+        register.insert("scopes".to_string(), serde_json::json!(["src/main.rs"]));
+        let mut traffic = HashMap::new();
+        traffic.insert("scopes".to_string(), serde_json::json!(["src/main.rs"]));
+
+        for (tool, args) in [
+            ("kin_register_intent", &register),
+            ("kin_check_traffic", &traffic),
+        ] {
+            match forward_tool_call(tool, args).await {
+                Err(message) => assert!(
+                    message.contains("unrecognized scope") && message.contains("artifact:<path>"),
+                    "{tool}: {message}"
+                ),
+                Ok(_) => panic!("{tool} forwarded a bare path instead of refusing it"),
+            }
+        }
     }
 
     #[test]

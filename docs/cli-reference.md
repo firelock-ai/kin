@@ -1421,7 +1421,6 @@ kin exec [options] -- <command>...
 | `--keep` |  | Keep the session workspace after the run and defer reconcile |
 | `--discard` |  | Discard all workspace changes after the run (no reconcile). Conflicts with `--keep`. |
 | `--strategy <strategy>` |  | Materialization strategy |
-| `--scope <scope>` |  | Scope filter |
 
 ### `kin shell`
 
@@ -1618,7 +1617,7 @@ kin intent register <scope> [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<scope>` | yes | Scope to lock (entity:&lt;uuid&gt;, file:&lt;path&gt;, or bare UUID/path) |
+| `<scope>` | yes | Scope to lock (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, file:&lt;path&gt;, artifact:&lt;path&gt;, or an entity UUID) |
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -1670,7 +1669,7 @@ kin traffic show <scope>
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<scope>` | yes | Scope to query (entity:&lt;uuid&gt;, file:&lt;path&gt;, or bare UUID/path) |
+| `<scope>` | yes | Scope to query (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, file:&lt;path&gt;, artifact:&lt;path&gt;, or an entity UUID) |
 
 #### `kin traffic sessions`
 
@@ -1703,7 +1702,7 @@ kin work create [options]
 | `-k, --kind <kind>` |  | Work kind: feature, task, issue, debt, todo, investigation |
 | `-t, --title <title>` |  | Work item title |
 | `-d, --description <description>` |  | Optional description |
-| `-s, --scope <scope>` |  | Scope to link (entity:&lt;uuid&gt;, artifact:&lt;path&gt;, or bare path) |
+| `-s, --scope <scope>` |  | Scope to link (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, or an entity UUID) |
 | `-p, --priority <priority>` |  | Priority: critical, high, medium, low, none |
 
 #### `kin work list`
@@ -1718,7 +1717,7 @@ kin work list [options]
 | --- | --- | --- |
 | `-s, --status <status>` |  | Filter by status |
 | `-k, --kind <kind>` |  | Filter by kind |
-| `--scope <scope>` |  | Filter by scope (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, or bare path) |
+| `--scope <scope>` |  | Filter by scope (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, or an entity UUID) |
 
 #### `kin work show`
 
@@ -1841,7 +1840,7 @@ kin note add <target> [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<target>` | yes | Target to annotate (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, work:&lt;uuid&gt;, or bare path) |
+| `<target>` | yes | Target to annotate (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, work:&lt;uuid&gt;, or an entity UUID) |
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -1858,7 +1857,7 @@ kin note list <target>
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<target>` | yes | Target to query (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, work:&lt;uuid&gt;, or bare path) |
+| `<target>` | yes | Target to query (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, work:&lt;uuid&gt;, or an entity UUID) |
 
 #### `kin note stale`
 

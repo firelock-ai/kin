@@ -1256,15 +1256,21 @@ fn parse_review_decision_state(s: &str) -> Result<kin_model::review::ReviewDecis
 }
 
 /// Parse an optional work scope from a JSON value (string like "entity:ID").
-fn parse_optional_work_scope(val: Option<&serde_json::Value>) -> Option<kin_model::WorkScope> {
+fn parse_optional_work_scope(
+    val: Option<&serde_json::Value>,
+) -> Result<Option<kin_model::WorkScope>> {
+    // A scope spelled in none of the documented forms is refused, not dropped:
+    // dropping it would fall through to `file_path`, or to no scope at all, and
+    // the note would anchor somewhere the caller did not ask for.
     val.and_then(|v| v.as_str())
-        .and_then(|s| parse_single_work_scope(s).ok())
+        .map(parse_single_work_scope)
+        .transpose()
 }
 
 fn parse_optional_scope_arg(
     args: &HashMap<String, serde_json::Value>,
 ) -> Result<Option<kin_model::WorkScope>> {
-    if let Some(scope) = parse_optional_work_scope(args.get("scope")) {
+    if let Some(scope) = parse_optional_work_scope(args.get("scope"))? {
         return Ok(Some(scope));
     }
 
@@ -1280,7 +1286,7 @@ fn parse_optional_scope_arg(
 fn parse_review_create_scopes(
     args: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<kin_model::WorkScope>> {
-    let scopes = parse_work_scopes(args.get("scopes")).unwrap_or_default();
+    let scopes = parse_work_scopes(args.get("scopes"))?;
     if !scopes.is_empty() {
         return Ok(scopes);
     }
@@ -1486,6 +1492,32 @@ mod tests {
             coverage[COVERING_TESTS_BOUND_KEY], COVERING_TESTS_BOUND,
             "a zero must say beside the number that missing local-variable property edges can \
              make it a false negative: {coverage}"
+        );
+    }
+
+    /// A review scope spelled in none of the documented forms is refused. Dropping
+    /// it instead would fall through to `file_path`, or to no scope, and the note
+    /// would anchor somewhere the caller did not ask for; a `scopes` entry would
+    /// fall through to `entity_ids`.
+    #[test]
+    fn a_misspelled_review_scope_is_refused_not_dropped() {
+        for args in [
+            serde_json::json!({ "scope": "src/a.rs" }),
+            serde_json::json!({ "scope": "src/a.rs", "file_path": "src/b.rs" }),
+        ] {
+            let args: HashMap<String, serde_json::Value> =
+                serde_json::from_value(args).expect("an argument object");
+            assert!(
+                parse_optional_scope_arg(&args).is_err(),
+                "a misspelled scope must refuse: {args:?}"
+            );
+        }
+
+        let mut args = HashMap::new();
+        args.insert("scopes".into(), serde_json::json!(["src/a.rs"]));
+        assert!(
+            parse_review_create_scopes(&args).is_err(),
+            "a misspelled scopes entry must refuse, not fall through to entity_ids"
         );
     }
 
