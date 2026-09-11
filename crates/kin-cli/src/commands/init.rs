@@ -2729,6 +2729,40 @@ mod tests {
             assert!(matches!(outcome, CrossFileEnrichment::Withheld { .. }));
         }
 
+        /// The second daemon on one store, which is what FIR-3551 measured.
+        ///
+        /// Every Rust file already carries edges an earlier pass made durable,
+        /// this daemon cannot start rust-analyzer, and its sweep now reports
+        /// those files under the language it cannot serve rather than as done.
+        /// This is the status that sweep publishes, read the way `kin init` and
+        /// `kin daemon sweep` read it: the line names the language and its file
+        /// count, says the earlier edges remain, and never says complete.
+        #[test]
+        fn a_daemon_that_cannot_serve_already_enriched_files_never_reads_complete() {
+            let status = serde_json::json!({
+                "files_done": 0,
+                "files_total": 72,
+                "files_blocked": 72,
+                "languages_skipped": [{
+                    "language": "rust",
+                    "files": 72,
+                    "reason": "this daemon cannot start a rust language server (server \
+                               initialization failed: Unknown binary 'rust-analyzer' in official \
+                               toolchain '1.96.0-aarch64-apple-darwin'), and these files keep the \
+                               language-server edges an earlier pass made durable but get no new \
+                               ones until it starts"
+                }]
+            });
+            let skipped = skipped_languages_from_status(&status);
+            assert_eq!(skipped.len(), 1, "the row survives parsing: {skipped:?}");
+
+            let (line, outcome) = cross_file_enrichment_outcome(0, 72, 72, &skipped);
+            assert!(!line.contains("complete"), "{line}");
+            assert!(line.contains("rust: 72 files not enriched"), "{line}");
+            assert!(line.contains("an earlier pass made durable"), "{line}");
+            assert!(matches!(outcome, CrossFileEnrichment::Withheld { .. }));
+        }
+
         /// The sentence accounts for every file the daemon says was blocked.
         ///
         /// Measured, at the sha this test lands on, on three rust, three

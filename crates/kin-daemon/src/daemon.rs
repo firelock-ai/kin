@@ -56,6 +56,34 @@ fn should_enable_lsp_enrichment(config_enabled: bool, filesystem_reconcile_disab
     config_enabled && !filesystem_reconcile_disabled
 }
 
+/// Start the language-server readiness probe only on a daemon that enriches.
+///
+/// The probe starts every enrichable language's server to see whether it
+/// completes a handshake. It used to run before the enrichment decision and
+/// regardless of it, so a daemon started with `KIN_DAEMON_DISABLE_LSP=1` still
+/// launched typescript-language-server, rust-analyzer and pyright at startup,
+/// and its answer described a host this daemon was never going to use. Now the
+/// same decision that opens the sweep's channel decides, and a daemon that does
+/// not enrich leaves readiness unpublished, which every observation already
+/// reads as unknown: the honest state for a daemon that did not look.
+///
+/// The spawner is a parameter so the gate is testable without a server.
+fn start_readiness_probe_if_enabled(
+    enrichment_enabled: bool,
+    workspace_root: std::path::PathBuf,
+    spawn: impl FnOnce(std::path::PathBuf),
+) -> bool {
+    if !enrichment_enabled {
+        info!(
+            "language-server enrichment is switched off for this daemon, so the readiness probe \
+             starts no language server"
+        );
+        return false;
+    }
+    spawn(workspace_root);
+    true
+}
+
 /// Whether the daemon opens its enrichment channel at startup.
 ///
 /// Taken ONCE, during startup, and that is the whole reason a language server
@@ -348,7 +376,6 @@ fn spawn_language_server_readiness_probe(workspace_root: std::path::PathBuf) {
     use kin_core::reference_coverage::{
         LanguageServerReadiness, LanguageServerReadinessMap, ENRICHABLE_LANGUAGES,
     };
-    use kin_lsp::registry::{ProviderGapReason, ProviderRegistry};
 
     tokio::spawn(async move {
         // One task per language so the probes overlap: the worst case is one
@@ -359,25 +386,7 @@ fn spawn_language_server_readiness_probe(workspace_root: std::path::PathBuf) {
             .map(|language| {
                 let workspace_root = workspace_root.clone();
                 tokio::spawn(async move {
-                    let registry = ProviderRegistry::with_defaults();
-                    let initialization_options = lsp_adapter_for(language, &workspace_root)
-                        .and_then(|(_, _, init_opts)| init_opts);
-                    let readiness = match kin_lsp::lifecycle::probe_readiness(
-                        &registry,
-                        language,
-                        &workspace_root,
-                        initialization_options,
-                    )
-                    .await
-                    {
-                        Ok(_) => LanguageServerReadiness::Usable,
-                        Err(gap) => match gap.reason {
-                            ProviderGapReason::ServerUnusable { message } => {
-                                LanguageServerReadiness::Unusable { reason: message }
-                            }
-                            _ => LanguageServerReadiness::Absent,
-                        },
-                    };
+                    let readiness = probe_language_server(language, &workspace_root).await;
                     (language, readiness)
                 })
             })
@@ -407,6 +416,133 @@ fn spawn_language_server_readiness_probe(workspace_root: std::path::PathBuf) {
 
         kin_mcp::edge_coverage::publish_language_server_readiness(readiness);
     });
+}
+
+/// Whether this daemon can start `language`'s server right now, asked the way
+/// the sweep and the incremental path start one.
+///
+/// The command is resolved by [`crate::language_server_command`], so the probe
+/// starts the binary the sweep will start, with the adapter's own arguments.
+/// It used to resolve kin-lsp's registry list instead (`pylsp` behind
+/// `pyright-langserver`, `vtsls` behind `typescript-language-server`) through
+/// the daemon's inherited working directory, so it could read a language as
+/// served that no sweep could serve, and the other way round.
+pub(crate) async fn probe_language_server(
+    language: kin_model::LanguageId,
+    workspace_root: &std::path::Path,
+) -> kin_core::reference_coverage::LanguageServerReadiness {
+    let Some((command, _, _)) = lsp_adapter_for(language, workspace_root) else {
+        return kin_core::reference_coverage::LanguageServerReadiness::Absent;
+    };
+    let resolved =
+        crate::language_server_command::resolve_on_this_host(command, workspace_root.to_path_buf())
+            .await;
+    probe_resolved_language_server(language, workspace_root, resolved).await
+}
+
+/// The probe's second half, from a resolution already made, so a test can hand
+/// it any resolution without the host's toolchains.
+async fn probe_resolved_language_server(
+    language: kin_model::LanguageId,
+    workspace_root: &std::path::Path,
+    resolved: crate::language_server_command::ServerCommand,
+) -> kin_core::reference_coverage::LanguageServerReadiness {
+    use crate::language_server_command::ServerCommand;
+    use kin_core::reference_coverage::LanguageServerReadiness;
+
+    let program = match resolved {
+        ServerCommand::NotInstalled => return LanguageServerReadiness::Absent,
+        ServerCommand::Unresolvable { reason } => {
+            return LanguageServerReadiness::Unusable { reason };
+        }
+        ServerCommand::Resolved { program, chosen } => {
+            info!(
+                %language,
+                program = %program.display(),
+                %chosen,
+                "resolved the language server this daemon starts"
+            );
+            program
+        }
+    };
+    let (args, initialization_options) = lsp_adapter_for(language, workspace_root)
+        .map(|(_, args, init_opts)| (args, init_opts))
+        .unwrap_or_default();
+    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match tokio::time::timeout(
+        kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT,
+        kin_lsp::lifecycle::LspServer::start(
+            &program.to_string_lossy(),
+            &args_refs,
+            workspace_root,
+            initialization_options,
+        ),
+    )
+    .await
+    {
+        Err(_) => LanguageServerReadiness::Unusable {
+            reason: format!(
+                "{} did not complete the initialize handshake within {}s",
+                program.display(),
+                kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT.as_secs()
+            ),
+        },
+        Ok(Err(error)) => LanguageServerReadiness::Unusable {
+            reason: error.to_string(),
+        },
+        // Dropped rather than shut down: `kill_on_drop` ends the process at
+        // once, and a probe has no session worth closing.
+        Ok(Ok(server)) => {
+            drop(server);
+            LanguageServerReadiness::Usable
+        }
+    }
+}
+
+/// Resolve `command` and start it: the one way this daemon starts a language
+/// server for the cold sweep and the incremental path.
+///
+/// The error is a sentence a skip reason can carry as it is: the resolver's
+/// own when nothing it found can serve, and the server's when it started and
+/// refused the handshake.
+async fn start_resolved_language_server(
+    language: kin_model::LanguageId,
+    command: &str,
+    args: &[String],
+    workspace_root: &std::path::Path,
+    initialization_options: Option<serde_json::Value>,
+) -> std::result::Result<kin_lsp::lifecycle::LspServer, String> {
+    use crate::language_server_command::ServerCommand;
+
+    let program = match crate::language_server_command::resolve_on_this_host(
+        command.to_string(),
+        workspace_root.to_path_buf(),
+    )
+    .await
+    {
+        ServerCommand::Resolved { program, chosen } => {
+            info!(
+                %language,
+                program = %program.display(),
+                %chosen,
+                "starting the language server this daemon resolved"
+            );
+            program
+        }
+        ServerCommand::NotInstalled => {
+            return Err(format!("no `{command}` is on this daemon's PATH"));
+        }
+        ServerCommand::Unresolvable { reason } => return Err(reason),
+    };
+    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    kin_lsp::lifecycle::LspServer::start(
+        &program.to_string_lossy(),
+        &args_refs,
+        workspace_root,
+        initialization_options,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 pub fn lsp_adapter_for(
@@ -3774,6 +3910,60 @@ fn sweep_work_succeeded(
         && (relations.published == 0 || published)
 }
 
+/// Report files this pass skipped as already enriched, in a language this
+/// daemon cannot serve, under that language instead of as done.
+///
+/// `readiness_now` holds, for each language that had no running server when the
+/// pass ended, either the probe's answer or, for a language whose server already
+/// refused in this pass, that refusal. A language it does not mention was served
+/// in this pass and keeps its counts. The
+/// files stay marked, because their edges are durable; what changes is that the
+/// pass no longer claims a server stands behind them, so `files_done` counts
+/// only files a server this daemon can run has processed, and the summary names
+/// the language and its file count the way `kin graph status` does.
+fn attribute_unserved_already_enriched(
+    tally: &mut SweepTally,
+    already_enriched_by_language: &std::collections::HashMap<kin_model::LanguageId, u64>,
+    readiness_now: &std::collections::HashMap<
+        kin_model::LanguageId,
+        kin_core::reference_coverage::LanguageServerReadiness,
+    >,
+    skip_files: &mut std::collections::HashMap<kin_model::LanguageId, u64>,
+    skip_reason: &mut std::collections::HashMap<kin_model::LanguageId, String>,
+) {
+    use kin_core::reference_coverage::LanguageServerReadiness;
+
+    for (language, readiness) in readiness_now {
+        let cause = match readiness {
+            LanguageServerReadiness::Usable => continue,
+            LanguageServerReadiness::Unusable { reason } => reason.clone(),
+            LanguageServerReadiness::Absent => {
+                "no server for it is on this daemon's PATH".to_string()
+            }
+        };
+        let files = already_enriched_by_language
+            .get(language)
+            .copied()
+            .unwrap_or(0);
+        let moved = usize::try_from(files)
+            .unwrap_or(usize::MAX)
+            .min(tally.already_enriched);
+        if moved == 0 {
+            continue;
+        }
+        tally.already_enriched -= moved;
+        tally.server_unavailable += moved;
+        *skip_files.entry(*language).or_insert(0) += moved as u64;
+        skip_reason.entry(*language).or_insert_with(|| {
+            format!(
+                "this daemon cannot start a {language} language server ({cause}), and these \
+                 files keep the language-server edges an earlier pass made durable but get no \
+                 new ones until it starts"
+            )
+        });
+    }
+}
+
 /// How long the file-level definitions pass may take for one file.
 ///
 /// The pass had no bound of any kind. It is called at its sweep site as
@@ -4291,16 +4481,20 @@ pub async fn run_with_authority_on(
     // than re-sweeping a converged graph.
     load_lsp_enriched_marker(&state);
 
+    // Set up LSP enrichment channel before wrapping state in Arc.
+    let enrichment_enabled =
+        should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());
+
     // The working directory as the layout already holds it. Deliberately not
     // canonicalized: a readiness probe asks whether a server starts and
     // completes a handshake, never resolving a file through this path, so the
     // filesystem round trip would buy nothing and this is an authority-path
     // crate where every such call has to earn itself.
-    spawn_language_server_readiness_probe(state.layout.working_dir().to_path_buf());
-
-    // Set up LSP enrichment channel before wrapping state in Arc.
-    let enrichment_enabled =
-        should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());
+    start_readiness_probe_if_enabled(
+        enrichment_enabled,
+        state.layout.working_dir().to_path_buf(),
+        spawn_language_server_readiness_probe,
+    );
     // Recorded so a caller can tell a deliberately disabled daemon from one that
     // simply found no server. Those need opposite answers and the channel alone
     // cannot separate them.
@@ -5108,10 +5302,8 @@ pub async fn run_with_authority_on(
                         // Lazily start LSP server for this language.
                         if !servers.contains_key(&lang) {
                             if let Some((cmd, args, init_opts)) = lsp_adapter_for(lang, &lsp_root) {
-                                let args_refs: Vec<&str> =
-                                    args.iter().map(|s| s.as_str()).collect();
-                                match kin_lsp::lifecycle::LspServer::start(
-                                    &cmd, &args_refs, &lsp_root, init_opts,
+                                match start_resolved_language_server(
+                                    lang, &cmd, &args, &lsp_root, init_opts,
                                 )
                                 .await
                                 {
@@ -5395,6 +5587,15 @@ pub async fn run_with_authority_on(
                         > = std::collections::HashMap::new();
                         let mut skip_files: std::collections::HashMap<kin_model::LanguageId, u64> =
                             std::collections::HashMap::new();
+                        // Files skipped as already enriched, per language. A
+                        // language whose every file was already enriched never
+                        // reaches a server start in this pass, so without this
+                        // the pass has no evidence the daemon can still serve
+                        // it, and a daemon that cannot would read complete.
+                        let mut already_enriched_by_language: std::collections::HashMap<
+                            kin_model::LanguageId,
+                            u64,
+                        > = std::collections::HashMap::new();
 
                         // Build entity index for the whole graph (used for target matching).
                         let entity_refs: Vec<kin_lsp::EntityRef> = entities
@@ -5452,6 +5653,7 @@ pub async fn run_with_authority_on(
                             // dares run is a sweep that never runs.
                             if file_already_enriched(&lsp_state, &file_id.0) {
                                 tally.already_enriched += 1;
+                                *already_enriched_by_language.entry(lang).or_insert(0) += 1;
                                 // Published here as well as on the enriching
                                 // arm, because `files_done` means a file the
                                 // sweep is done with and a skip is one. Stored
@@ -5498,10 +5700,8 @@ pub async fn run_with_authority_on(
                                 if let Some((cmd, args, init_opts)) =
                                     lsp_adapter_for(lang, &lsp_root)
                                 {
-                                    let args_refs: Vec<&str> =
-                                        args.iter().map(|s| s.as_str()).collect();
-                                    match kin_lsp::lifecycle::LspServer::start(
-                                        &cmd, &args_refs, &lsp_root, init_opts,
+                                    match start_resolved_language_server(
+                                        lang, &cmd, &args, &lsp_root, init_opts,
                                     )
                                     .await
                                     {
@@ -5842,6 +6042,52 @@ pub async fn run_with_authority_on(
                                 relations = total_relations.published,
                                 "not recording these files as enriched: their relations were \
                                  not published, so the next sweep must redo them"
+                            );
+                        }
+
+                        // A language whose every file this pass skipped as
+                        // already enriched never reached a server start, so the
+                        // pass holds no evidence this daemon can still serve it.
+                        // Ask now, the way the readiness probe asks. One it
+                        // cannot serve is reported with its files instead of
+                        // counted as done, which is what let a second daemon on
+                        // an enriched store read complete while it could not
+                        // start the server at all. Published before the counters
+                        // below, so every waiter reads the corrected numbers.
+                        //
+                        // Not on a pass that is stopping. A probe can take its
+                        // whole handshake budget per language, and a daemon on
+                        // its way out has a shutdown grace to keep; the files it
+                        // did not settle are reported as not visited instead.
+                        if !tally.ended_early {
+                            let mut readiness_now = std::collections::HashMap::new();
+                            for language in already_enriched_by_language.keys() {
+                                if servers.contains_key(language) {
+                                    continue;
+                                }
+                                // A language whose server already refused in
+                                // this pass needs no second start to know it.
+                                let readiness = if server_start_failed.contains(language) {
+                                    kin_core::reference_coverage::LanguageServerReadiness::Unusable {
+                                        reason: skip_reason.get(language).cloned().unwrap_or_else(
+                                            || "its server did not start in this pass".to_string(),
+                                        ),
+                                    }
+                                } else {
+                                    probe_language_server(*language, &lsp_root).await
+                                };
+                                readiness_now.insert(*language, readiness);
+                            }
+                            attribute_unserved_already_enriched(
+                                &mut tally,
+                                &already_enriched_by_language,
+                                &readiness_now,
+                                &mut skip_files,
+                                &mut skip_reason,
+                            );
+                            lsp_state.lsp_sweep_files_done.store(
+                                tally.files_processed() as u64,
+                                std::sync::atomic::Ordering::SeqCst,
                             );
                         }
 
@@ -10677,6 +10923,284 @@ mod lsp_query_column_tests {
     #[test]
     fn a_name_absent_from_the_signature_keeps_the_declaration_column() {
         assert_eq!(lsp_query_column("const x = 1", "handle", 3), 3);
+    }
+}
+
+#[cfg(test)]
+mod language_server_resolution_tests {
+    use super::{
+        attribute_unserved_already_enriched, probe_resolved_language_server,
+        start_readiness_probe_if_enabled, SweepTally,
+    };
+    use crate::language_server_command::ServerCommand;
+    use kin_core::reference_coverage::LanguageServerReadiness;
+    use kin_model::LanguageId;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    const UNKNOWN_BINARY: &str = "server initialization failed: server shutdown unexpectedly \
+        (server stderr: error: Unknown binary 'rust-analyzer' in official toolchain \
+        '1.96.0-aarch64-apple-darwin'.)";
+
+    /// The second daemon on one store, exactly as measured: every Rust file was
+    /// enriched by an earlier pass, so this pass skipped all of them before any
+    /// server start, and this daemon cannot start rust-analyzer. Counted as done
+    /// they made `files_done` 72 of 72 with nothing skipped, and `kin init` and
+    /// `kin daemon sweep` print "complete" off exactly that.
+    #[test]
+    fn already_enriched_files_in_a_language_this_daemon_cannot_serve_are_not_done() {
+        let mut tally = SweepTally {
+            already_enriched: 72,
+            ..SweepTally::default()
+        };
+        let by_language = HashMap::from([(LanguageId::Rust, 72u64)]);
+        let readiness = HashMap::from([(
+            LanguageId::Rust,
+            LanguageServerReadiness::Unusable {
+                reason: UNKNOWN_BINARY.to_string(),
+            },
+        )]);
+        let mut skip_files = HashMap::new();
+        let mut skip_reason = HashMap::new();
+
+        attribute_unserved_already_enriched(
+            &mut tally,
+            &by_language,
+            &readiness,
+            &mut skip_files,
+            &mut skip_reason,
+        );
+
+        assert_eq!(
+            tally.files_processed(),
+            0,
+            "no server this daemon can run processed any of them"
+        );
+        assert_eq!(tally.blocked(), 72);
+        assert_eq!(
+            tally.unaccounted(72),
+            0,
+            "every file is still accounted for"
+        );
+        assert_eq!(skip_files.get(&LanguageId::Rust), Some(&72));
+        let reason = skip_reason
+            .get(&LanguageId::Rust)
+            .expect("the language is named with a reason");
+        assert!(
+            reason.contains("Unknown binary 'rust-analyzer'"),
+            "{reason}"
+        );
+        assert!(reason.contains("an earlier pass made durable"), "{reason}");
+        assert!(
+            !reason.contains("; "),
+            "`; ` divides verdict clauses and must not appear inside one: {reason}"
+        );
+    }
+
+    /// The control. A language this daemon can serve keeps its already-enriched
+    /// files as done, so a converged store with a working server still reads
+    /// complete. Without this, reporting every skip as blocked would pass the
+    /// test above.
+    #[test]
+    fn already_enriched_files_in_a_language_this_daemon_serves_stay_done() {
+        let mut tally = SweepTally {
+            already_enriched: 72,
+            ..SweepTally::default()
+        };
+        let by_language = HashMap::from([(LanguageId::Rust, 72u64)]);
+        let readiness = HashMap::from([(LanguageId::Rust, LanguageServerReadiness::Usable)]);
+        let mut skip_files = HashMap::new();
+        let mut skip_reason = HashMap::new();
+
+        attribute_unserved_already_enriched(
+            &mut tally,
+            &by_language,
+            &readiness,
+            &mut skip_files,
+            &mut skip_reason,
+        );
+
+        assert_eq!(tally.files_processed(), 72);
+        assert_eq!(tally.blocked(), 0);
+        assert!(skip_files.is_empty() && skip_reason.is_empty());
+    }
+
+    /// A language the readiness map does not mention was served in this pass or
+    /// already failed to start in it, and its counts are left exactly as the
+    /// loop recorded them.
+    #[test]
+    fn a_language_the_pass_already_settled_is_left_alone() {
+        let mut tally = SweepTally {
+            already_enriched: 10,
+            enriched: 5,
+            ..SweepTally::default()
+        };
+        let by_language = HashMap::from([(LanguageId::Python, 10u64)]);
+        let mut skip_files = HashMap::new();
+        let mut skip_reason = HashMap::new();
+
+        attribute_unserved_already_enriched(
+            &mut tally,
+            &by_language,
+            &HashMap::new(),
+            &mut skip_files,
+            &mut skip_reason,
+        );
+
+        assert_eq!(tally.files_processed(), 15);
+        assert!(skip_files.is_empty());
+    }
+
+    /// A language whose server refused to start in this pass: two edited files
+    /// hit the refusal and seventy were already enriched. All seventy-two are
+    /// unserved by this daemon, so all seventy-two are reported under the
+    /// language, and the reason the start failure recorded is kept rather than
+    /// replaced, because it names what this process actually saw.
+    #[test]
+    fn a_refused_server_takes_its_already_enriched_files_with_it() {
+        let mut tally = SweepTally {
+            already_enriched: 70,
+            server_unavailable: 2,
+            ..SweepTally::default()
+        };
+        let by_language = HashMap::from([(LanguageId::Rust, 70u64)]);
+        let recorded =
+            "the `rust-analyzer` language server did not start (no toolchain ships it), \
+                        so nothing in this language was enriched"
+                .to_string();
+        let readiness = HashMap::from([(
+            LanguageId::Rust,
+            LanguageServerReadiness::Unusable {
+                reason: recorded.clone(),
+            },
+        )]);
+        let mut skip_files = HashMap::from([(LanguageId::Rust, 2u64)]);
+        let mut skip_reason = HashMap::from([(LanguageId::Rust, recorded.clone())]);
+
+        attribute_unserved_already_enriched(
+            &mut tally,
+            &by_language,
+            &readiness,
+            &mut skip_files,
+            &mut skip_reason,
+        );
+
+        assert_eq!(tally.files_processed(), 0);
+        assert_eq!(tally.blocked(), 72);
+        assert_eq!(skip_files.get(&LanguageId::Rust), Some(&72));
+        assert_eq!(skip_reason.get(&LanguageId::Rust), Some(&recorded));
+    }
+
+    /// `KIN_DAEMON_DISABLE_LSP=1` starts no language server at all. The probe
+    /// used to run before the enrichment decision and launched every
+    /// enrichable language's server on such a daemon anyway.
+    #[test]
+    fn a_daemon_that_does_not_enrich_starts_no_readiness_probe() {
+        let mut spawned: Option<PathBuf> = None;
+        assert!(!start_readiness_probe_if_enabled(
+            false,
+            PathBuf::from("/work"),
+            |root| spawned = Some(root),
+        ));
+        assert_eq!(spawned, None, "a disabled daemon must not probe");
+
+        assert!(start_readiness_probe_if_enabled(
+            true,
+            PathBuf::from("/work"),
+            |root| spawned = Some(root),
+        ));
+        assert_eq!(
+            spawned,
+            Some(PathBuf::from("/work")),
+            "an enabled daemon probes"
+        );
+    }
+
+    /// The probe reports the resolver's answer in the resolver's words. A
+    /// registry lookup could never produce this reason, so a probe that went
+    /// back to resolving its own list fails here.
+    #[tokio::test]
+    async fn the_probe_reports_what_the_resolver_found() {
+        let root = Path::new("/nonexistent-workspace");
+        assert_eq!(
+            probe_resolved_language_server(LanguageId::Rust, root, ServerCommand::NotInstalled)
+                .await,
+            LanguageServerReadiness::Absent
+        );
+        let reason = "`rust-analyzer` on this daemon's PATH is rustup's proxy, and no installed \
+                      toolchain ships it"
+            .to_string();
+        assert_eq!(
+            probe_resolved_language_server(
+                LanguageId::Rust,
+                root,
+                ServerCommand::Unresolvable {
+                    reason: reason.clone()
+                },
+            )
+            .await,
+            LanguageServerReadiness::Unusable { reason }
+        );
+    }
+
+    /// The program the resolver names is the program the probe starts. A
+    /// fixture that completes the handshake reads usable and one that exits
+    /// reads unusable with its own last words, so neither answer can come from
+    /// whatever the host has installed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_starts_the_program_the_resolver_named() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write_fixture = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).expect("fixture body");
+            let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("executable");
+            path
+        };
+        let usable = write_fixture(
+            "usable-server",
+            "#!/bin/sh\nread -r _ 2>/dev/null\n\
+             BODY='{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"definitionProvider\":true,\"referencesProvider\":true}}}'\n\
+             printf 'Content-Length: %d\\r\\n\\r\\n%s' \"${#BODY}\" \"$BODY\"\n\
+             sleep 30\n",
+        );
+        let refusing = write_fixture(
+            "refusing-server",
+            "#!/bin/sh\necho \"error: fixture toolchain has no such binary\" >&2\nexit 1\n",
+        );
+
+        assert_eq!(
+            probe_resolved_language_server(
+                LanguageId::Rust,
+                dir.path(),
+                ServerCommand::Resolved {
+                    program: usable,
+                    chosen: "a fixture".to_string()
+                },
+            )
+            .await,
+            LanguageServerReadiness::Usable
+        );
+        match probe_resolved_language_server(
+            LanguageId::Rust,
+            dir.path(),
+            ServerCommand::Resolved {
+                program: refusing,
+                chosen: "a fixture".to_string(),
+            },
+        )
+        .await
+        {
+            LanguageServerReadiness::Unusable { reason } => assert!(
+                reason.contains("fixture toolchain has no such binary"),
+                "the server's own last words are the reason: {reason}"
+            ),
+            other => panic!("a server that exits must read unusable, got {other:?}"),
+        }
     }
 }
 
