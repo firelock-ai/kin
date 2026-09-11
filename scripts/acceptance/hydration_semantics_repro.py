@@ -318,21 +318,17 @@ def envelope_problems(payload, standing, created_under=None, derives=None):
             "created_under is %r, wanted %r"
             % (observation.get("created_under"), created_under)
         )
-    if standing == "unreadable":
-        reason = observation.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            problems.append("an unreadable record published no read failure")
-    elif "reason" in observation:
-        problems.append("a %s standing published a reason: %r" % (standing, observation["reason"]))
-    expected = CANONICAL_REMEDY[standing]
-    if expected is None:
-        if "remedy" in observation:
-            problems.append("a current store published a remedy: %r" % (observation["remedy"],))
-    elif observation.get("remedy") != expected:
-        problems.append(
-            "the %s remedy is not canonical; got %r, wanted %r"
-            % (standing, observation.get("remedy"), expected)
-        )
+    # Envelope v2 sends the standing as the code and no sentence beside it. The
+    # safe action per standing is written once in docs/mcp-tools.md, and
+    # `kin graph status` and `kin doctor` still print it, graded above by exact
+    # equality against CANONICAL_REMEDY. Advice or a read failure back on the MCP
+    # observation is the v1 shape returning.
+    for key in ("reason", "remedy"):
+        if key in observation:
+            problems.append(
+                "the MCP observation carries %s %r; envelope v2 sends the standing only"
+                % (key, observation[key])
+            )
     return problems
 
 
@@ -1614,11 +1610,6 @@ def self_test():
         observation = {"standing": WIRE_STANDING[standing], "derives": derives}
         if created_under is not None:
             observation["created_under"] = created_under
-        if standing == "unreadable":
-            observation["reason"] = "schema kin.hydration-semantics.v2 is not v1"
-        remedy = CANONICAL_REMEDY[standing]
-        if remedy is not None:
-            observation["remedy"] = remedy
         observation.update(overrides)
         degraded = {} if standing == "current" else {FLAG: True}
         return {"_kin": {"degraded": degraded, OBSERVATION: observation}}
@@ -1667,13 +1658,8 @@ def self_test():
     fabricated = envelope_payload("absent", created_under=10)
     rejects("envelope unstamped with a fabricated version", envelope_problems(fabricated, "absent", None, 10))
 
-    for label, reason in (("omitted", None), ("empty", "   ")):
-        blank = envelope_payload("unreadable")
-        if reason is None:
-            blank["_kin"][OBSERVATION].pop("reason")
-        else:
-            blank["_kin"][OBSERVATION]["reason"] = reason
-        rejects("envelope unreadable with a %s reason" % label, envelope_problems(blank, "unreadable", None, 10))
+    reasoned = envelope_payload("unreadable", reason="schema kin.hydration-semantics.v2 is not v1")
+    rejects("envelope unreadable carrying a read failure on MCP", envelope_problems(reasoned, "unreadable", None, 10))
 
     # One field each, for the same reason the verdict arms below carry
     # single-field inputs: the two mutants above move the version AND the advice,

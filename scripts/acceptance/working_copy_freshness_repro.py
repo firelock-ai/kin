@@ -168,21 +168,23 @@ def grade_durability_withholds_the_all_clear(payload):
             "live_only_entities 0 beside state %r, which is the all-clear a caller "
             "reads off the field: %r" % (state, block)
         )
-    note = block.get("note") or ""
-    if "host path(s) on disk that no admission has taken" not in note:
-        return FAIL, "the note does not name the host paths it cannot see: %r" % (note,)
-    # FIR-2499 withdrew the prose and left the fields. The first cut of the
-    # FIR-2820 fix withdrew the fields and left the prose, composing the note's
-    # own lead out of live_only_entities one statement before setting it to
-    # None, so a reader grepping the payload for "0 uncommitted" over an
-    # unadmitted module still found it. The two halves move together or neither
-    # of them has moved.
-    if "uncommitted" in note:
+    # FIR-2499 withdrew the prose and left the fields; the first cut of the
+    # FIR-2820 fix withdrew the fields and left prose stating the count they had
+    # withdrawn. Envelope v2 sends no durability sentence at all, so any `note`
+    # is the v1 shape back, and the one that restated a withdrawn count with it.
+    if "note" in block:
         return FAIL, (
-            "the note still states an uncommitted count the field withdrew: %r" % (note,)
+            "envelope v2 carries no durability sentence, and this one is the v1 shape: %r"
+            % (block.get("note"),)
         )
-    return PASS, "state %r, live_only_entities %r, note names the host paths" % (
-        state, block.get("live_only_entities"),
+    behind = ((payload or {}).get("_kin") or {}).get("behind") or {}
+    unadmitted = behind.get("unadmitted_paths")
+    if not isinstance(unadmitted, int) or isinstance(unadmitted, bool) or unadmitted < 1:
+        return FAIL, "_kin.behind does not name the host paths this reading cannot see: %r" % (
+            behind,
+        )
+    return PASS, "state %r, live_only_entities %r, _kin.behind names %d unadmitted path(s)" % (
+        state, block.get("live_only_entities"), unadmitted,
     )
 
 
@@ -568,14 +570,12 @@ CHECKS = [
 ]
 
 
-QUALIFIED_NOTE = (
-    "6 entities answered here, and 1 host path(s) on disk that no admission has taken, so how "
-    "much of this working copy is recorded is unknown; this reading covers admitted content "
-    "only. `kin admit` takes those paths now, and a commit takes them anyway.")
+# The block `_kin.behind` carries beside a withdrawn durability reading.
+BEHIND_BLOCK = {"unadmitted_paths": 1, "measured": True, "sample": ["linkgraph/predicates.py"]}
 
 BEHIND = {"_kin": {"durability": {
-    "state": "unknown", "live_entities": 6, "durable_entities": 6,
-    "note": QUALIFIED_NOTE}}}
+    "state": "unknown", "live_entities": 6, "durable_entities": 6},
+    "behind": BEHIND_BLOCK}}
 SHIPPED_0_6_1 = {"_kin": {"durability": {
     "state": "recorded", "live_entities": 38, "durable_entities": 38,
     "live_only_entities": 0,
@@ -598,19 +598,19 @@ PROSE_ONLY = {"_kin": {"durability": {
 # exactly one assertion, so deleting that assertion turns this suite red and
 # nothing else does. Written as inputs, never by deleting a defence.
 STATE_ONLY = {"_kin": {"durability": {
-    "state": "recorded", "live_entities": 6, "durable_entities": 6,
-    "note": QUALIFIED_NOTE}}}
+    "state": "recorded", "live_entities": 6, "durable_entities": 6},
+    "behind": BEHIND_BLOCK}}
 FIELD_ONLY = {"_kin": {"durability": {
     "state": "unknown", "live_entities": 6, "durable_entities": 6,
-    "live_only_entities": 0,
-    "note": QUALIFIED_NOTE}}}
-NOTE_STATES_A_COUNT = {"_kin": {"durability": {
+    "live_only_entities": 0},
+    "behind": BEHIND_BLOCK}}
+CARRIES_A_NOTE = {"_kin": {"durability": {
     "state": "unknown", "live_entities": 6, "durable_entities": 6,
     "note": "6 entities, 0 uncommitted, and 1 host path(s) on disk that no admission has taken, "
-            "so how much of this working copy is recorded is unknown."}}}
-NOTE_NAMES_NOTHING = {"_kin": {"durability": {
-    "state": "unknown", "live_entities": 6, "durable_entities": 6,
-    "note": "This daemon has not levelled its query graph with durable repository authority."}}}
+            "so how much of this working copy is recorded is unknown."},
+    "behind": BEHIND_BLOCK}}
+BEHIND_NAMES_NOTHING = {"_kin": {"durability": {
+    "state": "unknown", "live_entities": 6, "durable_entities": 6}}}
 
 STATUS_HEAD = "Kin repository-v6 status\nTree: abc (3 artifacts, matching its base change)\n"
 STATUS_NAMING = STATUS_HEAD + (
@@ -739,9 +739,9 @@ def self_test():
     expect("durability fails a zero live_only_entities on its own",
            grade_durability_withholds_the_all_clear(FIELD_ONLY), FAIL)
     expect("durability fails a note that still states an uncommitted count",
-           grade_durability_withholds_the_all_clear(NOTE_STATES_A_COUNT), FAIL)
+           grade_durability_withholds_the_all_clear(CARRIES_A_NOTE), FAIL)
     expect("durability fails a note that names no host paths",
-           grade_durability_withholds_the_all_clear(NOTE_NAMES_NOTHING), FAIL)
+           grade_durability_withholds_the_all_clear(BEHIND_NAMES_NOTHING), FAIL)
 
     expect("durability control passes a committed tree",
            grade_durability_reads_clean_over_a_committed_tree(SHIPPED_0_6_1), PASS)

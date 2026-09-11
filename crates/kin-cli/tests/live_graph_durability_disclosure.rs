@@ -872,12 +872,10 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
         Some(live - durable_at_init),
         "and must say how much of it: {status_durability}"
     );
-    let note = status_durability["note"]
-        .as_str()
-        .expect("a durability object always carries a note");
     assert!(
-        note.contains("uncommitted") && note.contains("Commit to record it"),
-        "the note is what an agent reads instead of the counts: {note:?}"
+        status_durability.get("note").is_none(),
+        "envelope v2 sends the state and counts an agent reads, and no sentence restating \
+         them: {status_durability}"
     );
 
     // The call the agent actually believed. It reaches its envelope through
@@ -1258,10 +1256,9 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
         "exactly the stale file is outstanding; the catch-up took the other one: {behind}"
     );
     assert!(
-        behind["note"]
-            .as_str()
-            .is_some_and(|note| note.contains("Answers here cover admitted content only")),
-        "the disclosure has to say what it means for an answer: {behind}"
+        behind.get("note").is_none() && behind["measured"].is_boolean(),
+        "the disclosure is the count and whether a walk measured it; what it means for an \
+         answer is written once, in docs/mcp-tools.md: {behind}"
     );
     let durability = durability(&locate);
     assert_ne!(
@@ -1271,10 +1268,9 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
          module: {durability}"
     );
     assert!(
-        durability["note"]
-            .as_str()
-            .is_some_and(|note| note.contains("covers admitted content only")),
-        "the durability note has to say the reading is qualified: {durability}"
+        durability["live_only_entities"].is_null() && durability.get("note").is_none(),
+        "the reading is qualified by withdrawing the derived count, never by a sentence: \
+         {durability}"
     );
 
     second.stop();
