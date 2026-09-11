@@ -46,6 +46,151 @@ struct ExactMcpPlan {
     authored_files: BTreeSet<RepoPath>,
 }
 
+/// Exact MCP commits in flight, keyed by transaction id.
+///
+/// `kin mcp start` gives a forwarded call 60 s (`KIN_MCP_DAEMON_TIMEOUT_SECS`) and then
+/// sends it once more on the rest of its patience, and a commit on a large store runs past
+/// that: on a 5,088-entity store each attempt took about 135 s, and the second request
+/// waited on the coordination gate and then ran the whole commit again to the same answer.
+/// A commit is one daemon-owned job per transaction. The first request runs it on its own
+/// task, so a client that stops listening cannot cancel it half way, and an identical
+/// request that arrives while it runs is answered with the same outcome instead of starting
+/// another.
+#[derive(Default)]
+pub(crate) struct InflightMcpCommits {
+    running: std::sync::Mutex<HashMap<String, InflightMcpCommit>>,
+    /// How many requests joined a commit already in flight.
+    #[cfg(test)]
+    pub(crate) joined: std::sync::atomic::AtomicUsize,
+}
+
+struct InflightMcpCommit {
+    fingerprint: String,
+    outcome: tokio::sync::watch::Receiver<Option<McpCommitOutcome>>,
+}
+
+/// What the daemon's MCP route answers for one commit request.
+pub(crate) type McpCommitOutcome =
+    std::result::Result<kin_mcp::ToolCallResult, (axum::http::StatusCode, String)>;
+
+/// Whether a commit request runs the commit, joins one already running, or runs alone.
+pub(crate) enum McpCommitRole {
+    /// No commit for this transaction is running, so this request runs it and publishes
+    /// the outcome for every request that joins.
+    Lead(InflightMcpCommitLease),
+    /// An identical request is already running this commit; its outcome is this one's.
+    Join(tokio::sync::watch::Receiver<Option<McpCommitOutcome>>),
+    /// A commit for this transaction is running under different arguments or for a
+    /// different caller. Nothing is shared: the request runs as it always has, and the
+    /// coordination gate and the transaction's own state decide what it may do.
+    Alone,
+}
+
+/// The leading request's hold on one in-flight entry.
+///
+/// Publishing wakes every joined request. Dropping the lease removes the entry, on every
+/// exit a panic included, so no request can wait on a commit nobody is running, and a
+/// request that arrives after the entry is gone starts afresh: a commit that landed
+/// replays its receipt, and one that failed plans again.
+pub(crate) struct InflightMcpCommitLease {
+    state: Arc<DaemonState>,
+    transaction_id: String,
+    publish: tokio::sync::watch::Sender<Option<McpCommitOutcome>>,
+}
+
+impl InflightMcpCommitLease {
+    /// Where the leading request, like any joined one, waits for the outcome.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<McpCommitOutcome>> {
+        self.publish.subscribe()
+    }
+
+    /// Hand the commit's outcome to every request waiting on it.
+    pub(crate) fn publish(&self, outcome: McpCommitOutcome) {
+        let _ = self.publish.send(Some(outcome));
+    }
+}
+
+impl Drop for InflightMcpCommitLease {
+    fn drop(&mut self) {
+        self.state
+            .inflight_mcp_commits
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.transaction_id);
+    }
+}
+
+impl InflightMcpCommits {
+    /// Decide this request's role for the commit of `transaction_id`.
+    ///
+    /// `fingerprint` is what makes two requests the same request. A re-sent request
+    /// carries the same one; a different caller or different arguments do not, and those
+    /// never share an outcome.
+    pub(crate) fn claim(
+        state: &Arc<DaemonState>,
+        transaction_id: &str,
+        fingerprint: String,
+    ) -> McpCommitRole {
+        let mut running = state
+            .inflight_mcp_commits
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match running.get(transaction_id) {
+            Some(commit) if commit.fingerprint == fingerprint => {
+                #[cfg(test)]
+                state
+                    .inflight_mcp_commits
+                    .joined
+                    .fetch_add(1, Ordering::SeqCst);
+                McpCommitRole::Join(commit.outcome.clone())
+            }
+            Some(_) => McpCommitRole::Alone,
+            None => {
+                let (publish, outcome) = tokio::sync::watch::channel(None);
+                running.insert(
+                    transaction_id.to_string(),
+                    InflightMcpCommit {
+                        fingerprint,
+                        outcome,
+                    },
+                );
+                McpCommitRole::Lead(InflightMcpCommitLease {
+                    state: Arc::clone(state),
+                    transaction_id: transaction_id.to_string(),
+                    publish,
+                })
+            }
+        }
+    }
+}
+
+/// Wait for the outcome of a commit in flight.
+pub(crate) async fn await_mcp_commit_outcome(
+    mut outcome: tokio::sync::watch::Receiver<Option<McpCommitOutcome>>,
+    transaction_id: &str,
+) -> McpCommitOutcome {
+    loop {
+        if let Some(published) = outcome.borrow_and_update().clone() {
+            return published;
+        }
+        if outcome.changed().await.is_err() {
+            // The leading task ended. It publishes before it lets go, so an empty slot here
+            // means it ended without an outcome, which only a panic does.
+            return outcome.borrow().clone().unwrap_or_else(|| {
+                Err((
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "the commit of transaction {transaction_id} ended without an answer; \
+                         send the commit again, which resumes or replays it"
+                    ),
+                ))
+            });
+        }
+    }
+}
+
 /// What this process knows about a commit beyond the change it published.
 ///
 /// Present when the commit was planned here and absent when it was recovered by
@@ -239,6 +384,19 @@ fn commit_exact_transaction_inner(
     arguments: &HashMap<String, serde_json::Value>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
 ) -> Result<kin_mcp::ToolCallResult, String> {
+    #[cfg(test)]
+    {
+        state.mcp_commit_attempts.fetch_add(1, Ordering::SeqCst);
+        let hold = state
+            .mcp_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hold) = hold {
+            // Released by the test, or by its sender dropping when the test panics.
+            let _ = hold.recv();
+        }
+    }
     if state.storage_backend.is_some() {
         return Err(
             "exact MCP repository commits are not yet available for hosted snapshot backends"
