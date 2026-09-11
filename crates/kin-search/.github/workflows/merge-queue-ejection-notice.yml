@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Merge Queue Ejection Notice
+
+# The hosted merge queue drops a pull request when a `merge_group` check fails,
+# and it marks nothing on the pull request it dropped. The failing run belongs
+# to a `gh-readonly-queue` ref and names no pull request, so PR-level checks and
+# mergeable state keep reading CLEAN and MERGEABLE. What a captain sees is a
+# healthy change that simply never merges, which is indistinguishable from one
+# still waiting its turn.
+#
+# The shared implementation lives in firelock-ai/kin-actions and has run on that
+# repo's own pull requests since the defect was first observed there. This repo
+# had the same blind spot and no consumer.
+#
+# The four workflows below are every workflow here that runs on `merge_group`,
+# which makes them the four whose failure can eject an entry. Adding a
+# `merge_group:` trigger to another workflow means adding its name here too, or
+# the ejections it causes go back to being invisible. `workflow_run` is the
+# right trigger rather than an `if: failure()` job inside each of them, because
+# the check that ejects is frequently in a different workflow from the one
+# anybody would think to edit.
+on:
+  workflow_run:
+    workflows: ["CI", "PR Text Hygiene", "Registry Publish", "SAST"]
+    types: [completed]
+
+# Read-only by default, with the comment capability granted only to the job that
+# needs it. A reusable workflow can narrow the caller's token but never widen
+# it, so the grant has to be made on this side.
+permissions:
+  contents: read
+
+jobs:
+  notice:
+    permissions:
+      pull-requests: write
+    uses: firelock-ai/kin-actions/.github/workflows/merge-queue-ejection-notice.yml@v0.1.31
