@@ -37,8 +37,10 @@ carries the printable form beside it. Omit `source_change_id` to read the exact 
 workspace tree.";
 
 pub const ARTIFACT_READ_DESC: &str = "\
-Read one exact graph-owned repository artifact by stable `artifact_id` or canonical \
-byte-exact `path`. Blob and symlink bytes are returned losslessly as base64 and, only when \
+Read one exact graph-owned repository artifact by stable `artifact_id` or by `path`: the \
+repository-relative string `kin_artifact_list` prints as `path_label` (a leading `/` is \
+tolerated), or the byte-exact `{\"bytes_hex\": ...}` object for a path whose bytes are not \
+valid UTF-8. Blob and symlink bytes are returned losslessly as base64 and, only when \
 valid UTF-8, as `text_utf8`. Gitlinks return their external object identity, as the \
 algorithm-tagged `git_object_id` plus a printable `git_object_id_hex`, and have no \
 repository-owned body. Content-addressed hashes are lowercase hex strings, including the \
@@ -243,12 +245,74 @@ fn parse_artifact_id(value: &serde_json::Value) -> Result<ArtifactId> {
         .map_err(|error| McpError::InvalidParams(format!("invalid artifact_id: {error}")))
 }
 
+/// The spellings of a repository path this surface accepts, named in every refusal.
+const ACCEPTED_PATH_SHAPES: &str = "a repository-relative path string as kin_artifact_list \
+     prints it in path_label, such as \"src/lib.rs\" (a leading \"/\" is tolerated), or \
+     {\"bytes_hex\": \"...\"} for a path whose bytes are not valid UTF-8";
+
+/// Read a caller's `path` into a repository path.
+///
+/// Two spellings are accepted: the plain repository-relative string
+/// `kin_artifact_list` prints as `path_label`, and the byte-exact
+/// `{"bytes_hex": ...}` object for a path the label cannot spell. A repository
+/// path never begins with `/` or `./`, so either prefix is dropped before the
+/// path is checked: a caller that writes the path it was shown as if it were
+/// rooted means that same file, and refusing it left an agent holding the right
+/// path with no way to read it.
 fn parse_repo_path(value: &serde_json::Value) -> Result<RepoPath> {
-    serde_json::from_value(value.clone()).map_err(|error| {
-        McpError::InvalidParams(format!(
-            "invalid byte-exact path; expected {{\"bytes_hex\":\"...\"}}: {error}"
-        ))
-    })
+    let refuse = |why: String| {
+        McpError::InvalidParams(format!("invalid path: {why}; pass {ACCEPTED_PATH_SHAPES}"))
+    };
+    let bytes = match value {
+        serde_json::Value::String(text) => text.as_bytes().to_vec(),
+        serde_json::Value::Object(fields) => match (fields.len(), fields.get("bytes_hex")) {
+            (1, Some(serde_json::Value::String(hex))) => decode_lowercase_hex(hex)
+                .ok_or_else(|| refuse(format!("{hex:?} is not canonical lowercase hex")))?,
+            _ => {
+                return Err(refuse(
+                    "an object path carries exactly one key, bytes_hex".to_string(),
+                ))
+            }
+        },
+        other => {
+            return Err(refuse(format!(
+                "{} is neither a string nor an object",
+                json_kind(other)
+            )))
+        }
+    };
+    let mut rest: &[u8] = &bytes;
+    while let Some(stripped) = rest.strip_prefix(b"/").or_else(|| rest.strip_prefix(b"./")) {
+        rest = stripped;
+    }
+    RepoPath::from_bytes(rest.to_vec()).map_err(|error| refuse(error.to_string()))
+}
+
+/// Bytes from canonical lowercase hex, or `None` for anything else.
+fn decode_lowercase_hex(hex: &str) -> Option<Vec<u8>> {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| Some((digit(pair[0])? << 4) | digit(pair[1])?))
+        .collect()
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 fn select_artifact<'a>(
@@ -274,7 +338,11 @@ fn select_artifact<'a>(
             McpError::Context("graph authority gap: artifact_id is absent from this tree".into())
         }),
         (false, true) => by_path.ok_or_else(|| {
-            McpError::Context("graph authority gap: exact path is absent from this tree".into())
+            McpError::Context(
+                "graph authority gap: exact path is absent from this tree; a path is \
+                 repository-relative, spelled as kin_artifact_list prints it in path_label"
+                    .into(),
+            )
         }),
         (true, true) => match (by_id, by_path) {
             (Some(left), Some(right)) if left.artifact_id == right.artifact_id => Ok(left),
@@ -530,6 +598,48 @@ mod tests {
             assert_eq!(
                 model["type"], wire["type"],
                 "the variant tag must be unchanged: {model} vs {wire}"
+            );
+        }
+    }
+
+    /// A path reads from either spelling, with or without the leading slash a
+    /// model writes when it treats the path it was shown as rooted.
+    #[test]
+    fn a_path_is_read_from_either_spelling_with_or_without_a_leading_slash() {
+        let expected = RepoPath::from_utf8("crates/kin-db/src/admission.rs").unwrap();
+        let hex = |text: &str| {
+            text.bytes()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        for value in [
+            serde_json::json!("crates/kin-db/src/admission.rs"),
+            serde_json::json!("/crates/kin-db/src/admission.rs"),
+            serde_json::json!("./crates/kin-db/src/admission.rs"),
+            serde_json::json!({ "bytes_hex": hex("crates/kin-db/src/admission.rs") }),
+            serde_json::json!({ "bytes_hex": hex("/crates/kin-db/src/admission.rs") }),
+        ] {
+            assert_eq!(parse_repo_path(&value).unwrap(), expected, "{value}");
+        }
+        // The control: a path the label cannot spell still reads byte-exact.
+        let raw = RepoPath::from_bytes(b"assets/\xffpayload.bin".to_vec()).unwrap();
+        assert_eq!(
+            parse_repo_path(&serde_json::to_value(&raw).unwrap()).unwrap(),
+            raw
+        );
+        // Every refusal names the shapes that are accepted.
+        for bad in [
+            serde_json::json!(""),
+            serde_json::json!("/"),
+            serde_json::json!(42),
+            serde_json::json!({ "bytes_hex": "ZZ" }),
+            serde_json::json!({ "hex": "61" }),
+            serde_json::json!("a/../b"),
+        ] {
+            let error = parse_repo_path(&bad).unwrap_err().to_string();
+            assert!(
+                error.contains("repository-relative path string") && error.contains("bytes_hex"),
+                "{bad}: {error}"
             );
         }
     }

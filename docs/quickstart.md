@@ -552,7 +552,7 @@ after both commits exist so the exact SHAs are part of Kin's imported graph.
 
 If you chose the **AI agents** intent in step 2, `kin setup` already wrote Kin's MCP
 server entry into every detected AI client (Claude Code, Cursor, Codex CLI, Gemini CLI,
-Windsurf, Google Antigravity) and added a Kin-first discovery reminder to your agent
+Windsurf, Google Antigravity, LM Studio, Grok CLI) and added a Kin-first discovery reminder to your agent
 instruction files. There
 is **nothing else to configure**. Open your agent in a Kin repository and ask it to use
 the semantic tools:
@@ -724,6 +724,8 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | Gemini CLI | `~/.gemini/settings.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 | Google Antigravity | `~/.gemini/config/mcp_config.json` (global) and `<repo>/.agents/mcp_config.json` (workspace) |
+| LM Studio | `~/.lmstudio/mcp.json` |
+| Grok CLI | `~/.grok/config.toml` (TOML, bound to one repository like Codex) |
 
 Codex is the exception: it reads TOML (`[mcp_servers.<name>]` tables), not JSON. The wizard
 merges this table into `~/.codex/config.toml`, leaving the rest of the file untouched:

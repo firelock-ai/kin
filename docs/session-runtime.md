@@ -19,7 +19,7 @@ Four surfaces share this contract:
 
 `kin setup` is **not** part of this contract: it is one-time configuration that
 installs Kin's MCP server entry into your AI clients (Claude Code, Cursor,
-Codex, Gemini, Windsurf) and your shell hook. In short:
+Codex, Gemini, Windsurf, Google Antigravity, LM Studio, Grok CLI) and your shell hook. In short:
 
 - **`kin setup`**: configure clients once (MCP install, shell hook).
 - **`kin exec` / `kin shell`**: run ordinary commands through a session workspace.

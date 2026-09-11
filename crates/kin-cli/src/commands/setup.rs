@@ -1654,6 +1654,8 @@ const IDX_CODEX: usize = 2;
 const IDX_GEMINI: usize = 3;
 const IDX_WINDSURF: usize = 4;
 const IDX_ANTIGRAVITY: usize = 5;
+const IDX_LMSTUDIO: usize = 6;
+const IDX_GROK: usize = 7;
 
 /// The Claude Code CLI filename, by platform.
 fn claude_cli_filename() -> &'static str {
@@ -1702,6 +1704,8 @@ fn claude_code_install_evidence(home: &Path) -> bool {
 /// - Codex CLI: `codex` binary on PATH
 /// - Gemini CLI: `gemini` binary on PATH, or `~/.gemini` directory
 /// - Windsurf: `windsurf` binary on PATH, or `/Applications/Windsurf.app`
+/// - LM Studio: `lms` binary on PATH, `~/.lmstudio`, or `/Applications/LM Studio.app`
+/// - Grok CLI: `grok` binary on PATH, or `~/.grok`
 fn detect_ai_assistants() -> Vec<AiAssistant> {
     let claude_detected = check_binary_in_path("claude").is_some()
         || home_dir()
@@ -1722,6 +1726,15 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
         || PathBuf::from("/Applications/Antigravity IDE.app").exists()
         || home_dir()
             .map(|home| home.join(".gemini").join("antigravity").exists())
+            .unwrap_or(false);
+    let lmstudio_detected = check_binary_in_path("lms").is_some()
+        || PathBuf::from("/Applications/LM Studio.app").exists()
+        || home_dir()
+            .map(|home| home.join(".lmstudio").exists())
+            .unwrap_or(false);
+    let grok_detected = check_binary_in_path("grok").is_some()
+        || home_dir()
+            .map(|home| home.join(".grok").exists())
             .unwrap_or(false);
 
     vec![
@@ -1754,6 +1767,16 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
             name: "Google Antigravity",
             detected: antigravity_detected,
             install_hint: "install Google Antigravity",
+        },
+        AiAssistant {
+            name: "LM Studio",
+            detected: lmstudio_detected,
+            install_hint: "install from lmstudio.ai",
+        },
+        AiAssistant {
+            name: "Grok CLI",
+            detected: grok_detected,
+            install_hint: "install the Grok CLI from x.ai",
         },
     ]
 }
@@ -1996,6 +2019,18 @@ fn configure_cursor() -> Result<PathBuf> {
     Ok(target)
 }
 
+/// Configure MCP for LM Studio.
+///
+/// LM Studio reads its MCP servers from `~/.lmstudio/mcp.json`, a top-level
+/// `mcpServers` object whose stdio entries take `command`, `args` and `env`: the
+/// shape Cursor reads, so the same merge writes it.
+fn configure_lmstudio() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let target = home.join(".lmstudio").join("mcp.json");
+    merge_mcp_config(&target, "lmstudio")?;
+    Ok(target)
+}
+
 /// Merge the "kin" MCP server entry into a TOML MCP config (Codex CLI's
 /// `~/.codex/config.toml`). Creates the file if it doesn't exist.
 ///
@@ -2004,13 +2039,21 @@ fn configure_cursor() -> Result<PathBuf> {
 /// TOML edit so unrelated keys, tables, and comments in the user's config are
 /// left untouched.
 fn merge_mcp_config_toml(path: &PathBuf, repo_root: &Path) -> Result<()> {
+    merge_mcp_config_toml_for(path, repo_root, "codex")
+}
+
+/// [`merge_mcp_config_toml`] for any client whose Kin entry is a repository-bound
+/// `[mcp_servers.kin]` table, recorded in the install ledger under that client's id.
+/// The Grok CLI reads the same table from `~/.grok/config.toml`.
+fn merge_mcp_config_toml_for(path: &PathBuf, repo_root: &Path, target_id: &str) -> Result<()> {
     let topology = McpTopologyLock::acquire()?;
-    merge_mcp_config_toml_with_topology(path, repo_root, &topology)
+    merge_mcp_config_toml_with_topology(path, repo_root, target_id, &topology)
 }
 
 fn merge_mcp_config_toml_with_topology(
     path: &PathBuf,
     repo_root: &Path,
+    target_id: &str,
     _topology: &McpTopologyLock,
 ) -> Result<()> {
     let lock = ConfigLock::acquire(path)?;
@@ -2019,7 +2062,7 @@ fn merge_mcp_config_toml_with_topology(
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("kin");
-    merge_mcp_config_toml_locked(path, repo_root, &lock, "codex", command)
+    merge_mcp_config_toml_locked(path, repo_root, &lock, target_id, command)
 }
 
 fn merge_mcp_config_toml_locked(
@@ -2033,7 +2076,8 @@ fn merge_mcp_config_toml_locked(
 
     let repo_root = canonical_initialized_repo(repo_root).with_context(|| {
         format!(
-            "Codex MCP binding requires an initialized Kin repository: {}",
+            "{} MCP binding requires an initialized Kin repository: {}",
+            toml_client_label(target_id),
             repo_root.display()
         )
     })?;
@@ -2126,8 +2170,13 @@ fn merge_mcp_config_toml_locked(
 
     let formatted = doc.to_string();
     lock.write_guarded(path, formatted.as_bytes(), original.as_deref())?;
-    let owned_entry = read_kin_mcp_entry_from_bytes(path, formatted.as_bytes())
-        .context("generated Codex MCP entry is missing")?;
+    let owned_entry =
+        read_kin_mcp_entry_from_bytes(path, formatted.as_bytes()).with_context(|| {
+            format!(
+                "generated {} MCP entry is missing",
+                toml_client_label(target_id)
+            )
+        })?;
     record_mcp_entry_in_ledger(target_id, path, &owned_entry)
 }
 
@@ -2140,6 +2189,20 @@ fn configure_codex() -> Result<PathBuf> {
     let target = home.join(".codex").join("config.toml");
     let repo_root = current_initialized_setup_repo("Codex CLI")?;
     merge_mcp_config_toml(&target, &repo_root)?;
+    Ok(target)
+}
+
+/// Configure MCP for the Grok CLI.
+///
+/// Grok reads MCP servers from `~/.grok/config.toml`, the `[mcp_servers.<name>]`
+/// tables Codex reads, and applies that user-scope file to every project. So its
+/// Kin entry names one repository with `--repo`, as Codex's does, rather than
+/// trusting a session's working directory, which is often not a Kin repository.
+fn configure_grok() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let target = home.join(".grok").join("config.toml");
+    let repo_root = current_initialized_setup_repo("Grok CLI")?;
+    merge_mcp_config_toml_for(&target, &repo_root, "grok")?;
     Ok(target)
 }
 
@@ -2935,7 +2998,29 @@ fn mcp_target_supported(id: &str) -> bool {
             | "antigravity_workspace"
             | "gemini"
             | "windsurf"
+            | "lmstudio"
+            | "grok"
     )
+}
+
+/// Clients whose Kin entry is a `[mcp_servers.kin]` table in a TOML config, which
+/// only the TOML writer may touch: a JSON merge refuses the file, and a repair
+/// routed there would leave the entry unrepaired.
+fn mcp_target_is_toml(id: &str) -> bool {
+    matches!(id, "codex" | "grok")
+}
+
+/// Clients whose Kin entry names one repository with `--repo`.
+fn mcp_target_is_repo_bound(id: &str) -> bool {
+    matches!(id, "codex" | "grok" | "antigravity")
+}
+
+/// How a TOML client is named in a message.
+fn toml_client_label(id: &str) -> &'static str {
+    match id {
+        "grok" => "Grok CLI",
+        _ => "Codex",
+    }
 }
 
 fn workspace_root_for_mcp_path(path: &Path) -> Option<PathBuf> {
@@ -3515,6 +3600,8 @@ fn allowed_static_mcp_target_paths(id: &str) -> Result<Vec<PathBuf>> {
                 .join("antigravity-ide")
                 .join("mcp_config.json"),
         ],
+        "lmstudio" => vec![home.join(".lmstudio").join("mcp.json")],
+        "grok" => vec![home.join(".grok").join("config.toml")],
         "antigravity_workspace" => Vec::new(),
         _ => anyhow::bail!("unsupported managed MCP target '{id}'"),
     };
@@ -3601,7 +3688,7 @@ pub(crate) fn normalize_mcp_repair_targets(
             target.repo_root = Some(root);
         } else {
             validate_static_mcp_target_path(&target.id, &target.path)?;
-            if target.id == "codex" || target.id == "antigravity" {
+            if mcp_target_is_repo_bound(&target.id) {
                 let repo_root = target
                     .repo_root
                     .as_deref()
@@ -3935,7 +4022,7 @@ fn capture_mcp_repair_target_excluding(
     let repo_root = match id {
         "antigravity_workspace" => workspace_root_for_mcp_path(&path),
         "antigravity" => json_mcp_repo_from_entry_bytes(&bytes, "Antigravity")?,
-        "codex" => codex_repo_from_entry_bytes(&bytes)?,
+        "codex" | "grok" => codex_repo_from_entry_bytes(&bytes)?,
         _ => None,
     };
     Ok(Some(McpRepairTarget {
@@ -11885,10 +11972,12 @@ fn merge_codex_mcp_target_locked(
     command: &str,
     lock: &ConfigLock,
 ) -> Result<()> {
-    let repo_root = target
-        .repo_root
-        .as_deref()
-        .context("cannot determine an initialized Kin repository for the Codex MCP binding")?;
+    let repo_root = target.repo_root.as_deref().with_context(|| {
+        format!(
+            "cannot determine an initialized Kin repository for the {} MCP binding",
+            toml_client_label(&target.id)
+        )
+    })?;
     merge_mcp_config_toml_locked(&target.path, repo_root, lock, &target.id, command)
 }
 
@@ -11973,7 +12062,7 @@ fn remerge_mcp_targets_with_launcher(
 
     let mut outcome = McpRemergeOutcome::default();
     for (target, lock) in targets.into_iter().zip(&mut locks) {
-        let result = if target.id == "codex" {
+        let result = if mcp_target_is_toml(&target.id) {
             merge_codex_mcp_target_locked(&target, &command, lock)
         } else {
             merge_json_mcp_target_locked(&target, &command, lock)
@@ -12057,7 +12146,7 @@ pub(crate) fn remerge_mcp_targets_exact_with_topology_and_finalizer(
     }
     let mut repaired = Vec::with_capacity(targets.len());
     for (target, lock) in targets.iter().zip(&mut locks) {
-        if target.id == "codex" {
+        if mcp_target_is_toml(&target.id) {
             merge_codex_mcp_target_locked(target, &command, lock)?;
         } else {
             merge_json_mcp_target_locked(target, &command, lock)?;
@@ -13044,6 +13133,8 @@ fn mcp_config_path_for_index(idx: usize) -> Option<PathBuf> {
                 .join("mcp_config.json"),
         ),
         IDX_ANTIGRAVITY => Some(home.join(".gemini").join("config").join("mcp_config.json")),
+        IDX_LMSTUDIO => Some(home.join(".lmstudio").join("mcp.json")),
+        IDX_GROK => Some(home.join(".grok").join("config.toml")),
         _ => None,
     }
 }
@@ -13057,6 +13148,8 @@ fn configure_assistant_by_index(idx: usize) -> Option<Result<PathBuf>> {
         IDX_GEMINI => Some(configure_gemini_cli()),
         IDX_WINDSURF => Some(configure_windsurf()),
         IDX_ANTIGRAVITY => Some(configure_antigravity()),
+        IDX_LMSTUDIO => Some(configure_lmstudio()),
+        IDX_GROK => Some(configure_grok()),
         _ => None,
     }
 }
@@ -17802,6 +17895,7 @@ wait
         for (name, configure) in [
             ("Codex CLI", configure_codex as fn() -> Result<PathBuf>),
             ("Google Antigravity", configure_antigravity),
+            ("Grok CLI", configure_grok),
         ] {
             let error = configure()
                 .expect_err("a client whose entry names a repository cannot bind without one");
@@ -21435,6 +21529,51 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         );
     }
 
+    /// LM Studio reads `~/.lmstudio/mcp.json` in the shape Cursor reads, so setup
+    /// writes the same entry there, leaves every other server alone, and offers it
+    /// at the index it dispatches on.
+    #[test]
+    #[serial]
+    fn setup_registers_kin_with_lm_studio_beside_its_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(home.join(".lmstudio")).unwrap();
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::copy(
+            env::current_exe().unwrap(),
+            kin_home.join("bin").join("kin"),
+        )
+        .unwrap();
+        fs::write(
+            home.join(".lmstudio").join("mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"other-server"}}}"#,
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+
+        let config = configure_lmstudio().unwrap();
+        assert_eq!(config, home.join(".lmstudio").join("mcp.json"));
+        let root: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        let kin = &root["mcpServers"]["kin"];
+        assert_eq!(kin["args"], serde_json::json!(["mcp", "start"]));
+        assert_eq!(kin["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default");
+        assert!(Path::new(kin["command"].as_str().unwrap()).is_absolute());
+        assert_eq!(
+            root["mcpServers"]["other"]["command"], "other-server",
+            "every other server is left alone"
+        );
+        let assistants = detect_ai_assistants();
+        assert_eq!(assistants[IDX_LMSTUDIO].name, "LM Studio");
+        assert!(
+            assistants[IDX_LMSTUDIO].detected,
+            "~/.lmstudio is evidence of an install"
+        );
+        assert_eq!(mcp_config_path_for_index(IDX_LMSTUDIO), Some(config));
+        assert_eq!(assistants[IDX_GROK].name, "Grok CLI");
+    }
+
     /// Without a managed binary, setup falls back to the running executable
     /// and says so: nothing manages that path, and `kin update` will not
     /// repair a client config that points at it.
@@ -21484,6 +21623,50 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         ] {
             assert!(!text.contains('\u{2014}'), "{name} carries an em dash");
         }
+    }
+
+    /// Grok reads the `[mcp_servers.kin]` table Codex reads, from its own
+    /// `config.toml`, bound to one repository, and the rest of the file survives.
+    #[test]
+    #[serial]
+    fn grok_gets_a_repository_bound_mcp_table_beside_its_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# grok settings\n[mcp_servers.linear]\nurl = \"https://mcp.linear.app/mcp\"\n",
+        )
+        .unwrap();
+
+        merge_mcp_config_toml_for(&path, &repo, "grok").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# grok settings"),
+            "comments survive: {content}"
+        );
+        let root: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            root["mcp_servers"]["linear"]["url"].as_str(),
+            Some("https://mcp.linear.app/mcp"),
+            "every other server is left alone"
+        );
+        let kin = &root["mcp_servers"]["kin"];
+        let args: Vec<&str> = kin["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert_eq!(args, vec!["mcp", "start", "--repo", repo.to_str().unwrap()]);
+        assert_eq!(
+            kin["env"]["KIN_MCP_TOOL_PROFILE"].as_str(),
+            Some("agent-default")
+        );
     }
 
     #[test]
@@ -23895,6 +24078,60 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             assert!(format!("{error:#}").contains("not an allowed canonical config path"));
             assert_eq!(fs::read(victim).unwrap(), bytes);
         }
+    }
+
+    /// A Grok entry is repaired as the TOML table it is, keeping its repository
+    /// binding and every key Kin does not own, never handed to the JSON writer.
+    #[test]
+    #[serial]
+    fn a_grok_entry_is_repaired_as_toml_and_keeps_its_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let config = home.join(".grok/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[mcp_servers.kin]\ncommand = \"/stale/kin\"\nargs = [\"mcp\", \"start\", \"--repo\", {:?}]\n\n[mcp_servers.kin.env]\nKIN_MCP_TOOL_PROFILE = \"agent-default\"\nKIN_EMBED_BACKEND = \"cpu\"\n",
+                repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+
+        let grok = current_mcp_repair_targets()
+            .unwrap()
+            .into_iter()
+            .find(|target| target.id == "grok")
+            .expect("a Grok entry is captured for repair");
+        assert_eq!(grok.repo_root.as_deref(), Some(repo.as_path()));
+        remerge_mcp_targets_exact_with_finalizer(&[grok], || Ok(()))
+            .expect("a Grok entry repairs as TOML");
+
+        let root: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let kin = &root["mcp_servers"]["kin"];
+        assert_ne!(
+            kin["command"].as_str(),
+            Some("/stale/kin"),
+            "the launcher is repaired"
+        );
+        assert_eq!(
+            kin["args"][3].as_str(),
+            repo.to_str(),
+            "the repository binding is kept"
+        );
+        assert_eq!(
+            kin["env"]["KIN_EMBED_BACKEND"].as_str(),
+            Some("cpu"),
+            "a key Kin does not own is kept"
+        );
     }
 
     #[test]

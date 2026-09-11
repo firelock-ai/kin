@@ -6562,6 +6562,23 @@ mod tests {
             std::str::from_utf8(compose_bytes).unwrap()
         );
         assert_ne!(compose["text_utf8"], "filesystem fallback must never win\n");
+        // The spelling an agent reads off the listing, with the leading slash a
+        // model tends to add, reads the same artifact.
+        let by_label = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    ("path".into(), serde_json::json!("/compose.yaml")),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(by_label["text_utf8"], compose["text_utf8"]);
 
         let binary = tool_result_json(
             artifacts::handle_artifact_read(
