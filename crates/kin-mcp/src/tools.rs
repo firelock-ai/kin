@@ -783,8 +783,8 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "from": { "type": "string", "description": "Source end: entity UUID, exact name, or name@file to pin one of two same-named entities." },
                         "to": { "type": "string", "description": "Target end, in the same forms." },
-                        "from_file": { "type": "string", "description": "Pin `from` to the entity of that name in the file this path or path suffix names. Same request as the name@file spelling." },
-                        "to_file": { "type": "string", "description": "Pin `to` the same way." },
+                        "from_file": { "type": "string", "description": "Deprecated, answered through 0.7.16; pass the entity id in `from`. Pins `from` by file." },
+                        "to_file": { "type": "string", "description": "Deprecated, answered through 0.7.16; pass the entity id in `to`. Pins `to` by file." },
                         "max_depth": { "type": "integer", "description": "Hops walked between the two ends (default 6, ceiling 12). Containment hops joining a class to its members are not counted.", "default": 6, "minimum": 1, "maximum": crate::remediation::PATH_MAX_MAX_DEPTH },
                         "limit": { "type": "integer", "description": "Routes returned, shortest first (default 3, ceiling 25). `routes_total` says how many shortest routes exist.", "default": 3, "minimum": 1, "maximum": 25 },
                         "direction": {
@@ -865,7 +865,7 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to analyze impact for" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths: resolves to entities, then analyzes impact" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "Deprecated, answered through 0.7.16; use entity_ids. File paths resolved to entities." },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine and analyze impact" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on impacted entities", "default": true }
                     }
@@ -881,7 +881,7 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to diff (current state vs history)" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths: resolves to entities, then diffs" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "Deprecated, answered through 0.7.16; use entity_ids. File paths resolved to entities." },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one diff" }
                     }
                 }),
@@ -896,7 +896,7 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to review (current state vs history)" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths: resolves to entities, then reviews" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "Deprecated, answered through 0.7.16; use entity_ids. File paths resolved to entities." },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one review" },
                         "format": { "type": "string", "enum": ["text", "json"], "description": "Response format. Use json for editor integrations.", "default": "text" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on reviewed entities", "default": true }

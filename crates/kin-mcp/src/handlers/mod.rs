@@ -7501,6 +7501,76 @@ mod tests {
     /// looking for one, which is the wrong-cause error class this workspace
     /// polices. Tracked paths with no parser-emitted entities are the ordinary
     /// way to hit it: a workflow file is a real artifact and resolves to nothing.
+    /// Each files-mode tool answers a `files` call with the deprecation beside
+    /// its answer, and an `entity_ids` call with none.
+    #[tokio::test]
+    async fn a_files_call_carries_its_deprecation_and_an_entity_call_does_not() {
+        let store = InMemoryGraph::new();
+        let present = impact_probe_entity("deprecation_probe_3578", Some(3));
+        let present_path = present
+            .file_origin
+            .as_ref()
+            .expect("the probe carries a file origin")
+            .to_string();
+        kin_model::graph::EntityStore::upsert_entity(&store, &present).unwrap();
+        let sessions = SessionRegistry::new();
+        let by_file = HashMap::from([
+            ("files".to_string(), serde_json::json!([present_path])),
+            ("include_traffic".to_string(), serde_json::json!(false)),
+        ]);
+        let by_id = HashMap::from([
+            (
+                "entity_ids".to_string(),
+                serde_json::json!([present.id.to_string()]),
+            ),
+            ("include_traffic".to_string(), serde_json::json!(false)),
+        ]);
+        let text_of = |result: &ToolCallResult| {
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            text.clone()
+        };
+
+        let impact = tool_result_json(
+            review::handle_impact_analysis(&by_file, &store, &sessions)
+                .await
+                .expect("a resolvable file yields a report"),
+        );
+        assert_eq!(impact["deprecations"][0]["tool"], "impact_analysis");
+        assert_eq!(impact["deprecations"][0]["parameter"], "files");
+        let impact = tool_result_json(
+            review::handle_impact_analysis(&by_id, &store, &sessions)
+                .await
+                .expect("an entity id yields a report"),
+        );
+        assert!(impact.get("deprecations").is_none(), "{impact}");
+
+        for (tool, by_file_result, by_id_result) in [
+            (
+                "semantic_diff",
+                review::handle_semantic_diff(&by_file, &store).expect("diff by file"),
+                review::handle_semantic_diff(&by_id, &store).expect("diff by id"),
+            ),
+            (
+                "semantic_review",
+                review::handle_semantic_review(&by_file, &store, &sessions)
+                    .expect("review by file"),
+                review::handle_semantic_review(&by_id, &store, &sessions).expect("review by id"),
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&text_of(&by_file_result))
+                .unwrap_or_else(|_| panic!("{tool} by file must answer in JSON"));
+            assert_eq!(value["deprecations"][0]["tool"], tool, "{value}");
+            assert!(
+                value["message"].is_string(),
+                "{tool} keeps its text: {value}"
+            );
+            assert!(
+                !text_of(&by_id_result).contains("\"deprecations\""),
+                "{tool} by entity id must carry no deprecation"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn impact_analysis_files_mode_names_a_resolution_miss_not_a_diff_complaint() {
         let store = InMemoryGraph::new();

@@ -276,6 +276,53 @@ pub const ELISION_REASON_DEPENDENTS_CAP: &str = "dependents_cap";
 /// Where a payload publishes what its lists lost.
 pub const ELISIONS_KEY: &str = "elisions";
 
+/// Where a payload publishes the parameters it answered that are on their way
+/// out, beside `degradations` and `elisions`.
+///
+/// No `ResponseShape` names it, so the ladder never cuts it, and it is bounded
+/// by construction: one entry per deprecated parameter the call actually
+/// passed. It is measured with the rest of the payload, so it cannot push a
+/// response past its ceiling unseen.
+pub const DEPRECATIONS_KEY: &str = "deprecations";
+
+/// The last release that still answers a deprecated parameter. The parameter
+/// keeps working through it and is removed after it.
+pub const DEPRECATION_REMOVED_AFTER: &str = "0.7.16";
+
+/// Record that this response answered a deprecated parameter, naming what
+/// replaces it and the last release that still answers it. Recording the same
+/// tool and parameter twice keeps one entry. A payload that is not an object has
+/// no top level to carry the key, and is left as it is.
+pub fn record_deprecation(
+    payload: &mut Value,
+    tool: &str,
+    parameter: &str,
+    replacement: &str,
+    removed_after: &str,
+) {
+    let entry = json!({
+        "tool": tool,
+        "parameter": parameter,
+        "replacement": replacement,
+        "removed_after": removed_after,
+    });
+    let Some(map) = payload.as_object_mut() else {
+        return;
+    };
+    let list = map
+        .entry(DEPRECATIONS_KEY.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(entries) = list.as_array_mut() {
+        let already = entries.iter().any(|prior| {
+            prior.get("tool") == entry.get("tool")
+                && prior.get("parameter") == entry.get("parameter")
+        });
+        if !already {
+            entries.push(entry);
+        }
+    }
+}
+
 /// Per-row marker naming the budget that took this row's inline source.
 ///
 /// A row that simply loses its `body` key is byte-identical to a row from a
@@ -3271,6 +3318,40 @@ mod tests {
             "an unpaged tool must not be handed a cursor it never mints"
         );
         assert_eq!(unpaged["next_cursor"], Value::Null);
+    }
+
+    /// A deprecation rides beside the answer: one entry per tool and parameter,
+    /// never cut by the ladder, and still there after the ceiling has bitten.
+    #[test]
+    fn a_deprecation_is_recorded_once_and_survives_a_cut() {
+        let mut payload = file_entities_final_page(40, 200, 240, 600);
+        for _ in 0..2 {
+            record_deprecation(
+                &mut payload,
+                "impact_analysis",
+                "files",
+                "entity_ids",
+                DEPRECATION_REMOVED_AFTER,
+            );
+        }
+        let budget = ResponseBudget {
+            max_chars: 6_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, FILE_ENTITIES_TOOL, &budget).expect("budgeted");
+        assert!(
+            payload["entities"].as_array().expect("entities").len() < 40,
+            "the ceiling has to bite for this to test anything"
+        );
+        assert_eq!(
+            payload[DEPRECATIONS_KEY],
+            json!([{
+                "tool": "impact_analysis",
+                "parameter": "files",
+                "replacement": "entity_ids",
+                "removed_after": DEPRECATION_REMOVED_AFTER,
+            }])
+        );
     }
 
     fn cosine_locate_payload(hits: usize) -> Value {

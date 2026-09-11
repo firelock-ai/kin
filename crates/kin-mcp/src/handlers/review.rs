@@ -31,7 +31,41 @@ pub fn handle_semantic_diff<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let diff = resolve_diff(args, store)?;
     let formatted = kin_review::format_diff(&diff);
-    Ok(ToolCallResult::text(formatted))
+    text_answer(formatted, args, "semantic_diff")
+}
+
+/// Whether the call named `files`, the file-path targeting these tools keep
+/// answering for one more release.
+fn names_files(args: &HashMap<String, serde_json::Value>) -> bool {
+    get_optional_string_array(args, "files").is_some_and(|files| !files.is_empty())
+}
+
+fn record_files_deprecation(payload: &mut serde_json::Value, tool: &str) {
+    crate::budget::record_deprecation(
+        payload,
+        tool,
+        "files",
+        "entity_ids",
+        crate::budget::DEPRECATION_REMOVED_AFTER,
+    );
+}
+
+/// A text answer, or, when the call named the deprecated `files` parameter, the
+/// object the envelope already wraps text in, `{ "message": <text> }`, with the
+/// deprecation beside the text. A text answer has no top level to carry a key,
+/// so this is the one shape in which a text caller sees the notice.
+fn text_answer(
+    text: String,
+    args: &HashMap<String, serde_json::Value>,
+    tool: &str,
+) -> Result<ToolCallResult> {
+    if !names_files(args) {
+        return Ok(ToolCallResult::text(text));
+    }
+    let mut result = serde_json::json!({ "message": text });
+    record_files_deprecation(&mut result, tool);
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
 }
 
 pub const IMPACT_ANALYSIS_DESC: &str = "\
@@ -161,6 +195,9 @@ pub async fn handle_impact_analysis<G: GraphStore>(
 
     let mut result = serde_json::to_value(&impact).map_err(McpError::Json)?;
     annotate_impact_presentation_lines(&mut result, &impact);
+    if names_files(args) {
+        record_files_deprecation(&mut result, "impact_analysis");
+    }
 
     if include_traffic {
         // Collect traffic for all changed entities.
@@ -315,27 +352,29 @@ pub fn handle_semantic_review<G: GraphStore>(
                 }
             }
         }
+        if names_files(args) {
+            record_files_deprecation(&mut result, "semantic_review");
+        }
         let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
         return Ok(ToolCallResult::text(json));
     }
 
-    if include_traffic {
+    let text = if include_traffic {
         // Collect traffic for all entities in the diff.
         let traffic_lines = collect_review_traffic_lines(&review, sessions);
-
         if traffic_lines.is_empty() {
-            Ok(ToolCallResult::text(formatted))
+            formatted
         } else {
-            let with_traffic = format!(
+            format!(
                 "{}\n\n--- Active Traffic ---\n{}",
                 formatted,
                 traffic_lines.join("\n")
-            );
-            Ok(ToolCallResult::text(with_traffic))
+            )
         }
     } else {
-        Ok(ToolCallResult::text(formatted))
-    }
+        formatted
+    };
+    text_answer(text, args, "semantic_review")
 }
 
 fn collect_review_traffic_lines(
@@ -1519,6 +1558,33 @@ mod tests {
             parse_review_create_scopes(&args).is_err(),
             "a misspelled scopes entry must refuse, not fall through to entity_ids"
         );
+    }
+
+    /// A text tool answers in text until the caller names the deprecated `files`,
+    /// and then in the object the envelope wraps text in, with the notice beside it.
+    #[test]
+    fn a_text_answer_carries_the_files_deprecation_only_when_files_was_named() {
+        fn text_of(result: &ToolCallResult) -> String {
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            text.clone()
+        }
+
+        let by_id = HashMap::from([("entity_ids".to_string(), serde_json::json!(["x"]))]);
+        let answer = text_answer("the diff".to_string(), &by_id, "semantic_diff").unwrap();
+        assert_eq!(
+            text_of(&answer),
+            "the diff",
+            "no deprecated parameter, plain text"
+        );
+
+        let by_file = HashMap::from([("files".to_string(), serde_json::json!(["src/a.rs"]))]);
+        let answer = text_answer("the diff".to_string(), &by_file, "semantic_diff").unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&text_of(&answer)).expect("a files call answers in JSON");
+        assert_eq!(value["message"], "the diff");
+        assert_eq!(value["deprecations"][0]["tool"], "semantic_diff");
+        assert_eq!(value["deprecations"][0]["parameter"], "files");
+        assert_eq!(value["deprecations"][0]["replacement"], "entity_ids");
     }
 
     #[test]
