@@ -353,6 +353,13 @@ pub(crate) mod tests {
                     Err(error) => panic!("{error}"),
                 }
             };
+            // A socket accepted from a non-blocking listener inherits O_NONBLOCK on
+            // macOS and BSD, where on Linux it does not, and a read timeout does not
+            // apply to a non-blocking socket. Without this the read below returns
+            // WouldBlock the moment a client has not written its request yet, and
+            // this thread panics: measured on this fixture at twelve failures in two
+            // hundred runs, every one of them on WouldBlock.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -366,6 +373,40 @@ pub(crate) mod tests {
             String::from_utf8(request).unwrap()
         });
         (url, thread)
+    }
+
+    /// A client whose request lands after the server's first read is still served.
+    ///
+    /// The fixture binds a non-blocking listener so its accept loop can give up
+    /// rather than hang. On macOS and BSD the socket `accept` returns inherits that
+    /// flag and on Linux it does not, and `set_read_timeout` does nothing to a
+    /// non-blocking socket, so the server's first `read_exact` answered WouldBlock
+    /// whenever the client had not written yet and the fixture thread panicked. That
+    /// is the macOS shard's own failure on kin#1742's landing, and it measured here
+    /// at twelve failures in two hundred runs before the fix, all twelve on
+    /// WouldBlock.
+    ///
+    /// The delay is the subject rather than a wait for a race to settle: it puts the
+    /// client's bytes strictly after the server's first read, which is the ordering
+    /// the kernel failed on. On Linux this passes either way, so the macOS shards are
+    /// what grade it.
+    #[test]
+    fn a_client_whose_request_lands_after_the_first_read_is_still_served() {
+        use std::io::{Read, Write};
+        let (url, server) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        );
+        let mut client = std::net::TcpStream::connect(url.trim_start_matches("http://")).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: fixture\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let request = server
+            .join()
+            .expect("the fixture server must survive a client that writes after it reads");
+        assert!(request.starts_with("GET / HTTP/1.1"), "{request}");
     }
 
     #[test]
