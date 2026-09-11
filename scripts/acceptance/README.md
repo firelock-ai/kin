@@ -469,7 +469,15 @@ drives an edit the planner refuses (an unterminated comment that hides a
 declaration) and requires the file untouched and the model told. `create_lands` and
 `refused_create_is_clean` do the same for `write_file`, the second one requiring the
 refused content to come back to the model rather than as a file the graph does not
-hold.
+hold. `edit_survives_a_daemon_restart` stops the fixture's daemon with
+`kin daemon stop` after the agent's session opens and before its first edit, which
+is what an unattended update did to the demo's real-model run. Sessions live in the
+daemon, so the next begin names a session that no longer exists. The check requires
+the edit to commit through Kin anyway: the harness has to open a new session, and
+the file, `get_entity_source`, the durability block and the edit's own provenance
+must agree. It is the one place where kin-mcp's refusal wording meets kin-agent's
+reading of it. The suite sets `KIN_REGISTRY_PATH` under its scratch home, because
+`KIN_HOME` does not move the supervisor.
 
 `eject_journal_repro.py` covers the eject archive round trip the rc0552n green
 stranger lost on 0.5.52 (FIR-2664). A finished `kin eject` left its journal in
