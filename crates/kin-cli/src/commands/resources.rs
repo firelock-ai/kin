@@ -435,6 +435,12 @@ pub struct ReconcileHealth {
     /// accepted, and only a restart clears it. Absent on every other daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_tree_wedge: Option<DeferredTreeWedge>,
+    /// The loop has widened the gap between its own complete-admission
+    /// attempts because a run of them failed. Absent on every daemon whose
+    /// admissions are landing, and on one whose few failures are still what the
+    /// per-path retry ladder is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_hold: Option<AdmissionHold>,
     /// The filesystem watcher told this daemon it lost events, and no complete
     /// admission has covered that loss yet. Absent on every other daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -502,6 +508,29 @@ pub struct DeferredTreeWedge {
     /// against the daemon log that carries the failing commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+}
+
+/// The reconcile loop is deliberately not attempting a complete admission yet.
+///
+/// Present only after a run of complete-admission failures long enough that the
+/// daemon has already stopped calling them retries. It is the difference
+/// between a loop that is attempting and failing and one that has widened the
+/// gap between attempts, and without it the two are indistinguishable from
+/// outside: both report the same failure streak and the same last error, while
+/// one is spending a core on a 24-second attempt every half minute and the
+/// other is not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionHold {
+    /// Seconds until the next complete admission is attempted. Zero means the
+    /// hold has elapsed and the next tick will try, which is an ordinary state
+    /// rather than a fault.
+    #[serde(default)]
+    pub next_attempt_in_seconds: u64,
+    /// The width of the current hold, which is how far the ladder has climbed.
+    /// A reader compares it with the ceiling to tell a loop still widening from
+    /// one that has settled.
+    #[serde(default)]
+    pub held_for_seconds: u64,
 }
 
 /// A watcher-reported loss of events that no complete admission has covered.
@@ -599,9 +628,23 @@ impl ReconcileHealth {
                 .last_admission_error
                 .as_deref()
                 .unwrap_or("no error recorded");
+            // Said in the same sentence as the streak rather than in one of its
+            // own, because the two are one fact: how many attempts failed, and
+            // what the loop now does about it. A reader who sees only the streak
+            // cannot tell a daemon spending a core on an attempt every half
+            // minute from one that has stood down between attempts, and those
+            // are the two states this whole reading exists to separate.
+            let holding = match &self.admission_hold {
+                Some(hold) => format!(
+                    "; the loop is holding its next attempt {}s (widened to {}s after this run of \
+                     failures), so it is not attempting right now",
+                    hold.next_attempt_in_seconds, hold.held_for_seconds
+                ),
+                None => String::new(),
+            };
             reasons.push(format!(
                 "complete exact-tree admission has failed {} consecutive times (attention at \
-                 {ADMISSION_FAILURE_STREAK_ATTENTION}); {since}; last error: {error}",
+                 {ADMISSION_FAILURE_STREAK_ATTENTION}); {since}; last error: {error}{holding}",
                 self.admission_failure_streak
             ));
         }
@@ -1194,6 +1237,63 @@ mod tests {
         assert!(
             ReconcileHealth::default().notices().is_empty(),
             "a working copy with nothing untracked says nothing"
+        );
+    }
+
+    /// A loop that has stood down between attempts says so, in the same
+    /// sentence as the streak that made it.
+    ///
+    /// The two shapes here are the whole point. Both report the same failure
+    /// streak, the same last error and the same age, and from outside they are
+    /// the same daemon: one is spending a core on a complete admission every
+    /// half minute and the other is not. The hold clause is the only thing that
+    /// separates them, so a build that dropped it would leave a reader unable to
+    /// tell a daemon that had backed off from one that had not.
+    #[test]
+    fn a_held_loop_says_so_and_a_hammering_one_does_not() {
+        let hammering = ReconcileHealth {
+            admission_failure_streak: 9,
+            admission_failures: 9,
+            last_admission_error: Some(
+                "live exact tree does not match workspace authority".to_string(),
+            ),
+            last_admission_success_age_seconds: Some(19_800),
+            ..Default::default()
+        };
+        let held = ReconcileHealth {
+            admission_hold: Some(AdmissionHold {
+                next_attempt_in_seconds: 240,
+                held_for_seconds: 300,
+            }),
+            ..hammering.clone()
+        };
+
+        let hammering_reasons = hammering.degraded_reasons();
+        let held_reasons = held.degraded_reasons();
+        assert!(hammering.degraded() && held.degraded(), "both are faults");
+        assert_eq!(
+            hammering_reasons.len(),
+            held_reasons.len(),
+            "the hold belongs inside the streak's reason, not beside it as a second fault: {:?} \
+             against {:?}",
+            hammering_reasons,
+            held_reasons
+        );
+        assert!(
+            !hammering_reasons[0].contains("holding its next attempt"),
+            "a loop that is attempting every tick must not claim to be holding: {}",
+            hammering_reasons[0]
+        );
+        assert!(
+            held_reasons[0].contains("holding its next attempt 240s")
+                && held_reasons[0].contains("widened to 300s"),
+            "a held loop must name both when it will try again and how far the ladder climbed: {}",
+            held_reasons[0]
+        );
+        assert!(
+            held_reasons[0].contains("live exact tree does not match workspace authority"),
+            "the hold must not displace the error that caused it: {}",
+            held_reasons[0]
         );
     }
 
