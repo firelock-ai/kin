@@ -277,7 +277,50 @@ jobs:
           # Every platform now builds the same default feature set. Windows was
           # the only leg that stripped it, and dropping that split is what puts
           # native vector search in the shipped Windows archive.
-          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon
+          #
+          # The Linux legs sample their own memory and disk into this step's own
+          # log while cargo runs, and the sampler stays here permanently. The
+          # linux-aarch64 leg of v0.7.14 died at this step on all three attempts
+          # of run 34579776198 with "The runner has received a shutdown signal"
+          # and exit code 143, roughly sixteen minutes in and always during
+          # kin-daemon's fat-LTO codegen, and the log carried no resource
+          # numbers at all. A post-mortem step cannot supply them: a runner
+          # being torn down runs no further step, so only output already
+          # streamed out of the step that is dying survives. The x86_64 leg
+          # samples too, as the control that says which numbers are normal for
+          # this build on a leg that finishes.
+          sampler=""
+          if [ "$(uname -s)" = Linux ]; then
+            echo "resources before the build"
+            nproc || true
+            free -m || true
+            swapon --show || true
+            df -h || true
+            (
+              set +e
+              set +o pipefail
+              while :; do
+                avail=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo)
+                swap=$(awk '/^SwapFree:/{printf "%d", $2/1024}' /proc/meminfo)
+                root=$(df -m / | awk 'NR==2{print $4}')
+                top=$(ps -eo rss=,comm= --sort=-rss | head -1 | awk '{printf "%s/%dMB", $2, $1/1024}')
+                echo "resource-sample $(date -u +%H:%M:%SZ) mem_avail_mb=$avail swap_free_mb=$swap root_free_mb=$root top_rss=$top"
+                sleep 15
+              done
+            ) &
+            sampler=$!
+          fi
+          rc=0
+          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?
+          if [ -n "$sampler" ]; then
+            kill "$sampler" 2>/dev/null || true
+          fi
+          if [ "$(uname -s)" = Linux ]; then
+            echo "resources after the build"
+            free -m || true
+            df -h || true
+          fi
+          exit "$rc"
         env:
           TARGET: ${{ matrix.target }}
 
