@@ -195,12 +195,20 @@ macro_rules! note {
 }
 
 /// Exit status for a conversion that produced a store whose semantic enrichment
-/// a killed daemon left unattested.
+/// a daemon's death left unattested.
 ///
 /// Distinct from success so a script can tell "converted" from "converted, and
 /// something died on the way", and distinct from 1 so it is never read as the
 /// conversion having failed. The store is real, publishable and answers
 /// questions; what nobody can attest is that its enrichment finished.
+///
+/// A death, not specifically a kill. The store's summary says which of the two
+/// its record supports, and on a host that publishes no memory accounting it
+/// says the weaker one, because an ending nothing waited on carries no exit
+/// status to attribute. Both leave the enrichment equally unattested, so both
+/// reach a script as this code; see
+/// [`EnrichmentCaveat`][crate::daemon_death::EnrichmentCaveat], which is the
+/// one reading this code and that summary are both derived from.
 pub const EXIT_ENRICHMENT_UNATTESTED: i32 = 7;
 
 /// Exit status for a verified init whose reopen-acceleration section did not
@@ -387,14 +395,24 @@ fn materialize_graph_section_after_init(
 /// So the degraded outcome gets its own code rather than an error. Exit 1 would
 /// say the conversion failed and invite a re-run, which at the repository size
 /// that causes this is a loop that cannot terminate.
+///
+/// Derived from the same reading the summary above is rendered from, rather
+/// than from the presence of a record. The two are the same set today and were
+/// still able to disagree about what they had said: the summary gained a second
+/// vocabulary for a death nothing observed, and everything that recognized a
+/// named death by matching the first vocabulary went stale without either
+/// surface changing its mind. One reading feeding both is what makes the
+/// agreement structural rather than a coincidence maintained by hand.
 fn exit_code_for(
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     graph_section_failed: bool,
 ) -> i32 {
-    match daemon_death {
-        Some(_) => EXIT_ENRICHMENT_UNATTESTED,
-        None if graph_section_failed => EXIT_GRAPH_SECTION_UNMATERIALIZED,
-        None => 0,
+    if crate::daemon_death::enrichment_caveat(daemon_death).names_a_death() {
+        EXIT_ENRICHMENT_UNATTESTED
+    } else if graph_section_failed {
+        EXIT_GRAPH_SECTION_UNMATERIALIZED
+    } else {
+        0
     }
 }
 
@@ -3271,6 +3289,14 @@ mod tests {
     /// that are each correct can still jointly guarantee nothing: this walks the
     /// same reading into both surfaces and requires them to match, so a future
     /// change that fixes one and forgets the other goes red here.
+    ///
+    /// Every death class is walked, and that is the second defect this test
+    /// records. It used to feed one memory kill, so when a second class arrived
+    /// with a second sentence it stayed green while `kin init` exited 7 over a
+    /// summary whose wording no longer matched what this asserted about. The
+    /// agreement is now read off the caveat rather than off a sentence, and the
+    /// sentence is required to carry that caveat's own clause, so the surface
+    /// and the number cannot drift apart in either direction.
     #[test]
     fn the_exit_code_and_the_summary_agree_about_a_killed_daemon() {
         let status = enrichment(SemanticEnrichmentPresence::Present, 1058);
@@ -3286,19 +3312,53 @@ mod tests {
             limit_bytes: Some(8 * 1024 * 1024 * 1024),
             last_rss_bytes: Some(7 * 1024 * 1024 * 1024),
         };
+        // The ending nothing waited on: no signal and no memory attribution,
+        // which is what every macOS host and every uncapped Linux one records,
+        // and what both acceptance suites drive this path into.
+        let unobserved = kin_daemon_spawn::DaemonKillRecord {
+            memory_kills: 0,
+            last_cause: kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 0 },
+            limit_bytes: None,
+            last_rss_bytes: None,
+            ..record
+        };
+        let signalled = kin_daemon_spawn::DaemonKillRecord {
+            last_cause: kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 9 },
+            ..unobserved
+        };
 
-        for reading in [None, Some(&record)] {
+        for reading in [None, Some(&record), Some(&unobserved), Some(&signalled)] {
             let summary =
                 render_semantic_enrichment(&status, reading, &CrossFileEnrichment::Produced);
-            let names_a_kill = summary.contains("a daemon serving this store was killed");
+            let caveat = crate::daemon_death::enrichment_caveat(reading);
+            assert!(
+                summary.contains(caveat.clause()),
+                "the summary does not carry the caveat it was rendered from: wanted {:?} in \
+                 ({summary})",
+                caveat.clause()
+            );
+            let names_a_death = caveat.names_a_death();
             let code = exit_code_for(reading, false);
             assert_eq!(
-                names_a_kill,
+                names_a_death,
                 code != 0,
                 "the summary and the exit code disagree about one run: summary said \
-                 {names_a_kill}, exit code was {code} ({summary})"
+                 {names_a_death}, exit code was {code} ({summary})"
+            );
+            assert_eq!(
+                names_a_death,
+                summary.contains(crate::daemon_death::DEATH_CLAUSE_STEM),
+                "a reader recognizes a death by naming a daemon of this store, and this run \
+                 reads {names_a_death} to the caveat and the other way to the reader ({summary})"
             );
         }
+
+        assert_eq!(
+            exit_code_for(Some(&unobserved), false),
+            EXIT_ENRICHMENT_UNATTESTED,
+            "a daemon that ended without retiring left the enrichment just as unattested as \
+             one the kernel killed, and the code a script reads says so"
+        );
 
         assert_eq!(
             exit_code_for(None, false),
