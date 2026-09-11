@@ -143,6 +143,8 @@ It writes Kin's MCP server entry into the clients it finds:
 | Gemini CLI | `~/.gemini/settings.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 | Google Antigravity | `~/.gemini/config/mcp_config.json` |
+| LM Studio | `~/.lmstudio/mcp.json` |
+| Grok CLI | `~/.grok/config.toml` |
 
 The merge is defensive. It refuses to write to a file that is not valid JSON, only touches
 the `command`, `args`, and `env` keys under its own entry, and records every write to a

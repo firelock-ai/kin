@@ -2610,6 +2610,17 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
             "Google Antigravity",
             home.join(".gemini").join("config").join("mcp_config.json"),
         ),
+        (
+            "lmstudio",
+            "LM Studio",
+            home.join(".lmstudio").join("mcp.json"),
+        ),
+        (
+            "grok",
+            "Grok CLI",
+            // Grok reads the TOML `[mcp_servers.<name>]` tables Codex reads.
+            home.join(".grok").join("config.toml"),
+        ),
     ];
     if let Some(repo_root) = current_health_repo() {
         paths.push((
@@ -2679,7 +2690,10 @@ fn mcp_argument_vector_matches(
         McpLauncherTopology::Native => &["mcp", "start"],
         McpLauncherTopology::CanonicalNpm => &["-y", CANONICAL_NPM_MCP_PACKAGE, "mcp", "start"],
     };
-    if matches!(client_id, "codex" | "antigravity" | "antigravity_workspace") {
+    if matches!(
+        client_id,
+        "codex" | "grok" | "antigravity" | "antigravity_workspace"
+    ) {
         args.len() == prefix.len() + 2
             && values_match_strings(&args[..prefix.len()], prefix)
             && args[prefix.len()].as_str() == Some("--repo")
@@ -5573,6 +5587,43 @@ mod tests {
     use super::*;
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    /// Grok's Kin entry names one repository, as Codex's does, and LM Studio's
+    /// follows the session's working directory, as Cursor's does. Both are
+    /// checked clients.
+    #[test]
+    fn grok_is_bound_to_one_repository_and_lm_studio_is_not() {
+        let bound = serde_json::json!({ "args": ["mcp", "start", "--repo", "/work/umbrella"] });
+        let unbound = serde_json::json!({ "args": ["mcp", "start"] });
+        assert!(mcp_argument_vector_matches(
+            &bound,
+            "grok",
+            McpLauncherTopology::Native
+        ));
+        assert!(!mcp_argument_vector_matches(
+            &unbound,
+            "grok",
+            McpLauncherTopology::Native
+        ));
+        assert!(mcp_argument_vector_matches(
+            &unbound,
+            "lmstudio",
+            McpLauncherTopology::Native
+        ));
+        assert!(!mcp_argument_vector_matches(
+            &bound,
+            "lmstudio",
+            McpLauncherTopology::Native
+        ));
+        let ids: Vec<&str> = mcp_client_config_paths()
+            .iter()
+            .map(|(id, _, _)| *id)
+            .collect();
+        assert!(
+            ids.contains(&"lmstudio") && ids.contains(&"grok"),
+            "both clients are health-checked: {ids:?}"
+        );
+    }
 
     /// No em dash reaches a reader through this file.
     ///

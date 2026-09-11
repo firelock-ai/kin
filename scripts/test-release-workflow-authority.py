@@ -13957,7 +13957,7 @@ def main() -> None:
         "CANONICAL_NPM_MCP_COMMAND",
         "CANONICAL_NPM_MCP_PACKAGE",
         "mcp_argument_vector_matches(entry, client_id, topology)",
-        '"codex" | "antigravity" | "antigravity_workspace"',
+        '"codex" | "grok" | "antigravity" | "antigravity_workspace"',
         "configured_mcp_launcher()",
     ):
         require(health, policy, "product-owned exact MCP entry health validation")
