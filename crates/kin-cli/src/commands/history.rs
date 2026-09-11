@@ -177,7 +177,13 @@ pub fn execute_history_request_with(
     lines.extend(choice);
 
     if revisions.is_empty() {
-        lines.push("  No history recorded".to_string());
+        lines.extend(ref_lookup::empty_history_lines(
+            graph,
+            &target,
+            &pointer,
+            &head.change_id,
+            request.reference.as_deref(),
+        )?);
     } else {
         // Same rule as blame, from the same function, so the two surfaces cannot
         // disagree about which revisions are this entity's own.

@@ -487,6 +487,121 @@ where
         .map_err(|error| projection_error(reference, head, error))
 }
 
+/// What an answer says when the entity it resolved has no revision on the line
+/// of history it read.
+///
+/// Never a bare "No history recorded". The answer names the entity it looked
+/// at, the ref, and which empty case this is, because each has a different next
+/// step. A function with sixteen callers answered "No history recorded for this
+/// entity." and nothing else, which reads like code that was never committed.
+pub(crate) fn empty_history_lines(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    pointer: &EntityPointer,
+    head: &SemanticChangeId,
+    reference: Option<&str>,
+) -> Result<Vec<String>> {
+    let kind = kin_review::StableEntityIdentity::from_entity(target).kind;
+    let line = reference.unwrap_or("HEAD");
+    let mut lines = vec![format!(
+        "  No history recorded for {kind} '{}'{} (entity {}) on the line of history reaching \
+         {line}.",
+        target.name,
+        pointer_suffix(pointer),
+        target.id
+    )];
+    if reference.is_some() {
+        // A `--ref` entity comes from the state replayed at that ref, and the
+        // replay mints a revision for every entity it adds, so an empty list
+        // there is a gap in that replay rather than one of the cases below.
+        lines.push(
+            "  The state replayed at that ref holds this entity without the revision that added \
+             it."
+            .to_string(),
+        );
+        return Ok(lines);
+    }
+    let case = if graph.latest_revision_id_for(&target.id).is_some() {
+        "  Changes in this store record this entity, but none is on the first-parent line \
+         reaching HEAD, so its history is on another line of history, such as a branch or the \
+         side of a merge."
+            .to_string()
+    } else if let Some(recorded) = committed_twin_on_line(graph, target, head)? {
+        format!(
+            "  Committed history on that line records {kind} '{}' in {} under entity {recorded}, \
+             a different id from the one the live graph holds, so the two share no history. This \
+             is a graph gap. `kin history {recorded} --ref HEAD` reads the committed one.",
+            target.name,
+            target
+                .file_origin
+                .as_ref()
+                .map(|file| file.0.as_str())
+                .unwrap_or("its file"),
+        )
+    } else {
+        "  No change in this store records this entity id. That is how an entity admitted from \
+         the working tree since the last commit looks, and `kin commit` records it."
+            .to_string()
+    };
+    lines.push(case);
+    Ok(lines)
+}
+
+/// The newest entity id that committed history on `head`'s first-parent line
+/// records under `target`'s file, kind and name, other than `target`'s own.
+///
+/// Walked newest first, so the answer is the version that line holds at
+/// `head`, and an id the walk has already seen removed is never reported as
+/// held. Only an answer that is already empty pays for the walk.
+fn committed_twin_on_line<G>(
+    graph: &G,
+    target: &Entity,
+    head: &SemanticChangeId,
+) -> Result<Option<EntityId>>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let Some(file) = target.file_origin.as_ref() else {
+        return Ok(None);
+    };
+    let mut removed = HashSet::new();
+    let mut walked = HashSet::new();
+    let mut current = Some(*head);
+    while let Some(change_id) = current {
+        if !walked.insert(change_id) {
+            break;
+        }
+        let Some(change) = graph
+            .get_change(&change_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+        else {
+            break;
+        };
+        for delta in change.entity_deltas.iter().rev() {
+            let (entity, gone) = match delta {
+                kin_model::EntityDelta::Added { new }
+                | kin_model::EntityDelta::Modified { new, .. } => (new, false),
+                kin_model::EntityDelta::Removed { old } => (old, true),
+            };
+            if entity.id == target.id
+                || entity.name != target.name
+                || entity.kind != target.kind
+                || entity.file_origin.as_ref() != Some(file)
+            {
+                continue;
+            }
+            if gone {
+                removed.insert(entity.id);
+            } else if !removed.contains(&entity.id) {
+                return Ok(Some(entity.id));
+            }
+        }
+        current = change.parents.first().copied();
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,5 +966,72 @@ mod tests {
             alone.contains("58.2 s") && alone.contains("for this answer alone"),
             "{alone}"
         );
+    }
+
+    /// An empty history says which empty case it is. An entity recorded only
+    /// off HEAD's first-parent line, one committed history holds under another
+    /// id, and one no change records at all each get their own answer, and none
+    /// of them is the bare line.
+    #[test]
+    fn an_empty_history_says_which_empty_case_it_is() {
+        use kin_model::EntityStore;
+        let graph = kin_db::InMemoryGraph::new();
+        let side = named_entity("side_helper");
+        let fresh = named_entity("fresh_helper");
+        let committed = named_entity("gapped");
+        let mut regapped = committed.clone();
+        regapped.id = EntityId::new();
+
+        let root = change_with_deltas(Vec::new(), Vec::new());
+        let on_side = change_with_deltas(
+            vec![root.id],
+            vec![kin_model::EntityDelta::Added { new: side.clone() }],
+        );
+        let head = change_with_deltas(
+            vec![root.id],
+            vec![kin_model::EntityDelta::Added {
+                new: committed.clone(),
+            }],
+        );
+        for entry in [&root, &on_side, &head] {
+            graph.create_change(entry).unwrap();
+        }
+        for entity in [&side, &fresh, &regapped] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let answer = |entity: &Entity| {
+            let pointer = crate::entity_identity::entity_pointer(&graph, entity);
+            empty_history_lines(&graph, entity, &pointer, &head.id, None)
+                .unwrap()
+                .join("\n")
+        };
+
+        let elsewhere = answer(&side);
+        assert!(
+            elsewhere.contains(&side.id.to_string()) && elsewhere.contains("reaching HEAD"),
+            "the answer names the entity and the ref it read: {elsewhere}"
+        );
+        assert!(
+            elsewhere.contains("none is on the first-parent line"),
+            "an entity recorded only off HEAD's line must say so: {elsewhere}"
+        );
+
+        let gap = answer(&regapped);
+        assert!(
+            gap.contains(&format!("kin history {} --ref HEAD", committed.id)),
+            "a graph gap names the id committed history holds: {gap}"
+        );
+
+        let unrecorded = answer(&fresh);
+        assert!(
+            unrecorded.contains("No change in this store records this entity id"),
+            "an entity no change records must say so: {unrecorded}"
+        );
+        for text in [&elsewhere, &gap, &unrecorded] {
+            assert!(
+                !text.contains("No history recorded for this entity."),
+                "never the bare line: {text}"
+            );
+        }
     }
 }

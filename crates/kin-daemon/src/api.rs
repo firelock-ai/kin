@@ -49174,12 +49174,26 @@ mod tests {
     /// status and the body, which carries the rendered lines on success and the
     /// refusal otherwise.
     async fn entity_read(app: &axum::Router, endpoint: &str, entity: &str) -> (StatusCode, String) {
+        entity_read_at(app, endpoint, entity, None).await
+    }
+
+    /// [`entity_read`] with an explicit ref.
+    async fn entity_read_at(
+        app: &axum::Router,
+        endpoint: &str,
+        entity: &str,
+        reference: Option<&str>,
+    ) -> (StatusCode, String) {
+        let request = match reference {
+            Some(reference) => json!({ "entity": entity, "reference": reference }),
+            None => json!({ "entity": entity }),
+        };
         let response = app
             .clone()
             .oneshot(
                 Request::post(endpoint)
                     .header("content-type", "application/json")
-                    .body(Body::from(json!({ "entity": entity }).to_string()))
+                    .body(Body::from(request.to_string()))
                     .unwrap(),
             )
             .await
@@ -49326,6 +49340,90 @@ mod tests {
             body.contains("src/a.py") && body.contains("src/b.py"),
             "a pin that excludes both twins names both: {body}"
         );
+    }
+
+    /// An entity no change records answers with what it is, at which ref and
+    /// why it has no history, never with the bare line.
+    #[tokio::test]
+    async fn blame_names_an_entity_no_commit_records_and_says_why() {
+        let state =
+            test_state_with_committed_sources(&[("src/lib.py", "def retained():\n    return 1\n")]);
+        let fresh = test_entity("fresh_helper", "src/new.py");
+        state.graph.upsert_entity(&fresh).unwrap();
+        let app = router(Arc::clone(&state));
+
+        let (status, body) = entity_read(&app, "/blame", "fresh_helper").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let lines = answer_lines(&body);
+        let answer = lines.join("\n");
+        assert!(
+            answer.contains(&fresh.id.to_string()) && answer.contains("reaching HEAD"),
+            "the answer names the entity and the ref it read: {answer}"
+        );
+        assert!(
+            answer.contains("No change in this store records this entity id"),
+            "{answer}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.trim() == "No history recorded for this entity."),
+            "never the bare line: {answer}"
+        );
+    }
+
+    /// The graph gap: the live graph holds an entity under an id committed
+    /// history does not record, while that history records the same file, kind
+    /// and name under another. The answer names the committed id, and the
+    /// command it suggests reads that id's history.
+    #[tokio::test]
+    async fn history_names_the_committed_id_behind_a_graph_gap() {
+        let state =
+            test_state_with_committed_sources(&[("src/lib.py", "def retained():\n    return 1\n")]);
+        let committed = state
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("retained".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "retained")
+            .expect("the fixture commits retained");
+        let mut regapped = committed.clone();
+        regapped.id = EntityId::new();
+        state.graph.remove_entity(&committed.id).unwrap();
+        state.graph.upsert_entity(&regapped).unwrap();
+        let app = router(Arc::clone(&state));
+
+        let (status, body) = entity_read(&app, "/history", "retained").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let answer = answer_lines(&body).join("\n");
+        assert!(answer.contains(&regapped.id.to_string()), "{answer}");
+        let suggested = format!("kin history {} --ref HEAD", committed.id);
+        assert!(
+            answer.contains(&suggested),
+            "the answer names the committed id and how to read it: {answer}"
+        );
+
+        // The suggested command answers from the state replayed at HEAD.
+        let (status, body) =
+            entity_read_at(&app, "/history", &committed.id.to_string(), Some("HEAD")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = answer_lines(&body)
+            .iter()
+            .filter(|line| {
+                line.starts_with("  ")
+                    && line
+                        .chars()
+                        .skip(2)
+                        .take(12)
+                        .filter(char::is_ascii_hexdigit)
+                        .count()
+                        == 12
+            })
+            .count();
+        assert_eq!(rows, 1, "the committed id carries its one revision: {body}");
     }
 
     #[tokio::test]
