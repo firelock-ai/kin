@@ -3103,6 +3103,16 @@ pub struct DaemonState {
     /// but before the derived graph and terminal transaction state install.
     #[cfg(test)]
     pub(crate) mcp_fail_after_authority_once: AtomicBool,
+    /// Exact MCP commits in flight, keyed by transaction id, so a re-sent commit joins
+    /// the one already running instead of running the whole commit a second time.
+    pub(crate) inflight_mcp_commits: crate::mcp_commit::InflightMcpCommits,
+    /// How many exact MCP commits started, for the tests that prove a re-sent commit
+    /// does not start a second one.
+    #[cfg(test)]
+    pub(crate) mcp_commit_attempts: std::sync::atomic::AtomicUsize,
+    /// Holds the next exact MCP commit at its first step until the test releases it.
+    #[cfg(test)]
+    pub(crate) mcp_commit_hold: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Deterministic crash seam after a branch repository CAS but before the
     /// daemon installs its derived graph/generation cursor.
     #[cfg(test)]
@@ -5564,6 +5574,11 @@ impl DaemonState {
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
             mcp_fail_after_authority_once: AtomicBool::new(false),
+            inflight_mcp_commits: Default::default(),
+            #[cfg(test)]
+            mcp_commit_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            mcp_commit_hold: std::sync::Mutex::new(None),
             #[cfg(test)]
             repository_command_fail_after_authority_once: AtomicBool::new(false),
             #[cfg(test)]
@@ -5948,6 +5963,11 @@ impl DaemonState {
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
             mcp_fail_after_authority_once: AtomicBool::new(false),
+            inflight_mcp_commits: Default::default(),
+            #[cfg(test)]
+            mcp_commit_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            mcp_commit_hold: std::sync::Mutex::new(None),
             #[cfg(test)]
             repository_command_fail_after_authority_once: AtomicBool::new(false),
             #[cfg(test)]

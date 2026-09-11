@@ -14590,6 +14590,63 @@ async fn mcp_tools_call_inner(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<McpToolCallRequest>,
 ) -> Result<Json<kin_mcp::ToolCallResult>, (StatusCode, String)> {
+    let Some((transaction_id, fingerprint)) = mcp_commit_identity(&headers, &request) else {
+        return mcp_tools_call_dispatch(headers, State(state), Json(request)).await;
+    };
+    let outcome =
+        match crate::mcp_commit::InflightMcpCommits::claim(&state, &transaction_id, fingerprint) {
+            crate::mcp_commit::McpCommitRole::Alone => {
+                return mcp_tools_call_dispatch(headers, State(state), Json(request)).await;
+            }
+            crate::mcp_commit::McpCommitRole::Join(outcome) => outcome,
+            crate::mcp_commit::McpCommitRole::Lead(lease) => {
+                let outcome = lease.subscribe();
+                // On its own task, so the commit runs to its end even when the request
+                // that started it stops listening. The lease drops after the publish and
+                // takes the in-flight entry with it.
+                tokio::spawn(async move {
+                    let published = mcp_tools_call_dispatch(headers, State(state), Json(request))
+                        .await
+                        .map(|Json(result)| result);
+                    lease.publish(published);
+                });
+                outcome
+            }
+        };
+    crate::mcp_commit::await_mcp_commit_outcome(outcome, &transaction_id)
+        .await
+        .map(Json)
+}
+
+/// The transaction a commit request names, and what makes two requests the same request:
+/// every argument in a stable order, and the caller the `X-Kin-Session` header names.
+fn mcp_commit_identity(
+    headers: &axum::http::HeaderMap,
+    request: &McpToolCallRequest,
+) -> Option<(String, String)> {
+    if request.name != "kin_transaction_commit" {
+        return None;
+    }
+    let transaction_id = request
+        .arguments
+        .get("transaction_id")?
+        .as_str()?
+        .to_string();
+    let arguments: std::collections::BTreeMap<&String, &serde_json::Value> =
+        request.arguments.iter().collect();
+    let caller = headers
+        .get("X-Kin-Session")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let fingerprint = serde_json::to_string(&(caller, arguments)).ok()?;
+    Some((transaction_id, fingerprint))
+}
+
+async fn mcp_tools_call_dispatch(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<McpToolCallRequest>,
+) -> Result<Json<kin_mcp::ToolCallResult>, (StatusCode, String)> {
     // The same budget the wrapper will enforce, so an arm that bounds its own
     // walk bounds it to the number this call is actually served under.
     let response_budget =
@@ -44195,6 +44252,114 @@ mod tests {
             !block.note.contains("everything"),
             "no sentence over one axis may claim the whole graph: {}",
             block.note
+        );
+    }
+
+    /// Poll `ready` until it holds, failing the test with `what` after twenty seconds.
+    async fn wait_until(ready: impl Fn() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A commit sent again while it is still running joins it instead of running twice.
+    ///
+    /// `kin mcp start` re-sends a tool call once when its first 60 s run out, and a commit
+    /// on a large store runs longer than that. In run 3 of the local-model demo the daemon
+    /// then ran one commit twice back to back, about 135 s each, to the same answer. Here
+    /// the first commit is held at its first step, the identical request is sent again, and
+    /// only once that request has joined is the first released. Without the join the second
+    /// request queues on the coordination gate, never joins, and the wait fails loudly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_re_sent_while_it_runs_joins_it_instead_of_running_again() {
+        let state = test_state();
+        crate::mcp_commit::tests::install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 {\n    1\n}\n",
+            "value",
+        );
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({ "session_id": session_id, "scope": "src/lib.rs" }),
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "session_id": session_id,
+                "operations": [{
+                    "verb": "replace",
+                    "target": "src/lib.rs",
+                    "body": "pub fn value() -> u8 {\n    2\n}\n",
+                    "description": "change what value returns"
+                }]
+            }),
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true), "{}", mcp_result_text(&stage));
+
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        *state.mcp_commit_hold.lock().unwrap() = Some(hold);
+        let commit = serde_json::json!({ "transaction_id": tx_id });
+        let first = tokio::spawn(mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            commit.clone(),
+        ));
+        wait_until(
+            || {
+                state
+                    .mcp_commit_attempts
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 1
+            },
+            "the first commit never started",
+        )
+        .await;
+        let second = tokio::spawn(mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            commit,
+        ));
+        wait_until(
+            || {
+                state
+                    .inflight_mcp_commits
+                    .joined
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 1
+            },
+            "the re-sent commit never joined the one in flight",
+        )
+        .await;
+        release.send(()).unwrap();
+
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_ne!(first.is_error, Some(true), "{}", mcp_result_text(&first));
+        assert_eq!(
+            mcp_result_text(&first),
+            mcp_result_text(&second),
+            "both requests must get the one commit's answer"
+        );
+        assert_eq!(
+            state
+                .mcp_commit_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the commit must run once"
         );
     }
 
