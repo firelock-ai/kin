@@ -21109,20 +21109,637 @@ mod tests {
         );
 
         // A mutation in a collection no frame patches is refused too, because
-        // the proof compares the whole snapshot, not the patched fields.
-        let mut annotated = next.clone();
-        annotated
-            .work_links
-            .push(kin_model::WorkLink::DecomposesTo {
-                parent: kin_model::WorkId::new(),
-                child: kin_model::WorkId::new(),
-            });
-        let error = crate::storage::AuthorityFrame::encode(&current, &annotated)
+        // the proof compares the whole snapshot, not the patched fields. Frames
+        // carry collaboration now, so this moves a collection they still do
+        // not: downstream warnings, which no transaction writes.
+        let mut warned = next.clone();
+        warned.downstream_warnings.push((
+            kin_model::IntentId::new(),
+            kin_model::EntityId::new(),
+            "not a frame's to carry".to_string(),
+        ));
+        let error = crate::storage::AuthorityFrame::encode(&current, &warned)
             .expect_err("a successor that moved an unpatched collection is not a frame");
         assert!(
             error
                 .to_string()
-                .contains("does not reproduce the successor: work links differ"),
+                .contains("does not reproduce the successor: downstream warnings differ"),
+            "{error}"
+        );
+    }
+
+    /// A fixed instant, `seconds` after one fixed base, so records built
+    /// from it are the same bytes on every run.
+    fn collaboration_time(seconds: i64) -> Timestamp {
+        Timestamp(chrono::DateTime::from_timestamp(1_789_000_000 + seconds, 0).unwrap())
+    }
+
+    fn collaboration_review(
+        review_id: kin_model::ReviewId,
+        state: kin_model::ReviewDecisionState,
+        updated: i64,
+    ) -> kin_model::Review {
+        kin_model::Review {
+            review_id,
+            title: "collaboration frame".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "topic".to_string(),
+            state,
+            completion: kin_model::ReviewCompletionState::InReview,
+            created_by: kin_model::IdentityRef::human("framecollab"),
+            created_at: collaboration_time(0),
+            updated_at: collaboration_time(updated),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// One record in every collaboration collection, fixed in every byte for
+    /// a given seed, as one transaction's collaboration delta.
+    ///
+    /// A struct literal with no rest pattern, so a collection the model gains
+    /// does not compile here until it has a record, and the frame tests below
+    /// then carry it. Ids fold the seed in, so two seeds never share a record.
+    fn every_collaboration_collection(seed: u8) -> kin_model::CollaborationDelta {
+        let uuid = |n: u128| Uuid::from_u128((0xfc << 120) | (u128::from(seed) << 64) | n);
+        let hash = |n: u8| {
+            let mut bytes = [0xfc; 32];
+            bytes[0] = seed;
+            bytes[1] = n;
+            Hash256::from_bytes(bytes)
+        };
+        let at = collaboration_time(0);
+        let who = kin_model::IdentityRef::human("framecollab");
+        let scope = kin_model::WorkScope::Entity(kin_model::EntityId(uuid(0x5c0)));
+        let work_id = kin_model::WorkId(uuid(1));
+        let annotation_id = kin_model::AnnotationId(uuid(2));
+        let review_id = kin_model::ReviewId(uuid(4));
+        let test_id = kin_model::TestId(hash(9));
+        let assertion_id = kin_model::AssertionId(hash(10));
+        let run_id = kin_model::VerificationRunId(hash(11));
+        let contract_id = kin_model::ContractId(uuid(13));
+        let actor_id = kin_model::ActorId(hash(14));
+        kin_model::CollaborationDelta {
+            work_items: vec![kin_model::Keyed::new(
+                work_id,
+                kin_model::WorkItem {
+                    work_id,
+                    kind: kin_model::WorkKind::Task,
+                    title: format!("work {seed}"),
+                    description: "description".to_string(),
+                    status: kin_model::WorkStatus::Proposed,
+                    priority: kin_model::Priority::Medium,
+                    scopes: vec![scope.clone()],
+                    acceptance_criteria: Vec::new(),
+                    external_refs: Vec::new(),
+                    created_by: who.clone(),
+                    created_at: at.clone(),
+                },
+            )],
+            annotations: vec![kin_model::Keyed::new(
+                annotation_id,
+                kin_model::Annotation {
+                    annotation_id,
+                    kind: kin_model::AnnotationKind::Comment,
+                    body: format!("annotation {seed}"),
+                    scopes: vec![scope.clone()],
+                    anchored_fingerprint: None,
+                    authored_by: who.clone(),
+                    created_at: at.clone(),
+                    staleness: kin_model::StalenessState::Fresh,
+                },
+            )],
+            work_links: vec![kin_model::WorkLink::Affects {
+                work_id,
+                scope: scope.clone(),
+            }],
+            reviews: vec![kin_model::Keyed::new(
+                review_id,
+                collaboration_review(review_id, kin_model::ReviewDecisionState::Pending, 0),
+            )],
+            review_decisions: vec![kin_model::Keyed::new(
+                review_id,
+                vec![kin_model::ReviewDecision {
+                    reviewer: who.clone(),
+                    state: kin_model::ReviewDecisionState::Pending,
+                    comment: None,
+                    decided_at: at.clone(),
+                }],
+            )],
+            review_notes: vec![kin_model::ReviewNote {
+                note_id: kin_model::ReviewNoteId(uuid(6)),
+                review_id,
+                body: format!("note {seed}"),
+                scope: Some(scope.clone()),
+                authored_by: who.clone(),
+                created_at: at.clone(),
+            }],
+            review_discussions: vec![kin_model::ReviewDiscussion {
+                discussion_id: kin_model::ReviewDiscussionId(uuid(7)),
+                review_id,
+                scope: None,
+                state: kin_model::ReviewDiscussionState::Open,
+                comments: Vec::new(),
+                created_at: at.clone(),
+            }],
+            review_assignments: vec![kin_model::Keyed::new(
+                review_id,
+                vec![kin_model::ReviewAssignment {
+                    review_id,
+                    reviewer: who.clone(),
+                    assigned_at: at.clone(),
+                    assigned_by: who.clone(),
+                }],
+            )],
+            test_cases: vec![kin_model::Keyed::new(
+                test_id,
+                kin_model::TestCase {
+                    test_id,
+                    name: format!("case {seed}"),
+                    language: "rust".to_string(),
+                    kind: kin_model::TestKind::Unit,
+                    scopes: vec![scope.clone()],
+                    runner: kin_model::TestRunner::Cargo,
+                    file_origin: None,
+                },
+            )],
+            assertions: vec![kin_model::Keyed::new(
+                assertion_id,
+                kin_model::Assertion {
+                    assertion_id,
+                    summary: format!("assertion {seed}"),
+                    expected_behavior: "behaviour".to_string(),
+                    target_scope: scope.clone(),
+                },
+            )],
+            verification_runs: vec![kin_model::Keyed::new(
+                run_id,
+                kin_model::VerificationRun {
+                    run_id,
+                    test_ids: vec![test_id],
+                    status: kin_model::VerificationStatus::Passing,
+                    runner: kin_model::TestRunner::Cargo,
+                    started_at: at.clone(),
+                    finished_at: None,
+                    duration_ms: None,
+                    evidence_blob: None,
+                    exit_code: None,
+                },
+            )],
+            mock_hints: vec![kin_model::MockHint {
+                hint_id: kin_model::MockHintId(hash(12)),
+                test_id,
+                dependency_scope: scope.clone(),
+                strategy: kin_model::MockStrategy::Stub,
+            }],
+            contracts: vec![kin_model::Keyed::new(
+                contract_id,
+                kin_model::Contract {
+                    id: kin_model::EntityId(uuid(13)),
+                    kind: kin_model::ContractKind::OpenApi,
+                    name: format!("contract {seed}"),
+                    schema_hash: hash(13),
+                    producers: Vec::new(),
+                    consumers: Vec::new(),
+                    version: None,
+                },
+            )],
+            actors: vec![kin_model::Keyed::new(
+                actor_id,
+                kin_model::Actor {
+                    actor_id,
+                    kind: kin_model::ActorKind::Human,
+                    display_name: format!("actor {seed}"),
+                    external_refs: Vec::new(),
+                },
+            )],
+            delegations: vec![kin_model::Delegation {
+                delegation_id: kin_model::DelegationId(hash(15)),
+                principal: actor_id,
+                delegate: kin_model::ActorId(hash(0x8e)),
+                scope: vec![scope.clone()],
+                started_at: at.clone(),
+                ended_at: None,
+            }],
+            approvals: vec![kin_model::Approval {
+                approval_id: kin_model::ApprovalId(hash(16)),
+                change_id: kin_model::SemanticChangeId::from_hash(hash(0x81)),
+                approver: actor_id,
+                decision: kin_model::ApprovalDecision::Approved,
+                reason: format!("approval {seed}"),
+                timestamp: at.clone(),
+            }],
+            audit_events: vec![kin_model::AuditEvent {
+                event_id: kin_model::AuditEventId(hash(17)),
+                actor_id,
+                action: "review.create".to_string(),
+                target_scope: None,
+                timestamp: at,
+                details: None,
+            }],
+        }
+    }
+
+    /// A second event on the review [`every_collaboration_collection`] made:
+    /// a decision moves its state, its decision history and assignment set
+    /// grow, an actor is renamed, and a note and an audit event are added.
+    /// Keyed values replaced and unkeyed records appended, the two moves a
+    /// frame has to carry.
+    fn a_decision_on_that_review(seed: u8) -> kin_model::CollaborationDelta {
+        let first = every_collaboration_collection(seed);
+        let review_id = first.reviews[0].key;
+        let second = kin_model::IdentityRef::human("second-reviewer");
+        let mut decisions = first.review_decisions[0].value.clone();
+        decisions.push(kin_model::ReviewDecision {
+            reviewer: second.clone(),
+            state: kin_model::ReviewDecisionState::Approved,
+            comment: Some("ship it".to_string()),
+            decided_at: collaboration_time(60),
+        });
+        let mut assignments = first.review_assignments[0].value.clone();
+        assignments.push(kin_model::ReviewAssignment {
+            review_id,
+            reviewer: second,
+            assigned_at: collaboration_time(30),
+            assigned_by: kin_model::IdentityRef::human("framecollab"),
+        });
+        let mut actor = first.actors[0].clone();
+        actor.value.display_name = format!("renamed actor {seed}");
+        let mut note = first.review_notes[0].clone();
+        note.note_id = kin_model::ReviewNoteId(Uuid::from_u128(
+            (0xfd << 120) | (u128::from(seed) << 64) | 6,
+        ));
+        note.body = "second note".to_string();
+        let mut event = first.audit_events[0].clone();
+        let mut event_bytes = [0xfd; 32];
+        event_bytes[0] = seed;
+        event.event_id = kin_model::AuditEventId(Hash256::from_bytes(event_bytes));
+        event.action = "review.decide".to_string();
+        kin_model::CollaborationDelta {
+            reviews: vec![kin_model::Keyed::new(
+                review_id,
+                collaboration_review(review_id, kin_model::ReviewDecisionState::Approved, 60),
+            )],
+            review_decisions: vec![kin_model::Keyed::new(review_id, decisions)],
+            review_notes: vec![note],
+            review_assignments: vec![kin_model::Keyed::new(review_id, assignments)],
+            actors: vec![actor],
+            audit_events: vec![event],
+            ..kin_model::CollaborationDelta::default()
+        }
+    }
+
+    /// Reopen the store and require the head it rebuilds from its snapshot
+    /// and frames to be the live head in every collection.
+    fn assert_collaboration_reopens(
+        directory: &TempDir,
+        manager: &RepositoryAuthorityManager<LocalFileBackend>,
+        context: &str,
+    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+        let reopened = reopen(directory);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            context,
+        );
+        assert_eq!(
+            crate::storage::authority_frame::first_difference(
+                reopened.read_authority().snapshot(),
+                manager.read_authority().snapshot(),
+            )
+            .unwrap(),
+            None,
+            "{context}: the reopened head differs from the live head"
+        );
+        reopened
+    }
+
+    /// A transaction whose only mutation is collaboration persists as a
+    /// frame, not as a full snapshot, and a fresh open rebuilds every
+    /// collection from that frame.
+    ///
+    /// This is the defect the collaboration patch closes. On 0.7.112 the
+    /// drain carried no collaboration, the proof found "reviews differ", and
+    /// every review write persisted the whole snapshot: 2,374,240,379 bytes
+    /// in 23.9 s for one review create on a 1130-commit store. Falsify by
+    /// draining an empty patch: the first commit then lands as a full
+    /// snapshot and no frame is acknowledged.
+    #[test]
+    fn a_collaboration_only_transaction_persists_as_a_frame_and_reopens_exactly() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+
+        let mut create = transaction_shell(&manager, 0xfc_2026_0001);
+        create.collaboration_delta = Some(every_collaboration_collection(1));
+        manager.commit_repository_transaction(create).unwrap();
+        assert_eq!(
+            record_version(&directory),
+            4,
+            "a collaboration publication is a frame journal record, not a full snapshot"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+        let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
+        assert_eq!(
+            bytes[4..8],
+            crate::storage::AuthorityFrame::CURRENT_VERSION.to_le_bytes(),
+            "a frame that carries collaboration is written at version 3"
+        );
+        let frame = crate::storage::AuthorityFrame::from_bytes(&bytes).unwrap();
+        for name in kin_model::COLLABORATION_COLLECTIONS {
+            assert_eq!(
+                frame.collaboration.len_of(name),
+                1,
+                "{name}: the frame carries the one record the transaction admitted"
+            );
+        }
+        // One legal encoding: the same bytes under a version 2 header refuse.
+        let mut relabeled = bytes.clone();
+        relabeled[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let error = crate::storage::AuthorityFrame::from_bytes(&relabeled)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("declares version 2 but its contents are written at version 3"),
+            "{error}"
+        );
+        assert_collaboration_reopens(&directory, &manager, "create");
+
+        let mut decide = transaction_shell(&manager, 0xfc_2026_0002);
+        decide.collaboration_delta = Some(a_decision_on_that_review(1));
+        manager.commit_repository_transaction(decide).unwrap();
+        assert_eq!(
+            acknowledged_frame_count(&directory),
+            2,
+            "the second event is a second frame"
+        );
+        let frame = crate::storage::AuthorityFrame::from_bytes(
+            &std::fs::read(frame_path(&directory, 3)).unwrap(),
+        )
+        .unwrap();
+        let carried: Vec<(&str, usize)> = kin_model::COLLABORATION_COLLECTIONS
+            .iter()
+            .map(|name| (*name, frame.collaboration.len_of(name)))
+            .filter(|(_, len)| *len > 0)
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                ("reviews", 1),
+                ("review_decisions", 1),
+                ("review_notes", 1),
+                ("review_assignments", 1),
+                ("actors", 1),
+                ("audit_events", 1),
+            ],
+            "the frame carries what the event moved and nothing it did not"
+        );
+        let reopened = assert_collaboration_reopens(&directory, &manager, "decide");
+        let lease = reopened.read_authority();
+        let snapshot = lease.snapshot();
+        let review_id = every_collaboration_collection(1).reviews[0].key;
+        assert_eq!(
+            snapshot.reviews[&review_id].state,
+            kin_model::ReviewDecisionState::Approved
+        );
+        assert_eq!(snapshot.review_decisions[&review_id].len(), 2);
+        assert_eq!(snapshot.review_assignments[&review_id].len(), 2);
+        assert_eq!(snapshot.review_notes.len(), 2);
+        assert_eq!(snapshot.audit_events.len(), 2);
+    }
+
+    /// Dropping any one collaboration collection from the drained frame is
+    /// caught by the writer's proof, by name, and the publication falls back
+    /// to a full snapshot instead of persisting a frame that loses records.
+    ///
+    /// Driven by the collaboration model's own list, so a collection the
+    /// model gains is an arm here without anyone writing one, and `len_of`
+    /// panics on a name the patch does not have.
+    #[test]
+    fn dropping_any_collaboration_collection_from_a_frame_fails_the_proof() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        for (index, name) in kin_model::COLLABORATION_COLLECTIONS.iter().enumerate() {
+            let seed = u8::try_from(index + 1).unwrap();
+            let current = manager.read_authority().snapshot().clone();
+            let collection = name.to_string();
+            crate::storage::authority_frame::tamper_with_next_drained_frame(move |frame| {
+                assert_eq!(
+                    frame.collaboration.len_of(&collection),
+                    1,
+                    "{collection}: the honest frame carries the record"
+                );
+                frame.collaboration.clear(&collection);
+            });
+            let mut transaction = transaction_shell(&manager, 0xfc_2026_0100 + index as u128);
+            transaction.collaboration_delta = Some(every_collaboration_collection(seed));
+            manager
+                .commit_repository_transaction(transaction)
+                .expect("a refused frame costs a full snapshot, never the publication");
+            assert_eq!(
+                record_version(&directory),
+                3,
+                "{name}: the publication landed as a full snapshot"
+            );
+            assert_eq!(
+                acknowledged_frame_count(&directory),
+                0,
+                "{name}: no frame was persisted"
+            );
+            let next = manager.read_authority().snapshot().clone();
+
+            // The same drop, proven directly, names the collection it lost.
+            let mut dropped = crate::storage::AuthorityFrame::encode(&current, &next)
+                .expect("the honest frame proves");
+            dropped.collaboration.clear(name);
+            let error = dropped
+                .prove_from_own_bytes(&current, &next)
+                .expect_err("a frame that dropped a collection must not prove")
+                .to_string();
+            let label = name.replace('_', " ");
+            assert!(
+                error.contains(&format!("does not reproduce the successor: {label} differ")),
+                "{name}: {error}"
+            );
+        }
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopen(&directory).read_authority(),
+            "after every fallback",
+        );
+    }
+
+    /// A frame that carries no collaboration is the version 2 frame 0.7.112
+    /// writes for the same successor, byte for byte, and a version 2 frame
+    /// decodes here with an empty patch. The first keeps a store this binary
+    /// writes readable by 0.7.112 until its first collaboration frame; the
+    /// second keeps every store 0.7.112 wrote readable here.
+    #[test]
+    fn a_frame_without_collaboration_is_the_version_2_frame_byte_for_byte() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let current = manager.read_authority().snapshot().clone();
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xfc_2026_0201, 0x61))
+            .unwrap();
+        let next = manager.read_authority().snapshot().clone();
+        let persisted = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let frame = crate::storage::AuthorityFrame::from_bytes(&persisted).unwrap();
+        assert!(frame.collaboration.is_empty());
+        assert_eq!(
+            persisted[4..8],
+            2u32.to_le_bytes(),
+            "a frame without collaboration keeps version 2"
+        );
+        let legacy = crate::storage::authority_frame::LegacyFrameV2::from_frame(&frame).to_bytes();
+        assert_eq!(
+            persisted, legacy,
+            "the persisted frame is 0.7.112's layout byte for byte"
+        );
+
+        let decoded = crate::storage::AuthorityFrame::from_bytes(&legacy).unwrap();
+        assert_eq!(decoded, frame);
+        let mut applied = current.clone();
+        decoded.apply(&mut applied).unwrap();
+        assert_eq!(
+            crate::storage::authority_frame::first_difference(&applied, &next).unwrap(),
+            None
+        );
+
+        // One legal encoding: the same bytes under a version 3 header refuse.
+        let mut relabeled = persisted;
+        relabeled[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let error = crate::storage::AuthorityFrame::from_bytes(&relabeled)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("declares version 3 but its contents are written at version 2"),
+            "{error}"
+        );
+    }
+
+    fn rehashed<K: Copy + Eq + std::hash::Hash, V: Clone>(map: &HashMap<K, V>) -> HashMap<K, V> {
+        map.iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
+    }
+
+    /// One successor always encodes to one byte string, whatever order its
+    /// maps iterate in, which is what makes an exact retry of a frame append
+    /// idempotent at the backend. The second encoding reads a successor whose
+    /// keyed collections were rebuilt as fresh maps, so they iterate in
+    /// another order. Falsify by dropping the sort in `keyed_changes`.
+    #[test]
+    fn one_collaboration_successor_always_encodes_to_the_same_bytes() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let current = manager.read_authority().snapshot().clone();
+        let mut transaction = transaction_shell(&manager, 0xfc_2026_0301);
+        transaction.collaboration_delta = Some(every_collaboration_collection(1));
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        // Many entries in every keyed collection, so their order is a question.
+        let mut wide = manager.read_authority().snapshot().clone();
+        for seed in 2..=24u8 {
+            let delta = every_collaboration_collection(seed);
+            for entry in delta.work_items {
+                wide.work_items.insert(entry.key, entry.value);
+            }
+            for entry in delta.annotations {
+                wide.annotations.insert(entry.key, entry.value);
+            }
+            for entry in delta.reviews {
+                wide.reviews.insert(entry.key, entry.value);
+            }
+            for entry in delta.review_decisions {
+                wide.review_decisions.insert(entry.key, entry.value);
+            }
+            for entry in delta.review_assignments {
+                wide.review_assignments.insert(entry.key, entry.value);
+            }
+            for entry in delta.test_cases {
+                wide.test_cases.insert(entry.key, entry.value);
+            }
+            for entry in delta.assertions {
+                wide.assertions.insert(entry.key, entry.value);
+            }
+            for entry in delta.verification_runs {
+                wide.verification_runs.insert(entry.key, entry.value);
+            }
+            for entry in delta.contracts {
+                wide.contracts.insert(entry.key, entry.value);
+            }
+            for entry in delta.actors {
+                wide.actors.insert(entry.key, entry.value);
+            }
+        }
+        let mut reordered = wide.clone();
+        reordered.work_items = rehashed(&wide.work_items);
+        reordered.annotations = rehashed(&wide.annotations);
+        reordered.reviews = rehashed(&wide.reviews);
+        reordered.review_decisions = rehashed(&wide.review_decisions);
+        reordered.review_assignments = rehashed(&wide.review_assignments);
+        reordered.test_cases = rehashed(&wide.test_cases);
+        reordered.assertions = rehashed(&wide.assertions);
+        reordered.verification_runs = rehashed(&wide.verification_runs);
+        reordered.contracts = rehashed(&wide.contracts);
+        reordered.actors = rehashed(&wide.actors);
+        assert_ne!(
+            wide.reviews.keys().collect::<Vec<_>>(),
+            reordered.reviews.keys().collect::<Vec<_>>(),
+            "the control: a fresh map iterates in another order, or this proves nothing"
+        );
+
+        let first = crate::storage::AuthorityFrame::encode_proven(&current, &wide)
+            .expect("the wide successor proves")
+            .bytes()
+            .to_vec();
+        let second = crate::storage::AuthorityFrame::encode_proven(&current, &reordered)
+            .expect("the reordered successor proves")
+            .bytes()
+            .to_vec();
+        assert_eq!(first, second, "one successor, two byte strings");
+    }
+
+    /// A successor that removed a collaboration record, or rewrote one, is
+    /// not something a frame can carry, and the drain names the record class
+    /// rather than persisting a frame that loses it. Nothing produces such a
+    /// successor today; this is the net under a writer that someday does.
+    #[test]
+    fn the_drain_refuses_a_successor_that_removed_or_rewrote_a_collaboration_record() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let mut transaction = transaction_shell(&manager, 0xfc_2026_0401);
+        transaction.collaboration_delta = Some(every_collaboration_collection(1));
+        manager.commit_repository_transaction(transaction).unwrap();
+        let current = manager.read_authority().snapshot().clone();
+        let mut transaction = transaction_shell(&manager, 0xfc_2026_0402);
+        transaction.collaboration_delta = Some(a_decision_on_that_review(1));
+        manager.commit_repository_transaction(transaction).unwrap();
+        let next = manager.read_authority().snapshot().clone();
+        crate::storage::AuthorityFrame::encode(&current, &next)
+            .expect("the control: the honest successor encodes");
+
+        let review_id = every_collaboration_collection(1).reviews[0].key;
+        let mut removed = next.clone();
+        removed.reviews.remove(&review_id);
+        let error = crate::storage::AuthorityFrame::encode(&current, &removed)
+            .expect_err("a removed review is not a frame's to carry")
+            .to_string();
+        assert!(
+            error.contains("no longer holds review ReviewId(")
+                && error.contains("a frame only adds or replaces collaboration records"),
+            "{error}"
+        );
+
+        let mut rewritten = next;
+        rewritten.review_notes[0].body = "rewritten after the fact".to_string();
+        let error = crate::storage::AuthorityFrame::encode(&current, &rewritten)
+            .expect_err("a rewritten note is not a frame's to carry")
+            .to_string();
+        assert!(
+            error.contains(
+                "whose review note records are not the base's records followed by new ones"
+            ),
             "{error}"
         );
     }

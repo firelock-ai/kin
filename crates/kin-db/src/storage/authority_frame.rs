@@ -19,7 +19,10 @@
 //!
 //! The body is a MessagePack-serialized [`AuthorityFrame`]. The struct is
 //! encoded positionally, so its fields are only ever appended, and any change
-//! to what a field means bumps [`AuthorityFrame::CURRENT_VERSION`].
+//! to what a field means bumps [`AuthorityFrame::CURRENT_VERSION`]. The version
+//! in the header is derived from the contents
+//! ([`AuthorityFrame::wire_version`]): a frame that moves no collaboration
+//! record keeps the version 2 body byte for byte.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,9 +30,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
 use kin_model::{
-    ExternalChangeAlias, ExternalObjectRecord, FrozenLocalOverlay, GitExternalAuthority,
-    MergeTransactionRecord, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
-    RepositoryOperationRecord, RepositoryRefState, SemanticChange, WorkspaceState,
+    Actor, ActorId, Annotation, AnnotationId, Approval, Assertion, AssertionId, AuditEvent,
+    Contract, ContractId, Delegation, ExternalChangeAlias, ExternalObjectRecord,
+    FrozenLocalOverlay, GitExternalAuthority, MergeTransactionRecord, MockHint,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
+    RepositoryRefState, Review, ReviewAssignment, ReviewDecision, ReviewDiscussion, ReviewId,
+    ReviewNote, SemanticChange, TestCase, TestId, VerificationRun, VerificationRunId, WorkId,
+    WorkItem, WorkLink, WorkspaceState,
 };
 
 use crate::error::KinDbError;
@@ -81,6 +88,245 @@ impl GitExternalAuthorityPatch {
     }
 }
 
+/// The collaboration records one successor added or replaced, as the
+/// successor holds them.
+///
+/// A transaction moves collaboration only through its collaboration delta,
+/// and the commit path admits a delta in one way: a keyed entry replaces
+/// whatever is held under its key, and an unkeyed record is appended unless an
+/// identical one is already held. So a successor's collaboration differs from
+/// its base only by keyed values that are new or replaced and by records
+/// appended after every record of the base, and this carries exactly that. A
+/// keyed collection carries the successor's value for every key whose value is
+/// new or moved, sorted strictly by the key's MessagePack encoding so one
+/// successor always encodes to one byte string. An unkeyed collection carries
+/// the successor's records past the base's, in the successor's order.
+///
+/// A removal or a rewrite cannot be said here, and nothing can produce one: a
+/// collaboration delta has no removal form. The drain refuses a successor that
+/// would need one, and the writer persists that successor whole.
+///
+/// The fields are the seventeen collections the collaboration root folds, in
+/// fold order, named by [`Self::COLLECTIONS`]. Positional like the frame, so a
+/// field is only ever appended.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaborationPatch {
+    pub work_items: Vec<(WorkId, WorkItem)>,
+    pub annotations: Vec<(AnnotationId, Annotation)>,
+    pub work_links: Vec<WorkLink>,
+    pub reviews: Vec<(ReviewId, Review)>,
+    /// A review's decision history, whole, as the snapshot holds it.
+    pub review_decisions: Vec<(ReviewId, Vec<ReviewDecision>)>,
+    pub review_notes: Vec<ReviewNote>,
+    pub review_discussions: Vec<ReviewDiscussion>,
+    /// A review's assignment set, whole, as the snapshot holds it.
+    pub review_assignments: Vec<(ReviewId, Vec<ReviewAssignment>)>,
+    pub test_cases: Vec<(TestId, TestCase)>,
+    pub assertions: Vec<(AssertionId, Assertion)>,
+    pub verification_runs: Vec<(VerificationRunId, VerificationRun)>,
+    pub mock_hints: Vec<MockHint>,
+    pub contracts: Vec<(ContractId, Contract)>,
+    pub actors: Vec<(ActorId, Actor)>,
+    pub delegations: Vec<Delegation>,
+    pub approvals: Vec<Approval>,
+    pub audit_events: Vec<AuditEvent>,
+}
+
+impl CollaborationPatch {
+    /// The collections this patch carries, in field order, which is the fold
+    /// order of the collaboration root. A test holds this equal to the
+    /// collaboration model's own list, so a collection the model gains without
+    /// a field here fails that test rather than costing a full snapshot per
+    /// publication with nothing red.
+    pub const COLLECTIONS: [&'static str; 17] = [
+        "work_items",
+        "annotations",
+        "work_links",
+        "reviews",
+        "review_decisions",
+        "review_notes",
+        "review_discussions",
+        "review_assignments",
+        "test_cases",
+        "assertions",
+        "verification_runs",
+        "mock_hints",
+        "contracts",
+        "actors",
+        "delegations",
+        "approvals",
+        "audit_events",
+    ];
+
+    /// Whether this patch moves no collaboration record.
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            work_items,
+            annotations,
+            work_links,
+            reviews,
+            review_decisions,
+            review_notes,
+            review_discussions,
+            review_assignments,
+            test_cases,
+            assertions,
+            verification_runs,
+            mock_hints,
+            contracts,
+            actors,
+            delegations,
+            approvals,
+            audit_events,
+        } = self;
+        work_items.is_empty()
+            && annotations.is_empty()
+            && work_links.is_empty()
+            && reviews.is_empty()
+            && review_decisions.is_empty()
+            && review_notes.is_empty()
+            && review_discussions.is_empty()
+            && review_assignments.is_empty()
+            && test_cases.is_empty()
+            && assertions.is_empty()
+            && verification_runs.is_empty()
+            && mock_hints.is_empty()
+            && contracts.is_empty()
+            && actors.is_empty()
+            && delegations.is_empty()
+            && approvals.is_empty()
+            && audit_events.is_empty()
+    }
+
+    /// The collaboration `next` added or replaced over `current`, or the
+    /// record class it removed or rewrote, which no frame can carry.
+    fn drain(current: &GraphSnapshot, next: &GraphSnapshot) -> Result<Self, KinDbError> {
+        Ok(Self {
+            work_items: keyed_changes(&current.work_items, &next.work_items, "work item")?,
+            annotations: keyed_changes(&current.annotations, &next.annotations, "annotation")?,
+            work_links: appended_records(&current.work_links, &next.work_links, "work link")?,
+            reviews: keyed_changes(&current.reviews, &next.reviews, "review")?,
+            review_decisions: keyed_changes(
+                &current.review_decisions,
+                &next.review_decisions,
+                "review decision history",
+            )?,
+            review_notes: appended_records(
+                &current.review_notes,
+                &next.review_notes,
+                "review note",
+            )?,
+            review_discussions: appended_records(
+                &current.review_discussions,
+                &next.review_discussions,
+                "review discussion",
+            )?,
+            review_assignments: keyed_changes(
+                &current.review_assignments,
+                &next.review_assignments,
+                "review assignment set",
+            )?,
+            test_cases: keyed_changes(&current.test_cases, &next.test_cases, "test case")?,
+            assertions: keyed_changes(&current.assertions, &next.assertions, "assertion")?,
+            verification_runs: keyed_changes(
+                &current.verification_runs,
+                &next.verification_runs,
+                "verification run",
+            )?,
+            mock_hints: appended_records(&current.mock_hints, &next.mock_hints, "mock hint")?,
+            contracts: keyed_changes(&current.contracts, &next.contracts, "contract")?,
+            actors: keyed_changes(&current.actors, &next.actors, "actor")?,
+            delegations: appended_records(&current.delegations, &next.delegations, "delegation")?,
+            approvals: appended_records(&current.approvals, &next.approvals, "approval")?,
+            audit_events: appended_records(
+                &current.audit_events,
+                &next.audit_events,
+                "audit event",
+            )?,
+        })
+    }
+
+    /// Refuse a patch whose keyed collections are not in their one canonical
+    /// order, which is also what refuses a key carried twice.
+    fn validate_shape(&self) -> Result<(), KinDbError> {
+        let Self {
+            work_items,
+            annotations,
+            work_links: _,
+            reviews,
+            review_decisions,
+            review_notes: _,
+            review_discussions: _,
+            review_assignments,
+            test_cases,
+            assertions,
+            verification_runs,
+            mock_hints: _,
+            contracts,
+            actors,
+            delegations: _,
+            approvals: _,
+            audit_events: _,
+        } = self;
+        require_keyed_order(work_items, "collaboration work items")?;
+        require_keyed_order(annotations, "collaboration annotations")?;
+        require_keyed_order(reviews, "collaboration reviews")?;
+        require_keyed_order(review_decisions, "collaboration review decisions")?;
+        require_keyed_order(review_assignments, "collaboration review assignments")?;
+        require_keyed_order(test_cases, "collaboration test cases")?;
+        require_keyed_order(assertions, "collaboration assertions")?;
+        require_keyed_order(verification_runs, "collaboration verification runs")?;
+        require_keyed_order(contracts, "collaboration contracts")?;
+        require_keyed_order(actors, "collaboration actors")?;
+        Ok(())
+    }
+
+    /// Replace every keyed value this patch carries and append every record,
+    /// in place. It cannot fail, which is what lets [`AuthorityFrame::apply`]
+    /// run it after every check that can.
+    fn apply_to(&self, snapshot: &mut GraphSnapshot) {
+        let Self {
+            work_items,
+            annotations,
+            work_links,
+            reviews,
+            review_decisions,
+            review_notes,
+            review_discussions,
+            review_assignments,
+            test_cases,
+            assertions,
+            verification_runs,
+            mock_hints,
+            contracts,
+            actors,
+            delegations,
+            approvals,
+            audit_events,
+        } = self;
+        upsert(&mut snapshot.work_items, work_items);
+        upsert(&mut snapshot.annotations, annotations);
+        snapshot.work_links.extend(work_links.iter().cloned());
+        upsert(&mut snapshot.reviews, reviews);
+        upsert(&mut snapshot.review_decisions, review_decisions);
+        snapshot.review_notes.extend(review_notes.iter().cloned());
+        snapshot
+            .review_discussions
+            .extend(review_discussions.iter().cloned());
+        upsert(&mut snapshot.review_assignments, review_assignments);
+        upsert(&mut snapshot.test_cases, test_cases);
+        upsert(&mut snapshot.assertions, assertions);
+        upsert(&mut snapshot.verification_runs, verification_runs);
+        snapshot.mock_hints.extend(mock_hints.iter().cloned());
+        upsert(&mut snapshot.contracts, contracts);
+        upsert(&mut snapshot.actors, actors);
+        snapshot.delegations.extend(delegations.iter().cloned());
+        snapshot.approvals.extend(approvals.iter().cloned());
+        snapshot.audit_events.extend(audit_events.iter().cloned());
+    }
+}
+
 /// One acknowledged successor of a repository-authority state, as a patch over
 /// the state it extends.
 ///
@@ -114,23 +360,54 @@ pub struct AuthorityFrame {
     pub local_overlays: Vec<FrozenLocalOverlay>,
     /// The successor's complete merge record list; records are removed too.
     pub merge_transactions: Vec<MergeTransactionRecord>,
+    /// The collaboration records the successor added or replaced.
+    ///
+    /// Appended in version 3 and skipped when empty, so a frame that moves no
+    /// collaboration serializes as exactly the twelve-element version 2 body
+    /// and a version 2 body decodes with an empty patch.
+    #[serde(default, skip_serializing_if = "CollaborationPatch::is_empty")]
+    pub collaboration: CollaborationPatch,
 }
 
 impl AuthorityFrame {
     /// Magic bytes for the frame file header: "KNAF".
     pub const MAGIC: [u8; 4] = *b"KNAF";
 
-    /// Current frame format version.
+    /// Newest frame format version this binary reads and writes.
+    ///
+    /// Version 3 appends [`CollaborationPatch`]. A frame is written at the
+    /// version its contents need ([`Self::wire_version`]), so only a frame
+    /// that carries collaboration is a version 3 frame.
+    pub const CURRENT_VERSION: u32 = 3;
+
+    /// The oldest frame format version this binary reads, and the version a
+    /// frame that carries no collaboration is still written at.
     ///
     /// Version 1 carried the Git authority patch as a nested `Option`, which
     /// the wire cannot represent; it never reached a release, and a reader
     /// refuses it by version rather than misreading it.
-    pub const CURRENT_VERSION: u32 = 2;
+    pub const MIN_SUPPORTED_VERSION: u32 = 2;
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
 
     const HEADER_LEN: usize = 16;
+
+    /// The version these exact contents are written at.
+    ///
+    /// Derived from the contents, as a snapshot's version is: a frame that
+    /// carries collaboration needs the version 3 body, and every other frame
+    /// keeps the version 2 body byte for byte. So a store stays readable by a
+    /// version 2 reader until it holds its first collaboration frame, and a
+    /// version 2 reader refuses that frame by version rather than misreading
+    /// it.
+    pub fn wire_version(&self) -> u32 {
+        if self.collaboration.is_empty() {
+            Self::MIN_SUPPORTED_VERSION
+        } else {
+            Self::CURRENT_VERSION
+        }
+    }
 
     /// Logical generation of the successor this frame produces.
     pub fn generation(&self) -> Generation {
@@ -155,7 +432,7 @@ impl AuthorityFrame {
         })?;
         let mut buf = Vec::with_capacity(Self::HEADER_LEN + body.len() + Self::CHECKSUM_LEN);
         buf.extend_from_slice(&Self::MAGIC);
-        buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&self.wire_version().to_le_bytes());
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
         buf.extend_from_slice(&body);
         let hash = Sha256::digest(&body);
@@ -168,6 +445,11 @@ impl AuthorityFrame {
     /// Storage uses this to refuse a frame it cannot vouch for without decoding
     /// its body; recovery decodes the returned body afterwards.
     pub fn verify_frame_bytes(data: &[u8]) -> Result<&[u8], KinDbError> {
+        Self::verified_version_and_body(data).map(|(_, body)| body)
+    }
+
+    /// The header's declared version and the checksummed body.
+    fn verified_version_and_body(data: &[u8]) -> Result<(u32, &[u8]), KinDbError> {
         if data.len() < Self::HEADER_LEN {
             return Err(KinDbError::StorageError(
                 "authority frame too small for header".to_string(),
@@ -184,9 +466,19 @@ impl AuthorityFrame {
                 .try_into()
                 .map_err(|_| KinDbError::SliceConversionError("version bytes".to_string()))?,
         );
-        if version != Self::CURRENT_VERSION {
+        if version > Self::CURRENT_VERSION {
             return Err(KinDbError::StorageError(format!(
-                "unsupported authority frame version: {version} (expected {})",
+                "unsupported authority frame version: {version} (this kin-db reads versions {} to {}); \
+                 a newer kin-db wrote it, so open this store with a kin built on a kin-db that reads \
+                 frame version {version}",
+                Self::MIN_SUPPORTED_VERSION,
+                Self::CURRENT_VERSION
+            )));
+        }
+        if version < Self::MIN_SUPPORTED_VERSION {
+            return Err(KinDbError::StorageError(format!(
+                "unsupported authority frame version: {version} (this kin-db reads versions {} to {})",
+                Self::MIN_SUPPORTED_VERSION,
                 Self::CURRENT_VERSION
             )));
         }
@@ -228,15 +520,28 @@ impl AuthorityFrame {
                 "authority frame checksum mismatch: file is corrupted".to_string(),
             ));
         }
-        Ok(body)
+        Ok((version, body))
     }
 
     /// Deserialize a frame from bytes with header and checksum validation.
+    ///
+    /// The header must declare the version the decoded contents are written
+    /// at, so a frame has exactly one legal encoding: a version 2 header over
+    /// a body that carries collaboration, or a version 3 header over one that
+    /// carries none, is refused rather than read.
     pub fn from_bytes(data: &[u8]) -> Result<Self, KinDbError> {
-        let body = Self::verify_frame_bytes(data)?;
+        let (declared, body) = Self::verified_version_and_body(data)?;
         let frame: Self = rmp_serde::from_slice(body).map_err(|error| {
             KinDbError::StorageError(format!("authority frame deserialization failed: {error}"))
         })?;
+        if frame.wire_version() != declared {
+            return Err(KinDbError::StorageError(format!(
+                "authority frame declares version {declared} but its contents are written at \
+                 version {}; a frame is version {} exactly when it carries collaboration records",
+                frame.wire_version(),
+                Self::CURRENT_VERSION
+            )));
+        }
         frame.validate_shape()?;
         Ok(frame)
     }
@@ -280,6 +585,7 @@ impl AuthorityFrame {
             |workspace| workspace.workspace_id,
             "frame workspaces",
         )?;
+        self.collaboration.validate_shape()?;
         Ok(())
     }
 
@@ -331,6 +637,17 @@ impl AuthorityFrame {
         next: &GraphSnapshot,
     ) -> Result<Self, KinDbError> {
         Self::from_bytes(Self::encode_proven(current, next)?.bytes())
+    }
+
+    /// The writer's proof, run over this frame's own wire bytes, for tests
+    /// that build or alter a frame by hand and need the proof's verdict.
+    #[cfg(test)]
+    pub(crate) fn prove_from_own_bytes(
+        &self,
+        current: &GraphSnapshot,
+        next: &GraphSnapshot,
+    ) -> Result<(), KinDbError> {
+        Self::from_bytes(&self.to_bytes()?)?.prove_reproduces(current, next)
     }
 
     /// Drain the mutation into a frame without proving reproduction.
@@ -427,6 +744,7 @@ impl AuthorityFrame {
             workspaces,
             local_overlays: successor.local_overlays.clone(),
             merge_transactions: successor.merge_transactions.clone(),
+            collaboration: CollaborationPatch::drain(current, next)?,
         };
         frame.validate_shape()?;
         Ok(frame)
@@ -486,6 +804,9 @@ impl AuthorityFrame {
         base.change_children = change_children;
         base.entity_revisions.clear();
         base.repository_authority = Some(envelope);
+        // Last, and unable to fail: every check that can refuse this frame
+        // has already passed, so a refused frame applies nothing.
+        self.collaboration.apply_to(base);
         Ok(())
     }
 
@@ -947,6 +1268,91 @@ fn absent_from_base<T: Clone, K: Ord>(
         .collect()
 }
 
+/// The successor entries whose key the base does not hold, or holds with
+/// another value, sorted strictly by the key's MessagePack encoding.
+///
+/// A base key the successor no longer holds is a removal. No collaboration
+/// delta can make one and no frame can carry one, so it is refused by name
+/// rather than dropped, and the writer persists that successor whole.
+fn keyed_changes<K, V>(
+    base: &HashMap<K, V>,
+    successor: &HashMap<K, V>,
+    label: &str,
+) -> Result<Vec<(K, V)>, KinDbError>
+where
+    K: Copy + Eq + Hash + Serialize + std::fmt::Debug,
+    V: Clone + PartialEq,
+{
+    if let Some(removed) = base.keys().find(|key| !successor.contains_key(*key)) {
+        return Err(KinDbError::StorageError(format!(
+            "authority frame cannot carry a successor that no longer holds {label} {removed:?}; \
+             a frame only adds or replaces collaboration records"
+        )));
+    }
+    let mut changed = Vec::new();
+    for (key, value) in successor {
+        if base.get(key) != Some(value) {
+            changed.push((encoded_key(key)?, *key, value.clone()));
+        }
+    }
+    changed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(changed
+        .into_iter()
+        .map(|(_, key, value)| (key, value))
+        .collect())
+}
+
+/// The successor's records past every record of the base, in the successor's
+/// order.
+///
+/// The base must be exactly the successor's prefix. A record the successor
+/// dropped, rewrote or moved is not something appending reproduces, so it is
+/// refused by name rather than papered over.
+fn appended_records<T: Clone + PartialEq>(
+    base: &[T],
+    successor: &[T],
+    label: &str,
+) -> Result<Vec<T>, KinDbError> {
+    match successor.get(..base.len()) {
+        Some(prefix) if prefix == base => Ok(successor[base.len()..].to_vec()),
+        _ => Err(KinDbError::StorageError(format!(
+            "authority frame cannot carry a successor whose {label} records are not the base's \
+             records followed by new ones; a frame only appends collaboration records"
+        ))),
+    }
+}
+
+/// The canonical order of a collaboration key: its MessagePack encoding.
+fn encoded_key<K: Serialize>(key: &K) -> Result<Vec<u8>, KinDbError> {
+    rmp_serde::to_vec(key).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "authority frame collaboration key serialization failed: {error}"
+        ))
+    })
+}
+
+/// Replace or insert every carried value under its key.
+fn upsert<K: Copy + Eq + Hash, V: Clone>(target: &mut HashMap<K, V>, entries: &[(K, V)]) {
+    for (key, value) in entries {
+        target.insert(*key, value.clone());
+    }
+}
+
+/// Refuse keyed entries that are not strictly increasing by encoded key.
+fn require_keyed_order<K: Serialize, V>(entries: &[(K, V)], label: &str) -> Result<(), KinDbError> {
+    let mut previous: Option<Vec<u8>> = None;
+    for (key, _) in entries {
+        let current = encoded_key(key)?;
+        if previous.as_ref().is_some_and(|old| old >= &current) {
+            return Err(KinDbError::StorageError(format!(
+                "authority {label} are not in canonical unique order"
+            )));
+        }
+        previous = Some(current);
+    }
+    Ok(())
+}
+
 /// Merge sorted, unique `incoming` into sorted, unique `existing`, refusing any
 /// key the base already carries.
 fn merge_absent<T: Clone, K: Ord + std::fmt::Debug>(
@@ -1022,9 +1428,209 @@ fn decode_digest(hex_digest: &str, label: &str) -> Result<[u8; 32], KinDbError> 
     })
 }
 
+/// The frame exactly as kin-db 0.7.112 declared it: twelve positional fields
+/// under a version 2 header.
+///
+/// Kept verbatim (the registry's 0.7.112 `authority_frame.rs` is the file this
+/// revision started from) so a test can hold every frame this binary writes
+/// without collaboration byte-identical to what that release writes for the
+/// same successor, which is what keeps such a store readable by it.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LegacyFrameV2 {
+    pub schema_version: u32,
+    pub repository_id: RepositoryId,
+    pub operation: RepositoryOperationRecord,
+    pub changes: Vec<SemanticChange>,
+    pub admission_policies: Vec<ChangeAdmissionPolicy>,
+    pub external_objects: Vec<ExternalObjectRecord>,
+    pub aliases: Vec<ExternalChangeAlias>,
+    pub git_external_authority: GitExternalAuthorityPatch,
+    pub ref_state: RepositoryRefState,
+    pub workspaces: Vec<WorkspaceState>,
+    pub local_overlays: Vec<FrozenLocalOverlay>,
+    pub merge_transactions: Vec<MergeTransactionRecord>,
+}
+
+#[cfg(test)]
+impl LegacyFrameV2 {
+    /// Every field of `frame` except the collaboration patch it cannot hold.
+    pub(crate) fn from_frame(frame: &AuthorityFrame) -> Self {
+        Self {
+            schema_version: frame.schema_version,
+            repository_id: frame.repository_id.clone(),
+            operation: frame.operation.clone(),
+            changes: frame.changes.clone(),
+            admission_policies: frame.admission_policies.clone(),
+            external_objects: frame.external_objects.clone(),
+            aliases: frame.aliases.clone(),
+            git_external_authority: frame.git_external_authority.clone(),
+            ref_state: frame.ref_state.clone(),
+            workspaces: frame.workspaces.clone(),
+            local_overlays: frame.local_overlays.clone(),
+            merge_transactions: frame.merge_transactions.clone(),
+        }
+    }
+
+    /// The bytes 0.7.112's `AuthorityFrame::to_bytes` writes for this frame.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let body = rmp_serde::to_vec(self).expect("a legacy frame serializes");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KNAF");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&body);
+        buf.extend_from_slice(&Sha256::digest(&body));
+        buf
+    }
+}
+
+#[cfg(test)]
+impl CollaborationPatch {
+    /// How many entries this patch carries in the collection named `name`,
+    /// one of [`Self::COLLECTIONS`]. Panics on any other name, so a table
+    /// driven by the collaboration model's list stops on a collection the
+    /// patch does not have.
+    pub(crate) fn len_of(&self, name: &str) -> usize {
+        match name {
+            "work_items" => self.work_items.len(),
+            "annotations" => self.annotations.len(),
+            "work_links" => self.work_links.len(),
+            "reviews" => self.reviews.len(),
+            "review_decisions" => self.review_decisions.len(),
+            "review_notes" => self.review_notes.len(),
+            "review_discussions" => self.review_discussions.len(),
+            "review_assignments" => self.review_assignments.len(),
+            "test_cases" => self.test_cases.len(),
+            "assertions" => self.assertions.len(),
+            "verification_runs" => self.verification_runs.len(),
+            "mock_hints" => self.mock_hints.len(),
+            "contracts" => self.contracts.len(),
+            "actors" => self.actors.len(),
+            "delegations" => self.delegations.len(),
+            "approvals" => self.approvals.len(),
+            "audit_events" => self.audit_events.len(),
+            other => panic!("the collaboration patch has no collection named {other}"),
+        }
+    }
+
+    /// Drop every entry of the collection named `name`; panics like
+    /// [`Self::len_of`].
+    pub(crate) fn clear(&mut self, name: &str) {
+        match name {
+            "work_items" => self.work_items.clear(),
+            "annotations" => self.annotations.clear(),
+            "work_links" => self.work_links.clear(),
+            "reviews" => self.reviews.clear(),
+            "review_decisions" => self.review_decisions.clear(),
+            "review_notes" => self.review_notes.clear(),
+            "review_discussions" => self.review_discussions.clear(),
+            "review_assignments" => self.review_assignments.clear(),
+            "test_cases" => self.test_cases.clear(),
+            "assertions" => self.assertions.clear(),
+            "verification_runs" => self.verification_runs.clear(),
+            "mock_hints" => self.mock_hints.clear(),
+            "contracts" => self.contracts.clear(),
+            "actors" => self.actors.clear(),
+            "delegations" => self.delegations.clear(),
+            "approvals" => self.approvals.clear(),
+            "audit_events" => self.audit_events.clear(),
+            other => panic!("the collaboration patch has no collection named {other}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exhaustiveness guard. The patch names exactly the collections the
+    /// collaboration model has, in its fold order, and its own fields are
+    /// those names. A collection the model gains without a patch field goes
+    /// red on the first assertion, a patch field renamed or dropped on the
+    /// second. The destructuring below is the compiler's half: it names every
+    /// field of the model's delta with no rest pattern, so an eighteenth
+    /// field stops this module compiling until someone looks here.
+    #[test]
+    fn the_patch_carries_every_collection_the_collaboration_model_has() {
+        assert_eq!(
+            CollaborationPatch::COLLECTIONS,
+            kin_model::COLLABORATION_COLLECTIONS,
+            "the frame's collaboration patch and the collaboration model name different \
+             collections; give the patch a field, a drain arm and an apply arm for each"
+        );
+        let named = serde_json::to_value(CollaborationPatch::default()).unwrap();
+        let mut fields: Vec<&str> = named
+            .as_object()
+            .expect("the patch serializes as a map of its fields")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        let mut expected = kin_model::COLLABORATION_COLLECTIONS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            fields, expected,
+            "the patch's fields are not the collections it names"
+        );
+        let empty = CollaborationPatch::default();
+        for name in kin_model::COLLABORATION_COLLECTIONS {
+            assert_eq!(empty.len_of(name), 0, "{name}");
+        }
+        let kin_model::CollaborationDelta {
+            work_items: _,
+            annotations: _,
+            work_links: _,
+            reviews: _,
+            review_decisions: _,
+            review_notes: _,
+            review_discussions: _,
+            review_assignments: _,
+            test_cases: _,
+            assertions: _,
+            verification_runs: _,
+            mock_hints: _,
+            contracts: _,
+            actors: _,
+            delegations: _,
+            approvals: _,
+            audit_events: _,
+        } = kin_model::CollaborationDelta::default();
+    }
+
+    /// A version outside the ones this binary reads is refused before any
+    /// body is decoded, and a frame too new to read says what to do about it.
+    #[test]
+    fn frame_versions_outside_the_supported_range_refuse_by_name() {
+        let body = b"never decoded";
+        for (version, needle) in [
+            (1, "this kin-db reads versions 2 to 3"),
+            (
+                AuthorityFrame::CURRENT_VERSION + 1,
+                "a newer kin-db wrote it, so open this store with a kin built on a kin-db that \
+                 reads frame version 4",
+            ),
+        ] {
+            let mut bytes = frame_bytes_from(body);
+            bytes[4..8].copy_from_slice(&u32::to_le_bytes(version));
+            let error = AuthorityFrame::verify_frame_bytes(&bytes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("unsupported authority frame version") && error.contains(needle),
+                "version {version}: {error}"
+            );
+        }
+        for version in [
+            AuthorityFrame::MIN_SUPPORTED_VERSION,
+            AuthorityFrame::CURRENT_VERSION,
+        ] {
+            let mut bytes = frame_bytes_from(body);
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(AuthorityFrame::verify_frame_bytes(&bytes).unwrap(), body);
+        }
+    }
 
     fn frame_bytes_from(body: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
