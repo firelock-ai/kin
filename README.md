@@ -42,11 +42,11 @@ For Claude Code:
 
 For [Codex](plugins/kin-codex/README.md#install), add the marketplace and install the plugin, or let `kin setup --intent agent` write the MCP server into `~/.codex/config.toml` for you.
 
-For [Cursor](plugins/kin-cursor/README.md#install), install from the Cursor Marketplace, or add the MCP server by hand.
+For Cursor, add the MCP server by hand; see [plugins/kin-cursor](plugins/kin-cursor/README.md#install) for the exact snippet.
 
 After installing, run `kin init .` in a small repository you know well; the `kin-setup` skill walks you through the rest.
 
-Kin is not published on crates.io. The `kin` crate that name resolves to there belongs to an unrelated project.
+Kin is not published on crates.io. The `kin` crate there is an unrelated project.
 
 ## Quickstart
 
