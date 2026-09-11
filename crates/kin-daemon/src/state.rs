@@ -5314,6 +5314,15 @@ impl DaemonState {
         } else {
             Self::pin_registered_local_repository_authorities(&layout)
         };
+        // The publication this open is about to load, read BEFORE it for the
+        // reason every held authority's label is read first: a label taken
+        // afterwards could name a publication that landed during the load and
+        // mark older bytes as current. An unreadable record only means the
+        // daemon does not hold this open afterwards; the open itself decides
+        // whether the store is usable.
+        let startup_publication =
+            crate::api::read_local_publication_identity(&local_repository_backend, &repository_id)
+                .ok();
         // Startup is a reopen of an initialized repository, never construction
         // of an unpersisted generation-zero authority. Use the receipt from
         // this same recovery to refuse an intact namespace whose authority
@@ -5493,7 +5502,8 @@ impl DaemonState {
             "loaded daemon query graph from workspace-scoped repository-v6 authority"
         );
         drop(lease);
-        drop(authority);
+        // `authority` stays alive: the daemon keeps the manager this open paid
+        // for as its held authority, installed once the state exists below.
 
         // The repository snapshot above is authoritative. Vector/text
         // structures built from it are derived query surfaces only.
@@ -5734,6 +5744,18 @@ impl DaemonState {
                     state.finalize_loaded_generation(generation)
                 })?;
             }
+        }
+        // Hold the startup open instead of dropping it. It carries the label read
+        // before it, so the admission pair, the first flush and the first
+        // projection read reuse it while the record still reads the same, and
+        // load fresh the moment another writer moves it.
+        if let Some(published) = startup_publication {
+            state.projection_authority.install_opened(
+                published,
+                Arc::new(authority),
+                repository_id,
+                workspace_id,
+            );
         }
         state.register_daemon_system_session();
         // The first settled status reading, taken here because this is the last
@@ -11344,7 +11366,9 @@ impl DaemonState {
 
     /// Finish local artifacts for one already-committed authority generation.
     ///
-    /// The read index is rebuilt from reopened durable authority, not the live
+    /// The read index is rebuilt from durable authority at that generation
+    /// (the daemon's held authority while the record still reads as it did
+    /// when that authority was loaded, a fresh open otherwise), not the live
     /// graph, which may already contain mutations that arrived after the
     /// committed batch. It is staged off-path, the old canonical index is
     /// removed, the generation marker is durably published, and only then is
@@ -11425,6 +11449,22 @@ impl DaemonState {
         Ok(index_path)
     }
 
+    /// The daemon's one held repository authority for the current publication.
+    ///
+    /// Borrowed rather than opened: an open decodes the complete persisted
+    /// authority and re-verifies every body in repository CAS, and the flush and
+    /// its finalize each used to pay that for a publication the daemon already
+    /// held. The held authority is handed out only while `authority.json` still
+    /// reads as it did before that authority was loaded, so a publication by
+    /// another process is loaded fresh, never served from what this daemon held
+    /// before it.
+    fn held_local_repository_authority(
+        &self,
+    ) -> Result<Arc<RepositoryAuthorityManager<LocalFileBackend>>> {
+        crate::api::held_repository_authority(self)
+            .map_err(|(_, message)| DaemonError::Graph(kin_db::KinDbError::StorageError(message)))
+    }
+
     /// Prove the derived graph still matches workspace authority at this
     /// generation, publish the language-server relations authority does not
     /// hold yet, and report the generation the workspace ends at.
@@ -11447,14 +11487,16 @@ impl DaemonState {
     /// whatever an earlier attempt failed to land, and it does not care which
     /// batch an edge arrived in.
     ///
-    /// One authority open serves the whole pass. An open is O(store) rather
-    /// than a cheap handle, because kin-db decodes the complete persisted
-    /// authority and then re-verifies every body in repository CAS against its
-    /// content address, so the tree proof, the diff, and the commit all run
-    /// against this one lease.
+    /// One authority serves the whole pass, and it is the daemon's held one,
+    /// not an open of its own. An open is O(store) rather than a cheap handle,
+    /// because kin-db decodes the complete persisted authority and then
+    /// re-verifies every body in repository CAS against its content address,
+    /// and a flush that opened its own paid that for a publication the daemon
+    /// already held. The tree proof, the diff and the commit all run against
+    /// this one authority.
     fn publish_local_workspace_enrichment(&self, expected_generation: u64) -> Result<u64> {
         let binding = self.local_repository_authority_binding()?;
-        let authority = binding.open_manager().map_err(DaemonError::from)?;
+        let authority = self.held_local_repository_authority()?;
         let workspace_id = binding.workspace_id();
         let lease = authority.read_authority();
         let observed_generation = lease.roots().generation;
@@ -11669,7 +11711,7 @@ impl DaemonState {
             }
         } else {
             let binding = self.local_repository_authority_binding()?;
-            let authority = binding.open_manager().map_err(DaemonError::from)?;
+            let authority = self.held_local_repository_authority()?;
             let lease = authority.read_authority();
             let observed_generation = lease.roots().generation;
             if observed_generation != generation {
@@ -19993,6 +20035,127 @@ mod tests {
                 .contains_key(&enriched.id),
             "a language-server relation must be graph-owned durable truth, not runtime state \
              the next process does not inherit"
+        );
+    }
+
+    /// One publication costs the daemon one whole-store open, however many of
+    /// its own readers ask for authority at it.
+    ///
+    /// An open decodes the complete persisted authority and re-verifies every
+    /// body in repository CAS. The startup open used to be dropped, and the
+    /// admission pair and the persistence flush then opened the store again for
+    /// the publication the daemon had just loaded.
+    #[test]
+    fn the_startup_open_serves_the_admission_pair_and_the_flush() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        // The positive control: opening the daemon genuinely opens authority,
+        // so a counter that cannot move is caught here rather than read below
+        // as a pass.
+        let before_open = kin_core::authority_opens();
+        let state = test_state(init.layout, repo_dir.path());
+        assert!(
+            kin_core::authority_opens() > before_open,
+            "the authority-open counter did not move across a daemon open, so it cannot report \
+             an open at all and the assertion below would pass on any tree"
+        );
+
+        let before = kin_core::authority_opens();
+        crate::api::cached_authority_admission(&state)
+            .expect("the admission pair must resolve at the startup publication");
+        state
+            .save_snapshot()
+            .expect("a flush with nothing to publish succeeds");
+        crate::api::held_repository_authority(&state)
+            .expect("the held authority must answer at the startup publication");
+        assert_eq!(
+            kin_core::authority_opens(),
+            before,
+            "the admission pair, the flush and a projection read at the startup publication \
+             must borrow the authority the daemon opened at startup, not open the store again"
+        );
+    }
+
+    /// A publication the held authority did not make is loaded fresh, never
+    /// served from what the daemon held before it.
+    ///
+    /// The commit below goes through a manager of its own, the way the CLI or a
+    /// second daemon writes beside this one, so the held authority never sees
+    /// it. What the commit changes is `authority.json`, and the held authority's
+    /// label is the digest of that record as it read before the held load.
+    #[test]
+    fn a_record_another_writer_moved_is_loaded_fresh_not_served_from_the_held_authority() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let held = crate::api::held_repository_authority(&state).unwrap();
+        let held_generation = held.read_authority().roots().generation;
+
+        publish_authority_entities(&state, &[test_entity("send", "src/sessions.rs")]);
+
+        let before = kin_core::authority_opens();
+        let fresh = crate::api::held_repository_authority(&state).unwrap();
+        let fresh_generation = fresh.read_authority().roots().generation;
+        assert!(
+            fresh_generation > held_generation,
+            "a reader after another writer's publication must get that publication (generation \
+             {fresh_generation}), never the held authority at generation {held_generation}"
+        );
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "a moved record must cost exactly one fresh load"
+        );
+        let (roots, _) = crate::api::cached_authority_admission(&state).unwrap();
+        assert_eq!(
+            roots.generation, fresh_generation,
+            "the admission pair must follow the moved record too"
+        );
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "and share that fresh load rather than paying one of its own"
+        );
+    }
+
+    /// The flush after a publication pays one open for it, and its finalize and
+    /// the readers after it borrow that one.
+    #[test]
+    fn the_flush_after_a_publication_opens_once_and_its_finalize_borrows_it() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        publish_authority_entities(
+            &state,
+            &[
+                test_entity("send", "src/sessions.rs"),
+                test_entity("adapter_send", "src/adapters.rs"),
+            ],
+        );
+        assert!(
+            state
+                .post_commit_finalization_pending
+                .load(Ordering::SeqCst),
+            "the fixture publication must leave a finalize for the flush to run"
+        );
+
+        let before = kin_core::authority_opens();
+        state
+            .save_snapshot()
+            .expect("the flush after a publication succeeds");
+        assert!(
+            !state
+                .post_commit_finalization_pending
+                .load(Ordering::SeqCst),
+            "the flush must have run its read-index finalize"
+        );
+        crate::api::cached_authority_admission(&state).unwrap();
+        crate::api::held_repository_authority(&state).unwrap();
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "one publication is one whole-store open: the flush loads it, and its finalize and \
+             the readers after it borrow that load"
         );
     }
 
