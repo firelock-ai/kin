@@ -78,12 +78,13 @@
     },
     {
       "name": "kin-vfs",
-      "layer": "flagship",
+      "layer": "deprecated",
       "role": "filesystem-projection",
       "dependsOn": [
         "kin",
         "kin-db"
       ],
+      "note": "Defocused by the founder on 2026-09-11. Libc-interception filesystem projection via LD_PRELOAD and DYLD; the repository stays public and deprecated for reference, and its binaries leave the shipped release archives. kin-vfs-core is kept as a crate inside kin's own workspace for the projection engine. `kin run -- <cmd>` on fast ephemeral sandboxes (APFS copy-on-write on macOS, tmpfs or reflink on Linux) is the execution path being designed to replace it; localhost NFS is a secondary exploration, not a day-one dependency.",
       "quickChecks": [
         {
           "name": "cargo-tests",
@@ -99,8 +100,7 @@
       "layer": "flagship",
       "role": "editor-access-surface",
       "dependsOn": [
-        "kin",
-        "kin-vfs"
+        "kin"
       ],
       "quickChecks": [
         {
@@ -282,7 +282,7 @@
       "from": "kin",
       "to": "kin-vfs",
       "via": "filesystem-projection",
-      "purpose": "materializes graph-backed files through a transparent filesystem layer"
+      "purpose": "kin-vfs is defocused and kept public for reference since 2026-09-11, with kin run sandboxes replacing it as the execution path"
     },
     {
       "from": "kin",
@@ -301,12 +301,6 @@
       "to": "kin",
       "via": "control-plane-gateway",
       "purpose": "grounds hosted collaboration in real Kin workspace state"
-    },
-    {
-      "from": "kinlab",
-      "to": "kin-vfs",
-      "via": "native-adoption-wedge",
-      "purpose": "uses filesystem projection as part of the first-class adoption path"
     },
     {
       "from": "kin-mcp",
