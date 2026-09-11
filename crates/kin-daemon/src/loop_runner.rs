@@ -632,6 +632,24 @@ pub(crate) fn current_authority_admission(
 /// reading still being current enough, or a daemon whose graph is its own write
 /// authority and whose checkout is therefore not evidence about anything.
 pub(crate) fn refresh_untracked_reading(state: &DaemonState) -> Result<bool> {
+    refresh_untracked_reading_with(state, true)
+}
+
+/// [`refresh_untracked_reading`] for a caller that must answer now.
+///
+/// When the admission pair for the current publication is not already held,
+/// the reading keeps the age it has rather than this call paying for, or
+/// waiting out, a whole-store open to refresh it. Every surface judges the
+/// count by that age, so an older reading is disclosed rather than hidden.
+/// `/health` is the caller: a client's probe budget there is two seconds.
+pub(crate) fn refresh_untracked_reading_without_waiting(state: &DaemonState) -> Result<bool> {
+    refresh_untracked_reading_with(state, false)
+}
+
+fn refresh_untracked_reading_with(
+    state: &DaemonState,
+    wait_for_admission_pair: bool,
+) -> Result<bool> {
     // A graph-authority daemon does not scan a projected checkout in the first
     // place, so host paths there are not content anything failed to admit and
     // counting them would manufacture a disclosure out of the projection.
@@ -651,7 +669,14 @@ pub(crate) fn refresh_untracked_reading(state: &DaemonState) -> Result<bool> {
         return Ok(false);
     }
     let working_dir = state.layout.working_dir();
-    let (_roots, policy) = current_authority_admission(state)?;
+    let policy = if wait_for_admission_pair {
+        current_authority_admission(state)?.1
+    } else {
+        match crate::api::held_authority_admission(state) {
+            Some((_roots, policy)) => policy,
+            None => return Ok(false),
+        }
+    };
     let previous = state.graph.resolved_tree();
     let tracked_paths = previous
         .artifacts_by_path()
@@ -1176,7 +1201,66 @@ fn exact_tree_admission_once(
 /// authority and the observation is planned once more, against the tree
 /// authority actually holds. Once, not in a loop: a second refusal goes back to
 /// the caller and its retry ladder like any other.
+///
+/// The whole of it runs through [`off_the_runtime_worker`]: a publication opens
+/// repository authority end to end, and holding a runtime worker for that long
+/// is how a daemon in the middle of an admission stopped answering `/readiness`.
 fn exact_tree_admission(
+    state: &DaemonState,
+    observation: Option<&BTreeSet<RepoPath>>,
+    publication: TreePublication,
+) -> Result<ExactTreeAdmission> {
+    off_the_runtime_worker(|| {
+        #[cfg(test)]
+        pause_admission_for_test(state);
+        exact_tree_admission_on_this_thread(state, observation, publication)
+    })
+}
+
+/// Run synchronous work that can hold this thread for seconds or minutes
+/// without holding the runtime worker it was called on.
+///
+/// A complete exact-tree admission publishes to repository authority, and the
+/// publication opens the whole store: 78.5 s and 121.9 s on a 3.5 GiB scratch
+/// store, 21 to 32 s a round on the founder's. Inline on a runtime worker it
+/// keeps whatever the scheduler queued on that worker for the whole time, and a
+/// worker's LIFO slot is not stealable, so a daemon in an admission could leave
+/// its listener unpolled: measured, every new connection to `/readiness` waited
+/// out the admission, two 60 s timeouts and then an answer as the publication
+/// finished. `block_in_place` hands the worker's queue to a replacement thread
+/// before the work starts. On a current-thread runtime, where it would refuse
+/// and every task shares the one thread anyway, and off any runtime, including
+/// a blocking-pool thread, the work runs directly.
+pub(crate) fn off_the_runtime_worker<R>(work: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
+/// A pause an admission takes before it starts, for the one daemon state a
+/// test names, so a test can hold an admission open without a store large
+/// enough to make it slow. Keyed by the state's address, so no other test's
+/// admission waits on it.
+#[cfg(test)]
+static ADMISSION_PAUSE_FOR_TEST: std::sync::Mutex<Option<(usize, Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn pause_admission_for_test(state: &DaemonState) {
+    let owner = state as *const DaemonState as usize;
+    let named = *ADMISSION_PAUSE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((named_state, pause)) = named {
+        if named_state == owner {
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+/// [`exact_tree_admission`] on whichever thread it was handed.
+fn exact_tree_admission_on_this_thread(
     state: &DaemonState,
     observation: Option<&BTreeSet<RepoPath>>,
     publication: TreePublication,
@@ -4793,6 +4877,7 @@ mod tests {
     include!("loop_runner/tests/startup_recovery.rs");
     include!("loop_runner/tests/enrichment_churn.rs");
     include!("loop_runner/tests/authority_split.rs");
+    include!("loop_runner/tests/admission_worker.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
