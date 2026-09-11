@@ -184,6 +184,8 @@ LOG = sys.argv[1]
 # Staged operations per transaction, so a commit publishes what was staged rather than
 # answering yes to anything. The server runs with the repository as its cwd.
 STAGED = {}
+# Every session this server has opened, in order.
+SESSIONS = []
 
 TOOLS = [
     {"name": "semantic_locate", "description": "Find entities by meaning.",
@@ -259,7 +261,18 @@ def call(name, args):
     if name == "get_entity_source":
         return payload({"source": "def greet(name):\n    return name\n", "_kin": ENVELOPE})
     if name == "kin_session_start":
-        return payload({"session_id": "sess-fixture-1", "_kin": ENVELOPE})
+        # Numbered, so a harness that re-opens its session gets a new id, as it does from
+        # a daemon that was started again.
+        SESSIONS.append(len(SESSIONS) + 1)
+        return payload({"session_id": "sess-fixture-%d" % SESSIONS[-1], "_kin": ENVELOPE})
+    if name == "kin_transaction_begin":
+        # src/stale.py: the first session is gone, as after a daemon restart; a re-opened
+        # session is accepted. src/nobegin.py: every begin is refused the same way.
+        scope, session = args.get("scope"), args.get("session_id")
+        gone = {"error": "Session not found: " + str(session) + ". It was ended or expired "
+                         "after its idle timeout.", "_kin": ENVELOPE}
+        if scope == "src/nobegin.py" or (scope == "src/stale.py" and session == "sess-fixture-1"):
+            return payload(gone, is_error=True)
     if name == "kin_session_end":
         return payload({"ended": True, "_kin": ENVELOPE})
     if name == "kin_transaction_begin":
@@ -269,7 +282,7 @@ def call(name, args):
         # the mirror of it: a replace whose path authority does not track. TRACKED stands
         # for the fixture graph's contents, so both refusals are the graph's answer rather
         # than a look at the working tree.
-        TRACKED = ("src/greet.py", "README.md", "src/dirty.py")
+        TRACKED = ("src/greet.py", "README.md", "src/dirty.py", "src/stale.py")
         for op in args.get("operations", []):
             verb = op.get("verb")
             target = op.get("target")
@@ -367,6 +380,18 @@ fn fixture_repo(dir: &Path) -> PathBuf {
     std::fs::write(
         repo.join("src/dirty.py"),
         "def stale(name):\n    return name\n",
+    )
+    .unwrap();
+    // The scripted server refuses begin for these two by path: src/stale.py only under the
+    // first session, as after a daemon restart, and src/nobegin.py under every session.
+    std::fs::write(
+        repo.join("src/stale.py"),
+        "def later(name):\n    return name\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/nobegin.py"),
+        "def never(name):\n    return name\n",
     )
     .unwrap();
     repo
@@ -1222,6 +1247,141 @@ fn a_create_authority_refuses_leaves_no_file_and_hands_the_content_back() {
     assert!(
         observation.contains(body),
         "the refused content must come back to the model: {observation}"
+    );
+}
+
+/// When the session is gone, as after the daemon that held it was stopped and started again,
+/// the edit re-opens the session once, begins again under the new one, and lands.
+#[test]
+fn an_edit_after_the_session_is_gone_reopens_it_and_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Fixing it.",
+            Some(tool_call(
+                "c1",
+                "edit_file",
+                json!({ "path": "src/stale.py", "find": "return name", "replace": "return name.strip()" }),
+            )),
+        ),
+        completion("Fixed.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success, "{:?}", outcome.result);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 0);
+
+    let calls = mcp_log(&log);
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_session_end"
+        ],
+        "a gone session is re-opened once and the begin retried: {names:?}"
+    );
+    let stage = calls
+        .iter()
+        .find(|call| call["tool"] == "kin_transaction_stage")
+        .expect("the edit is staged");
+    assert_eq!(
+        stage["args"]["session_id"], "sess-fixture-2",
+        "the stage names the re-opened session"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/stale.py")).unwrap(),
+        "def later(name):\n    return name.strip()\n"
+    );
+}
+
+/// When Kin is attached but no transaction opens, the edit writes nothing and the model is
+/// told why, in the server's own words with the envelope stripped.
+///
+/// The harness used to fall back to a local write and report "Edited", which is how a real
+/// run left ten lines on disk that repository authority never saw.
+#[test]
+fn an_edit_kin_cannot_open_a_transaction_for_writes_nothing_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Fixing it.",
+            Some(tool_call(
+                "c1",
+                "edit_file",
+                json!({ "path": "src/nobegin.py", "find": "return name", "replace": "return name.strip()" }),
+            )),
+        ),
+        completion("Fixed.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/nobegin.py")).unwrap(),
+        "def never(name):\n    return name\n",
+        "nothing may be written without a transaction"
+    );
+
+    let calls = mcp_log(&log);
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_session_end"
+        ],
+        "begin is retried once and nothing is staged: {names:?}"
+    );
+
+    // The refusal's own words reach the trace, not the envelope that comes first.
+    let trace = read_jsonl(&outcome.trace_path);
+    let begin = trace
+        .iter()
+        .rev()
+        .find(|row| row["tool"] == "kin_transaction_begin")
+        .expect("the refused begin is traced");
+    let detail = begin["detail"].as_str().unwrap();
+    assert!(detail.contains("Session not found"), "{detail}");
+    assert!(!detail.contains("envelope_version"), "{detail}");
+
+    let requests = endpoint.requests();
+    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        observation.contains("was not changed")
+            && observation.contains("Session not found")
+            && observation.contains("unchanged on disk and in the graph"),
+        "the model must be told nothing changed and why: {observation}"
     );
 }
 

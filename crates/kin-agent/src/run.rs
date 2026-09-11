@@ -822,11 +822,16 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                             let plan = plan_stage(&repo, tool, &call.arguments);
                                             let mut bracket = begin_transaction(
                                                 &mut servers[index],
+                                                &config,
                                                 session.as_deref(),
                                                 &call.arguments,
                                                 &plan,
                                                 &mut writer,
                                             )?;
+                                            // A gone session is re-opened inside the
+                                            // bracket, so the stage below names the
+                                            // session the transaction was begun under.
+                                            let session = servers[index].session.clone();
                                             // Repository authority writes a created file
                                             // itself as part of publishing the change, so
                                             // a create is published FIRST and is never
@@ -903,6 +908,32 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                         provenance,
                                                     )
                                                 }
+                                            } else if servers[index]
+                                                .declares("kin_transaction_begin")
+                                                && servers[index].declares("kin_transaction_stage")
+                                            {
+                                                // Kin is attached and no transaction opened,
+                                                // so nothing is written: a local write here is
+                                                // a change on disk the graph never hears about,
+                                                // the state a refused commit used to leave.
+                                                counters.unpublished_changes += 1;
+                                                let reason =
+                                                    bracket.reason.clone().unwrap_or_else(|| {
+                                                        "no reason was given".to_string()
+                                                    });
+                                                let provenance = close_transaction(
+                                                    &mut servers[index],
+                                                    bracket,
+                                                    false,
+                                                    &mut writer,
+                                                )?;
+                                                (
+                                                    belt::unbracketed_refusal(
+                                                        &call.arguments,
+                                                        &reason,
+                                                    ),
+                                                    provenance,
+                                                )
                                             } else {
                                                 let mut outcome = match tool {
                                                     LocalTool::Edit => {
@@ -1453,8 +1484,19 @@ impl Bracket {
     }
 }
 
+/// Whether a refused `kin_transaction_begin` says the session it named no longer exists.
+///
+/// A session lives in the daemon that registered it, so a daemon that stops and is started
+/// again for the same repository answers every later call with "session not found" while
+/// the harness still holds the old id. Both the daemon and the MCP session registry word
+/// the refusal this way.
+fn session_is_gone(refusal: &str) -> bool {
+    refusal.to_ascii_lowercase().contains("session not found")
+}
+
 fn begin_transaction(
     server: &mut Server,
+    config: &AgentConfig,
     session: Option<&str>,
     arguments: &Value,
     plan: &StagePlan,
@@ -1481,45 +1523,62 @@ fn begin_transaction(
         .and_then(Value::as_str)
         .unwrap_or("repository")
         .to_string();
-    match server.client.call_tool(
-        "kin_transaction_begin",
-        &json!({ "session_id": session, "scope": scope }),
-    ) {
-        Ok(outcome) if !outcome.is_error => {
-            let transaction_id = extract_id(&outcome, &["transaction_id", "id"]);
-            writer.trace(json!({
-                "surface": "kin",
-                "server": server_name,
-                "tool": "kin_transaction_begin",
-                "policy": "allowed",
-                "event": "transaction_begin",
-                "scope": scope,
-                "wall_ms": outcome.wall_ms as u64,
-                "is_error": false,
-                "transaction_id": transaction_id.clone(),
-            }))?;
-            Ok(Bracket {
-                reason: transaction_id
-                    .is_none()
-                    .then(|| "the server returned no transaction id".to_string()),
-                transaction_id,
-                staged: None,
-            })
+    let mut session = session.to_string();
+    let mut reopened = false;
+    loop {
+        match server.client.call_tool(
+            "kin_transaction_begin",
+            &json!({ "session_id": session, "scope": scope }),
+        ) {
+            Ok(outcome) if !outcome.is_error => {
+                let transaction_id = extract_id(&outcome, &["transaction_id", "id"]);
+                writer.trace(json!({
+                    "surface": "kin",
+                    "server": server_name,
+                    "tool": "kin_transaction_begin",
+                    "policy": "allowed",
+                    "event": "transaction_begin",
+                    "scope": scope,
+                    "wall_ms": outcome.wall_ms as u64,
+                    "is_error": false,
+                    "transaction_id": transaction_id.clone(),
+                }))?;
+                return Ok(Bracket {
+                    reason: transaction_id
+                        .is_none()
+                        .then(|| "the server returned no transaction id".to_string()),
+                    transaction_id,
+                    staged: None,
+                });
+            }
+            Ok(outcome) => {
+                // The envelope comes first in every answer and is longer than the budget, so
+                // it is stripped, or the refusal's own words never reach the trace.
+                let detail = close_detail(&outcome.text);
+                writer.trace(json!({
+                    "surface": "kin",
+                    "server": server_name,
+                    "tool": "kin_transaction_begin",
+                    "policy": "allowed",
+                    "event": "transaction_begin",
+                    "scope": scope,
+                    "is_error": true,
+                    "detail": detail.clone(),
+                }))?;
+                // When the session is gone, re-open once and retry begin, so an edit made
+                // after the daemon was restarted still goes through a transaction.
+                if !reopened && session_is_gone(&outcome.text) {
+                    reopened = true;
+                    if let Some(fresh) = start_kin_session(server, config, writer)? {
+                        server.session = Some(fresh.clone());
+                        session = fresh;
+                        continue;
+                    }
+                }
+                return Ok(Bracket::unopened(detail));
+            }
+            Err(err) => return Ok(Bracket::unopened(err.to_string())),
         }
-        Ok(outcome) => {
-            writer.trace(json!({
-                "surface": "kin",
-                "server": server_name,
-                "tool": "kin_transaction_begin",
-                "policy": "allowed",
-                "event": "transaction_begin",
-                "scope": scope,
-                "is_error": true,
-                "detail": truncate(&outcome.text, 300),
-            }))?;
-            Ok(Bracket::unopened(truncate(&outcome.text, 200)))
-        }
-        Err(err) => Ok(Bracket::unopened(err.to_string())),
     }
 }
 
