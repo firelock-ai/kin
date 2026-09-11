@@ -112,12 +112,63 @@ pub struct AdmissionRuleProvenance {
 pub enum AdmissionDecisionReason {
     NoMatchingRule,
     TrackedArtifact,
-    IntrinsicControl,
+    IntrinsicControl(IntrinsicControl),
     Rule(AdmissionRuleProvenance),
     IgnoredAncestor {
         ancestor: RepoPath,
         rule: AdmissionRuleProvenance,
     },
+}
+
+/// What one path component that names repository control actually is.
+///
+/// The three differ in one thing: whether tracking can make the path ordinary
+/// content. Only the nested case can, because a control directory a tree tracks
+/// was put there on purpose. The other two are structural facts about where the
+/// component sits, and no amount of tracking changes either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntrinsicControlKind {
+    /// This repository's own control directory, at the repository root. It
+    /// holds the repository rather than belonging to it, so it is never
+    /// content, and a tree that tracks one is describing a different
+    /// repository's root than the one being admitted.
+    OwnControlDirectory,
+    /// The control directory of a repository nested inside this one. Untracked,
+    /// it is that repository's live state and admitting it would pull another
+    /// store's internals in as content. Tracked, somebody committed it here
+    /// deliberately, which is what a startup-recovery or migration fixture is.
+    ///
+    /// Git's own index refuses to add a path with a `.git` component, so in
+    /// practice a tracked nested control directory reaches Kin spelled `.kin`
+    /// or `.git-export`. The rule does not depend on that, and says what it
+    /// means for all three.
+    NestedControlDirectory,
+    /// Transient state one Kin run writes beside the work and removes when it
+    /// finishes. Kin stays free to create and delete these anywhere under the
+    /// tree while it works, so a marker path that were also tracked content
+    /// would make the next reconcile choose between its own scratch directory
+    /// and the operator's file. Excluded wherever it appears.
+    RuntimeMarker,
+}
+
+/// The intrinsic-control component of one repository path, with what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntrinsicControl {
+    /// The offending component's exact bytes, so a refusal can name it.
+    pub component: Vec<u8>,
+    pub kind: IntrinsicControlKind,
+}
+
+impl IntrinsicControl {
+    /// Whether this component keeps the path out of repository content.
+    ///
+    /// Tracking decides the nested case and nothing else.
+    pub const fn excludes(&self, tracked: bool) -> bool {
+        match self.kind {
+            IntrinsicControlKind::OwnControlDirectory | IntrinsicControlKind::RuntimeMarker => true,
+            IntrinsicControlKind::NestedControlDirectory => !tracked,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,12 +290,24 @@ impl ResolvedAdmissionMatcher {
         self.generation
     }
 
+    /// Judge one path against this generation.
+    ///
+    /// Intrinsic control is asked first and tracking second, and the order is
+    /// load-bearing in both directions. A live control directory must stay out
+    /// whatever the tree says, and a control directory the tree tracks on
+    /// purpose must come in, so this asks `IntrinsicControl::excludes` with the
+    /// same `tracked` the next check would use rather than refusing before
+    /// tracking is consulted at all. Refusing first is what stopped `kin init`
+    /// on a repository carrying a nested control directory as a test fixture,
+    /// after twenty-eight minutes of import work (FIR-3527).
     pub fn decide(&self, path: &RepoPath, is_dir: bool, tracked: bool) -> AdmissionDecision {
-        if is_intrinsic_repository_control_path(path) {
-            return AdmissionDecision {
-                admitted: false,
-                reason: AdmissionDecisionReason::IntrinsicControl,
-            };
+        if let Some(control) = intrinsic_repository_control(path) {
+            if control.excludes(tracked) {
+                return AdmissionDecision {
+                    admitted: false,
+                    reason: AdmissionDecisionReason::IntrinsicControl(control),
+                };
+            }
         }
         if tracked {
             return AdmissionDecision {
@@ -453,11 +516,19 @@ fn ancestors(path: &RepoPath) -> impl Iterator<Item = RepoPath> + '_ {
         .filter_map(|(index, _)| RepoPath::from_bytes(path.as_bytes()[..index].to_vec()).ok())
 }
 
-fn is_intrinsic_repository_control_component(component: &[u8]) -> bool {
+/// A component naming a repository's control directory, Kin's or Git's.
+///
+/// Spelling only. Where the component sits decides what it means, and
+/// [`intrinsic_repository_control`] is what asks that.
+fn is_control_directory_component(component: &[u8]) -> bool {
     component.eq_ignore_ascii_case(b".kin")
         || component.eq_ignore_ascii_case(b".git")
         || component.eq_ignore_ascii_case(b".git-export")
-        || component.eq_ignore_ascii_case(b".kin-session")
+}
+
+/// A component naming transient state that belongs to one Kin run.
+fn is_runtime_marker_component(component: &[u8]) -> bool {
+    component.eq_ignore_ascii_case(b".kin-session")
         || component.eq_ignore_ascii_case(b".kin-session.json")
         || component.eq_ignore_ascii_case(b".kin-shadow")
         || component
@@ -468,10 +539,47 @@ fn is_intrinsic_repository_control_component(component: &[u8]) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b".kin-checkout-"))
 }
 
+/// The intrinsic-control component of `path`, and what kind it is.
+///
+/// The strongest answer wins, because the stronger one refuses whatever the
+/// tree says: a runtime marker anywhere outranks a control directory, and the
+/// repository's own control directory outranks a nested one. Component zero is
+/// the repository's own by construction, since `RepoPath` is relative and
+/// non-empty and carries no empty, `.` or `..` components, so the first
+/// component is always an entry at the repository root.
+pub fn intrinsic_repository_control(path: &RepoPath) -> Option<IntrinsicControl> {
+    let mut nested = None;
+    for (index, component) in path.as_bytes().split(|byte| *byte == b'/').enumerate() {
+        if is_runtime_marker_component(component) {
+            return Some(IntrinsicControl {
+                component: component.to_vec(),
+                kind: IntrinsicControlKind::RuntimeMarker,
+            });
+        }
+        if is_control_directory_component(component) {
+            if index == 0 {
+                return Some(IntrinsicControl {
+                    component: component.to_vec(),
+                    kind: IntrinsicControlKind::OwnControlDirectory,
+                });
+            }
+            nested.get_or_insert_with(|| IntrinsicControl {
+                component: component.to_vec(),
+                kind: IntrinsicControlKind::NestedControlDirectory,
+            });
+        }
+    }
+    nested
+}
+
+/// Whether any component of `path` names repository control at all.
+///
+/// This is the narrow spelling question and it is not the admission one.
+/// Admission asks [`intrinsic_repository_control`], because position and
+/// tracking decide the outcome and a tracked nested control directory is
+/// ordinary content.
 pub fn is_intrinsic_repository_control_path(path: &RepoPath) -> bool {
-    path.as_bytes()
-        .split(|byte| *byte == b'/')
-        .any(is_intrinsic_repository_control_component)
+    intrinsic_repository_control(path).is_some()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -919,5 +1027,206 @@ def build_match_query(term):
                 "placeholder or short value must stay admissible: {line:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fir3527_intrinsic_control {
+    use super::*;
+
+    /// The exact path kin's own repository tracks, which `kin init` refused.
+    const KIN_FIXTURE: &str =
+        "scripts/release-proof/startup-recovery/fixtures/legacy-fixed/.kin/config.toml";
+
+    const BOTH_CASES: [AdmissionCase; 2] = [AdmissionCase::Sensitive, AdmissionCase::FoldAscii];
+
+    fn decide(path: &str, tracked: bool, case: AdmissionCase) -> AdmissionDecision {
+        ResolvedAdmissionMatcher::empty(case).decide(
+            &RepoPath::from_utf8(path).unwrap(),
+            false,
+            tracked,
+        )
+    }
+
+    fn control(decision: &AdmissionDecision) -> &IntrinsicControl {
+        match &decision.reason {
+            AdmissionDecisionReason::IntrinsicControl(control) => control,
+            other => panic!("expected an intrinsic-control refusal, got {other:?}"),
+        }
+    }
+
+    /// THE PROPERTY FIR-3527 IS ABOUT. A control directory the tree tracks is
+    /// content, because tracking is how a tree says somebody put it there.
+    ///
+    /// kin's own repository tracks two of these as startup-recovery fixtures,
+    /// so `kin init` on a full-history clone of kin imported the whole history
+    /// and then refused on this one path, twenty-eight minutes in. The fixture
+    /// path is spelled here exactly as kin spells it, because that is the case
+    /// that had to work.
+    ///
+    /// Both matching cases, because the refusal blamed case folding and case
+    /// had nothing to do with it: `decide` refused before any rule could run.
+    #[test]
+    fn a_tracked_nested_control_directory_is_ordinary_content() {
+        for case in BOTH_CASES {
+            let decision = decide(KIN_FIXTURE, true, case);
+            assert!(
+                decision.admitted,
+                "a tracked nested control directory must be admitted under {case:?}: {decision:?}"
+            );
+            assert_eq!(
+                decision.reason,
+                AdmissionDecisionReason::TrackedArtifact,
+                "it must be admitted for being tracked, not by a rule that happened to miss it"
+            );
+        }
+    }
+
+    /// THE CONTROL for the property above, and the half that must not move.
+    ///
+    /// The same shape untracked is a repository somebody ran `kin init` inside,
+    /// and admitting it would pull that store's internals in as this
+    /// repository's content. Without this pair the change above reads as "stop
+    /// excluding `.kin`", which is not what it says.
+    #[test]
+    fn an_untracked_nested_control_directory_is_still_control() {
+        for case in BOTH_CASES {
+            let decision = decide("vendor/other-repo/.kin/config.toml", false, case);
+            assert!(
+                decision.is_ignored(),
+                "an untracked nested control directory must stay refused under {case:?}: \
+                 {decision:?}"
+            );
+            assert_eq!(
+                control(&decision).kind,
+                IntrinsicControlKind::NestedControlDirectory,
+                "the refusal must say it is a nested control directory, since that is the one \
+                 kind tracking can change"
+            );
+            assert_eq!(
+                control(&decision).component,
+                b".kin".to_vec(),
+                "the refusal must name the component it decided on"
+            );
+        }
+    }
+
+    /// The repository's own control directory is never content, tracked or not.
+    ///
+    /// This is the line the fix must not cross. A tree that tracks a root
+    /// `.kin` is describing some other repository's root, and admitting it
+    /// would let a store's own bytes become artifacts inside itself.
+    ///
+    /// Spelled `.KIN` as well, because the intrinsic check folds ASCII case in
+    /// both matching modes and always did. Pinning that here is the point: the
+    /// refusal a reader saw named a matching mode, and the matching mode was
+    /// never consulted.
+    #[test]
+    fn the_repositorys_own_control_directory_is_never_content() {
+        for case in BOTH_CASES {
+            for tracked in [true, false] {
+                for path in [
+                    ".kin/config.toml",
+                    ".KIN/config.toml",
+                    ".git/config",
+                    ".git-export/HEAD",
+                ] {
+                    let decision = decide(path, tracked, case);
+                    assert!(
+                        decision.is_ignored(),
+                        "{path} must stay refused with tracked={tracked} under {case:?}: \
+                         {decision:?}"
+                    );
+                    assert_eq!(
+                        control(&decision).kind,
+                        IntrinsicControlKind::OwnControlDirectory,
+                        "{path} is the repository's own control directory, tracked={tracked}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A runtime marker is never content, wherever it sits and whatever the
+    /// tree says.
+    ///
+    /// Kin writes and removes these anywhere under the tree while it works, so
+    /// a marker path that were also tracked content would make the next
+    /// reconcile choose between its own scratch directory and the operator's
+    /// file. Tracking cannot buy its way past that, which is why this arm runs
+    /// `tracked = true` as well.
+    #[test]
+    fn a_runtime_marker_is_never_content_wherever_it_sits() {
+        for case in BOTH_CASES {
+            for tracked in [true, false] {
+                for path in [
+                    ".kin-shadow/tree/main.rs",
+                    "nested/deep/.kin-shadow/tree/main.rs",
+                    ".kin-session/state.json",
+                    ".kin-session.json",
+                    "nested/.kin-reconcile-9f2a/plan.json",
+                    "nested/.kin-checkout-9f2a/plan.json",
+                    "nested/.KIN-SHADOW/tree/main.rs",
+                ] {
+                    let decision = decide(path, tracked, case);
+                    assert!(
+                        decision.is_ignored(),
+                        "{path} must stay refused with tracked={tracked} under {case:?}: \
+                         {decision:?}"
+                    );
+                    assert_eq!(
+                        control(&decision).kind,
+                        IntrinsicControlKind::RuntimeMarker,
+                        "{path} is transient run state, tracked={tracked}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The strongest answer wins when one path carries more than one.
+    ///
+    /// A tracked fixture repository is content, and a shadow tree inside it is
+    /// still a shadow tree. Reading components left to right and stopping at
+    /// the first would admit this whole subtree the moment the fixture became
+    /// tracked, which is the quiet way a fix like this goes wrong.
+    #[test]
+    fn a_marker_below_a_tracked_nested_control_directory_still_refuses() {
+        let decision = decide(
+            "fixtures/legacy-fixed/.kin/.kin-shadow/tree/main.rs",
+            true,
+            AdmissionCase::Sensitive,
+        );
+        assert!(
+            decision.is_ignored(),
+            "a marker under a tracked fixture must still refuse: {decision:?}"
+        );
+        assert_eq!(
+            control(&decision).kind,
+            IntrinsicControlKind::RuntimeMarker,
+            "the marker is the stronger answer and must be the one reported"
+        );
+    }
+
+    /// An ordinary path carries no intrinsic control at all, which is the
+    /// positive control for every negative above: if
+    /// `intrinsic_repository_control` answered `None` for everything, each test
+    /// above would still pass its admitted arm and fail its refused arms, and
+    /// this pins the other side.
+    #[test]
+    fn an_ordinary_path_names_no_control_at_all() {
+        for path in ["src/main.rs", "kindb/graph.kidx", "docs/.kinignore"] {
+            assert_eq!(
+                intrinsic_repository_control(&RepoPath::from_utf8(path).unwrap()),
+                None,
+                "{path} names no repository control"
+            );
+            assert!(!is_intrinsic_repository_control_path(
+                &RepoPath::from_utf8(path).unwrap()
+            ));
+        }
+        assert!(is_intrinsic_repository_control_path(
+            &RepoPath::from_utf8(KIN_FIXTURE).unwrap()
+        ));
     }
 }

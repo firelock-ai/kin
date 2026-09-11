@@ -6010,12 +6010,13 @@ struct ArtifactAdmissionContext<'a> {
     case: crate::admission::AdmissionCase,
 }
 
-/// Name the rule that decided an exclusion.
+/// Name what decided an exclusion.
 ///
 /// A refusal that says only "excluded by the exact graph-owned admission policy"
 /// tells a reader that something matched and not what, so the next step is to
 /// guess. `AdmissionDecisionReason` already carries the source, the line, the
-/// pattern and whether it was negated; this renders them.
+/// pattern and whether it was negated, or the control component and what it is;
+/// this renders them.
 fn describe_admission_exclusion(reason: &crate::admission::AdmissionDecisionReason) -> String {
     fn source_name(source: &ResolvedAdmissionRuleSource) -> String {
         match source {
@@ -6039,16 +6040,67 @@ fn describe_admission_exclusion(reason: &crate::admission::AdmissionDecisionReas
             provenance.line
         )
     }
+    fn intrinsic(control: &crate::admission::IntrinsicControl) -> String {
+        let component = String::from_utf8_lossy(&control.component);
+        match control.kind {
+            crate::admission::IntrinsicControlKind::OwnControlDirectory => format!(
+                "component {component:?} is this repository's own control directory, which holds \
+                 the repository rather than belonging to it"
+            ),
+            crate::admission::IntrinsicControlKind::NestedControlDirectory => format!(
+                "component {component:?} is the control directory of a repository nested inside \
+                 this one and nothing tracks it, so it is that repository's live state rather \
+                 than content committed here"
+            ),
+            crate::admission::IntrinsicControlKind::RuntimeMarker => format!(
+                "component {component:?} is transient state one Kin run owns, which is never \
+                 repository content wherever it appears"
+            ),
+        }
+    }
     match reason {
         crate::admission::AdmissionDecisionReason::Rule(provenance) => rule(provenance),
         crate::admission::AdmissionDecisionReason::IgnoredAncestor {
             ancestor,
             rule: provenance,
         } => format!("ancestor {ancestor} excluded by {}", rule(provenance)),
-        // These three ADMIT, so reaching them behind `is_ignored()` means the
+        crate::admission::AdmissionDecisionReason::IntrinsicControl(control) => intrinsic(control),
+        // These two ADMIT, so reaching them behind `is_ignored()` means the
         // decision and its reason disagree. Say that rather than invent a rule.
         other => format!("no rule recorded, which disagrees with the decision: {other:?}"),
     }
+}
+
+/// Say why one artifact was refused, in the terms the decision was made in.
+///
+/// A rule decided under one matching case and could decide the same policy bytes
+/// differently under the other, so a rule refusal names the case it matched
+/// under and that clause is load-bearing. An intrinsic control path is
+/// structural: no rule ran, no case applied, and appending the clause anyway
+/// sent a reader hunting for a policy line nothing had consulted, over a
+/// decision case could not have changed. FIR-3527 is what that pairing cost.
+fn admission_refusal(
+    label: &str,
+    path: &RepoPath,
+    reason: &crate::admission::AdmissionDecisionReason,
+    case: crate::admission::AdmissionCase,
+) -> String {
+    let description = describe_admission_exclusion(reason);
+    if matches!(
+        reason,
+        crate::admission::AdmissionDecisionReason::IntrinsicControl(_)
+    ) {
+        return format!("{label} artifact {path} is not repository content: {description}");
+    }
+    let (applied, other) = match case {
+        crate::admission::AdmissionCase::Sensitive => ("case-sensitive", "ASCII-folded"),
+        crate::admission::AdmissionCase::FoldAscii => ("ASCII-folded", "case-sensitive"),
+    };
+    format!(
+        "{label} artifact {path} is excluded by the exact graph-owned admission policy: \
+         {description}, matched under {applied} matching, which is the case this replica admits \
+         under; {other} matching can decide the same policy bytes differently"
+    )
 }
 
 /// Judge one proposed artifact against the exact rules that bind it.
@@ -6070,19 +6122,11 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
 ) -> Result<(), KinDbError> {
     let decision = matcher.decide(&artifact.path, false, context.tracked);
     if decision.is_ignored() {
-        let (applied, other) = match context.case {
-            crate::admission::AdmissionCase::Sensitive => ("case-sensitive", "ASCII-folded"),
-            crate::admission::AdmissionCase::FoldAscii => ("ASCII-folded", "case-sensitive"),
-        };
-        return Err(ModelError::InvalidOperation(format!(
-            "{} artifact {} is excluded by the exact graph-owned admission policy: {}, matched \
-             under {} matching, which is the case this replica admits under; {} matching can \
-             decide the same policy bytes differently",
+        return Err(ModelError::InvalidOperation(admission_refusal(
             context.label,
-            artifact.path,
-            describe_admission_exclusion(&decision.reason),
-            applied,
-            other
+            &artifact.path,
+            &decision.reason,
+            context.case,
         ))
         .into());
     }
@@ -25193,5 +25237,205 @@ mod fir3064_open_cost {
         drop(lease);
         drop(manager);
         report("after_drop", started, after_graph_kb);
+    }
+}
+
+#[cfg(test)]
+mod fir3527_refusal_wording {
+    use super::*;
+    use crate::admission::AdmissionCase;
+
+    /// The exact path kin's own repository tracks, which `kin init` refused.
+    const KIN_FIXTURE: &str =
+        "scripts/release-proof/startup-recovery/fixtures/legacy-fixed/.kin/config.toml";
+
+    fn artifact(path: &str) -> ResolvedArtifact {
+        ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8(path).unwrap(),
+            TreeEntry::Blob {
+                hash: Hash256::from_bytes([0; 32]),
+                executable: false,
+            },
+        )
+    }
+
+    /// Judge one artifact through the real call site.
+    ///
+    /// The formatter is deliberately not called directly. A test that renders
+    /// the string itself cannot see a caller appending the case clause on its
+    /// own, and the caller is exactly where that clause used to live.
+    fn judge(
+        path: &str,
+        tracked: bool,
+        case: AdmissionCase,
+        rules: Option<&[u8]>,
+    ) -> Result<(), KinDbError> {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let backend = crate::storage::backend::LocalFileBackend::new(directory.path());
+        let matcher = match rules {
+            None => ResolvedAdmissionMatcher::empty(case),
+            Some(body) => ResolvedAdmissionMatcher::compile(
+                case,
+                vec![ResolvedAdmissionRuleSet::from_bytes(
+                    ResolvedAdmissionRuleSource::GlobalExclude,
+                    0,
+                    None,
+                    body.to_vec(),
+                )],
+            )
+            .expect("one global rule set compiles"),
+        };
+        let policy = SharedAdmissionPolicy::empty(0);
+        verify_artifact_admission(
+            &backend,
+            &RepositoryId::new("fir3527-refusal-wording").expect("repository id"),
+            &matcher,
+            &artifact(path),
+            ArtifactAdmissionContext {
+                policy: &policy,
+                tracked,
+                gitlink_is_admitted: false,
+                label: "workspace",
+                case,
+            },
+        )
+    }
+
+    fn refusal(path: &str, tracked: bool, case: AdmissionCase, rules: Option<&[u8]>) -> String {
+        judge(path, tracked, case, rules)
+            .expect_err("this fixture must be refused")
+            .to_string()
+    }
+
+    /// The kin fixture that cost twenty-eight minutes is admitted here, through
+    /// the verifier `kin init` actually calls rather than through the matcher
+    /// alone.
+    #[test]
+    fn the_tracked_kin_fixture_is_admitted_through_the_verifier() {
+        for case in [AdmissionCase::Sensitive, AdmissionCase::FoldAscii] {
+            judge(KIN_FIXTURE, true, case, None).unwrap_or_else(|error| {
+                panic!("the tracked kin fixture must be admitted under {case:?}: {error}")
+            });
+        }
+    }
+
+    /// A TRACKED ROOT CONTROL DIRECTORY IS STILL REFUSED, and the refusal says
+    /// whose it is rather than leaving the reader to work that out.
+    ///
+    /// This is the line the FIR-3527 fix must not cross. Tracking admits a
+    /// nested control directory and nothing else, so a tree that tracks a root
+    /// `.kin` is describing another repository's root, and admitting it would
+    /// let a store's own bytes become artifacts inside itself.
+    #[test]
+    fn a_tracked_root_control_directory_is_refused_as_this_repositorys_own() {
+        for case in [AdmissionCase::Sensitive, AdmissionCase::FoldAscii] {
+            let message = refusal(".kin/config.toml", true, case, None);
+            assert!(
+                message.contains("this repository's own control directory"),
+                "the refusal must name whose control directory decided it: {message}"
+            );
+            assert!(
+                message.contains("\".kin\""),
+                "the refusal must name the component that decided, quoted so it is readable \
+                 apart from the path: {message}"
+            );
+            assert!(
+                message.contains(".kin/config.toml"),
+                "the refusal must name the artifact: {message}"
+            );
+        }
+    }
+
+    /// AN INTRINSIC REFUSAL SAYS WHAT IT IS AND NEVER NAMES A MATCHING CASE.
+    ///
+    /// The old message ran every refusal through one sentence: excluded by the
+    /// policy, reason, "matched under {case} matching ... {other} matching can
+    /// decide the same policy bytes differently". For a rule that is exactly
+    /// right. For an intrinsic control path it made two wrong claims at once.
+    /// No rule had been recorded, so the reason fell through to the arm written
+    /// for the decisions that ADMIT and printed "no rule recorded, which
+    /// disagrees with the decision", which reads as an internal inconsistency.
+    /// And no case had applied, so the clause sent the reader after a
+    /// matching-mode difference that could not have decided anything.
+    ///
+    /// A lane read that message after twenty-eight minutes of import work and
+    /// diagnosed case folding. The mechanism was the tracked check running
+    /// second. So this pins the words.
+    #[test]
+    fn an_intrinsic_refusal_names_the_control_and_carries_no_case_clause() {
+        for (path, tracked, phrase) in [
+            (
+                ".kin/config.toml",
+                true,
+                "this repository's own control directory",
+            ),
+            (
+                "vendor/other-repo/.kin/config.toml",
+                false,
+                "control directory of a repository nested inside",
+            ),
+            (
+                "nested/.kin-shadow/tree/main.rs",
+                true,
+                "transient state one Kin run owns",
+            ),
+        ] {
+            for case in [AdmissionCase::Sensitive, AdmissionCase::FoldAscii] {
+                let message = refusal(path, tracked, case, None);
+                assert!(
+                    message.contains(phrase),
+                    "the refusal for {path} must say what the component is: {message}"
+                );
+                assert!(
+                    !message.contains("no rule recorded"),
+                    "an intrinsic refusal must not claim its own decision disagrees with itself: \
+                     {message}"
+                );
+                for clause in [
+                    "matched under",
+                    "case-sensitive",
+                    "ASCII-folded",
+                    "policy bytes differently",
+                ] {
+                    assert!(
+                        !message.contains(clause),
+                        "an intrinsic refusal must not name a matching case, because none was \
+                         consulted; found {clause:?} in: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE CONTROL for the test above. A rule-decided refusal still carries the
+    /// case clause, because there it is the whole point: the same policy bytes
+    /// can decide the other way under the other case.
+    ///
+    /// Without this pair, deleting the clause outright would pass.
+    #[test]
+    fn a_rule_decided_refusal_still_names_the_case_it_matched_under() {
+        let message = refusal(
+            "secrets/value.txt",
+            false,
+            AdmissionCase::Sensitive,
+            Some(b"secrets/*\n"),
+        );
+        assert!(
+            message.contains("excluded by the exact graph-owned admission policy"),
+            "a rule refusal must still name the policy: {message}"
+        );
+        assert!(
+            message.contains("matched under case-sensitive matching"),
+            "a rule refusal must name the case it matched under: {message}"
+        );
+        assert!(
+            message.contains("ASCII-folded matching can decide the same policy bytes differently"),
+            "a rule refusal must name the other case too: {message}"
+        );
+        assert!(
+            message.contains("secrets/*"),
+            "a rule refusal must name the rule that decided: {message}"
+        );
     }
 }
