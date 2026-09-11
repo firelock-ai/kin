@@ -436,6 +436,71 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
+    reconcile_source_tree_and_commit_accepting_targets(
+        root,
+        previous_tree,
+        target_tree,
+        previous_entries,
+        entries,
+        authority,
+        transaction,
+        None,
+    )
+}
+
+/// Reconcile a graph-derived working tree and publish its repository
+/// transaction, accepting paths the transaction itself authored whose working
+/// copy already holds their exact target bytes.
+///
+/// A writer that authored a path's new content and put those bytes on disk
+/// before committing is publishing a change the working copy already shows.
+/// [`reconcile_source_tree_and_commit_repository_transaction`] calls that path
+/// drift, because it holds every tracked path to the previous tree. Here an
+/// authored path is held to its previous body or to its exact target body,
+/// read through the same no-follow capability and identity revalidation as
+/// every other path. A path already at its target is neither written nor
+/// journaled, so a failure before the authority commit leaves the author's
+/// bytes where the author put them. Every path the transaction did not author
+/// is still held to the previous tree byte for byte, and an authored path
+/// holding any third body is refused exactly as before. Authority itself still
+/// compares against the original previous tree; only the filesystem baseline
+/// moves.
+///
+/// Each authored path must name a regular-file entry of the target tree.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_source_tree_and_commit_authored_repository_transaction<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    authored_paths: &BTreeSet<RepoPath>,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    reconcile_source_tree_and_commit_accepting_targets(
+        root,
+        previous_tree,
+        target_tree,
+        previous_entries,
+        entries,
+        authority,
+        transaction,
+        Some(authored_paths),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_source_tree_and_commit_accepting_targets<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    accepted_target_paths: Option<&BTreeSet<RepoPath>>,
+) -> Result<(usize, RepositoryCommitReceipt)> {
     let entries = validated_source_entries(entries)?;
     let previous_entries = validated_source_entries(previous_entries)?;
     validate_repository_projection_transaction(
@@ -461,6 +526,7 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         &should_preserve_checkout_path,
         ReconciledProjectionOptions {
             open_mode: ProjectionOpenMode::ExistingRepositoryFrozen(authority),
+            accepted_target_paths,
             ..ReconciledProjectionOptions::default()
         },
         || {},

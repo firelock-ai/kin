@@ -430,8 +430,91 @@ pub fn resolve_across_repos(repos: &[PathBuf], raw: &str) -> Result<(usize, Path
     }
 }
 
-/// Run `edit_file`.
+/// An `edit_file` call resolved against the file's current text, before anything is written.
+///
+/// The harness publishes an edit through repository authority, and authority's projection is
+/// what writes the file, so the edit is computed here and handed to the stage as the file's
+/// complete new text instead of being applied to the working copy first.
+#[derive(Debug, Clone)]
+pub struct PlannedEdit {
+    /// The path as the model wrote it, for the messages the model reads.
+    pub raw_path: String,
+    /// The resolved path inside the repository.
+    pub path: PathBuf,
+    /// How many occurrences the edit replaces.
+    pub replaced: usize,
+    /// The file's length before the edit, in bytes.
+    pub before_len: usize,
+    /// The file's complete new text.
+    pub updated: String,
+}
+
+impl PlannedEdit {
+    /// What the edit does, without saying whether it landed.
+    fn summary(&self) -> String {
+        format!(
+            "Edited `{}`: replaced {} occurrence{} ({} bytes before, {} after)",
+            self.raw_path,
+            self.replaced,
+            if self.replaced == 1 { "" } else { "s" },
+            self.before_len,
+            self.updated.len()
+        )
+    }
+}
+
+/// Run `edit_file` on the working copy directly.
+///
+/// This is the path for an edit no transaction brackets. A bracketed edit is planned with
+/// [`plan_edit`] and published through repository authority, which writes the file itself.
 pub fn run_edit(repo: &Path, arguments: &Value) -> LocalOutcome {
+    let planned = match plan_edit(repo, arguments) {
+        Ok(planned) => planned,
+        Err(refusal) => return refusal,
+    };
+    if let Err(err) = std::fs::write(&planned.path, &planned.updated) {
+        return LocalOutcome::error(format!("could not write `{}`: {err}", planned.raw_path));
+    }
+    LocalOutcome {
+        text: format!("{}.", planned.summary()),
+        is_error: false,
+        changed: Some(planned.raw_path.clone()),
+        body: Some(planned.updated),
+    }
+}
+
+/// The outcome of an `edit_file` whose change repository authority published for us.
+///
+/// The new text reached the working copy through the commit rather than through this
+/// process, so nothing is written here; the model is told what landed and who wrote it.
+pub fn published_edit(planned: PlannedEdit) -> LocalOutcome {
+    LocalOutcome {
+        text: format!(
+            "{} and published it through repository authority, which wrote the file.",
+            planned.summary()
+        ),
+        is_error: false,
+        changed: Some(planned.raw_path.clone()),
+        body: Some(planned.updated),
+    }
+}
+
+/// The outcome of an `edit_file` repository authority did not publish.
+///
+/// Nothing was written. The edit exists only in the model's own call, the working copy and
+/// the graph both still hold the file as it was, and the model is told so, with the server's
+/// reason, so it can correct the cause and send the edit again.
+pub fn unpublished_edit(planned: &PlannedEdit, reason: &str) -> LocalOutcome {
+    LocalOutcome::error(format!(
+        "The edit of `{path}` did not land: repository authority did not publish it: {reason}. \
+         Nothing was written, so `{path}` is unchanged on disk and in the graph. Correct the \
+         cause and send the edit again.",
+        path = planned.raw_path,
+    ))
+}
+
+/// Resolve an `edit_file` call against the file's current text without writing anything.
+pub fn plan_edit(repo: &Path, arguments: &Value) -> Result<PlannedEdit, LocalOutcome> {
     let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
     let find = arguments.get("find").and_then(Value::as_str).unwrap_or("");
     let replace = arguments
@@ -443,55 +526,37 @@ pub fn run_edit(repo: &Path, arguments: &Value) -> LocalOutcome {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let path = match resolve_in_repo(repo, raw_path) {
-        Ok(path) => path,
-        Err(message) => return LocalOutcome::error(message),
-    };
-    let original = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) => {
-            return LocalOutcome::error(format!(
-                "could not read `{raw_path}`: {err}. Use Kin to find the file before editing it."
-            ))
-        }
-    };
+    let path = resolve_in_repo(repo, raw_path).map_err(LocalOutcome::error)?;
+    let original = std::fs::read_to_string(&path).map_err(|err| {
+        LocalOutcome::error(format!(
+            "could not read `{raw_path}`: {err}. Use Kin to find the file before editing it."
+        ))
+    })?;
     let occurrences = original.matches(find).count();
     if occurrences == 0 {
-        return LocalOutcome::error(format!(
+        return Err(LocalOutcome::error(format!(
             "the `find` text does not appear in `{raw_path}`. Read the exact current text with \
              {KIN_TOOL_PREFIX}get_entity_source before editing, and match it byte for byte."
-        ));
+        )));
     }
     if occurrences > 1 && !replace_all {
-        return LocalOutcome::error(format!(
+        return Err(LocalOutcome::error(format!(
             "the `find` text appears {occurrences} times in `{raw_path}`. Give a longer, unique \
              snippet, or set replace_all to true if every occurrence should change."
-        ));
+        )));
     }
     let updated = if replace_all {
         original.replace(find, replace)
     } else {
         original.replacen(find, replace, 1)
     };
-    if let Err(err) = std::fs::write(&path, &updated) {
-        return LocalOutcome::error(format!("could not write `{raw_path}`: {err}"));
-    }
-    LocalOutcome {
-        text: format!(
-            "Edited `{raw_path}`: replaced {} occurrence{} ({} bytes before, {} after).",
-            if replace_all { occurrences } else { 1 },
-            if replace_all && occurrences != 1 {
-                "s"
-            } else {
-                ""
-            },
-            original.len(),
-            updated.len()
-        ),
-        is_error: false,
-        changed: Some(raw_path.to_string()),
-        body: Some(updated),
-    }
+    Ok(PlannedEdit {
+        raw_path: raw_path.to_string(),
+        path,
+        replaced: if replace_all { occurrences } else { 1 },
+        before_len: original.len(),
+        updated,
+    })
 }
 
 /// Run `write_file`.
@@ -546,6 +611,25 @@ pub fn published_create(arguments: &Value) -> LocalOutcome {
         changed: Some(raw_path.to_string()),
         body: Some(content.to_string()),
     }
+}
+
+/// The outcome of a `write_file` repository authority did not publish.
+///
+/// Nothing is written, so the path stays exactly as it was on disk and in the graph. The
+/// refused content comes back in the result, which is where the model keeps its work: a
+/// copy left on disk was a file the graph did not hold, the same split a refused edit left.
+pub fn unpublished_create(arguments: &Value, reason: &str) -> LocalOutcome {
+    let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    let content = arguments
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    LocalOutcome::error(format!(
+        "`{raw_path}` was not created: repository authority did not publish it: {reason}. \
+         Nothing was written, so `{raw_path}` is unchanged on disk and in the graph. The {} \
+         bytes you sent follow, so you can correct the cause and send them again:\n{content}",
+        content.len()
+    ))
 }
 
 impl LocalOutcome {

@@ -827,12 +827,12 @@
     },
     {
       "file": "crates/kin-agent/src/belt.rs",
-      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module is the write boundary. `edit_file` reads the one file it is about to change so a find-and-replace can be exact and can refuse an ambiguous match, and `write_file` writes the one file it was given; both resolve the path inside the repository first and refuse any escape. Neither answers a question: the model has already been told where the code is by `mcp__kin__semantic_locate` and what it says by `mcp__kin__get_entity_source`, and nothing derived from these reads reaches a tool result. Pinned rather than whole-file so a newly added filesystem primitive in this module fails the guard, which is exactly what should happen if anyone ever adds a read or search tool to the belt.",
+      "reason": "kin-agent is a CLIENT of graph authority, never a source of it. It reaches Kin only through the MCP server over stdio, so every tool result it hands a model comes from the graph, and it deliberately ships no file-read, file-search or shell tool for a model to call. The filesystem and subprocess touches here are the two explicit boundaries the zero-file-search rule allows: materializing an edit the model asked for, and writing the run's own transcript. This module is the write boundary. `edit_file` reads the one file it is about to change so a find-and-replace can be exact and can refuse an ambiguous match. When a Kin transaction brackets the call, the edit's complete new text is staged and repository authority's commit writes the file; the harness writes it itself, as `write_file` writes the one file it was given, only when no transaction could be opened. Both resolve the path inside the repository first and refuse any escape. Neither answers a question: the model has already been told where the code is by `mcp__kin__semantic_locate` and what it says by `mcp__kin__get_entity_source`, and nothing derived from these reads reaches a tool result. Pinned rather than whole-file so a newly added filesystem primitive in this module fails the guard, which is exactly what should happen if anyone ever adds a read or search tool to the belt.",
       "owner": "kin-agent",
       "expiration": "2026-12-31",
       "allow_match": [
         "std::fs::read_to_string(&path)",
-        "std::fs::write(&path, &updated)",
+        "std::fs::write(&planned.path, &planned.updated)",
         "std::fs::create_dir_all(parent)",
         "path.exists()",
         "std::fs::write(&path, content)"

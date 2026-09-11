@@ -44198,6 +44198,134 @@ mod tests {
         );
     }
 
+    /// Any string anywhere in a tool payload containing `needle`.
+    fn payload_mentions(payload: &serde_json::Value, needle: &str) -> bool {
+        match payload {
+            serde_json::Value::String(text) => text.contains(needle),
+            serde_json::Value::Array(items) => {
+                items.iter().any(|item| payload_mentions(item, needle))
+            }
+            serde_json::Value::Object(fields) => {
+                fields.values().any(|value| payload_mentions(value, needle))
+            }
+            _ => false,
+        }
+    }
+
+    /// FIR-3550 through the route every agent call reaches the daemon by. The writer edits
+    /// the file first, then stages its complete new text and commits: the order `kin agent`'s
+    /// `edit_file` ran in during run 3 of the local-model demo, and the order of any agent
+    /// that edits with its own file tools. The commit used to refuse the writer's own bytes as
+    /// drift from the prior tree. It now publishes them, `get_entity_source` answers with the
+    /// new body, durability reads level, and the working copy matches what authority holds.
+    #[tokio::test]
+    async fn an_agent_edit_staged_after_it_reached_disk_commits_and_reads_back() {
+        let state = test_state();
+        let (entity, _) = crate::mcp_commit::tests::install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 {\n    1\n}\n",
+            "value",
+        );
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
+        let edited = "/// The value this module reports.\npub fn value() -> u8 {\n    0x2a\n}\n";
+
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({ "session_id": session_id, "scope": "src/lib.rs" }),
+        )
+        .await;
+        assert_ne!(begin.is_error, Some(true), "{}", mcp_result_text(&begin));
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+
+        let working = state.layout.working_dir().join("src/lib.rs");
+        std::fs::write(&working, edited).unwrap();
+
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "session_id": session_id,
+                "operations": [{
+                    "verb": "replace",
+                    "target": "src/lib.rs",
+                    "body": edited,
+                    "description": "document value and change what it returns"
+                }]
+            }),
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true), "{}", mcp_result_text(&stage));
+
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_ne!(
+            commit.is_error,
+            Some(true),
+            "the agent's own edit was refused: {}",
+            mcp_result_text(&commit)
+        );
+
+        let source = mcp_call(
+            router(Arc::clone(&state)),
+            "get_entity_source",
+            serde_json::json!({ "entity_id": entity.id.to_string() }),
+        )
+        .await;
+        let source_text = mcp_result_text(&source);
+        assert_ne!(source.is_error, Some(true), "{source_text}");
+        let source_payload: serde_json::Value = serde_json::from_str(&source_text).unwrap();
+        assert!(
+            payload_mentions(&source_payload, "0x2a"),
+            "get_entity_source must answer with the committed body: {source_text}"
+        );
+
+        let status = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_ne!(status.is_error, Some(true), "{}", mcp_result_text(&status));
+        let block = durability_block(&state).await;
+        assert_eq!(block.state, "recorded", "{}", block.note);
+        assert_eq!(block.live_only_entities, Some(0), "{}", block.note);
+        assert_eq!(block.live_only_relations, Some(0), "{}", block.note);
+
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let base = crate::repository_commit::load_native_commit_base(&context).unwrap();
+        let artifact = base
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+            .expect("the edited file stays tracked");
+        let published = crate::repository_commit::load_native_source_blob(
+            &context,
+            artifact
+                .entry
+                .blob_identity()
+                .expect("a tracked source file has a body"),
+        )
+        .unwrap();
+        assert_eq!(published, edited.as_bytes(), "authority holds the edit");
+        assert_eq!(
+            std::fs::read(&working).unwrap(),
+            published,
+            "the working copy must match what authority published"
+        );
+    }
+
     /// The control. Right after a commit that captured every live relation, the
     /// same block reads level on both axes, so the disclosure above is a
     /// reading and not a fixture that always fires.

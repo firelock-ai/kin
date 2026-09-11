@@ -29,7 +29,7 @@ use crate::local_repository_authority::{
     require_fresh_daemon_workspace, LocalRepositoryAuthorityContext,
 };
 use crate::repository_commit::{
-    commit_native_plan_with_projection, load_native_commit_base, load_native_source_blob,
+    commit_native_plan_with_authored_projection, load_native_commit_base, load_native_source_blob,
     plan_native_commit_from_base_declaring_carry, recover_native_commit, NativeCommitBase,
     NativeCommitResult,
 };
@@ -39,6 +39,11 @@ struct ExactMcpPlan {
     native: crate::repository_commit::NativeCommitPlan,
     layouts: Vec<FileLayout>,
     carried_pending_files: Vec<RepoPath>,
+    /// The paths this transaction's own operations write. Publication accepts
+    /// one of them when the working copy already holds its exact target bytes,
+    /// because a writer that edited the file and then staged its new text is
+    /// publishing the change the working copy already shows.
+    authored_files: BTreeSet<RepoPath>,
 }
 
 /// What this process knows about a commit beyond the change it published.
@@ -413,11 +418,12 @@ fn commit_exact_transaction_inner(
     }
 
     let committed = match timed_commit_phase("publish_authority_and_projection", || {
-        commit_native_plan_with_projection(
+        commit_native_plan_with_authored_projection(
             &state.layout,
             state.blobs.as_ref(),
             &authority_context,
             plan.native,
+            &plan.authored_files,
         )
     }) {
         Ok(committed) => committed,
@@ -1392,6 +1398,7 @@ fn plan_exact_transaction(
         native,
         layouts,
         carried_pending_files,
+        authored_files,
     })
 }
 
@@ -3036,7 +3043,7 @@ fn stabilize_layout_ids(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::OnceLock;
@@ -3117,7 +3124,10 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
-    fn install_exact_source(
+    /// Install `content` at `file` as committed, projected source and return the named
+    /// entity with the change that installed it. Shared with the route tests in `api`, which
+    /// need tracked source on disk to drive a commit through `/mcp/tools/call`.
+    pub(crate) fn install_exact_source(
         state: &Arc<DaemonState>,
         file: &str,
         content: &[u8],
@@ -3787,6 +3797,181 @@ mod tests {
             named("doomed").is_empty(),
             "an entity the new text drops must leave the graph"
         );
+    }
+
+    const DOCUMENTED_RS: &str = "/// The value this module reports.\npub fn value() -> u8 {\n    1\n}\n\npub fn doomed() -> u8 {\n    9\n}\n";
+    const OTHER_RS: &str = "pub fn other() -> u8 {\n    4\n}\n";
+
+    fn commit_arguments(transaction_id: &str) -> HashMap<String, serde_json::Value> {
+        HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(transaction_id),
+        )])
+    }
+
+    /// Stage `body` as the complete new text of `path` in a fresh transaction and commit it.
+    fn replace_and_commit(
+        state: &Arc<DaemonState>,
+        sessions: &kin_mcp::SessionRegistry,
+        path: &str,
+        body: &str,
+    ) -> kin_mcp::ToolCallResult {
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, &format!("file:{path}"))
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![replaced_source_file(path, body)],
+            )
+            .unwrap();
+        commit_exact_transaction(
+            state,
+            sessions,
+            &commit_arguments(&transaction.transaction_id),
+            None,
+        )
+    }
+
+    /// The shape run 3 of the local-model demo hit: the writer edits the file, then stages
+    /// the file's complete new text and commits. By then the working copy holds exactly the
+    /// bytes the transaction publishes, and the commit held every tracked path to the
+    /// previous tree, so it refused the writer's own edit as drift ("tracked working-copy
+    /// path ... differs from prior workspace source (the file content changed)") and left
+    /// the edit on disk with authority still on the old text. A working-copy change that is
+    /// the staged change is not a conflict: the commit publishes it, the file keeps the
+    /// published bytes, and authority holds the same bytes.
+    #[test]
+    fn an_edit_the_writer_already_put_on_disk_is_published_rather_than_refused() {
+        let (_dir, state) = test_state();
+        let (value, installed) =
+            install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        let working = state.layout.working_dir().join("src/lib.rs");
+        std::fs::write(&working, DOCUMENTED_RS).unwrap();
+
+        let sessions = test_sessions();
+        let result = replace_and_commit(&state, &sessions, "src/lib.rs", DOCUMENTED_RS);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "the writer's own edit was refused: {}",
+            result_text(&result)
+        );
+
+        assert_eq!(std::fs::read_to_string(&working).unwrap(), DOCUMENTED_RS);
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let published = after
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+            .expect("the edited file stays tracked");
+        let hash = published
+            .entry
+            .blob_identity()
+            .expect("a tracked source file has a body");
+        assert_eq!(
+            load_native_source_blob(&state.layout, hash).unwrap(),
+            DOCUMENTED_RS.as_bytes(),
+            "authority must hold the bytes the working copy holds"
+        );
+        let committed = SemanticChangeId::from_hash(
+            Hash256::from_hex(
+                commit_reply(&result)["change_id"]
+                    .as_str()
+                    .expect("a successful commit names its change"),
+            )
+            .expect("the change id is a content hash"),
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_changes_since(&installed, &committed)
+                .unwrap()
+                .iter()
+                .map(|change| change.id)
+                .collect::<Vec<_>>(),
+            vec![committed],
+            "the edit must publish exactly one change on top of the fixture"
+        );
+        assert!(
+            after.graph.get_entity(&value.id).unwrap().is_some(),
+            "the documented entity keeps its identity"
+        );
+    }
+
+    /// The rule above is exact. An authored path whose working copy holds a third body,
+    /// neither its previous text nor the text staged, is a real conflict: publishing would
+    /// overwrite bytes nobody staged, or declare a tree the disk does not hold. It is refused
+    /// as before, authority does not move, and the bytes on disk are left alone.
+    #[test]
+    fn an_authored_path_holding_a_third_body_is_still_refused() {
+        let (_dir, state) = test_state();
+        install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let working = state.layout.working_dir().join("src/lib.rs");
+        let foreign = "pub fn value() -> u8 {\n    7\n}\n";
+        std::fs::write(&working, foreign).unwrap();
+
+        let sessions = test_sessions();
+        let result = replace_and_commit(&state, &sessions, "src/lib.rs", DOCUMENTED_RS);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a third body on disk was published over: {}",
+            result_text(&result)
+        );
+        assert!(
+            result_text(&result).contains("differs from prior workspace source"),
+            "the refusal must name the drift: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "a refused commit must not move authority"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&working).unwrap(),
+            foreign,
+            "the refusal must leave the bytes on disk alone"
+        );
+    }
+
+    /// Accepting an authored path loosens no other path. With the authored file already at
+    /// its target and a second tracked file carrying an edit no operation staged, the commit
+    /// is refused over the second file, authority does not move, and neither file is
+    /// touched: the unstaged edit is not overwritten and the authored bytes are not rolled
+    /// back.
+    #[test]
+    fn accepting_an_authored_path_still_holds_every_other_path_to_the_prior_tree() {
+        let (_dir, state) = test_state();
+        install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        install_exact_source(&state, "src/other.rs", OTHER_RS.as_bytes(), "other");
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let lib = state.layout.working_dir().join("src/lib.rs");
+        let other = state.layout.working_dir().join("src/other.rs");
+        std::fs::write(&lib, DOCUMENTED_RS).unwrap();
+        let unstaged = "pub fn other() -> u8 {\n    5\n}\n";
+        std::fs::write(&other, unstaged).unwrap();
+
+        let sessions = test_sessions();
+        let result = replace_and_commit(&state, &sessions, "src/lib.rs", DOCUMENTED_RS);
+        let text = result_text(&result);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "an unstaged edit rode along: {text}"
+        );
+        assert!(
+            text.contains("src/other.rs") && text.contains("differs from prior workspace source"),
+            "the refusal must name the file nobody staged: {text}"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "a refused commit must not move authority"
+        );
+        assert_eq!(std::fs::read_to_string(&lib).unwrap(), DOCUMENTED_RS);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), unstaged);
     }
 
     #[test]

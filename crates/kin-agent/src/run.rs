@@ -105,8 +105,9 @@ struct Counters {
     kin_calls: u32,
     local_calls: u32,
     refused_calls: u32,
-    /// Local edits whose transaction the daemon refused to publish. A run holding one of
-    /// these wrote files and landed nothing, which must not read as a success.
+    /// Changes the model asked for that repository authority did not publish. A run holding
+    /// one of these landed nothing for that change, whatever its closing paragraph says,
+    /// which must not read as a success.
     unpublished_changes: u32,
     repairs: u32,
     unsafe_absence_events: u32,
@@ -827,17 +828,39 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 &mut writer,
                                             )?;
                                             // Repository authority writes a created file
-                                            // itself as part of publishing the change. So
-                                            // a create is published FIRST and the local
-                                            // write is the fallback: writing it here
-                                            // first leaves an untracked path sitting on
-                                            // the exact workspace target, which
+                                            // itself as part of publishing the change, so
+                                            // a create is published FIRST and is never
+                                            // written locally: writing it here first
+                                            // leaves an untracked path sitting on the
+                                            // exact workspace target, which
                                             // `validate_reconciliation_targets` refuses,
                                             // and every commit fails on the harness's own
                                             // file.
                                             let publish_first = bracket.transaction_id.is_some()
                                                 && matches!(plan, StagePlan::Create { .. });
-                                            let (outcome, provenance) = if publish_first {
+                                            // An edit is published first too, with no local
+                                            // fallback: its new text is computed from the
+                                            // file's current text and staged whole, and the
+                                            // commit's projection writes the file. Written to
+                                            // the working copy ahead of the commit, the edit
+                                            // read to the daemon as drift from the prior tree
+                                            // and was refused over its own bytes, and every
+                                            // refusal left it on disk with the graph still
+                                            // holding the old text.
+                                            let publish_edit = bracket.transaction_id.is_some()
+                                                && matches!(plan, StagePlan::Replace { .. });
+                                            let (outcome, provenance) = if publish_edit {
+                                                publish_planned_edit(
+                                                    &mut servers[index],
+                                                    bracket,
+                                                    session.as_deref(),
+                                                    &plan,
+                                                    &repo,
+                                                    &call.arguments,
+                                                    &mut counters,
+                                                    &mut writer,
+                                                )?
+                                            } else if publish_first {
                                                 let staged = stage_planned_operation(
                                                     &mut servers[index],
                                                     &mut bracket,
@@ -858,24 +881,27 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                         provenance,
                                                     )
                                                 } else {
-                                                    // Nothing was published, so the file
-                                                    // does not exist yet. Write it, so the
-                                                    // model keeps its work, and tell the
-                                                    // model the change did not land rather
-                                                    // than reporting a bare success.
+                                                    // Nothing was published and nothing is
+                                                    // written: the path stays as it was on
+                                                    // disk and in the graph. The refused
+                                                    // content goes back to the model in the
+                                                    // tool result, which is where the model
+                                                    // keeps its work; a local copy was a
+                                                    // file the graph did not hold.
                                                     counters.unpublished_changes += 1;
-                                                    let mut outcome =
-                                                        belt::run_write(&repo, &call.arguments);
-                                                    if !outcome.is_error {
-                                                        outcome.text = format!(
-                                                            "{} Repository authority did \
-                                                             not publish it: {}. The file \
-                                                             is on disk and uncommitted.",
-                                                            outcome.text,
-                                                            unpublished_reason(&provenance),
-                                                        );
-                                                    }
-                                                    (outcome, provenance)
+                                                    let reason = unpublished_reason(&provenance);
+                                                    let provenance = abort_refused_commit(
+                                                        &mut servers[index],
+                                                        provenance,
+                                                        &mut writer,
+                                                    )?;
+                                                    (
+                                                        belt::unpublished_create(
+                                                            &call.arguments,
+                                                            &reason,
+                                                        ),
+                                                        provenance,
+                                                    )
                                                 }
                                             } else {
                                                 let mut outcome = match tool {
@@ -1642,6 +1668,96 @@ fn close_transaction(
         "response": detail.clone(),
         "detail": if is_error { Value::String(detail) } else { Value::Null },
     }))
+}
+
+/// Publish one `edit_file` call through repository authority before anything touches the
+/// working copy.
+///
+/// The edit is resolved against the file's current text, its complete new text is staged as
+/// the `replace` operation, and the commit publishes it; repository authority's projection is
+/// what writes the file. When authority does not publish, nothing was written: the transaction
+/// is aborted so the model's retry opens a clean one, and the model is told the edit did not
+/// land and why. An edit that cannot be applied to the current text stages nothing and aborts
+/// the bracket, because an empty transaction is refused by design.
+#[allow(clippy::too_many_arguments)]
+fn publish_planned_edit(
+    server: &mut Server,
+    mut bracket: Bracket,
+    session: Option<&str>,
+    plan: &StagePlan,
+    repo: &Path,
+    arguments: &Value,
+    counters: &mut Counters,
+    writer: &mut TranscriptWriter,
+) -> anyhow::Result<(belt::LocalOutcome, Value)> {
+    let planned = match belt::plan_edit(repo, arguments) {
+        Ok(planned) => planned,
+        Err(refusal) => {
+            let provenance = close_transaction(server, bracket, false, writer)?;
+            return Ok((refusal, provenance));
+        }
+    };
+    let staged = stage_planned_operation(
+        server,
+        &mut bracket,
+        session,
+        plan,
+        Some(&planned.updated),
+        writer,
+    )?;
+    let provenance = close_transaction(server, bracket, staged, writer)?;
+    if published_by_authority(&provenance) {
+        return Ok((belt::published_edit(planned), provenance));
+    }
+    counters.unpublished_changes += 1;
+    let reason = unpublished_reason(&provenance);
+    let provenance = abort_refused_commit(server, provenance, writer)?;
+    Ok((belt::unpublished_edit(&planned, &reason), provenance))
+}
+
+/// Abort a transaction whose commit repository authority refused.
+///
+/// A refused commit leaves the transaction open on the server, its staged set cleared or its
+/// commit fence reset, and nothing here can reuse it: the model's retry is a new call that
+/// opens a new bracket. Left open, every refusal holds one of the session's unfinished
+/// transaction slots until the session ends, so a model that keeps correcting and retrying is
+/// eventually refused a bracket at all. A bracket that closed by aborting has nothing left to
+/// release.
+fn abort_refused_commit(
+    server: &mut Server,
+    mut provenance: Value,
+    writer: &mut TranscriptWriter,
+) -> anyhow::Result<Value> {
+    if provenance["closed_with"] != json!("kin_transaction_commit") {
+        return Ok(provenance);
+    }
+    let Some(transaction_id) = provenance["transaction_id"].as_str().map(str::to_string) else {
+        return Ok(provenance);
+    };
+    let server_name = server.name();
+    let outcome = server.client.call_tool(
+        "kin_transaction_abort",
+        &json!({ "transaction_id": transaction_id }),
+    );
+    let (is_error, detail) = match &outcome {
+        Ok(outcome) => (outcome.is_error, close_detail(&outcome.text)),
+        Err(err) => (true, err.to_string()),
+    };
+    writer.trace(json!({
+        "surface": "kin",
+        "server": server_name,
+        "tool": "kin_transaction_abort",
+        "policy": "allowed",
+        "event": "transaction_abort",
+        "transaction_id": transaction_id,
+        "is_error": is_error,
+        "detail": detail,
+    }))?;
+    provenance["aborted_after_refusal"] = json!({
+        "closed_cleanly": !is_error,
+        "detail": if is_error { Value::String(detail) } else { Value::Null },
+    });
+    Ok(provenance)
 }
 
 /// Whether repository authority actually published this bracket.
