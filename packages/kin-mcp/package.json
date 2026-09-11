@@ -1,6 +1,6 @@
 {
   "name": "@kinlab/kin-mcp",
-  "version": "0.7.12",
+  "version": "0.7.13",
   "mcpName": "ai.kinlab/kin",
   "description": "Start the MCP server for Kin, a graph-native code repository for people and AI agents, through an npm-friendly wrapper.",
   "type": "module",
