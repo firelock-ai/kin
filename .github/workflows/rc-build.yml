@@ -278,17 +278,46 @@ jobs:
           # the only leg that stripped it, and dropping that split is what puts
           # native vector search in the shipped Windows archive.
           #
-          # The Linux legs sample their own memory and disk into this step's own
-          # log while cargo runs, and the sampler stays here permanently. The
+          # The Linux legs are given swap and then sample their own memory and
+          # disk into this step's own log while cargo runs. Both halves stay
+          # here permanently, because the second is what proves the first is
+          # still enough.
+          #
+          # What this leg ran out of, measured rather than guessed. The
           # linux-aarch64 leg of v0.7.14 died at this step on all three attempts
           # of run 34579776198 with "The runner has received a shutdown signal"
-          # and exit code 143, roughly sixteen minutes in and always during
-          # kin-daemon's fat-LTO codegen, and the log carried no resource
-          # numbers at all. A post-mortem step cannot supply them: a runner
-          # being torn down runs no further step, so only output already
-          # streamed out of the step that is dying survives. The x86_64 leg
-          # samples too, as the control that says which numbers are normal for
-          # this build on a leg that finishes.
+          # and exit code 143, and the step log carried no resource numbers at
+          # all. Re-running the same build on main's head under the sampler
+          # (rc-build run 34642288259, job 103404693178) reproduced it exactly
+          # and said why. Free disk never moved: 108,661 MB on every one of the
+          # 55 samples, with the whole build consuming 1.9 GB. Memory went one
+          # way. The largest rustc climbed from 4,287 MB to 7,789 MB while
+          # available memory fell from 6,602 MB to 253 MB, the kernel then ate
+          # the image's own 3 GB swapfile to nothing by 20:18:51Z, and the
+          # runner was torn down thirteen seconds later, still climbing. The
+          # runner has 15,947 MB of RAM, so the peak needs more than the roughly
+          # 19 GB of RAM plus swap that the image ships with.
+          #
+          # Why the peak is that big: cargo links kin-cli and kin-daemon in one
+          # invocation, and the release profile is fat LTO with one codegen
+          # unit, so the peak is two whole-program links of a large Rust binary
+          # resident at once. The largest single process was 7.8 GB while total
+          # commitment was about 19 GB, which is that shape. Thin LTO on one
+          # architecture would change what ships and the release notes would
+          # have to say so, and the runner label is a cost decision rather than
+          # an engineering one, so the leg is given memory instead.
+          #
+          # Both Linux legs get it rather than the arm row alone, and the
+          # x86_64 leg's own samples from that same run are why the distinction
+          # is not worth a guard. It succeeded on an identically sized runner,
+          # 15,988 MB of RAM and the same 3 GB swapfile, with its largest rustc
+          # peaking at 4,193 MB, 5,006 MB still available and swap never
+          # touched. So the same fat-LTO build of the same crates costs roughly
+          # 1.9 times the peak resident set on aarch64 that it costs on x86_64,
+          # which is a property of the backend rather than of what is being
+          # built. The x86_64 leg has headroom today and its swap is insurance;
+          # keying the headroom to an architecture would record the accident of
+          # which leg crossed first rather than the reason either might.
           sampler=""
           if [ "$(uname -s)" = Linux ]; then
             echo "resources before the build"
@@ -296,6 +325,40 @@ jobs:
             free -m || true
             swapon --show || true
             df -h || true
+            # Raise total swap to the target, never taking more than half of
+            # what is free, and add to the image's swapfile rather than
+            # replacing it so nothing already paging is disturbed.
+            want_mb=24576
+            free_mb=$(df -m --output=avail / | tail -1 | tr -d ' ')
+            room_mb=$(( free_mb / 2 ))
+            [ "$want_mb" -le "$room_mb" ] || want_mb=$room_mb
+            have_mb=$(awk '/^SwapTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+            add_mb=$(( want_mb - have_mb ))
+            if [ "$add_mb" -gt 512 ]; then
+              swapfile=/kin-release-swapfile
+              sudo rm -f "$swapfile"
+              if sudo fallocate -l "${add_mb}M" "$swapfile" \
+                && sudo chmod 600 "$swapfile" \
+                && sudo mkswap "$swapfile" > /dev/null \
+                && sudo swapon "$swapfile"
+              then
+                echo "added ${add_mb}MB of swap for a ${want_mb}MB total"
+              else
+                # A swapfile the kernel refuses is usually one fallocate left
+                # holding unwritten extents, which a written file cannot have.
+                sudo swapoff "$swapfile" 2> /dev/null || true
+                sudo rm -f "$swapfile"
+                sudo dd if=/dev/zero of="$swapfile" bs=1M count="$add_mb" status=none
+                sudo chmod 600 "$swapfile"
+                sudo mkswap "$swapfile" > /dev/null
+                sudo swapon "$swapfile"
+                echo "added ${add_mb}MB of swap for a ${want_mb}MB total, written rather than allocated"
+              fi
+            else
+              echo "existing ${have_mb}MB of swap already meets the ${want_mb}MB target"
+            fi
+            swapon --show || true
+            free -m || true
             (
               set +e
               set +o pipefail
