@@ -1,8 +1,0 @@
-# Kin Cargo registry for public and local builds.
-#
-# Keep this file free of local path patches and credentials so a fresh public
-# clone can resolve Kin crates from public source. Put machine-local overrides
-# in Cargo's user-level config instead of this tracked file.
-
-[registries.kin]
-index = "sparse+https://kinlab.ai/registry/cargo/"

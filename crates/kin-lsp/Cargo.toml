@@ -11,7 +11,7 @@ repository = "https://github.com/firelock-ai/kin-lsp"
 authors = ["Troy Fortin <troy@firelock.ai>"]
 
 [dependencies]
-kin-model = { version = "0.7.28", registry = "kin" }
+kin-model = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
@@ -25,9 +25,13 @@ tokio = { version = "1", features = ["full"] }
 # Not a real dependency of this crate. tinyvec 1.13.0, published 2026-09-03, does
 # not compile: src/tinyvec.rs:3 does `use alloc::vec::{self, Vec}`, which binds
 # `vec` to the module and shadows the `vec!` macro that line 710 then calls.
-# This repo gitignores Cargo.lock, so CI resolves fresh on every run and takes the
-# broken release, while a developer's older local lock still pins a good one. Same
-# tree, different resolution. tinyvec is reachable only transitively, through
+# This crate's own repository gitignored Cargo.lock, so CI resolved fresh on every
+# run and took the broken release, while a developer's older local lock still
+# pinned a good one. Same tree, different resolution. Inside kin's workspace the
+# tracked root lock pins tinyvec 1.11.0, so this bound is now a second defence
+# rather than the only one, and it stays until 1.13.0 is yanked or fixed: a fresh
+# resolution of this package as a published crate has no lock to fall back on.
+# tinyvec is reachable only transitively, through
 # kin-model -> gix-object -> gix-utils -> unicode-normalization,
 # so a direct requirement here is the only in-tree lever.
 # A bare "<1.13" does NOT work: it admits the 0.x line, so cargo takes tinyvec
