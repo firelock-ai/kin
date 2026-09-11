@@ -2970,6 +2970,53 @@ impl GraphStatusSettledCache {
     }
 }
 
+/// The HEAD graph state the last certified reference read answered from.
+///
+/// A reference read is certified when no writer spanned it and the graph held
+/// still through its final check, and nothing kept what it had certified. So a
+/// writer that holds graph authority for longer than the settle budget left
+/// `find_references` nothing to answer from at all: every attempt found the
+/// writer active, no snapshot was ever detached, and the caller got an error
+/// about a graph that had not changed. A reconcile round whose publication
+/// authority refuses holds it for the whole publication, measured at 21 to 32
+/// seconds a round on a long-lived store.
+///
+/// Two values rather than a graph. The replay reads the live graph and serves
+/// only while its root is still this one, so what is kept costs nothing
+/// proportional to the store.
+#[derive(Default)]
+pub(crate) struct XrefSettledHead {
+    last: std::sync::Mutex<Option<XrefCertifiedHead>>,
+}
+
+#[derive(Clone)]
+struct XrefCertifiedHead {
+    root: String,
+    head_version: u64,
+    at: Instant,
+}
+
+impl XrefSettledHead {
+    /// Keep what a certified read answered from. A session-scope read carries
+    /// no HEAD version and is not kept, because the replay compares HEAD.
+    fn record(&self, attempt: &XrefGraphReadAttempt) {
+        let Some(head_version) = attempt.head_version else {
+            return;
+        };
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some(XrefCertifiedHead {
+                root: attempt.root.clone(),
+                head_version,
+                at: Instant::now(),
+            });
+        }
+    }
+
+    fn get(&self) -> Option<XrefCertifiedHead> {
+        self.last.lock().ok()?.clone()
+    }
+}
+
 /// Capture one point-in-time status observation of the graph selected for this
 /// request.
 ///
@@ -3341,6 +3388,12 @@ const MUTATION_IN_FLIGHT_REASON: &str = "mutation_in_flight";
 /// away. A constant for the same reason the two above are: a check asserts on
 /// exactly this string.
 const GRAPH_AUTHORITY_RETRY_REASON: &str = "retry";
+/// Pairs with [`GRAPH_AUTHORITY_COMPONENT`] to compose
+/// `graph_authority:settled_replay`, for an answer read while a writer held
+/// graph authority through every attempt, from a graph whose root was still the
+/// one the last certified read answered from. A constant for the reason the
+/// ones above are.
+const GRAPH_AUTHORITY_SETTLED_REPLAY_REASON: &str = "settled_replay";
 
 /// Which writer this daemon can actually name as the one that was moving.
 ///
@@ -3585,6 +3638,108 @@ fn serve_superseded_xref_answer(
     }
 }
 
+/// A read of the live HEAD graph that answers as the last certified read did,
+/// taken when no attempt could see graph authority stand still.
+///
+/// A writer holding authority is not the same thing as a graph that moved. The
+/// snapshot is taken under the graph's own read lock, so it is one instant of
+/// the graph, and it is used only when its merkle root, and the HEAD version on
+/// both sides of the capture, equal what the last certified read answered from.
+/// Equal roots are equal entities and relations, so every row answered from it
+/// is a row that certified read would have returned. What it cannot promise is
+/// currency, because the writer is still in flight, and the disclosure says so.
+///
+/// `None` for a session scope, which has no HEAD version to compare, and
+/// whenever nothing has been certified or the graph moved since.
+fn prepare_settled_xref_replay(
+    state: &DaemonState,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+) -> Option<(Arc<kin_db::InMemoryGraph>, String, Duration)> {
+    if !matches!(authority, RequestGraphAuthority::Head) {
+        return None;
+    }
+    let certified = state.xref_settled.get()?;
+    if state.vfs_version.load(std::sync::atomic::Ordering::SeqCst) != certified.head_version {
+        return None;
+    }
+    let snapshot = selected_graph.to_snapshot();
+    let root_hash = kin_db::compute_graph_root_hash(&snapshot);
+    if hex::encode(root_hash) != certified.root
+        || state.vfs_version.load(std::sync::atomic::Ordering::SeqCst) != certified.head_version
+    {
+        return None;
+    }
+    let graph =
+        kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(snapshot, root_hash)
+            .ok()?;
+    Some((Arc::new(graph), certified.root, certified.at.elapsed()))
+}
+
+/// Serve a settled replay with its disclosure, or refuse.
+///
+/// A handler error passes through unchanged, for the reason
+/// [`serve_superseded_xref_answer`] gives. An error RESULT is refused instead:
+/// the one most likely here is a focal miss, and a miss read while a writer
+/// holds authority must never be published as though the graph had settled. A
+/// payload that cannot carry the disclosure refuses for the reason
+/// [`disclose_mutation_in_flight`] gives.
+fn serve_settled_replay(
+    result: kin_mcp::Result<kin_mcp::ToolCallResult>,
+    state: &DaemonState,
+    surface: &str,
+    certified_age: Duration,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    let answer = result?;
+    let refused = || kin_mcp::McpError::Other(xref_authority_unsettled_message(state, surface));
+    if answer.is_error == Some(true) {
+        return Err(refused());
+    }
+    stamp_settled_replay(&answer, state, certified_age).ok_or_else(refused)
+}
+
+/// The payload half of [`serve_settled_replay`].
+fn stamp_settled_replay(
+    result: &kin_mcp::ToolCallResult,
+    state: &DaemonState,
+    certified_age: Duration,
+) -> Option<kin_mcp::ToolCallResult> {
+    let kin_mcp::ContentBlock::Text { text } = result.content.first()?;
+    let mut payload = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if !payload.is_object() {
+        return None;
+    }
+    let certified_age_ms = u64::try_from(certified_age.as_millis()).unwrap_or(u64::MAX);
+    let entry = serde_json::json!({
+        "component": GRAPH_AUTHORITY_COMPONENT,
+        "reason": GRAPH_AUTHORITY_SETTLED_REPLAY_REASON,
+        "certified_age_ms": certified_age_ms,
+        "detail": format!(
+            "graph authority was held through every one of the {XREF_CURRENCY_ATTEMPTS} attempts \
+             this read made ({}), so none could certify a live snapshot. This answer was read \
+             from the graph as it stands, under one read lock, and is served because its merkle \
+             root is still the one the last certified reference read answered from \
+             {certified_age_ms} ms ago: every row here is a row that read would have returned, and \
+             nothing here is a torn read. Currency is what is missing: the writer was still in \
+             flight, so the graph may move after this answer and an absence measured here may not \
+             hold. Re-run once the writer drains for an answer this daemon can certify as current.",
+            graph_authority_writer_sentence(state),
+        ),
+    });
+    match payload
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(entry),
+        None => payload["degradations"] = serde_json::Value::Array(vec![entry]),
+    }
+    let rendered = serde_json::to_string_pretty(&payload).ok()?;
+    Some(kin_mcp::ToolCallResult {
+        content: vec![kin_mcp::ContentBlock::Text { text: rendered }],
+        is_error: result.is_error,
+    })
+}
+
 async fn command_xref_with_stable_authority<F>(
     state: &DaemonState,
     session_id: Option<&SessionId>,
@@ -3625,6 +3780,7 @@ where
         if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
             .await
         {
+            state.xref_settled.record(&attempt);
             return response.map_err(internal_error);
         }
         tracing::warn!(
@@ -3702,6 +3858,7 @@ where
             // Current, and on any attempt after the first it is current only
             // because an earlier one was thrown away. That is the fact this
             // return used to swallow.
+            state.xref_settled.record(&attempt);
             return disclose_graph_authority_retry(result, attempt_number);
         }
         tracing::warn!(
@@ -3710,6 +3867,27 @@ where
         );
         superseded = Some(result);
         settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
+    }
+    // No attempt detached a snapshot: a writer held graph authority through
+    // every one of them. That is not a graph that moved, so the graph is read
+    // once more and served if it is still the one last certified.
+    if superseded.is_none() {
+        if let Some((graph, root, certified_age)) =
+            prepare_settled_xref_replay(state, &selected_graph, authority)
+        {
+            let result = kin_mcp::handlers::entities::handle_find_references_with_authority(
+                arguments,
+                graph.as_ref(),
+                kin_mcp::handlers::entities::FindReferencesAuthority {
+                    repo_id: &state.cached_repo_id,
+                    graph_root: &root,
+                    spine,
+                },
+                repository_authority.as_ref(),
+            )
+            .await;
+            return serve_settled_replay(result, state, "find_references", certified_age);
+        }
     }
     serve_superseded_xref_answer(superseded, state, "find_references")
 }
@@ -3881,6 +4059,7 @@ where
             // Current, and on any attempt after the first it is current only
             // because an earlier one was thrown away. That is the fact this
             // return used to swallow.
+            state.xref_settled.record(&attempt);
             return disclose_graph_authority_retry(result, attempt_number);
         }
         tracing::warn!(
@@ -3889,6 +4068,23 @@ where
         );
         superseded = Some(result);
         settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
+    }
+    // The same replay `find_references` takes, for the same reason.
+    if superseded.is_none() {
+        if let Some((graph, root, certified_age)) =
+            prepare_settled_xref_replay(state, &selected_graph, authority)
+        {
+            let result = kin_mcp::handlers::entities::handle_bulk_check_references_with_authority(
+                arguments,
+                graph.as_ref(),
+                kin_mcp::handlers::entities::FindReferencesAuthority {
+                    repo_id: &state.cached_repo_id,
+                    graph_root: &root,
+                    spine,
+                },
+            );
+            return serve_settled_replay(result, state, "bulk_check_references", certified_age);
+        }
     }
     serve_superseded_xref_answer(superseded, state, "bulk_check_references")
 }
@@ -53728,6 +53924,136 @@ mod tests {
                     .any(|signal| signal == "graph_authority:mutation_in_flight")),
             "the verdict must name the write among its signals: {}",
             finalized["negative"]
+        );
+    }
+
+    /// A writer that holds graph authority through every attempt, and moves
+    /// nothing, is answered from the graph the last certified read answered
+    /// from, with its own disclosure, instead of refused.
+    ///
+    /// The shape a long-lived store produced: a reconcile round whose
+    /// publication authority refused held the guard for the whole publication,
+    /// 21 to 32 seconds a round, so every attempt found the writer active, no
+    /// snapshot was ever detached, and `find_references` refused about a graph
+    /// that had not changed. Holding the guard across the call is that writer.
+    #[tokio::test]
+    async fn a_writer_holding_every_attempt_is_answered_from_the_certified_graph() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        let settled = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+        let settled_body: serde_json::Value =
+            serde_json::from_str(&mcp_result_text(&settled)).unwrap();
+
+        let writer = state.begin_graph_authority_mutation();
+        let held = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("a writer that moved nothing leaves the certified graph to answer from");
+        drop(writer);
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&held)).unwrap();
+
+        assert_eq!(body["focal_entity"], settled_body["focal_entity"]);
+        assert_eq!(body["references"], settled_body["references"]);
+        let labels = degradation_labels(&body);
+        assert!(
+            labels.contains(&"graph_authority:settled_replay".to_string()),
+            "a replay must say it is one: {labels:?}"
+        );
+        let finalized = finalized_payload(held, "find_references");
+        assert_eq!(
+            finalized["negative"]["trust"], "inconclusive",
+            "an answer whose currency is not certified must not certify an absence: {}",
+            finalized["negative"]
+        );
+    }
+
+    /// The replay is refused once the graph it would answer from has moved, so
+    /// it can never serve a row the certified read did not hold. The writer here
+    /// moves the graph and has not finished, which is the window the root
+    /// comparison exists for: the HEAD version has not moved yet.
+    #[tokio::test]
+    async fn a_replay_is_refused_once_the_graph_moved_after_the_certified_read() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+        mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+
+        let writer = state.begin_graph_authority_mutation();
+        let edge = kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(target.id),
+            dst: kin_model::GraphNodeId::Entity(target.id),
+            confidence: 0.95,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        kin_model::EntityStore::upsert_relation(state.graph.as_ref(), &edge).unwrap();
+        let refused = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect_err("a graph that moved since the certified read must not be replayed");
+        drop(writer);
+        assert!(
+            refused.to_string().contains("no settled graph authority"),
+            "{refused}"
+        );
+    }
+
+    /// Nothing certified, nothing replayed: a read that meets a writer holding
+    /// every attempt before any read was certified is refused exactly as
+    /// before, naming the write.
+    #[tokio::test]
+    async fn a_replay_needs_a_certified_read_to_answer_from() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+        let writer = state.begin_graph_authority_mutation();
+        let refused = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect_err("there is no certified graph to answer from yet");
+        drop(writer);
+        assert!(
+            refused.to_string().contains("no settled graph authority"),
+            "{refused}"
         );
     }
 
