@@ -1284,7 +1284,6 @@ mod tests {
         let store = store_with(7, Some(ParseCompleteness::Full));
         let mut cursor: Option<String> = None;
         let mut pages = 0;
-        let mut last_truncated = true;
 
         loop {
             let mut args = vec![("page_size", serde_json::json!(3))];
@@ -1313,20 +1312,23 @@ mod tests {
                 payload["next_cursor"].as_str().is_some(),
                 "truncated and next_cursor must agree: page {pages}"
             );
-            last_truncated = truncated;
-
             match payload["next_cursor"].as_str() {
                 Some(token) => cursor = Some(token.to_string()),
-                None => break,
+                // Asserted where the final page is identified, rather than
+                // carried out of the loop in a variable whose initial value
+                // no path ever reads.
+                None => {
+                    assert!(
+                        !truncated,
+                        "the final page of a walk has nothing left to fetch"
+                    );
+                    break;
+                }
             }
             assert!(pages < 10, "cursor walk did not terminate");
         }
 
         assert_eq!(pages, 3, "7 entities at page_size 3 is three pages");
-        assert!(
-            !last_truncated,
-            "the final page of a walk has nothing left to fetch"
-        );
     }
 
     /// Pagination walks the whole set with no duplicates and no silent cap.
