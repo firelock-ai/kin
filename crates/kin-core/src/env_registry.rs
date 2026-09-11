@@ -1817,6 +1817,28 @@ mod tests {
         None
     }
 
+    /// Whether `Cargo.lock` records `crate_name` as a workspace member: a package
+    /// entry with no `source` line, which is how cargo writes a path dependency.
+    fn lock_entry_is_workspace_member(root: &std::path::Path, crate_name: &str) -> bool {
+        let Ok(lock) = std::fs::read_to_string(root.join("Cargo.lock")) else {
+            return false;
+        };
+        let (mut found, mut saw_source) = (false, false);
+        for line in lock.lines() {
+            let line = line.trim();
+            if line == "[[package]]" {
+                if found {
+                    return !saw_source;
+                }
+            } else if line == format!("name = \"{crate_name}\"") {
+                found = true;
+            } else if found && line.starts_with("source = ") {
+                saw_source = true;
+            }
+        }
+        found && !saw_source
+    }
+
     /// Locate the vendored source of a pinned registry crate under the cargo home.
     /// Returns `None` when it is not on disk (a vendored or offline build layout).
     fn vendored_crate_src(crate_dir: &str) -> Option<std::path::PathBuf> {
@@ -1919,13 +1941,29 @@ mod tests {
                 eprintln!("{crate_name} not found in Cargo.lock; enumeration arm did not run");
                 continue;
             };
-            let Some(src) = vendored_crate_src(&format!("{crate_name}-{version}")) else {
+            // A crate developed in this workspace is scanned where it lives. The
+            // Kin libraries moved into crates/, and a fresh runner never downloads a
+            // path dependency, so a registry-cache-only lookup would skip them there
+            // while the test stayed green. A workspace member is always present, so
+            // a missing tree fails instead of skipping.
+            let src = if lock_entry_is_workspace_member(&root, crate_name) {
+                let member = root.join("crates").join(crate_name).join("src");
+                assert!(
+                    member.is_dir(),
+                    "{crate_name} is a workspace member in Cargo.lock, but {member:?} is \
+                     not a directory, so the enumeration arm has nothing to scan"
+                );
+                member
+            } else if let Some(vendored) = vendored_crate_src(&format!("{crate_name}-{version}")) {
+                vendored
+            } else {
                 eprintln!(
                     "vendored {crate_name}-{version} source not on disk; enumeration arm \
                      did not run"
                 );
                 continue;
             };
+            eprintln!("{crate_name}-{version}: enumeration arm scanning {src:?}");
             let scanned = scan_kin_literals(&src);
             // Control: an enumeration that found nothing, or lost names the pinned list
             // already proves are there, means the scan pointed somewhere wrong. Without
