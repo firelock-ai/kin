@@ -5,6 +5,10 @@
 <h3 align="center">AI changed who writes code.<br />Kin changes what they build on.</h3>
 
 <p align="center">
+  <img src="docs/assets/kin-impact-human-bytes.gif" alt="kin impact human_bytes --file crates/kin-cli/src/commands/cache.rs --kind function --depth 1, showing its direct callers in Kin's own codebase next to a git grep search for the same name" width="100%" />
+</p>
+
+<p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0" /></a>
   <a href="https://github.com/firelock-ai/kin/releases/latest"><img src="https://img.shields.io/badge/release-latest-6E56CF.svg" alt="Latest release" /></a>
 </p>
@@ -12,6 +16,8 @@
 **Kin is an open-source code repository and version control system for people and AI agents.** It keeps track of how the code fits together, so you can investigate what a change might affect.
 
 Functions, types, recorded relationships, and change history are repository data that you commit, branch, and merge. The graph is the repository model, not a separate index alongside Git. Exact source is preserved byte for byte, and filesystem projections let supported tools keep working with ordinary files.
+
+A star helps other people find Kin, and [Discussions](https://github.com/firelock-ai/kin/discussions) is where to bring a question about it.
 
 **Public alpha.** Start with a small repository you know well. Expect rough edges and breaking changes.
 
@@ -24,6 +30,23 @@ Before changing a shared function, what else should you inspect? Kin lets you lo
 <img src="docs/assets/kin-impact-ripgrep.png" alt="A recorded kin impact query on ripgrep, showing related entities for a signature change" width="100%" />
 
 *Recorded on a prepared ripgrep graph at `e89fff89ac9af12e8d4ce9d5fd07beb408ca730f`. Raw run artifacts are not public. This illustrates a workflow, not a performance benchmark.*
+
+## Use it from Claude Code, Codex or Cursor
+
+For Claude Code:
+
+```
+/plugin marketplace add firelock-ai/kin
+/plugin install kin@kin
+```
+
+For [Codex](plugins/kin-codex/README.md#install), add the marketplace and install the plugin, or let `kin setup --intent agent` write the MCP server into `~/.codex/config.toml` for you.
+
+For Cursor, add the MCP server by hand; see [plugins/kin-cursor](plugins/kin-cursor/README.md#install) for the exact snippet.
+
+After installing, run `kin init .` in a small repository you know well; the `kin-setup` skill walks you through the rest.
+
+Kin is not published on crates.io. The `kin` crate there is an unrelated project.
 
 ## Quickstart
 

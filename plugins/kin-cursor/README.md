@@ -6,10 +6,10 @@ analysis without raw file search.
 
 ## Install
 
-Install from the Cursor Marketplace, or add the MCP server directly with the one-click link
-in the [repository README](https://github.com/firelock-ai/kin#works-with-your-agent).
+Add the MCP server by hand. See the [repository README](https://github.com/firelock-ai/kin#use-it-from-claude-code-codex-or-cursor)
+for the surrounding context.
 
-By hand, add this to `~/.cursor/mcp.json`:
+Add this to `~/.cursor/mcp.json`:
 
 ```json
 {
