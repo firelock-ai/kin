@@ -361,6 +361,13 @@ pub struct Degraded {
     /// clears itself rather than needing a second event to retract it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_pressure: Option<bool>,
+    /// Which heavy work the standing memory-pressure refusal declined, by its
+    /// stable id (`embed-batch`, `lsp-sweep`), kept beside the flag so the
+    /// verdict can bound only the answers that work feeds. Never on the wire:
+    /// the wire keeps `memory_pressure: true` alone, and an envelope read back
+    /// from the wire carries no work id, which bounds every answer.
+    #[serde(skip)]
+    pub memory_pressure_work: Option<String>,
     /// This store's graph currently holds fewer relations than its own last
     /// verified-good census did, over an entity count that did not fall. The
     /// relation census is the only surface that could see it, and on the rc0550
@@ -415,6 +422,38 @@ impl Degraded {
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
+    }
+
+    /// Whether a standing flag bounds an answer drawn from `substrate`.
+    ///
+    /// A flag describes one producer, and it bounds the answers whose substrate
+    /// that producer feeds. Scoping is opt-in per flag: this clears, from a
+    /// copy, exactly the flags whose producer cannot touch `substrate`, and asks
+    /// [`Self::any`] about what is left. A flag not named here, and a
+    /// memory-pressure refusal of any work other than the two named here or of
+    /// work nobody recorded, is never cleared, so it keeps bounding every
+    /// answer.
+    pub fn bounds(&self, substrate: AbsenceSubstrate) -> bool {
+        use kin_core::memory_pressure::HeavyWork;
+        let mut rest = self.clone();
+        // A stopped embedding worker freezes the vector index, and a store with
+        // no durable vector sidecar runs no embedding at all. Only an answer
+        // ranked over vectors reads either.
+        if substrate != AbsenceSubstrate::Vectors {
+            rest.embed_worker_failed = None;
+            rest.embed_persistence_unavailable = None;
+        }
+        // A held embedding batch leaves vectors where they are; a held sweep
+        // leaves cross-file relations at what is durable.
+        let work = rest.memory_pressure_work.as_deref();
+        let embed_batch_out_of_scope =
+            work == Some(HeavyWork::EmbedBatch.id()) && substrate != AbsenceSubstrate::Vectors;
+        let lsp_sweep_out_of_scope =
+            work == Some(HeavyWork::LspSweep.id()) && substrate != AbsenceSubstrate::Relations;
+        if embed_batch_out_of_scope || lsp_sweep_out_of_scope {
+            rest.memory_pressure = None;
+        }
+        rest.any()
     }
 
     /// The names of the degraded signals that are affirmatively set, in a stable
@@ -1211,6 +1250,25 @@ pub enum NegativeClass {
     /// absence-trust depends on the *graph* being initialized and loaded, not on
     /// embedding coverage.
     Structural,
+}
+
+/// What an absence answer reads, which decides the degraded flags that bound
+/// it.
+///
+/// Finer than [`NegativeClass`], which only separates vectors from the graph:
+/// a held language-server sweep leaves relations stale and changes nothing the
+/// entity index or history holds, so the graph is split where the flags split
+/// it. See [`Degraded::bounds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsenceSubstrate {
+    /// Embeddings, ranked by `semantic_locate`.
+    Vectors,
+    /// Which entities exist under a name, kind, role or file.
+    EntityIndex,
+    /// Typed relations between entities.
+    Relations,
+    /// Change history.
+    History,
 }
 
 /// Which substrate an answer was drawn from, and therefore what "complete"
@@ -2272,6 +2330,7 @@ impl Envelope {
             },
             sweep_suspended: self.degraded.sweep_suspended,
             memory_pressure: self.degraded.memory_pressure,
+            memory_pressure_work: self.degraded.memory_pressure_work.clone(),
             relation_census_loss: self.degraded.relation_census_loss,
             hydration_semantics_stale: self.degraded.hydration_semantics_stale,
             enrichment_shortfall: self.degraded.enrichment_shortfall,
@@ -2359,8 +2418,9 @@ impl Envelope {
         mut self,
         refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
     ) -> Self {
-        if refusal.is_some() {
+        if let Some(refusal) = refusal {
             self.degraded.memory_pressure = Some(true);
+            self.degraded.memory_pressure_work = Some(refusal.work.clone());
         }
         self
     }
@@ -2710,9 +2770,11 @@ impl Envelope {
     ///
     /// This is the epistemic core of the confidence-qualified-negative contract:
     /// a "not found" is only distinguishable from "not indexed" when the answer
-    /// came from daemon-owned truth (`RepoDaemon`) with no degraded signals **and**
-    /// the substrate the tool actually reads is complete. The two runtime/degraded
-    /// gates are shared; the completeness gate is class-specific:
+    /// came from daemon-owned truth (`RepoDaemon`) with no degraded signal
+    /// bounding `substrate`, the thing the answer reads ([`Degraded::bounds`]),
+    /// **and** that substrate is complete. The runtime gate is shared, the
+    /// degraded gate is scoped to the substrate, and the completeness gate is
+    /// class-specific:
     ///
     /// - [`NegativeClass::Semantic`] tools read embeddings, so absence is
     ///   authoritative only with **complete embedding coverage**.
@@ -2730,14 +2792,18 @@ impl Envelope {
     /// and finishes the sentence there. Claiming the wider silence from here
     /// shipped in v0.5.43 as `trust_reason` ending "with no degraded signals"
     /// one field away from a two-element `degraded_signals` array (FIR-2505).
-    pub fn negative_trust(&self, class: NegativeClass) -> (bool, &'static str) {
+    pub fn negative_trust(
+        &self,
+        class: NegativeClass,
+        substrate: AbsenceSubstrate,
+    ) -> (bool, &'static str) {
         if self.runtime != Runtime::RepoDaemon {
             return (
                 false,
                 "offline_fallback: answered by the in-process graph, a fallback surface — not authoritative graph truth",
             );
         }
-        if self.degraded.any() {
+        if self.degraded.bounds(substrate) {
             return (
                 false,
                 "degraded: the daemon reported a degraded signal, so the index may not reflect current truth",
@@ -6377,6 +6443,56 @@ mod tests {
         );
     }
 
+    /// The refused work is what lets the verdict bound only the answers that
+    /// work feeds, and it never reaches the wire. The wire keeps
+    /// `memory_pressure: true` exactly as before, and an envelope read back
+    /// from the wire has no work id, so it bounds every answer. Selected-graph
+    /// qualification, which rebuilds the flags for graph status, keeps the work
+    /// beside the flag it belongs to.
+    #[test]
+    fn the_wire_keeps_memory_pressure_and_never_the_refused_work() {
+        let refusal = kin_core::memory_pressure::PressureRefusal {
+            work: "embed-batch".to_string(),
+            level: "critical".to_string(),
+            reason: "host memory pressure is critical".to_string(),
+            at_unix: 4_800,
+        };
+        let held = Envelope::daemon().with_memory_pressure(Some(&refusal));
+        assert_eq!(
+            held.degraded.memory_pressure_work.as_deref(),
+            Some("embed-batch")
+        );
+        assert!(!held.degraded.bounds(AbsenceSubstrate::Relations));
+
+        let json = serde_json::to_string(&held.degraded).expect("serialize degraded");
+        assert!(json.contains("\"memory_pressure\":true"), "{json}");
+        assert!(
+            !json.contains("embed-batch") && !json.contains("memory_pressure_work"),
+            "the refused work stays off the wire: {json}"
+        );
+
+        let read_back: Degraded = serde_json::from_str(&json).expect("degraded reads back");
+        assert_eq!(read_back.memory_pressure, Some(true));
+        for substrate in [
+            AbsenceSubstrate::Vectors,
+            AbsenceSubstrate::EntityIndex,
+            AbsenceSubstrate::Relations,
+            AbsenceSubstrate::History,
+        ] {
+            assert!(
+                read_back.bounds(substrate),
+                "a refusal with no recorded work bounds every answer: {substrate:?}"
+            );
+        }
+
+        let selected = held.with_selected_graph_observation(level_counts(4, 4), 4, 0, 4);
+        assert_eq!(selected.degraded.memory_pressure, Some(true));
+        assert!(
+            !selected.degraded.bounds(AbsenceSubstrate::Relations),
+            "selected-graph qualification keeps the refused work beside its flag"
+        );
+    }
+
     /// Absent rather than `false` on the wire, for the reason every flag in
     /// this struct is absent when unobserved: a client cannot tell a
     /// serialized `false` from an answer that looked and found nothing wrong.
@@ -6502,9 +6618,22 @@ mod tests {
                 .degraded
                 .active_labels()
                 .contains(&"hydration_semantics_stale"));
-            let (trusted, reason) = flagged.negative_trust(NegativeClass::Semantic);
+            let (trusted, reason) =
+                flagged.negative_trust(NegativeClass::Semantic, AbsenceSubstrate::Vectors);
             assert!(!trusted);
             assert!(reason.contains("degraded"), "{reason}");
+            for substrate in [
+                AbsenceSubstrate::Vectors,
+                AbsenceSubstrate::EntityIndex,
+                AbsenceSubstrate::Relations,
+                AbsenceSubstrate::History,
+            ] {
+                assert!(
+                    flagged.degraded.bounds(substrate),
+                    "a hydration gap keeps bounding every answer until HEAD is verified: \
+                     {substrate:?}"
+                );
+            }
 
             let selected = flagged.with_selected_graph_observation(level_counts(4, 4), 4, 0, 4);
             assert_eq!(
