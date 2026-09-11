@@ -63,10 +63,13 @@ fn exact_source_archive_exports() -> Arc<ExactSourceArchiveExportQueue> {
 ///
 /// The manager is shared rather than owned so a caller that has already paid
 /// for one open can hand the same coherent authority to another reader; see
-/// [`ProjectionAuthorityCache`].
+/// [`ProjectionAuthorityCache`]. The payload receipt that recovery returned
+/// travels with it, because it describes the open this manager came out of, and
+/// a reader that borrows the manager reports the payload it actually read from.
 #[derive(Clone)]
 struct ActiveApiRepositoryAuthority {
     manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+    payload_stats: Option<kin_db::AuthorityPayloadStats>,
     repository_id: RepositoryId,
     workspace_id: WorkspaceId,
 }
@@ -76,10 +79,13 @@ impl ActiveApiRepositoryAuthority {
         let binding = state
             .local_repository_authority_binding()
             .map_err(repository_authority_error)?;
-        let manager = binding.open_manager().map_err(repository_authority_error)?;
+        let (manager, payload_stats) = binding
+            .open_manager_with_payload_stats()
+            .map_err(repository_authority_error)?;
         state.projection_authority.record_load();
         Ok(Self {
             manager: Arc::new(manager),
+            payload_stats,
             repository_id: binding.repository_id().clone(),
             workspace_id: binding.workspace_id(),
         })
@@ -89,9 +95,12 @@ impl ActiveApiRepositoryAuthority {
     fn open_layout_for_test(layout: &kin_core::KinLayout) -> Result<Self, (StatusCode, String)> {
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)
             .map_err(repository_authority_error)?;
-        let manager = binding.open_manager().map_err(repository_authority_error)?;
+        let (manager, payload_stats) = binding
+            .open_manager_with_payload_stats()
+            .map_err(repository_authority_error)?;
         Ok(Self {
             manager: Arc::new(manager),
+            payload_stats,
             repository_id: binding.repository_id().clone(),
             workspace_id: binding.workspace_id(),
         })
@@ -359,6 +368,7 @@ impl ProjectionAuthorityCache {
         &self,
         published: LocalPublicationIdentity,
         manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+        payload_stats: Option<kin_db::AuthorityPayloadStats>,
         repository_id: RepositoryId,
         workspace_id: WorkspaceId,
     ) {
@@ -366,6 +376,7 @@ impl ProjectionAuthorityCache {
             published,
             ActiveApiRepositoryAuthority {
                 manager,
+                payload_stats,
                 repository_id,
                 workspace_id,
             },
@@ -685,26 +696,30 @@ fn query_repository_authority(
         return Ok(authority);
     }
 
-    let _load = lock_recover(&state.projection_authority.load_gate);
-    // Re-read under the gate: the publication may have moved while this request
-    // waited, and the label installed below must be the one taken before the
-    // load it describes.
-    let published = read_local_publication_identity(&backend, &repository_id)?;
+    // The manager comes from the daemon's one held authority rather than from an
+    // open of this wrapper's own. `held_projection_authority` reads the
+    // publication record before the load it labels, serializes misses on the
+    // shared load gate, and returns the label that authority was loaded under,
+    // so this slot is keyed on the publication its bytes were verified at and
+    // never on a later reading.
+    let (published, held) = held_projection_authority(state)?;
+    // Whoever waited on that gate takes the wrapper the winner installed rather
+    // than building a second one over the same manager.
     if let Some(authority) = state.projection_authority.reuse_query(&published) {
         return Ok(authority);
     }
-    let authority = Arc::new(
-        kin_mcp::handlers::ActiveRepositoryAuthority::open(&binding)
-            .map_err(repository_authority_error)?,
-    );
-    state.projection_authority.record_load();
+    let authority = Arc::new(kin_mcp::handlers::ActiveRepositoryAuthority::from_shared(
+        Arc::clone(&held.manager),
+        repository_id.clone(),
+        held.workspace_id,
+    ));
     state
         .projection_authority
         .install_query(published, Arc::clone(&authority));
     tracing::debug!(
         repository = %repository_id,
         loads = state.projection_authority.loads(),
-        "query repository authority loaded"
+        "query repository authority bound to the held load"
     );
     Ok(authority)
 }
@@ -753,26 +768,28 @@ fn command_repository_authority(
         return Ok(authority);
     }
 
-    let _load = lock_recover(&state.projection_authority.load_gate);
-    // Re-read under the gate: the publication may have moved while this request
-    // waited, and the label installed below must be the one taken before the
-    // load it describes.
-    let published = read_local_publication_identity(&backend, &repository_id)?;
+    // The same borrow the query wrapper above takes, under the same label rule
+    // and the same gate. The receipt travels with the manager so a status report
+    // answered through this wrapper still names the payload it read.
+    let (published, held) = held_projection_authority(state)?;
     if let Some(authority) = state.projection_authority.reuse_command(&published) {
         return Ok(authority);
     }
     let authority = Arc::new(
-        kin_cli::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
-            .map_err(repository_authority_error)?,
+        kin_cli::commands::repository_authority::ActiveRepositoryAuthority::from_shared(
+            Arc::clone(&held.manager),
+            held.payload_stats,
+            repository_id.clone(),
+            held.workspace_id,
+        ),
     );
-    state.projection_authority.record_load();
     state
         .projection_authority
         .install_command(published, Arc::clone(&authority));
     tracing::debug!(
         repository = %repository_id,
         loads = state.projection_authority.loads(),
-        "command repository authority loaded"
+        "command repository authority bound to the held load"
     );
     Ok(authority)
 }
@@ -49000,6 +49017,137 @@ mod tests {
         );
     }
 
+    /// The MCP query tools and the kin-cli command helpers read through the
+    /// authority this daemon already holds, so one publication costs ONE
+    /// whole-store open for all three wrappers rather than one each.
+    ///
+    /// Three wrappers over one durable state is migration debt, and each of them
+    /// used to open for itself. One open ran 6.3 to 7.6 s on the 1.42 GB scratch
+    /// store this was measured on, so the first source read and the first
+    /// entity-source read after every publication each re-verified bytes this
+    /// daemon had already verified, and retained a second and a third copy of
+    /// them.
+    ///
+    /// Counted on `kin_core::authority_opens()`, the funnel every path into
+    /// KinDB's recovery reaches. Either wrapper's own counter is blind to an open
+    /// taken through another wrapper, which is why the funnel counter exists.
+    #[tokio::test]
+    async fn the_query_and_command_wrappers_borrow_the_held_authority() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // The publication the fixture just made moved the record every slot is
+        // keyed on, so this pair is cold: one of the two must load, and before
+        // this change both did.
+        let cold = kin_core::authority_opens();
+        let query =
+            query_repository_authority(&state).expect("the fixture must resolve a query authority");
+        let command = command_repository_authority(&state)
+            .expect("the fixture must resolve a command authority");
+        assert_eq!(
+            kin_core::authority_opens() - cold,
+            1,
+            "the query and the command wrapper at one publication must share one whole-store \
+             open; one open each is two full re-verifications of the same durable bytes"
+        );
+
+        for call in 1..=8 {
+            let query_again = query_repository_authority(&state)
+                .unwrap_or_else(|(_, message)| panic!("query reuse call {call} failed: {message}"));
+            let command_again =
+                command_repository_authority(&state).unwrap_or_else(|(_, message)| {
+                    panic!("command reuse call {call} failed: {message}")
+                });
+            assert!(
+                Arc::ptr_eq(&query, &query_again) && Arc::ptr_eq(&command, &command_again),
+                "reuse call {call} rebuilt a wrapper at a publication that had not moved"
+            );
+        }
+        assert_eq!(
+            kin_core::authority_opens() - cold,
+            1,
+            "eight further reads at one publication must open the store no further times"
+        );
+
+        // A publication moves the record both slots are keyed on. Neither
+        // wrapper may keep answering from the manager it borrowed before it, and
+        // stopping must not cost one load each.
+        install_repository_file(&state, "src/next.py", b"def added():\n    return 2\n");
+        let moved = kin_core::authority_opens();
+        let query_after =
+            query_repository_authority(&state).expect("the read after a publication must resolve");
+        let command_after = command_repository_authority(&state)
+            .expect("the read after a publication must resolve");
+        assert!(
+            !Arc::ptr_eq(&query, &query_after) && !Arc::ptr_eq(&command, &command_after),
+            "a wrapper handed out after another publication is pinned to the authority it \
+             borrowed before it, which is worse than a slow read"
+        );
+        assert_eq!(
+            kin_core::authority_opens() - moved,
+            1,
+            "the publication must cost one fresh load, shared by both wrappers"
+        );
+    }
+
+    /// A status report answered through a borrowed authority still names the
+    /// payload it was read from.
+    ///
+    /// `/commands/status` renders the payload receipt KinDB's recovery returns,
+    /// and that receipt used to arrive because this route opened the store for
+    /// itself. Reading through the daemon's held authority instead is only the
+    /// same answer if the receipt travels with the manager; carrying the manager
+    /// alone would delete a field from the report and leave the route green.
+    #[tokio::test]
+    async fn a_status_report_from_the_borrowed_authority_still_names_its_payload() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Hold the authority first, so the route below is answered from a borrow
+        // rather than from an open of its own. Without this the report would
+        // carry a receipt either way and the test would prove nothing.
+        let held = kin_core::authority_opens();
+        crate::api::held_repository_authority(&state).expect("the fixture must hold an authority");
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "json": false }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the status route must answer: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            kin_core::authority_opens() - held,
+            1,
+            "the status route must read through the authority this daemon already held, so the \
+             only open in this section is the one that produced it"
+        );
+        let report: kin_cli::commands::status::CommandStatusResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            report.report.authority_payload.is_some(),
+            "the report answered from a borrowed authority dropped its payload receipt: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     /// A trace request must not be the only thing this daemon can be doing.
     ///
     /// The walk now runs on the blocking pool, so the runtime stays free to
@@ -50514,11 +50662,19 @@ mod tests {
     /// thread that built it, and on the daemon's load counter. The counter alone
     /// could not fail: a route handed the bare binding opens the store through
     /// the ref grammar and never touches this daemon's cache, so the counter
-    /// stays flat while every request pays for a whole-store open.
+    /// stays flat while every request pays for a whole-store open. The answer's
+    /// own witness is kin-core's funnel counter, so it names an open whichever
+    /// crate's wrapper performed it.
     #[tokio::test]
     async fn blame_and_history_answer_head_from_the_authority_the_daemon_holds() {
         let state =
             test_state_with_committed_sources(&[("src/lib.py", "def retained():\n    return 1\n")]);
+        // `DaemonState::open` holds the authority its own startup paid for, so
+        // this fixture already holds the publication it just imported and a read
+        // through it opens nothing at all. Invalidate first, which is the state a
+        // publication by another writer leaves, so the read below is the first at
+        // a publication this daemon does not hold.
+        state.projection_authority.invalidate();
         let loads_before = state.projection_authority.loads();
         let app = router(Arc::clone(&state));
 
@@ -59296,7 +59452,12 @@ mod tests {
         install_locate_page(&state, PAGE);
         let app = router(state);
 
-        let before = kin_mcp::handlers::common::repository_authority_opens_on_this_thread();
+        // Counted on `kin_core::authority_opens()`, the funnel every path into
+        // KinDB's recovery reaches. The query wrapper's own counter counts only
+        // the opens that wrapper performs, and this daemon's query slot reads
+        // through the authority it already holds, so a count taken there reads
+        // zero whether the page opened once or once per projected body.
+        let before = kin_core::authority_opens();
         let fused = call_semantic_locate(
             app,
             json!({
@@ -59307,7 +59468,7 @@ mod tests {
             }),
         )
         .await;
-        let opens = kin_mcp::handlers::common::repository_authority_opens_on_this_thread() - before;
+        let opens = kin_core::authority_opens() - before;
 
         // Non-vacuity first. A page that projected fewer than two bodies cannot
         // tell "one open per request" apart from "one open per body", so the
