@@ -405,6 +405,25 @@ jobs:
           run_nonempty_target "kin-git library" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-git --lib
+          # The two imported libraries that carry Windows-only code, and the
+          # coverage the import would otherwise have dropped. kin-blobs and
+          # kin-vector each ran `cargo test` on a native Windows runner on a
+          # nightly cron in their own repositories, and that workflow went with
+          # the rest of that CI when they moved here. kin's own Windows jobs
+          # never named them. The class is real and expensive: a `sync_all` on
+          # a read-only handle and a `File::open` on a directory both fail on
+          # Windows and on nothing else, which is what these two crates do on
+          # every durable write. `windows-cross-check` compiles them on the
+          # pull-request path through kin-cli and kin-daemon, so what is left to
+          # buy is RUNNING them, and this is where that happens. kin-search and
+          # kin-model are not here: neither carries a `cfg(windows)` arm and
+          # neither ever had a native Windows run to preserve.
+          run_nonempty_target "kin-blobs library" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-blobs --lib
+          run_nonempty_target "kin-vector library" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-vector --lib
           # Stays in this job rather than moving to the CLI one: the npm proof
           # above asserts that the compatibility wrapper finds its sibling
           # daemon, and this is the unit case for the discovery it depends on.
