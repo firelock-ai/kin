@@ -92,7 +92,7 @@ import re
 import sys
 import tomllib
 import xml.etree.ElementTree as ElementTree
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 CONFIG = Path(".config") / "nextest.toml"
@@ -197,6 +197,18 @@ def parse_date(value):
         return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
     except ValueError:
         return None
+
+
+def grading_date(now):
+    """The date every clock here is graded on: the UTC date of `now`.
+
+    CI grades in UTC. A host west of Greenwich that graded on its own date
+    would call a row fresh for hours after the hosted runner calls it expired,
+    on a required context. A naive `now` is read as local time, which is what
+    `datetime.now()` returns, so it converts to the same date.
+    """
+
+    return now.astimezone(timezone.utc).date()
 
 
 def check_rows(rows, root, today):
@@ -441,7 +453,9 @@ def run_controls():
     with what it mutated.
     """
 
+    import os
     import tempfile
+    import time
 
     today = date(2026, 8, 27)
     fresh = (today - timedelta(days=1)).isoformat()
@@ -520,6 +534,60 @@ def run_controls():
             raise AssertionError(
                 "control failed: a row naming a missing source file was not "
                 "caught as stale-row"
+            )
+
+        # The clock is graded in UTC because CI is, whatever zone the host is
+        # in. The arm pins this process four hours west of Greenwich, where
+        # 23:30 on the 10th is already the 11th in UTC and a row dated the 27th
+        # of the month before is fifteen days old rather than the local date's
+        # fourteen. It grades that instant, aware and naive, then the finding
+        # the graded date produces, after proving the local date would not
+        # have produced it, so the arm can tell the two readings apart. The
+        # date is a past one so no reading of the wall clock can match it.
+        evening = datetime(2025, 9, 10, 23, 30)
+        instants = [evening.replace(tzinfo=timezone(timedelta(hours=-4)))]
+        pinned = hasattr(time, "tzset")
+        saved_tz = os.environ.get("TZ")
+        if pinned:
+            os.environ["TZ"] = "<-04>+4"
+            time.tzset()
+        try:
+            if pinned:
+                if time.timezone != 4 * 3600:
+                    raise AssertionError(
+                        "control failed: this process could not be pinned to "
+                        "UTC-4, so the arm would grade the host's own zone"
+                    )
+                instants.append(evening)
+            graded = {grading_date(instant) for instant in instants}
+        finally:
+            if pinned:
+                if saved_tz is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = saved_tz
+                time.tzset()
+        if graded != {date(2025, 9, 11)}:
+            shown = ", ".join(day.isoformat() for day in sorted(graded))
+            raise AssertionError(
+                f"control failed: 23:30 at UTC-4 on 2025-09-10 graded as {shown} "
+                "rather than 2025-09-11, so a host west of Greenwich reads a row "
+                "as fresh for hours after CI expires it"
+            )
+        boundary = CLEAN_FIXTURE.format(
+            since="2025-08-27", flake="2025-09-10", source="target.rs"
+        )
+        local, _ = check_rows(parse_rows(boundary), tmp, date(2025, 9, 10))
+        if any(finding.startswith("expired:") for finding in local):
+            raise AssertionError(
+                "control failed: the boundary row already expires on the local "
+                "date, so this arm cannot tell the two readings apart"
+            )
+        findings, _ = check_rows(parse_rows(boundary), tmp, date(2025, 9, 11))
+        if not any(finding.startswith("expired:") for finding in findings):
+            raise AssertionError(
+                "control failed: a row fifteen days old in UTC was not caught as "
+                "expired at 23:30 on a host four hours west of Greenwich"
             )
 
 
@@ -603,7 +671,8 @@ def main(argv):
                 quarantined.append(named.group(1).rsplit("::", 1)[-1])
         return report_junit(junit, quarantined)
 
-    findings, warnings = check_rows(rows, root, date.today())
+    today = grading_date(datetime.now(timezone.utc))
+    findings, warnings = check_rows(rows, root, today)
 
     for warning in warnings:
         print(f"::warning title=Quarantine promotion candidate::{warning}")
