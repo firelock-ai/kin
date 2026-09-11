@@ -87,15 +87,8 @@ pub async fn todo_import(path: Option<String>) -> Result<()> {
 // -- Helpers --
 
 fn parse_annotation_target(target: &str) -> Result<AnnotationTarget> {
-    if let Some(rest) = target.strip_prefix("work:") {
-        let uuid = uuid::Uuid::parse_str(rest)
-            .map_err(|_| anyhow::anyhow!("invalid work item UUID: {}", rest))?;
-        Ok(AnnotationTarget::Work(WorkId(uuid)))
-    } else {
-        Ok(AnnotationTarget::Scope(
-            crate::commands::work::parse_work_scope(target)?,
-        ))
-    }
+    // One parser for the CLI and the MCP tools, as for `work::parse_work_scope`.
+    Ok(kin_mcp::handlers::common::parse_annotation_target(target)?)
 }
 
 #[cfg(test)]

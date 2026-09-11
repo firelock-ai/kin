@@ -360,30 +360,10 @@ fn parse_work_id(s: &str) -> Result<WorkId> {
 }
 
 pub(crate) fn parse_work_scope(s: &str) -> Result<WorkScope> {
-    if let Some(rest) = s.strip_prefix("entity:") {
-        let uuid = uuid::Uuid::parse_str(rest)
-            .map_err(|_| anyhow::anyhow!("invalid entity UUID: {}", rest))?;
-        Ok(WorkScope::Entity(EntityId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("contract:") {
-        let uuid = uuid::Uuid::parse_str(rest)
-            .map_err(|_| anyhow::anyhow!("invalid contract UUID: {}", rest))?;
-        Ok(WorkScope::Contract(ContractId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("artifact:") {
-        Ok(WorkScope::Artifact(FilePathId::new(rest)))
-    } else if let Some(rest) = s.strip_prefix("file:") {
-        Ok(WorkScope::Artifact(FilePathId::new(rest)))
-    } else if let Some(rest) = s.strip_prefix("change:") {
-        let hash = Hash256::from_hex(rest)
-            .map_err(|_| anyhow::anyhow!("invalid semantic change ID: {}", rest))?;
-        Ok(WorkScope::Change(SemanticChangeId::from_hash(hash)))
-    } else {
-        // Try as UUID (entity), then fall back to file path.
-        if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-            Ok(WorkScope::Entity(EntityId(uuid)))
-        } else {
-            Ok(WorkScope::Artifact(FilePathId::new(s)))
-        }
-    }
+    // The CLI and the MCP tools read a scope through one parser, so the
+    // spellings it accepts, and the refusal an unrecognized one gets, are the
+    // same on both surfaces.
+    Ok(kin_mcp::handlers::common::parse_single_work_scope(s)?)
 }
 
 fn render_work_list(
@@ -977,6 +957,18 @@ mod tests {
     use super::*;
     use kin_model::WorkStore;
 
+    /// The CLI reads a scope through the same parser as the MCP tools, so a bare
+    /// path is refused here too rather than becoming a path scope.
+    #[test]
+    fn the_cli_scope_parser_refuses_a_bare_path() {
+        let error = parse_work_scope("src/main.rs").expect_err("a bare path is refused");
+        assert!(error.to_string().contains("artifact:<path>"), "{error}");
+        assert!(matches!(
+            parse_work_scope("artifact:src/main.rs"),
+            Ok(WorkScope::Artifact(_))
+        ));
+    }
+
     async fn create_in_layout_direct(
         layout: &kin_core::KinLayout,
         kind: String,
@@ -1157,7 +1149,7 @@ mod tests {
             "task".into(),
             "wire persistence".into(),
             Some("make work writes stick".into()),
-            Some("src/main.rs".into()),
+            Some("artifact:src/main.rs".into()),
             Some("high".into()),
         )
         .await
@@ -1220,7 +1212,7 @@ mod tests {
             "feature".into(),
             "ship semantic work graph".into(),
             None,
-            Some("src/main.rs".into()),
+            Some("artifact:src/main.rs".into()),
             None,
         )
         .await
@@ -1230,7 +1222,7 @@ mod tests {
             "task".into(),
             "wire graph queries".into(),
             None,
-            Some("src/lib.rs".into()),
+            Some("artifact:src/lib.rs".into()),
             None,
         )
         .await

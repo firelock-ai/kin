@@ -3709,20 +3709,49 @@ pub fn resolve_diff<G: GraphStore>(
 
 // ── Work/annotation helpers ──
 
+/// The spellings a work scope is written in, named once so every surface that
+/// refuses an unrecognized one lists the same forms.
+pub const WORK_SCOPE_FORMS: &str = "entity:<uuid>, contract:<uuid>, artifact:<path>, file:<path>, change:<id>, or a bare entity UUID";
+
+/// The spellings an annotation target is written in: every work scope, and a
+/// work item.
+pub const ANNOTATION_TARGET_FORMS: &str = "entity:<uuid>, contract:<uuid>, artifact:<path>, file:<path>, change:<id>, work:<uuid>, or a bare entity UUID";
+
+/// The spellings an intent or traffic scope is written in, which is what the
+/// daemon's intent parser accepts.
+pub const INTENT_SCOPE_FORMS: &str =
+    "entity:<uuid>, contract:<uuid>, file:<path>, artifact:<path>, or a bare entity UUID";
+
+/// The sentence every scope parser refuses an unrecognized spelling with.
+///
+/// A string is a scope only in one of the documented spellings. Reading any
+/// other string as a repository path would turn a mistyped entity id or a bare
+/// name into a durable file-path scope, a path lock or a path annotation, with
+/// nothing anywhere to say so, so a path is a scope only when it is spelled as
+/// one.
+pub fn unrecognized_scope_message(scope: &str, forms: &str) -> String {
+    format!(
+        "unrecognized scope {scope:?}: write it as {forms}. A repository path is a scope only \
+         when it is spelled as one, such as artifact:<path>; a bare string is not read as a path."
+    )
+}
+
 pub fn parse_work_scopes(val: Option<&serde_json::Value>) -> Result<Vec<kin_model::WorkScope>> {
     let arr = match val {
         Some(serde_json::Value::Array(a)) => a,
         _ => return Ok(vec![]),
     };
 
-    let mut scopes = Vec::new();
-    for item in arr {
-        if let Some(s) = item.as_str() {
-            let scope = parse_single_work_scope(s)?;
-            scopes.push(scope);
-        }
-    }
-    Ok(scopes)
+    // An entry that is not a string is refused rather than skipped, so a scope
+    // the caller named is never silently missing from the answer.
+    arr.iter()
+        .map(|item| {
+            let s = item.as_str().ok_or_else(|| {
+                McpError::InvalidParams(format!("scope entries must be strings, got {item}"))
+            })?;
+            parse_single_work_scope(s)
+        })
+        .collect()
 }
 
 pub fn parse_annotation_targets(
@@ -3733,59 +3762,147 @@ pub fn parse_annotation_targets(
         _ => return Ok(vec![]),
     };
 
-    let mut targets = Vec::new();
-    for item in raw_targets {
-        if let Some(s) = item.as_str() {
-            targets.push(parse_annotation_target(s)?);
-        }
-    }
-    Ok(targets)
+    raw_targets
+        .iter()
+        .map(|item| {
+            let s = item.as_str().ok_or_else(|| {
+                McpError::InvalidParams(format!("target entries must be strings, got {item}"))
+            })?;
+            parse_annotation_target(s)
+        })
+        .collect()
 }
 
 pub fn parse_annotation_target(s: &str) -> Result<kin_model::AnnotationTarget> {
     if let Some(rest) = s.strip_prefix("work:") {
         let uuid = uuid::Uuid::parse_str(rest)
             .map_err(|_| McpError::InvalidParams(format!("invalid work UUID: {}", rest)))?;
-        Ok(kin_model::AnnotationTarget::Work(kin_model::WorkId(uuid)))
-    } else {
-        Ok(kin_model::AnnotationTarget::Scope(parse_single_work_scope(
-            s,
-        )?))
+        return Ok(kin_model::AnnotationTarget::Work(kin_model::WorkId(uuid)));
     }
+    recognize_work_scope(s)?
+        .map(kin_model::AnnotationTarget::Scope)
+        .ok_or_else(|| {
+            McpError::InvalidParams(unrecognized_scope_message(s, ANNOTATION_TARGET_FORMS))
+        })
 }
 
 pub fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {
+    recognize_work_scope(s)?
+        .ok_or_else(|| McpError::InvalidParams(unrecognized_scope_message(s, WORK_SCOPE_FORMS)))
+}
+
+/// A work scope in one of [`WORK_SCOPE_FORMS`], `Ok(None)` when the string is
+/// none of them, and an error when it names a form and then malforms it.
+///
+/// Unrecognized is its own answer so each caller refuses it with the forms that
+/// apply where it is called: an annotation target also accepts `work:<uuid>`.
+fn recognize_work_scope(s: &str) -> Result<Option<kin_model::WorkScope>> {
     if let Some(rest) = s.strip_prefix("entity:") {
         let uuid = uuid::Uuid::parse_str(rest)
             .map_err(|_| McpError::InvalidParams(format!("invalid entity UUID: {}", rest)))?;
-        Ok(kin_model::WorkScope::Entity(kin_model::EntityId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("contract:") {
+        return Ok(Some(kin_model::WorkScope::Entity(kin_model::EntityId(
+            uuid,
+        ))));
+    }
+    if let Some(rest) = s.strip_prefix("contract:") {
         let uuid = uuid::Uuid::parse_str(rest)
             .map_err(|_| McpError::InvalidParams(format!("invalid contract UUID: {}", rest)))?;
-        Ok(kin_model::WorkScope::Contract(kin_model::ContractId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("artifact:") {
-        Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(
-            rest,
-        )))
-    } else if let Some(rest) = s.strip_prefix("file:") {
-        Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(
-            rest,
-        )))
-    } else if let Some(rest) = s.strip_prefix("change:") {
+        return Ok(Some(kin_model::WorkScope::Contract(kin_model::ContractId(
+            uuid,
+        ))));
+    }
+    if let Some(rest) = s
+        .strip_prefix("artifact:")
+        .or_else(|| s.strip_prefix("file:"))
+    {
+        if rest.is_empty() {
+            return Err(McpError::InvalidParams(format!(
+                "scope {s:?} names no path"
+            )));
+        }
+        return Ok(Some(kin_model::WorkScope::Artifact(
+            kin_model::FilePathId::new(rest),
+        )));
+    }
+    if let Some(rest) = s.strip_prefix("change:") {
         let hash = kin_model::Hash256::from_hex(rest).map_err(|_| {
             McpError::InvalidParams(format!("invalid semantic change ID: {}", rest))
         })?;
-        Ok(kin_model::WorkScope::Change(
+        return Ok(Some(kin_model::WorkScope::Change(
             kin_model::SemanticChangeId::from_hash(hash),
-        ))
-    } else {
-        if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-            Ok(kin_model::WorkScope::Entity(kin_model::EntityId(uuid)))
-        } else {
-            Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(
-                s,
-            )))
+        )));
+    }
+    Ok(uuid::Uuid::parse_str(s)
+        .ok()
+        .map(|uuid| kin_model::WorkScope::Entity(kin_model::EntityId(uuid))))
+}
+
+#[cfg(test)]
+mod scope_grammar_tests {
+    use super::*;
+
+    /// A scope is read only in one of the documented spellings. A bare string
+    /// is refused, and the refusal names the input and the forms, rather than
+    /// being read as a repository path.
+    #[test]
+    fn a_bare_string_is_refused_rather_than_read_as_a_path() {
+        match parse_single_work_scope("src/main.rs") {
+            Err(McpError::InvalidParams(message)) => {
+                assert!(message.contains("artifact:<path>"), "{message}");
+                assert!(message.contains("\"src/main.rs\""), "{message}");
+            }
+            other => panic!("a bare path must be refused, got {other:?}"),
         }
+        for spelled in ["artifact:src/main.rs", "file:src/main.rs"] {
+            match parse_single_work_scope(spelled) {
+                Ok(kin_model::WorkScope::Artifact(path)) => assert_eq!(path.0, "src/main.rs"),
+                other => panic!("{spelled} resolved to {other:?}"),
+            }
+        }
+        let id = uuid::Uuid::new_v4();
+        for spelled in [format!("entity:{id}"), id.to_string()] {
+            assert!(
+                matches!(
+                    parse_single_work_scope(&spelled),
+                    Ok(kin_model::WorkScope::Entity(kin_model::EntityId(found))) if found == id
+                ),
+                "{spelled}"
+            );
+        }
+        assert!(
+            parse_single_work_scope("artifact:").is_err(),
+            "a path scope must name a path"
+        );
+    }
+
+    /// An annotation target also takes a work item, and its refusal says so.
+    #[test]
+    fn an_annotation_target_refusal_names_the_work_form() {
+        match parse_annotation_target("src/main.rs") {
+            Err(McpError::InvalidParams(message)) => {
+                assert!(message.contains("work:<uuid>"), "{message}")
+            }
+            other => panic!("a bare path must be refused, got {other:?}"),
+        }
+        let id = uuid::Uuid::new_v4();
+        assert!(matches!(
+            parse_annotation_target(&format!("work:{id}")),
+            Ok(kin_model::AnnotationTarget::Work(kin_model::WorkId(found))) if found == id
+        ));
+    }
+
+    /// A scope entry that is not a string is refused rather than skipped, so a
+    /// scope the caller named is never silently missing.
+    #[test]
+    fn a_non_string_scope_entry_is_refused_rather_than_skipped() {
+        let entries = serde_json::json!(["artifact:src/main.rs", 7]);
+        assert!(parse_work_scopes(Some(&entries)).is_err());
+        let mut args = HashMap::new();
+        args.insert(
+            "targets".to_string(),
+            serde_json::json!([{ "Entity": "x" }]),
+        );
+        assert!(parse_annotation_targets(&args).is_err());
     }
 }
 
