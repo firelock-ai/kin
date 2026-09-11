@@ -634,6 +634,12 @@ pub async fn status(json: bool) -> Result<()> {
     // The current repo's own worker endpoint files, classified independently so a
     // stale local endpoint is visible even when the supervisor has pruned it.
     let current = current_repo_status();
+    // Whether the supervisor's registry holds the current repository's daemon.
+    // One started outside it is running all the same and is still reported.
+    let supervised = current
+        .as_ref()
+        .and_then(|current| current.pid)
+        .is_some_and(|pid| daemons.iter().any(|daemon| daemon.pid == pid));
 
     // The supervisor is machine-wide, so this listing can span managed homes.
     // Every entry is labelled with the home it belongs to and whether that is
@@ -683,6 +689,8 @@ pub async fn status(json: bool) -> Result<()> {
                 "port": c.port,
                 "pid_file": c.pid_file,
                 "port_file": c.port_file,
+                "serving_since_unix": c.serving_since_unix,
+                "supervised": supervised,
             })),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -752,11 +760,7 @@ pub async fn status(json: bool) -> Result<()> {
 
     if let Some(current) = current {
         println!();
-        println!(
-            "Current repo ({}): worker daemon {}",
-            current.label,
-            current.state.label(),
-        );
+        println!("{}", current_repo_line(&current, supervised));
         if current.state.is_stale() {
             println!("  note: endpoint files are stale; `kin daemon stop` will clear them");
         }
@@ -773,6 +777,9 @@ struct CurrentRepoStatus {
     port: Option<u16>,
     pid_file: String,
     port_file: String,
+    /// When the daemon began serving this store, from the serving record it
+    /// publishes, and only when that record names the recorded pid.
+    serving_since_unix: Option<u64>,
 }
 
 fn current_repo_status() -> Option<CurrentRepoStatus> {
@@ -784,6 +791,9 @@ fn current_repo_status() -> Option<CurrentRepoStatus> {
     let alive = pid.map(is_process_alive).unwrap_or(false);
     let port_open = port.map(is_port_open).unwrap_or(false);
     let state = classify_liveness(pid, alive, port_open);
+    let serving_since_unix = kin_daemon_spawn::read_serving_daemon(kin_root)
+        .filter(|serving| Some(serving.pid) == pid)
+        .map(|serving| serving.at_unix);
     Some(CurrentRepoStatus {
         label: repo_label(working_dir),
         repo_root: canonical(working_dir),
@@ -792,7 +802,54 @@ fn current_repo_status() -> Option<CurrentRepoStatus> {
         port,
         pid_file: repo_daemon_pid_path(kin_root).display().to_string(),
         port_file: repo_daemon_port_path(kin_root).display().to_string(),
+        serving_since_unix,
     })
+}
+
+/// The line naming this repository's own worker daemon.
+///
+/// The pid and port are the pair an operator checks by hand, and the serving
+/// record says since when. A daemon started as `kin-daemon --repo <path>` is
+/// in no registry the supervisor serves, so the listing above this line never
+/// shows it and this line is the only place it appears. It says so, rather
+/// than leave that listing to read as everything that is running.
+fn current_repo_line(current: &CurrentRepoStatus, supervised: bool) -> String {
+    let mut line = format!(
+        "Current repo ({}): worker daemon {}",
+        current.label,
+        current.state.label()
+    );
+    if !matches!(
+        current.state,
+        DaemonLiveness::Running | DaemonLiveness::Unresponsive
+    ) {
+        return line;
+    }
+    let mut facts = Vec::new();
+    if let Some(pid) = current.pid {
+        facts.push(format!("pid {pid}"));
+    }
+    if let Some(port) = current.port {
+        facts.push(format!("port {port}"));
+    }
+    if let Some(since) = current.serving_since_unix.and_then(utc_minute) {
+        facts.push(format!("serving since {since}"));
+    }
+    if !facts.is_empty() {
+        line.push_str(&format!(" ({})", facts.join(", ")));
+    }
+    if !supervised {
+        line.push_str(
+            "; it is not in the supervisor's registry, so the listing above does not show it",
+        );
+    }
+    line
+}
+
+/// A unix time as the minute it names, with its date, in UTC.
+fn utc_minute(unix: u64) -> Option<String> {
+    let at = chrono::DateTime::from_timestamp(i64::try_from(unix).ok()?, 0)?;
+    Some(at.format("%Y-%m-%d %H:%MZ").to_string())
 }
 
 // ── stop ────────────────────────────────────────────────────────────────────
@@ -2069,6 +2126,57 @@ mod tests {
         assert_eq!(
             classify_liveness(Some(4219), true, true),
             DaemonLiveness::Running
+        );
+    }
+
+    /// A daemon the supervisor does not list is still named, with the pair an
+    /// operator checks by hand and the time its serving record gives, and the
+    /// line says why the listing above it does not show it.
+    ///
+    /// Breaking it: print the bare state word again, or drop the registry
+    /// clause, and `kin daemon status` beside a standalone daemon reads as
+    /// though nothing but a state word were known about it.
+    #[test]
+    fn a_daemon_the_supervisor_does_not_list_is_named_with_its_pid_and_port() {
+        let current = CurrentRepoStatus {
+            label: "kin".to_string(),
+            repo_root: "/work/kin".to_string(),
+            state: DaemonLiveness::Running,
+            pid: Some(12538),
+            port: Some(56698),
+            pid_file: "/work/kin/.kin/daemon.pid".to_string(),
+            port_file: "/work/kin/.kin/daemon.port".to_string(),
+            // 2026-09-10T17:57:05Z.
+            serving_since_unix: Some(1_789_063_025),
+        };
+        let standalone = current_repo_line(&current, false);
+        assert!(standalone.contains("pid 12538"), "{standalone}");
+        assert!(standalone.contains("port 56698"), "{standalone}");
+        assert!(
+            standalone.contains("serving since 2026-09-10 17:57Z"),
+            "{standalone}"
+        );
+        assert!(
+            standalone.contains("not in the supervisor's registry"),
+            "{standalone}"
+        );
+
+        // The supervised twin names the same daemon and makes no registry claim.
+        let supervised = current_repo_line(&current, true);
+        assert!(supervised.contains("pid 12538"), "{supervised}");
+        assert!(!supervised.contains("registry"), "{supervised}");
+
+        // A repository with nothing running keeps its one-word state.
+        let idle = CurrentRepoStatus {
+            state: DaemonLiveness::NotRunning,
+            pid: None,
+            port: None,
+            serving_since_unix: None,
+            ..current
+        };
+        assert_eq!(
+            current_repo_line(&idle, false),
+            "Current repo (kin): worker daemon not running"
         );
     }
 

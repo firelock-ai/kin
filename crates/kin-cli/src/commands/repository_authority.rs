@@ -284,6 +284,12 @@ pub enum AuthoritySource {
     RunningDaemonAndOwnOpen,
     /// This command opened repository authority itself.
     OwnAuthorityOpen,
+    /// This command opened repository authority itself while this repository's
+    /// daemon was running and did not answer in time.
+    ///
+    /// Its own arm because the remedy is the opposite of the one above: that
+    /// line tells a reader to start a daemon, and this daemon is already up.
+    OwnAuthorityOpenBesideLiveDaemon,
 }
 
 /// The line naming which authority open answered this invocation.
@@ -310,6 +316,12 @@ pub fn answered_by_line(source: AuthoritySource) -> String {
              repository-authority open, which re-verifies every persisted body; no daemon \
              answered. Start this repository's daemon to serve it from one open per publication \
              instead"
+            .to_string(),
+        AuthoritySource::OwnAuthorityOpenBesideLiveDaemon => "Answered by: this command's own \
+             repository-authority open, which re-verifies every persisted body, because this \
+             repository's daemon is running and could not serve this read in time. It is not \
+             absent, so do not start another: re-run once it answers and it serves this from the \
+             authority it already holds open"
             .to_string(),
     }
 }
