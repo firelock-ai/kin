@@ -1375,10 +1375,17 @@ third of the idle window the session reply named in `idle_timeout_secs`, so a tu
 than that window does not cost the run its session. A reply that names no window gets no
 heartbeat rather than a guessed one. The result record counts them in `session_heartbeats`.
 
+The local `edit_file` and `write_file` tools publish through a Kin session and transaction.
+They require the server to expose session start plus transaction begin, stage, commit and
+abort. A query-only or search-only profile that omits those tools refuses the change before
+writing any file, returns an error to the model and increments `unpublished_changes`.
+Use `agent-default` for native agent tasks that need these writing tools. Discovering a
+transaction tool later does not provision the harness's publication session.
+
 The exit code is the run's outcome: `0` a final answer, `1` a harness error, `2` the
 tool-call budget was spent, `3` the deadline expired, `4` the endpoint was unreachable or
-answered with nothing usable, `5` the MCP server failed, `6` the run changed files that
-repository authority never published, `7` the conversation reached the model's context
+answered with nothing usable, `5` the MCP server failed, `6` requested changes were not
+published by repository authority, `7` the conversation reached the model's context
 window. A transcript is written and closed on every one of them, so a failed run is still
 measurable.
 

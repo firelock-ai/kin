@@ -210,6 +210,90 @@ fn write_fake_mcp_server(dir: &Path) -> PathBuf {
     path
 }
 
+/// Search-only profiles and incomplete transaction surfaces must never turn a local
+/// writing tool into an untracked filesystem edit.
+#[test]
+fn incomplete_publication_surface_refuses_edit_and_create_without_changing_files() {
+    for missing in [
+        "all",
+        "kin_session_start",
+        "kin_transaction_begin",
+        "kin_transaction_stage",
+        "kin_transaction_commit",
+        "kin_transaction_abort",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fixture_repo(dir.path());
+        let original = std::fs::read(repo.join("src/greet.py")).unwrap();
+        let server = dir.path().join("incomplete_mcp.py");
+        let filter = if missing == "all" {
+            "TOOLS = [t for t in TOOLS if not t['name'].startswith('kin_')]".to_string()
+        } else {
+            format!("TOOLS = [t for t in TOOLS if t['name'] != '{missing}']")
+        };
+        std::fs::write(
+            &server,
+            FAKE_SERVER.replace("ENVELOPE =", &format!("{filter}\n\nENVELOPE =")),
+        )
+        .unwrap();
+        let log = dir.path().join("mcp-calls.jsonl");
+        let endpoint = FakeEndpoint::start(vec![
+            completion(
+                "Editing.",
+                Some(tool_call(
+                    "e1",
+                    "edit_file",
+                    json!({
+                        "path": "src/greet.py", "find": "hello", "replace": "goodbye"
+                    }),
+                )),
+            ),
+            completion(
+                "Creating.",
+                Some(tool_call(
+                    "w1",
+                    "write_file",
+                    json!({
+                        "path": "src/new.py", "content": "def created():\n    return 1\n"
+                    }),
+                )),
+            ),
+            completion("Both changes landed.", None),
+        ]);
+        let outcome = kin_agent::run(config(
+            &repo,
+            &dir.path().join("out"),
+            &endpoint.base_url,
+            mcp_command(&server, &log),
+        ))
+        .unwrap();
+        assert_eq!(
+            std::fs::read(repo.join("src/greet.py")).unwrap(),
+            original,
+            "missing {missing}"
+        );
+        assert!(!repo.join("src/new.py").exists(), "missing {missing}");
+        assert_eq!(
+            outcome.status,
+            ExitStatus::ChangesUnpublished,
+            "missing {missing}"
+        );
+        assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 2);
+        let analyzed = analyze(&read_jsonl(&outcome.transcript_path));
+        assert_eq!(analyzed.tool_results.len(), 2);
+        assert!(analyzed
+            .tool_results
+            .iter()
+            .all(|(_, text, error)| *error && text.contains("was not changed")));
+        assert!(
+            !mcp_log(&log)
+                .iter()
+                .any(|row| row["tool"] == "kin_transaction_begin"),
+            "an incomplete surface must not open a transaction: missing {missing}"
+        );
+    }
+}
+
 const FAKE_SERVER: &str = r#"#!/usr/bin/env python3
 import json, os, sys, time
 

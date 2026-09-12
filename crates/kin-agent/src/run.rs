@@ -1121,10 +1121,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                         provenance,
                                                     )
                                                 }
-                                            } else if servers[index]
-                                                .declares("kin_transaction_begin")
-                                                && servers[index].declares("kin_transaction_stage")
-                                            {
+                                            } else {
                                                 // Kin is attached and no transaction opened,
                                                 // so nothing is written: a local write here is
                                                 // a change on disk the graph never hears about,
@@ -1147,63 +1144,6 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                     ),
                                                     provenance,
                                                 )
-                                            } else {
-                                                let mut outcome = match tool {
-                                                    LocalTool::Edit => {
-                                                        belt::run_edit(&repo, &call.arguments)
-                                                    }
-                                                    LocalTool::Write => {
-                                                        belt::run_write(&repo, &call.arguments)
-                                                    }
-                                                };
-                                                // Stage what the harness just did, inside
-                                                // the open bracket, so the commit below
-                                                // has something to publish. An empty
-                                                // transaction is refused by design.
-                                                let staged = if outcome.is_error {
-                                                    false
-                                                } else {
-                                                    stage_planned_operation(
-                                                        &mut servers[index],
-                                                        &mut bracket,
-                                                        session.as_deref(),
-                                                        &plan,
-                                                        outcome.body.as_deref(),
-                                                        &mut writer,
-                                                    )?
-                                                };
-                                                let wanted_publication =
-                                                    !outcome.is_error && staged;
-                                                let provenance = close_transaction(
-                                                    &mut servers[index],
-                                                    bracket,
-                                                    wanted_publication,
-                                                    &mut writer,
-                                                )?;
-                                                if wanted_publication
-                                                    && !published_by_authority(&provenance)
-                                                {
-                                                    counters.unpublished_changes += 1;
-                                                    // The model has to hear this. A bare
-                                                    // success reads as "the edit reached
-                                                    // the graph", and it did not: the
-                                                    // change is on disk and the
-                                                    // transaction aborted. The create
-                                                    // branch has said so since kin#1082,
-                                                    // and this branch had no traffic at
-                                                    // all until an edit could stage.
-                                                    if !outcome.is_error {
-                                                        outcome.text = format!(
-                                                            "{} Repository authority did \
-                                                             not publish it: {}. The \
-                                                             change is on disk and \
-                                                             uncommitted.",
-                                                            outcome.text,
-                                                            unpublished_reason(&provenance),
-                                                        );
-                                                    }
-                                                }
-                                                (outcome, provenance)
                                             };
                                             if let Some(path) = outcome.changed.clone() {
                                                 // With several repositories attached the
@@ -1687,7 +1627,7 @@ fn start_kin_session(
             "server": server_name,
             "policy": "allowed",
             "event": "session_unavailable",
-            "detail": "the server does not expose kin_session_start; edits will carry no session provenance",
+            "detail": "the server does not expose kin_session_start; local writing tools will refuse changes",
         }))?;
         return Ok(None);
     }
@@ -1892,7 +1832,12 @@ fn begin_transaction(
     let Some(session) = session else {
         return Ok(Bracket::unopened("no Kin session was open"));
     };
-    for required in ["kin_transaction_begin", "kin_transaction_stage"] {
+    for required in [
+        "kin_transaction_begin",
+        "kin_transaction_stage",
+        "kin_transaction_commit",
+        "kin_transaction_abort",
+    ] {
         if !server.declares(required) {
             return Ok(Bracket::unopened(format!(
                 "the server does not expose {required}"
