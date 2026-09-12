@@ -186,6 +186,9 @@ impl ReviewDomain {
     }
 
     /// Keep the review audit events and the actors they name.
+    ///
+    /// The `review.unassign` events among them are what records a reviewer's
+    /// removal, so carrying them is what carries removals between replicas.
     fn adopt_provenance(&mut self, events: &[AuditEvent], actors: &HashMap<ActorId, Actor>) {
         for event in events {
             if event.action.starts_with(REVIEW_AUDIT_PREFIX) {
@@ -285,6 +288,10 @@ impl ReviewDomain {
                 }
             }
         }
+        // A review's assignment set only ever grows: a removal is recorded as a
+        // `review.unassign` audit event, which travels with the events below,
+        // and each replica derives its reviewers from the set and those events.
+        // So merging the sets is appending, and no reviewer is taken off here.
         for (id, ours) in &self.assignments {
             let theirs = holder.assignments.get(id).cloned().unwrap_or_default();
             let merged = appended(&theirs, ours);
@@ -300,8 +307,9 @@ impl ReviewDomain {
                 gaps.push(CollaborationGap {
                     record: format!("assignments of review {id}"),
                     detail: format!(
-                        "{} holds {} that {} does not; if that was a removal, it cannot travel, \
-                         because a collaboration delta expresses no removal",
+                        "{} holds {} that {} does not; an assignment set only grows, and a removal \
+                         travels as its own record, so this is a set written before removals were \
+                         recorded and the difference cannot be read as either one",
                         sides.holder,
                         held_only.join(", "),
                         sides.sender

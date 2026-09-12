@@ -446,6 +446,36 @@ impl PageCursor {
             total: value.get("t")?.as_u64()? as usize,
         })
     }
+
+    /// The cursor reaching the rows a response budget withheld from one page of
+    /// this tool, read off the served payload.
+    ///
+    /// The budget cuts a suffix of `entities` after the handler has already
+    /// decided this page's `next_cursor`, so the token the caller receives names
+    /// a row the response no longer carries, or is null on a page that was whole
+    /// before the cut. Either way the withheld rows become unreachable by
+    /// paging, and the caller is told to narrow `page_size`, which asks a
+    /// different question rather than finishing this one.
+    ///
+    /// Recomputing rather than adjusting the old token is what makes both cases
+    /// one case. This enumeration is a stable ordered list addressed by absolute
+    /// offset, so the first row not served is always `offset + kept`, whatever
+    /// the handler had planned. `None` means the cut left nothing beyond this
+    /// page, which is the only honest answer a cursor cannot give.
+    pub fn after_withheld(payload: &serde_json::Value, kept: usize) -> Option<String> {
+        let path = payload.get("path")?.as_str()?;
+        let offset = payload.get("offset")?.as_u64()? as usize;
+        let total = payload.get("total_in_file")?.as_u64()? as usize;
+        let reached = offset.checked_add(kept)?;
+        (reached < total).then(|| {
+            Self {
+                path: path.to_string(),
+                offset: reached,
+                total,
+            }
+            .encode()
+        })
+    }
 }
 
 /// Normalize a caller's path to the spelling the graph stores.
@@ -683,9 +713,19 @@ pub fn handle_list_file_entities<G: GraphStore>(
         "page_size": page_size,
         "offset": offset,
         "next_cursor": next_cursor,
-        // The same flag `kin_artifact_list` and `semantic_search` publish, in
-        // the same sense: this response does not hold everything it counted.
-        "truncated": next_cursor.is_some() || offset > 0,
+        // Whether rows remain past this response, which is the same sense
+        // `kin_artifact_list` publishes: `offset + returned < total`
+        // ([`crate::handlers::artifacts`]). This flag used to read
+        // `next_cursor.is_some() || offset > 0` under a comment claiming that
+        // parity, and the two disagreed on exactly the page a pager acts on:
+        // the last one. A walk's final page has `offset > 0` and no cursor, so
+        // it announced more to fetch over a response after which there is
+        // nothing, and an agent paging on the flag either loops or gives up
+        // holding a complete set it was told was partial. The count fields say
+        // how much of the file this page holds (`returned` against
+        // `total_in_file`); this says whether to ask again, and `next_cursor`
+        // is what answers it.
+        "truncated": next_cursor.is_some(),
         "enumeration_shifted": enumeration_shifted,
         FILE_COVERAGE_KEY: {
             "path": path,
@@ -1227,6 +1267,68 @@ mod tests {
             // answer it can still act on.
             assert_eq!(payload["total_in_file"], serde_json::json!(4));
         }
+    }
+
+    /// FIR-3554. `truncated` answers "ask again?", and on the page after which
+    /// there is nothing to ask for it answers no.
+    ///
+    /// The rule is `kin_artifact_list`'s, which this flag's own comment already
+    /// claimed parity with while disagreeing: that tool publishes
+    /// `offset + returned < total` ([`crate::handlers::artifacts`]), false on the
+    /// final page, and this one published `next_cursor.is_some() || offset > 0`,
+    /// true on it. The control is asserted on every page of the walk, not just
+    /// the last, so a change that fixes the final page by breaking an earlier
+    /// one cannot pass here.
+    #[test]
+    fn truncated_answers_whether_rows_remain_on_every_page() {
+        let store = store_with(7, Some(ParseCompleteness::Full));
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+
+        loop {
+            let mut args = vec![("page_size", serde_json::json!(3))];
+            match &cursor {
+                Some(token) => args.push(("cursor", serde_json::json!(token))),
+                None => args.push(("path", serde_json::json!(FILE))),
+            }
+            let payload = call(&store, &args).unwrap();
+            pages += 1;
+
+            let offset = payload["offset"].as_u64().expect("offset") as usize;
+            let returned = payload["returned"].as_u64().expect("returned") as usize;
+            let total = payload["total_in_file"].as_u64().expect("total") as usize;
+            let truncated = payload["truncated"].as_bool().expect("truncated");
+            // kin_artifact_list's rule, spelled out rather than called, so this
+            // assertion states the contract instead of agreeing with whatever
+            // the other tool currently does.
+            assert_eq!(
+                truncated,
+                offset + returned < total,
+                "page {pages} at offset {offset} returned {returned} of {total} and said \
+                 truncated={truncated}"
+            );
+            assert_eq!(
+                truncated,
+                payload["next_cursor"].as_str().is_some(),
+                "truncated and next_cursor must agree: page {pages}"
+            );
+            match payload["next_cursor"].as_str() {
+                Some(token) => cursor = Some(token.to_string()),
+                // Asserted where the final page is identified, rather than
+                // carried out of the loop in a variable whose initial value
+                // no path ever reads.
+                None => {
+                    assert!(
+                        !truncated,
+                        "the final page of a walk has nothing left to fetch"
+                    );
+                    break;
+                }
+            }
+            assert!(pages < 10, "cursor walk did not terminate");
+        }
+
+        assert_eq!(pages, 3, "7 entities at page_size 3 is three pages");
     }
 
     /// Pagination walks the whole set with no duplicates and no silent cap.

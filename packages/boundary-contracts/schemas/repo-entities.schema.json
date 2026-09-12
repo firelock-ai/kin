@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/repo-entities",
+  "description": "The entities of one repository's graph, as served by GET /repos/{repo_id}/entities on the daemon. Identity is always present on a row; the ranking numbers and the text ride along only when the request asked for them with include, and total appears only when the request asked for a window with limit or offset. A reader of the identity fields alone keeps reading every response this route has ever served.",
+  "type": "object",
+  "required": ["repo_id", "entities"],
+  "additionalProperties": false,
+  "properties": {
+    "repo_id": {
+      "type": "string",
+      "description": "The repository this list was read from."
+    },
+    "entities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entity" }
+    },
+    "total": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Entities the filter matched before the window was applied. Present only when the request asked for a window, where it is what separates a last page from a full one."
+    }
+  },
+  "$defs": {
+    "entity": {
+      "type": "object",
+      "required": ["id", "name", "kind", "file_path"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Entity UUID."
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Entity kind in the graph's own spelling, e.g. Function, Method, EnumVariant."
+        },
+        "file_path": {
+          "type": ["string", "null"],
+          "description": "Repository-relative path, or null for an entity the graph placed in no file."
+        },
+        "degree": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct undirected (neighbour, kind) pairs, the same definition the graph export publishes, so a list and a picture of one repository agree. Present only when the request asked for include=ranking or order=importance."
+        },
+        "dependents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct entities that reach this one over a call, an import or a reference, the entity itself excluded and receiver-name guesses excluded: the set the reference surface certifies, and what order=importance ranks by. Present under the same conditions as degree."
+        },
+        "signature": {
+          "type": "string",
+          "description": "The declaration as the graph recorded it, collapsed to one line. Present only when the request asked for include=signature and the entity has one."
+        },
+        "summary": {
+          "type": "string",
+          "description": "The first line of the entity's doc summary. Present only when the request asked for include=summary and the entity has one."
+        }
+      }
+    }
+  }
+}

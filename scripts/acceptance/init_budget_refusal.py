@@ -601,6 +601,31 @@ def check_3(suite):
     return result
 
 
+# The half every clause about a dead daemon carries, in either vocabulary. It
+# matches `DEATH_CLAUSE_STEM` in `crates/kin-cli/src/daemon_death.rs`, which the
+# product renders every one of those clauses from.
+DEATH_CLAUSE_STEM = "a daemon serving this store"
+
+
+def summary_names_a_daemon_death(text):
+    """Whether `kin init`'s summary says a daemon of this store died.
+
+    Written over the stem both clauses share rather than over one of the
+    sentences, because matching a sentence is what broke. This check asked for
+    "a daemon serving this store was killed" verbatim; the product then gained
+    a second, more careful clause for an ending nothing observed, which is
+    exactly what this check's own kill produces on a host with no cgroup
+    accounting, and the check reported the product as having stopped naming
+    deaths on the build that had started naming them precisely.
+
+    Both halves are required. The caveat alone is true of every store and is
+    what the defect looked like, so a text carrying only "completion not
+    attested" names no death.
+    """
+    text = text or ""
+    return "completion not attested" in text and DEATH_CLAUSE_STEM in text
+
+
 def check_4(suite):
     """A daemon killed during a conversion makes `kin init` exit non-zero.
 
@@ -608,6 +633,13 @@ def check_4(suite):
     "completion not attested, and a daemon serving this store was killed". The
     words were already right; the exit code was the surface a scripted setup
     reads and it said the run was fine.
+
+    The summary is graded on what it names, not on which sentence it uses. A
+    daemon killed on a host that publishes no memory accounting, which is every
+    macOS host and every uncapped Linux one, leaves a record with no signal and
+    no attribution, and the product says that store's daemon "ended without
+    retiring" rather than claiming a kill nothing saw. Both readings are a
+    daemon death this store recorded, and both must carry the non-zero exit.
 
     Driven by killing the real daemon rather than by planting a record. The pid
     comes from the store's own `daemon.serving` file and the signal goes to that
@@ -694,23 +726,23 @@ def check_4(suite):
         result.unknown("the conversion wrote no store, so this is not the case under test")
         return result
 
-    says_killed = "a daemon serving this store was killed" in out
+    says_died = summary_names_a_daemon_death(out)
     if rc == 0:
         result.bad("`kin init` exited 0 after its daemon was killed, which is the zero a "
-                   "scripted setup reads as done (summary named the kill: %s)" % says_killed)
+                   "scripted setup reads as done (summary named the death: %s)" % says_died)
     else:
         result.ok("`kin init` exited %d" % rc)
 
     # The two surfaces have to agree. A non-zero exit whose summary says nothing,
-    # or a summary that names a kill beside a zero, is the same defect wearing
+    # or a summary that names a death beside a zero, is the same defect wearing
     # the other face.
-    if says_killed and rc == 0:
-        result.bad("the summary names the kill and the exit code says success")
-    elif rc != 0 and not says_killed:
-        result.bad("`kin init` exited %d but its summary never names a killed daemon: %s"
-                   % (rc, tail(out, 700)))
-    elif says_killed and rc != 0:
-        result.ok("the summary and the exit code agree that a daemon was killed")
+    if says_died and rc == 0:
+        result.bad("the summary names the death and the exit code says success")
+    elif rc != 0 and not says_died:
+        result.bad("`kin init` exited %d but its summary never names a daemon of this store "
+                   "that died: %s" % (rc, tail(out, 700)))
+    elif says_died and rc != 0:
+        result.ok("the summary and the exit code agree that a daemon of this store died")
     return result
 
 
@@ -907,6 +939,33 @@ def self_test():
     expect(passing.status == PASS, "two passes did not read PASS")
     expect("one" in passing.detail and "two" in passing.detail,
            "a passing detail dropped one of its assertions")
+
+    # The summary grader, over both vocabularies the product renders and over
+    # the two texts it must reject. The second accepted case is the one that
+    # went stale: a kill on a host with no memory accounting, which is what this
+    # suite's own check 4 produces.
+    death_summaries = [
+        (True, "Semantic enrichment: present (1058 entities, 2016 relations, 6731 changes in "
+               "durable authority generation 1; completion not attested, and a daemon serving "
+               "this store was killed)"),
+        (True, "Semantic enrichment: present (6 entities, 6 relations, 1 changes in durable "
+               "authority generation 2; completion not attested, and a daemon serving this "
+               "store ended without retiring)"),
+        # The measured line, which is the one this grader must reject: every
+        # word of it is true of a healthy store.
+        (False, "Semantic enrichment: present (1058 entities, 2016 relations, 6731 changes in "
+                "durable authority generation 1; completion not attested)"),
+        # A summary that named a daemon and dropped the caveat is not a fix
+        # either: the counts are still unattested and a reader loses that.
+        (False, "Semantic enrichment: present (1058 entities; a daemon serving this store was "
+                "killed)"),
+        (False, ""),
+        (False, None),
+    ]
+    for want, text in death_summaries:
+        expect(summary_names_a_daemon_death(text) == want,
+               "summary_names_a_daemon_death(%r) = %s, wanted %s"
+               % (text, summary_names_a_daemon_death(text), want))
 
     expect(len(CHECKS) == len({check_id for check_id, _ in CHECKS}),
            "two checks share an id, so one of them cannot be selected")

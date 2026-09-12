@@ -487,11 +487,13 @@ pub async fn exec(
     keep: bool,
     discard: bool,
     strategy: Option<String>,
-    scope: Option<String>,
 ) -> Result<()> {
     let invocation = ExecInvocation::parse(command_parts, shell)?;
     let layout = discover_layout()?;
-    let projection = materialize(layout, strategy, scope).await?;
+    // The whole session: a scoped session workspace is refused by the daemon
+    // until its selected artifact set can be authenticated outside the editable
+    // session.
+    let projection = materialize(layout, strategy, None).await?;
     eprintln!("Session workspace: {}", projection.root().display());
 
     let exit = run_in_session(&projection, invocation.command())?;

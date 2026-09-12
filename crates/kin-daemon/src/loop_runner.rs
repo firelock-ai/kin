@@ -8328,17 +8328,19 @@ mod tests {
     /// is that a record reaches disk. Breaking `stand_down_tick` by dropping its
     /// publish reds this and nothing else.
     ///
-    /// The idle publisher's cadence and tree sample are process-wide. A suite
-    /// that already published in the last thirty seconds, or that pinned
-    /// `KIN_MEMORY_PRESSURE` with no figures, makes the tick a no-op for this
-    /// store. Seed both so the arm grades the tick, not the neighbours.
+    /// The idle publisher's tree sample is process-wide, and a suite that
+    /// pinned `KIN_MEMORY_PRESSURE` with no figures makes the tick a no-op for
+    /// this store, so the sample is seeded and the arm grades the tick, not the
+    /// neighbours. The publish cadence is this store's own and this store is
+    /// new, so no neighbour's publish can silence it. That half used to be
+    /// process-wide, and it failed this test three runs in twenty, featureless
+    /// and threaded; the sibling below holds it deterministically.
     #[test]
     fn a_round_that_stands_down_publishes_the_footprint_standing() {
         let _budget = kin_core::test_env::EnvVarGuard::set(
             kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV,
             (8u64 * 1024 * 1024 * 1024).to_string(),
         );
-        crate::daemon::reset_footprint_publish_clock_for_test();
         crate::daemon::seed_tree_footprint_for_test(kin_core::memory_pressure::TreeFootprint {
             own_bytes: 64 * 1024 * 1024,
             children_bytes: 0,
@@ -8368,6 +8370,86 @@ mod tests {
         assert!(
             published.budget_bytes > 0,
             "a standing with no budget states nothing about what the daemon is allowed to hold"
+        );
+    }
+
+    /// A store that has never published is owed its first standing, whatever
+    /// another store in the same process published a moment ago.
+    ///
+    /// The race the test above used to lose, made deterministic. The publish
+    /// cadence was one clock for the whole process, so a sibling's publish for
+    /// its own store told a store that had published nothing that it was not
+    /// owed a publish, and the round that stood down wrote no standing at all.
+    /// Measured before the fix on the featureless build: three failures in
+    /// twenty threaded runs of the target beside its publishers, and none in
+    /// twenty with one test thread. Here the other store lives in this same
+    /// test, so the interleaving happens on every run rather than one in seven.
+    ///
+    /// Both stores have never published, so both first rounds are the property.
+    /// Run alone, the first store publishes and the second is the one a shared
+    /// clock silences. Run in a crowd, another test's publish can silence the
+    /// first store instead, and a shared clock was seen doing exactly that when
+    /// this test was falsified, so the first assertion names the defect too
+    /// rather than blaming the harness.
+    ///
+    /// The control is the cadence itself. A second tick for the same store
+    /// inside its own interval must not publish again, or a build that passed
+    /// the first half by publishing on every tick would pass this too and put
+    /// a pressure read on the loop's poll cadence. The idle path returns on the
+    /// interval before it reads pressure at all, so the control does not
+    /// depend on which rung the machine sits at.
+    #[test]
+    fn a_store_that_never_published_is_not_silenced_by_another_stores_publish() {
+        let _budget = kin_core::test_env::EnvVarGuard::set(
+            kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV,
+            (8u64 * 1024 * 1024 * 1024).to_string(),
+        );
+        crate::daemon::seed_tree_footprint_for_test(kin_core::memory_pressure::TreeFootprint {
+            own_bytes: 64 * 1024 * 1024,
+            children_bytes: 0,
+            child_count: 0,
+            kernel_capped: false,
+        });
+
+        let first_repo = tempfile::TempDir::new().unwrap();
+        let first = open_test_state(&first_repo);
+        let first_pass = first
+            .background_work
+            .pass(crate::background_work::PASS_RECONCILE);
+        stand_down_tick(&first, &first_pass);
+        assert!(
+            kin_core::memory_pressure::DaemonFootprint::read(first.layout.root()).is_some(),
+            "a store that had never published wrote no standing on its first round: either a \
+             publish for some other store in this process silenced it, which is the defect this \
+             test is about, or this tick publishes nothing at all"
+        );
+
+        let second_repo = tempfile::TempDir::new().unwrap();
+        let second = open_test_state(&second_repo);
+        let second_pass = second
+            .background_work
+            .pass(crate::background_work::PASS_RECONCILE);
+        assert!(
+            kin_core::memory_pressure::DaemonFootprint::read(second.layout.root()).is_none(),
+            "a store that has never published must start with no record"
+        );
+        stand_down_tick(&second, &second_pass);
+        assert!(
+            kin_core::memory_pressure::DaemonFootprint::read(second.layout.root()).is_some(),
+            "a store that had never published was silenced by another store's publish a \
+             moment earlier"
+        );
+
+        // The control: the cadence still holds for the store that just published.
+        std::fs::remove_file(kin_core::memory_pressure::footprint_record_path(
+            second.layout.root(),
+        ))
+        .expect("the record the second store just published is on disk");
+        stand_down_tick(&second, &second_pass);
+        assert!(
+            kin_core::memory_pressure::DaemonFootprint::read(second.layout.root()).is_none(),
+            "a store's second tick inside its own interval published again, so the cadence \
+             that keeps a pressure read off the poll loop is gone"
         );
     }
 

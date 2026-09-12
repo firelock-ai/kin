@@ -1316,8 +1316,10 @@ mod tests {
     use crate::repository_transfer::{
         repository_ref_advertisement, RepositoryTransferApplyOutcome, FEATURE_COLLABORATION,
     };
+    use kin_model::provenance::{ActorId, AuditEvent, AuditEventId};
     use kin_model::review::{
-        Review, ReviewCompletionState, ReviewDecision, ReviewDecisionState, ReviewId,
+        Review, ReviewAssignment, ReviewCompletionState, ReviewDecision, ReviewDecisionState,
+        ReviewId,
     };
     use kin_model::{CollaborationDelta, IdentityRef, Keyed};
 
@@ -1771,6 +1773,152 @@ mod tests {
 
     fn reviews_of(manager: &TestManager) -> HashMap<ReviewId, Review> {
         manager.read_authority().snapshot().reviews.clone()
+    }
+
+    fn assignments_of(manager: &TestManager, review_id: &ReviewId) -> Vec<ReviewAssignment> {
+        manager
+            .read_authority()
+            .snapshot()
+            .review_assignments
+            .get(review_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn holds_event(manager: &TestManager, event_id: &AuditEventId) -> bool {
+        manager
+            .read_authority()
+            .snapshot()
+            .audit_events
+            .iter()
+            .any(|event| &event.event_id == event_id)
+    }
+
+    /// Commit `records` into `manager` as one collaboration-only transaction, in
+    /// the canonical order an export produces.
+    fn record_collaboration(
+        manager: &TestManager,
+        repository_id: &RepositoryId,
+        operation: u128,
+        records: CollaborationDelta,
+    ) {
+        let records = ReviewDomain::from_delta(&records)
+            .to_delta()
+            .expect("the fixture records something");
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("negotiation-fixture"),
+            reason: "record collaboration state".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: Some(records),
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+    }
+
+    /// A replica that still holds an assignment never puts it back on a replica
+    /// that removed it, and the removal itself travels.
+    ///
+    /// A review's assignment set is an add log: it only grows, and what records a
+    /// removal is a `review.unassign` audit event. So a transfer has nothing to
+    /// undo, and carrying the event is what carries the removal. What the event
+    /// names, and how a replica derives its reviewers from the two, is
+    /// `kin_review::assignments` and is tested there.
+    ///
+    /// Falsify by dropping review audit events from the exported domain: the
+    /// removal never reaches the other replica and the last assertion goes red.
+    #[test]
+    fn a_removal_travels_and_a_replica_holding_the_assignment_does_not_undo_it() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.destination);
+        let review = review_record("assigned to two");
+        let id = review.review_id;
+        let assignment = |name: &str| ReviewAssignment {
+            review_id: id,
+            reviewer: IdentityRef::human(name),
+            assigned_at: Timestamp::now(),
+            assigned_by: IdentityRef::human("troy"),
+        };
+        let bob = assignment("bob");
+        let alice = assignment("alice");
+        record_collaboration(
+            &fixture.source,
+            &fixture.repository_id,
+            100,
+            CollaborationDelta {
+                reviews: vec![Keyed::new(id, review)],
+                review_assignments: vec![Keyed::new(id, vec![bob.clone(), alice.clone()])],
+                ..CollaborationDelta::default()
+            },
+        );
+        push(&fixture, &peer);
+        assert_eq!(
+            assignments_of(&fixture.destination, &id),
+            vec![bob.clone(), alice.clone()],
+            "the push carries both assignments"
+        );
+
+        // The remote takes bob off. The set it holds does not change; the event
+        // is what records it.
+        let removal = AuditEvent {
+            event_id: AuditEventId::new(),
+            actor_id: ActorId::new(),
+            action: "review.unassign".to_string(),
+            target_scope: None,
+            timestamp: Timestamp::now(),
+            details: Some(format!("review_id={id}; reviewer=bob")),
+        };
+        record_collaboration(
+            &fixture.destination,
+            &fixture.repository_id,
+            200,
+            CollaborationDelta {
+                audit_events: vec![removal.clone()],
+                ..CollaborationDelta::default()
+            },
+        );
+
+        // This replica still holds bob's assignment and pushes again.
+        push(&fixture, &peer);
+        assert_eq!(
+            assignments_of(&fixture.destination, &id),
+            vec![bob, alice],
+            "a push adds to the log and never re-assigns what a removal took off"
+        );
+        assert!(
+            holds_event(&fixture.destination, &removal.event_id),
+            "the remote still holds its removal"
+        );
+
+        // And a pull brings that removal home.
+        let remote = LocalPeer::new(&fixture.destination);
+        pull_from_remote(
+            &fixture.source,
+            &remote,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+            AuthorId::new("review-puller"),
+        )
+        .unwrap();
+        assert!(
+            holds_event(&fixture.source, &removal.event_id),
+            "the removal travels to the replica that still held the assignment"
+        );
     }
 
     fn push(fixture: &Fixture, peer: &LocalPeer<'_>) -> RepositoryTransferOutcome {

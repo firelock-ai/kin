@@ -3083,40 +3083,35 @@ pub(crate) struct PressureCall {
 /// window every reader judges it by, at one small write per half minute.
 const FOOTPRINT_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Publish this daemon's standing against its budget, on a cadence.
-///
-/// Called from every point that already took a pressure call, so the standing
-/// keeps up with the daemon's own work without a task of its own to schedule,
-/// idle-shutdown against, or leak. A level change publishes at once: the rung
-/// is the part a reader acts on, and delaying it by up to half a minute would
-/// be the one field worth having promptly.
-/// When this daemon last published a standing, and at what level.
+/// When each store this process serves last had a standing published, and at
+/// what rung.
 ///
 /// Hoisted out of [`publish_footprint_standing`] so the idle path can ask
 /// whether the interval alone owes a publish WITHOUT paying for a pressure
 /// read first. That question has to be cheap: it is asked on a tick that found
 /// nothing to do, at the loop's poll cadence.
-static FOOTPRINT_LAST_PUBLISH: std::sync::OnceLock<
-    std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>>,
-> = std::sync::OnceLock::new();
-
-fn footprint_last_publish(
-) -> &'static std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>> {
-    FOOTPRINT_LAST_PUBLISH.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Forget the process-wide publish clock.
 ///
-/// The idle publisher checks this clock before it writes, and the clock is one
-/// cell for the whole test process. A sibling that published in the last thirty
-/// seconds makes `stand_down_tick` a no-op for every other store, which is how
-/// `a_round_that_stands_down_publishes_the_footprint_standing` went red on the
-/// featureless main job: 1561 tests in one process, one shared cadence.
-#[cfg(test)]
-pub(crate) fn reset_footprint_publish_clock_for_test() {
-    if let Ok(mut guard) = footprint_last_publish().lock() {
-        *guard = None;
-    }
+/// Keyed by store root because the record it paces is. A standing is written
+/// to one store's `footprint_record_path`, and "never published" is a fact
+/// about that store, while one cell for the whole process read it as a fact
+/// about the process. A daemon process opens exactly one `DaemonState`
+/// (`create_state` in the binary, hosted mode included, whose other
+/// repositories are cached graphs inside that one state), so in production
+/// this holds one entry and decides exactly what the single cell decided.
+/// Where one process holds many stores, which is this crate's own test binary,
+/// the single cell let one store's publish tell a store that had never
+/// published anything that it was not owed one.
+static FOOTPRINT_LAST_PUBLISH: std::sync::OnceLock<std::sync::Mutex<FootprintPublishClock>> =
+    std::sync::OnceLock::new();
+
+/// The last publish per store root, and the rung it published at.
+type FootprintPublishClock = std::collections::HashMap<
+    std::path::PathBuf,
+    (Instant, kin_core::memory_pressure::PressureLevel),
+>;
+
+fn footprint_last_publish() -> &'static std::sync::Mutex<FootprintPublishClock> {
+    FOOTPRINT_LAST_PUBLISH.get_or_init(|| std::sync::Mutex::new(FootprintPublishClock::new()))
 }
 
 /// Whether the interval alone owes a publish.
@@ -3161,7 +3156,9 @@ fn publish_is_owed(since_last: Option<Duration>, level_changed: bool) -> bool {
 /// twenty-nine of every thirty seconds.
 pub(crate) fn publish_footprint_standing_on_idle_tick(state: &DaemonState) {
     let since_last = match footprint_last_publish().lock() {
-        Ok(guard) => guard.as_ref().map(|(published, _)| published.elapsed()),
+        Ok(guard) => guard
+            .get(state.layout.root())
+            .map(|(published, _)| published.elapsed()),
         // A poisoned lock is not a reason to publish; the busy path holds the
         // same lock and will report its own failure.
         Err(_) => return,
@@ -3173,25 +3170,34 @@ pub(crate) fn publish_footprint_standing_on_idle_tick(state: &DaemonState) {
     publish_footprint_standing(state, &call);
 }
 
+/// Publish this store's standing against its budget, on this store's cadence.
+///
+/// Called from every point that already took a pressure call, so the standing
+/// keeps up with the daemon's own work without a task of its own to schedule,
+/// idle-shutdown against, or leak. A level change publishes at once: the rung
+/// is the part a reader acts on, and delaying it by up to half a minute would
+/// be the one field worth having promptly. Both the interval and the rung are
+/// this store's own; see [`FOOTPRINT_LAST_PUBLISH`].
 pub(crate) fn publish_footprint_standing(state: &DaemonState, call: &PressureCall) {
     let Some(standing) = call.standing.as_ref() else {
         return;
     };
+    let root = state.layout.root();
     let cell = footprint_last_publish();
     let Ok(mut guard) = cell.lock() else {
         return;
     };
-    let (since_last, level_changed) = match guard.as_ref() {
+    let (since_last, level_changed) = match guard.get(root) {
         Some((published, level)) => (Some(published.elapsed()), *level != call.level),
         None => (None, false),
     };
     if !publish_is_owed(since_last, level_changed) {
         return;
     }
-    *guard = Some((Instant::now(), call.level));
+    guard.insert(root.to_path_buf(), (Instant::now(), call.level));
     drop(guard);
     kin_core::memory_pressure::DaemonFootprint::record(
-        state.layout.root(),
+        root,
         standing,
         call.level,
         std::process::id(),

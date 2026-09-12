@@ -272,7 +272,7 @@ Kin is one system with a few clear public surfaces:
 | Surface | What it does |
 | --- | --- |
 | **[kin](https://github.com/firelock-ai/kin)** | Semantic system of record: CLI, daemon, graph lifecycle, MCP, review, provenance, and Git coexistence. |
-| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Projects graph-owned files through normal filesystem calls so existing tools can keep using files. |
+| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Deprecated. Projected graph-owned files through normal filesystem calls; defocused 2026-09-11 in favor of `kin run -- <cmd>` sandboxes, kept public for reference. |
 | **[kin-editor](https://github.com/firelock-ai/kin-editor)** | VS Code access to the entity explorer, semantic search, trace, review, and rename surfaces. |
 | **[Kin MCP](mcp-tools.md)** | Typed graph tools for AI agents, bundled into `kin` and launched with `kin mcp start`. |
 | **[KinLab](https://kinlab.ai)** | Hosted collaboration and control plane. Public repository connection is not a first-run flow yet. |
@@ -283,10 +283,12 @@ The graph is the repository, and everything in the map below either reaches
 that authority or supports it. Humans and AI agents come in
 through the CLI, the bundled MCP server, or the VS Code extension. All
 three ask the same daemon, and the daemon answers from graph authority rather
-than by re-reading the tree. `kin-vfs` projects that same graph back through
-ordinary filesystem calls, so editors, compilers, and build systems keep seeing
-files. Git sits beside the graph as an import and export boundary rather than as
-an answer path, and KinLab is the hosted layer over the same authority.
+than by re-reading the tree. Filesystem projection (`kin-vfs`) used to project
+that same graph back through ordinary filesystem calls; it is defocused as of
+2026-09-11 and kept public for reference, with `kin run -- <cmd>` sandboxes as
+the adoption path being designed instead. Git sits beside the graph as an
+import and export boundary rather than as an answer path, and KinLab is the
+hosted layer over the same authority.
 
 ```mermaid
 flowchart TD
@@ -302,7 +304,7 @@ flowchart TD
     authority["Graph authority<br/>entities, relations, changes, provenance"]
     db["kin-db<br/>graph storage, snapshots,<br/>index, text and vector search"]
     prims["kin-model, kin-blobs, kin-search,<br/>kin-vector, kin-infer, kin-lsp"]
-    vfs["kin-vfs<br/>transparent file projection"]
+    vfs["kin-vfs (deprecated)<br/>parked, kept for reference"]
     tools["Editors, compilers, build systems"]
     git["Git<br/>import and export boundary"]
     kinlab["KinLab<br/>hosted collaboration and control plane"]
@@ -340,9 +342,9 @@ needs to assemble. None of them is installed separately.
 ## Open source and the Kin ecosystem
 
 The core of Kin is open source under Apache-2.0: [kin](https://github.com/firelock-ai/kin),
-[kin-db](https://github.com/firelock-ai/kin-db), [kin-vfs](https://github.com/firelock-ai/kin-vfs),
-and [kin-editor](https://github.com/firelock-ai/kin-editor), plus the supporting
-libraries kin-model, kin-blobs, kin-search, kin-vector, kin-infer, kin-lsp, and
+[kin-db](https://github.com/firelock-ai/kin-db), [kin-vfs](https://github.com/firelock-ai/kin-vfs)
+(deprecated, kept public for reference), and [kin-editor](https://github.com/firelock-ai/kin-editor),
+plus the supporting libraries kin-model, kin-blobs, kin-search, kin-vector, kin-infer, kin-lsp, and
 kin-actions.
 
 [KinLab](https://kinlab.ai) is a proprietary product built on this open core: the

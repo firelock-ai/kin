@@ -125,33 +125,114 @@ pub fn kin_root_from_cwd() -> Option<std::path::PathBuf> {
     Some(kin_core::KinLayout::discover(&cwd)?.root().to_path_buf())
 }
 
+/// The half of the caveat every clause about a dead daemon carries, whatever
+/// vocabulary the record supports.
+///
+/// Named once because three separate surfaces have to recognize "this store's
+/// caveat names a daemon's death" across every death class, and each of them
+/// did it by matching whichever whole sentence existed the day it was written.
+/// [`EnrichmentCaveat`] records what that cost.
+pub const DEATH_CLAUSE_STEM: &str = "a daemon serving this store";
+
+/// What a store's own records let its enrichment caveat claim, as a value
+/// rather than as a sentence.
+///
+/// The reading is named because asking for it by matching the sentence is what
+/// broke. A second death class arrived with a second sentence, and every
+/// matcher written against the first went stale in that same commit while
+/// reading exactly like a product that had stopped reporting deaths at all:
+/// `kin init` kept exiting [`EXIT_ENRICHMENT_UNATTESTED`][exit] over a summary
+/// that no longer carried the phrase the exit code was being checked against,
+/// so the number a script reads and the sentence a person reads disagreed
+/// about one run. That is the FIR-2650 defect in the other direction, and both
+/// acceptance suites that grade this reported it as the product having
+/// regressed.
+///
+/// So the classification is a value every surface can ask for, the clause is
+/// derived from it, and [`Self::names_a_death`] is the one predicate the exit
+/// code is built on. A caller that wants to know whether a death was named
+/// asks the reading; nothing downstream matches a sentence.
+///
+/// [exit]: crate::commands::init::EXIT_ENRICHMENT_UNATTESTED
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentCaveat {
+    /// Nothing on record. The ordinary and unalarming case, true of a store
+    /// that never lost a daemon: its enrichment simply has not been certified.
+    Unattested,
+    /// A daemon serving this store ended without retiring its record, and
+    /// nothing on this host saw how. A kernel kill, a crash and a force exit
+    /// past the shutdown grace all leave exactly this, so the reading says how
+    /// it ended as far as anything saw it and stops there.
+    EndedWithoutRetiring,
+    /// A daemon serving this store was killed, and something observed it: the
+    /// kernel attributed the death to memory, or a signal was seen.
+    Killed,
+}
+
+impl EnrichmentCaveat {
+    /// Whether this caveat names a daemon's death at all, in either vocabulary.
+    ///
+    /// The predicate `kin init`'s exit code is derived from, so the number and
+    /// the sentence come from one reading of one record rather than from two
+    /// readings that are each correct and can still disagree about a run.
+    pub fn names_a_death(self) -> bool {
+        !matches!(self, Self::Unattested)
+    }
+
+    /// The clause this reading renders as, in place of a bare "completion not
+    /// attested".
+    ///
+    /// A store whose enrichment nobody attested and whose daemon died reads,
+    /// unchanged, exactly like a store whose enrichment simply has not been
+    /// certified yet. The counts are the same, the presence is the same, and
+    /// the parenthetical is the same. Naming the death is the only thing that
+    /// separates them.
+    ///
+    /// It stays a clause rather than becoming the whole line because the counts
+    /// beside it are still true: the entities were extracted and the relations
+    /// were derived. What is in doubt is whether anything more was coming.
+    pub fn clause(self) -> &'static str {
+        match self {
+            Self::Unattested => "completion not attested",
+            Self::EndedWithoutRetiring => {
+                "completion not attested, and a daemon serving this store ended without retiring"
+            }
+            Self::Killed => "completion not attested, and a daemon serving this store was killed",
+        }
+    }
+}
+
+/// How this store's records qualify its enrichment.
+///
+/// Exhaustive over the cause on purpose, so a third death class cannot be added
+/// without deciding here which vocabulary it belongs in. The arm this replaces
+/// was a `Some(_)` fallthrough, which is how the second class arrived already
+/// classified as the first.
+pub fn enrichment_caveat(record: Option<&DaemonKillRecord>) -> EnrichmentCaveat {
+    let Some(record) = record else {
+        return EnrichmentCaveat::Unattested;
+    };
+    match (record.attributed_to_memory(), record.last_cause) {
+        // The kernel's own accounting saw it, whatever the signal says.
+        (true, _) => EnrichmentCaveat::Killed,
+        (false, kin_daemon_spawn::DaemonKillCause::MemoryLimit { .. }) => EnrichmentCaveat::Killed,
+        // Signal zero is the record saying it has no signal, not a signal
+        // numbered zero: nobody waited on the process, so its exit status is
+        // gone. An ending nothing observed is not a kill anything saw.
+        (false, kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 0 }) => {
+            EnrichmentCaveat::EndedWithoutRetiring
+        }
+        (false, kin_daemon_spawn::DaemonKillCause::Unattributed { .. }) => EnrichmentCaveat::Killed,
+    }
+}
+
 /// The clause that replaces a bare "completion not attested".
 ///
-/// A store whose enrichment nobody attested and whose daemon was killed reads,
-/// unchanged, exactly like a store whose enrichment simply has not been
-/// certified yet, which is the ordinary and unalarming case. The counts are the
-/// same, the presence is the same, and the parenthetical is the same. Naming
-/// the kill is the only thing that separates them.
-///
-/// It stays a clause rather than becoming the whole line because the counts
-/// beside it are still true: the entities were extracted and the relations were
-/// derived. What is in doubt is whether anything more was coming.
+/// Kept as a function because two rendering surfaces interpolate it directly.
+/// Any caller that needs to know what the clause SAYS asks
+/// [`enrichment_caveat`] instead.
 pub fn enrichment_clause(record: Option<&DaemonKillRecord>) -> &'static str {
-    match record {
-        // An ending nothing observed is not a kill anything saw. The record says
-        // the daemon did not retire, and that is all it says.
-        Some(record)
-            if !record.attributed_to_memory()
-                && matches!(
-                    record.last_cause,
-                    kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 0 }
-                ) =>
-        {
-            "completion not attested, and a daemon serving this store ended without retiring"
-        }
-        Some(_) => "completion not attested, and a daemon serving this store was killed",
-        None => "completion not attested",
-    }
+    enrichment_caveat(record).clause()
 }
 
 /// The sentence a daemon request that went unanswered ends with, when the store
@@ -400,6 +481,97 @@ mod tests {
         let killed = enrichment_clause(Some(&memory_kill()));
         assert!(killed.starts_with("completion not attested"), "{killed}");
         assert!(killed.contains("killed"), "{killed}");
+    }
+
+    /// Every death this record can hold reaches a reader as a death.
+    ///
+    /// The class this guards is wording drift, and it has been paid for once.
+    /// A second death class arrived with a second sentence and every surface
+    /// that recognized "the caveat named a death" by matching the first
+    /// sentence went stale in that commit: two acceptance suites reported the
+    /// product as having stopped naming daemon deaths, on a build that had
+    /// started naming them more precisely. Those suites grade main after a
+    /// landing and no pull request sees them, so this stands in for them where
+    /// a pull request can go red.
+    ///
+    /// Written over every cause rather than over the two sentences, so a third
+    /// class is caught by this test and by the exhaustive match it exercises
+    /// rather than by a release. Both halves are required: a death clause has
+    /// to carry the stem, and the no-record control has to not carry it, or a
+    /// build that appended the stem to every caveat would pass a one-sided
+    /// check while telling a healthy reader their daemon died.
+    #[test]
+    fn every_death_class_names_a_daemon_of_this_store_in_its_caveat() {
+        let every_death = [
+            memory_kill(),
+            unattributed_kill(),
+            DaemonKillRecord {
+                last_cause: DaemonKillCause::Unattributed { signal: 9 },
+                ..unattributed_kill()
+            },
+            // A cause the kernel named without the tally agreeing, which is
+            // what a record written by an older build can carry.
+            DaemonKillRecord {
+                memory_kills: 0,
+                last_cause: DaemonKillCause::MemoryLimit {
+                    kernel_oom_kills: 1,
+                },
+                ..memory_kill()
+            },
+        ];
+        for record in &every_death {
+            let caveat = enrichment_caveat(Some(record));
+            assert!(
+                caveat.names_a_death(),
+                "{:?} is a death this store recorded and its caveat does not name one",
+                record.last_cause
+            );
+            let clause = caveat.clause();
+            assert!(
+                clause.contains(DEATH_CLAUSE_STEM),
+                "a reader and the suites that grade this recognize a death by {DEATH_CLAUSE_STEM:?}, \
+                 and {:?} renders {clause:?}",
+                record.last_cause
+            );
+            assert!(
+                clause.starts_with("completion not attested"),
+                "the counts beside it are still true: {clause}"
+            );
+        }
+
+        let control = enrichment_caveat(None);
+        assert!(
+            !control.names_a_death(),
+            "a store that lost no daemon must name none"
+        );
+        assert!(
+            !control.clause().contains(DEATH_CLAUSE_STEM),
+            "a reader who has never lost a daemon must not start seeing daemon deaths \
+             discussed: {}",
+            control.clause()
+        );
+    }
+
+    /// The two vocabularies stay apart, and each keeps its own class.
+    #[test]
+    fn an_observed_kill_and_an_unobserved_ending_read_as_different_things() {
+        assert_eq!(
+            enrichment_caveat(Some(&memory_kill())),
+            EnrichmentCaveat::Killed
+        );
+        assert_eq!(
+            enrichment_caveat(Some(&unattributed_kill())),
+            EnrichmentCaveat::EndedWithoutRetiring
+        );
+        assert_eq!(
+            enrichment_caveat(Some(&DaemonKillRecord {
+                last_cause: DaemonKillCause::Unattributed { signal: 9 },
+                ..unattributed_kill()
+            })),
+            EnrichmentCaveat::Killed,
+            "a signal something saw is a kill something saw"
+        );
+        assert_eq!(enrichment_caveat(None), EnrichmentCaveat::Unattested);
     }
 
     /// A store nothing has happened to says what it always said.

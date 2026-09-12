@@ -10,7 +10,7 @@
 //! surfaces that answer in JSON. A review is graph authority like any other
 //! record, so nothing here reads a file.
 
-use kin_model::graph::ReviewStore;
+use kin_model::graph::{GraphStore, ReviewStore};
 use kin_model::review::{
     Review, ReviewAssignment, ReviewDecision, ReviewDecisionState, ReviewDiscussion, ReviewFilter,
     ReviewId, ReviewNote,
@@ -68,18 +68,22 @@ pub fn list_stored_reviews<S: ReviewStore + ?Sized>(
 
 /// One review and its history, or `None` when the store holds no review under
 /// that id.
-pub fn read_review_record<S: ReviewStore + ?Sized>(
+/// The reviewers come from [`crate::assignments::current_assignments`] rather
+/// than from the stored set, because a removal is recorded as an event and the
+/// set it leaves behind cannot express one. Every surface that shows a review
+/// reads it here, so they all show the same reviewers.
+pub fn read_review_record<S: GraphStore + ?Sized>(
     store: &S,
     review_id: &ReviewId,
-) -> Result<Option<ReviewRecord>, S::Error> {
-    let Some(review) = store.get_review(review_id)? else {
+) -> Result<Option<ReviewRecord>, <S as GraphStore>::Error> {
+    let Some(review) = ReviewStore::get_review(store, review_id)? else {
         return Ok(None);
     };
     Ok(Some(ReviewRecord {
-        decisions: store.get_review_decisions(review_id)?,
-        notes: store.get_review_notes(review_id)?,
-        discussions: store.get_review_discussions(review_id)?,
-        assignments: store.get_review_assignments(review_id)?,
+        decisions: ReviewStore::get_review_decisions(store, review_id)?,
+        notes: ReviewStore::get_review_notes(store, review_id)?,
+        discussions: ReviewStore::get_review_discussions(store, review_id)?,
+        assignments: crate::assignments::current_assignments(store, review_id)?,
         review,
     }))
 }
@@ -333,6 +337,66 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "an id the store does not hold is None, not an empty record"
+        );
+    }
+
+    /// A review shows the reviewers it has, which is its assignments minus
+    /// every one a removal names. Every surface reads a review here, so they
+    /// all show the same reviewers.
+    ///
+    /// Falsify by reading the stored set instead of deriving: the removed
+    /// reviewer comes back and the first assertion goes red.
+    #[test]
+    fn a_removed_reviewer_is_no_longer_a_reviewer() {
+        use crate::assignments::{tag_details, AssignmentTag, UNASSIGN_ACTION};
+        use kin_model::graph::ProvenanceStore;
+        use kin_model::provenance::{ActorId, AuditEvent, AuditEventId};
+        use kin_model::review::ReviewAssignment;
+
+        let graph = InMemoryGraph::new();
+        let review = review_at("assigned", 0, ReviewDecisionState::Pending);
+        graph.create_review(&review).unwrap();
+        let assignment = |name: &str| ReviewAssignment {
+            review_id: review.review_id,
+            reviewer: IdentityRef::human(name),
+            assigned_at: Timestamp::now(),
+            assigned_by: IdentityRef::human("troy"),
+        };
+        let bob = assignment("bob");
+        let alice = assignment("alice");
+        for entry in [&bob, &alice] {
+            graph.assign_reviewer(entry).unwrap();
+        }
+        graph
+            .record_audit_event(&AuditEvent {
+                event_id: AuditEventId::new(),
+                actor_id: ActorId::new(),
+                action: UNASSIGN_ACTION.to_string(),
+                target_scope: None,
+                timestamp: Timestamp::now(),
+                details: Some(format!(
+                    "review_id={}; reviewer=bob; {}",
+                    review.review_id,
+                    tag_details(&[AssignmentTag::of(&bob)])
+                )),
+            })
+            .unwrap();
+
+        let record = read_review_record(&graph, &review.review_id)
+            .unwrap()
+            .expect("the stored review reads back");
+        assert_eq!(
+            record.assignments,
+            vec![alice],
+            "a reviewer a removal names is not a reviewer any more"
+        );
+        assert_eq!(
+            graph
+                .get_review_assignments(&review.review_id)
+                .unwrap()
+                .len(),
+            2,
+            "and the stored set still holds both, because it is an add log"
         );
     }
 

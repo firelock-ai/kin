@@ -933,9 +933,6 @@ enum Command {
         /// Materialization strategy
         #[arg(long)]
         strategy: Option<String>,
-        /// Scope filter
-        #[arg(long)]
-        scope: Option<String>,
     },
     /// Manage local telemetry consent and the spool
     Telemetry {
@@ -1904,7 +1901,7 @@ enum IntentAction {
     List,
     /// Register a new intent (lock a scope)
     Register {
-        /// Scope to lock (entity:<uuid>, file:<path>, or bare UUID/path)
+        /// Scope to lock (entity:<uuid>, contract:<uuid>, file:<path>, artifact:<path>, or an entity UUID)
         scope: String,
         /// Lock type: hard or soft
         #[arg(short, long, default_value = "soft")]
@@ -2046,7 +2043,7 @@ enum ReviewAction {
 enum TrafficAction {
     /// Show active traffic on a scope
     Show {
-        /// Scope to query (entity:<uuid>, file:<path>, or bare UUID/path)
+        /// Scope to query (entity:<uuid>, contract:<uuid>, file:<path>, artifact:<path>, or an entity UUID)
         scope: String,
     },
     /// List all active sessions
@@ -2316,7 +2313,7 @@ enum WorkAction {
         /// Optional description
         #[arg(short, long)]
         description: Option<String>,
-        /// Scope to link (entity:<uuid>, artifact:<path>, or bare path)
+        /// Scope to link (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, or an entity UUID)
         #[arg(short, long)]
         scope: Option<String>,
         /// Priority: critical, high, medium, low, none
@@ -2331,7 +2328,7 @@ enum WorkAction {
         /// Filter by kind
         #[arg(short, long)]
         kind: Option<String>,
-        /// Filter by scope (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, or bare path)
+        /// Filter by scope (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, or an entity UUID)
         #[arg(long)]
         scope: Option<String>,
     },
@@ -2391,7 +2388,7 @@ enum WorkAction {
 enum NoteAction {
     /// Add an annotation to a semantic scope or work item
     Add {
-        /// Target to annotate (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>, or bare path)
+        /// Target to annotate (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>, or an entity UUID)
         target: String,
         /// Annotation kind: comment, warning, instruction, reasoning
         #[arg(short, long)]
@@ -2402,7 +2399,7 @@ enum NoteAction {
     },
     /// List annotations for a semantic scope or work item
     List {
-        /// Target to query (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>, or bare path)
+        /// Target to query (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>, or an entity UUID)
         target: String,
     },
     /// Show stale annotations
@@ -4004,11 +4001,9 @@ fn run() -> Result<()> {
                     keep,
                     discard,
                     strategy,
-                    scope,
                 } => {
                     commands::capabilities::require_ready("exec")?;
-                    commands::session_run::exec(command, shell, keep, discard, strategy, scope)
-                        .await
+                    commands::session_run::exec(command, shell, keep, discard, strategy).await
                 }
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
@@ -4865,6 +4860,35 @@ fn default_filter_directives(command: &str) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// `kin exec` takes no scope. A scoped session workspace is refused by the
+    /// daemon until its selected artifact set can be authenticated outside the
+    /// editable session, so the command materializes the whole session. Read off
+    /// the clap definition rather than a parse, because `exec`'s command
+    /// positional accepts hyphen values and could swallow a stray flag into the
+    /// command it runs instead of rejecting it.
+    #[test]
+    fn exec_carries_no_scope_flag() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::command();
+                let exec = cli
+                    .find_subcommand("exec")
+                    .expect("kin exec is a subcommand");
+                let ids: Vec<String> = exec
+                    .get_arguments()
+                    .map(|arg| arg.get_id().as_str().to_string())
+                    .collect();
+                // Positive control: the lookup sees exec's real flags, so the
+                // absence below is not a lookup that saw nothing.
+                assert!(ids.iter().any(|id| id == "strategy"), "{ids:?}");
+                assert!(!ids.iter().any(|id| id == "scope"), "{ids:?}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn recovery_restore_requires_a_complete_fresh_target_pair() {

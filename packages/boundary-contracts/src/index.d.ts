@@ -999,6 +999,50 @@ export interface RepoImportedWorkSummary {
 }
 
 /**
+ * One entity of a repository's graph, as `GET /repos/{repo_id}/entities` serves
+ * it.
+ *
+ * Identity is always present. The ranking numbers and the text ride along only
+ * when the request asked for them, so a consumer reading the identity fields
+ * alone reads every response this route has ever served.
+ */
+export interface RepoEntityEntry {
+  /** Entity UUID. */
+  id: string;
+  name: string;
+  /** Entity kind in the graph's own spelling, e.g. Function, Method, EnumVariant. */
+  kind: string;
+  /** Repository-relative path, or null for an entity the graph placed in no file. */
+  file_path: string | null;
+  /**
+   * Distinct undirected (neighbour, kind) pairs, the same definition the graph
+   * export publishes. Present only under include=ranking or order=importance.
+   */
+  degree?: number;
+  /**
+   * Distinct entities that reach this one over a call, an import or a
+   * reference, the entity itself and receiver-name guesses excluded. This is
+   * what order=importance ranks by. Present under the same conditions as degree.
+   */
+  dependents?: number;
+  /** The declaration as the graph recorded it, collapsed to one line. */
+  signature?: string;
+  /** The first line of the entity's doc summary. */
+  summary?: string;
+}
+
+/** The entities of one repository's graph. */
+export interface RepoEntitiesResponse {
+  repo_id: string;
+  entities: RepoEntityEntry[];
+  /**
+   * Entities the filter matched before the window. Present only when the
+   * request asked for one with limit or offset.
+   */
+  total?: number;
+}
+
+/**
  * The drawable projection of a Kin repository graph.
  *
  * Served by `GET /graph/export` and `GET /repos/{repo_id}/graph/export` on the

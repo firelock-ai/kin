@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.15] - 2026-09-11
+
+### Changed
+
+- Bound agent tool results, context and endpoint waits (FIR-3545) (#1694)
+- Level the live graph with repository authority instead of refusing every later admission (FIR-3546) (#1696)
+- Report an empty graph and a missing repository as graph gaps (FIR-3543) (#1695)
+- Publish agent writes through authority and accept a working copy at the staged bytes (FIR-3550) (#1697)
+- Run one exact MCP commit per transaction and let a re-sent request join it (FIR-3550) (#1704)
+- Grade an agent's write end to end in product acceptance (FIR-3550) (#1703)
+- Answer find_references from the last certified graph when a writer holds every settle attempt (FIR-3540) (#1705)
+- Resolve a name one way in refs, impact and graph source, and mark stale pointers (#1702)
+- Configure LM Studio and the Grok CLI in kin setup, and read an artifact by its label (FIR-3544) (#1706)
+- Write nothing when an agent edit cannot open a transaction, and re-open a gone session (FIR-3550) (#1708)
+- Read a standalone daemon in kin status and name any open beside a live one (FIR-3542) (#1710)
+- Run the admission off the runtime worker and answer /health without an authority load (FIR-3542) (#1711)
+- Keep the agent's Kin session alive through a long model turn (#1709)
+- Return a UTF-8 artifact as text alone, and its bytes only on request (#1714)
+- Grade an agent edit made after its daemon restarts (FIR-3550) (#1715)
+- Start the same language server from every daemon and name what a daemon cannot serve (FIR-3551) (#1717)
+- Serve blame and history from the daemon's held authority (FIR-3547) (#1713)
+- Record a watchdog force exit as the daemon ending itself, and date and name a daemon's ending (FIR-3549) (#1716)
+- Serve repo-scoped review reads and semantic diff on the multi-repo daemon surface (#1718)
+- Say why an entity has no history in blame and history (FIR-3547) (#1719)
+- Commit review state to repository authority so reviews survive a restart (#1720)
+- Mark the files a sweep finished even when another file's query failed (#1721)
+- End a stop at once when its in-flight flush cannot finish inside the grace (FIR-3549) (#1723)
+- Name the cross-file edges a graph still holds when no language server can run (#1722)
+- Keep the owner a qualified call wrote when linking by leaf (#1724)
+- Hold one repository authority per publication for the daemon's own readers (#1725)
+- Carry review records through kin push and kin pull (#1727)
+- Answer a hosted context pack on the most-called entity instead of a retryable 503 (#1728)
+- Read and commit an exact MCP commit through the daemon's held authority (#1729)
+- Add the agent-write suite to the acceptance inventory and run the visibility rule on pull requests (#1730)
+- docs: first-screen agent onboarding, allow fork PRs to pass secret scan (#1731)
+- Bound an answer only by the degraded flags that describe what it reads (FIR-3541) (#1726)
+- Rank, page and describe the hosted entity list (#1739)
+- Record a reviewer's removal so it survives a push and a pull (#1742)
+- Give the Linux release build legs swap for the fat-LTO peak (#1741)
+- Read a daemon's death off the record rather than off the sentence it rendered (#1743)
+- Answer the file enumeration's pagination honestly on its last page and its cut ones (#1740)
+- Record v0.7.14 as an abandoned release tag (#1744)
+- Decide a flush publication from the live graph before materializing authority (#1745)
+
+
 ## [0.7.14] - 2026-09-11
 
 ### Changed

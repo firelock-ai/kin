@@ -44,11 +44,13 @@ Kin can import an exact Git snapshot or complete reachable history, and can expo
 graph-owned state back to Git when interoperability is required. Git is an input/output
 boundary during migration, never a runtime answer authority or silent repair path.
 
-### 2. The virtual filesystem (`kin-vfs`)
-`kin-vfs` acts as a "Trojan horse" for graph-first adoption. By intercepting filesystem
-calls (via `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`), it serves graph-backed files as normal
-files to any compiler, linter, or legacy tool. To the host OS the codebase looks like
-ordinary files on disk, while the underlying data is served from the semantic graph.
+### 2. Filesystem projection (`kin-vfs`), parked
+Libc-interception filesystem projection (`kin-vfs`, via `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`)
+was the original adoption path. The founder defocused it on 2026-09-11: the repository stays
+public and deprecated for reference, and `kin-vfs-core` remains a crate in kin's own workspace
+for the projection engine. `kin run -- <cmd>` on fast ephemeral sandboxes (APFS copy-on-write on
+macOS, tmpfs or reflink on Linux) is the execution path being designed to replace it. Localhost
+NFS is a secondary exploration, not a day-one dependency.
 
 ### 3. Agent integration (MCP)
 Kin's built-in MCP server exposes semantic primitives directly to AI agents. Instead of
