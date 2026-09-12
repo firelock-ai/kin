@@ -24,7 +24,7 @@
 //! would be exactly that, and it would go stale the first time a description
 //! moved without anyone noticing.
 //!
-//! **What it returns is callable.** A match is the whole [`ToolDefinition`] as
+//! **What it returns is the registered schema.** A match is the whole [`ToolDefinition`] as
 //! the `full` profile serves it: name, description, annotations and input
 //! schema, with nothing trimmed. A search that returned a summary would make an
 //! agent guess the arguments, which is how a found tool becomes a failed call.
@@ -38,7 +38,8 @@
 //! rather than silent. This tool bounds itself for that reason: it is not in
 //! [`crate::budget`]'s shape table, because a budget that shed a schema would
 //! hand back a definition that is not the one `full` serves, and fidelity is the
-//! property the whole design rests on.
+//! property the whole design rests on. Discovery does not enable a tool that
+//! the connection's profile withholds; the server also reports profile eligibility.
 //!
 //! It is deliberately absent from [`crate::negative`]'s spec table. An empty
 //! match list here is an absence claim about a complete in-memory registry,
@@ -54,7 +55,7 @@
 //! build would answer with its own registry, and an agent would be handed a
 //! schema for a tool this server cannot dispatch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{McpError, Result};
 use crate::types::{ToolCallResult, ToolDefinition};
@@ -98,8 +99,10 @@ small always-on set, chosen so the list you carry on every turn stays cheap, and
 reached through here. Give `need` a plain-language description of the job (\"what breaks if I \
 change this\", \"who calls this function\", \"read one file's exact bytes\") and each match comes \
 back as the complete tool definition, carrying its name, description, annotations and input schema \
-exactly as the `full` profile serves them, so a tool you find is callable on your next turn with \
-nothing withheld. `matched_names` lists every match in rank order and `matches` carries the full \
+exactly as the `full` profile serves them. Discovery does not activate tools or change this \
+connection's profile. Read `invocation.profile_enabled` for each returned match; a disabled tool \
+requires a connection configured with a profile that serves it. Enabled tools still require \
+their normal repository, session and authorization checks. `matched_names` lists every match in rank order and `matches` carries the full \
 definitions for the first `limit` of them, so a match this call had no room for is reported rather \
 than dropped. Omit `need` to enumerate the whole registry. Ranking reads tool names first, then \
 titles, then descriptions, and an exact tool name always comes back first. This answers from the \
@@ -235,6 +238,14 @@ fn limit_from(args: &HashMap<String, serde_json::Value>) -> Result<u64> {
 
 /// Answer one tool search from the registry this binary compiled.
 pub fn handle_tool_search(args: &HashMap<String, serde_json::Value>) -> Result<ToolCallResult> {
+    handle_tool_search_with_profile(args, None)
+}
+
+/// The profile controls dispatch eligibility independently of catalog discovery.
+pub fn handle_tool_search_with_profile(
+    args: &HashMap<String, serde_json::Value>,
+    allowed_tools: Option<&HashSet<String>>,
+) -> Result<ToolCallResult> {
     let need = match args.get("need") {
         None => String::new(),
         Some(value) if value.is_null() => String::new(),
@@ -259,6 +270,15 @@ pub fn handle_tool_search(args: &HashMap<String, serde_json::Value>) -> Result<T
         .map(|hit| hit.definition)
         .collect();
     let withheld = matched_names.len().saturating_sub(matches.len());
+    let profile_enabled: HashMap<&str, bool> = matches
+        .iter()
+        .map(|tool| {
+            (
+                tool.name.as_str(),
+                allowed_tools.is_none_or(|allowed| allowed.contains(&tool.name)),
+            )
+        })
+        .collect();
 
     let payload = serde_json::json!({
         "need": need,
@@ -271,6 +291,11 @@ pub fn handle_tool_search(args: &HashMap<String, serde_json::Value>) -> Result<T
         // not see from `matches_withheld`.
         "matched_names": matched_names,
         "matches_withheld": withheld,
+        "invocation": {
+            "profile_enabled": profile_enabled,
+            "discovery_changes_profile": false,
+            "normal_authorization_required": true,
+        },
         "registry": {
             "tools": registry.tools.len(),
             "source": "the tool registry compiled into this server",

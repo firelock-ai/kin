@@ -7,7 +7,9 @@ use crate::belt::{self, Belt, LocalTool, Route};
 use crate::context::{self, ContextMeter};
 use crate::mcp::{McpClient, McpError, McpTool, ToolOutcome};
 use crate::parse::{self, Turn};
-use crate::provider::{Completion, Provider, ProviderError, Usage};
+use crate::provider::{
+    ChatRequest, Completion, PromptCount, Provider, ProviderError, RequestAccounting, Usage,
+};
 use crate::transcript::{now_iso, TranscriptWriter};
 use crate::{AgentConfig, ExitStatus, RunOutcome};
 use serde_json::{json, Map, Value};
@@ -358,9 +360,85 @@ enum EndpointStop {
     Failed(ProviderError),
 }
 
+/// Optional admission controls; existing AgentConfig callers remain compatible.
+#[derive(Debug, Clone, Copy)]
+pub struct RunOptions {
+    pub accounting: RequestAccounting,
+    pub output_reserve_tokens: Option<u64>,
+}
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            accounting: RequestAccounting::Heuristic,
+            output_reserve_tokens: None,
+        }
+    }
+}
+
+fn parse_output_reserve(value: &str) -> anyhow::Result<u64> {
+    let reserve = value.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!("KIN_AGENT_OUTPUT_RESERVE_TOKENS must be a positive integer")
+    })?;
+    anyhow::ensure!(
+        reserve > 0,
+        "KIN_AGENT_OUTPUT_RESERVE_TOKENS must be a positive integer"
+    );
+    Ok(reserve)
+}
+
 /// Run one task to completion.
 pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
+    let accounting = match std::env::var("KIN_AGENT_CONTEXT_ACCOUNTING") {
+        Err(std::env::VarError::NotPresent) => RequestAccounting::Heuristic,
+        Ok(value) if value == "heuristic" => RequestAccounting::Heuristic,
+        Ok(value) if value == "llama_cpp" => RequestAccounting::LlamaCpp,
+        _ => anyhow::bail!("KIN_AGENT_CONTEXT_ACCOUNTING must be heuristic or llama_cpp"),
+    };
+    let output_reserve_tokens = match std::env::var("KIN_AGENT_OUTPUT_RESERVE_TOKENS") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(value) => Some(parse_output_reserve(&value)?),
+        Err(_) => anyhow::bail!("KIN_AGENT_OUTPUT_RESERVE_TOKENS must be a positive integer"),
+    };
+    run_with_options(
+        config,
+        RunOptions {
+            accounting,
+            output_reserve_tokens,
+        },
+    )
+}
+
+/// Run with explicit request accounting without changing process-wide environment.
+pub fn run_with_accounting(
+    config: AgentConfig,
+    accounting: RequestAccounting,
+) -> anyhow::Result<RunOutcome> {
+    run_with_options(
+        config,
+        RunOptions {
+            accounting,
+            ..RunOptions::default()
+        },
+    )
+}
+
+/// Run with a chosen counting contract and optional output reserve. Invalid overrides
+/// fail before creating a transcript, attaching a graph server, or contacting the model.
+pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Result<RunOutcome> {
+    if let Some(reserve) = options.output_reserve_tokens {
+        anyhow::ensure!(
+            reserve > 0 && reserve < config.context.tokens,
+            "output reserve must be positive and below the {}-token context window (got {reserve})",
+            config.context.tokens
+        );
+    }
+    let accounting = options.accounting;
+    let output_reserve = options
+        .output_reserve_tokens
+        .unwrap_or_else(|| config.context.answer_reserve());
     let started = Instant::now();
+    // Validate the provider dialect before transcript or MCP I/O. Construction sends no request.
+    let provider = Provider::new(config.provider.clone())?;
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut writer = TranscriptWriter::create(&config.out_dir, &session_id)?;
     let mut counters = Counters::new();
@@ -374,7 +452,10 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         "max_tool_calls": config.max_tool_calls,
         "deadline_s": config.deadline.as_secs(),
         "context_tokens": config.context.tokens,
+        "output_reserve_tokens": output_reserve,
+        "output_token_parameter": provider.output_token_parameter(),
         "context_source": config.context.source.label(),
+        "context_accounting": match accounting { RequestAccounting::Heuristic => "heuristic", RequestAccounting::LlamaCpp => "llama_cpp" },
         "max_result_bytes": result_ceiling,
         "tool_profile": config.tool_profile.clone().unwrap_or_else(|| "server-default".into()),
         // Which belt this run actually had, recorded beside the server profile
@@ -517,8 +598,6 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         agent_meta,
     )?;
 
-    let provider = Provider::new(config.provider.clone())?;
-
     // Open a Kin session per server, so every mutation this run makes names this agent
     // rather than an anonymous file write. A server without the tool is not an error; it
     // just means the provenance bracket is unavailable there and the trace says so.
@@ -551,7 +630,8 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     let baseline_bytes = system_prompt.len()
         + config.task.len()
         + serde_json::to_vec(&specs).map_or(0, |bytes| bytes.len());
-    let mut meter = ContextMeter::new(config.context, baseline_bytes as u64);
+    let mut meter =
+        ContextMeter::with_reserve(config.context, baseline_bytes as u64, output_reserve);
     let mut messages = vec![
         json!({ "role": "system", "content": system_prompt }),
         json!({ "role": "user", "content": config.task }),
@@ -570,12 +650,33 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
             stop = Stop::deadline(&config, "before the next turn");
             break;
         }
+        let mut prepared = None;
         let spent = if counters.tool_calls >= config.max_tool_calls {
             Some(Spent::ToolCalls)
-        } else if context_note.is_some() || !meter.has_room_for_a_turn() {
+        } else if context_note.is_some() {
             Some(Spent::Context)
         } else {
-            None
+            match prepare_turn(
+                &provider,
+                &messages,
+                &specs,
+                accounting,
+                &mut meter,
+                deadline_at,
+                &mut counters,
+                &mut writer,
+                false,
+            )? {
+                Ok(Some(request)) => {
+                    prepared = Some(request);
+                    None
+                }
+                Ok(None) => Some(Spent::Context),
+                Err(error) => {
+                    (stop, final_text) = accounting_stop(&config, error);
+                    break;
+                }
+            }
         };
         if let Some(spent) = spent {
             // A budget is spent. Ask for an answer with nothing to call, so the run ends
@@ -592,18 +693,33 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                 // The first request alone does not fit, so nothing was learned to ask for.
                 break;
             }
-            if !meter.fits_a_final_request(prompt.len() as u64) {
-                final_text = "(no final answer: the conversation no longer fits the model's \
-                              context window)"
-                    .to_string();
-                break;
-            }
-            meter.add(prompt.len() as u64);
             messages.push(json!({ "role": "user", "content": prompt }));
-            match wait_for_turn(
+            let request = match prepare_turn(
                 &provider,
                 &messages,
                 &[],
+                accounting,
+                &mut meter,
+                deadline_at,
+                &mut counters,
+                &mut writer,
+                true,
+            )? {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    final_text =
+                        "(no final answer: the complete request leaves no admitted output room)"
+                            .into();
+                    break;
+                }
+                Err(error) => {
+                    (stop, final_text) = accounting_stop(&config, error);
+                    break;
+                }
+            };
+            match wait_for_turn(
+                &provider,
+                &request,
                 &mut counters,
                 deadline_at,
                 &mut servers,
@@ -634,7 +750,12 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                     );
                 }
                 Err(EndpointStop::Failed(err)) => {
-                    final_text = format!("(no final answer: {err})");
+                    if err.is_accounting_failure() {
+                        record_accounting_failure(&mut meter, &mut counters, &mut writer, &err)?;
+                        (stop, final_text) = accounting_stop(&config, EndpointStop::Failed(err));
+                    } else {
+                        final_text = format!("(no final answer: {err})");
+                    }
                 }
             }
             break;
@@ -642,8 +763,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
 
         let completion = match wait_for_turn(
             &provider,
-            &messages,
-            &specs,
+            &prepared.expect("ordinary turn was admitted"),
             &mut counters,
             deadline_at,
             &mut servers,
@@ -658,12 +778,17 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                 break;
             }
             Err(EndpointStop::Failed(err)) => {
-                stop = Stop::new(
-                    ExitStatus::EndpointError,
-                    "endpoint_unreachable",
-                    Some(err.to_string()),
-                );
-                final_text = err.to_string();
+                if err.is_accounting_failure() {
+                    record_accounting_failure(&mut meter, &mut counters, &mut writer, &err)?;
+                    (stop, final_text) = accounting_stop(&config, EndpointStop::Failed(err));
+                } else {
+                    stop = Stop::new(
+                        ExitStatus::EndpointError,
+                        "endpoint_unreachable",
+                        Some(err.to_string()),
+                    );
+                    final_text = err.to_string();
+                }
                 break;
             }
         };
@@ -1400,6 +1525,137 @@ fn check_arguments(belt: &Belt, name: &str, arguments: &Value) -> Result<(), Str
     }
 }
 
+fn record_accounting_failure(
+    meter: &mut ContextMeter,
+    counters: &mut Counters,
+    writer: &mut TranscriptWriter,
+    error: &ProviderError,
+) -> anyhow::Result<()> {
+    let reason = error.to_string();
+    let observed_usage = if let ProviderError::RejectedCompletion { usage, .. } = error {
+        // Rejection prevents dispatch of the choice, but cannot undo generation.
+        counters.absorb(usage);
+        usage.to_json()
+    } else {
+        None
+    };
+    meter.accounting_failed(&reason);
+    writer.trace(json!({"event":"context_accounting_failed", "reason":reason, "exact":false, "admitted":false,
+        "completion_rejected":matches!(error, ProviderError::RejectedCompletion { .. }), "observed_usage":observed_usage}))?;
+    Ok(())
+}
+
+fn accounting_stop(config: &AgentConfig, error: EndpointStop) -> (Stop, String) {
+    match error {
+        EndpointStop::Deadline { .. } => (
+            Stop::deadline(config, "while counting the complete request"),
+            String::new(),
+        ),
+        EndpointStop::Failed(error) => (
+            Stop::new(
+                ExitStatus::EndpointError,
+                "context_accounting_failed",
+                Some(error.to_string()),
+            ),
+            error.to_string(),
+        ),
+    }
+}
+
+/// Count and admit the full body, including the tool-free closing request. A shorter final
+/// answer changes the output bound, so that exact body must be counted again before dispatch.
+#[allow(clippy::too_many_arguments)]
+fn prepare_turn(
+    provider: &Provider,
+    messages: &[Value],
+    tools: &[Value],
+    accounting: RequestAccounting,
+    meter: &mut ContextMeter,
+    deadline_at: Instant,
+    counters: &mut Counters,
+    writer: &mut TranscriptWriter,
+    final_answer: bool,
+) -> anyhow::Result<Result<Option<ChatRequest>, EndpointStop>> {
+    let began = Instant::now();
+    let mut request = provider.prepare_request(messages, tools, meter.reserve());
+    let heuristic_floor = meter.used();
+    for round in 0..3 {
+        let remaining = deadline_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            meter.accounting_failed("run deadline exhausted during counting");
+            return Ok(Err(EndpointStop::Deadline {
+                waited: began.elapsed(),
+            }));
+        }
+        let asked = Instant::now();
+        let measured = match accounting {
+            RequestAccounting::Heuristic => Ok(PromptCount::Unsupported(
+                "generic provider: byte heuristic selected".into(),
+            )),
+            RequestAccounting::LlamaCpp => provider.count_prompt_within(
+                &request,
+                remaining
+                    .min(provider.config().request_timeout)
+                    .min(Duration::from_secs(5)),
+            ),
+        };
+        counters.api_ms += asked.elapsed().as_millis();
+        let measured = match measured {
+            Ok(value) if Instant::now() < deadline_at => value,
+            result => {
+                let reason = result.err().map_or_else(
+                    || "run deadline exhausted during counting".into(),
+                    |error| error.to_string(),
+                );
+                meter.accounting_failed(&reason);
+                writer.trace(json!({"event":"context_accounting_failed", "reason":reason, "exact":false, "admitted":false}))?;
+                return Ok(Err(if Instant::now() >= deadline_at {
+                    EndpointStop::Deadline {
+                        waited: began.elapsed(),
+                    }
+                } else {
+                    EndpointStop::Failed(ProviderError::Accounting(reason))
+                }));
+            }
+        };
+        let (tokens, exact, reason) = match measured {
+            PromptCount::Counted(tokens) => (tokens, true, None),
+            PromptCount::Unsupported(reason) => (
+                request.heuristic_tokens().max(heuristic_floor),
+                false,
+                Some(reason),
+            ),
+        };
+        let room = meter.window().tokens.saturating_sub(tokens);
+        let admitted = request.max_tokens() > 0 && request.max_tokens() <= room;
+        let detail = json!({
+            "event":"context_admission", "method":if exact {"llama_cpp_template_tokenize"} else {"heuristic"},
+            "exact":exact, "contract":if exact {Some("rendered_text_add_special_false_parse_special_true")} else {None},
+            "fallback_reason":reason, "prompt_tokens":tokens, "max_tokens":request.max_tokens(),
+            "output_token_parameter":request.output_token_parameter(),
+            "window_tokens":meter.window().tokens, "tool_free":tools.is_empty(), "round":round, "admitted":admitted,
+        });
+        meter.record_request(tokens, detail.clone());
+        writer.trace(detail)?;
+        if admitted {
+            if exact {
+                request.expect_prompt_tokens(tokens);
+            }
+            return Ok(Ok(Some(request)));
+        }
+        if !final_answer || room == 0 {
+            return Ok(Ok(None));
+        }
+        request.set_max_tokens(room.min(meter.reserve()));
+    }
+    let reason = "rendered final request did not stabilize within its output budget";
+    meter.accounting_failed(reason);
+    writer.trace(json!({"event":"context_accounting_failed", "reason":reason, "exact":false, "admitted":false}))?;
+    Ok(Err(EndpointStop::Failed(ProviderError::Accounting(
+        reason.into(),
+    ))))
+}
+
 /// Ask the endpoint for one turn, inside what is left of the run's deadline.
 ///
 /// Every attempt carries the remaining budget as its timeout, and a retry never starts once
@@ -1408,8 +1664,7 @@ fn check_arguments(belt: &Belt, name: &str, arguments: &Value) -> Result<(), Str
 /// deadline is the deadline's, whatever the transport said.
 fn complete_with_retry(
     provider: &Provider,
-    messages: &[Value],
-    tools: &[Value],
+    request: &ChatRequest,
     counters: &mut Counters,
     deadline_at: Instant,
     keepalive: &mut Keepalive<'_>,
@@ -1425,11 +1680,16 @@ fn complete_with_retry(
         }
         let limit = remaining.min(provider.config().request_timeout);
         let asked = Instant::now();
-        let outcome = keepalive.wait(provider, messages, tools, limit);
+        let outcome = keepalive.wait(provider, request, limit);
         // Time spent waiting is endpoint time whether or not an answer came back.
         counters.api_ms += asked.elapsed().as_millis();
         match outcome {
             Ok(completion) => return Ok(completion),
+            // A parsed response has observed usage even if the deadline elapsed while
+            // receiving it. Preserve the rejection so the caller records that cost once.
+            Err(err @ ProviderError::RejectedCompletion { .. }) => {
+                return Err(EndpointStop::Failed(err));
+            }
             Err(err) => {
                 if Instant::now() >= deadline_at {
                     return Err(EndpointStop::Deadline {
@@ -1458,22 +1718,14 @@ fn complete_with_retry(
 /// and each heartbeat it sent written to the trace once the wait is over.
 fn wait_for_turn(
     provider: &Provider,
-    messages: &[Value],
-    tools: &[Value],
+    request: &ChatRequest,
     counters: &mut Counters,
     deadline_at: Instant,
     servers: &mut [Server],
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Result<Completion, EndpointStop>> {
     let mut keepalive = Keepalive::new(servers);
-    let outcome = complete_with_retry(
-        provider,
-        messages,
-        tools,
-        counters,
-        deadline_at,
-        &mut keepalive,
-    );
+    let outcome = complete_with_retry(provider, request, counters, deadline_at, &mut keepalive);
     counters.session_heartbeats += keepalive.beats;
     for row in keepalive.rows {
         writer.trace(row)?;
@@ -1562,18 +1814,17 @@ impl<'a> Keepalive<'a> {
     fn wait(
         &mut self,
         provider: &Provider,
-        messages: &[Value],
-        tools: &[Value],
+        request: &ChatRequest,
         limit: Duration,
     ) -> Result<Completion, ProviderError> {
         if self.next_due().is_none() {
-            return provider.complete_within(messages, tools, limit);
+            return provider.complete_request_within(request, limit);
         }
         std::thread::scope(|scope| {
             let (answer, answered) = std::sync::mpsc::channel();
-            let request = scope.spawn(move || {
+            let request_thread = scope.spawn(move || {
                 // The receiver lives until this scope ends, so the send cannot fail.
-                let _ = answer.send(provider.complete_within(messages, tools, limit));
+                let _ = answer.send(provider.complete_request_within(request, limit));
             });
             loop {
                 let until = self
@@ -1585,7 +1836,7 @@ impl<'a> Keepalive<'a> {
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         // The request thread ends without answering only when it panics, and
                         // the panic is carried here, as it would surface without the split.
-                        match request.join() {
+                        match request_thread.join() {
                             Err(panic) => std::panic::resume_unwind(panic),
                             Ok(()) => unreachable!("the request thread always sends its answer"),
                         }
@@ -2358,5 +2609,17 @@ mod annotate_tests {
             "the warning must name the gap it was given: {annotated}"
         );
         assert_eq!(counters.unsafe_absence_events, 1);
+    }
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::parse_output_reserve;
+    #[test]
+    fn output_reserve_environment_value_requires_a_positive_integer() {
+        for value in ["", "0", "-1", "1.5", "18446744073709551616", "unlimited"] {
+            assert!(parse_output_reserve(value).is_err(), "{value}");
+        }
+        assert_eq!(parse_output_reserve("32768").unwrap(), 32768);
     }
 }

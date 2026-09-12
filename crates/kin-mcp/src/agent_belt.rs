@@ -260,10 +260,11 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
         // short form here describes a capability; this one describes the surface.
         (
             crate::handlers::tool_search::TOOL_NAME,
-            "Find the Kin tools this profile does not serve. The served list is small on purpose \
-             and everything else is reached only through here. Describe the job in plain \
-             language; each match comes back as a complete, callable definition. Omit `need` to \
-             list every tool.",
+            "This profile does not serve every tool in the registry. Find tools by describing \
+             the job. Each match includes its full \
+             schema and invocation.profile_enabled. Discovery does not enable withheld tools; \
+             use a connection whose profile serves them. Enabled tools still require normal \
+             authorization. Omit `need` to list every tool.",
         ),
         (
             "kin_provenance_query",

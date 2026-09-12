@@ -390,7 +390,7 @@ impl ResolvedToolProfile {
                  belt without the session and transaction tools ({} tools), which a \
                  query-only client re-sends in every prompt and never calls, \
                  KIN_MCP_TOOL_PROFILE=agent-search for the measured always-on set ({} tools) \
-                 with every other tool reached through kin_tool_search, or \
+                 plus kin_tool_search for discovery (withheld tools remain disabled), or \
                  KIN_MCP_TOOL_PROFILE=full for the complete {} tool surface; accepted \
                  profiles: {}.",
                 McpToolProfile::AgentQuery.tool_count(),
