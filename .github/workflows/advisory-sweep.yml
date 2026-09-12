@@ -125,6 +125,23 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
+      # A second, narrower mint for the alarm alone. The bump-branch token above
+      # carries contents and pull-request authority on this repository; the
+      # unfixable-advisory issue lives on firelock-ai/kin-infra and needs
+      # issues: write there and here and nothing else, so it gets a token that
+      # holds exactly that. A mint that fails fails the sweep loudly.
+      - name: Mint the alarm token, issues only, this repository and kin-infra
+        id: alarm-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            kin-infra
+          permission-issues: write
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -285,27 +302,58 @@ jobs:
       - name: Open or update the unfixable-advisory issue
         if: steps.plan.outputs.unfixable != '0'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          gh label create "advisory-sweep" --repo "$GITHUB_REPOSITORY" \
+          # Two labels: the kind of alarm, and the repository it is about, since
+          # kin-infra collects every repository's alarms. Both are created
+          # before the issue that carries them, idempotently, so a missing label
+          # can never fail the create.
+          gh label create "advisory-sweep" --repo "$ALARM_REPO" \
             --color "B60205" \
             --description "Advisories with no semver-compatible bump, found by the scheduled sweep" \
             --force
+          gh label create "$ALARM_LABEL" --repo "$ALARM_REPO" --force \
+            --color 5319E7 \
+            --description "Alarms raised by ${GITHUB_REPOSITORY}'s workflows"
           node scripts/advisory-sweep.mjs \
             --plan-in "$RUNNER_TEMP/plan.json" \
             --render issue-body > "$RUNNER_TEMP/issue-body.md"
           ids="$(jq -r '[.unfixable[].id] | unique | join(", ")' "$RUNNER_TEMP/plan.json")"
           title="Advisories with no semver-compatible bump: ${ids}"
-          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --label "advisory-sweep" --json number --jq '.[0].number // ""')"
+          issue="$(gh issue list --repo "$ALARM_REPO" --state open \
+            --label "advisory-sweep,${ALARM_LABEL}" --json number --jq '.[0].number // ""')"
           if [ -z "$issue" ]; then
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
-              --label "advisory-sweep" --body-file "$RUNNER_TEMP/issue-body.md" > /dev/null
-          else
-            gh issue edit "$issue" --repo "$GITHUB_REPOSITORY" --title "$title" \
+            gh issue create --repo "$ALARM_REPO" --title "$title" \
+              --label "advisory-sweep" --label "$ALARM_LABEL" \
               --body-file "$RUNNER_TEMP/issue-body.md" > /dev/null
+          else
+            gh issue edit "$issue" --repo "$ALARM_REPO" --title "$title" \
+              --body-file "$RUNNER_TEMP/issue-body.md" > /dev/null
+          fi
+
+      # The close path this issue never had. A sweep that resolves every
+      # advisory, by bump or by a deny.toml ignore with a reason, is the green
+      # run of this workflow, and the issue it leaves open would otherwise sit
+      # on kin-infra until somebody noticed.
+      - name: Close the unfixable-advisory issue once the sweep finds none
+        if: steps.plan.outcome == 'success' && steps.plan.outputs.unfixable == '0'
+        env:
+          GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          issue="$(gh issue list --repo "$ALARM_REPO" --state open \
+            --label "advisory-sweep,${ALARM_LABEL}" --json number --jq '.[0].number // ""')"
+          if [ -n "$issue" ]; then
+            gh issue close "$issue" --repo "$ALARM_REPO" \
+              --comment "This sweep found no advisory without a semver-compatible bump: ${RUN_URL}."
+            echo "closed unfixable-advisory issue #${issue}"
           fi
 
       - name: Summarize

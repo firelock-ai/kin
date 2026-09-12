@@ -33,7 +33,7 @@ kin-model = { workspace = true }
 kin-core = { workspace = true }
 kin-daemon-spawn = { workspace = true }
 kin-db = { workspace = true }
-kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
+kin-infer = { workspace = true }
 kin-blobs = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
@@ -91,7 +91,7 @@ windows-sys = { version = "0.61", features = [
 # Additive via feature unification; absent on Linux so the Linux build stays green.
 [target.'cfg(target_os = "macos")'.dependencies]
 kin-db = { workspace = true, features = ["metal", "accelerate"] }
-kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
+kin-infer = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]
 async-trait = "0.1"

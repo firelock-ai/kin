@@ -82,21 +82,57 @@ RECOVERED = "RECOVERED"
 
 ALARM_TITLE = "Release rail is parked: RC Build has no follow-on Release Cut run"
 
+# The alarm lives on firelock-ai/kin-infra beside every other repository's alarms,
+# and the label passed as --label is how a reader tells whose each one is.
+LABEL_COLOR = "5319E7"
+
+# The run lookups above read THIS repository with the workflow token. The alarm
+# repository is another, private repository that token cannot reach, so the calls
+# that touch it swap in the issues-only App token the workflow minted, carried in
+# this variable. Absent, the alarm calls use whatever GH_TOKEN the run has, which is
+# right when the alarm repository is this one.
+ALARM_TOKEN_ENV = "KIN_ALARM_TOKEN"
+
 
 class Unreadable(Exception):
     """A `gh` call failed, or answered with a shape this script does not recognize."""
 
 
-def gh(args, capture=True):
+def gh(args, capture=True, env=None):
     """Run gh, refusing an empty answer rather than treating it as a zero (same idiom
     as acceptance_red_alarm.py and release-sentinel-credential-alarm.py: a gh call can
     go out unauthenticated and its 403 wears a quota costume)."""
-    proc = subprocess.run(["gh"] + args, capture_output=capture, text=True, check=False)
+    proc = subprocess.run(["gh"] + args, capture_output=capture, text=True, check=False, env=env)
     if proc.returncode != 0:
         raise Unreadable(
             "gh %s exited %d: %s" % (" ".join(args), proc.returncode, (proc.stderr or "").strip()[:400])
         )
     return proc.stdout
+
+
+def alarm_env(base=None):
+    """Pure. The environment for a gh call that touches the alarm repository: the
+    caller's environment with GH_TOKEN replaced by the alarm token when one is set."""
+    env = dict(os.environ if base is None else base)
+    token = env.get(ALARM_TOKEN_ENV)
+    if token:
+        env["GH_TOKEN"] = token
+    return env
+
+
+def gh_alarm(args, capture=True):
+    return gh(args, capture=capture, env=alarm_env())
+
+
+def ensure_label(repo, label, gh_fn=gh):
+    """Create the source-repository label on the alarm repository, idempotently.
+
+    Created before the issue rather than assumed, because a create against a missing
+    label fails, and an alarm that fails to file is the one outcome this script exists
+    to prevent. `--force` makes an existing label a no-op.
+    """
+    gh_fn(["label", "create", label, "--repo", repo, "--force", "--color", LABEL_COLOR,
+           "--description", "Alarms raised by the %s repository's workflows" % label])
 
 
 def gh_json(args, gh_fn):
@@ -248,10 +284,16 @@ def render_alarm_body(repo, rc_build, detail):
     return "\n".join(lines) + "\n"
 
 
-def run_alarm(repo, rc_build_runs, release_cut_runs, now, dry_run=False, gh_fn=gh):
+def run_alarm(repo, rc_build_runs, release_cut_runs, now, dry_run=False, gh_fn=gh,
+              alarm_repo=None, label=None, alarm_gh_fn=None):
+    """`repo` is the repository whose rail was read and is named in the body;
+    `alarm_repo` is where the issue lives (defaulting to `repo`), `label` names the
+    source repository on it, and `alarm_gh_fn` is the gh that can reach it."""
+    alarm_repo = alarm_repo or repo
+    alarm_gh_fn = alarm_gh_fn or gh_fn
     verdict, detail, rc_build = decide(rc_build_runs, release_cut_runs, now)
-    label = "RC Build %s" % rc_build.get("id") if rc_build else "no qualifying RC Build run"
-    print("VERDICT %s (%s): %s" % (verdict, label, detail))
+    subject = "RC Build %s" % rc_build.get("id") if rc_build else "no qualifying RC Build run"
+    print("VERDICT %s (%s): %s" % (verdict, subject, detail))
 
     if dry_run:
         if verdict == PARKED:
@@ -259,19 +301,23 @@ def run_alarm(repo, rc_build_runs, release_cut_runs, now, dry_run=False, gh_fn=g
             print(render_alarm_body(repo, rc_build, detail))
         return verdict
 
-    existing = find_issue(repo, gh_fn=gh_fn)
+    existing = find_issue(alarm_repo, gh_fn=alarm_gh_fn)
     if verdict == PARKED:
         body = render_alarm_body(repo, rc_build, detail)
         if existing:
-            gh_fn(["issue", "comment", str(existing), "--repo", repo, "--body", body])
+            alarm_gh_fn(["issue", "comment", str(existing), "--repo", alarm_repo, "--body", body])
             print("updated tracking issue #%s" % existing)
         else:
-            number = gh_fn(["issue", "create", "--repo", repo, "--title", ALARM_TITLE, "--body", body])
+            create = ["issue", "create", "--repo", alarm_repo, "--title", ALARM_TITLE, "--body", body]
+            if label:
+                ensure_label(alarm_repo, label, gh_fn=alarm_gh_fn)
+                create += ["--label", label]
+            number = alarm_gh_fn(create)
             print("opened tracking issue %s" % number.strip())
     else:
         if existing:
-            gh_fn(["issue", "close", str(existing), "--repo", repo, "--comment",
-                   "The rail is no longer parked: %s" % detail])
+            alarm_gh_fn(["issue", "close", str(existing), "--repo", alarm_repo, "--comment",
+                         "The rail is no longer parked: %s" % detail])
             print("closed tracking issue #%s" % existing)
         else:
             print("nothing open to close")
@@ -320,9 +366,13 @@ class _FakeGh:
         self.open_issue = existing_issue
         self.closed_issue = None
         self.comments = []
+        self.labels = []
 
     def __call__(self, args):
         self.calls.append(args)
+        if args[0] == "label" and args[1] == "create":
+            self.labels.append(args[2])
+            return ""
         if args[0] == "issue" and args[1] == "list":
             rows = [{"number": self.open_issue, "title": ALARM_TITLE}] if self.open_issue else []
             return json.dumps(rows)
@@ -442,6 +492,51 @@ def self_test():
     check("CLEAR with nothing open performs no mutation",
           [c for c in fake4.calls if c[1] in ("create", "comment", "close")] == [] and verdict == CLEAR)
 
+    # The alarm repository is not the repository whose rail was read. Every issue
+    # call goes to the alarm repository through the alarm gh, the run repository
+    # stays in the body, the label is created there before the issue that carries
+    # it, and the gh that read the runs never touches an issue.
+    runs_gh = _FakeGh(existing_issue=None)
+    alarm_gh = _FakeGh(existing_issue=None)
+    verdict = run_alarm("firelock-ai/kin", [REAL_RC_BUILD_V0_7_10], [], now_soon_after,
+                        gh_fn=runs_gh, alarm_repo="firelock-ai/kin-infra", label="kin",
+                        alarm_gh_fn=alarm_gh)
+    created = [c for c in alarm_gh.calls if c[:2] == ["issue", "create"]]
+    check("a routed PARKED creates exactly one issue through the alarm gh",
+          verdict == PARKED and len(created) == 1)
+    check("the routed create lands on the alarm repository",
+          created and created[0][2:4] == ["--repo", "firelock-ai/kin-infra"])
+    check("the routed create carries the source label",
+          created and "--label" in created[0] and created[0][created[0].index("--label") + 1] == "kin")
+    check("the label is created on the alarm repository before the issue",
+          alarm_gh.labels == ["kin"]
+          and alarm_gh.calls.index(["label", "create", "kin", "--repo", "firelock-ai/kin-infra",
+                                    "--force", "--color", LABEL_COLOR, "--description",
+                                    "Alarms raised by the kin repository's workflows"])
+          < alarm_gh.calls.index(created[0]))
+    check("the routed body still names the repository whose rail was read",
+          created and "repos/firelock-ai/kin/dispatches" in created[0][created[0].index("--body") + 1])
+    check("the gh that reads the runs never touches an issue", runs_gh.calls == [])
+
+    alarm_gh_repeat = _FakeGh(existing_issue=889)
+    run_alarm("firelock-ai/kin", [REAL_RC_BUILD_V0_7_10], [], now_soon_after,
+              gh_fn=runs_gh, alarm_repo="firelock-ai/kin-infra", label="kin",
+              alarm_gh_fn=alarm_gh_repeat)
+    check("a routed repeat PARKED comments on the alarm repository and never relabels",
+          alarm_gh_repeat.labels == [] and len(alarm_gh_repeat.comments) == 1
+          and [c for c in alarm_gh_repeat.calls if c[:2] == ["issue", "create"]] == []
+          and all(c[c.index("--repo") + 1] == "firelock-ai/kin-infra"
+                  for c in alarm_gh_repeat.calls if "--repo" in c))
+
+    # The token routing the workflow relies on: with the alarm token set, the alarm
+    # calls authenticate with it; without it, the environment passes through unchanged.
+    routed = alarm_env({"GH_TOKEN": "workflow", ALARM_TOKEN_ENV: "app"})
+    check("alarm_env swaps in the alarm token when one is set", routed["GH_TOKEN"] == "app")
+    check("alarm_env keeps the rest of the environment", routed[ALARM_TOKEN_ENV] == "app")
+    untouched = alarm_env({"GH_TOKEN": "workflow"})
+    check("alarm_env leaves GH_TOKEN alone when no alarm token is set",
+          untouched == {"GH_TOKEN": "workflow"})
+
     print("release-rail-parked-alarm: self-test %s"
           % ("PASSED" if not failures else "FAILED on %s" % ", ".join(failures)))
     return 1 if failures else 0
@@ -449,7 +544,14 @@ def self_test():
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "firelock-ai/kin"))
+    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "firelock-ai/kin"),
+                        help="the repository whose rail is read")
+    parser.add_argument("--alarm-repo", default=None,
+                        help="where the tracking issue lives; defaults to --repo. Its gh calls "
+                             "authenticate with $%s when set" % ALARM_TOKEN_ENV)
+    parser.add_argument("--label", default=None,
+                        help="the source-repository label to put on a newly opened alarm; "
+                             "created on the alarm repository first when given")
     parser.add_argument("--dry-run", action="store_true", help="judge and print, touch no issue")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv[1:])
@@ -461,7 +563,8 @@ def main(argv):
         rc_build_runs = fetch_rc_build_runs(args.repo, gh)
         release_cut_runs = fetch_release_cut_runs(args.repo, gh)
         verdict = run_alarm(args.repo, rc_build_runs, release_cut_runs,
-                             datetime.now(timezone.utc), dry_run=args.dry_run)
+                             datetime.now(timezone.utc), dry_run=args.dry_run,
+                             alarm_repo=args.alarm_repo, label=args.label, alarm_gh_fn=gh_alarm)
     except Unreadable as exc:
         print("VERDICT UNREADABLE %s" % exc)
         return 2

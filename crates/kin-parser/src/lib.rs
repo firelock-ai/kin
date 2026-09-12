@@ -35,6 +35,7 @@ pub mod adapter;
 pub mod error;
 pub mod extract;
 pub mod languages;
+pub mod scope;
 pub mod shallow;
 pub mod todos;
 

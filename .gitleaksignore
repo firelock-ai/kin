@@ -1,0 +1,5 @@
+# Gitleaks ignore list
+# Test fixtures in crates/kin-db/src/admission.rs testing secret admission rejection
+c6792e701a0c7b548bad102ec109c8475e99da89:crates/kin-db/src/admission.rs:generic-api-key:848
+c6792e701a0c7b548bad102ec109c8475e99da89:crates/kin-db/src/admission.rs:generic-api-key:850
+c6792e701a0c7b548bad102ec109c8475e99da89:crates/kin-db/src/admission.rs:generic-api-key:851

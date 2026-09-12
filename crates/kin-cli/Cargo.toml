@@ -46,7 +46,7 @@ kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
 similar = { workspace = true }
-kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
+kin-infer = { workspace = true }
 kin-ranking = { workspace = true }
 kin-lsp = { workspace = true }
 kin-remote = { workspace = true, features = ["http"] }
@@ -132,4 +132,4 @@ windows-sys = { version = "0.61", features = [
 # block is absent and metal is never requested, keeping the Linux build green.
 [target.'cfg(target_os = "macos")'.dependencies]
 kin-db = { workspace = true, features = ["metal", "accelerate"] }
-kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
+kin-infer = { workspace = true, features = ["metal"] }

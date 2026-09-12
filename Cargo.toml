@@ -6,6 +6,7 @@ resolver = "2"
 members = [
     # Kin libraries, developed here and published as independent packages.
     "crates/kin-blobs",
+    "crates/kin-db",
     "crates/kin-infer",
     "crates/kin-lsp",
     "crates/kin-model",
@@ -183,7 +184,7 @@ kin-infer = { path = "crates/kin-infer", version = "=0.2.44", registry = "kin", 
 # nothing rather than failing to build. The rule above stands on its own reason, which is
 # that a workspace entry cannot be target-gated and so would state a macOS choice for
 # every target.
-kin-db = { version = "=0.7.112", registry = "kin", default-features = false }
+kin-db = { path = "crates/kin-db", version = "=0.7.114", registry = "kin", default-features = false }
 # Pinned to the exact version kin-db builds its name-token index with. A
 # per-token name query hits that index only when the token came out of the same
 # tokenizer, so a version skew here would be a silent recall loss rather than a
@@ -194,37 +195,6 @@ kin-vfs-core = { path = "crates/kin-vfs-core", version = "=0.4.25", registry = "
 # here naming it. It still needs an entry, because a workspace member can only
 # say `{ workspace = true }` for a name this table carries.
 kin-vector = { path = "crates/kin-vector", version = "=0.2.1", registry = "kin" }
-
-# Transitional, and removed by the pull request that imports kin-db.
-#
-# Until kin-db is a workspace member it still resolves from the Kin registry,
-# and the published kin-db depends on the published kin-model, kin-search and
-# kin-vector. Without this table the graph would carry two of each: one built
-# from `crates/`, one downloaded, distinct types with the same name. Every
-# requirement kin-db 0.7.112 publishes is satisfied by the version in
-# `crates/`, read from the registry index on 2026-09-11:
-#
-#   kin-model  "=0.7.28"   crates/kin-model  0.7.28
-#   kin-search "0.1.9"     crates/kin-search 0.1.9
-#   kin-vector "=0.2.1"    crates/kin-vector 0.2.1
-#   kin-infer  "0.2.44"    crates/kin-infer  0.2.44
-#
-# kin-lsp and kin-vfs-core are deliberately NOT here, and that was measured
-# rather than assumed. No registry crate depends on either, and kin's own crates
-# reach both by path, so nothing requests them from the registry for a patch to
-# redirect. Removing candidate rows for the two and re-locking moved no line of
-# the lock and produced no cargo output at all, so a row for either would have
-# been decoration carrying a reason it did not have.
-#
-# A patch whose version does not satisfy the requirement is ignored SILENTLY
-# and the build succeeds against the registry copy, so `cargo tree -d` listing
-# no Kin library twice is the check that this table is doing anything at all.
-[patch.kin]
-kin-blobs = { path = "crates/kin-blobs" }
-kin-infer = { path = "crates/kin-infer" }
-kin-model = { path = "crates/kin-model" }
-kin-search = { path = "crates/kin-search" }
-kin-vector = { path = "crates/kin-vector" }
 
 [profile.release]
 opt-level = 3

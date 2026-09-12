@@ -21,6 +21,9 @@ pub use go::{attach_go_command_effect_contract_metadata, GoAdapter};
 pub use hcl::HclAdapter;
 pub use java::JavaAdapter;
 pub use javascript::JavaScriptAdapter;
+// Crate-private: the module-identity rule these two spell is the one
+// `crate::scope` derives a module specifier from, so both surfaces stay one rule.
+pub(crate) use javascript::{js_module_identity, TS_SUFFIXES};
 pub use kotlin::KotlinAdapter;
 pub use php::PhpAdapter;
 pub use python::{is_python_builtin_name, PythonAdapter, PYTHON_BUILTIN_NAMES};

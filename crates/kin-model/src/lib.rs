@@ -64,6 +64,7 @@ pub mod relation;
 pub mod repository;
 pub mod retrieval;
 pub mod review;
+pub mod scope;
 pub mod sealed_observation;
 pub mod session;
 pub mod spec;
@@ -154,6 +155,7 @@ pub use review::{
     ReviewDecisionState, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewFilter,
     ReviewId, ReviewNote, ReviewNoteId, RiskLevel, RiskSummary,
 };
+pub use scope::{EntityScope, ScopeAbsence, ScopePath, ScopePathError};
 pub use spec::Spec;
 pub use stats::GraphStats;
 pub use temporal::{is_active_at, ArtifactRevision, EntityRevision, RelationRevision};

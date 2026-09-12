@@ -2931,7 +2931,7 @@ pub(super) const JS_SUFFIXES: &[&str] = &[".jsx", ".mjs", ".cjs", ".js"];
 /// `.d.ts` leads because it must: `foo.d.ts` stripped of `.ts` is `foo.d`, a
 /// name no source ever writes. The old `is_ts_index_file` never matched
 /// `index.d.ts` at all, which is the drift the shared helper exists to stop.
-pub(super) const TS_SUFFIXES: &[&str] = &[".d.ts", ".tsx", ".ts"];
+pub(crate) const TS_SUFFIXES: &[&str] = &[".d.ts", ".tsx", ".ts"];
 
 /// The module identity of a JavaScript or TypeScript source file: its name, and
 /// whether the file is a package index.
@@ -2955,7 +2955,7 @@ pub(super) const TS_SUFFIXES: &[&str] = &[".d.ts", ".tsx", ".ts"];
 /// once for the directory name. Python has no such blocklist and neither does
 /// this. `lib/index.js` is named `lib`, because `require('./lib')` is what the
 /// source calls it.
-pub(super) fn js_module_identity(path: &str, suffixes: &[&str]) -> (String, bool) {
+pub(crate) fn js_module_identity(path: &str, suffixes: &[&str]) -> (String, bool) {
     let basename = path.rsplit('/').next().unwrap_or(path);
     let Some(stem) = suffixes
         .iter()
