@@ -88,6 +88,103 @@ function readManifestVersion(text) {
   throw new Error(`could not read [workspace.package]/[package] version from manifest`);
 }
 
+// Every path listed under the root manifest's `[workspace]` `members` array,
+// read from manifest TEXT. Pure, so it is reachable from a test without a
+// filesystem; only readLocalMemberVersions() below turns a member path into a
+// file read. The real root manifest opens the array with a comment line,
+// which contains no quotes and is skipped for free.
+export function readWorkspaceMembers(text) {
+  const members = [];
+  let section = '';
+  let inMembers = false;
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (line.startsWith('[') && line.endsWith(']') && !inMembers) {
+      section = line;
+      continue;
+    }
+    if (section !== '[workspace]') continue;
+    if (inMembers) {
+      const closeAt = line.indexOf(']');
+      const segment = closeAt === -1 ? line : line.slice(0, closeAt);
+      for (const m of segment.matchAll(/"([^"]+)"/g)) members.push(m[1]);
+      if (closeAt !== -1) inMembers = false;
+      continue;
+    }
+    const opening = line.match(/^members\s*=\s*\[(.*)$/);
+    if (!opening) continue;
+    inMembers = true;
+    const closeAt = opening[1].indexOf(']');
+    const segment = closeAt === -1 ? opening[1] : opening[1].slice(0, closeAt);
+    for (const m of segment.matchAll(/"([^"]+)"/g)) members.push(m[1]);
+    if (closeAt !== -1) inMembers = false;
+  }
+  return members;
+}
+
+// A member manifest's own package identity: its name, and its own version
+// ONLY when the member declares one explicitly (`version = "x"` under
+// `[package]`). A member that inherits `version.workspace = true`, or
+// declares neither, reports `explicitVersion: null` so the caller falls back
+// to the workspace version. Pure, same reason as readWorkspaceMembers.
+export function readPackageIdentity(text) {
+  let section = '';
+  let name = null;
+  let explicitVersion = null;
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (line.startsWith('[') && line.endsWith(']')) {
+      section = line;
+      continue;
+    }
+    if (section !== '[package]') continue;
+    const nameMatch = line.match(/^name\s*=\s*"([^"]+)"/);
+    if (nameMatch) {
+      name = nameMatch[1];
+      continue;
+    }
+    if (/^version\.workspace\s*=\s*true/.test(line)) continue;
+    const versionMatch = line.match(/^version\s*=\s*"([^"]+)"/);
+    if (versionMatch) explicitVersion = versionMatch[1];
+  }
+  return { name, explicitVersion };
+}
+
+// The version a local Cargo.lock entry must carry: its own manifest's version
+// when the workspace member that produced it declares one explicitly, the
+// workspace version otherwise. `memberVersions` is name -> explicit version,
+// built by walking the `[workspace]` members list rather than any list of
+// names kept here, because kin#1747 made kin-blobs, kin-model, kin-search and
+// kin-vector independently versioned by that rule alone, and every crate
+// after them (kin-infer, kin-lsp, kin-vfs-core, kin-db as of this writing)
+// must be covered without editing this file again.
+export function expectedLocalVersion(name, memberVersions, workspaceVersion) {
+  const explicit = memberVersions.get(name);
+  if (explicit != null) return { expected: explicit, independent: true };
+  return { expected: workspaceVersion, independent: false };
+}
+
+// Read every workspace member's own version declaration off disk, keyed by
+// package name. A member whose manifest cannot be read is silently absent
+// from the map rather than a failure here: expectedLocalVersion() then falls
+// back to the workspace version for it, which is the pre-kin#1747 behaviour
+// and keeps a member with no on-disk manifest (a minimal test fixture, a
+// member removed mid-history) from failing a check it was never the subject
+// of.
+async function readLocalMemberVersions(manifestPath, manifestText) {
+  const lastSlash = manifestPath.lastIndexOf('/');
+  const root = lastSlash === -1 ? '' : manifestPath.slice(0, lastSlash + 1);
+  const members = readWorkspaceMembers(manifestText);
+  const versions = new Map();
+  for (const member of members) {
+    const text = await readFileOrNull(`${root}${member}/Cargo.toml`);
+    if (text === null) continue;
+    const { name, explicitVersion } = readPackageIdentity(text);
+    if (name && explicitVersion != null) versions.set(name, explicitVersion);
+  }
+  return versions;
+}
+
 // Is a changed path something a release actually ships?
 //
 // This mirrors `classifyPath` in scripts/check-release-version.mjs and is a
@@ -282,6 +379,7 @@ async function main() {
   const version = readManifestVersion(manifestText);
   const tag = `v${version}`;
   const isPrerelease = version.includes('-');
+  const memberVersions = await readLocalMemberVersions(opts.manifest, manifestText);
 
   const failures = [];
   const warnings = [];
@@ -303,10 +401,14 @@ async function main() {
   }
   const npmVersion = npmVersions.map((n) => `${n.manifest.split('/').slice(-2, -1)[0] ?? n.manifest}@${n.version ?? '<missing>'}`).join(', ');
 
-  // 1b. Cargo's explicit internal path-version pin and every local Kin
-  // workspace entry in Cargo.lock must move with the workspace version. A
-  // global text replacement is forbidden: third-party packages such as
-  // async-stream can legitimately have the same numeric version.
+  // 1b. Cargo's explicit internal path-version pin always moves with the
+  // workspace version (kin-spine has no independent version of its own).
+  // Every local Kin workspace entry in Cargo.lock moves with EITHER the
+  // workspace version or its own manifest's version, decided by
+  // expectedLocalVersion() from what that member's own Cargo.toml declares,
+  // never by name or a remembered list. A global text replacement is
+  // forbidden: third-party packages such as async-stream can legitimately
+  // have the same numeric version.
   const cliManifestPath = 'crates/kin-cli/Cargo.toml';
   const cliManifest = await readFileOrNull(cliManifestPath);
   const spinePin = cliManifest?.match(
@@ -329,10 +431,13 @@ async function main() {
       const name = block.match(/^name = "([^"]+)"/m)?.[1] ?? null;
       const locked = block.match(/^version = "([^"]+)"/m)?.[1] ?? null;
       if (!name?.startsWith('kin-')) continue;
-      localLockVersions.push({ name, version: locked });
-      if (locked !== version) {
+      const { expected, independent } = expectedLocalVersion(name, memberVersions, version);
+      localLockVersions.push({ name, version: locked, independent });
+      if (locked !== expected) {
         failures.push(
-          `${cargoLockPath} local package ${name} is ${locked ?? '<missing>'}, workspace is ${version}`,
+          independent
+            ? `${cargoLockPath} local package ${name} is ${locked ?? '<missing>'}, its own manifest is ${expected}`
+            : `${cargoLockPath} local package ${name} is ${locked ?? '<missing>'}, workspace is ${expected}`,
         );
       }
     }
@@ -340,10 +445,15 @@ async function main() {
       failures.push(`${cargoLockPath} has no local Kin workspace packages`);
     }
   }
+  const independentLockCount = localLockVersions.filter((v) => v.independent).length;
+  const workspaceLockCount = localLockVersions.length - independentLockCount;
 
-  // 1c. The fuzz workspace resolves kin-parser by path, so its lockfile carries
-  // the workspace version as well. A stale entry only surfaces in the fuzz job's
-  // --locked resolution, which runs after the release commit already exists.
+  // 1c. The fuzz workspace resolves kin-parser by path, so its lockfile
+  // carries whatever version kin-parser's own manifest calls for, by the same
+  // rule as 1b (the workspace version today; kin-parser's own version the day
+  // it is published independently too). A stale entry only surfaces in the
+  // fuzz job's --locked resolution, which runs after the release commit
+  // already exists.
   const fuzzLockPath = 'fuzz/Cargo.lock';
   const fuzzLock = await readFileOrNull(fuzzLockPath);
   if (fuzzLock === null) {
@@ -356,9 +466,12 @@ async function main() {
       const locked = block.match(/^version = "([^"]+)"/m)?.[1] ?? null;
       if (name !== 'kin-parser') continue;
       fuzzLocal += 1;
-      if (locked !== version) {
+      const { expected, independent } = expectedLocalVersion(name, memberVersions, version);
+      if (locked !== expected) {
         failures.push(
-          `${fuzzLockPath} local package ${name} is ${locked ?? '<missing>'}, workspace is ${version}`,
+          independent
+            ? `${fuzzLockPath} local package ${name} is ${locked ?? '<missing>'}, its own manifest is ${expected}`
+            : `${fuzzLockPath} local package ${name} is ${locked ?? '<missing>'}, workspace is ${expected}`,
         );
       }
     }
@@ -407,7 +520,7 @@ async function main() {
     console.log(`  workspace version : ${version}`);
     console.log(`  npm packages      : ${npmVersion || '<missing>'}`);
     console.log(`  kin-spine pin     : ${spinePin ?? '<missing>'}`);
-    console.log(`  local lock entries: ${localLockVersions.length}`);
+    console.log(`  local lock entries: ${localLockVersions.length} (${workspaceLockCount} workspace-versioned, ${independentLockCount} independent)`);
     console.log(`  changelog section : ${hasChangelog ? 'present' : 'absent'}`);
     console.log(`  newest tag        : ${newest ?? '<none>'}`);
     console.log(`  tag ${tag}${' '.repeat(Math.max(0, 13 - tag.length))}: ${tagExists ? 'exists' : 'absent'}`);
