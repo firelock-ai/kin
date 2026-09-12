@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Show the `--continue` alias in `kin resolve --help`.
 
+### Fixed
+
+- Let top-level `kin --help`, `kin -h`, `kin --version`, and `kin -V` display without a nested-repository parent-store warning.
+
 ## [0.7.16] - 2026-09-12
 
 ### Changed

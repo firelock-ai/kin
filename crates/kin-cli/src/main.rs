@@ -2930,6 +2930,17 @@ fn parse_cli_or_report_retired_command() -> Cli {
     }
 }
 
+fn is_top_level_display_flag() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    let Some(flag) = args.next() else {
+        return false;
+    };
+    if args.next().is_some() {
+        return false;
+    }
+    matches!(flag.to_str(), Some("--help" | "-h" | "--version" | "-V"))
+}
+
 /// The process entry. The outcome of [`run`] becomes an exit status in one
 /// place, so a refusal is reported the same way whether or not anyone still
 /// reads stderr, and the `println!` and `eprintln!` this file imports from
@@ -2965,8 +2976,10 @@ fn run() -> Result<()> {
     // the daemon runs under the repository's profile and this process does not,
     // and every command in such a repository reports a behavior-env divergence
     // whose remedy cannot clear it.
-    if let Ok(cwd) = std::env::current_dir() {
-        kin_cli::resource_profile::apply_repository_profile_at(&cwd);
+    if !is_top_level_display_flag() {
+        if let Ok(cwd) = std::env::current_dir() {
+            kin_cli::resource_profile::apply_repository_profile_at(&cwd);
+        }
     }
     // Put Kin's own tool directories on PATH while this process is still
     // single-threaded, so a language server Kin provisioned is reachable by the
