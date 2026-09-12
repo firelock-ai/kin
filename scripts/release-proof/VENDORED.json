@@ -1,12 +1,12 @@
 {
   "source_repository": "firelock-ai/kin-ecosystem",
   "source_commit": "c1cbeeb25f6070e59178badb401e9195537d91de",
-  "note": "Byte-identical copies of the umbrella proof tooling so the hosted preflight runs from kin alone; bin/kin-lane is a single-host lock shim written for this tree, not a copy. scripts/release-proof/vendored.test.mjs refuses a file whose sha256 left this manifest. One exception stands against source_commit: bin/kin-release-preflight.d/validate.mjs carries a PORTED_FROM pin restamped in kin first, because kin#1652 moved install-proof.yml and the preflight then refused all three legs of the v0.7.9 cut on the stale pin. kin-ecosystem needs the same one-line restamp before the next re-vendor overwrites it. A second exception stands against source_commit the other way: bin/kin-release-preflight.d/proof-flow.sh carries the bytes of kin-ecosystem's proof-flow exit-tolerance change (branch chore/lane-prefrc-kin-ecosystem-proof-flow at 434dcf75321f03195d005d35895120f5e9010015, sha256 943160af), vendored into kin AHEAD of that change landing on the umbrella's main. The order is forced: the umbrella's own parity check requires kin to carry identical bytes before its pull request can go green, so kin vendors first and the umbrella lands second.",
+  "note": "The hashes are the authority for the exact proof bytes this tree runs. source_commit identifies the last umbrella vendor snapshot. bin/kin-lane is local to this tree. bin/kin-release-preflight, bin/kin-release-preflight.d/proof-flow.sh, and bin/kin-release-preflight.d/validate.mjs carry the Kin-side VFS retirement update: future release packages omit the external kin-vfs executable and preload shims while complete legacy archives remain verifiable. Re-vendor the corresponding umbrella update before calling those copies byte-identical again.",
   "files": {
-    "bin/kin-release-preflight": {"source": "bin/kin-release-preflight", "sha256": "aedf49d66f774ff5fc34c84a4efccbe913278478281ece0917d50b8d910dd235"},
+    "bin/kin-release-preflight": {"source": "bin/kin-release-preflight", "sha256": "71ca13cdcacde94c1f1cbc67aa351f3bb7c7b13eb0ad525fc6c82bc4d9c302cd"},
     "bin/kin-release-preflight.d/Dockerfile": {"source": "bin/kin-release-preflight.d/Dockerfile", "sha256": "e6c0e30c2bf46fc889484fb7e32c73163c3cf315d60351be3acd2428d22d12f6"},
-    "bin/kin-release-preflight.d/proof-flow.sh": {"source": "bin/kin-release-preflight.d/proof-flow.sh", "sha256": "943160afa4bb1f2aa58e0e1639c1cb81dccba20e1566bec80757f452834b4ef1"},
-    "bin/kin-release-preflight.d/validate.mjs": {"source": "bin/kin-release-preflight.d/validate.mjs", "sha256": "fc9c482ce588b0c78d59e08dfda8382f1e31615592d721dcd00625c6ba0917a2"},
+    "bin/kin-release-preflight.d/proof-flow.sh": {"source": "bin/kin-release-preflight.d/proof-flow.sh", "sha256": "ea81918079bbe7662391836b2a1341471da4487a184ed6086e7450a7757f8738"},
+    "bin/kin-release-preflight.d/validate.mjs": {"source": "bin/kin-release-preflight.d/validate.mjs", "sha256": "0c991568dba0763781a08c66bf464dff247e77a62b0ab420edde6900cd5d48f9"},
     "bin/kin-evidence-publish": {"source": "bin/kin-evidence-publish", "sha256": "8912fd933ba37e2570ea2ff685a885551543f2a01e3baeb394876121f8811679"},
     "bin/kin-acceptance-suite": {"source": "bin/kin-acceptance-suite", "sha256": "7ce214e6563e227695cf02411762ca5e8d01edf8898634db465ee30f455918f7"}
   }

@@ -13,8 +13,8 @@
 # with nothing local having ever asked the question. This tool asks it here:
 # the same flow, the same assertions, the same repro suite, against a build
 # from a worktree or an archive as shipped, on this host and inside a Debian 12
-# container for a Linux archive, with the glibc floor read off the packaged
-# kin-vfs and shim exactly as the release does.
+# container for a Linux archive. Legacy archives that still carry the retired
+# VFS pair retain their own compatibility proof.
 #
 # DEV-LOCAL. NON-CITABLE. The publish-fetch surface (get.kinlab.dev, the
 # attestation, the tag binding, the provenance manifest) is not exercised, and
@@ -63,13 +63,13 @@ What it judges, and where:
                       builds through `bin/kin-lane run <lane> kin -- cargo build`, any
                       other checkout builds in place with --locked --release), then
                       overlay them onto the newest published archive for this host
-                      (kin-vfs, the shim and KinNotifier.app come from that base) and
-                      prove the result on the host
+                      (KinNotifier.app comes from that base), remove retired VFS
+                      runtime artifacts, and prove the result on the host
   --bin/--daemon      the same, from binaries you already built
   --archive FILE      a release-shaped archive as shipped. The host's own target runs
                       on the host; a Linux archive runs inside a Debian 12 container
-                      of its architecture (linux/arm64 for kin-linux-aarch64), where the
-                      glibc floor guard also runs on kin-vfs and the shim. Repeat the
+                      of its architecture (linux/arm64 for kin-linux-aarch64). A legacy
+                      archive retains its VFS compatibility check. Repeat the
                       flag to judge several archives in one run
   --rc-run ID         download every kin-<os>-<arch>.tar.gz a kin rc-build.yml run
                       produced and judge each one as --archive would. This is how
@@ -86,7 +86,7 @@ Options:
   --base-archive FILE archive to overlay --build/--bin binaries onto (default: the newest
                       GitHub release's archive for this host, cached under
                       .kin-coord/preflight/base/<tag>/)
-  --kin-repo DIR      kin checkout supplying scripts/install.sh, check-glibc-floor.mjs
+  --kin-repo DIR      kin checkout supplying scripts/install.sh, archive documentation,
                       and the workflow the assertions were ported from (default: the
                       --build checkout, else <umbrella>/kin)
   --kin-ref REF       git ref of --kin-repo to take those files from (default: the
@@ -474,6 +474,8 @@ if [ -z "$BUILD_DIR" ] && [ -z "$KIN_REF" ]; then
 fi
 if [ -n "$KIN_REF" ]; then TOOL_SRC="$KIN_REPO @ $KIN_REF"; else TOOL_SRC="$KIN_REPO (working tree)"; fi
 read_kin_file scripts/install.sh "$RUN_ROOT/tools/install.sh" || die "scripts/install.sh not found at $TOOL_SRC"
+read_kin_file scripts/write-release-archive-docs.mjs "$RUN_ROOT/tools/write-release-archive-docs.mjs" \
+  || die "scripts/write-release-archive-docs.mjs not found at $TOOL_SRC"
 if read_kin_file scripts/check-glibc-floor.mjs "$RUN_ROOT/tools/check-glibc-floor.mjs"; then
   GLIBC_GUARD="present"
 else
@@ -487,10 +489,10 @@ PORTED_SHA="$(sed -n 's/^  sha256: "\([0-9a-f]\{64\}\)",$/\1/p' "$HELPERS/valida
 cp "$HELPERS/proof-flow.sh" "$RUN_ROOT/tools/proof-flow.sh"
 cp "$HELPERS/validate.mjs" "$RUN_ROOT/tools/validate.mjs"
 # The acceptance suite comes from kin, never from a copy kept here. A release
-# archive carries kin, kin-daemon, kin-vfs, the shim, README and INSTALL and no
+# archive carries kin, kin-daemon, README and INSTALL and no
 # scripts directory, so the bytes under test cannot supply their own checks;
 # the suite is pinned to the same KIN_REPO @ KIN_REF that already supplies
-# scripts/install.sh and check-glibc-floor.mjs. bin/kin-acceptance-suite prints
+# scripts/install.sh. bin/kin-acceptance-suite prints
 # the path, sha256 and tree sha it resolved, and refuses a copy that came from
 # outside that tree. The umbrella used to keep its own copy and it drifted six
 # checks behind kin's within two days, which is why there is one copy now.
@@ -518,7 +520,7 @@ else
   fi
 fi
 chmod +x "$RUN_ROOT/tools/proof-flow.sh" "$RUN_ROOT/tools/install.sh" 2>/dev/null
-say "tooling from $TOOL_SRC: install.sh, check-glibc-floor.mjs $GLIBC_GUARD"
+say "tooling from $TOOL_SRC: install.sh, archive docs, check-glibc-floor.mjs $GLIBC_GUARD"
 say "acceptance suite: $MAGIC_SRC"
 # validate.mjs is a hand port of install-proof.yml's "Validate installed
 # capability proof" block. When the two disagree, a PASS here is a PASS against
@@ -649,6 +651,16 @@ fetch_base_archive() { # prints the path of a base archive for the host target
   printf '%s\n' "$dest/kin-$HOST_TARGET.tar.gz"
 }
 
+archive_target_for_host() {
+  case "$HOST_TARGET" in
+    macos-aarch64) printf '%s\n' 'aarch64-apple-darwin' ;;
+    macos-x86_64) printf '%s\n' 'x86_64-apple-darwin' ;;
+    linux-aarch64) printf '%s\n' 'aarch64-unknown-linux-musl' ;;
+    linux-x86_64) printf '%s\n' 'x86_64-unknown-linux-musl' ;;
+    *) die "no Cargo target mapping for $HOST_TARGET" ;;
+  esac
+}
+
 if [ -n "$BUILT_KIN" ]; then
   kin_line="$("$BUILT_KIN" --version 2>&1 | tail -1)"
   daemon_line="$("$BUILT_DAEMON" --version 2>&1 | tail -1)"
@@ -670,6 +682,17 @@ if [ -n "$BUILT_KIN" ]; then
   [ "$(basename "$content_root")" = "kin-$HOST_TARGET" ] || die "base archive content root $(basename "$content_root") is not kin-$HOST_TARGET"
   cp "$BUILT_KIN" "$content_root/kin" && cp "$BUILT_DAEMON" "$content_root/kin-daemon" || die "overlay failed"
   chmod +x "$content_root/kin" "$content_root/kin-daemon"
+  # The newest published base may predate VFS retirement. This scratch archive
+  # models the prospective release, so remove only its copied retired runtime
+  # files and regenerate its in-archive documentation and checksum inventory.
+  rm -f "$content_root/kin-vfs" "$content_root/kin-vfs.exe" \
+    "$content_root/libkin_vfs_shim.so" "$content_root/libkin_vfs_shim.dylib" \
+    "$content_root/kin_vfs_shim.dll"
+  archive_target="$(archive_target_for_host)"
+  archive_version="$(printf '%s\n' "$kin_line" | awk '{print $2}')"
+  node "$RUN_ROOT/tools/write-release-archive-docs.mjs" \
+    "$content_root" "$archive_target" "$archive_version" \
+    || die "could not regenerate the prospective archive documentation"
   host_archive="$RUN_ROOT/dist/kin-$HOST_TARGET.tar.gz"
   ( cd "$assemble" && tar -czf "$host_archive" "kin-$HOST_TARGET" ) || die "could not assemble $host_archive"
   rm -rf "$assemble"
@@ -689,7 +712,7 @@ if [ -n "$BUILT_KIN" ]; then
   kin-daemon:   $BUILT_DAEMON
                 sha256 $(sha256_of "$BUILT_DAEMON")
                 $daemon_line
-  base archive: $base (sha256 $base_sha) supplies kin-vfs, the shim and KinNotifier.app; kin and kin-daemon were overlaid onto it, so the assembled archive is neither a release nor a reproducible build
+  base archive: $base (sha256 $base_sha) supplies KinNotifier.app; kin and kin-daemon were overlaid and retired VFS runtime artifacts removed, so the assembled archive is neither a release nor a reproducible build
   assembled:    $host_archive (sha256 $(sha256_of "$host_archive"))
   expected:     commit $expected_commit${BUILD_DIR:+ (HEAD of $BUILD_DIR)}; Cargo.lock sha256 ${lock_sha:-UNRESOLVED}"
 fi

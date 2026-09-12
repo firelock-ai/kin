@@ -15,10 +15,6 @@ on:
         description: Exact public release tag to install and verify.
         required: true
         type: string
-      expected_vfs_commit:
-        description: Reviewed kin-vfs commit pinned by the calling release workflow.
-        required: true
-        type: string
       local_artifact:
         description: >
           Name of an artifact in the CALLING run holding binaries this pull
@@ -163,7 +159,6 @@ jobs:
         shell: bash
         env:
           RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
-          REVIEWED_VFS_COMMIT: ${{ inputs.expected_vfs_commit || '' }}
           LOCAL_ARTIFACT: ${{ inputs.local_artifact || '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -221,6 +216,7 @@ jobs:
               echo "installed kin-daemon $installed_daemon_version, expected pull request build $expected_version" >&2
               exit 1
             fi
+            printf 'false\n' > legacy-vfs-mode.txt
             exit 0
           fi
 
@@ -327,19 +323,8 @@ jobs:
             "https://github.com/firelock-ai/kin/releases/download/$expected_tag/release-provenance.json.sha256" \
             -o release-provenance.json.sha256
 
-          expected_vfs_commit="$REVIEWED_VFS_COMMIT"
-          if [ -z "$expected_vfs_commit" ]; then
-            expected_vfs_commit="$(node -e \
-              'process.stdout.write(JSON.parse(require("fs").readFileSync("release-provenance.json", "utf8")).kin_vfs?.commit || "")')"
-          fi
-          if ! printf '%s\n' "$expected_vfs_commit" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "could not resolve the reviewed kin-vfs commit for $expected_tag" >&2
-            exit 1
-          fi
-
           RELEASE_ASSET="$release_asset" EXPECTED_TAG="$expected_tag" \
-          EXPECTED_COMMIT="$expected_commit" \
-          EXPECTED_VFS_COMMIT="$expected_vfs_commit" node <<'NODE'
+          EXPECTED_COMMIT="$expected_commit" RUNNER_OS="$RUNNER_OS" node <<'NODE'
           const crypto = require("crypto");
           const fs = require("fs");
 
@@ -360,22 +345,51 @@ jobs:
             "release provenance tag does not match the installed release");
           fail(manifest.kin?.commit === process.env.EXPECTED_COMMIT,
             "release provenance Kin commit does not match the installed release tag");
-          fail(manifest.kin_vfs?.commit === process.env.EXPECTED_VFS_COMMIT,
-            "release provenance does not bind the reviewed kin-vfs commit");
-          fail(manifest.kin_vfs?.dirty === false,
-            "release provenance does not certify a clean kin-vfs checkout");
           const platform = manifest.artifacts?.find(
             (artifact) => artifact.archive?.name === process.env.RELEASE_ASSET
           );
           fail(platform, `release provenance omits ${process.env.RELEASE_ASSET}`);
+          fail(Array.isArray(platform.archive_contents),
+            "release provenance omits the archive content inventory");
           fail(platform.release_tag === process.env.EXPECTED_TAG,
             "platform provenance tag does not match the installed release");
           fail(platform.kin?.commit === process.env.EXPECTED_COMMIT,
             "platform provenance Kin commit does not match the installed release");
-          fail(platform.kin_vfs?.commit === process.env.EXPECTED_VFS_COMMIT,
-            "platform provenance does not bind the reviewed kin-vfs commit");
           fail(platform.archive?.sha256 === sha256(`attested-${process.env.RELEASE_ASSET}`),
             "attested archive bytes do not match aggregate release provenance");
+          const shim = process.env.RUNNER_OS === "Linux"
+            ? "libkin_vfs_shim.so"
+            : process.env.RUNNER_OS === "macOS"
+              ? "libkin_vfs_shim.dylib"
+              : null;
+          const names = new Set((platform.archive_contents ?? []).map((entry) => entry.name));
+          const hasVfs = names.has("kin-vfs");
+          const hasShim = shim !== null && names.has(shim);
+          fail(hasVfs === hasShim,
+            "archive carries a partial retired VFS runtime pair");
+          const legacyVfs = hasVfs && hasShim;
+          // v0.7.16 recorded the retired source input in its aggregate and every
+          // platform record, but Windows deliberately shipped no VFS pair. Keep
+          // that released provenance verifiable without allowing a future Unix
+          // archive to omit its pair or a future archive to retain either field.
+          const legacyVfsSource = manifest.kin_vfs !== undefined || platform.kin_vfs !== undefined;
+          if (legacyVfs || legacyVfsSource) {
+            const expectedVfsCommit = manifest.kin_vfs?.commit;
+            fail(/^[0-9a-f]{40}$/.test(expectedVfsCommit ?? ""),
+              "legacy release provenance does not bind a reviewed kin-vfs commit");
+            fail(manifest.kin_vfs?.dirty === false,
+              "legacy release provenance does not certify a clean kin-vfs checkout");
+            fail(platform.kin_vfs?.commit === expectedVfsCommit,
+              "legacy platform provenance does not bind the reviewed kin-vfs commit");
+            fail(legacyVfs || process.env.RUNNER_OS === "Windows",
+              "legacy VFS provenance may omit the runtime pair only on Windows");
+          } else {
+            fail(!names.has("kin-vfs"), "new archive unexpectedly carries kin-vfs");
+            fail(shim === null || !names.has(shim), "new archive unexpectedly carries a VFS preload shim");
+            fail(manifest.kin_vfs === undefined && platform.kin_vfs === undefined,
+              "new release provenance unexpectedly records retired VFS source inputs");
+          }
+          fs.writeFileSync("legacy-vfs-mode.txt", `${legacyVfs}\n`);
           NODE
 
           aggregate_verified=false
@@ -417,13 +431,13 @@ jobs:
           fi
 
           RUN_COMPONENT_COMPARE="$([ "$RUNNER_OS" != "Windows" ] && printf true || printf false)" \
+          LEGACY_VFS="$(cat legacy-vfs-mode.txt)" \
           RELEASE_ASSET="$release_asset" EXPECTED_TAG="$expected_tag" \
           EXPECTED_COMMIT="$expected_commit" CONTENT_ROOT="$content_root" \
-          EXPECTED_VFS_COMMIT="$expected_vfs_commit" \
           INSTALLED_VFS="$HOME/.kin/bin/kin-vfs" \
           INSTALLED_SHIM="$HOME/.kin/lib/$shim_name" \
           SHIM_NAME="$shim_name" node <<'NODE'
-          if (process.env.RUN_COMPONENT_COMPARE !== "true") process.exit(0);
+          if (process.env.RUN_COMPONENT_COMPARE !== "true" || process.env.LEGACY_VFS !== "true") process.exit(0);
           const crypto = require("crypto");
           const fs = require("fs");
           const path = require("path");
@@ -459,7 +473,7 @@ jobs:
             schema_version: 1,
             release_tag: process.env.EXPECTED_TAG,
             kin_commit: process.env.EXPECTED_COMMIT,
-            kin_vfs_commit: process.env.EXPECTED_VFS_COMMIT,
+            kin_vfs_commit: platform.kin_vfs?.commit,
             archive: process.env.RELEASE_ASSET,
             components,
           }, null, 2)}\n`);
@@ -1309,17 +1323,20 @@ jobs:
           child.stdin.write(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
           NODE
 
-      # kin-vfs and its shim are built from a separate repository at a commit
-      # the release workflow pins, so a pull request produces no such bytes and
-      # its archive carries none. The installer says so out loud and the CLI
-      # reports the projection unsupported, which the capability validator below
-      # requires in that mode rather than tolerating any status.
+      # Published archives before this retirement carried the separate VFS
+      # runtime. Preserve its proof only when the attested archive inventory
+      # records the complete legacy pair. New archives deliberately skip it and
+      # the capability validator requires VFS projection to be unsupported.
       - name: Graph-backed VFS projection proof
         if: runner.os != 'Windows' && !inputs.local_artifact
         shell: bash
         working-directory: kin-install-proof
         run: |
           set -euo pipefail
+          if [ "$(cat ../legacy-vfs-mode.txt)" != true ]; then
+            echo "retired VFS runtime absent from this archive; projection proof is unsupported by contract"
+            exit 0
+          fi
           # Same capture directory the first-run step opened. The VFS logs and
           # the probe's own output are reports about the tree, so they stay out
           # of it while the daemon is watching.
@@ -1724,10 +1741,10 @@ jobs:
           const path = require("path");
           const runnerOs = process.env.RUNNER_OS;
           const isWindows = runnerOs === "Windows";
-          const isPullRequestBuild = (process.env.LOCAL_ARTIFACT ?? "") !== "";
           const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
           const expectedLock = fs.readFileSync("../expected-lock-sha.txt", "utf8").trim();
           const installedKin = fs.readFileSync("../installed-kin-command.txt", "utf8").trim();
+          const legacyVfs = fs.readFileSync("../legacy-vfs-mode.txt", "utf8").trim() === "true";
           const expectedInstalledKin = path.join(os.homedir(), ".kin", "bin", isWindows ? "kin.exe" : "kin");
           if (installedKin !== expectedInstalledKin) {
             throw new Error(`installed Kin command proof ${installedKin || "missing"} does not equal ${expectedInstalledKin}`);
@@ -1900,7 +1917,7 @@ jobs:
             ["shell_path", "healthy"],
             ["setup_ledger", "healthy"],
             ["registry_authority", isWindows ? "unsupported" : "healthy"],
-            ["vfs_projection", isWindows || isPullRequestBuild ? "unsupported" : "healthy"],
+            ["vfs_projection", isWindows || !legacyVfs ? "unsupported" : "healthy"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],
             ["mcp_client_codex", "healthy"],

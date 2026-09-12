@@ -478,22 +478,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux core binaries (kin, kin-daemon) target musl and link static by
-          # default, so a single artifact runs on any Linux distro: musl (Alpine)
-          # and glibc (Ubuntu/Debian/RHEL) alike, with no OpenSSL or glibc version
-          # coupling. The VFS leg builds against gnu (vfs_target) because an
-          # LD_PRELOAD shim is intrinsically libc-specific (see the VFS steps).
+          # Linux runtime binaries (kin, kin-daemon) target musl and link static
+          # by default, so a single artifact runs on musl (Alpine) and glibc
+          # (Ubuntu/Debian/RHEL) systems without an OpenSSL or glibc dependency.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            vfs_target: x86_64-unknown-linux-gnu
             artifact: kin-linux-x86_64
-            shim_name: libkin_vfs_shim.so
             cross: false
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            vfs_target: aarch64-unknown-linux-gnu
             artifact: kin-linux-aarch64
-            shim_name: libkin_vfs_shim.so
             cross: false
           # Use an Intel host so this archive is executed before packaging;
           # building x86_64 on an arm64 runner would leave it unproven.
@@ -521,23 +515,14 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
-            shim_name: libkin_vfs_shim.dylib
             cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
-            shim_name: libkin_vfs_shim.dylib
             cross: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: kin-windows-x86_64
-            shim_name: kin_vfs_shim.dll
-            # kin-vfs only. This row used to carry `skip_vector: true`, which
-            # gated BOTH the vector feature set and the kin-vfs build, so
-            # shipping vectors on Windows by deleting that one key would also
-            # have started building an LD_PRELOAD libc interceptor for msvc.
-            # The two are unrelated and are now named separately.
-            skip_vfs: true
             cross: false
 
     steps:
@@ -554,9 +539,7 @@ jobs:
       - name: Install Rust stable
         uses: ./.github/actions/rust-toolchain
         with:
-          # On the Linux legs the core (kin, kin-daemon) targets musl and the VFS
-          # leg targets gnu (vfs_target), so both targets must be installed.
-          targets: ${{ matrix.target }}${{ matrix.vfs_target && format(' {0}', matrix.vfs_target) || '' }}
+          targets: ${{ matrix.target }}
 
       # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
       # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
@@ -577,15 +560,6 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Checkout kin-vfs
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: firelock-ai/kin-vfs
-          path: kin-vfs
-          # Release inputs must never move under an unchanged Kin tag.
-          ref: 199818f0d1d9ff934de76b73b353183352db08b3
-          persist-credentials: false
-
       - name: Verify canonical release input bytes
         shell: bash
         run: |
@@ -594,63 +568,21 @@ jobs:
           const childProcess = require("child_process");
           const crypto = require("crypto");
           const fs = require("fs");
-          const path = require("path");
 
           const sha256 = (bytes) =>
             crypto.createHash("sha256").update(bytes).digest("hex");
-          for (const [label, root] of [["Kin", process.cwd()], ["kin-vfs", path.join(process.cwd(), "kin-vfs")]]) {
-            const tracked = childProcess.execFileSync(
-              "git",
-              ["cat-file", "blob", "HEAD:Cargo.lock"],
-              { cwd: root }
-            );
-            const working = fs.readFileSync(path.join(root, "Cargo.lock"));
-            if (!working.equals(tracked)) {
-              throw new Error(
-                `${label} Cargo.lock working bytes ${sha256(working)} do not match ` +
-                `tracked Git bytes ${sha256(tracked)}; refusing platform-specific release provenance`
-              );
-            }
-            console.log(`Verified canonical ${label} Cargo.lock bytes: ${sha256(tracked)}`);
-          }
-
-          const lockPackages = (lockPath) => fs.readFileSync(lockPath, "utf8")
-            .split("[[package]]")
-            .slice(1)
-            .map((block) => ({
-              name: block.match(/^name = "([^"]+)"/m)?.[1],
-              version: block.match(/^version = "([^"]+)"/m)?.[1],
-              source: block.match(/^source = "([^"]+)"/m)?.[1] ?? null,
-            }));
-          // Kin's side is the kin-vfs-core Kin BUILDS WITH, wherever it comes from. It
-          // used to come only from the registry; since the crate moved into
-          // crates/kin-vfs-core it has no `source` line at all, the shape a workspace
-          // member has in any lock. Both are accepted, and the question is unchanged:
-          // the shipped kin-vfs binaries are built from the pinned kin-vfs checkout, and
-          // if that checkout builds a different kin-vfs-core than Kin does, the release
-          // is wrong. The pinned side keeps the strict `source === null` rule, because
-          // that lock is the kin-vfs repository's own and its member entry is the one
-          // being compared. scripts/check-kin-vfs-compat.mjs is the pull-request
-          // counterpart and carries the same rule with its own tests.
-          const kinVfsCore = lockPackages(path.join(process.cwd(), "Cargo.lock"))
-            .filter((pkg) => pkg.name === "kin-vfs-core"
-              && (pkg.source === null || pkg.source.startsWith("sparse+")));
-          const pinnedVfsCore = lockPackages(path.join(process.cwd(), "kin-vfs", "Cargo.lock"))
-            .filter((pkg) => pkg.name === "kin-vfs-core" && pkg.source === null);
-          if (kinVfsCore.length !== 1 || pinnedVfsCore.length !== 1) {
+          const tracked = childProcess.execFileSync(
+            "git",
+            ["cat-file", "blob", "HEAD:Cargo.lock"],
+          );
+          const working = fs.readFileSync("Cargo.lock");
+          if (!working.equals(tracked)) {
             throw new Error(
-              `expected one Kin kin-vfs-core, from the registry or from this workspace, ` +
-              `and one pinned local kin-vfs-core; ` +
-              `found ${kinVfsCore.length} and ${pinnedVfsCore.length}`
+              `Kin Cargo.lock working bytes ${sha256(working)} do not match ` +
+              `tracked Git bytes ${sha256(tracked)}; refusing release provenance`
             );
           }
-          if (kinVfsCore[0].version !== pinnedVfsCore[0].version) {
-            throw new Error(
-              `Kin resolves kin-vfs-core ${kinVfsCore[0].version}, but the pinned release ` +
-              `checkout builds ${pinnedVfsCore[0].version}; update the immutable kin-vfs pin`
-            );
-          }
-          console.log(`Verified Kin/kin-vfs release compatibility at kin-vfs-core ${kinVfsCore[0].version}`);
+          console.log(`Verified canonical Kin Cargo.lock bytes: ${sha256(tracked)}`);
           NODE
 
       - name: Assert clean release source
@@ -661,12 +593,6 @@ jobs:
           if [ -n "$dirty" ]; then
             printf '%s\n' "$dirty" >&2
             echo "::error::release checkout is not clean before compilation"
-            exit 1
-          fi
-          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
-          if [ -n "$vfs_dirty" ]; then
-            printf '%s\n' "$vfs_dirty" >&2
-            echo "::error::pinned kin-vfs checkout is not clean before compilation"
             exit 1
           fi
 
@@ -814,103 +740,6 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
 
-      # kin and kin-daemon are static musl and carry no glibc floor at all. The
-      # VFS pair is the only glibc-linked thing Kin publishes for Linux, and
-      # until now its floor was a property of the runner image: Rust std
-      # references pidfd_spawnp and pidfd_getpid as weak undefined symbols, the
-      # linker binds them to whatever libc the build host exports, and the
-      # ubuntu-24.04 images export them at GLIBC_2.39. v0.5.38 shipped a
-      # linux-aarch64 kin-vfs the Debian 12 loader refused outright for exactly
-      # that reason. Zig ships glibc headers for every version, so building
-      # through it pins the floor to a number under review here rather than to
-      # whichever image the runner label resolves to this month.
-      - name: Install the pinned glibc floor toolchain (Linux)
-        if: ${{ runner.os == 'Linux' && !matrix.cross && !matrix.skip_vfs }}
-        shell: bash
-        env:
-          ZIG_VERSION: "0.13.0"
-          CARGO_ZIGBUILD_VERSION: "0.19.8"
-          # Published by ziglang.org/download/index.json for these exact
-          # tarballs. A release input must be immutable, so the download is
-          # checked rather than trusted.
-          ZIG_SHA256_X86_64: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
-          ZIG_SHA256_AARCH64: 041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556
-        run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64) zig_arch=x86_64; zig_sha="$ZIG_SHA256_X86_64" ;;
-            aarch64) zig_arch=aarch64; zig_sha="$ZIG_SHA256_AARCH64" ;;
-            *)
-              echo "::error::no pinned zig tarball for Linux $(uname -m); the release cannot pin its glibc floor on this host"
-              exit 1
-              ;;
-          esac
-          tarball="$RUNNER_TEMP/zig-${ZIG_VERSION}.tar.xz"
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused \
-            --location --silent --show-error --fail \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${zig_arch}-${ZIG_VERSION}.tar.xz" \
-            --output "$tarball"
-          echo "${zig_sha}  ${tarball}" | sha256sum --check --strict -
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$tarball" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-          cargo install cargo-zigbuild --locked --version "$CARGO_ZIGBUILD_VERSION"
-
-      - name: Build kin-vfs (native)
-        if: ${{ !matrix.cross && !matrix.skip_vfs }}
-        working-directory: kin-vfs
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The VFS shim is an LD_PRELOAD libc interceptor and is therefore
-          # libc-specific: on Linux it builds against gnu (VFS_TARGET) so it can
-          # preload into the host distro's glibc programs. macOS/Windows have no
-          # vfs_target, so VFS_TARGET falls back to the core target there.
-          # The mount features are what make the shipped driver able to serve a
-          # projection the operating system mounts, rather than only the
-          # injected shim. macOS gets nfs because it carries an NFS client in
-          # the base system; Linux gets fuse below because it carries libfuse
-          # far more widely than a configured NFS client. Neither flag moves the
-          # glibc floor or adds a runtime dependency: building the same tree
-          # with and without them yields an identical shared-library set and an
-          # identical set of referenced GLIBC symbol versions, and fuser links
-          # no library because it mounts through the fusermount3 helper.
-          # --locked still holds: nfsserve and fuser are already in kin-vfs's
-          # tracked lock at the pinned ref.
-          if [ "$RUNNER_OS" != "Linux" ]; then
-            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli --features nfs
-            cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-shim
-            exit 0
-          fi
-          # The floor is read out of the guard rather than written here as
-          # well. A build targeting one floor while the guard enforces another
-          # is worse than no guard, and the two drifting apart is exactly the
-          # shape that survives review.
-          floor="$(node "$GITHUB_WORKSPACE/scripts/check-glibc-floor.mjs" --print-floor)"
-          # zig cc does not search Debian/Ubuntu multiarch directories, and the
-          # OpenSSL that kin-vfs-daemon links through reqwest lives in them:
-          # the headers under /usr/include/<multiarch> and the link libraries
-          # under /usr/lib/<multiarch>. Both Linux legs build natively, so the
-          # multiarch triple is the VFS target's architecture.
-          multiarch="${VFS_TARGET%%-*}-linux-gnu"
-          scoped="$(printf '%s' "$VFS_TARGET" | tr - _)"
-          upper="$(printf '%s' "$scoped" | tr '[:lower:]' '[:upper:]')"
-          export "CFLAGS_${scoped}=-I/usr/include/${multiarch}"
-          export "CARGO_TARGET_${upper}_RUSTFLAGS=-L native=/usr/lib/${multiarch}"
-          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-cli --features fuse
-          cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-shim
-        env:
-          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-
-      - name: Build kin-vfs (cross)
-        if: ${{ matrix.cross }}
-        working-directory: kin-vfs
-        run: |
-          cross build --locked --release --target "$TARGET" -p kin-vfs-cli
-          cross build --locked --release --target "$TARGET" -p kin-vfs-shim
-        env:
-          TARGET: ${{ matrix.target }}
-
       - name: Verify native release build provenance
         if: ${{ !matrix.cross }}
         shell: bash
@@ -1004,12 +833,6 @@ jobs:
             echo "::error::release build mutated the source checkout"
             exit 1
           fi
-          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
-          if [ -n "$vfs_dirty" ]; then
-            printf '%s\n' "$vfs_dirty" >&2
-            echo "::error::release build mutated the pinned kin-vfs checkout"
-            exit 1
-          fi
 
       # --- macOS code signing + notarization -------------------------------
       # Tag releases fail closed when signing/notarization credentials are not
@@ -1077,9 +900,7 @@ jobs:
         run: |
           for f in \
             "target/${TARGET}/release/kin" \
-            "target/${TARGET}/release/kin-daemon" \
-            "kin-vfs/target/${TARGET}/release/kin-vfs" \
-            "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
+            "target/${TARGET}/release/kin-daemon"; do
             test -f "$f"
             codesign --force --options runtime --timestamp \
               --sign "$MACOS_DEVELOPER_ID" "$f"
@@ -1096,7 +917,6 @@ jobs:
         env:
           MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
           TARGET: ${{ matrix.target }}
-          SHIM_NAME: ${{ matrix.shim_name }}
 
       # Zip the signed Mach-O binaries for notarization. Apple Notary accepts a
       # zip of standalone executables/dylibs (the same input notarytool takes);
@@ -1111,9 +931,7 @@ jobs:
           FILES=()
           for f in \
             "target/${TARGET}/release/kin" \
-            "target/${TARGET}/release/kin-daemon" \
-            "kin-vfs/target/${TARGET}/release/kin-vfs" \
-            "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
+            "target/${TARGET}/release/kin-daemon"; do
             [ -f "$f" ] && FILES+=("$f")
           done
           zip -j "$NOTARIZE_ZIP" "${FILES[@]}"
@@ -1123,7 +941,6 @@ jobs:
           ( cd "target/${TARGET}/release" && zip -qr "$OLDPWD/$NOTARIZE_ZIP" KinNotifier.app )
         env:
           TARGET: ${{ matrix.target }}
-          SHIM_NAME: ${{ matrix.shim_name }}
           ARTIFACT: ${{ matrix.artifact }}
 
       # Fallback / default backend: notarize inline on the macOS runner. Runs
@@ -1172,10 +989,6 @@ jobs:
           # archive lets `kin init` succeed but then `kin status`/`kin search`
           # fail with no daemon on PATH, so a missing daemon must fail the build.
           cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
-          # kin-vfs (cli + shim) is built under VFS_TARGET, which on Linux is the
-          # gnu triple (the shim is libc-specific) and elsewhere equals TARGET.
-          cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/"
-          cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/"
           # KinNotifier.app is macOS-only and is copied whole: -R preserves the
           # bundle structure and the stapled notarization ticket inside it.
           if [ -d "target/${TARGET}/release/KinNotifier.app" ]; then
@@ -1183,8 +996,8 @@ jobs:
           fi
           # Words, not just executables. Both arms of the isolated stranger run
           # installed this archive successfully and both scored the packaging
-          # below the binaries, because nothing in it says where the three
-          # executables go or that the shared library belongs somewhere else.
+          # below the binaries, because nothing in it says where the two
+          # executables go or that the daemon belongs beside the CLI.
           node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "${GITHUB_REF_NAME#v}"
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
           # Take the listing once into a file. Piping it into `grep -q` lets grep
@@ -1194,7 +1007,7 @@ jobs:
           ARCHIVE_LISTING="$RUNNER_TEMP/${ARTIFACT}.listing.txt"
           tar tzf "${ARTIFACT}.tar.gz" > "$ARCHIVE_LISTING"
           # All supported Unix surfaces are mandatory release contents.
-          for required in kin kin-daemon kin-vfs "$SHIM_NAME" README.md INSTALL.md checksums-sha256.txt; do
+          for required in kin kin-daemon README.md INSTALL.md checksums-sha256.txt; do
             if ! grep -q "/${required}$" "$ARCHIVE_LISTING"; then
               echo "::error::$required missing from ${ARTIFACT}.tar.gz"
               exit 1
@@ -1212,24 +1025,7 @@ jobs:
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
           TARGET: ${{ matrix.target }}
-          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
-          SHIM_NAME: ${{ matrix.shim_name }}
-
-      # Read the floor back off the bytes that were just packaged. The build
-      # above pins it, and a pin goes quiet the day it stops taking effect,
-      # which is how v0.5.38 published a kin-vfs that no Debian 12 could start
-      # while every check in this workflow stayed green. This step is the half
-      # that cannot pass by accident: it names the highest GLIBC requirement in
-      # each shipped dynamic binary and the symbols that set it, and refuses the
-      # release above the floor.
-      - name: Verify the packaged Linux binaries meet the published glibc floor
-        if: ${{ runner.os == 'Linux' && !matrix.skip_vfs }}
-        shell: bash
-        run: node scripts/check-glibc-floor.mjs "$ARTIFACT/kin-vfs" "$ARTIFACT/$SHIM_NAME"
-        env:
-          ARTIFACT: ${{ matrix.artifact }}
-          SHIM_NAME: ${{ matrix.shim_name }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -1240,8 +1036,6 @@ jobs:
           # kin-daemon is mandatory: fail hard if it's missing rather
           # than ship a daemon-less archive that can `kin init` but nothing else.
           Copy-Item "target/$env:TARGET/release/kin-daemon.exe" "$env:ARTIFACT/" -ErrorAction Stop
-          Copy-Item "kin-vfs/target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
-          Copy-Item "kin-vfs/target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
           # See the Unix leg: the archive carries its own README, INSTALL and
           # checksum manifest so a stranger is not guessing at layout.
           node scripts/write-release-archive-docs.mjs "$env:ARTIFACT" "$env:TARGET" ($env:GITHUB_REF_NAME -replace '^v', '')
@@ -1319,15 +1113,12 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
-          SHIM_NAME: ${{ matrix.shim_name }}
 
       - name: Generate artifact provenance manifest
         shell: bash
         env:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
-          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: 199818f0d1d9ff934de76b73b353183352db08b3
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1352,14 +1143,7 @@ jobs:
             childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
           const kinCommit = git(root, "rev-parse", "HEAD");
-          const vfsRoot = path.join(root, "kin-vfs");
-          const vfsCommit = git(vfsRoot, "rev-parse", "HEAD");
-          if (vfsCommit !== process.env.EXPECTED_VFS_COMMIT) {
-            throw new Error(`kin-vfs checkout ${vfsCommit} does not match pinned ${process.env.EXPECTED_VFS_COMMIT}`);
-          }
-
           const kinLockSha = sha256(path.join(root, "Cargo.lock"));
-          const vfsLockSha = sha256(path.join(vfsRoot, "Cargo.lock"));
           const buildMetaPath = path.join(
             process.env.RUNNER_TEMP,
             `kin-release-provenance-${target}`,
@@ -1449,16 +1233,10 @@ jobs:
             release_tag: process.env.GITHUB_REF_NAME,
             artifact,
             target,
-            vfs_target: process.env.VFS_TARGET,
             kin: {
               commit: kinCommit,
               cargo_lock_sha256: kinLockSha,
               embedded_dependency_provenance: buildMeta.dependency_provenance,
-            },
-            kin_vfs: {
-              commit: vfsCommit,
-              dirty: false,
-              cargo_lock_sha256: vfsLockSha,
             },
             archive: archiveRecord(archive),
             ...(additionalArchiveNames.length
@@ -1614,14 +1392,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Checkout pinned kin-vfs provenance source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: firelock-ai/kin-vfs
-          path: release-inputs/kin-vfs
-          ref: 199818f0d1d9ff934de76b73b353183352db08b3
-          persist-credentials: false
-
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
@@ -1722,8 +1492,6 @@ jobs:
         run: python3 ./scripts/verify-installer-release-assets.py --assets-dir .
 
       - name: Verify and aggregate release provenance
-        env:
-          EXPECTED_VFS_COMMIT: 199818f0d1d9ff934de76b73b353183352db08b3
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1777,29 +1545,25 @@ jobs:
               artifact: "kin-linux-x86_64",
               archive: "kin-linux-x86_64.tar.gz",
               target: "x86_64-unknown-linux-musl",
-              vfsTarget: "x86_64-unknown-linux-gnu",
-              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"],
+              required: ["kin", "kin-daemon"],
             },
             {
               artifact: "kin-linux-aarch64",
               archive: "kin-linux-aarch64.tar.gz",
               target: "aarch64-unknown-linux-musl",
-              vfsTarget: "aarch64-unknown-linux-gnu",
-              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"],
+              required: ["kin", "kin-daemon"],
             },
             {
               artifact: "kin-macos-x86_64",
               archive: "kin-macos-x86_64.tar.gz",
               target: "x86_64-apple-darwin",
-              vfsTarget: "x86_64-apple-darwin",
-              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"],
+              required: ["kin", "kin-daemon"],
             },
             {
               artifact: "kin-macos-aarch64",
               archive: "kin-macos-aarch64.tar.gz",
               target: "aarch64-apple-darwin",
-              vfsTarget: "aarch64-apple-darwin",
-              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"],
+              required: ["kin", "kin-daemon"],
             },
             {
               artifact: "kin-windows-x86_64",
@@ -1810,18 +1574,12 @@ jobs:
               // drift into shipping different bytes under one release.
               additionalArchives: ["kin-windows-x86_64.tar.gz"],
               target: "x86_64-pc-windows-msvc",
-              vfsTarget: "x86_64-pc-windows-msvc",
               required: ["kin.exe", "kin-daemon.exe"],
             },
           ];
 
           const kinCommit = git(root, "rev-parse", "HEAD");
           const kinLockSha = sha256(path.join(root, "Cargo.lock"));
-          const vfsRoot = path.join(root, "release-inputs", "kin-vfs");
-          const vfsCommit = git(vfsRoot, "rev-parse", "HEAD");
-          const vfsLockSha = sha256(path.join(vfsRoot, "Cargo.lock"));
-          fail(vfsCommit === process.env.EXPECTED_VFS_COMMIT,
-            `kin-vfs checkout ${vfsCommit} does not match pinned ${process.env.EXPECTED_VFS_COMMIT}`);
 
           const artifacts = specs.map((spec) => {
             const manifestPath = `${spec.artifact}.provenance.json`;
@@ -1831,18 +1589,11 @@ jobs:
               `${manifestPath} release tag does not match ${process.env.GITHUB_REF_NAME}`);
             fail(manifest.artifact === spec.artifact, `${manifestPath} artifact identity is wrong`);
             fail(manifest.target === spec.target, `${manifestPath} target identity is wrong`);
-            fail(manifest.vfs_target === spec.vfsTarget, `${manifestPath} kin-vfs target identity is wrong`);
             fail(manifest.kin?.commit === kinCommit, `${manifestPath} Kin commit does not match the tag`);
             fail(manifest.kin?.cargo_lock_sha256 === kinLockSha,
               `${manifestPath} Kin Cargo.lock hash does not match the tag`);
             fail(manifest.kin?.embedded_dependency_provenance === kinLockSha,
               `${manifestPath} embedded dependency provenance does not match the tagged Cargo.lock`);
-            fail(manifest.kin_vfs?.commit === vfsCommit,
-              `${manifestPath} kin-vfs commit does not match the pinned checkout`);
-            fail(manifest.kin_vfs?.dirty === false,
-              `${manifestPath} does not certify a clean kin-vfs checkout`);
-            fail(manifest.kin_vfs?.cargo_lock_sha256 === vfsLockSha,
-              `${manifestPath} kin-vfs Cargo.lock hash does not match the pinned checkout`);
             fail(manifest.archive?.name === spec.archive, `${manifestPath} archive name is wrong`);
             fail(manifest.archive?.sha256 === sha256(spec.archive),
               `${manifestPath} archive hash does not match the final archive`);
@@ -1980,7 +1731,6 @@ jobs:
             schema_version: 2,
             release_tag: process.env.GITHUB_REF_NAME,
             kin: { commit: kinCommit, cargo_lock_sha256: kinLockSha },
-            kin_vfs: { commit: vfsCommit, dirty: false, cargo_lock_sha256: vfsLockSha },
             artifacts,
             workflow: {
               repository: process.env.GITHUB_REPOSITORY,
@@ -2097,7 +1847,6 @@ jobs:
     uses: ./.github/workflows/install-proof.yml
     with:
       release_tag: ${{ github.ref_name }}
-      expected_vfs_commit: 199818f0d1d9ff934de76b73b353183352db08b3
     permissions:
       contents: read
       attestations: read

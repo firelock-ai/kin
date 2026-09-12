@@ -119,20 +119,6 @@ RELEASE_TRAIN_BODY_POLICY = "scripts/release-train-body.mjs"
 RELEASE_TRAIN_BODY_BEGIN = "<!-- kin-release-train:begin -->"
 RELEASE_TRAIN_BODY_END = "<!-- kin-release-train:end -->"
 ASSERTION_REACHABILITY_POLICY = "scripts/test-assertion-reachability.py"
-GLIBC_FLOOR_GUARD = ROOT / "scripts" / "check-glibc-floor.mjs"
-GLIBC_FLOOR_GUARD_POLICY = "scripts/check-glibc-floor.mjs"
-GLIBC_FLOOR_TEST = ROOT / "scripts" / "check-glibc-floor.test.mjs"
-GLIBC_FLOOR_TEST_POLICY = "scripts/check-glibc-floor.test.mjs"
-GLIBC_FLOOR_RELEASE_CHECK = (
-    'run: node scripts/check-glibc-floor.mjs "$ARTIFACT/kin-vfs" "$ARTIFACT/$SHIM_NAME"'
-)
-GLIBC_FLOOR_BUILD_READ = (
-    'floor="$(node "$GITHUB_WORKSPACE/scripts/check-glibc-floor.mjs" --print-floor)"'
-)
-KIN_VFS_COMPAT_GUARD = ROOT / "scripts" / "check-kin-vfs-compat.mjs"
-KIN_VFS_COMPAT_GUARD_POLICY = "scripts/check-kin-vfs-compat.mjs"
-KIN_VFS_COMPAT_TEST = ROOT / "scripts" / "check-kin-vfs-compat.test.mjs"
-KIN_VFS_COMPAT_TEST_POLICY = "scripts/check-kin-vfs-compat.test.mjs"
 INSTALLER_ASSET_GUARD = ROOT / "scripts" / "verify-installer-release-assets.py"
 INSTALLER_ASSET_GUARD_POLICY = "scripts/verify-installer-release-assets.py"
 INSTALLER_ASSET_FALSIFIER = ROOT / "scripts" / "falsify-installer-release-assets.py"
@@ -649,7 +635,6 @@ UBUNTU_SHARD_ONE_ONLY_GATES = (
     "Validate mandatory Homebrew release outcome gate",
     "Validate automatic release policy",
     "Check the RC build mirrors the release build",
-    "Verify Kin/kin-vfs compatibility at the pinned release input",
     "Check formatting",
     "Check Zero File-Search Invariant",
     "Check Zero File-Search Invariant (answer modules)",
@@ -1022,7 +1007,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/rc-build.yml",
         "build",
-    ): "8dc0699fb69599edbca87492f3f3a895aefa3bea8384c86d8fc11fef99f9d52a",
+    ): "ef55f31e1fbf929910766fe3b1cdfc964aeda3c56a35ec336772b7964e77ae93",
     (
         ".github/workflows/rc-build.yml",
         "capability",
@@ -1034,7 +1019,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/release.yml",
         "build",
-    ): "ffde401b1343930965ae6a2a89ca3a81b2996af5821b332f65de7eba874e2be2",
+    ): "bfabe8b21b0e8985dd14051ed1c6affa8ec3279477a96507fa2a76507952808c",
     (
         ".github/workflows/release.yml",
         "verify_npm_published",
@@ -2134,7 +2119,7 @@ UNIX_REQUIRED_VALIDATOR_CHECKS = {
     "shell_path": "healthy",
     "setup_ledger": "healthy",
     "registry_authority": "healthy",
-    "vfs_projection": "healthy",
+    "vfs_projection": "unsupported",
     "mcp_client_claude": "healthy",
     "mcp_client_cursor": "healthy",
     "mcp_client_codex": "healthy",
@@ -2189,6 +2174,7 @@ def unix_node_validator_fixture() -> tuple[
         {
             "../expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
             "../expected-lock-sha.txt": VALIDATOR_FIXTURE_LOCK,
+            "../legacy-vfs-mode.txt": "false",
             "../installed-kin-command.txt": executable,
             "kin-status.json": {
                 "schema": "kin.status.v3",
@@ -2630,6 +2616,21 @@ def assert_unix_node_validator_behavior(step: str) -> None:
     proof, home, environment = unix_node_validator_fixture()
     label = "released-byte Unix install proof"
     assert_node_validator_accepts_fixture(step, label, proof, home, environment)
+
+    # A new archive carries no external VFS pair, so its report must mark the
+    # projection unsupported. Already-published archives that carry the complete
+    # pair still set this mode from their attested inventory and must require the
+    # historical healthy proof. These two fixtures make both arms executable.
+    legacy_proof = copy.deepcopy(proof)
+    legacy_proof["../legacy-vfs-mode.txt"] = "true"
+    for report_path in ("kin-health.json", "kin-doctor.json"):
+        legacy_proof = fixture_with_check_status(
+            legacy_proof, report_path, "vfs_projection", "healthy"
+        )
+        legacy_proof = fixture_with_derived_aggregate(legacy_proof, report_path)
+    assert_node_validator_accepts_fixture(
+        step, f"{label} (legacy VFS archive)", legacy_proof, home, environment
+    )
 
     def reject(
         case: str,
@@ -5792,159 +5793,101 @@ def assert_assertion_reachability_gate_wired(workflow: str) -> None:
         )
 
 
-def assert_kin_vfs_mount_features_built(release: str) -> None:
-    """Keep the shipped kin-vfs able to serve a mounted projection.
+def assert_retired_vfs_runtime_is_absent_from_new_archives(
+    ci: str,
+    release: str,
+    rc_build: str,
+    install_proof: str,
+    archive_shape: str,
+    archive_docs: str,
+    workspace_manifest: str,
+    cli_manifest: str,
+) -> None:
+    """Keep new archives free of the retired external VFS runtime.
 
-    Kin has four projections and only one of them, the injected shim, needs no
-    feature flag. The published `kin-vfs` is built by this workflow from a
-    pinned checkout, and with no `--features` it carries neither `nfs-start` nor
-    `mount`, so every mount reports itself unavailable on every machine that
-    installs Kin. That is invisible from the release side: the archive shape
-    check greps for a file named `kin-vfs` and finds one either way, and nothing
-    else reads what the binary can do.
-
-    macOS builds `nfs` because it carries an NFS client in the base system, and
-    Linux builds `fuse` because it carries libfuse far more widely than a
-    configured NFS client. Both are asserted, because losing either one silently
-    removes a platform's mount without removing anything a reader would notice.
+    `kin-vfs-core` remains a local projection-engine crate used by the CLI. The
+    external `kin-vfs` executable and preload shim are a different, deprecated
+    delivery surface. Future release and RC archives must never build, copy, or
+    attest that external pair, while install proof keeps a conditional reader
+    for already-published archives that carry both files and their provenance.
     """
 
-    release_lines = {line.strip() for line in release.splitlines()}
-    if (
-        'cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli --features nfs'
-        not in release_lines
-    ):
-        raise AssertionError(
-            "release.yml must build the macOS kin-vfs CLI with --features nfs; "
-            "without it the shipped driver carries no nfs-start and every NFS "
-            "mount reports itself unavailable on every install"
-        )
-    if (
-        'cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}" -p kin-vfs-cli --features fuse'
-        not in release_lines
-    ):
-        raise AssertionError(
-            "release.yml must build the Linux kin-vfs CLI with --features fuse; "
-            "without it the shipped driver carries no mount subcommand and every "
-            "FUSE mount reports itself unavailable on every install"
-        )
+    for workflow, label in ((release, "release.yml"), (rc_build, "rc-build.yml")):
+        for forbidden in (
+            "repository: firelock-ai/kin-vfs",
+            "kin-vfs/target/",
+            "VFS_TARGET",
+            "SHIM_NAME",
+            "vfs_target:",
+            "shim_name:",
+        ):
+            if forbidden in workflow:
+                raise AssertionError(
+                    f"{label} must not build or package retired VFS runtime inputs: {forbidden}"
+                )
+        for policy in (
+            "node scripts/write-release-archive-docs.mjs",
+            "for required in kin kin-daemon README.md INSTALL.md checksums-sha256.txt; do",
+            'require("./scripts/release-archive-shape.cjs")',
+            "classifyReleaseArchiveRoot(artifact, { target })",
+        ):
+            require(workflow, policy, f"{label} new archive contract")
 
-
-def assert_glibc_floor_guard_wired(ci: str, release: str) -> None:
-    """Keep the floor that decides which Linux distributions can start Kin.
-
-    kin and kin-daemon are static musl and carry no glibc floor. The kin-vfs
-    pair is the only glibc-linked thing Kin publishes for Linux, and its floor
-    used to be a property of the runner image rather than of anything under
-    review: Rust std references pidfd_spawnp and pidfd_getpid as weak undefined
-    symbols, the linker binds them to whatever libc the build host exports, and
-    the ubuntu-24.04 images export them at GLIBC_2.39. v0.5.38 shipped a
-    linux-aarch64 kin-vfs that the Debian 12 loader refused outright, while
-    every check in the release stayed green, because nothing read the floor.
-
-    Two halves are required here and neither is sufficient alone. The build
-    must go through the pinned floor, reading it from the guard rather than
-    recording it a second time, or the number the guard enforces and the number
-    the build targets can drift apart. And the release must read the floor back
-    off the packaged bytes, because a pin that quietly stops taking effect
-    looks exactly like a pin that worked.
-    """
-
-    for path, policy in (
-        (GLIBC_FLOOR_GUARD, GLIBC_FLOOR_GUARD_POLICY),
-        (GLIBC_FLOOR_TEST, GLIBC_FLOOR_TEST_POLICY),
-    ):
-        if not path.is_file():
+    for forbidden in ("kin-vfs", "libkin_vfs_shim"):
+        if forbidden in archive_shape:
             raise AssertionError(
-                f"{policy} is missing; the Linux archives could ship a kin-vfs "
-                "no supported distribution can start and nothing would notice"
+                "release archive shape must not allow the retired VFS runtime "
+                f"artifact {forbidden}"
+            )
+    for policy in (
+        'darwin: Object.freeze(["kin", "kin-daemon", ...DOC_FILES]),',
+        'linux: Object.freeze(["kin", "kin-daemon", ...DOC_FILES]),',
+        'windows: Object.freeze(["kin.exe", "kin-daemon.exe", ...DOC_FILES]),',
+    ):
+        require(archive_shape, policy, "release archive root payload")
+
+    for policy in (
+        "const retiredProjectionFiles = [vfs, shim].filter(hasRegularFile);",
+        "release archive carries retired VFS runtime artifact(s):",
+    ):
+        require(archive_docs, policy, "release archive documentation generator")
+
+    for policy in (
+        '"legacy-vfs-mode.txt"',
+        'fail(!names.has("kin-vfs"), "new archive unexpectedly carries kin-vfs");',
+        "manifest.kin_vfs === undefined && platform.kin_vfs === undefined",
+        "const legacyVfsSource = manifest.kin_vfs !== undefined || platform.kin_vfs !== undefined;",
+        'fail(legacyVfs || process.env.RUNNER_OS === "Windows",',
+    ):
+        require(install_proof, policy, "legacy-aware VFS proof boundary")
+    for forbidden in ("expected_vfs_commit:", "REVIEWED_VFS_COMMIT"):
+        if forbidden in install_proof:
+            raise AssertionError(
+                "install proof must derive legacy VFS verification from the archived "
+                f"provenance rather than a current release caller input: {forbidden}"
             )
 
-    # Match whole invocations rather than searching for the path, which a
-    # commented-out line would still satisfy.
-    release_lines = {line.strip() for line in release.splitlines()}
-    if GLIBC_FLOOR_RELEASE_CHECK not in release_lines:
-        raise AssertionError(
-            "release.yml must run "
-            f"{GLIBC_FLOOR_GUARD_POLICY} against the packaged Linux binaries; "
-            "the build's intent to pin a floor is not the same evidence as the "
-            "floor of the bytes about to be published"
-        )
-    if GLIBC_FLOOR_BUILD_READ not in release_lines:
-        raise AssertionError(
-            "release.yml must read the glibc floor from "
-            f"{GLIBC_FLOOR_GUARD_POLICY}; a build targeting one floor while the "
-            "guard enforces another is worse than no guard"
-        )
-    if 'cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}"' not in release:
-        raise AssertionError(
-            "release.yml must build the Linux kin-vfs binaries against the "
-            "pinned floor; a plain cargo build takes its floor from the runner "
-            "image, which is what shipped an unloadable v0.5.38 kin-vfs"
-        )
-
-    # The tests are load-bearing rather than decorative: the guard's whole
-    # answer is a parse of readelf output, and a parse that silently found
-    # nothing would be a guard that cannot fail.
-    ci_lines = {line.strip() for line in ci.splitlines()}
-    if not ci_lines & {
-        GLIBC_FLOOR_TEST_POLICY,
-        f"{GLIBC_FLOOR_TEST_POLICY} \\",
-        f"./{GLIBC_FLOOR_TEST_POLICY}",
-        f"./{GLIBC_FLOOR_TEST_POLICY} \\",
-    }:
-        raise AssertionError(
-            "ci.yml must run "
-            f"{GLIBC_FLOOR_TEST_POLICY}; the guard reads a floor out of readelf "
-            "output, and an unproven parse is a gate that cannot fail"
-        )
-
-
-def assert_kin_vfs_compat_gate_wired(ci: str) -> None:
-    """Keep the pull-request half of the Kin/kin-vfs compatibility check.
-
-    release.yml refuses a release whose Kin lock resolves a different
-    kin-vfs-core than the pinned kin-vfs checkout builds. That comparison used
-    to run only at release time, so a pull request moving the Kin lock passed
-    every required context and went red after the tag existed, where the tag
-    has already resolved its own workflows and no fix lands without cutting
-    another tag. kin#788 was exactly that shape: its first commit moved the
-    lock to 0.4.2 while the pin still built 0.3.0.
-
-    The gate reads the pin out of release.yml instead of recording it a sixth
-    time, so its unit tests are load-bearing rather than decorative: an
-    extraction that silently found nothing would be a gate that cannot fail.
-    Both halves are required here for that reason.
-    """
-
-    # Match whole invocations rather than searching for the path, which a
-    # commented-out line would still satisfy.
-    lines = {line.strip() for line in ci.splitlines()}
-    command = f"node {KIN_VFS_COMPAT_GUARD_POLICY}"
-    if not lines & {command, f"run: {command}"}:
-        raise AssertionError(
-            "ci.yml must run "
-            f"{KIN_VFS_COMPAT_GUARD_POLICY}; without it a Kin lock change that "
-            "outruns the immutable kin-vfs pin stays green until it reds a tag"
-        )
-    # The test list is a line-continuation block, so the invocation carries a
-    # trailing backslash on every entry but the last.
-    if not lines & {KIN_VFS_COMPAT_TEST_POLICY, f"{KIN_VFS_COMPAT_TEST_POLICY} \\"}:
-        raise AssertionError(
-            "ci.yml must run "
-            f"{KIN_VFS_COMPAT_TEST_POLICY}; the gate reads the pin out of "
-            "release.yml, and an unproven extraction is a gate that cannot fail"
-        )
-    for path, policy in (
-        (KIN_VFS_COMPAT_GUARD, KIN_VFS_COMPAT_GUARD_POLICY),
-        (KIN_VFS_COMPAT_TEST, KIN_VFS_COMPAT_TEST_POLICY),
+    for forbidden in (
+        "scripts/check-kin-vfs-compat.mjs",
+        "scripts/check-kin-vfs-compat.test.mjs",
+        "expected_vfs_commit: """,
     ):
-        if not path.is_file():
+        if forbidden in ci:
             raise AssertionError(
-                f"{policy} is missing; Kin could resolve a kin-vfs-core that "
-                "the pinned release input does not build and no pull request "
-                "would go red"
+                "CI must not retain a current-release compatibility gate for retired "
+                f"external VFS packaging: {forbidden}"
             )
+
+    for policy in (
+        '"crates/kin-vfs-core",',
+        'kin-vfs-core = { path = "crates/kin-vfs-core",',
+    ):
+        require(workspace_manifest, policy, "local kin-vfs-core workspace engine")
+    require(
+        cli_manifest,
+        "kin-vfs-core = { workspace = true }",
+        "CLI projection-engine dependency",
+    )
 
 
 def assert_installer_asset_guard_wired(ci: str, release: str) -> None:
@@ -14171,52 +14114,9 @@ def main() -> None:
     ):
         require(proof_upload, report, "preserved installed-artifact proof report")
 
-    vfs_checkout_count = len(
-        re.findall(r"repository:\s*firelock-ai/kin-vfs\s*$", release, re.MULTILINE)
-    )
-    vfs_checkout_refs = re.findall(
-        r"repository:\s*firelock-ai/kin-vfs\s*$"
-        r"(?:(?!^\s+- name:).)*?^\s+ref:\s*([^\s#]+)",
-        release,
-        re.MULTILINE | re.DOTALL,
-    )
-    if len(vfs_checkout_refs) != vfs_checkout_count or any(
-        re.fullmatch(r"[0-9a-f]{40}", ref) is None for ref in vfs_checkout_refs
-    ):
-        raise AssertionError(
-            "every kin-vfs release checkout must declare a full immutable commit; "
-            f"checkouts={vfs_checkout_count}, refs={vfs_checkout_refs}"
-        )
-    vfs_refs = set(vfs_checkout_refs)
-    vfs_expected = set(re.findall(r"EXPECTED_VFS_COMMIT:\s*([0-9a-f]{40})", release))
-    install_proof_vfs_expected = set(
-        re.findall(r"expected_vfs_commit:\s*([0-9a-f]{40})", release)
-    )
-    if len(vfs_refs) != 1 or vfs_expected != vfs_refs:
-        raise AssertionError(
-            "release workflow must use one immutable kin-vfs commit for build "
-            f"and provenance verification; refs={sorted(vfs_refs)}, "
-            f"expected={sorted(vfs_expected)}"
-        )
-    if install_proof_vfs_expected != vfs_refs:
-        raise AssertionError(
-            "install proof must bind the same immutable kin-vfs commit as the "
-            f"release workflow; release={sorted(vfs_refs)}, "
-            f"install-proof={sorted(install_proof_vfs_expected)}"
-        )
-    # The Kin-side filter moved when kin-vfs-core became a workspace member: a
-    # member carries no `source` line, so a registry-only filter finds zero and the
-    # gate throws in the release build job, after the tag exists. What is pinned here
-    # is the pair of shapes Kin's side must accept, not the old spelling of it, and
-    # the pinned side's strict rule is pinned separately below so loosening it still
-    # has to be a deliberate edit to this list.
-    for policy in (
-        "Verified Kin/kin-vfs release compatibility at kin-vfs-core",
-        'pkg.source === null || pkg.source.startsWith("sparse+")',
-        'pkg.name === "kin-vfs-core" && pkg.source === null',
-        "update the immutable kin-vfs pin",
-    ):
-        require(release, policy, "Kin and pinned kin-vfs release compatibility gate")
+    # New release and RC archive builders no longer have an external VFS source
+    # input. The package and proof boundary is asserted above, while this later
+    # release admission block stays focused on the active shipped runtime.
 
     # What Windows admission does is stated once and asserted from one script.
     # The installer leg proves it on the landing push, which is the commit
@@ -15129,23 +15029,25 @@ def main() -> None:
     build_job = release[build_start:build_end]
     windows_bytes = build_job.index("      - name: Preserve tracked bytes on Windows")
     checkout = build_job.index("      - name: Checkout\n")
-    vfs_checkout = build_job.index("      - name: Checkout kin-vfs")
     lock_assertion = build_job.index(
         "      - name: Verify canonical release input bytes"
     )
     first_compile = build_job.index("      - name: Build kin-cli + kin-daemon (native)")
-    if not windows_bytes < checkout < vfs_checkout < lock_assertion < first_compile:
+    if not windows_bytes < checkout < lock_assertion < first_compile:
         raise AssertionError(
             "release build must disable Windows conversion before checkout and verify "
-            "both tracked lockfiles before compilation"
+            "the tracked Kin lockfile before compilation"
+        )
+    if "kin-vfs" in build_job:
+        raise AssertionError(
+            "release build must not reintroduce retired external VFS build inputs"
         )
     for policy in (
         "if: runner.os == 'Windows'",
         "git config --global core.autocrlf false",
         '["cat-file", "blob", "HEAD:Cargo.lock"]',
-        '[["Kin", process.cwd()], ["kin-vfs", path.join(process.cwd(), "kin-vfs")]]',
         "if (!working.equals(tracked))",
-        "refusing platform-specific release provenance",
+        "refusing release provenance",
     ):
         require(build_job, policy, "cross-platform release lockfile authority")
 
@@ -15598,99 +15500,108 @@ def main() -> None:
                 expected,
                 lambda mutant=mutant: assert_advisory_sweep_authority(mutant, release_train),
             )
-    assert_kin_vfs_compat_gate_wired(ci_workflow)
-    assert_glibc_floor_guard_wired(ci_workflow, release)
-    assert_kin_vfs_mount_features_built(release)
-    expect_assertion(
-        "macOS kin-vfs built without the nfs feature",
-        "--features nfs",
-        lambda: assert_kin_vfs_mount_features_built(
-            release.replace(
-                '-p kin-vfs-cli --features nfs',
-                '-p kin-vfs-cli',
-            )
-        ),
+    rc_build_workflow = workflow_sources[RC_BUILD]
+    archive_shape = (ROOT / "scripts" / "release-archive-shape.cjs").read_text(
+        encoding="utf-8"
     )
-    expect_assertion(
-        "Linux kin-vfs built without the fuse feature",
-        "--features fuse",
-        lambda: assert_kin_vfs_mount_features_built(
-            release.replace(
-                '-p kin-vfs-cli --features fuse',
-                '-p kin-vfs-cli',
-            )
-        ),
+    archive_docs = (ROOT / "scripts" / "write-release-archive-docs.mjs").read_text(
+        encoding="utf-8"
     )
-    expect_assertion(
-        "release.yml stops reading the glibc floor off the packaged binaries",
-        "release.yml must run",
-        lambda: assert_glibc_floor_guard_wired(
-            ci_workflow,
-            release.replace(GLIBC_FLOOR_RELEASE_CHECK, "run: true"),
-        ),
+    workspace_manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    cli_manifest = (ROOT / "crates" / "kin-cli" / "Cargo.toml").read_text(
+        encoding="utf-8"
     )
-    expect_assertion(
-        "the floor check survives only as a commented-out release.yml step",
-        "release.yml must run",
-        lambda: assert_glibc_floor_guard_wired(
-            ci_workflow,
-            release.replace(
-                GLIBC_FLOOR_RELEASE_CHECK,
-                GLIBC_FLOOR_RELEASE_CHECK.replace("run: ", "run: # "),
+    assert_retired_vfs_runtime_is_absent_from_new_archives(
+        ci_workflow,
+        release,
+        rc_build_workflow,
+        install_proof,
+        archive_shape,
+        archive_docs,
+        workspace_manifest,
+        cli_manifest,
+    )
+    for label, expected, inputs in (
+        (
+            "release packaging restores an external kin-vfs checkout",
+            "must not build or package retired VFS runtime inputs",
+            {"release": release + "\nrepository: firelock-ai/kin-vfs\n"},
+        ),
+        (
+            "RC packaging restores a VFS target input",
+            "must not build or package retired VFS runtime inputs",
+            {"rc_build": rc_build_workflow + "\nVFS_TARGET=legacy\n"},
+        ),
+        (
+            "a new archive stops rejecting kin-vfs in its attested inventory",
+            "legacy-aware VFS proof boundary",
+            {
+                "install_proof": install_proof.replace(
+                    'fail(!names.has("kin-vfs"), "new archive unexpectedly carries kin-vfs");',
+                    'fail(true, "new archive unexpectedly carries kin-vfs");',
+                    1,
+                )
+            },
+        ),
+        (
+            "legacy source provenance can omit a VFS pair on Unix",
+            "legacy-aware VFS proof boundary",
+            {
+                "install_proof": install_proof.replace(
+                    'fail(legacyVfs || process.env.RUNNER_OS === "Windows",',
+                    'fail(legacyVfs || process.env.RUNNER_OS === "Linux",',
+                    1,
+                )
+            },
+        ),
+        (
+            "the archive shape readmits a VFS executable",
+            "must not allow the retired VFS runtime artifact",
+            {
+                "archive_shape": archive_shape.replace(
+                    'darwin: Object.freeze(["kin", "kin-daemon", ...DOC_FILES]),',
+                    'darwin: Object.freeze(["kin", "kin-daemon", "kin-vfs", ...DOC_FILES]),',
+                    1,
+                )
+            },
+        ),
+        (
+            "the CLI drops its local projection engine",
+            "CLI projection-engine dependency",
+            {
+                "cli_manifest": cli_manifest.replace(
+                    "kin-vfs-core = { workspace = true }",
+                    "# kin-vfs-core removed",
+                    1,
+                )
+            },
+        ),
+    ):
+        values = {
+            "ci": ci_workflow,
+            "release": release,
+            "rc_build": rc_build_workflow,
+            "install_proof": install_proof,
+            "archive_shape": archive_shape,
+            "archive_docs": archive_docs,
+            "workspace_manifest": workspace_manifest,
+            "cli_manifest": cli_manifest,
+        }
+        values.update(inputs)
+        expect_assertion(
+            label,
+            expected,
+            lambda values=values: assert_retired_vfs_runtime_is_absent_from_new_archives(
+                values["ci"],
+                values["release"],
+                values["rc_build"],
+                values["install_proof"],
+                values["archive_shape"],
+                values["archive_docs"],
+                values["workspace_manifest"],
+                values["cli_manifest"],
             ),
-        ),
-    )
-    expect_assertion(
-        "the release build stops reading the floor from the guard that enforces it",
-        "must read the glibc floor",
-        lambda: assert_glibc_floor_guard_wired(
-            ci_workflow,
-            release.replace(GLIBC_FLOOR_BUILD_READ, 'floor="2.31"'),
-        ),
-    )
-    expect_assertion(
-        "the Linux kin-vfs build reverts to taking its floor from the runner image",
-        "must build the Linux kin-vfs binaries against the pinned floor",
-        lambda: assert_glibc_floor_guard_wired(
-            ci_workflow,
-            release.replace(
-                'cargo zigbuild --locked --release --target "${VFS_TARGET}.${floor}"',
-                'cargo build --locked --release --target "$VFS_TARGET"',
-            ),
-        ),
-    )
-    expect_assertion(
-        "ci.yml keeps the floor guard but drops the tests proving its parse",
-        "ci.yml must run",
-        lambda: assert_glibc_floor_guard_wired(
-            ci_workflow.replace(GLIBC_FLOOR_TEST_POLICY, "scripts/absent.test.mjs"),
-            release,
-        ),
-    )
-    expect_assertion(
-        "ci.yml drops the pull-request Kin/kin-vfs compatibility gate",
-        "ci.yml must run",
-        lambda: assert_kin_vfs_compat_gate_wired(
-            ci_workflow.replace(f"run: node {KIN_VFS_COMPAT_GUARD_POLICY}", "run: true")
-        ),
-    )
-    expect_assertion(
-        "the Kin/kin-vfs gate survives only as a commented-out ci.yml step",
-        "ci.yml must run",
-        lambda: assert_kin_vfs_compat_gate_wired(
-            ci_workflow.replace(
-                f"run: node {KIN_VFS_COMPAT_GUARD_POLICY}",
-                f"run: # node {KIN_VFS_COMPAT_GUARD_POLICY}",
-            )
-        ),
-    )
-    expect_assertion(
-        "ci.yml keeps the Kin/kin-vfs gate but drops the tests proving its parse",
-        "ci.yml must run",
-        lambda: assert_kin_vfs_compat_gate_wired(
-            ci_workflow.replace(KIN_VFS_COMPAT_TEST_POLICY, "scripts/absent.test.mjs")
-        ),
-    )
+        )
     assert_installer_asset_guard_wired(ci_workflow, release)
     expect_assertion(
         "ci.yml drops the guard that installer asset names are published",
@@ -18178,7 +18089,6 @@ jobs:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: 199818f0d1d9ff934de76b73b353183352db08b3",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 

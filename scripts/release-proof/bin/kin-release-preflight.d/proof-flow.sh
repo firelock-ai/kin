@@ -17,8 +17,8 @@
 # Contract (environment):
 #   PF_ROOT             leg root (created); HOME, KIN_HOME, temp, probe live under it
 #   PF_ARCHIVE          the release-shaped kin-<os>-<arch>.tar.gz to install
-#   PF_TOOLS            dir holding install.sh, validate.mjs and, when present,
-#                       check-glibc-floor.mjs and kin-magic-repro
+#   PF_TOOLS            dir holding install.sh, validate.mjs and kin-magic-repro;
+#                       check-glibc-floor.mjs is used only for legacy VFS archives
 #   PF_LEG              leg name for the result
 #   PF_RUNNER_OS        macOS | Linux         PF_RUNNER_ARCH  ARM64 | X64
 #   PF_SETUP_SHELL      zsh | bash            (what kin setup is told)
@@ -31,7 +31,8 @@
 #   PF_PYTHON           exact tomllib-capable Python executable (default python3)
 #   PF_SETTLE_SECONDS   settle budget (default 180, the workflow's)
 #   PF_QUIESCE_SECONDS  kin status --wait-quiesce (default 60, the workflow's)
-#   PF_GLIBC_FLOOR      1 runs check-glibc-floor.mjs on kin-vfs and the shim
+#   PF_GLIBC_FLOOR      1 runs check-glibc-floor.mjs only when a legacy archive
+#                       carries the retired kin-vfs and preload shim pair
 #   PF_MAGIC_REPRO      1 runs kin-magic-repro against the installed binaries
 #   PF_EMULATED         1 marks a leg running under CPU emulation: the daemon-
 #                       runtime probe steps are skipped because they are
@@ -275,6 +276,7 @@ trap 'say "interrupted"; FINAL_RC=130; exit 130' INT TERM
 ARCHIVE_NAME="$(basename "$PF_ARCHIVE")"
 ARCHIVE_SHA=""
 CONTENT_ROOT=""
+LEGACY_VFS=0
 ARTIFACT_NAME="${ARCHIVE_NAME%.tar.gz}"
 case "$PF_RUNNER_OS" in
   Linux) SHIM_NAME="libkin_vfs_shim.so" ;;
@@ -308,6 +310,20 @@ step_stage_archive() {
   for required in kin kin-daemon; do
     [ -f "$CONTENT_ROOT/$required" ] || { echo "$required missing from $ARCHIVE_NAME" >&2; exit 1; }
   done
+  has_vfs=0
+  has_shim=0
+  [ -f "$CONTENT_ROOT/kin-vfs" ] && has_vfs=1
+  [ -n "$SHIM_NAME" ] && [ -f "$CONTENT_ROOT/$SHIM_NAME" ] && has_shim=1
+  if [ "$has_vfs" != "$has_shim" ]; then
+    echo "archive carries a partial retired VFS runtime pair" >&2
+    exit 1
+  fi
+  if [ "$has_vfs" = 1 ]; then
+    LEGACY_VFS=1
+    echo "legacy VFS runtime pair: present"
+  else
+    echo "retired VFS runtime pair: absent"
+  fi
   ls -la "$CONTENT_ROOT"
   # The archive under test must be the one this host can run: a Linux archive
   # reaches this script only inside a Linux container.
@@ -344,8 +360,8 @@ step_stage_archive() {
   printf '%s  %s\n' "$ARCHIVE_SHA" "$ARCHIVE_NAME" > "$stub/$ARCHIVE_NAME.sha256"
   echo "install mirror: $PF_ROOT/stub (version $INSTALL_VERSION)"
   {
-    printf 'archive=%s\narchive_sha256=%s\ncontent_root=%s\nkin_version_line=%s\ndaemon_version_line=%s\nstamp_sha=%s\ninstall_version=%s\n' \
-      "$PF_ARCHIVE" "$ARCHIVE_SHA" "$CONTENT_ROOT" "$KIN_VERSION_LINE" "$DAEMON_VERSION_LINE" "$STAMP_SHA" "$INSTALL_VERSION"
+    printf 'archive=%s\narchive_sha256=%s\ncontent_root=%s\nlegacy_vfs=%s\nkin_version_line=%s\ndaemon_version_line=%s\nstamp_sha=%s\ninstall_version=%s\n' \
+      "$PF_ARCHIVE" "$ARCHIVE_SHA" "$CONTENT_ROOT" "$LEGACY_VFS" "$KIN_VERSION_LINE" "$DAEMON_VERSION_LINE" "$STAMP_SHA" "$INSTALL_VERSION"
   } > "$PF_ROOT/archive.env"
 }
 run_step stage-archive 1 "$PF_ROOT" step_stage_archive
@@ -353,6 +369,7 @@ if [ -f "$PF_ROOT/archive.env" ]; then
   # Re-read the values the subshell resolved.
   ARCHIVE_SHA="$(sed -n 's/^archive_sha256=//p' "$PF_ROOT/archive.env")"
   CONTENT_ROOT="$(sed -n 's/^content_root=//p' "$PF_ROOT/archive.env")"
+  LEGACY_VFS="$(sed -n 's/^legacy_vfs=//p' "$PF_ROOT/archive.env")"
   KIN_VERSION_LINE="$(sed -n 's/^kin_version_line=//p' "$PF_ROOT/archive.env")"
   DAEMON_VERSION_LINE="$(sed -n 's/^daemon_version_line=//p' "$PF_ROOT/archive.env")"
   STAMP_SHA="$(sed -n 's/^stamp_sha=//p' "$PF_ROOT/archive.env")"
@@ -375,7 +392,7 @@ step_glibc_floor() {
   fi
   node "$PF_TOOLS/check-glibc-floor.mjs" "$CONTENT_ROOT/kin-vfs" "$CONTENT_ROOT/$SHIM_NAME"
 }
-if [ "$PF_GLIBC_FLOOR" = 1 ] && [ "$PF_RUNNER_OS" = Linux ]; then
+if [ "$PF_GLIBC_FLOOR" = 1 ] && [ "$PF_RUNNER_OS" = Linux ] && [ "$LEGACY_VFS" = 1 ]; then
   run_step glibc-floor 0 "$PF_ROOT" step_glibc_floor
 fi
 
@@ -474,7 +491,11 @@ step_vfs_components() {
   for (const component of components) console.log(`${component.name}: ${component.sha256} (${component.installed_path})`);
 NODE
 }
-run_step vfs-components 0 "$WORKSPACE" step_vfs_components
+if [ "$LEGACY_VFS" = 1 ]; then
+  run_step vfs-components 0 "$WORKSPACE" step_vfs_components
+else
+  say "step vfs-components: SKIPPED (retired runtime absent from this archive)"
+fi
 
 # ------------------------------- 5. First-run repository, daemon, and setup proof
 step_first_run() {
@@ -1022,8 +1043,10 @@ C
   cleanup_vfs
   trap - INT TERM
 }
-if [ "$PF_EMULATED" = 1 ]; then
-  say "step vfs-projection: SKIPPED (emulated leg; the projection is served by the kin-vfs daemon through the preload shim, daemon-runtime that binds on real runners)"
+if [ "$LEGACY_VFS" != 1 ]; then
+  say "step vfs-projection: SKIPPED (retired runtime absent from this archive)"
+elif [ "$PF_EMULATED" = 1 ]; then
+  say "step vfs-projection: SKIPPED (emulated legacy runtime leg; daemon behavior binds on real runners)"
 else
   run_step vfs-projection 0 "$PROBE" step_vfs_projection
 fi
@@ -1213,6 +1236,7 @@ step_validate() {
   PF_EXPECTED_COMMIT="$PF_EXPECTED_COMMIT" \
   PF_EXPECTED_LOCK_SHA="$PF_EXPECTED_LOCK_SHA" \
   PF_RUNNER_OS="$RUNNER_OS" \
+  PF_LEGACY_VFS="$LEGACY_VFS" \
   PF_ALLOW_DIRTY="$PF_ALLOW_DIRTY" \
   PF_HOST_APPS="$PF_HOST_APPS" \
   PF_RESULT_JSON="$PF_ROOT/validate.json" \
@@ -1257,7 +1281,7 @@ fi
 # ------------------------------------------------------------------ 12. result
 PF_ROOT="$PF_ROOT" PF_LEG="$PF_LEG" STEPS_TSV="$STEPS_TSV" ARCHIVE_ENV="$PF_ROOT/archive.env" \
 PF_RUNNER_OS="$PF_RUNNER_OS" PF_RUNNER_ARCH="$PF_RUNNER_ARCH" PF_EXPECTED_COMMIT="$PF_EXPECTED_COMMIT" \
-PF_EXPECTED_LOCK_SHA="$PF_EXPECTED_LOCK_SHA" PF_ALLOW_DIRTY="$PF_ALLOW_DIRTY" \
+PF_EXPECTED_LOCK_SHA="$PF_EXPECTED_LOCK_SHA" PF_LEGACY_VFS="$LEGACY_VFS" PF_ALLOW_DIRTY="$PF_ALLOW_DIRTY" \
 node - <<'NODE'
 const fs = require("fs");
 const path = require("path");
@@ -1328,7 +1352,7 @@ const result = {
     stamp_sha: archiveEnv.stamp_sha ?? null,
     version: archiveEnv.install_version ?? null,
   },
-  expected: { commit: process.env.PF_EXPECTED_COMMIT || null, lock_sha256: process.env.PF_EXPECTED_LOCK_SHA || null, allow_dirty: process.env.PF_ALLOW_DIRTY === "1" },
+  expected: { commit: process.env.PF_EXPECTED_COMMIT || null, lock_sha256: process.env.PF_EXPECTED_LOCK_SHA || null, legacy_vfs: process.env.PF_LEGACY_VFS === "1", allow_dirty: process.env.PF_ALLOW_DIRTY === "1" },
   steps,
   glibc_floor: glibc ? { status: glibc.status, detail: glibc.status === "PASS" ? lastLines(readMaybe(glibc.log), 2).join(" | ") : glibc.failing } : null,
   assertions: validate,

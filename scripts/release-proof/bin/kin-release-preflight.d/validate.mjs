@@ -30,20 +30,11 @@
 //   PF_EXPECTED_COMMIT  40-hex commit the binaries must report, or empty
 //   PF_EXPECTED_LOCK_SHA 64-hex sha256 of that commit's Cargo.lock, or empty
 //   PF_RUNNER_OS        macOS | Linux
-//   PF_LOCAL_BUILD      1 declares that the bytes under test carry no kin-vfs,
-//                       the port of the workflow's `local_artifact` mode. The
-//                       workflow sets that input when a pull request installs
-//                       binaries it built itself, which exist for kin and
-//                       kin-daemon only, and the capability contract then
-//                       requires vfs_projection unsupported rather than
-//                       healthy. No preflight leg sets it today: --archive and
-//                       --rc-run judge whole release-layout archives, and
-//                       --build overlays the built kin and kin-daemon onto a
-//                       base release archive that supplies kin-vfs, the shim
-//                       and KinNotifier.app. It is carried so the two
-//                       contracts stay diffable, and so a future mode that
-//                       does drop the VFS bytes has to say so rather than
-//                       silently failing an assertion that was right
+//   PF_LEGACY_VFS       1 only when the archive under test carries the complete
+//                       retired VFS runtime pair. New archives and local
+//                       artifacts omit it and must report vfs_projection as
+//                       unsupported. This keeps an old published archive
+//                       verifiable without permitting the pair in new output.
 //   PF_EMULATED         1 waives assertions whose capture is missing: an
 //                       emulated leg skips the daemon-runtime producer steps,
 //                       so those captures are absent by design (present
@@ -101,7 +92,7 @@ import path from "node:path";
 // by that pull request rather than by a release.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "a92d64226a0ed4e99b8078cb3469a1b4027503eb0cc9e013b79d4477e8de6f26",
+  sha256: "b9d95da504c2223ff4322bc60c735f1cc0dba4dbb806ae8c65cdc250f20598d4",
 };
 
 class Unreadable extends Error {}
@@ -109,9 +100,7 @@ class Unreadable extends Error {}
 const captures = process.env.PF_CAPTURES || process.cwd();
 const runnerOs = process.env.PF_RUNNER_OS || (process.platform === "darwin" ? "macOS" : "Linux");
 const isWindows = runnerOs === "Windows";
-// The workflow's `isPullRequestBuild`, which it derives from the LOCAL_ARTIFACT
-// input. See PF_LOCAL_BUILD above for why no preflight leg sets this.
-const isLocalBuild = process.env.PF_LOCAL_BUILD === "1";
+const legacyVfs = process.env.PF_LEGACY_VFS === "1";
 const allowDirty = process.env.PF_ALLOW_DIRTY === "1";
 const emulated = process.env.PF_EMULATED === "1";
 const home = process.env.PF_HOME || os.homedir();
@@ -421,7 +410,7 @@ const required = new Map([
   ["shell_path", "healthy"],
   ["setup_ledger", "healthy"],
   ["registry_authority", isWindows ? "unsupported" : "healthy"],
-  ["vfs_projection", isWindows || isLocalBuild ? "unsupported" : "healthy"],
+  ["vfs_projection", isWindows || !legacyVfs ? "unsupported" : "healthy"],
   ["mcp_client_claude", "healthy"],
   ["mcp_client_cursor", "healthy"],
   ["mcp_client_codex", "healthy"],
