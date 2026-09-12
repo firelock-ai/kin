@@ -238,6 +238,7 @@ jobs:
             --crate kin-db
             --crate kin-lsp
             --crate kin-search
+            --crate kin-vector
           )
           # Anything but the exact string "true" holds, so a step that failed to
           # emit its decision holds rather than rolling on an empty value.

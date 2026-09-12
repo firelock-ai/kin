@@ -1,0 +1,6420 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Repository-authority transaction contracts shared by storage and transport.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::{
+    collaboration::CollaborationDelta,
+    identity::{
+        append_canonical_key, append_canonical_object_header, append_canonical_seq,
+        append_canonical_value, canonical_json_bytes, CanonicalSink, CountingSink, HashingSink,
+    },
+    validate_semantic_change_id, validate_transaction_delta, AuthorId, DefaultRefMutation,
+    EffectiveAdmissionPolicyStamp, EntityDelta, ExternalChangeAlias, ExternalObjectKind,
+    ExternalObjectRecord, ExternalReferenceDelta, FrozenLocalOverlayDelta,
+    GitExternalAuthorityDelta, GitObjectId, Hash256, MergeTransactionDelta, ModelError,
+    OperationId, RefMutation, RefName, RefTarget, RelationDelta, RepositoryId, RepositoryRef,
+    ResolvedTree, Result, SealedObservationBinding, SemanticChange, SemanticChangeId,
+    SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead, WorkspaceId,
+};
+
+/// Clean-slate transaction schema whose persistence authority owns both exact
+/// workspace trees and their uncommitted semantic overlays.
+///
+/// Version 3 persisted only a dirty workspace tree and therefore reconstructed
+/// entity/relation state from `base_target` after restart. It has no
+/// compatibility decoder: a repository that cannot prove the complete
+/// workspace graph must be re-imported rather than silently losing semantics.
+pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 4;
+pub const REPOSITORY_ROOT_SCHEMA_VERSION: u32 = 1;
+pub const WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION: u32 = 1;
+pub const WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION: u32 = 1;
+
+/// One canonical entity/relation transition for mutable workspace authority.
+///
+/// [`WorkspaceMutation::semantic_delta`] carries the incremental transition
+/// from the expected workspace graph to its successor. The same representation
+/// is stored cumulatively in [`WorkspaceState::semantic_overlay`] relative to
+/// `base_target`. Exact repository membership remains independently
+/// authoritative in [`WorkspaceState::tree`].
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSemanticDelta {
+    version: u32,
+    entity_deltas: Vec<EntityDelta>,
+    relation_deltas: Vec<RelationDelta>,
+    /// Deliberately last for additive positional-wire compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    external_reference_deltas: Vec<ExternalReferenceDelta>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSemanticDeltaWire {
+    version: u32,
+    entity_deltas: Vec<EntityDelta>,
+    relation_deltas: Vec<RelationDelta>,
+    #[serde(default)]
+    external_reference_deltas: Vec<ExternalReferenceDelta>,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceSemanticDelta {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceSemanticDeltaWire::deserialize(deserializer)?;
+        let delta = Self {
+            version: wire.version,
+            entity_deltas: wire.entity_deltas,
+            relation_deltas: wire.relation_deltas,
+            external_reference_deltas: wire.external_reference_deltas,
+        };
+        delta.validate().map_err(serde::de::Error::custom)?;
+        Ok(delta)
+    }
+}
+
+impl WorkspaceSemanticDelta {
+    pub fn new(
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+    ) -> Result<Self> {
+        Self::new_with_external_references(entity_deltas, relation_deltas, Vec::new())
+    }
+
+    pub fn new_with_external_references(
+        mut entity_deltas: Vec<EntityDelta>,
+        mut relation_deltas: Vec<RelationDelta>,
+        mut external_reference_deltas: Vec<ExternalReferenceDelta>,
+    ) -> Result<Self> {
+        entity_deltas.sort_by_key(EntityDelta::target_id);
+        relation_deltas.sort_by_key(RelationDelta::target_id);
+        external_reference_deltas.sort_by_key(ExternalReferenceDelta::target_id);
+        let delta = Self {
+            version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+            entity_deltas,
+            relation_deltas,
+            external_reference_deltas,
+        };
+        delta.validate()?;
+        Ok(delta)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION {
+            return Err(ModelError::InvalidOperation(format!(
+                "unsupported workspace semantic delta version {}",
+                self.version
+            )));
+        }
+        if self
+            .entity_deltas
+            .windows(2)
+            .any(|pair| pair[0].target_id() >= pair[1].target_id())
+        {
+            return Err(ModelError::InvalidOperation(
+                "workspace semantic entity deltas are not in canonical unique target order"
+                    .to_string(),
+            ));
+        }
+        if self
+            .relation_deltas
+            .windows(2)
+            .any(|pair| pair[0].target_id() >= pair[1].target_id())
+        {
+            return Err(ModelError::InvalidOperation(
+                "workspace semantic relation deltas are not in canonical unique target order"
+                    .to_string(),
+            ));
+        }
+        if self
+            .external_reference_deltas
+            .windows(2)
+            .any(|pair| pair[0].target_id() >= pair[1].target_id())
+        {
+            return Err(ModelError::InvalidOperation(
+                "workspace semantic external-reference deltas are not in canonical unique target order"
+                    .to_string(),
+            ));
+        }
+        validate_transaction_delta(&self.transaction_delta())
+    }
+
+    pub fn identity_hash(&self) -> Result<Hash256> {
+        self.validate()?;
+        let mut canonical = self.clone();
+        canonical.sort_canonical();
+        let encoded = canonical_json_bytes(&canonical)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-workspace-semantic-delta-v1\0");
+        hasher.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| {
+                    ModelError::InvalidOperation("workspace semantic delta exceeds u64".to_string())
+                })?
+                .to_le_bytes(),
+        );
+        hasher.update(encoded);
+        let result = hasher.finalize();
+        let mut bytes = [0_u8; 32];
+        bytes.copy_from_slice(&result);
+        Ok(Hash256::from_bytes(bytes))
+    }
+
+    pub fn entity_deltas(&self) -> &[EntityDelta] {
+        &self.entity_deltas
+    }
+
+    pub fn relation_deltas(&self) -> &[RelationDelta] {
+        &self.relation_deltas
+    }
+
+    pub fn external_reference_deltas(&self) -> &[ExternalReferenceDelta] {
+        &self.external_reference_deltas
+    }
+
+    pub fn transaction_delta(&self) -> TransactionDelta {
+        TransactionDelta {
+            entity_deltas: self.entity_deltas.clone(),
+            relation_deltas: self.relation_deltas.clone(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: self.external_reference_deltas.clone(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entity_deltas.is_empty()
+            && self.relation_deltas.is_empty()
+            && self.external_reference_deltas.is_empty()
+    }
+
+    fn sort_canonical(&mut self) {
+        self.entity_deltas.sort_by_key(EntityDelta::target_id);
+        self.relation_deltas.sort_by_key(RelationDelta::target_id);
+        self.external_reference_deltas
+            .sort_by_key(ExternalReferenceDelta::target_id);
+    }
+}
+
+impl Default for WorkspaceSemanticDelta {
+    fn default() -> Self {
+        Self {
+            version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            external_reference_deltas: Vec::new(),
+        }
+    }
+}
+
+/// Canonical cumulative entity/relation state relative to a workspace base.
+///
+/// This is intentionally a different type from [`WorkspaceSemanticDelta`].
+/// Storage must derive it by diffing the requested successor workspace against
+/// its new immutable base; an incremental mutation cannot be persisted here by
+/// accident.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct WorkspaceSemanticOverlay(WorkspaceSemanticDelta);
+
+impl WorkspaceSemanticOverlay {
+    pub fn new(
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+    ) -> Result<Self> {
+        Ok(Self(WorkspaceSemanticDelta::new(
+            entity_deltas,
+            relation_deltas,
+        )?))
+    }
+
+    pub fn new_with_external_references(
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+        external_reference_deltas: Vec<ExternalReferenceDelta>,
+    ) -> Result<Self> {
+        Ok(Self(WorkspaceSemanticDelta::new_with_external_references(
+            entity_deltas,
+            relation_deltas,
+            external_reference_deltas,
+        )?))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.0.version != WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION {
+            return Err(ModelError::InvalidOperation(format!(
+                "unsupported workspace semantic overlay version {}",
+                self.0.version
+            )));
+        }
+        self.0.validate()
+    }
+
+    pub fn identity_hash(&self) -> Result<Hash256> {
+        self.validate()?;
+        let encoded = canonical_json_bytes(self)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-workspace-semantic-overlay-v1\0");
+        hasher.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| {
+                    ModelError::InvalidOperation(
+                        "workspace semantic overlay exceeds u64".to_string(),
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        hasher.update(encoded);
+        let result = hasher.finalize();
+        let mut bytes = [0_u8; 32];
+        bytes.copy_from_slice(&result);
+        Ok(Hash256::from_bytes(bytes))
+    }
+
+    pub fn entity_deltas(&self) -> &[EntityDelta] {
+        self.0.entity_deltas()
+    }
+
+    pub fn relation_deltas(&self) -> &[RelationDelta] {
+        self.0.relation_deltas()
+    }
+
+    pub fn external_reference_deltas(&self) -> &[ExternalReferenceDelta] {
+        self.0.external_reference_deltas()
+    }
+
+    pub fn transaction_delta(&self) -> TransactionDelta {
+        self.0.transaction_delta()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// One versioned digest in the repository authority root bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityRoot {
+    pub version: u32,
+    pub hash: Hash256,
+}
+
+impl AuthorityRoot {
+    pub const fn new(version: u32, hash: Hash256) -> Self {
+        Self { version, hash }
+    }
+}
+
+/// Exhaustive root partition for replicated and receiver-local repository authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RootBundle {
+    /// Schema version for this complete root bundle and each authority root.
+    pub version: u32,
+    /// Receiver-local transaction sequence. This may advance without changing
+    /// transferred repository truth.
+    pub generation: u64,
+    /// Replicated semantic change history.
+    pub history: AuthorityRoot,
+    /// Replicated authority for the current refs, their exact targets, and the
+    /// default ref.
+    pub ref_state: AuthorityRoot,
+    /// Receiver-local operation receipt history.
+    ///
+    /// This root binds the operations accepted by one receiver, including the
+    /// destination operation identity and receiver commit time. It is not
+    /// portable ref history and does not override `ref_state`. It remains in the
+    /// complete root bundle so receipt and operation chains retain their exact
+    /// local identity, but it does not participate in replicated-truth equality.
+    pub ref_log: AuthorityRoot,
+    /// Replicated collaboration authority.
+    pub collaboration: AuthorityRoot,
+    /// Replicated external, Git, alias, and replication authority.
+    pub replication: AuthorityRoot,
+    /// Receiver-local workspace, session, and overlay authority.
+    pub local_state: AuthorityRoot,
+}
+
+impl RootBundle {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != REPOSITORY_ROOT_SCHEMA_VERSION {
+            return Err(ModelError::InvalidOperation(format!(
+                "unsupported repository root bundle version {}",
+                self.version
+            )));
+        }
+        for (name, root) in [
+            ("history", &self.history),
+            ("ref_state", &self.ref_state),
+            ("ref_log", &self.ref_log),
+            ("collaboration", &self.collaboration),
+            ("replication", &self.replication),
+            ("local_state", &self.local_state),
+        ] {
+            if root.version != REPOSITORY_ROOT_SCHEMA_VERSION {
+                return Err(ModelError::InvalidOperation(format!(
+                    "unsupported {name} authority root version {}",
+                    root.version
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether two authority bundles name the same replicated repository truth.
+    ///
+    /// `generation` advances for every repository transaction, including
+    /// local-only workspace transitions. `ref_log` roots receiver-specific
+    /// operation receipts rather than portable ref history. `local_state` roots
+    /// workspace, session, and overlay authority. Those three fields do not
+    /// participate in replicated-truth equality.
+    ///
+    /// Schema version and every transferred partition remain exact. In
+    /// particular, `ref_state` remains the replicated authority for current ref
+    /// names, targets, and the default ref. The complete `RootBundle` still
+    /// includes every receiver-local root for validation and root-chain
+    /// integrity.
+    ///
+    /// This predicate does not validate either bundle. An untrusted bundle must
+    /// pass [`RootBundle::validate`] first, including schema-version validation
+    /// for the receiver-local roots excluded here.
+    pub fn has_same_replicated_truth(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.history == other.history
+            && self.ref_state == other.ref_state
+            && self.collaboration == other.collaboration
+            && self.replication == other.replication
+    }
+}
+
+/// VFS/projection binding for one exact workspace snapshot.
+///
+/// `workspace_tree_hash` is the projected graph-owned tree. It is deliberately
+/// distinct from `base_tree_hash`: a dirty workspace must never pretend that
+/// its tree is the commit named by `base_target`. Both base fields are absent
+/// for an unborn symbolic ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSnapshotBinding {
+    pub repository_id: RepositoryId,
+    pub workspace_id: WorkspaceId,
+    pub workspace_head: WorkspaceHead,
+    pub base_target: Option<RefTarget>,
+    pub base_tree_hash: Option<Hash256>,
+    pub workspace_tree_hash: Hash256,
+    pub workspace_semantic_overlay_hash: Hash256,
+    pub roots: RootBundle,
+    pub workspace_generation: u64,
+    pub admission_policy: EffectiveAdmissionPolicyStamp,
+}
+
+impl WorkspaceSnapshotBinding {
+    /// Validate the repository/workspace authority fields carried over a
+    /// projection boundary.
+    pub fn validate(&self) -> Result<()> {
+        self.roots.validate()?;
+        if self.base_target.is_some() != self.base_tree_hash.is_some() {
+            return Err(ModelError::InvalidOperation(
+                "workspace snapshot base target and tree must both be present or absent"
+                    .to_string(),
+            ));
+        }
+        validate_head_base(
+            &self.workspace_head,
+            &self.base_target,
+            self.base_tree_hash,
+            "workspace snapshot",
+        )
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.workspace_semantic_overlay_hash
+            != WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .expect("empty workspace semantic overlay has a canonical identity")
+            || self.base_tree_hash.map_or_else(
+                || {
+                    self.workspace_tree_hash
+                        != compute_resolved_tree_hash(&ResolvedTree::default())
+                            .expect("empty tree has a canonical identity")
+                },
+                |base| base != self.workspace_tree_hash,
+            )
+    }
+}
+
+/// Graph-owned exact working state for one local workspace or agent session.
+///
+/// This state is not derived from a branch on demand. The full repository tree
+/// is persisted independently so unsupported languages, configuration, binary
+/// assets, symlinks, gitlinks, and dirty changes all remain authoritative.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceState {
+    pub repository_id: RepositoryId,
+    pub workspace_id: WorkspaceId,
+    pub generation: u64,
+    pub head: WorkspaceHead,
+    /// Resolved target of `head`, or `None` for an unborn symbolic ref.
+    pub base_target: Option<RefTarget>,
+    /// Tree at `base_target`, or `None` for an unborn symbolic ref.
+    pub base_tree_hash: Option<Hash256>,
+    /// Exact graph-owned working tree, including uncommitted state.
+    pub tree: ResolvedTree,
+    pub tree_hash: Hash256,
+    /// Complete uncommitted semantic state relative to `base_target`.
+    pub semantic_overlay: WorkspaceSemanticOverlay,
+    pub semantic_overlay_hash: Hash256,
+    /// Complete shared matcher policy active for this exact workspace tree.
+    ///
+    /// This may be newer than committed history when a dirty workspace edits
+    /// `.gitignore` or `.kinignore`.
+    pub shared_admission_policy: SharedAdmissionPolicy,
+    pub admission_policy: EffectiveAdmissionPolicyStamp,
+}
+
+impl WorkspaceState {
+    /// Build and validate complete workspace authority in one call.
+    ///
+    /// The semantic overlay is deliberately explicit even when empty. A
+    /// caller must never persist a dirty exact tree while accidentally
+    /// inheriting base semantics through a convenience constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repository_id: RepositoryId,
+        workspace_id: WorkspaceId,
+        generation: u64,
+        head: WorkspaceHead,
+        base_target: Option<RefTarget>,
+        base_tree_hash: Option<Hash256>,
+        tree: ResolvedTree,
+        semantic_overlay: WorkspaceSemanticOverlay,
+        shared_admission_policy: SharedAdmissionPolicy,
+        admission_policy: EffectiveAdmissionPolicyStamp,
+    ) -> Result<Self> {
+        let tree_hash = compute_resolved_tree_hash(&tree)?;
+        let semantic_overlay_hash = semantic_overlay.identity_hash()?;
+        let state = Self {
+            repository_id,
+            workspace_id,
+            generation,
+            head,
+            base_target,
+            base_tree_hash,
+            tree,
+            tree_hash,
+            semantic_overlay,
+            semantic_overlay_hash,
+            shared_admission_policy,
+            admission_policy,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.shared_admission_policy.validate()?;
+        if self.shared_admission_policy.stamp() != self.admission_policy.shared {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} shared admission policy does not match its effective policy stamp",
+                self.workspace_id
+            )));
+        }
+        if self.base_target.is_some() != self.base_tree_hash.is_some() {
+            return Err(ModelError::InvalidOperation(
+                "workspace base target and base tree must both be present or absent".to_string(),
+            ));
+        }
+        validate_head_base(
+            &self.head,
+            &self.base_target,
+            self.base_tree_hash,
+            "workspace",
+        )?;
+        let computed = compute_resolved_tree_hash(&self.tree)?;
+        if computed != self.tree_hash {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace tree hash {} recomputes to {}",
+                self.tree_hash, computed
+            )));
+        }
+        let computed_overlay = self.semantic_overlay.identity_hash()?;
+        if computed_overlay != self.semantic_overlay_hash {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace semantic overlay hash {} recomputes to {}",
+                self.semantic_overlay_hash, computed_overlay
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn snapshot_binding(&self, roots: RootBundle) -> Result<WorkspaceSnapshotBinding> {
+        self.validate()?;
+        roots.validate()?;
+        let binding = WorkspaceSnapshotBinding {
+            repository_id: self.repository_id.clone(),
+            workspace_id: self.workspace_id,
+            workspace_head: self.head.clone(),
+            base_target: self.base_target.clone(),
+            base_tree_hash: self.base_tree_hash,
+            workspace_tree_hash: self.tree_hash,
+            workspace_semantic_overlay_hash: self.semantic_overlay_hash,
+            roots,
+            workspace_generation: self.generation,
+            admission_policy: self.admission_policy,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        !self.semantic_overlay.is_empty()
+            || self
+                .base_tree_hash
+                .map_or(!self.tree.is_empty(), |base| base != self.tree_hash)
+    }
+}
+
+/// Exact compare-and-swap expectation for persisted workspace authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// This is a persisted wire contract used far more often as data than as a
+// stack-local enum. Keeping the exact expectation inline avoids a boxed
+// authority sub-object and an unnecessary public schema seam.
+#[allow(clippy::large_enum_variant)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkspaceExpectation {
+    MustNotExist,
+    MustEqual {
+        generation: u64,
+        head: WorkspaceHead,
+        base_target: Option<RefTarget>,
+        base_tree_hash: Option<Hash256>,
+        tree_hash: Hash256,
+        semantic_overlay_hash: Hash256,
+        admission_policy: EffectiveAdmissionPolicyStamp,
+    },
+}
+
+/// One exact graph-owned workspace transition.
+///
+/// The authority implementation applies `tree_deltas` and `semantic_delta` to
+/// the graph identified by `expected`, derives the successor's cumulative
+/// base-relative semantic overlay, verifies the exact result, and commits it
+/// in the same repository transaction as history and ref updates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMutation {
+    pub workspace_id: WorkspaceId,
+    pub expected: WorkspaceExpectation,
+    pub new_generation: u64,
+    pub new_head: WorkspaceHead,
+    pub new_base_target: Option<RefTarget>,
+    pub new_base_tree_hash: Option<Hash256>,
+    pub tree_deltas: Vec<TreeDelta>,
+    pub new_tree_hash: Hash256,
+    /// Incremental entity/relation transition from the expected workspace
+    /// graph to the successor workspace graph. Durable storage derives and
+    /// persists the cumulative base-relative overlay from this exact delta.
+    pub semantic_delta: WorkspaceSemanticDelta,
+    /// Complete shared policy active for the resulting workspace tree.
+    ///
+    /// A dirty or unborn workspace may contain a new `.gitignore` before any
+    /// semantic change records that policy. Persisting only its stamp would
+    /// leave storage unable to reproduce or validate the matcher inputs.
+    pub new_shared_admission_policy: SharedAdmissionPolicy,
+    pub new_admission_policy: EffectiveAdmissionPolicyStamp,
+}
+
+impl WorkspaceMutation {
+    pub fn validate_against(
+        &self,
+        repository_id: &RepositoryId,
+        current: Option<&WorkspaceState>,
+        derived_semantic_overlay: WorkspaceSemanticOverlay,
+    ) -> Result<WorkspaceState> {
+        self.validate_shape()?;
+        let (current_tree, expected_next_generation) = match (&self.expected, current) {
+            (WorkspaceExpectation::MustNotExist, None) => (ResolvedTree::default(), 0),
+            (WorkspaceExpectation::MustNotExist, Some(_)) => {
+                return Err(ModelError::Conflict(format!(
+                    "workspace {} already exists",
+                    self.workspace_id
+                )));
+            }
+            (
+                WorkspaceExpectation::MustEqual {
+                    generation,
+                    head,
+                    base_target,
+                    base_tree_hash,
+                    tree_hash,
+                    semantic_overlay_hash,
+                    admission_policy,
+                },
+                Some(current),
+            ) => {
+                current.validate()?;
+                if current.repository_id != *repository_id
+                    || current.workspace_id != self.workspace_id
+                    || current.generation != *generation
+                    || current.head != *head
+                    || current.base_target != *base_target
+                    || current.base_tree_hash != *base_tree_hash
+                    || current.tree_hash != *tree_hash
+                    || current.semantic_overlay_hash != *semantic_overlay_hash
+                    || current.admission_policy != *admission_policy
+                {
+                    return Err(ModelError::Conflict(format!(
+                        "workspace {} no longer matches its expected generation, head, base, tree, semantic overlay, and policy",
+                        self.workspace_id
+                    )));
+                }
+                (
+                    current.tree.clone(),
+                    current.generation.checked_add(1).ok_or_else(|| {
+                        ModelError::InvalidOperation(format!(
+                            "workspace {} generation overflow",
+                            self.workspace_id
+                        ))
+                    })?,
+                )
+            }
+            (WorkspaceExpectation::MustEqual { .. }, None) => {
+                return Err(ModelError::Conflict(format!(
+                    "workspace {} does not exist",
+                    self.workspace_id
+                )));
+            }
+        };
+
+        if self.new_generation != expected_next_generation {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} generation must become {}, not {}",
+                self.workspace_id, expected_next_generation, self.new_generation
+            )));
+        }
+
+        let tree = current_tree.apply(&self.tree_deltas).map_err(|error| {
+            ModelError::InvalidOperation(format!(
+                "workspace {} tree transition is invalid: {error}",
+                self.workspace_id
+            ))
+        })?;
+        let computed_tree_hash = compute_resolved_tree_hash(&tree)?;
+        if computed_tree_hash != self.new_tree_hash {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} new tree hash {} recomputes to {}",
+                self.workspace_id, self.new_tree_hash, computed_tree_hash
+            )));
+        }
+
+        WorkspaceState::new(
+            repository_id.clone(),
+            self.workspace_id,
+            self.new_generation,
+            self.new_head.clone(),
+            self.new_base_target.clone(),
+            self.new_base_tree_hash,
+            tree,
+            derived_semantic_overlay,
+            self.new_shared_admission_policy.clone(),
+            self.new_admission_policy,
+        )
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        self.semantic_delta.validate()?;
+        self.new_shared_admission_policy.validate()?;
+        if self.new_shared_admission_policy.stamp() != self.new_admission_policy.shared {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} shared admission policy does not match its effective policy stamp",
+                self.workspace_id
+            )));
+        }
+
+        let expected_tree = match &self.expected {
+            WorkspaceExpectation::MustNotExist => {
+                if self.new_generation != 0 {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "new workspace {} must start at generation zero",
+                        self.workspace_id
+                    )));
+                }
+                ResolvedTree::default()
+            }
+            WorkspaceExpectation::MustEqual {
+                generation,
+                head,
+                base_target,
+                base_tree_hash,
+                ..
+            } => {
+                if base_target.is_some() != base_tree_hash.is_some() {
+                    return Err(ModelError::InvalidOperation(
+                        "expected workspace base target and tree must both be present or absent"
+                            .to_string(),
+                    ));
+                }
+                validate_head_base(head, base_target, *base_tree_hash, "expected workspace")?;
+                let next_generation = generation.checked_add(1).ok_or_else(|| {
+                    ModelError::InvalidOperation(format!(
+                        "workspace {} generation overflow",
+                        self.workspace_id
+                    ))
+                })?;
+                if self.new_generation != next_generation {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "workspace {} generation must advance from {} to {}",
+                        self.workspace_id, generation, next_generation
+                    )));
+                }
+                // The actual old tree is storage authority. Duplicate targets
+                // can still be rejected without loading it.
+                ResolvedTree::default()
+            }
+        };
+
+        let mut touched = BTreeSet::new();
+        for delta in &self.tree_deltas {
+            if !touched.insert(delta.artifact_id()) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "workspace {} mutates artifact {:?} more than once",
+                    self.workspace_id,
+                    delta.artifact_id()
+                )));
+            }
+        }
+        if matches!(&self.expected, WorkspaceExpectation::MustNotExist) {
+            let computed = expected_tree.apply(&self.tree_deltas).map_err(|error| {
+                ModelError::InvalidOperation(format!(
+                    "new workspace {} tree transition is invalid: {error}",
+                    self.workspace_id
+                ))
+            })?;
+            if compute_resolved_tree_hash(&computed)? != self.new_tree_hash {
+                return Err(ModelError::InvalidOperation(format!(
+                    "new workspace {} tree hash does not match its initial deltas",
+                    self.workspace_id
+                )));
+            }
+        }
+        if self.new_base_target.is_some() != self.new_base_tree_hash.is_some() {
+            return Err(ModelError::InvalidOperation(
+                "new workspace base target and tree must both be present or absent".to_string(),
+            ));
+        }
+        validate_head_base(
+            &self.new_head,
+            &self.new_base_target,
+            self.new_base_tree_hash,
+            "new workspace",
+        )?;
+        if let WorkspaceExpectation::MustEqual {
+            head,
+            base_target,
+            base_tree_hash,
+            tree_hash,
+            admission_policy,
+            ..
+        } = &self.expected
+        {
+            if self.tree_deltas.is_empty()
+                && self.new_head == *head
+                && self.new_base_target == *base_target
+                && self.new_base_tree_hash == *base_tree_hash
+                && self.new_tree_hash == *tree_hash
+                && self.semantic_delta.is_empty()
+                && self.new_admission_policy == *admission_policy
+            {
+                return Err(ModelError::InvalidOperation(format!(
+                    "workspace {} mutation is a no-op",
+                    self.workspace_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_head_base(
+    head: &WorkspaceHead,
+    base_target: &Option<RefTarget>,
+    base_tree_hash: Option<Hash256>,
+    label: &str,
+) -> Result<()> {
+    if matches!(base_target, Some(RefTarget::Symbolic { .. })) {
+        return Err(ModelError::InvalidOperation(format!(
+            "{label} base target must be resolved, not symbolic"
+        )));
+    }
+    if let WorkspaceHead::Detached { target } = head {
+        if matches!(target, RefTarget::Symbolic { .. }) {
+            return Err(ModelError::InvalidOperation(format!(
+                "{label} detached HEAD target must be resolved, not symbolic"
+            )));
+        }
+        if base_target != &Some(target.clone()) || base_tree_hash.is_none() {
+            return Err(ModelError::InvalidOperation(format!(
+                "{label} detached HEAD must bind its exact target and tree"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Append-only record of one committed repository operation.
+///
+/// This type is persisted through a positional MessagePack encoding. Any
+/// future optional authority field must be appended after every existing field
+/// and carry a compatibility round-trip proving older, shorter records still
+/// decode. Inserting an optional field earlier shifts all following values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryOperationRecord {
+    pub operation_id: OperationId,
+    pub repository_id: RepositoryId,
+    /// Canonical identity of the complete committed transaction, including
+    /// history, raw-object descriptors, Git authority, aliases, refs,
+    /// workspace, and policy.
+    pub transaction_hash: Hash256,
+    pub actor: AuthorId,
+    pub committed_at: crate::Timestamp,
+    /// Exact authority transition retained in the append-only audit record.
+    pub git_authority_delta: Option<GitExternalAuthorityDelta>,
+    pub ref_mutations: Vec<RefMutation>,
+    pub default_ref_mutation: Option<DefaultRefMutation>,
+    pub workspace_mutation: Option<WorkspaceMutation>,
+    pub local_overlay_delta: Option<FrozenLocalOverlayDelta>,
+    pub roots_before: RootBundle,
+    pub roots_after: RootBundle,
+    /// Exact transition of this workspace's durable merge record, when the
+    /// operation opened, resolved, or terminated a merge.
+    ///
+    /// Optional and omitted when absent, so an operation that touches no merge
+    /// serializes to the bytes it always did and keeps its identity under the
+    /// existing hash domain.
+    ///
+    /// Deliberately last. Operation records are persisted inside a MessagePack
+    /// snapshot, where a struct is an array and position decides the mapping,
+    /// so an optional field is only additive at the end: an already-written
+    /// record simply runs out of elements and takes the default. Anywhere else
+    /// it would shift every field after it and silently mis-decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_transaction_delta: Option<MergeTransactionDelta>,
+}
+
+/// The identity-bearing projection of one [`RepositoryOperationRecord`].
+///
+/// This is a mirror kept by hand: it names the record's fields, in the record's
+/// declaration order, minus `roots_before` and `roots_after`, which are
+/// excluded because the ref-log root is itself part of those bundles and
+/// including them would make the identity circular.
+///
+/// A mirror kept by hand can drift in two ways, and the hash can see NEITHER.
+/// The record can grow a field this list never gains, in which case two records
+/// that differ only in that field collide on one identity. The list can be
+/// reordered, which is invisible because the identity encodes through
+/// `canonical_json_bytes`, whose object encoder sorts keys. Both are guarded by
+/// `operation_identity_mirrors_every_record_field_positionally`, which diffs
+/// this payload's positional encoding against a reference built from the record
+/// and then requires every record field to either move the identity or be one
+/// of the two named exclusions. `tests/persisted_schema.rs` holds the
+/// registration that refuses a new mirror arriving without such a test.
+#[derive(Serialize)]
+struct RepositoryOperationIdentity<'a> {
+    operation_id: OperationId,
+    repository_id: &'a RepositoryId,
+    transaction_hash: Hash256,
+    actor: &'a AuthorId,
+    committed_at: &'a crate::Timestamp,
+    git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
+    ref_mutations: &'a [RefMutation],
+    default_ref_mutation: &'a Option<DefaultRefMutation>,
+    workspace_mutation: &'a Option<WorkspaceMutation>,
+    local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+}
+
+impl RepositoryOperationRecord {
+    pub fn validate(&self) -> Result<()> {
+        if self.operation_id.as_uuid().is_nil() {
+            return Err(ModelError::InvalidOperation(
+                "repository operation id must not be nil".to_string(),
+            ));
+        }
+        self.roots_before.validate()?;
+        self.roots_after.validate()?;
+        let next_generation = self.roots_before.generation.checked_add(1).ok_or_else(|| {
+            ModelError::InvalidOperation("repository operation generation overflow".to_string())
+        })?;
+        if self.roots_after.generation != next_generation {
+            return Err(ModelError::InvalidOperation(format!(
+                "repository operation roots must advance generation from {} to {}",
+                self.roots_before.generation, next_generation
+            )));
+        }
+        if let Some(delta) = &self.git_authority_delta {
+            delta
+                .validate_for_repository(&self.repository_id)
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "invalid Git external-authority operation delta: {error}"
+                    ))
+                })?;
+        }
+        let mut refs = BTreeSet::new();
+        for mutation in &self.ref_mutations {
+            mutation.validate()?;
+            if !refs.insert(mutation.name.clone()) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "repository operation mutates ref {} more than once",
+                    mutation.name
+                )));
+            }
+        }
+        if let Some(mutation) = &self.default_ref_mutation {
+            mutation.validate()?;
+        }
+        if let Some(mutation) = &self.workspace_mutation {
+            mutation.validate_shape()?;
+        }
+        if let Some(delta) = &self.local_overlay_delta {
+            delta.validate()?;
+        }
+        if let Some(delta) = &self.merge_transaction_delta {
+            delta.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Canonical ref-log leaf identity.
+    ///
+    /// Root bundles are transition evidence and intentionally excluded: the
+    /// ref-log root is itself part of those bundles, so including them would
+    /// make the identity circular.
+    pub fn identity_hash(&self) -> Result<Hash256> {
+        self.validate()?;
+        let canonical = self.canonicalized();
+        hash_serialized(
+            b"kin-repository-operation-v4\0",
+            &canonical.identity_payload(),
+        )
+    }
+
+    /// This record with every collection this identity canonicalizes in its
+    /// canonical order, **borrowed when it is already in that order**.
+    ///
+    /// The digest is unchanged by construction: when the collections are
+    /// already sorted, sorting them would produce this exact value, so hashing
+    /// the record itself hashes the same bytes the copy would have produced.
+    /// The only thing that moves is whether a copy is made.
+    ///
+    /// It matters because the copy is not small. A `RepositoryOperationRecord`
+    /// carries its whole `workspace_mutation`, and on a converted Linux subtree
+    /// that record is 411,771,106 bytes on the wire, so every identity cloned
+    /// it and then serialized the clone.
+    ///
+    /// **And the largest collection it sorted was already sorted.**
+    /// [`Self::validate`] runs first, above, and reaches
+    /// `workspace_mutation.validate_shape()`, which calls
+    /// `semantic_delta.validate()`, which REFUSES any of the three delta
+    /// vectors whose adjacent pairs are not strictly increasing by
+    /// `target_id`. `WorkspaceSemanticDelta::sort_canonical` sorts by exactly
+    /// that key. So on a record that has passed validation, sorting the
+    /// semantic delta is provably a no-op, and the whole record was being
+    /// copied in order to perform it.
+    ///
+    /// `ref_mutations` and `tree_deltas` are different: validation checks them
+    /// for uniqueness, through a `BTreeSet` on name and on artifact id, and not
+    /// for order. So they may genuinely need sorting, and when either does this
+    /// still makes the copy it always made.
+    fn canonicalized(&self) -> Cow<'_, Self> {
+        if self.is_already_canonical() {
+            return Cow::Borrowed(self);
+        }
+        let mut canonical = self.clone();
+        canonical
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut canonical.workspace_mutation {
+            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            workspace.semantic_delta.sort_canonical();
+        }
+        Cow::Owned(canonical)
+    }
+
+    /// Whether every collection [`Self::canonicalized`] sorts is already in
+    /// that order.
+    ///
+    /// Deliberately does NOT consult the semantic delta. Validation has already
+    /// refused any record whose delta vectors are out of order, so asking again
+    /// would walk the one collection that is large to re-establish something
+    /// the caller proved a few lines earlier. If that validation ever stops
+    /// enforcing the order, this comment is the thing that is wrong, and the
+    /// differential test against the retained sorting path is what will say so.
+    fn is_already_canonical(&self) -> bool {
+        let refs_sorted = self
+            .ref_mutations
+            .windows(2)
+            .all(|pair| pair[0].name <= pair[1].name);
+        let tree_sorted = self.workspace_mutation.as_ref().is_none_or(|workspace| {
+            workspace
+                .tree_deltas
+                .windows(2)
+                .all(|pair| pair[0].artifact_id() <= pair[1].artifact_id())
+        });
+        refs_sorted && tree_sorted
+    }
+
+    /// The pre-borrowing `canonicalized`: always a copy, always sorted.
+    ///
+    /// Retained as the ORACLE rather than deleted. A differential in which both
+    /// sides go through the same new code proves nothing, so this is kept as
+    /// the exact body that shipped, and the borrowing path is graded against
+    /// it. That is the same reason `canonical_json_bytes_via_tree` is kept
+    /// beside the streaming encoder in this crate.
+    #[cfg(test)]
+    fn canonicalized_by_copying(&self) -> Self {
+        let mut canonical = self.clone();
+        canonical
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut canonical.workspace_mutation {
+            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            workspace.semantic_delta.sort_canonical();
+        }
+        canonical
+    }
+
+    /// [`Self::identity_hash`] as it computed before the borrowing path, for
+    /// the differential.
+    #[cfg(test)]
+    pub(crate) fn identity_hash_by_copying(&self) -> Result<Hash256> {
+        self.validate()?;
+        hash_serialized(
+            b"kin-repository-operation-v4\0",
+            &self.canonicalized_by_copying().identity_payload(),
+        )
+    }
+
+    /// The exact payload [`Self::identity_hash`] hashes, over a canonicalized
+    /// record.
+    ///
+    /// Split out of the hash for the same reason
+    /// `reference_canonical_transaction` is split out of the transaction's
+    /// reference hash: the payload is a mirror written by hand, the hash is
+    /// built by `canonical_json_bytes`, and that encoder sorts object keys, so
+    /// a hash comparison cannot see a field this mirror dropped, gained or
+    /// moved. A test needs the payload itself to encode it positionally.
+    /// `operation_identity_mirrors_every_record_field_positionally` is that
+    /// test.
+    fn identity_payload(&self) -> RepositoryOperationIdentity<'_> {
+        RepositoryOperationIdentity {
+            operation_id: self.operation_id,
+            repository_id: &self.repository_id,
+            transaction_hash: self.transaction_hash,
+            actor: &self.actor,
+            committed_at: &self.committed_at,
+            git_authority_delta: &self.git_authority_delta,
+            ref_mutations: &self.ref_mutations,
+            default_ref_mutation: &self.default_ref_mutation,
+            workspace_mutation: &self.workspace_mutation,
+            local_overlay_delta: &self.local_overlay_delta,
+            merge_transaction_delta: &self.merge_transaction_delta,
+        }
+    }
+}
+
+/// One atomic repository-authority transition.
+///
+/// This type is persisted through a positional MessagePack encoding. Any
+/// future optional authority field must be appended after every existing field
+/// and carry compatibility tests for every combination of adjacent optional
+/// tail fields. A later tail value must keep an explicit `nil` placeholder for
+/// any absent earlier value so positions never shift.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransaction {
+    pub schema_version: u32,
+    pub operation_id: OperationId,
+    pub repository_id: RepositoryId,
+    pub expected_generation: u64,
+    pub expected_roots: RootBundle,
+    pub actor: AuthorId,
+    pub reason: String,
+    pub external_objects: Vec<ExternalObjectRecord>,
+    /// Exact compare-and-swap of repository-scoped Git authority. Closure
+    /// records may already exist in CAS and need not be repeated above.
+    pub git_authority_delta: Option<GitExternalAuthorityDelta>,
+    pub changes: Vec<SemanticChange>,
+    pub aliases: Vec<ExternalChangeAlias>,
+    pub ref_mutations: Vec<RefMutation>,
+    pub default_ref_mutation: Option<DefaultRefMutation>,
+    pub workspace_mutation: Option<WorkspaceMutation>,
+    pub local_overlay_delta: Option<FrozenLocalOverlayDelta>,
+    /// Exact transition of one workspace's durable merge record.
+    ///
+    /// A merge that composes cleanly publishes without one. This carries the
+    /// merges that did not: opening a conflict set, settling an entry, and
+    /// terminating by publishing the merge change or aborting back to the
+    /// recorded restore point. Optional and omitted when absent, so a
+    /// transaction that touches no merge keeps its existing identity.
+    #[serde(default)]
+    pub merge_transaction_delta: Option<MergeTransactionDelta>,
+    /// Fingerprint and coverage of the admitted content closure observed by
+    /// the enforcement layer.
+    ///
+    /// Repository storage validates only the binding's internal shape and
+    /// binds it into transaction identity. It cannot re-derive the fingerprint;
+    /// admission remains responsible for verifying it against graph-owned
+    /// content before committing this transaction.
+    ///
+    /// Positional serialization emits an explicit absent merge slot when this
+    /// field is present without a merge delta.
+    #[serde(default)]
+    pub sealed_observation: Option<SealedObservationBinding>,
+    /// The collaboration records this transaction admits.
+    ///
+    /// `RootBundle::collaboration` is replicated truth and
+    /// `has_same_replicated_truth` compares it, so two replicas that complete a
+    /// transfer must agree on it. Before this field existed nothing could move
+    /// it: no field here named a collaboration record, and `prepare_successor`
+    /// on the kin-db side had no collaboration domain to admit one into. Two
+    /// replicas could finish a successful transfer holding different
+    /// collaboration roots, with nothing erroring and no test failing.
+    ///
+    /// Optional and omitted when absent, so a transaction that touches no
+    /// collaboration serializes to the bytes it always did and keeps its
+    /// identity under the existing hash domain. That is what lets
+    /// `REPOSITORY_TRANSACTION_SCHEMA_VERSION` stay at 4: the version is gated
+    /// by exact equality, so moving it would refuse every transaction every
+    /// shipped binary builds, in both directions, to buy a compatibility this
+    /// field does not need.
+    ///
+    /// Deliberately last. Positional serialization emits explicit absent merge
+    /// and sealed slots when this field is present without them.
+    #[serde(default)]
+    pub collaboration_delta: Option<CollaborationDelta>,
+}
+
+#[derive(Serialize)]
+struct RepositoryTransactionHumanReadable<'a> {
+    schema_version: u32,
+    operation_id: OperationId,
+    repository_id: &'a RepositoryId,
+    expected_generation: u64,
+    expected_roots: &'a RootBundle,
+    actor: &'a AuthorId,
+    reason: &'a str,
+    external_objects: &'a [ExternalObjectRecord],
+    git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
+    changes: &'a [SemanticChange],
+    aliases: &'a [ExternalChangeAlias],
+    ref_mutations: &'a [RefMutation],
+    default_ref_mutation: &'a Option<DefaultRefMutation>,
+    workspace_mutation: &'a Option<WorkspaceMutation>,
+    local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sealed_observation: &'a Option<SealedObservationBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collaboration_delta: &'a Option<CollaborationDelta>,
+}
+
+impl Serialize for RepositoryTransaction {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            return RepositoryTransactionHumanReadable {
+                schema_version: self.schema_version,
+                operation_id: self.operation_id,
+                repository_id: &self.repository_id,
+                expected_generation: self.expected_generation,
+                expected_roots: &self.expected_roots,
+                actor: &self.actor,
+                reason: &self.reason,
+                external_objects: &self.external_objects,
+                git_authority_delta: &self.git_authority_delta,
+                changes: &self.changes,
+                aliases: &self.aliases,
+                ref_mutations: &self.ref_mutations,
+                default_ref_mutation: &self.default_ref_mutation,
+                workspace_mutation: &self.workspace_mutation,
+                local_overlay_delta: &self.local_overlay_delta,
+                merge_transaction_delta: &self.merge_transaction_delta,
+                sealed_observation: &self.sealed_observation,
+                collaboration_delta: &self.collaboration_delta,
+            }
+            .serialize(serializer);
+        }
+
+        use serde::ser::SerializeSeq;
+
+        const LEGACY_FIELD_COUNT: usize = 15;
+        // Each tail slot is written when it is occupied OR when a later one is,
+        // so a present later value never slides into an absent earlier one's
+        // position. The chain is what keeps the rule stated once as the tail
+        // grows: read it upward from the last field.
+        let has_collaboration_slot = self.collaboration_delta.is_some();
+        let has_sealed_slot = self.sealed_observation.is_some() || has_collaboration_slot;
+        let has_merge_slot = self.merge_transaction_delta.is_some() || has_sealed_slot;
+        let field_count = LEGACY_FIELD_COUNT
+            + usize::from(has_merge_slot)
+            + usize::from(has_sealed_slot)
+            + usize::from(has_collaboration_slot);
+        let mut sequence = serializer.serialize_seq(Some(field_count))?;
+        sequence.serialize_element(&self.schema_version)?;
+        sequence.serialize_element(&self.operation_id)?;
+        sequence.serialize_element(&self.repository_id)?;
+        sequence.serialize_element(&self.expected_generation)?;
+        sequence.serialize_element(&self.expected_roots)?;
+        sequence.serialize_element(&self.actor)?;
+        sequence.serialize_element(&self.reason)?;
+        sequence.serialize_element(&self.external_objects)?;
+        sequence.serialize_element(&self.git_authority_delta)?;
+        sequence.serialize_element(&self.changes)?;
+        sequence.serialize_element(&self.aliases)?;
+        sequence.serialize_element(&self.ref_mutations)?;
+        sequence.serialize_element(&self.default_ref_mutation)?;
+        sequence.serialize_element(&self.workspace_mutation)?;
+        sequence.serialize_element(&self.local_overlay_delta)?;
+        if has_merge_slot {
+            sequence.serialize_element(&self.merge_transaction_delta)?;
+        }
+        if has_sealed_slot {
+            sequence.serialize_element(&self.sealed_observation)?;
+        }
+        if has_collaboration_slot {
+            sequence.serialize_element(&self.collaboration_delta)?;
+        }
+        sequence.end()
+    }
+}
+
+/// Canonically ordered view of a transaction that borrows rather than clones.
+///
+/// [`RepositoryTransaction::canonical_hash`] must sort several collections
+/// before it serializes, and the only way to sort an owned `Vec` is to own it.
+/// The implementation this replaced cloned the entire transaction to get
+/// something mutable, which on a whole-history import is a second copy of every
+/// change, every tree delta and every external object, charged at the point
+/// admission already holds its largest working set. Measured at 259 MiB
+/// transient on a 32-commit fixture, and it ran on every commit.
+///
+/// This holds `&` to the original plus one `Vec` of references per sorted
+/// collection, so the cost is a pointer per element instead of a deep copy.
+///
+/// # The obligation these types carry
+///
+/// The bytes are a durable identity. `transaction_hash` is stored in every
+/// [`RepositoryCommitReceipt`] and compared on idempotent replay, so a view that
+/// serializes one byte differently from the owned type invalidates receipts
+/// already on disk. Each type below therefore mirrors its owned counterpart's
+/// serialization exactly: the same struct name, the same field names in the
+/// same order, the same field count, and the same skip rules. Where the owned
+/// type hand-writes its encoding, the view hand-writes the same one; where the
+/// owned type derives, the view reproduces what that derive emits.
+///
+/// Enforced by `the_canonicalization_matches_the_implementation_it_replaced`
+/// and `the_canonical_view_serializes_positionally_identical_bytes`. The first
+/// runs the production hash against the retained cloning reference over 64
+/// permutations. The second is not redundant: the hash encodes through
+/// `canonical_json_bytes`, whose object encoder sorts keys, so field ORDER is
+/// invisible to it. The positional test drives the non-human-readable branch,
+/// where order, struct name and field count are all load-bearing.
+struct CanonicalTransaction<'a> {
+    source: &'a RepositoryTransaction,
+    changes: Vec<CanonicalChange<'a>>,
+    external_objects: Vec<&'a ExternalObjectRecord>,
+    aliases: Vec<&'a ExternalChangeAlias>,
+    ref_mutations: Vec<&'a RefMutation>,
+    workspace_mutation: Option<CanonicalWorkspaceMutation<'a>>,
+}
+
+impl<'a> CanonicalTransaction<'a> {
+    fn new(source: &'a RepositoryTransaction) -> Self {
+        let mut changes: Vec<CanonicalChange<'a>> =
+            source.changes.iter().map(CanonicalChange::new).collect();
+        changes.sort_by_key(|change| change.source.id);
+
+        let mut external_objects: Vec<&'a ExternalObjectRecord> =
+            source.external_objects.iter().collect();
+        external_objects.sort_by_key(|record| record.object);
+
+        let mut aliases: Vec<&'a ExternalChangeAlias> = source.aliases.iter().collect();
+        aliases.sort_by_key(|alias| alias.oid);
+
+        let mut ref_mutations: Vec<&'a RefMutation> = source.ref_mutations.iter().collect();
+        ref_mutations.sort_by(|left, right| left.name.cmp(&right.name));
+
+        Self {
+            source,
+            changes,
+            external_objects,
+            aliases,
+            ref_mutations,
+            workspace_mutation: source
+                .workspace_mutation
+                .as_ref()
+                .map(CanonicalWorkspaceMutation::new),
+        }
+    }
+}
+
+/// Fields the human-readable serialization always writes, before its two
+/// independently-skipping tail fields.
+///
+/// Hoisted out of the `Serialize` impl so the incremental preimage counts the
+/// same fields from the same constant rather than from a copy that can drift.
+const HUMAN_READABLE_FIELD_COUNT: usize = 15;
+
+/// Domain separator hashed ahead of a repository transaction's preimage.
+///
+/// Named rather than spelled at the one call site because the streaming hash
+/// writes it through the same sink as the payload, and the buffered reference
+/// the tests keep must write the identical bytes for the comparison to mean
+/// anything.
+const REPOSITORY_TRANSACTION_HASH_DOMAIN: &[u8] = b"kin-repository-transaction-v4\0";
+
+impl CanonicalTransaction<'_> {
+    /// This transaction's canonical preimage, collected into one `Vec`.
+    ///
+    /// Only the tests want this. They compare whole encodings byte for byte and
+    /// pin them by digest, which needs the bytes in hand; production hashes them
+    /// as they are produced and never holds them.
+    #[cfg(test)]
+    fn canonical_preimage(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_canonical_preimage(&mut out)?;
+        Ok(out)
+    }
+
+    /// This transaction's canonical preimage, written one field at a time into
+    /// any sink.
+    ///
+    /// Byte-for-byte what `canonical_json_bytes` over the whole view produces,
+    /// and the corpus test asserts exactly that against the whole-tree path. The
+    /// difference is what is resident while it is produced. The whole-tree path
+    /// builds a `serde_json::Value` of the entire transaction, measured at
+    /// eleven times the transaction's own size, where this holds one array
+    /// element's tree at a time; and writing into a sink rather than returning a
+    /// `Vec` means the caller need not hold the encoding either, which on a
+    /// bootstrap commit is the entire converted history.
+    ///
+    /// Two obligations come with hand-writing the framing, and both are tested
+    /// rather than trusted.
+    ///
+    /// The fields are emitted in BYTE-WISE KEY ORDER, not in the order the
+    /// `Serialize` impl below writes them, because the whole-tree walk sorts a
+    /// `serde_json::Map` before encoding it. The order here is that sorted
+    /// order, and `the_incremental_preimage_matches_the_whole_tree_path` fails
+    /// if it drifts.
+    ///
+    /// The field COUNT must match what the human-readable branch of the
+    /// `Serialize` impl emits, including how its two tail fields skip
+    /// independently. `the_preimage_field_set_matches_the_serialized_one` fails
+    /// if a field is added to one and not the other, which is the failure that
+    /// would otherwise move every identity in every store on disk silently.
+    fn write_canonical_preimage<S: CanonicalSink>(&self, out: &mut S) -> Result<()> {
+        self.write_preimage_with_changes(out, |out| append_canonical_seq(out, &self.changes))
+    }
+
+    fn write_preimage_with_changes<S: CanonicalSink>(
+        &self,
+        out: &mut S,
+        changes: impl FnOnce(&mut S) -> Result<()>,
+    ) -> Result<()> {
+        let source = self.source;
+        let field_count = HUMAN_READABLE_FIELD_COUNT
+            + usize::from(source.merge_transaction_delta.is_some())
+            + usize::from(source.sealed_observation.is_some())
+            + usize::from(source.collaboration_delta.is_some());
+
+        append_canonical_object_header(out, field_count)?;
+
+        append_canonical_key(out, "actor")?;
+        append_canonical_value(out, &source.actor)?;
+        append_canonical_key(out, "aliases")?;
+        append_canonical_seq(out, &self.aliases)?;
+        append_canonical_key(out, "changes")?;
+        changes(out)?;
+        // "changes" then "collaboration_delta" then "default_ref_mutation":
+        // they share nothing past the first byte, and 'h' < 'o' < 'e' is not the
+        // comparison, 'c' == 'c' then 'h' < 'o' is, and then 'c' < 'd'.
+        if source.collaboration_delta.is_some() {
+            append_canonical_key(out, "collaboration_delta")?;
+            append_canonical_value(out, &source.collaboration_delta)?;
+        }
+        append_canonical_key(out, "default_ref_mutation")?;
+        append_canonical_value(out, &source.default_ref_mutation)?;
+        append_canonical_key(out, "expected_generation")?;
+        append_canonical_value(out, &source.expected_generation)?;
+        append_canonical_key(out, "expected_roots")?;
+        append_canonical_value(out, &source.expected_roots)?;
+        append_canonical_key(out, "external_objects")?;
+        append_canonical_seq(out, &self.external_objects)?;
+        append_canonical_key(out, "git_authority_delta")?;
+        append_canonical_value(out, &source.git_authority_delta)?;
+        append_canonical_key(out, "local_overlay_delta")?;
+        append_canonical_value(out, &source.local_overlay_delta)?;
+        if source.merge_transaction_delta.is_some() {
+            append_canonical_key(out, "merge_transaction_delta")?;
+            append_canonical_value(out, &source.merge_transaction_delta)?;
+        }
+        append_canonical_key(out, "operation_id")?;
+        append_canonical_value(out, &source.operation_id)?;
+        // "reason" sorts before "ref_mutations": they share "re", and 'a' is
+        // below 'f'. Writing them the other way round is the mistake this
+        // ordering is easiest to make, and the corpus caught it on the first
+        // run.
+        append_canonical_key(out, "reason")?;
+        append_canonical_value(out, &source.reason.as_str())?;
+        append_canonical_key(out, "ref_mutations")?;
+        append_canonical_seq(out, &self.ref_mutations)?;
+        append_canonical_key(out, "repository_id")?;
+        append_canonical_value(out, &source.repository_id)?;
+        append_canonical_key(out, "schema_version")?;
+        append_canonical_value(out, &source.schema_version)?;
+        if source.sealed_observation.is_some() {
+            append_canonical_key(out, "sealed_observation")?;
+            append_canonical_value(out, &source.sealed_observation)?;
+        }
+        append_canonical_key(out, "workspace_mutation")?;
+        append_canonical_value(out, &self.workspace_mutation)?;
+
+        Ok(())
+    }
+}
+
+impl Serialize for CanonicalTransaction<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let source = self.source;
+
+        if serializer.is_human_readable() {
+            use serde::ser::SerializeStruct;
+
+            // Mirrors the derive on `RepositoryTransactionHumanReadable`,
+            // including its name: a serializer that records struct names must
+            // see the same one. Its two tail fields skip independently on their
+            // own `Option::is_none`, which is NOT the positional branch's rule.
+            let field_count = HUMAN_READABLE_FIELD_COUNT
+                + usize::from(source.merge_transaction_delta.is_some())
+                + usize::from(source.sealed_observation.is_some())
+                + usize::from(source.collaboration_delta.is_some());
+            let mut state =
+                serializer.serialize_struct("RepositoryTransactionHumanReadable", field_count)?;
+            state.serialize_field("schema_version", &source.schema_version)?;
+            state.serialize_field("operation_id", &source.operation_id)?;
+            state.serialize_field("repository_id", &source.repository_id)?;
+            state.serialize_field("expected_generation", &source.expected_generation)?;
+            state.serialize_field("expected_roots", &source.expected_roots)?;
+            state.serialize_field("actor", &source.actor)?;
+            state.serialize_field("reason", source.reason.as_str())?;
+            state.serialize_field("external_objects", &self.external_objects)?;
+            state.serialize_field("git_authority_delta", &source.git_authority_delta)?;
+            state.serialize_field("changes", &self.changes)?;
+            state.serialize_field("aliases", &self.aliases)?;
+            state.serialize_field("ref_mutations", &self.ref_mutations)?;
+            state.serialize_field("default_ref_mutation", &source.default_ref_mutation)?;
+            state.serialize_field("workspace_mutation", &self.workspace_mutation)?;
+            state.serialize_field("local_overlay_delta", &source.local_overlay_delta)?;
+            if source.merge_transaction_delta.is_some() {
+                state
+                    .serialize_field("merge_transaction_delta", &source.merge_transaction_delta)?;
+            }
+            if source.sealed_observation.is_some() {
+                state.serialize_field("sealed_observation", &source.sealed_observation)?;
+            }
+            if source.collaboration_delta.is_some() {
+                state.serialize_field("collaboration_delta", &source.collaboration_delta)?;
+            }
+            return state.end();
+        }
+
+        use serde::ser::SerializeSeq;
+
+        // Mirrors the positional branch of `impl Serialize for
+        // RepositoryTransaction`, whose element count varies with which
+        // optional tail fields are present.
+        const LEGACY_FIELD_COUNT: usize = 15;
+        let has_collaboration_slot = source.collaboration_delta.is_some();
+        let has_sealed_slot = source.sealed_observation.is_some() || has_collaboration_slot;
+        let has_merge_slot = source.merge_transaction_delta.is_some() || has_sealed_slot;
+        let field_count = LEGACY_FIELD_COUNT
+            + usize::from(has_merge_slot)
+            + usize::from(has_sealed_slot)
+            + usize::from(has_collaboration_slot);
+        let mut sequence = serializer.serialize_seq(Some(field_count))?;
+        sequence.serialize_element(&source.schema_version)?;
+        sequence.serialize_element(&source.operation_id)?;
+        sequence.serialize_element(&source.repository_id)?;
+        sequence.serialize_element(&source.expected_generation)?;
+        sequence.serialize_element(&source.expected_roots)?;
+        sequence.serialize_element(&source.actor)?;
+        sequence.serialize_element(&source.reason)?;
+        sequence.serialize_element(&self.external_objects)?;
+        sequence.serialize_element(&source.git_authority_delta)?;
+        sequence.serialize_element(&self.changes)?;
+        sequence.serialize_element(&self.aliases)?;
+        sequence.serialize_element(&self.ref_mutations)?;
+        sequence.serialize_element(&source.default_ref_mutation)?;
+        sequence.serialize_element(&self.workspace_mutation)?;
+        sequence.serialize_element(&source.local_overlay_delta)?;
+        if has_merge_slot {
+            sequence.serialize_element(&source.merge_transaction_delta)?;
+        }
+        if has_sealed_slot {
+            sequence.serialize_element(&source.sealed_observation)?;
+        }
+        if has_collaboration_slot {
+            sequence.serialize_element(&source.collaboration_delta)?;
+        }
+        sequence.end()
+    }
+}
+
+/// Canonically ordered view of one [`SemanticChange`].
+///
+/// Mirrors that type's derive rather than a hand-written encoding, so the
+/// obligation is field order, the struct name, and the trailing
+/// `skip_serializing_if = "Vec::is_empty"` on `external_reference_deltas`.
+struct CanonicalChange<'a> {
+    source: &'a SemanticChange,
+    entity_deltas: Vec<&'a EntityDelta>,
+    relation_deltas: Vec<&'a RelationDelta>,
+    tree_deltas: Vec<&'a TreeDelta>,
+    external_reference_deltas: Vec<&'a ExternalReferenceDelta>,
+}
+
+impl<'a> CanonicalChange<'a> {
+    fn new(source: &'a SemanticChange) -> Self {
+        let mut entity_deltas: Vec<&'a EntityDelta> = source.entity_deltas.iter().collect();
+        entity_deltas.sort_by_key(|delta| EntityDelta::target_id(delta));
+
+        let mut relation_deltas: Vec<&'a RelationDelta> = source.relation_deltas.iter().collect();
+        relation_deltas.sort_by_key(|delta| RelationDelta::target_id(delta));
+
+        let mut tree_deltas: Vec<&'a TreeDelta> = source.tree_deltas.iter().collect();
+        tree_deltas.sort_by_key(|delta| TreeDelta::artifact_id(delta));
+
+        let mut external_reference_deltas: Vec<&'a ExternalReferenceDelta> =
+            source.external_reference_deltas.iter().collect();
+        external_reference_deltas.sort_by_key(|delta| ExternalReferenceDelta::target_id(delta));
+
+        Self {
+            source,
+            entity_deltas,
+            relation_deltas,
+            tree_deltas,
+            external_reference_deltas,
+        }
+    }
+}
+
+impl Serialize for CanonicalChange<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let source = self.source;
+        const ALWAYS_PRESENT_FIELD_COUNT: usize = 14;
+        let field_count =
+            ALWAYS_PRESENT_FIELD_COUNT + usize::from(!self.external_reference_deltas.is_empty());
+        let mut state = serializer.serialize_struct("SemanticChange", field_count)?;
+        state.serialize_field("id", &source.id)?;
+        state.serialize_field("origin", &source.origin)?;
+        state.serialize_field("parents", &source.parents)?;
+        state.serialize_field("timestamp", &source.timestamp)?;
+        state.serialize_field("author", &source.author)?;
+        state.serialize_field("message", &source.message)?;
+        state.serialize_field("entity_deltas", &self.entity_deltas)?;
+        state.serialize_field("relation_deltas", &self.relation_deltas)?;
+        state.serialize_field("tree_deltas", &self.tree_deltas)?;
+        state.serialize_field("admission_policy_delta", &source.admission_policy_delta)?;
+        state.serialize_field("projected_files", &source.projected_files)?;
+        state.serialize_field("spec_link", &source.spec_link)?;
+        state.serialize_field("evidence", &source.evidence)?;
+        state.serialize_field("risk_summary", &source.risk_summary)?;
+        if !self.external_reference_deltas.is_empty() {
+            state.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        }
+        state.end()
+    }
+}
+
+/// Canonically ordered view of one [`WorkspaceMutation`].
+///
+/// Mirrors that type's derive: eleven fields, none skipped.
+struct CanonicalWorkspaceMutation<'a> {
+    source: &'a WorkspaceMutation,
+    tree_deltas: Vec<&'a TreeDelta>,
+    semantic_delta: CanonicalWorkspaceSemanticDelta<'a>,
+}
+
+impl<'a> CanonicalWorkspaceMutation<'a> {
+    fn new(source: &'a WorkspaceMutation) -> Self {
+        let mut tree_deltas: Vec<&'a TreeDelta> = source.tree_deltas.iter().collect();
+        tree_deltas.sort_by_key(|delta| TreeDelta::artifact_id(delta));
+        Self {
+            source,
+            tree_deltas,
+            semantic_delta: CanonicalWorkspaceSemanticDelta::new(&source.semantic_delta),
+        }
+    }
+}
+
+impl Serialize for CanonicalWorkspaceMutation<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let source = self.source;
+        let mut state = serializer.serialize_struct("WorkspaceMutation", 11)?;
+        state.serialize_field("workspace_id", &source.workspace_id)?;
+        state.serialize_field("expected", &source.expected)?;
+        state.serialize_field("new_generation", &source.new_generation)?;
+        state.serialize_field("new_head", &source.new_head)?;
+        state.serialize_field("new_base_target", &source.new_base_target)?;
+        state.serialize_field("new_base_tree_hash", &source.new_base_tree_hash)?;
+        state.serialize_field("tree_deltas", &self.tree_deltas)?;
+        state.serialize_field("new_tree_hash", &source.new_tree_hash)?;
+        state.serialize_field("semantic_delta", &self.semantic_delta)?;
+        state.serialize_field(
+            "new_shared_admission_policy",
+            &source.new_shared_admission_policy,
+        )?;
+        state.serialize_field("new_admission_policy", &source.new_admission_policy)?;
+        state.end()
+    }
+}
+
+/// Canonically ordered view of one [`WorkspaceSemanticDelta`].
+///
+/// The only collection here that a valid transaction can carry out of order is
+/// none of them: `WorkspaceSemanticDelta::validate` REJECTS non-canonical order
+/// rather than canonicalizing it, so this view's sorting is defensive against
+/// input that cannot legally arrive. It is still exercised, because the
+/// differential drives `canonical_hash` directly and can therefore feed it
+/// orderings no valid transaction may carry.
+struct CanonicalWorkspaceSemanticDelta<'a> {
+    source: &'a WorkspaceSemanticDelta,
+    entity_deltas: Vec<&'a EntityDelta>,
+    relation_deltas: Vec<&'a RelationDelta>,
+    external_reference_deltas: Vec<&'a ExternalReferenceDelta>,
+}
+
+impl<'a> CanonicalWorkspaceSemanticDelta<'a> {
+    fn new(source: &'a WorkspaceSemanticDelta) -> Self {
+        let mut entity_deltas: Vec<&'a EntityDelta> = source.entity_deltas.iter().collect();
+        entity_deltas.sort_by_key(|delta| EntityDelta::target_id(delta));
+
+        let mut relation_deltas: Vec<&'a RelationDelta> = source.relation_deltas.iter().collect();
+        relation_deltas.sort_by_key(|delta| RelationDelta::target_id(delta));
+
+        let mut external_reference_deltas: Vec<&'a ExternalReferenceDelta> =
+            source.external_reference_deltas.iter().collect();
+        external_reference_deltas.sort_by_key(|delta| ExternalReferenceDelta::target_id(delta));
+
+        Self {
+            source,
+            entity_deltas,
+            relation_deltas,
+            external_reference_deltas,
+        }
+    }
+}
+
+impl Serialize for CanonicalWorkspaceSemanticDelta<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        const ALWAYS_PRESENT_FIELD_COUNT: usize = 3;
+        let field_count =
+            ALWAYS_PRESENT_FIELD_COUNT + usize::from(!self.external_reference_deltas.is_empty());
+        let mut state = serializer.serialize_struct("WorkspaceSemanticDelta", field_count)?;
+        state.serialize_field("version", &self.source.version)?;
+        state.serialize_field("entity_deltas", &self.entity_deltas)?;
+        state.serialize_field("relation_deltas", &self.relation_deltas)?;
+        if !self.external_reference_deltas.is_empty() {
+            state.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        }
+        state.end()
+    }
+}
+
+impl RepositoryTransaction {
+    pub fn validate(&self) -> Result<()> {
+        self.validate_changes(self.changes.len(), self.changes.iter().map(Ok))
+    }
+
+    fn validate_changes<C: std::borrow::Borrow<SemanticChange>>(
+        &self,
+        change_count: usize,
+        changes: impl IntoIterator<Item = Result<C>>,
+    ) -> Result<()> {
+        if self.schema_version != REPOSITORY_TRANSACTION_SCHEMA_VERSION {
+            return Err(ModelError::InvalidOperation(format!(
+                "unsupported repository transaction version {}",
+                self.schema_version
+            )));
+        }
+        if self.operation_id.as_uuid().is_nil() {
+            return Err(ModelError::InvalidOperation(
+                "repository transaction operation id must not be nil".to_string(),
+            ));
+        }
+        if self.reason.trim().is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "repository transaction requires a reason".to_string(),
+            ));
+        }
+        if self.external_objects.is_empty()
+            && self.git_authority_delta.is_none()
+            && change_count == 0
+            && self.aliases.is_empty()
+            && self.ref_mutations.is_empty()
+            && self.default_ref_mutation.is_none()
+            && self.workspace_mutation.is_none()
+            && self.local_overlay_delta.is_none()
+            && self.merge_transaction_delta.is_none()
+            && self.collaboration_delta.is_none()
+        {
+            return Err(ModelError::InvalidOperation(
+                "repository transaction must contain at least one mutation".to_string(),
+            ));
+        }
+        if let Some(delta) = &self.collaboration_delta {
+            delta.validate().map_err(|error| {
+                ModelError::InvalidOperation(format!("invalid collaboration delta: {error}"))
+            })?;
+        }
+        self.expected_roots.validate()?;
+        if self.expected_generation != self.expected_roots.generation {
+            return Err(ModelError::InvalidOperation(format!(
+                "expected generation {} does not match root bundle generation {}",
+                self.expected_generation, self.expected_roots.generation
+            )));
+        }
+
+        let mut objects = BTreeSet::new();
+        for object in &self.external_objects {
+            if !objects.insert(object.object) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "repository transaction contains duplicate external object {}",
+                    object.object.oid
+                )));
+            }
+        }
+
+        if let Some(delta) = &self.git_authority_delta {
+            delta
+                .validate_for_repository(&self.repository_id)
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "invalid Git external-authority transaction delta: {error}"
+                    ))
+                })?;
+        }
+
+        let mut aliases = BTreeMap::new();
+        for alias in &self.aliases {
+            if alias.repository_id != self.repository_id {
+                return Err(ModelError::InvalidOperation(format!(
+                    "external alias repository {} does not match transaction repository {}",
+                    alias.repository_id, self.repository_id
+                )));
+            }
+            if let Some(previous) = aliases.insert(alias.oid, alias.change_id) {
+                if previous != alias.change_id {
+                    return Err(ModelError::Conflict(format!(
+                        "transaction attempts to bind external commit {} to both {} and {}",
+                        alias.oid, previous, alias.change_id
+                    )));
+                }
+                return Err(ModelError::InvalidOperation(format!(
+                    "repository transaction repeats external alias {}",
+                    alias.oid
+                )));
+            }
+        }
+
+        let mut aliases_by_change: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for alias in &self.aliases {
+            aliases_by_change
+                .entry(alias.change_id)
+                .or_default()
+                .push(alias);
+        }
+        let mut ids = BTreeSet::new();
+        for change in changes {
+            let change = change?;
+            let change = change.borrow();
+            validate_semantic_change_id(change)?;
+            if !ids.insert(change.id) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "repository transaction contains duplicate change {}",
+                    change.id
+                )));
+            }
+            if let Some(aliases) = aliases_by_change.get(&change.id) {
+                for alias in aliases {
+                    alias.validate_change(change)?;
+                }
+            }
+            if let crate::ChangeOrigin::GitCommit { oid } = change.origin {
+                let commit = crate::ExternalObjectId::new(ExternalObjectKind::Commit, oid);
+                if !objects.contains(&commit) {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "Git-origin change {} lacks raw commit object {}",
+                        change.id, oid
+                    )));
+                }
+                if aliases.get(&oid) != Some(&change.id) {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "Git-origin change {} lacks its final alias for {}",
+                        change.id, oid
+                    )));
+                }
+            }
+        }
+
+        if ids.len() != change_count {
+            return Err(ModelError::InvalidOperation(
+                "streamed change count mismatch".into(),
+            ));
+        }
+
+        let mut refs = BTreeSet::new();
+        for mutation in &self.ref_mutations {
+            mutation.validate()?;
+            if !refs.insert(mutation.name.clone()) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "repository transaction mutates ref {} more than once",
+                    mutation.name
+                )));
+            }
+        }
+        if let Some(mutation) = &self.default_ref_mutation {
+            mutation.validate()?;
+        }
+
+        if let Some(workspace) = &self.workspace_mutation {
+            workspace.validate_shape()?;
+        }
+
+        if let Some(overlay_delta) = &self.local_overlay_delta {
+            overlay_delta.validate()?;
+            let new_overlay = overlay_delta.new.as_ref().ok_or_else(|| {
+                ModelError::InvalidOperation(
+                    "repository transaction cannot remove a required local overlay".to_string(),
+                )
+            })?;
+            let workspace = self.workspace_mutation.as_ref().ok_or_else(|| {
+                ModelError::InvalidOperation(
+                    "local overlay mutation is not bound to a workspace mutation".to_string(),
+                )
+            })?;
+            if workspace.workspace_id != new_overlay.workspace_id
+                || workspace.new_admission_policy.local != new_overlay.stamp()
+            {
+                return Err(ModelError::InvalidOperation(
+                    "local overlay mutation and workspace state must bind the same workspace and new overlay stamp"
+                        .to_string(),
+                ));
+            }
+        }
+
+        if let Some(merge_delta) = &self.merge_transaction_delta {
+            merge_delta.validate()?;
+            for record in [merge_delta.old.as_ref(), merge_delta.new.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if record.repository_id != self.repository_id {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "merge transaction record repository {} does not match transaction \
+                         repository {}",
+                        record.repository_id, self.repository_id
+                    )));
+                }
+            }
+            if let Some(workspace) = &self.workspace_mutation {
+                if merge_delta.workspace_id() != Some(workspace.workspace_id) {
+                    return Err(ModelError::InvalidOperation(
+                        "merge transaction record and workspace mutation must bind the same \
+                         workspace"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        if let Some(binding) = &self.sealed_observation {
+            binding.validate()?;
+        }
+
+        Ok(())
+    }
+
+    pub fn transaction_hash(&self) -> Result<Hash256> {
+        // Deliberately first, and deliberately still here: hash-implies-valid is
+        // contract other callers rely on, so the canonicalization below is split
+        // out beneath it rather than in front of it.
+        self.validate()?;
+        self.canonical_hash()
+    }
+
+    /// Hash metadata with externally stored changes in strictly increasing identity order.
+    ///
+    /// `self.changes` must be empty. The factory is opened three times and must
+    /// return the same fallible sequence each time. Every change is validated,
+    /// and canonical change digests are compared across passes before returning
+    /// a hash. Memory holds one change body and compact identity indexes.
+    pub fn transaction_hash_with_changes<F, I>(
+        &self,
+        change_count: usize,
+        mut open: F,
+    ) -> Result<Hash256>
+    where
+        F: FnMut() -> Result<I>,
+        I: IntoIterator<Item = Result<SemanticChange>>,
+    {
+        if !self.changes.is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "streamed transaction metadata must have no owned changes".into(),
+            ));
+        }
+        let mut validated = HashingSink::new();
+        let mut previous = None;
+        self.validate_changes(
+            change_count,
+            open()?.into_iter().map(|item| {
+                let change = item?;
+                check_stream_order(&mut previous, change.id)?;
+                append_canonical_value(&mut validated, &CanonicalChange::new(&change))?;
+                Ok(change)
+            }),
+        )?;
+        let digest = validated.finish();
+        let view = CanonicalTransaction::new(self);
+        let mut counter = CountingSink::default();
+        view.write_preimage_with_changes(&mut counter, |out| {
+            write_streamed_changes(out, change_count, open()?, digest)
+        })?;
+        let mut sink = HashingSink::new();
+        sink.write_bytes(REPOSITORY_TRANSACTION_HASH_DOMAIN);
+        sink.write_bytes(&counter.len().to_le_bytes());
+        let header_len = sink.written();
+        view.write_preimage_with_changes(&mut sink, |out| {
+            write_streamed_changes(out, change_count, open()?, digest)
+        })?;
+        if sink.written() - header_len != counter.len() {
+            return Err(ModelError::InvalidOperation(
+                "canonical preimage length differs between counting and hashing passes".into(),
+            ));
+        }
+        Ok(Hash256::from_bytes(sink.finish()))
+    }
+
+    /// Canonical identity of this transaction, without validating it.
+    ///
+    /// Split from [`Self::transaction_hash`] so the canonicalization can be
+    /// exercised against transactions built purely to vary ordering, which need
+    /// not satisfy `validate`. Callers outside tests want `transaction_hash`,
+    /// which validates first.
+    fn canonical_hash(&self) -> Result<Hash256> {
+        let view = CanonicalTransaction::new(self);
+
+        // Two passes over the same walk, because the preimage's length is
+        // hashed AHEAD of the preimage and a hasher cannot be told the length
+        // afterwards. The first pass counts and keeps nothing; the second
+        // hashes and keeps nothing. What neither does is hold the encoding,
+        // which on a bootstrap commit is the entire converted history.
+        let mut counter = CountingSink::default();
+        view.write_canonical_preimage(&mut counter)?;
+        let payload_len = counter.len();
+
+        let mut sink = HashingSink::new();
+        sink.write_bytes(REPOSITORY_TRANSACTION_HASH_DOMAIN);
+        sink.write_bytes(&payload_len.to_le_bytes());
+        let header_len = sink.written();
+        view.write_canonical_preimage(&mut sink)?;
+
+        // The two passes walk the same immutable view, so they agree or
+        // something under them is not deterministic. Refuse rather than return
+        // a well-formed hash of a preimage whose length prefix contradicts its
+        // payload, because every transaction identity in every store on disk is
+        // this value.
+        let hashed_payload = sink.written() - header_len;
+        if hashed_payload != payload_len {
+            return Err(ModelError::InvalidOperation(format!(
+                "canonical preimage length pass counted {payload_len} bytes and the \
+                 hashing pass wrote {hashed_payload}; the transaction hash is not \
+                 derivable from a non-deterministic encoding"
+            )));
+        }
+
+        Ok(Hash256::from_bytes(sink.finish()))
+    }
+}
+
+fn check_stream_order(previous: &mut Option<SemanticChangeId>, id: SemanticChangeId) -> Result<()> {
+    if previous.is_some_and(|previous| previous >= id) {
+        return Err(ModelError::InvalidOperation(
+            "streamed changes must have strictly increasing identities".into(),
+        ));
+    }
+    *previous = Some(id);
+    Ok(())
+}
+
+fn write_streamed_changes<S: CanonicalSink>(
+    out: &mut S,
+    expected: usize,
+    changes: impl IntoIterator<Item = Result<SemanticChange>>,
+    validated_digest: [u8; 32],
+) -> Result<()> {
+    out.push_byte(4);
+    out.write_bytes(
+        &u64::try_from(expected)
+            .map_err(|_| ModelError::InvalidOperation("canonical array exceeds u64".into()))?
+            .to_le_bytes(),
+    );
+    let mut digest = HashingSink::new();
+    let mut previous = None;
+    let mut count = 0;
+    for change in changes {
+        let change = change?;
+        check_stream_order(&mut previous, change.id)?;
+        if count == expected {
+            return Err(ModelError::InvalidOperation(
+                "streamed change count mismatch".into(),
+            ));
+        }
+        let bytes = canonical_json_bytes(&CanonicalChange::new(&change))?;
+        out.write_bytes(&bytes);
+        digest.write_bytes(&bytes);
+        count += 1;
+    }
+    if count != expected || digest.finish() != validated_digest {
+        return Err(ModelError::InvalidOperation(
+            "streamed changes differ from validated sequence".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryCommitOutcome {
+    Committed,
+    IdempotentReplay,
+}
+
+/// Durable result returned for a committed or idempotently replayed operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryCommitReceipt {
+    pub operation_id: OperationId,
+    pub repository_id: RepositoryId,
+    pub transaction_hash: Hash256,
+    pub outcome: RepositoryCommitOutcome,
+    pub generation: u64,
+    pub roots_before: RootBundle,
+    pub roots_after: RootBundle,
+    pub operation: RepositoryOperationRecord,
+}
+
+impl RepositoryCommitReceipt {
+    pub fn validate(&self) -> Result<()> {
+        self.operation.validate()?;
+        if self.operation_id != self.operation.operation_id
+            || self.repository_id != self.operation.repository_id
+            || self.transaction_hash != self.operation.transaction_hash
+            || self.roots_before != self.operation.roots_before
+            || self.roots_after != self.operation.roots_after
+        {
+            return Err(ModelError::InvalidOperation(
+                "repository receipt does not match its operation record".to_string(),
+            ));
+        }
+        if self.generation != self.roots_after.generation {
+            return Err(ModelError::InvalidOperation(format!(
+                "repository receipt generation {} does not match roots-after generation {}",
+                self.generation, self.roots_after.generation
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Storage boundary implemented by the durable repository authority.
+pub trait RepositoryAuthorityStore: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn commit_repository_transaction(
+        &self,
+        transaction: RepositoryTransaction,
+    ) -> std::result::Result<RepositoryCommitReceipt, Self::Error>;
+
+    fn get_repository_ref(
+        &self,
+        repository_id: &RepositoryId,
+        name: &RefName,
+    ) -> std::result::Result<Option<RepositoryRef>, Self::Error>;
+
+    fn list_repository_refs(
+        &self,
+        repository_id: &RepositoryId,
+    ) -> std::result::Result<Vec<RepositoryRef>, Self::Error>;
+
+    fn resolve_external_alias(
+        &self,
+        repository_id: &RepositoryId,
+        oid: &GitObjectId,
+    ) -> std::result::Result<Option<SemanticChangeId>, Self::Error>;
+
+    fn workspace_snapshot_binding(
+        &self,
+        repository_id: &RepositoryId,
+        workspace_id: &WorkspaceId,
+    ) -> std::result::Result<Option<WorkspaceSnapshotBinding>, Self::Error>;
+
+    fn get_workspace_state(
+        &self,
+        repository_id: &RepositoryId,
+        workspace_id: &WorkspaceId,
+    ) -> std::result::Result<Option<WorkspaceState>, Self::Error>;
+}
+
+/// Canonical identity of an exact resolved repository tree.
+pub fn compute_resolved_tree_hash(tree: &ResolvedTree) -> Result<Hash256> {
+    hash_serialized(b"kin-resolved-tree-v1\0", tree)
+}
+
+/// Hash a canonical payload a caller has already encoded.
+///
+/// Split from [`hash_serialized`] so a caller that assembles its preimage
+/// incrementally reaches the same domain separation and the same length prefix
+/// without going back through a whole-document `serde_json::Value`. The bytes
+/// hashed are identical either way; only who built them differs.
+#[cfg(test)]
+fn hash_preimage(domain: &[u8], payload: &[u8]) -> Result<Hash256> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(
+        u64::try_from(payload.len())
+            .map_err(|_| {
+                ModelError::InvalidOperation("repository transaction exceeds u64".to_string())
+            })?
+            .to_le_bytes(),
+    );
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(Hash256::from_bytes(bytes))
+}
+
+fn hash_serialized(domain: &[u8], value: &impl Serialize) -> Result<Hash256> {
+    let payload = canonical_json_bytes(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(
+        u64::try_from(payload.len())
+            .map_err(|_| {
+                ModelError::InvalidOperation("repository transaction exceeds u64".to_string())
+            })?
+            .to_le_bytes(),
+    );
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(Hash256::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use sha1::Sha1;
+
+    use super::*;
+    use crate::{
+        AdmissionCase, AdmissionPolicyStamp, AdmissionRuleSource, AdmissionRuleSourceKind,
+        ArtifactId, Entity, EntityId, EntityKind, EntityMetadata, ExternalObjectId,
+        ExternalReference, FingerprintAlgorithm, FrozenLocalOverlay, GitExternalAuthority,
+        GitObjectBodyLoader, GitObjectFormat, GitRawRef, GitRawTarget, LanguageId,
+        LocalOverlayHash, LocalOverlayStamp, LocatedEntry, RefExpectation, RefUpdatePolicy,
+        RepoPath, SemanticFingerprint, SharedAdmissionPolicy, TreeEntry, Visibility,
+    };
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct TestBodies(BTreeMap<Hash256, Vec<u8>>);
+
+    impl GitObjectBodyLoader for TestBodies {
+        type Error = Infallible;
+
+        fn load_body(
+            &mut self,
+            body_hash: &Hash256,
+        ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.0.get(body_hash).cloned())
+        }
+    }
+
+    fn root(byte: u8) -> AuthorityRoot {
+        AuthorityRoot::new(
+            REPOSITORY_ROOT_SCHEMA_VERSION,
+            Hash256::from_bytes([byte; 32]),
+        )
+    }
+
+    fn roots() -> RootBundle {
+        RootBundle {
+            version: REPOSITORY_ROOT_SCHEMA_VERSION,
+            generation: 7,
+            history: root(1),
+            ref_state: root(2),
+            ref_log: root(3),
+            collaboration: root(4),
+            replication: root(5),
+            local_state: root(6),
+        }
+    }
+
+    fn blob_git_authority(repository_id: RepositoryId, body: &[u8]) -> GitExternalAuthority {
+        let mut envelope = format!("blob {}\0", body.len()).into_bytes();
+        envelope.extend_from_slice(body);
+        let digest = Sha1::digest(&envelope);
+        let mut oid = [0_u8; 20];
+        oid.copy_from_slice(&digest);
+        let object = ExternalObjectId::new(ExternalObjectKind::Blob, GitObjectId::sha1(oid));
+        let record =
+            ExternalObjectRecord::from_raw(ExternalObjectKind::Blob, object.oid, body).unwrap();
+        let mut bodies = TestBodies::default();
+        bodies.0.insert(record.body_hash, body.to_vec());
+        let main = RefName::branch(b"main").unwrap();
+        GitExternalAuthority::from_raw_parts(
+            repository_id,
+            GitObjectFormat::Sha1,
+            vec![GitRawRef {
+                name: main.clone(),
+                target: GitRawTarget::Direct { object },
+            }],
+            GitRawTarget::Symbolic { target: main },
+            vec![record],
+            &mut bodies,
+        )
+        .unwrap()
+    }
+
+    fn authority_only_transaction(delta: GitExternalAuthorityDelta) -> RepositoryTransaction {
+        let mut transaction = workspace_transaction();
+        transaction.reason = "replace external Git authority atomically".to_string();
+        transaction.git_authority_delta = Some(delta);
+        transaction.workspace_mutation = None;
+        transaction.local_overlay_delta = None;
+        transaction
+    }
+
+    /// The premise the borrowing path rests on, asserted rather than argued.
+    ///
+    /// `canonicalized` may borrow instead of copying only because a record that
+    /// has passed `validate` already has its semantic delta in the order
+    /// `sort_canonical` would impose. That holds only if the two use the SAME
+    /// key: `sort_canonical` sorts by `target_id`, and `validate` refuses
+    /// adjacent pairs that are not strictly increasing by `target_id`.
+    ///
+    /// If this ever fires, `canonicalized` must go back to copying, or become a
+    /// view type that sorts the delta itself. Everything else here assumes it.
+    #[test]
+    fn validate_enforces_the_order_sort_canonical_imposes() {
+        let first = EntityDelta::Added {
+            new: semantic_entity(1, "first"),
+        };
+        let second = EntityDelta::Added {
+            new: semantic_entity(2, "second"),
+        };
+        assert_ne!(
+            first.target_id(),
+            second.target_id(),
+            "the control: the two deltas must have distinct targets, or order is unobservable"
+        );
+        let (low, high) = if first.target_id() < second.target_id() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        let descending = WorkspaceSemanticDelta {
+            version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+            entity_deltas: vec![high.clone(), low.clone()],
+            relation_deltas: Vec::new(),
+            external_reference_deltas: Vec::new(),
+        };
+        assert!(
+            descending.validate().is_err(),
+            "validate must refuse a descending delta, or it enforces no order at all"
+        );
+
+        let mut sorted = descending.clone();
+        sorted.sort_canonical();
+        assert_eq!(
+            sorted.entity_deltas,
+            vec![low, high],
+            "sort_canonical must order by the key validate enforces"
+        );
+        sorted.validate().expect(
+            "a sorted delta must satisfy validate; if it does not, sort_canonical and validate \
+             use different keys and canonicalized must not borrow",
+        );
+    }
+
+    /// The borrowing identity must be the copying identity, byte for byte.
+    ///
+    /// This is a PERSISTED authority digest. A byte that differs is not a
+    /// faster hash, it is every root bundle in every store being wrong, so the
+    /// borrowing path is graded against the exact body that shipped rather than
+    /// against a constant this binary produced.
+    #[test]
+    fn the_borrowed_identity_is_the_copying_identity_for_every_shape() {
+        let mut reversed_refs = sample_operation_record();
+        reversed_refs.ref_mutations.reverse();
+
+        let mut reversed_tree = sample_operation_record();
+        if let Some(workspace) = &mut reversed_tree.workspace_mutation {
+            workspace.tree_deltas.reverse();
+        }
+
+        let mut no_workspace = sample_operation_record();
+        no_workspace.workspace_mutation = None;
+
+        let mut no_refs = sample_operation_record();
+        no_refs.ref_mutations.clear();
+
+        // A case that IS canonical, so the borrow path is exercised. The
+        // fixture is deliberately non-canonical: `canonicalizable_transaction`
+        // says "every vector below is out of canonical order on purpose", so
+        // without this every case took the copy path, and the control below
+        // said so on the first CI run.
+        let mut already_canonical = sample_operation_record();
+        already_canonical
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut already_canonical.workspace_mutation {
+            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+        }
+
+        let cases: [(&str, RepositoryOperationRecord); 6] = [
+            ("already canonical", already_canonical),
+            ("as built", sample_operation_record()),
+            ("ref mutations reversed", reversed_refs),
+            ("tree deltas reversed", reversed_tree),
+            ("no workspace mutation", no_workspace),
+            ("no ref mutations", no_refs),
+        ];
+
+        for (name, record) in &cases {
+            let borrowed = record.identity_hash().expect("the borrowing path hashes");
+            let copying = record
+                .identity_hash_by_copying()
+                .expect("the copying oracle hashes");
+            assert_eq!(
+                borrowed, copying,
+                "the borrowed identity differs from the copying identity for the {name} case, \
+                 which would change a persisted authority digest"
+            );
+        }
+
+        // The control that stops this passing vacuously: at least one case must
+        // actually take the COPYING path, or the differential only ever
+        // compared the borrowing path with itself.
+        assert!(
+            cases
+                .iter()
+                .any(|(_, record)| !record.is_already_canonical()),
+            "the control: some case must be non-canonical, or the copy path is never exercised"
+        );
+        // And at least one must take the BORROWING path, for the same reason in
+        // the other direction.
+        assert!(
+            cases
+                .iter()
+                .any(|(_, record)| record.is_already_canonical()),
+            "the control: some case must be canonical, or the borrow path is never exercised"
+        );
+    }
+
+    /// One operation record carrying every optional field this crate can put in
+    /// one.
+    ///
+    /// `RepositoryOperationRecord::identity_hash` hashes `identity_payload()`
+    /// through the shared canonical encoder, and no transaction fixture reaches
+    /// it, so the byte differential needs a record built directly. The Git
+    /// authority delta is set here for the same reason it is set in the preimage
+    /// corpus: it is the payload the encoder rewrite was about (FIR-2551).
+    fn sample_operation_record() -> RepositoryOperationRecord {
+        let transaction = canonicalizable_transaction();
+        let mut roots_after = roots();
+        roots_after.generation += 1;
+        RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: Some(GitExternalAuthorityDelta::initialize(blob_git_authority(
+                RepositoryId::new("repo").unwrap(),
+                b"services:\n  api:\n    build: .\n",
+            ))),
+            ref_mutations: transaction.ref_mutations.clone(),
+            default_ref_mutation: transaction.default_ref_mutation.clone(),
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            merge_transaction_delta: None,
+            roots_before: roots(),
+            roots_after,
+        }
+    }
+
+    #[test]
+    fn replicated_truth_equality_classifies_every_root_bundle_field() {
+        let expected = roots();
+
+        type Case = (&'static str, bool, fn(&mut RootBundle));
+        let cases: [Case; 8] = [
+            ("version", false, |bundle| bundle.version += 1),
+            ("generation", true, |bundle| bundle.generation += 9),
+            ("history", false, |bundle| bundle.history = root(0x71)),
+            ("ref_state", false, |bundle| bundle.ref_state = root(0x72)),
+            ("ref_log", true, |bundle| bundle.ref_log = root(0x73)),
+            ("collaboration", false, |bundle| {
+                bundle.collaboration = root(0x74)
+            }),
+            ("replication", false, |bundle| {
+                bundle.replication = root(0x75)
+            }),
+            ("local_state", true, |bundle| {
+                bundle.local_state = root(0x76)
+            }),
+        ];
+
+        assert_eq!(
+            messagepack_array_len(&rmp_serde::to_vec(&expected).unwrap()),
+            cases.len(),
+            "RootBundle gained or lost a field; classify it explicitly as replicated or receiver-local"
+        );
+
+        let expected_wire = rmp_serde::to_vec(&expected).unwrap();
+        for (field, expects_same_replicated_truth, mutate) in cases {
+            let mut changed = expected.clone();
+            mutate(&mut changed);
+
+            assert_ne!(changed, expected, "{field} mutation must change the bundle");
+            assert_ne!(
+                rmp_serde::to_vec(&changed).unwrap(),
+                expected_wire,
+                "{field} must remain bound by complete RootBundle identity"
+            );
+            assert_eq!(
+                expected.has_same_replicated_truth(&changed),
+                expects_same_replicated_truth,
+                "{field} has the wrong replicated-truth classification"
+            );
+        }
+
+        let mut another_receiver = expected.clone();
+        another_receiver.generation += 9;
+        another_receiver.ref_log = root(0x77);
+        another_receiver.local_state = root(0x78);
+        assert!(expected.has_same_replicated_truth(&another_receiver));
+        assert_ne!(expected, another_receiver);
+        assert_ne!(expected_wire, rmp_serde::to_vec(&another_receiver).unwrap());
+
+        another_receiver.ref_state = root(0x79);
+        assert!(
+            !expected.has_same_replicated_truth(&another_receiver),
+            "receiver-local receipt differences must not hide a real ref-state move"
+        );
+    }
+
+    #[test]
+    fn root_bundle_rejects_mixed_schema_version_in_every_partition() {
+        type Case = (&'static str, fn(&mut RootBundle));
+        let cases: [Case; 6] = [
+            ("history", |bundle| bundle.history.version += 1),
+            ("ref_state", |bundle| bundle.ref_state.version += 1),
+            ("ref_log", |bundle| bundle.ref_log.version += 1),
+            ("collaboration", |bundle| bundle.collaboration.version += 1),
+            ("replication", |bundle| bundle.replication.version += 1),
+            ("local_state", |bundle| bundle.local_state.version += 1),
+        ];
+
+        for (partition, mutate) in cases {
+            let mut invalid = roots();
+            mutate(&mut invalid);
+            let error = invalid.validate().unwrap_err();
+            let expected = format!("unsupported {partition} authority root version");
+            assert!(
+                error.to_string().contains(expected.as_str()),
+                "{partition} must remain version-validated even when it is receiver-local"
+            );
+        }
+    }
+
+    fn admission_policy(
+        workspace_id: WorkspaceId,
+    ) -> (
+        SharedAdmissionPolicy,
+        EffectiveAdmissionPolicyStamp,
+        FrozenLocalOverlayDelta,
+    ) {
+        let shared = SharedAdmissionPolicy::empty(0);
+        let local =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        (
+            shared.clone(),
+            EffectiveAdmissionPolicyStamp {
+                shared: shared.stamp(),
+                local: local.stamp(),
+            },
+            FrozenLocalOverlayDelta::initialize(local),
+        )
+    }
+
+    fn add_artifact(
+        artifact_id: ArtifactId,
+        path: impl Into<Vec<u8>>,
+        byte: u8,
+        executable: bool,
+    ) -> TreeDelta {
+        TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(
+                RepoPath::from_bytes(path).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([byte; 32]), executable),
+            ),
+        }
+    }
+
+    fn semantic_entity(id: u128, name: &str) -> Entity {
+        Entity {
+            id: EntityId(Uuid::from_u128(id)),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([id as u8; 32]),
+                signature_hash: Hash256::from_bytes([id as u8; 32]),
+                behavior_hash: Hash256::from_bytes([id as u8; 32]),
+                equivalence_hash: Hash256::from_bytes([id as u8; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Private,
+            role: Default::default(),
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn create_workspace_mutation(
+        workspace_id: WorkspaceId,
+        shared_policy: SharedAdmissionPolicy,
+        policy: EffectiveAdmissionPolicyStamp,
+        deltas: Vec<TreeDelta>,
+    ) -> WorkspaceMutation {
+        let tree = ResolvedTree::default().apply(&deltas).unwrap();
+        WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: WorkspaceHead::Symbolic {
+                target: RefName::branch(b"main").unwrap(),
+            },
+            new_base_target: None,
+            new_base_tree_hash: None,
+            tree_deltas: deltas,
+            new_tree_hash: compute_resolved_tree_hash(&tree).unwrap(),
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: shared_policy,
+            new_admission_policy: policy,
+        }
+    }
+
+    fn workspace_transaction() -> RepositoryTransaction {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(9));
+        let (shared_policy, policy, local_overlay_delta) = admission_policy(workspace_id);
+        let mutation = create_workspace_mutation(
+            workspace_id,
+            shared_policy,
+            policy,
+            vec![
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(10)),
+                    b"compose.yaml".to_vec(),
+                    0x41,
+                    false,
+                ),
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(11)),
+                    b"assets/data-\xff.bin".to_vec(),
+                    0x42,
+                    false,
+                ),
+            ],
+        );
+        RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(12)),
+            repository_id: repository_id.clone(),
+            expected_generation: 7,
+            expected_roots: roots(),
+            actor: AuthorId::new("actor"),
+            reason: "capture exact workspace".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(mutation),
+            local_overlay_delta: Some(local_overlay_delta),
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        }
+    }
+
+    /// Peak live bytes allocated by `body` on this thread, from the crate's
+    /// one allocation probe.
+    fn measure_peak_live_bytes(body: impl FnOnce()) -> usize {
+        crate::alloc_probe::peak_live_bytes(body)
+    }
+
+    fn sealed_observation() -> SealedObservationBinding {
+        SealedObservationBinding::new(Hash256::from_bytes([0x73; 32]), 3, 21, 7, 98, 1, 1).unwrap()
+    }
+
+    fn messagepack_array_len(bytes: &[u8]) -> usize {
+        match bytes {
+            [tag @ 0x90..=0x9f, ..] => usize::from(*tag & 0x0f),
+            [0xdc, high, low, ..] => usize::from(u16::from_be_bytes([*high, *low])),
+            [0xdd, a, b, c, d, ..] => {
+                usize::try_from(u32::from_be_bytes([*a, *b, *c, *d])).unwrap()
+            }
+            _ => panic!("expected a MessagePack array"),
+        }
+    }
+
+    /// A transaction that touches no merge or seal must hash exactly as it did
+    /// before either binding existed.
+    ///
+    /// The two pinned digests were measured on the commit that introduced this
+    /// test, before `merge_transaction_delta` was added. They are what makes
+    /// the field additive in fact rather than in intent: every repository
+    /// already on disk keeps its operation identities and its authority roots,
+    /// so no re-import is owed. A change that moves either digest has broken
+    /// that promise and must carry a schema version instead.
+    #[test]
+    fn a_transaction_without_a_merge_keeps_its_pre_merge_identity() {
+        let transaction = workspace_transaction();
+        assert!(transaction.merge_transaction_delta.is_none());
+        assert!(transaction.sealed_observation.is_none());
+        assert_eq!(
+            transaction.transaction_hash().unwrap().to_string(),
+            "3d1a5564f1284d98aeacb1b2c6166bc2ae49586661897933dc0cb45bb7f583df",
+            "adding an absent merge record must not move transaction identity"
+        );
+        assert!(
+            !serde_json::to_string(&transaction)
+                .unwrap()
+                .contains("merge_transaction_delta"),
+            "an absent merge record must not appear on the wire"
+        );
+        assert!(
+            !serde_json::to_string(&transaction)
+                .unwrap()
+                .contains("sealed_observation"),
+            "an absent sealed observation must not appear on the wire"
+        );
+
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            merge_transaction_delta: None,
+            roots_before: roots(),
+            roots_after,
+        };
+        assert_eq!(
+            operation.identity_hash().unwrap().to_string(),
+            "eae3a8c100dcc231fd552ce1d20c5e258e489e09139076cfa431ebaf6bfa916b",
+            "adding an absent merge record must not move operation identity"
+        );
+    }
+
+    /// Operation records live inside a MessagePack snapshot, where a struct is
+    /// an array and position decides the mapping.
+    ///
+    /// An optional field is therefore additive only at the end: a record
+    /// written before it existed runs out of elements and takes the default,
+    /// and a record with nothing to say encodes to the same element count it
+    /// always did. This proves both directions against the real encoder rather
+    /// than trusting the JSON contract to describe the on-disk one, which it
+    /// does not.
+    #[test]
+    fn an_operation_record_round_trips_through_positional_encoding() {
+        let transaction = workspace_transaction();
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            roots_before: roots(),
+            roots_after,
+            merge_transaction_delta: None,
+        };
+
+        // An absent merge record is not written at all, so the encoded array
+        // has the arity a pre-merge binary produced, and decodes.
+        let bytes = rmp_serde::to_vec(&operation).unwrap();
+        let decoded: RepositoryOperationRecord = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, operation);
+        assert!(decoded.merge_transaction_delta.is_none());
+
+        let mut with_merge = operation.clone();
+        with_merge.merge_transaction_delta = Some(MergeTransactionDelta::open(
+            crate::merge::tests::sample_record(
+                operation.repository_id.clone(),
+                operation.workspace_mutation.as_ref().unwrap().workspace_id,
+            ),
+        ));
+        let bytes_with_merge = rmp_serde::to_vec(&with_merge).unwrap();
+        assert!(bytes_with_merge.len() > bytes.len());
+        let decoded: RepositoryOperationRecord = rmp_serde::from_slice(&bytes_with_merge).unwrap();
+        assert_eq!(decoded, with_merge);
+    }
+
+    /// The same, for the transaction that carries the delta over the wire.
+    #[test]
+    fn a_transaction_round_trips_through_positional_encoding() {
+        let transaction = workspace_transaction();
+        let bytes = rmp_serde::to_vec(&transaction).unwrap();
+        assert_eq!(messagepack_array_len(&bytes), 15);
+        let decoded: RepositoryTransaction = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(decoded.merge_transaction_delta.is_none());
+        assert!(decoded.sealed_observation.is_none());
+        assert_eq!(
+            decoded.transaction_hash().unwrap(),
+            transaction.transaction_hash().unwrap()
+        );
+
+        let mut with_merge = transaction.clone();
+        with_merge.merge_transaction_delta = Some(MergeTransactionDelta::open(
+            crate::merge::tests::sample_record(
+                transaction.repository_id.clone(),
+                transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id,
+            ),
+        ));
+        let decoded: RepositoryTransaction =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&with_merge).unwrap()).unwrap();
+        assert_eq!(
+            messagepack_array_len(&rmp_serde::to_vec(&with_merge).unwrap()),
+            16
+        );
+        assert_eq!(
+            decoded.transaction_hash().unwrap(),
+            with_merge.transaction_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn positional_transaction_tail_round_trips_all_merge_and_seal_combinations() {
+        let transaction = workspace_transaction();
+        let merge = MergeTransactionDelta::open(crate::merge::tests::sample_record(
+            transaction.repository_id.clone(),
+            transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id,
+        ));
+        let seal = sealed_observation();
+        let collaboration = crate::collaboration::tests::sample_delta();
+        // A present tail slot forces every earlier one to be written as an
+        // explicit nil, so arity is decided by the LAST occupied slot, not by
+        // how many are occupied. That is why the three seventeens and the four
+        // eighteens below are not a typo.
+        let combinations = [
+            (None, None, None, 15),
+            (Some(merge.clone()), None, None, 16),
+            (None, Some(seal), None, 17),
+            (Some(merge.clone()), Some(seal), None, 17),
+            (None, None, Some(collaboration.clone()), 18),
+            (Some(merge.clone()), None, Some(collaboration.clone()), 18),
+            (None, Some(seal), Some(collaboration.clone()), 18),
+            (Some(merge), Some(seal), Some(collaboration), 18),
+        ];
+
+        for (merge_transaction_delta, sealed_observation, collaboration_delta, expected_arity) in
+            combinations
+        {
+            let mut candidate = transaction.clone();
+            candidate.merge_transaction_delta = merge_transaction_delta;
+            candidate.sealed_observation = sealed_observation;
+            candidate.collaboration_delta = collaboration_delta;
+            let encoded = rmp_serde::to_vec(&candidate).unwrap();
+            assert_eq!(messagepack_array_len(&encoded), expected_arity);
+            let decoded: RepositoryTransaction = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, candidate);
+        }
+
+        let mut seal_only = transaction;
+        seal_only.sealed_observation = Some(seal);
+        let json = serde_json::to_value(&seal_only).unwrap();
+        assert!(json.get("merge_transaction_delta").is_none());
+        assert_eq!(
+            json.get("sealed_observation")
+                .and_then(|value| value.get("fingerprint")),
+            Some(&serde_json::to_value(seal.fingerprint).unwrap())
+        );
+    }
+
+    #[test]
+    fn json_transaction_tail_round_trips_all_merge_and_seal_combinations() {
+        let transaction = workspace_transaction();
+        let merge = MergeTransactionDelta::open(crate::merge::tests::sample_record(
+            transaction.repository_id.clone(),
+            transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id,
+        ));
+        let seal = sealed_observation();
+        let collaboration = crate::collaboration::tests::sample_delta();
+        let combinations = [
+            (None, None, None),
+            (Some(merge.clone()), None, None),
+            (None, Some(seal), None),
+            (Some(merge.clone()), Some(seal), None),
+            (None, None, Some(collaboration.clone())),
+            (Some(merge.clone()), None, Some(collaboration.clone())),
+            (None, Some(seal), Some(collaboration.clone())),
+            (Some(merge), Some(seal), Some(collaboration)),
+        ];
+
+        for (merge_transaction_delta, sealed_observation, collaboration_delta) in combinations {
+            let mut candidate = transaction.clone();
+            candidate.merge_transaction_delta = merge_transaction_delta;
+            candidate.sealed_observation = sealed_observation;
+            candidate.collaboration_delta = collaboration_delta;
+            let encoded = serde_json::to_vec(&candidate).unwrap();
+            let decoded: RepositoryTransaction = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, candidate);
+        }
+    }
+
+    /// A transaction that carries no collaboration is byte-identical to what
+    /// the release before this field wrote, at both encodings, for every tail
+    /// it could already have.
+    ///
+    /// This is the reader-version RANGE gate, stated on bytes rather than in
+    /// prose. `V0724RepositoryTransaction` is the wire as kin-model 0.7.24
+    /// wrote and read it, which is also the wire as of 0.7.25: #94 moved only
+    /// the kin-vector requirement in `Cargo.toml`, so `src/repository.rs` is
+    /// byte-identical at both tags and the encoder below is the immediate
+    /// predecessor's as well as 0.7.24's. Three things are asserted against it: the new writer
+    /// produces exactly those bytes when the field is absent, the new reader
+    /// decodes them back, and the pinned digest below does not move.
+    ///
+    /// The digest is what makes the field additive in fact rather than in
+    /// intent. It was measured before this field existed, and every repository
+    /// already on disk keeps its transaction identities and its authority roots
+    /// only while it holds. A change that moves it has broken that promise and
+    /// owes a schema version and a re-import, which is exactly the cost this
+    /// field was shaped to avoid: `REPOSITORY_TRANSACTION_SCHEMA_VERSION` is
+    /// compared by exact equality at `validate`, so a bump refuses every
+    /// transaction every shipped binary builds, in both directions.
+    #[test]
+    fn a_transaction_without_collaboration_keeps_its_pre_collaboration_identity() {
+        #[derive(Serialize)]
+        struct V0724RepositoryTransaction<'a> {
+            schema_version: u32,
+            operation_id: OperationId,
+            repository_id: &'a RepositoryId,
+            expected_generation: u64,
+            expected_roots: &'a RootBundle,
+            actor: &'a AuthorId,
+            reason: &'a str,
+            external_objects: &'a [ExternalObjectRecord],
+            git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
+            changes: &'a [SemanticChange],
+            aliases: &'a [ExternalChangeAlias],
+            ref_mutations: &'a [RefMutation],
+            default_ref_mutation: &'a Option<DefaultRefMutation>,
+            workspace_mutation: &'a Option<WorkspaceMutation>,
+            local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sealed_observation: &'a Option<SealedObservationBinding>,
+        }
+
+        // Mirrors the positional branch as 0.7.24 wrote it: the merge slot is
+        // written when either tail field is present, the sealed slot only when
+        // it is itself present. Written as a type with its own `Serialize`
+        // rather than by driving a serializer, so it goes through the same
+        // `rmp_serde::to_vec` the production path does and no framing
+        // difference can come from the harness.
+        struct V0724Positional<'a>(&'a RepositoryTransaction);
+
+        impl Serialize for V0724Positional<'_> {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeSeq;
+                let transaction = self.0;
+                let has_merge_slot = transaction.merge_transaction_delta.is_some()
+                    || transaction.sealed_observation.is_some();
+                let count = 15
+                    + usize::from(has_merge_slot)
+                    + usize::from(transaction.sealed_observation.is_some());
+                let mut sequence = serializer.serialize_seq(Some(count))?;
+                sequence.serialize_element(&transaction.schema_version)?;
+                sequence.serialize_element(&transaction.operation_id)?;
+                sequence.serialize_element(&transaction.repository_id)?;
+                sequence.serialize_element(&transaction.expected_generation)?;
+                sequence.serialize_element(&transaction.expected_roots)?;
+                sequence.serialize_element(&transaction.actor)?;
+                sequence.serialize_element(&transaction.reason)?;
+                sequence.serialize_element(&transaction.external_objects)?;
+                sequence.serialize_element(&transaction.git_authority_delta)?;
+                sequence.serialize_element(&transaction.changes)?;
+                sequence.serialize_element(&transaction.aliases)?;
+                sequence.serialize_element(&transaction.ref_mutations)?;
+                sequence.serialize_element(&transaction.default_ref_mutation)?;
+                sequence.serialize_element(&transaction.workspace_mutation)?;
+                sequence.serialize_element(&transaction.local_overlay_delta)?;
+                if has_merge_slot {
+                    sequence.serialize_element(&transaction.merge_transaction_delta)?;
+                }
+                if transaction.sealed_observation.is_some() {
+                    sequence.serialize_element(&transaction.sealed_observation)?;
+                }
+                sequence.end()
+            }
+        }
+
+        fn legacy_bytes(transaction: &RepositoryTransaction) -> Vec<u8> {
+            rmp_serde::to_vec(&V0724Positional(transaction)).unwrap()
+        }
+
+        fn legacy_wire(transaction: &RepositoryTransaction) -> V0724RepositoryTransaction<'_> {
+            V0724RepositoryTransaction {
+                schema_version: transaction.schema_version,
+                operation_id: transaction.operation_id,
+                repository_id: &transaction.repository_id,
+                expected_generation: transaction.expected_generation,
+                expected_roots: &transaction.expected_roots,
+                actor: &transaction.actor,
+                reason: &transaction.reason,
+                external_objects: &transaction.external_objects,
+                git_authority_delta: &transaction.git_authority_delta,
+                changes: &transaction.changes,
+                aliases: &transaction.aliases,
+                ref_mutations: &transaction.ref_mutations,
+                default_ref_mutation: &transaction.default_ref_mutation,
+                workspace_mutation: &transaction.workspace_mutation,
+                local_overlay_delta: &transaction.local_overlay_delta,
+                merge_transaction_delta: &transaction.merge_transaction_delta,
+                sealed_observation: &transaction.sealed_observation,
+            }
+        }
+
+        let base = workspace_transaction();
+        assert!(base.collaboration_delta.is_none());
+        assert_eq!(
+            base.transaction_hash().unwrap().to_string(),
+            "3d1a5564f1284d98aeacb1b2c6166bc2ae49586661897933dc0cb45bb7f583df",
+            "adding an absent collaboration delta must not move transaction identity"
+        );
+        assert!(
+            !serde_json::to_string(&base)
+                .unwrap()
+                .contains("collaboration_delta"),
+            "an absent collaboration delta must not appear on the wire"
+        );
+
+        let merge = MergeTransactionDelta::open(crate::merge::tests::sample_record(
+            base.repository_id.clone(),
+            base.workspace_mutation.as_ref().unwrap().workspace_id,
+        ));
+        let seal = sealed_observation();
+        for (merge_transaction_delta, sealed_observation) in [
+            (None, None),
+            (Some(merge.clone()), None),
+            (None, Some(seal)),
+            (Some(merge), Some(seal)),
+        ] {
+            let mut candidate = base.clone();
+            candidate.merge_transaction_delta = merge_transaction_delta;
+            candidate.sealed_observation = sealed_observation;
+
+            let legacy = legacy_bytes(&candidate);
+            assert_eq!(
+                rmp_serde::to_vec(&candidate).unwrap(),
+                legacy,
+                "a collaboration-free transaction must write the exact bytes 0.7.24 wrote"
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<RepositoryTransaction>(&legacy).unwrap(),
+                candidate,
+                "this reader must decode bytes a 0.7.24 writer produced"
+            );
+            assert_eq!(
+                serde_json::to_value(&candidate).unwrap(),
+                serde_json::to_value(legacy_wire(&candidate)).unwrap(),
+                "the named encoding must not gain a key either"
+            );
+        }
+    }
+
+    /// A transaction carrying collaboration records must not be mistakable for
+    /// one that does not, and the operation record inherits that through the
+    /// transaction hash rather than through a field of its own.
+    ///
+    /// The second half is the design being asserted, not an aside.
+    /// `merge_transaction_delta` sits on BOTH the transaction and the operation
+    /// record because it is a small authority transition the append-only audit
+    /// retains. Collaboration records are bulk graph content, like `changes`,
+    /// which is also absent from the record. Putting them in the operation log
+    /// would store every review note twice forever, once in the snapshot and
+    /// once in every record, which is the fat-receipt defect FIR-3064 measured
+    /// at 411,771,864 bytes of a 2,043,051,848 byte store and removed. So the
+    /// record binds WHAT the collaboration root became, through `roots_after`
+    /// and `transaction_hash`, and not WHICH records moved it.
+    #[test]
+    fn a_collaboration_delta_participates_in_transaction_and_operation_identity() {
+        let mut transaction = workspace_transaction();
+        let baseline = transaction.transaction_hash().unwrap();
+        transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
+        transaction.validate().unwrap();
+        let moved = transaction.transaction_hash().unwrap();
+        assert_ne!(
+            baseline, moved,
+            "two transactions differing only in the collaboration they admit share one identity"
+        );
+
+        let mut other = workspace_transaction();
+        let mut second = crate::collaboration::tests::sample_delta();
+        second.review_notes = vec![crate::collaboration::tests::review_note(0x6f)];
+        other.collaboration_delta = Some(second);
+        assert_ne!(
+            moved,
+            other.transaction_hash().unwrap(),
+            "two different collaboration deltas share one transaction identity"
+        );
+
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let record = |transaction: &RepositoryTransaction| RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: transaction.ref_mutations.clone(),
+            default_ref_mutation: transaction.default_ref_mutation.clone(),
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            roots_before: roots(),
+            roots_after: roots_after.clone(),
+            merge_transaction_delta: None,
+        };
+        assert_ne!(
+            record(&workspace_transaction()).identity_hash().unwrap(),
+            record(&transaction).identity_hash().unwrap(),
+            "the operation record must inherit the collaboration difference through its \
+             transaction hash; if it does not, the record needs a field of its own after all"
+        );
+    }
+
+    #[test]
+    fn legacy_v064_transaction_messagepack_bytes_are_preserved_exactly() {
+        #[derive(Serialize)]
+        struct V064RepositoryTransaction<'a> {
+            schema_version: u32,
+            operation_id: OperationId,
+            repository_id: &'a RepositoryId,
+            expected_generation: u64,
+            expected_roots: &'a RootBundle,
+            actor: &'a AuthorId,
+            reason: &'a str,
+            external_objects: &'a [ExternalObjectRecord],
+            git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
+            changes: &'a [SemanticChange],
+            aliases: &'a [ExternalChangeAlias],
+            ref_mutations: &'a [RefMutation],
+            default_ref_mutation: &'a Option<DefaultRefMutation>,
+            workspace_mutation: &'a Option<WorkspaceMutation>,
+            local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+        }
+
+        fn legacy_wire(transaction: &RepositoryTransaction) -> V064RepositoryTransaction<'_> {
+            V064RepositoryTransaction {
+                schema_version: transaction.schema_version,
+                operation_id: transaction.operation_id,
+                repository_id: &transaction.repository_id,
+                expected_generation: transaction.expected_generation,
+                expected_roots: &transaction.expected_roots,
+                actor: &transaction.actor,
+                reason: &transaction.reason,
+                external_objects: &transaction.external_objects,
+                git_authority_delta: &transaction.git_authority_delta,
+                changes: &transaction.changes,
+                aliases: &transaction.aliases,
+                ref_mutations: &transaction.ref_mutations,
+                default_ref_mutation: &transaction.default_ref_mutation,
+                workspace_mutation: &transaction.workspace_mutation,
+                local_overlay_delta: &transaction.local_overlay_delta,
+                merge_transaction_delta: &transaction.merge_transaction_delta,
+            }
+        }
+
+        fn legacy_bytes(transaction: &RepositoryTransaction) -> Vec<u8> {
+            rmp_serde::to_vec(&legacy_wire(transaction)).unwrap()
+        }
+
+        let mut transaction = workspace_transaction();
+        let legacy_json = serde_json::to_value(legacy_wire(&transaction)).unwrap();
+        assert_eq!(serde_json::to_value(&transaction).unwrap(), legacy_json);
+        let legacy = legacy_bytes(&transaction);
+        assert_eq!(rmp_serde::to_vec(&transaction).unwrap(), legacy);
+        assert_eq!(
+            rmp_serde::from_slice::<RepositoryTransaction>(&legacy).unwrap(),
+            transaction
+        );
+
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+            crate::merge::tests::sample_record(
+                transaction.repository_id.clone(),
+                transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id,
+            ),
+        ));
+        let legacy_json = serde_json::to_value(legacy_wire(&transaction)).unwrap();
+        assert_eq!(serde_json::to_value(&transaction).unwrap(), legacy_json);
+        let legacy = legacy_bytes(&transaction);
+        assert_eq!(rmp_serde::to_vec(&transaction).unwrap(), legacy);
+        assert_eq!(
+            rmp_serde::from_slice::<RepositoryTransaction>(&legacy).unwrap(),
+            transaction
+        );
+    }
+
+    /// The same transaction carrying a merge record must not be mistakable for
+    /// one that does not, at either identity.
+    #[test]
+    fn a_merge_record_participates_in_transaction_and_operation_identity() {
+        let mut transaction = workspace_transaction();
+        let baseline = transaction.transaction_hash().unwrap();
+        let record = crate::merge::tests::sample_record(
+            transaction.repository_id.clone(),
+            transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id,
+        );
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        transaction.validate().unwrap();
+        let with_merge = transaction.transaction_hash().unwrap();
+        assert_ne!(with_merge, baseline);
+        assert_eq!(
+            with_merge.to_string(),
+            "26fc5b4ecb312a18be0ff24cd07ce7c5b23ac7e040d897eaecfc02b60d098c57",
+            "the v0.6.4 merge-only transaction identity must survive the seal field"
+        );
+
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let mut operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: with_merge,
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            merge_transaction_delta: transaction.merge_transaction_delta.clone(),
+            roots_before: roots(),
+            roots_after,
+        };
+        let bound = operation.identity_hash().unwrap();
+        operation.merge_transaction_delta = None;
+        assert_ne!(operation.identity_hash().unwrap(), bound);
+    }
+
+    #[test]
+    fn a_sealed_observation_is_shape_validated_and_participates_in_identity() {
+        let mut transaction = workspace_transaction();
+        let baseline = transaction.transaction_hash().unwrap();
+        transaction.sealed_observation = Some(sealed_observation());
+        transaction.validate().unwrap();
+        let sealed = transaction.transaction_hash().unwrap();
+        assert_ne!(sealed, baseline);
+
+        let mut changed = transaction.clone();
+        changed.sealed_observation.as_mut().unwrap().fingerprint = Hash256::from_bytes([0x74; 32]);
+        assert_ne!(changed.transaction_hash().unwrap(), sealed);
+
+        let mut malformed = transaction;
+        malformed.sealed_observation.as_mut().unwrap().opaque_bodies = 8;
+        assert!(malformed
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("more opaque bodies"));
+    }
+
+    #[test]
+    fn a_sealed_observation_binds_a_real_mutation_but_is_not_one_by_itself() {
+        let mut transaction = workspace_transaction();
+        transaction.workspace_mutation = None;
+        transaction.local_overlay_delta = None;
+        transaction.sealed_observation = Some(sealed_observation());
+        assert!(transaction
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must contain at least one mutation"));
+    }
+
+    /// A merge record alone is a real mutation, and an invalid one is refused
+    /// by the transaction that carries it rather than only by the store.
+    #[test]
+    fn a_transaction_carrying_only_a_merge_record_is_a_mutation_and_is_validated() {
+        let mut transaction = workspace_transaction();
+        let workspace_id = transaction
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .workspace_id;
+        transaction.workspace_mutation = None;
+        transaction.local_overlay_delta = None;
+        transaction.merge_transaction_delta = None;
+        assert!(transaction
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must contain at least one mutation"));
+
+        let record =
+            crate::merge::tests::sample_record(transaction.repository_id.clone(), workspace_id);
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        transaction.validate().unwrap();
+
+        let mut forged = record;
+        forged.hash = Hash256::from_bytes([0x99; 32]);
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(forged));
+        assert!(transaction
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("recomputes to"));
+    }
+
+    #[test]
+    fn workspace_snapshot_keeps_dirty_tree_distinct_from_base_commit() {
+        let binding = WorkspaceSnapshotBinding {
+            repository_id: RepositoryId::new("repo").unwrap(),
+            workspace_id: WorkspaceId::new(),
+            workspace_head: WorkspaceHead::Symbolic {
+                target: RefName::branch(b"main").unwrap(),
+            },
+            base_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([0x11; 32]),
+            ))),
+            base_tree_hash: Some(Hash256::from_bytes([0x22; 32])),
+            workspace_tree_hash: Hash256::from_bytes([0x23; 32]),
+            workspace_semantic_overlay_hash: WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
+            roots: roots(),
+            workspace_generation: 9,
+            admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: AdmissionPolicyStamp {
+                    hash: crate::AdmissionPolicyHash(Hash256::from_bytes([0x24; 32])),
+                    generation: 1,
+                },
+                local: LocalOverlayStamp {
+                    hash: LocalOverlayHash(Hash256::from_bytes([0x25; 32])),
+                    generation: 2,
+                },
+            },
+        };
+        binding.validate().unwrap();
+        assert!(binding.is_dirty());
+    }
+
+    #[test]
+    fn workspace_semantic_delta_is_canonical_and_rejects_duplicate_targets() {
+        let first = semantic_entity(0x90, "first");
+        let second = semantic_entity(0x91, "second");
+        let forward = WorkspaceSemanticDelta::new(
+            vec![
+                EntityDelta::Added { new: first.clone() },
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let reversed = WorkspaceSemanticDelta::new(
+            vec![
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+                EntityDelta::Added { new: first.clone() },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            forward.identity_hash().unwrap(),
+            reversed.identity_hash().unwrap()
+        );
+        let forward_overlay = WorkspaceSemanticOverlay::new(
+            vec![
+                EntityDelta::Added { new: first.clone() },
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let reversed_overlay = WorkspaceSemanticOverlay::new(
+            vec![
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+                EntityDelta::Added { new: first.clone() },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            forward_overlay.identity_hash().unwrap(),
+            reversed_overlay.identity_hash().unwrap()
+        );
+        assert_ne!(
+            forward.identity_hash().unwrap(),
+            forward_overlay.identity_hash().unwrap(),
+            "incremental and cumulative identities must use distinct domains"
+        );
+
+        let error = WorkspaceSemanticDelta::new(
+            vec![
+                EntityDelta::Added { new: first.clone() },
+                EntityDelta::Removed { old: first },
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical unique target order"));
+
+        let mut encoded = serde_json::to_value(&forward).unwrap();
+        encoded
+            .get_mut("entity_deltas")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(
+            serde_json::from_value::<WorkspaceSemanticDelta>(encoded).is_err(),
+            "noncanonical persisted semantic deltas must fail during decode"
+        );
+    }
+
+    #[test]
+    fn workspace_semantic_delta_persists_external_references_without_moving_legacy_wire() {
+        #[derive(Serialize)]
+        struct LegacyWorkspaceSemanticDelta<'a> {
+            version: u32,
+            entity_deltas: &'a [EntityDelta],
+            relation_deltas: &'a [RelationDelta],
+        }
+
+        let first = ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let second =
+            ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge").unwrap();
+        let forward = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ExternalReferenceDelta::Added { new: first.clone() },
+                ExternalReferenceDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+        )
+        .unwrap();
+        let reversed = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ExternalReferenceDelta::Added {
+                    new: second.clone(),
+                },
+                ExternalReferenceDelta::Added { new: first.clone() },
+            ],
+        )
+        .unwrap();
+        assert_eq!(forward, reversed);
+        assert_eq!(
+            forward.identity_hash().unwrap(),
+            reversed.identity_hash().unwrap()
+        );
+        assert_eq!(
+            forward.transaction_delta().external_reference_deltas,
+            forward.external_reference_deltas()
+        );
+        assert_eq!(
+            WorkspaceSemanticOverlay::new_with_external_references(
+                Vec::new(),
+                Vec::new(),
+                forward.external_reference_deltas().to_vec(),
+            )
+            .unwrap()
+            .external_reference_deltas(),
+            forward.external_reference_deltas()
+        );
+
+        let duplicate = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ExternalReferenceDelta::Added { new: first.clone() },
+                ExternalReferenceDelta::Removed { old: first },
+            ],
+        )
+        .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("canonical unique target order"));
+
+        let legacy = WorkspaceSemanticDelta::default();
+        let legacy_wire = LegacyWorkspaceSemanticDelta {
+            version: legacy.version,
+            entity_deltas: legacy.entity_deltas(),
+            relation_deltas: legacy.relation_deltas(),
+        };
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::to_value(&legacy_wire).unwrap()
+        );
+        let legacy_bytes = rmp_serde::to_vec(&legacy_wire).unwrap();
+        assert_eq!(rmp_serde::to_vec(&legacy).unwrap(), legacy_bytes);
+        assert_eq!(
+            rmp_serde::from_slice::<WorkspaceSemanticDelta>(&legacy_bytes).unwrap(),
+            legacy
+        );
+    }
+
+    /// The wire twin that decodes a workspace semantic delta must mirror the
+    /// derive that encodes it, element for element, with every collection
+    /// populated.
+    ///
+    /// `WorkspaceSemanticDelta` derives `Serialize` but hand-writes
+    /// `Deserialize` through `WorkspaceSemanticDeltaWire`, so the two field
+    /// lists are kept in step by hand. On the positional encoding a struct is
+    /// an array and position decides the mapping, so a wire twin whose fields
+    /// moved decodes each value into the wrong slot.
+    ///
+    /// `workspace_semantic_delta_persists_external_references_without_moving_legacy_wire`
+    /// already diffs the encoding against a hand-built reference, but it does
+    /// so on `WorkspaceSemanticDelta::default()`, where every collection is
+    /// empty. Two empty arrays are byte-identical, so swapping `entity_deltas`
+    /// and `relation_deltas` in either the type or its wire twin leaves that
+    /// assertion green: its empty input makes the invariant trivially true.
+    /// This drives the same rule with both collections populated and
+    /// distinguishable, which is the only form that can fail.
+    ///
+    /// Both tail states are covered, because `external_reference_deltas` skips
+    /// serialization when empty and therefore changes the array's arity.
+    #[test]
+    fn workspace_semantic_delta_wire_mirror_is_positionally_exact() {
+        let entity = semantic_entity(0x51, "encode");
+        let relation = crate::Relation {
+            id: crate::RelationId(Uuid::from_u128(0x52)),
+            kind: crate::RelationKind::Calls,
+            src: crate::GraphNodeId::Entity(entity.id),
+            dst: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0x53))),
+            confidence: 1.0,
+            origin: crate::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let reference =
+            ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge").unwrap();
+
+        for (label, tail, arity) in [
+            ("an empty external-reference tail", Vec::new(), 3_usize),
+            (
+                "a populated external-reference tail",
+                vec![ExternalReferenceDelta::Added { new: reference }],
+                4,
+            ),
+        ] {
+            let delta = WorkspaceSemanticDelta::new_with_external_references(
+                vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+                tail,
+            )
+            .unwrap();
+
+            // Every element carries a value, and no two carry the same one, so
+            // a field the wire twin moved lands in a slot whose type rejects it.
+            assert!(!delta.entity_deltas().is_empty());
+            assert!(!delta.relation_deltas().is_empty());
+
+            let encoded = rmp_serde::to_vec(&delta).unwrap();
+            assert_eq!(
+                messagepack_array_len(&encoded),
+                arity,
+                "the workspace semantic delta encodes the wrong number of elements with {label}"
+            );
+
+            let expected = if arity == 3 {
+                rmp_serde::to_vec(&(
+                    &delta.version,
+                    delta.entity_deltas(),
+                    delta.relation_deltas(),
+                ))
+                .unwrap()
+            } else {
+                rmp_serde::to_vec(&(
+                    &delta.version,
+                    delta.entity_deltas(),
+                    delta.relation_deltas(),
+                    delta.external_reference_deltas(),
+                ))
+                .unwrap()
+            };
+            assert_eq!(
+                encoded, expected,
+                "the workspace semantic delta's encoded element order moved with {label}, which \
+                 shifts every persisted record into the wrong slots"
+            );
+
+            let decoded: WorkspaceSemanticDelta = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(
+                decoded, delta,
+                "WorkspaceSemanticDeltaWire no longer mirrors the encoding it decodes with {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_only_workspace_transition_is_durable_dirty_authority() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x92));
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let clean =
+            create_workspace_mutation(workspace_id, shared_policy.clone(), policy, Vec::new())
+                .validate_against(&repository_id, None, WorkspaceSemanticOverlay::default())
+                .unwrap();
+        assert!(!clean.is_dirty());
+
+        let entity_delta = EntityDelta::Added {
+            new: semantic_entity(0x93, "uncommitted"),
+        };
+        let delta = WorkspaceSemanticDelta::new(vec![entity_delta.clone()], Vec::new()).unwrap();
+        let overlay = WorkspaceSemanticOverlay::new(vec![entity_delta], Vec::new()).unwrap();
+        let overlay_hash = overlay.identity_hash().unwrap();
+        let mutation = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: clean.generation,
+                head: clean.head.clone(),
+                base_target: clean.base_target.clone(),
+                base_tree_hash: clean.base_tree_hash,
+                tree_hash: clean.tree_hash,
+                semantic_overlay_hash: clean.semantic_overlay_hash,
+                admission_policy: clean.admission_policy,
+            },
+            new_generation: clean.generation + 1,
+            new_head: clean.head.clone(),
+            new_base_target: clean.base_target.clone(),
+            new_base_tree_hash: clean.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: clean.tree_hash,
+            semantic_delta: delta,
+            new_shared_admission_policy: shared_policy,
+            new_admission_policy: clean.admission_policy,
+        };
+        let dirty = mutation
+            .validate_against(&repository_id, Some(&clean), overlay)
+            .unwrap();
+        assert!(dirty.is_dirty());
+        assert_eq!(dirty.tree, clean.tree);
+        assert_eq!(dirty.semantic_overlay_hash, overlay_hash);
+
+        let encoded = serde_json::to_value(&dirty).unwrap();
+        let mut legacy = encoded.clone();
+        legacy.as_object_mut().unwrap().remove("semantic_overlay");
+        assert!(serde_json::from_value::<WorkspaceState>(legacy).is_err());
+        assert_eq!(
+            serde_json::from_value::<WorkspaceState>(encoded).unwrap(),
+            dirty
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_binding_requires_complete_base_authority() {
+        let mut binding = WorkspaceSnapshotBinding {
+            repository_id: RepositoryId::new("repo").unwrap(),
+            workspace_id: WorkspaceId::new(),
+            workspace_head: WorkspaceHead::Symbolic {
+                target: RefName::branch(b"main").unwrap(),
+            },
+            base_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([0x31; 32]),
+            ))),
+            base_tree_hash: Some(Hash256::from_bytes([0x32; 32])),
+            workspace_tree_hash: Hash256::from_bytes([0x32; 32]),
+            workspace_semantic_overlay_hash: WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
+            roots: roots(),
+            workspace_generation: 3,
+            admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: AdmissionPolicyStamp {
+                    hash: crate::AdmissionPolicyHash(Hash256::from_bytes([0x33; 32])),
+                    generation: 1,
+                },
+                local: LocalOverlayStamp {
+                    hash: LocalOverlayHash(Hash256::from_bytes([0x34; 32])),
+                    generation: 2,
+                },
+            },
+        };
+        binding.validate().unwrap();
+
+        binding.base_tree_hash = None;
+        let error = binding.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("base target and tree must both be present or absent"));
+    }
+
+    #[test]
+    fn workspace_snapshot_binding_rejects_detached_target_mismatch() {
+        let head_target =
+            RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])));
+        let mut binding = WorkspaceSnapshotBinding {
+            repository_id: RepositoryId::new("repo").unwrap(),
+            workspace_id: WorkspaceId::new(),
+            workspace_head: WorkspaceHead::Detached {
+                target: head_target.clone(),
+            },
+            base_target: Some(head_target),
+            base_tree_hash: Some(Hash256::from_bytes([0x42; 32])),
+            workspace_tree_hash: Hash256::from_bytes([0x42; 32]),
+            workspace_semantic_overlay_hash: WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
+            roots: roots(),
+            workspace_generation: 4,
+            admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: AdmissionPolicyStamp {
+                    hash: crate::AdmissionPolicyHash(Hash256::from_bytes([0x43; 32])),
+                    generation: 1,
+                },
+                local: LocalOverlayStamp {
+                    hash: LocalOverlayHash(Hash256::from_bytes([0x44; 32])),
+                    generation: 2,
+                },
+            },
+        };
+        binding.validate().unwrap();
+
+        binding.base_target = Some(RefTarget::change(SemanticChangeId::from_hash(
+            Hash256::from_bytes([0x45; 32]),
+        )));
+        let error = binding.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("detached HEAD must bind its exact target and tree"));
+    }
+
+    #[test]
+    fn unborn_dirty_ignore_policy_is_authoritative_without_fake_history() {
+        let mut transaction = workspace_transaction();
+        let ignore_hash = Hash256::from_bytes([0x66; 32]);
+        let shared_policy = SharedAdmissionPolicy::new(
+            0,
+            vec![AdmissionRuleSource {
+                kind: AdmissionRuleSourceKind::GitIgnore,
+                path: RepoPath::from_utf8(".gitignore").unwrap(),
+                base_directory: None,
+                body_hash: ignore_hash,
+                body_len: 8,
+                precedence: 0,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let workspace = transaction.workspace_mutation.as_mut().unwrap();
+        workspace.tree_deltas.push(add_artifact(
+            ArtifactId(Uuid::from_u128(13)),
+            b".gitignore".to_vec(),
+            0x66,
+            false,
+        ));
+        let candidate = ResolvedTree::default()
+            .apply(&workspace.tree_deltas)
+            .unwrap();
+        workspace.new_tree_hash = compute_resolved_tree_hash(&candidate).unwrap();
+        workspace.new_shared_admission_policy = shared_policy.clone();
+        workspace.new_admission_policy.shared = shared_policy.stamp();
+
+        assert!(transaction.changes.is_empty());
+        assert!(workspace.new_base_target.is_none());
+        assert_ne!(
+            shared_policy.stamp(),
+            SharedAdmissionPolicy::empty(0).stamp()
+        );
+        transaction.validate().unwrap();
+
+        let mut mismatched = transaction;
+        mismatched
+            .workspace_mutation
+            .as_mut()
+            .unwrap()
+            .new_shared_admission_policy = SharedAdmissionPolicy::empty(0);
+        let error = mismatched.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("shared admission policy does not match its effective policy stamp"));
+    }
+
+    #[test]
+    fn workspace_shared_policy_is_bound_by_transaction_and_operation_identities() {
+        let original = workspace_transaction();
+        original.validate().unwrap();
+        let original_hash = original.transaction_hash().unwrap();
+
+        let mut updated = original.clone();
+        let shared_policy = SharedAdmissionPolicy::empty(1);
+        let workspace = updated.workspace_mutation.as_mut().unwrap();
+        workspace.new_shared_admission_policy = shared_policy.clone();
+        workspace.new_admission_policy.shared = shared_policy.stamp();
+        updated.validate().unwrap();
+        assert_ne!(updated.transaction_hash().unwrap(), original_hash);
+
+        let mut roots_after = roots();
+        roots_after.generation = 8;
+        let operation = RepositoryOperationRecord {
+            operation_id: original.operation_id,
+            repository_id: original.repository_id.clone(),
+            transaction_hash: original_hash,
+            actor: original.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: original.workspace_mutation,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            roots_before: roots(),
+            roots_after,
+        };
+        let operation_identity = operation.identity_hash().unwrap();
+        let mut updated_operation = operation;
+        updated_operation.workspace_mutation = updated.workspace_mutation;
+        assert_ne!(
+            updated_operation.identity_hash().unwrap(),
+            operation_identity
+        );
+    }
+
+    #[test]
+    fn unborn_workspace_persists_arbitrary_files_then_commits_without_losing_tree() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(21));
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let create = create_workspace_mutation(
+            workspace_id,
+            shared_policy.clone(),
+            policy,
+            vec![
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(22)),
+                    b"Dockerfile".to_vec(),
+                    0x51,
+                    true,
+                ),
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(23)),
+                    b"infra/compose-\xfe.yaml".to_vec(),
+                    0x52,
+                    false,
+                ),
+            ],
+        );
+        let dirty = create
+            .validate_against(&repository_id, None, WorkspaceSemanticOverlay::default())
+            .unwrap();
+        assert!(dirty.is_dirty());
+        assert_eq!(dirty.shared_admission_policy, shared_policy);
+        assert!(dirty
+            .tree
+            .artifact_at_path(&RepoPath::from_bytes(b"infra/compose-\xfe.yaml".to_vec()).unwrap())
+            .is_some());
+
+        let committed_change = SemanticChangeId::from_hash(Hash256::from_bytes([0x53; 32]));
+        let commit = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: dirty.generation,
+                head: dirty.head.clone(),
+                base_target: dirty.base_target.clone(),
+                base_tree_hash: dirty.base_tree_hash,
+                tree_hash: dirty.tree_hash,
+                semantic_overlay_hash: dirty.semantic_overlay_hash,
+                admission_policy: dirty.admission_policy,
+            },
+            new_generation: 1,
+            new_head: dirty.head.clone(),
+            new_base_target: Some(RefTarget::change(committed_change)),
+            new_base_tree_hash: Some(dirty.tree_hash),
+            tree_deltas: Vec::new(),
+            new_tree_hash: dirty.tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: shared_policy,
+            new_admission_policy: dirty.admission_policy,
+        };
+        let clean = commit
+            .validate_against(
+                &repository_id,
+                Some(&dirty),
+                WorkspaceSemanticOverlay::default(),
+            )
+            .unwrap();
+        assert!(!clean.is_dirty());
+        assert_eq!(clean.tree, dirty.tree);
+        assert_eq!(clean.base_target, Some(RefTarget::change(committed_change)));
+    }
+
+    #[test]
+    fn workspace_mutation_rejects_stale_head_tree_or_generation() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(31));
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let current =
+            create_workspace_mutation(workspace_id, shared_policy.clone(), policy, Vec::new())
+                .validate_against(&repository_id, None, WorkspaceSemanticOverlay::default())
+                .unwrap();
+        let stale = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: current.generation + 1,
+                head: current.head.clone(),
+                base_target: None,
+                base_tree_hash: None,
+                tree_hash: Hash256::from_bytes([0x99; 32]),
+                semantic_overlay_hash: current.semantic_overlay_hash,
+                admission_policy: current.admission_policy,
+            },
+            new_generation: current.generation + 2,
+            new_head: WorkspaceHead::Detached {
+                target: RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes(
+                    [0x61; 32],
+                ))),
+            },
+            new_base_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([0x61; 32]),
+            ))),
+            new_base_tree_hash: Some(current.tree_hash),
+            tree_deltas: Vec::new(),
+            new_tree_hash: current.tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: shared_policy,
+            new_admission_policy: current.admission_policy,
+        };
+        assert!(matches!(
+            stale.validate_against(
+                &repository_id,
+                Some(&current),
+                current.semantic_overlay.clone()
+            ),
+            Err(ModelError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn detached_workspace_preserves_exact_external_tag_target() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(35));
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let tree = ResolvedTree::default();
+        let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        let target = RefTarget::external_object(crate::ExternalObjectId::new(
+            ExternalObjectKind::Tag,
+            GitObjectId::sha1([0x71; 20]),
+        ));
+        let state = WorkspaceState::new(
+            repository_id,
+            workspace_id,
+            3,
+            WorkspaceHead::Detached {
+                target: target.clone(),
+            },
+            Some(target.clone()),
+            Some(tree_hash),
+            tree,
+            WorkspaceSemanticOverlay::default(),
+            shared_policy,
+            policy,
+        )
+        .unwrap();
+
+        assert_eq!(state.base_target, Some(target));
+        assert!(!state.is_dirty());
+        let encoded = serde_json::to_vec(&state).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<WorkspaceState>(&encoded).unwrap(),
+            state
+        );
+        let mut mismatched = state;
+        mismatched.shared_admission_policy = SharedAdmissionPolicy::empty(1);
+        assert!(mismatched.validate().is_err());
+    }
+
+    /// A transaction carrying every collection `transaction_hash` canonicalizes.
+    ///
+    /// Deliberately built with each collection OUT of its canonical order, so a
+    /// test that reorders one of them is comparing two genuinely different
+    /// literals rather than two copies of the same sorted vector.
+    fn canonicalizable_transaction() -> RepositoryTransaction {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(9));
+        let (shared_policy, policy, local_overlay_delta) = admission_policy(workspace_id);
+        let mutation = create_workspace_mutation(
+            workspace_id,
+            shared_policy,
+            policy,
+            vec![
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(11)),
+                    b"assets/data-\xff.bin".to_vec(),
+                    0x42,
+                    false,
+                ),
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(10)),
+                    b"compose.yaml".to_vec(),
+                    0x41,
+                    false,
+                ),
+            ],
+        );
+
+        let first = native_change(0xa0, 220, 210, 120, 110);
+        let second = native_change(0xb0, 240, 230, 140, 130);
+        let (low, high) = if first.id <= second.id {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let low_oid = match low.origin {
+            crate::ChangeOrigin::GitCommit { oid } => oid,
+            crate::ChangeOrigin::Native => unreachable!("fixture changes are Git-origin"),
+        };
+        let high_oid = match high.origin {
+            crate::ChangeOrigin::GitCommit { oid } => oid,
+            crate::ChangeOrigin::Native => unreachable!("fixture changes are Git-origin"),
+        };
+
+        let commit_object = |oid: GitObjectId| ExternalObjectRecord {
+            object: ExternalObjectId::new(ExternalObjectKind::Commit, oid),
+            body_hash: Hash256::from_bytes([0x5a; 32]),
+            body_len: 42,
+        };
+        let alias = |oid: GitObjectId, change_id: SemanticChangeId| {
+            ExternalChangeAlias::new(repository_id.clone(), oid, change_id)
+        };
+        let ref_mutation = |name: &[u8], byte: u8| RefMutation {
+            name: RefName::branch(name).unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([byte; 32]),
+            ))),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        };
+
+        RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(12)),
+            repository_id: repository_id.clone(),
+            expected_generation: 7,
+            expected_roots: roots(),
+            actor: AuthorId::new("actor"),
+            reason: "canonicalization fixture".to_string(),
+            // every vector below is out of canonical order on purpose
+            external_objects: vec![commit_object(high_oid), commit_object(low_oid)],
+            git_authority_delta: None,
+            changes: vec![high.clone(), low.clone()],
+            aliases: vec![alias(high_oid, high.id), alias(low_oid, low.id)],
+            ref_mutations: vec![ref_mutation(b"zeta", 0x71), ref_mutation(b"alpha", 0x70)],
+            default_ref_mutation: None,
+            workspace_mutation: Some(mutation),
+            local_overlay_delta: Some(local_overlay_delta),
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        }
+    }
+
+    /// A native change whose own delta vectors are out of canonical order.
+    ///
+    /// Valid despite that, because `compute_semantic_change_id` canonicalizes
+    /// before hashing, which is the property that makes reordering a change's
+    /// deltas testable at all.
+    fn native_change(
+        seed: u8,
+        entity_high: u128,
+        entity_low: u128,
+        artifact_high: u128,
+        artifact_low: u128,
+    ) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: crate::ChangeOrigin::GitCommit {
+                oid: GitObjectId::sha1([seed; 20]),
+            },
+            parents: Vec::new(),
+            timestamp: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("actor"),
+            message: format!("native change {seed}"),
+            entity_deltas: vec![
+                crate::EntityDelta::Added {
+                    new: semantic_entity(entity_high, "later"),
+                },
+                crate::EntityDelta::Added {
+                    new: semantic_entity(entity_low, "earlier"),
+                },
+            ],
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(artifact_high)),
+                    format!("z-{seed}.rs").into_bytes(),
+                    seed,
+                    false,
+                ),
+                add_artifact(
+                    ArtifactId(Uuid::from_u128(artifact_low)),
+                    format!("a-{seed}.rs").into_bytes(),
+                    seed,
+                    false,
+                ),
+            ],
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            // Out of canonical order like every other vector here, so the sort
+            // that orders them has something to do.
+            external_reference_deltas: vec![
+                ExternalReferenceDelta::Added {
+                    new: ExternalReference::new_resolved("python-module-v1", "zzz-later", "sym")
+                        .unwrap(),
+                },
+                ExternalReferenceDelta::Added {
+                    new: ExternalReference::new_resolved("python-module-v1", "aaa-early", "sym")
+                        .unwrap(),
+                },
+            ],
+        };
+        change.id = crate::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// The canonicalization as it stood before it was optimized, kept verbatim
+    /// as the reference the production implementation is diffed against.
+    ///
+    /// Clones the whole transaction and sorts the copy. That is precisely the
+    /// cost the production version exists to avoid, which is why this stays: an
+    /// optimization of a durable identity is only safe if it can be shown to
+    /// produce the same bytes as the implementation it replaces, on inputs
+    /// chosen to vary exactly what it changed.
+    fn reference_canonical_hash(transaction: &RepositoryTransaction) -> Result<Hash256> {
+        hash_serialized(
+            b"kin-repository-transaction-v4\0",
+            &reference_canonical_transaction(transaction),
+        )
+    }
+
+    /// The owned, sorted transaction the reference implementation built.
+    ///
+    /// Split out of [`reference_canonical_hash`] so the same reference can be
+    /// serialized directly, which is what
+    /// `the_canonical_view_serializes_positionally_identical_bytes` needs: the
+    /// hash encodes through `canonical_json_bytes`, whose object encoder sorts
+    /// keys, so comparing hashes alone cannot see a field order difference.
+    fn reference_canonical_transaction(
+        transaction: &RepositoryTransaction,
+    ) -> RepositoryTransaction {
+        let mut canonical = transaction.clone();
+        canonical.changes.sort_by_key(|change| change.id);
+        for change in &mut canonical.changes {
+            change
+                .entity_deltas
+                .sort_by_key(crate::EntityDelta::target_id);
+            change
+                .relation_deltas
+                .sort_by_key(crate::RelationDelta::target_id);
+            change.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            change
+                .external_reference_deltas
+                .sort_by_key(ExternalReferenceDelta::target_id);
+        }
+        canonical
+            .external_objects
+            .sort_by_key(|record| record.object);
+        canonical.aliases.sort_by_key(|alias| alias.oid);
+        canonical
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut canonical.workspace_mutation {
+            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            workspace.semantic_delta.sort_canonical();
+        }
+        canonical
+    }
+
+    /// Deterministic permutation, so a failure is reproducible from its seed.
+    fn permute<T>(items: &mut [T], seed: u64) {
+        if items.len() < 2 {
+            return;
+        }
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        for index in (1..items.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let pick = usize::try_from(state >> 33).unwrap_or(0) % (index + 1);
+            items.swap(index, pick);
+        }
+    }
+
+    /// Permute every collection the canonicalization sorts, including the ones
+    /// `validate` would refuse out of order.
+    ///
+    /// Reachable only because `canonical_hash` does not validate: the workspace
+    /// semantic delta's vectors are rejected by `WorkspaceSemanticDelta::validate`
+    /// when non-canonical, so no valid transaction can carry them shuffled, and
+    /// no fixture-based test can reach that sort at all.
+    fn permute_every_canonicalized_collection(transaction: &mut RepositoryTransaction, seed: u64) {
+        permute(&mut transaction.changes, seed);
+        for (index, change) in transaction.changes.iter_mut().enumerate() {
+            let seed = seed.wrapping_add(index as u64).wrapping_mul(31);
+            permute(&mut change.entity_deltas, seed);
+            permute(&mut change.relation_deltas, seed ^ 0x11);
+            permute(&mut change.tree_deltas, seed ^ 0x22);
+            permute(&mut change.external_reference_deltas, seed ^ 0x33);
+        }
+        permute(&mut transaction.external_objects, seed ^ 0x44);
+        permute(&mut transaction.aliases, seed ^ 0x55);
+        permute(&mut transaction.ref_mutations, seed ^ 0x66);
+        if let Some(workspace) = &mut transaction.workspace_mutation {
+            permute(&mut workspace.tree_deltas, seed ^ 0x77);
+            permute(&mut workspace.semantic_delta.entity_deltas, seed ^ 0x88);
+            permute(&mut workspace.semantic_delta.relation_deltas, seed ^ 0x99);
+            permute(
+                &mut workspace.semantic_delta.external_reference_deltas,
+                seed ^ 0xaa,
+            );
+        }
+    }
+
+    /// [`canonicalizable_transaction`] plus a workspace semantic delta held out
+    /// of canonical order.
+    ///
+    /// Deliberately NOT a valid transaction. `WorkspaceSemanticDelta::validate`
+    /// refuses non-canonical order, so this shape can never reach
+    /// `transaction_hash`, and the `sort_canonical()` call inside the
+    /// canonicalization is unreachable from any valid fixture. Driving
+    /// `canonical_hash` directly is the only way to exercise it.
+    fn differential_fixture() -> RepositoryTransaction {
+        let mut transaction = canonicalizable_transaction();
+        let workspace = transaction.workspace_mutation.as_mut().unwrap();
+        workspace.semantic_delta.external_reference_deltas = vec![
+            ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("npm-package-v1", "zzz-pkg", "merge").unwrap(),
+            },
+            ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("npm-package-v1", "aaa-pkg", "merge").unwrap(),
+            },
+        ];
+        assert!(
+            transaction.validate().is_err(),
+            "this fixture is meant to be unvalidatable; if it validates, the \
+             sort_canonical path it exists to reach is reachable another way"
+        );
+        transaction
+    }
+
+    /// The optimized canonicalization must produce the same bytes as the one it
+    /// replaced, on inputs that vary exactly what it changed.
+    ///
+    /// This is the bar for touching `transaction_hash` at all. The identity is
+    /// durable: it is stored in every `RepositoryCommitReceipt` and compared on
+    /// idempotent replay, so an implementation that hashes differently by one
+    /// byte invalidates receipts already on disk. A pinned digest cannot carry
+    /// that load alone, because it fixes one value for one fixture; this fixes
+    /// equality against the previous implementation across many orderings.
+    ///
+    /// It drives `canonical_hash` rather than `transaction_hash` on purpose, so
+    /// the inputs need not satisfy `validate` and can therefore include
+    /// orderings no valid transaction may carry. That is what reaches the
+    /// workspace semantic delta's `sort_canonical()`, which no fixture-based
+    /// test can exercise, because `WorkspaceSemanticDelta::validate` refuses
+    /// non-canonical order outright.
+    ///
+    /// Coverage was measured, not assumed. Each of the ten sorts was removed in
+    /// turn and this test was required to fail: nine did. The exception is the
+    /// per-change `relation_deltas` sort, which this fixture cannot reach
+    /// because it carries no relations, and an empty collection makes its sort
+    /// unobservable. Populating it needs a `Relation` fixture this module does
+    /// not have. That gap is named here rather than left for a reader to
+    /// discover, because a test that appears to cover ten sorts and covers nine
+    /// is worse than one that says which nine.
+    #[test]
+    fn the_canonicalization_matches_the_implementation_it_replaced() {
+        let base = differential_fixture();
+        for seed in 0..64_u64 {
+            let mut permuted = base.clone();
+            permute_every_canonicalized_collection(&mut permuted, seed);
+            assert_eq!(
+                permuted.canonical_hash().unwrap(),
+                reference_canonical_hash(&permuted).unwrap(),
+                "optimized canonicalization disagrees with the implementation it \
+                 replaced, at permutation seed {seed}"
+            );
+            assert_eq!(
+                permuted.canonical_hash().unwrap(),
+                base.canonical_hash().unwrap(),
+                "canonicalization is order-dependent at permutation seed {seed}"
+            );
+        }
+    }
+
+    /// The canonical view must produce the same bytes POSITIONALLY, not merely
+    /// the same hash.
+    ///
+    /// This is not a duplicate of
+    /// [`the_canonicalization_matches_the_implementation_it_replaced`]. That
+    /// test compares hashes, and the hash is built by `canonical_json_bytes`,
+    /// which routes through `serde_json::to_value` and then an encoder that
+    /// SORTS object keys (`identity.rs`, the `Value::Object` arm). Field order
+    /// is therefore invisible to it: swapping two fields in a mirror view type
+    /// keeps every one of those 64 permutations green.
+    ///
+    /// A field order the mirror got wrong is exactly the failure mode these
+    /// view types can have, so the guard against it has to be a serializer that
+    /// can see order. MessagePack is not human-readable, so it drives the
+    /// positional branch of the transaction's own `Serialize` impl, where the
+    /// element count varies with the optional tail fields, and it encodes each
+    /// struct as an ordered array. Order, element count and skip rules are all
+    /// load-bearing here.
+    #[test]
+    fn the_canonical_view_serializes_positionally_identical_bytes() {
+        let base = differential_fixture();
+        for seed in 0..64_u64 {
+            let mut permuted = base.clone();
+            permute_every_canonicalized_collection(&mut permuted, seed);
+            let view = rmp_serde::to_vec(&CanonicalTransaction::new(&permuted)).unwrap();
+            let reference = rmp_serde::to_vec(&reference_canonical_transaction(&permuted)).unwrap();
+            assert_eq!(
+                view, reference,
+                "canonical view bytes differ from the cloning implementation at \
+                 permutation seed {seed}"
+            );
+        }
+    }
+
+    /// Both optional tail combinations, because the element count depends on
+    /// them and the two branches compute it by different rules.
+    ///
+    /// The positional branch emits an explicit absent merge slot when a sealed
+    /// observation is present without a merge delta; the human-readable branch
+    /// skips each independently. A mirror that copied one rule onto both would
+    /// pass every permutation above, since the differential fixture carries
+    /// neither field.
+    #[test]
+    fn the_canonical_view_matches_across_every_optional_tail_combination() {
+        let base = canonicalizable_transaction();
+        // Eight, not four. `HAND_KEPT_MIRRORS` registers this test as
+        // `RepositoryTransactionHumanReadable`'s entire disposition, on the
+        // grounds that it diffs that mirror's field SET, so a tail axis missing
+        // here is coverage the registration claims and does not have. A review
+        // found exactly that: deleting `collaboration_delta` from the
+        // human-readable branch of `Serialize for CanonicalTransaction` left
+        // the suite green.
+        for (label, merge, sealed, collaboration) in [
+            ("neither", false, false, false),
+            ("merge only", true, false, false),
+            ("sealed only", false, true, false),
+            ("merge and sealed", true, true, false),
+            ("collaboration only", false, false, true),
+            ("merge and collaboration", true, false, true),
+            ("sealed and collaboration", false, true, true),
+            ("all three", true, true, true),
+        ] {
+            let mut transaction = base.clone();
+            if merge {
+                let workspace_id = transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id;
+                transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+                    crate::merge::tests::sample_record(
+                        transaction.repository_id.clone(),
+                        workspace_id,
+                    ),
+                ));
+            }
+            if sealed {
+                transaction.sealed_observation = Some(sealed_observation());
+            }
+            if collaboration {
+                transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
+            }
+            assert_eq!(
+                rmp_serde::to_vec(&CanonicalTransaction::new(&transaction)).unwrap(),
+                rmp_serde::to_vec(&reference_canonical_transaction(&transaction)).unwrap(),
+                "positional bytes differ with {label}"
+            );
+            assert_eq!(
+                serde_json::to_value(CanonicalTransaction::new(&transaction)).unwrap(),
+                serde_json::to_value(reference_canonical_transaction(&transaction)).unwrap(),
+                "human-readable form differs with {label}"
+            );
+            assert_eq!(
+                transaction.canonical_hash().unwrap(),
+                reference_canonical_hash(&transaction).unwrap(),
+                "hash differs with {label}"
+            );
+        }
+    }
+
+    /// The view must BORROW the transaction, which is the whole point of it.
+    ///
+    /// Hash equality cannot show this: a version that cloned the transaction
+    /// and sorted the copy would satisfy every differential above while costing
+    /// exactly what this change exists to remove. Pointer identity can show it,
+    /// and it is exact rather than statistical, so it neither flakes nor needs
+    /// a threshold.
+    ///
+    /// Each element the view claims to reference is required to be the very
+    /// element inside the caller's transaction, not an equal copy of it.
+    #[test]
+    fn the_canonical_view_borrows_the_transaction_rather_than_cloning_it() {
+        let transaction = canonicalizable_transaction();
+        let view = CanonicalTransaction::new(&transaction);
+
+        assert!(
+            std::ptr::eq(view.source, &transaction),
+            "canonical view does not point at the transaction it was built from"
+        );
+
+        let borrows_one_of = |target: *const SemanticChange| {
+            transaction
+                .changes
+                .iter()
+                .any(|change| std::ptr::eq(change, target))
+        };
+        assert_eq!(view.changes.len(), transaction.changes.len());
+        for change in &view.changes {
+            assert!(
+                borrows_one_of(change.source),
+                "canonical change is a copy rather than a reference into the transaction"
+            );
+        }
+
+        assert!(
+            view.external_objects.iter().all(|record| transaction
+                .external_objects
+                .iter()
+                .any(|source| std::ptr::eq(*record, source))),
+            "external object records were copied rather than referenced"
+        );
+        assert!(
+            view.aliases.iter().all(|alias| transaction
+                .aliases
+                .iter()
+                .any(|source| std::ptr::eq(*alias, source))),
+            "aliases were copied rather than referenced"
+        );
+        assert!(
+            view.ref_mutations.iter().all(|mutation| transaction
+                .ref_mutations
+                .iter()
+                .any(|source| std::ptr::eq(*mutation, source))),
+            "ref mutations were copied rather than referenced"
+        );
+
+        let workspace = view
+            .workspace_mutation
+            .as_ref()
+            .expect("fixture carries a workspace mutation");
+        assert!(
+            std::ptr::eq(
+                workspace.source,
+                transaction.workspace_mutation.as_ref().unwrap()
+            ),
+            "workspace mutation view is a copy rather than a reference"
+        );
+        assert!(
+            std::ptr::eq(
+                workspace.semantic_delta.source,
+                &transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .semantic_delta
+            ),
+            "workspace semantic delta view is a copy rather than a reference"
+        );
+
+        // The sort still has to have happened; a view that borrowed and did
+        // nothing else would pass everything above.
+        assert!(
+            view.changes
+                .windows(2)
+                .all(|pair| pair[0].source.id <= pair[1].source.id),
+            "canonical view did not sort the changes it borrowed"
+        );
+    }
+
+    /// A transaction large enough that a whole-transaction clone is visible in
+    /// the heap, which the 32-commit fixtures above are not.
+    #[test]
+    fn external_change_stream_matches_owned_hash_and_validation() {
+        let mut accepted = 0;
+        for (name, transaction) in preimage_corpus() {
+            let mut metadata = transaction.clone();
+            let mut changes = std::mem::take(&mut metadata.changes);
+            changes.sort_by_key(|change| change.id);
+            let actual = metadata.transaction_hash_with_changes(changes.len(), || {
+                Ok(changes.clone().into_iter().map(Ok))
+            });
+            match transaction.transaction_hash() {
+                Ok(expected) => {
+                    assert_eq!(actual.unwrap(), expected, "{name}");
+                    accepted += 1;
+                }
+                Err(_) => assert!(actual.is_err(), "{name}"),
+            }
+        }
+        assert!(accepted > 0);
+    }
+
+    #[test]
+    fn external_change_stream_rejects_bad_sources() {
+        let mut metadata = canonicalizable_transaction();
+        let mut changes = std::mem::take(&mut metadata.changes);
+        changes.sort_by_key(|change| change.id);
+        assert!(changes.len() >= 2);
+        assert!(metadata
+            .transaction_hash_with_changes(changes.len(), || Ok(changes
+                .clone()
+                .into_iter()
+                .map(Ok)))
+            .is_ok());
+        for count in [changes.len() - 1, changes.len() + 1] {
+            assert!(metadata
+                .transaction_hash_with_changes(count, || Ok(changes.clone().into_iter().map(Ok)))
+                .is_err());
+        }
+        let mut reversed = changes.clone();
+        reversed.reverse();
+        assert!(metadata
+            .transaction_hash_with_changes(reversed.len(), || Ok(reversed
+                .clone()
+                .into_iter()
+                .map(Ok)))
+            .is_err());
+        let duplicate = vec![changes[0].clone(), changes[0].clone()];
+        assert!(metadata
+            .transaction_hash_with_changes(2, || Ok(duplicate.clone().into_iter().map(Ok)))
+            .is_err());
+        for failing_pass in 1..=3 {
+            let mut pass = 0;
+            assert!(metadata
+                .transaction_hash_with_changes(changes.len(), || {
+                    pass += 1;
+                    let mut items: Vec<_> = changes.clone().into_iter().map(Ok).collect();
+                    if pass == failing_pass {
+                        items[0] = Err(ModelError::InvalidOperation("read failed".into()));
+                    }
+                    Ok(items)
+                })
+                .is_err());
+        }
+        for changed_pass in [2, 3] {
+            let mut pass = 0;
+            assert!(metadata
+                .transaction_hash_with_changes(changes.len(), || {
+                    pass += 1;
+                    let mut items = changes.clone();
+                    if pass == changed_pass {
+                        let replacement = if items[0].message.starts_with('x') {
+                            "y"
+                        } else {
+                            "x"
+                        };
+                        items[0].message = replacement.repeat(items[0].message.len());
+                    }
+                    Ok(items.into_iter().map(Ok))
+                })
+                .is_err());
+        }
+    }
+
+    fn large_transaction(change_count: usize) -> RepositoryTransaction {
+        let mut transaction = canonicalizable_transaction();
+        transaction.changes = (0..change_count)
+            .map(|index| {
+                let seed = u8::try_from(index % 251).unwrap_or(0);
+                let base = u128::try_from(index).unwrap_or(0) * 16 + 1_000;
+                native_change(seed, base + 3, base + 2, base + 1, base)
+            })
+            .collect();
+        transaction
+    }
+
+    /// The canonicalization must not allocate a copy of the transaction, and
+    /// the saving must be the clone rather than noise.
+    ///
+    /// This is the quantitative half of
+    /// [`the_canonical_view_borrows_the_transaction_rather_than_cloning_it`].
+    /// That test proves the view holds references; this one prices what the
+    /// references save, and calibrates the threshold against the clone's own
+    /// measured cost so there is no magic constant to drift.
+    ///
+    /// # What this measured, which is not what removing the clone was expected
+    /// to buy
+    ///
+    /// On a 200-change transaction, debug profile, macOS, live heap:
+    ///
+    /// | quantity | bytes |
+    /// |---|---|
+    /// | cloning the transaction, alone | 603_850 |
+    /// | building the borrowing view, alone | 51_200 |
+    /// | the `serde_json::Value` tree the encoder builds | 6_667_601 |
+    /// | whole hash, cloning implementation | 9_339_027 |
+    /// | whole hash, borrowing implementation | 8_765_641 |
+    ///
+    /// The clone is gone: the saving of 573_386 bytes is 94.9 percent of what
+    /// the clone cost. But it is 6.1 percent of the call's peak, because
+    /// `canonical_json_bytes` materializes a whole `serde_json::Value` tree,
+    /// and that tree is eleven times the size of the transaction it encodes.
+    /// The clone was never the dominant term inside this call.
+    ///
+    /// So the assertion is deliberately NOT a peak ceiling. A ceiling here
+    /// would be pinning the encoder, would drift with any serde change, and
+    /// would say nothing about whether a clone came back. The invariants that
+    /// matter are that the view costs a small fraction of a clone, and that
+    /// removing the clone removed approximately the clone.
+    ///
+    /// The counter is thread-local, so tests running in parallel in this same
+    /// binary cannot contaminate it.
+    ///
+    /// One number below has moved since this table was written, and in the
+    /// direction this test is indifferent to. `canonical_hash` now builds its
+    /// preimage a field at a time rather than as one `serde_json::Value` tree,
+    /// so the borrowing arm measures roughly 2.1 MB where the table records
+    /// 8_765_641. The invariants asserted here are unaffected: the view still
+    /// costs a fraction of a clone, and removing the clone still saved
+    /// approximately the clone. The table is left as measured, because it is
+    /// the record of what removing the clone bought and not a live reading.
+    #[test]
+    fn the_canonicalization_does_not_allocate_a_copy_of_the_transaction() {
+        let transaction = large_transaction(200);
+
+        // Warm any lazily-initialized state so it is not charged to one arm.
+        transaction.canonical_hash().unwrap();
+        reference_canonical_hash(&transaction).unwrap();
+
+        let clone_cost = measure_peak_live_bytes(|| {
+            let copy = transaction.clone();
+            std::hint::black_box(&copy);
+        });
+        let view_cost = measure_peak_live_bytes(|| {
+            let view = CanonicalTransaction::new(&transaction);
+            std::hint::black_box(&view);
+        });
+        let cloning = measure_peak_live_bytes(|| {
+            reference_canonical_hash(&transaction).unwrap();
+        });
+        let borrowing = measure_peak_live_bytes(|| {
+            transaction.canonical_hash().unwrap();
+        });
+        println!("clone {clone_cost} view {view_cost} cloning {cloning} borrowing {borrowing}");
+
+        assert!(
+            clone_cost > 0 && view_cost > 0 && cloning > 0 && borrowing > 0,
+            "the allocation probe measured nothing, so it cannot fail: clone \
+             {clone_cost}, view {view_cost}, cloning {cloning}, borrowing {borrowing}"
+        );
+        assert!(
+            view_cost * 4 < clone_cost,
+            "building the canonical view cost {view_cost} bytes against a clone's \
+             {clone_cost}, which is not the shape of a view over references"
+        );
+        let saved = cloning.saturating_sub(borrowing);
+        assert!(
+            saved * 4 >= clone_cost * 3,
+            "removing the clone saved {saved} bytes of a clone that costs \
+             {clone_cost}; the canonicalization is allocating a copy again \
+             ({cloning} cloning against {borrowing} borrowing)"
+        );
+    }
+
+    /// Transaction shapes whose canonical preimage is pinned.
+    ///
+    /// One shape was pinned before this: `workspace_transaction()`, whose
+    /// `changes`, `aliases`, `external_objects` and `ref_mutations` are all
+    /// empty. That pin is real and it guards an additive-field promise, but it
+    /// exercises none of the collections, so an encoder change could rewrite how
+    /// every array and every nested object is framed and still pass it.
+    ///
+    /// This corpus exists because the encoder is about to be rewritten. The
+    /// `serde_json::Value` tree it builds is 76 percent of the hash's peak, and
+    /// removing it means reproducing this encoding exactly. Every identity in
+    /// every store on disk depends on the preimage, so the acceptance for that
+    /// work is "the same bytes, less memory", and this is the "same bytes" half,
+    /// landed first and deliberately.
+    fn preimage_corpus() -> Vec<(&'static str, RepositoryTransaction)> {
+        let mut wide = canonicalizable_transaction();
+        wide.changes = vec![native_change(7, 1_000, 999, 998, 997)];
+
+        let mut unicode = canonicalizable_transaction();
+        unicode.changes = vec![{
+            let mut change = native_change(3, 21, 22, 23, 24);
+            // Combining marks, an astral-plane character, and a right-to-left
+            // mark. All three survive a round trip only if the encoder is
+            // length-prefixing bytes rather than counting characters.
+            change.message = "re\u{0301}sume\u{0301} \u{1F9EA} \u{200F}bidi".to_string();
+            change
+        }];
+
+        let mut empty_collections = canonicalizable_transaction();
+        empty_collections.changes = Vec::new();
+        empty_collections.aliases = Vec::new();
+        empty_collections.external_objects = Vec::new();
+        empty_collections.ref_mutations = Vec::new();
+
+        // `canonical_preimage` has three conditional branches, for the tail
+        // fields that skip independently, and no shape above reaches any of
+        // them. Hash-level coverage exists in
+        // `the_canonical_view_matches_across_every_optional_tail_combination`,
+        // but the offset reporter is the instrument that caught the
+        // reason/ref_mutations ordering bug, and it can only report on shapes
+        // it is given. An independent review pointed this out for the merge and
+        // sealed branches, and a second one pointed it out again when
+        // `collaboration_delta` added a third: without a shape that populates
+        // it, moving its key out of byte-sorted order left the whole suite
+        // green.
+        let with_tails = |merge: bool, sealed: bool, collaboration: bool| {
+            let mut transaction = canonicalizable_transaction();
+            if merge {
+                let workspace_id = transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id;
+                transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+                    crate::merge::tests::sample_record(
+                        transaction.repository_id.clone(),
+                        workspace_id,
+                    ),
+                ));
+            }
+            if sealed {
+                transaction.sealed_observation = Some(sealed_observation());
+            }
+            if collaboration {
+                transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
+            }
+            transaction
+        };
+
+        // The Git authority delta is the payload the encoder rewrite was
+        // entirely about: on a bootstrap it is one element carrying the whole
+        // Git object closure, and its `serde_json::Value` tree measured
+        // 60,495,152 bytes on a 400-commit conversion. Until this shape existed
+        // it was also the one payload class with no pinned digest, because
+        // every other shape here derives from a fixture whose
+        // `git_authority_delta` is `None`. The follow-on work is a hand-written
+        // incremental preimage writer for exactly this delta, and without an
+        // anchor nothing would notice it emitting different bytes (FIR-2551).
+        let git_authority =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(blob_git_authority(
+                RepositoryId::new("repo").unwrap(),
+                b"services:\n  api:\n    build: .\n",
+            )));
+
+        vec![
+            ("workspace_only", workspace_transaction()),
+            ("canonicalizable", canonicalizable_transaction()),
+            ("empty_collections", empty_collections),
+            ("one_change", wide),
+            ("unicode_message", unicode),
+            ("sixteen_changes", large_transaction(16)),
+            ("merge_only", with_tails(true, false, false)),
+            ("sealed_only", with_tails(false, true, false)),
+            ("merge_and_sealed", with_tails(true, true, false)),
+            ("collaboration_only", with_tails(false, false, true)),
+            (
+                "merge_sealed_and_collaboration",
+                with_tails(true, true, true),
+            ),
+            ("git_authority", git_authority),
+        ]
+    }
+
+    /// The canonical preimage of every corpus shape, pinned by digest.
+    ///
+    /// Measured on the commit that introduced this test. A digest that moves
+    /// here is a change to what a transaction identity commits to, which every
+    /// store already on disk depends on. It is a decision to make and version,
+    /// never a value to regenerate.
+    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 12] = [
+        (
+            "workspace_only",
+            "87c06b3a2f89a7f7ca9cf1e45207a9b425b1e40c07d6d78ab43ea8625acb69a8",
+        ),
+        (
+            "canonicalizable",
+            "7a2fbbebb2c1ba8c8bf5e5fa5e55a62f354ef60339f76ed2f13eb78aed5c205d",
+        ),
+        (
+            "empty_collections",
+            "3dc9e8c91616d31c6e31f1e392f329144d3e471a27f5ae4ee95cd289c838bc38",
+        ),
+        (
+            "one_change",
+            "5a352ceec24d3697cfb75776c4d23e703a7e054710effd8decc52fc4b8772ccd",
+        ),
+        (
+            "unicode_message",
+            "fe3ea7ff53bd1faedcac286579664cd2754e204ff770bdb547e9bfbcb083bab4",
+        ),
+        (
+            "sixteen_changes",
+            "e03347ebd49b1da8bb3779259c4cebb030c2749437b5fddb7259ec6266a13229",
+        ),
+        (
+            "merge_only",
+            "71b64e2e9588e879c6885960dfaa51a701e1ecf545c67e165b7c9b939c14f434",
+        ),
+        (
+            "sealed_only",
+            "668b8184c7e82a24c8969b64ea5f0fb18c028a816c53861640543e8271a99792",
+        ),
+        (
+            "merge_and_sealed",
+            "ba3d8e459829fcdf514938d327a5540677544d0ae6ba4fbfdae99730f3a65d3c",
+        ),
+        (
+            "collaboration_only",
+            "d45db4e09df71643754cb3c44a4b846b4871ee6eae19e6dc11fc626c6c68ff33",
+        ),
+        (
+            "merge_sealed_and_collaboration",
+            "282d173076ffcefb9d6d304d67044985ad2eaa7c4fb9ae9bddc02c7b2aea59f0",
+        ),
+        (
+            "git_authority",
+            "68de6409c40b6f6bda61d7631206043d99bcfaa3d049f38680c471d341a8900f",
+        ),
+    ];
+
+    /// The same digest, taken through the retained tree walk.
+    ///
+    /// Only used to prove a pin is anchored to the oracle rather than to the
+    /// encoder that produced it. Pinning a value measured solely by the new
+    /// encoder would anchor it to itself.
+    #[cfg(test)]
+    fn preimage_digest_via_tree(transaction: &RepositoryTransaction) -> String {
+        let bytes =
+            crate::identity::canonical_json_bytes_via_tree(&CanonicalTransaction::new(transaction))
+                .unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(out, "{byte:02x}").unwrap();
+        }
+        out
+    }
+
+    fn preimage_digest(transaction: &RepositoryTransaction) -> String {
+        let bytes =
+            crate::identity::canonical_json_bytes(&CanonicalTransaction::new(transaction)).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(out, "{byte:02x}").unwrap();
+        }
+        out
+    }
+
+    /// The incremental preimage is the whole-tree preimage, byte for byte.
+    ///
+    /// This is the acceptance for building the encoding a field at a time:
+    /// the same bytes, less memory. Compared against the path it replaces
+    /// rather than against a pinned digest, so a divergence names the offset
+    /// and the bytes on both sides instead of two hashes that differ.
+    ///
+    /// It earned that reporting on its first run. Emitting `ref_mutations`
+    /// before `reason` produced encodings of identical LENGTH that differed at
+    /// one offset, because the two keys sort the other way round: they share
+    /// "re" and 'a' is below 'f'. A digest comparison would have said only that
+    /// something moved.
+    #[test]
+    fn the_incremental_preimage_matches_the_whole_tree_path() {
+        for (name, transaction) in preimage_corpus() {
+            let view = CanonicalTransaction::new(&transaction);
+            let whole = crate::identity::canonical_json_bytes(&view).unwrap();
+            let incremental = view.canonical_preimage().unwrap();
+            if whole == incremental {
+                continue;
+            }
+            let at = whole
+                .iter()
+                .zip(incremental.iter())
+                .position(|(left, right)| left != right)
+                .unwrap_or(whole.len().min(incremental.len()));
+            let from = at.saturating_sub(24);
+            panic!(
+                "`{name}` encodes differently field by field than as one tree, \
+                 first at offset {at} of {} against {}. Every transaction identity \
+                 in every store on disk is derived from these bytes.\n  whole tree {:?}\n  \
+                 incremental {:?}",
+                whole.len(),
+                incremental.len(),
+                &whole[from..(at + 24).min(whole.len())],
+                &incremental[from..(at + 24).min(incremental.len())],
+            );
+        }
+    }
+
+    /// The streamed hash is the buffered hash, and both are the cloning
+    /// reference's hash, for every corpus shape.
+    ///
+    /// This is the acceptance for hashing without holding the preimage. Three
+    /// implementations are compared rather than two: the shipped streaming
+    /// hash, the same preimage buffered whole and then hashed, and the original
+    /// reference that clones the transaction and encodes it as one
+    /// `serde_json::Value` tree. Every transaction identity in every store on
+    /// disk is this value, so the chain has to reach back to the implementation
+    /// those stores were written under, not only to the one it directly
+    /// replaces.
+    #[test]
+    fn the_streamed_hash_is_the_buffered_hash_for_every_corpus_shape() {
+        for (name, transaction) in preimage_corpus() {
+            let payload = CanonicalTransaction::new(&transaction)
+                .canonical_preimage()
+                .unwrap();
+            let buffered = hash_preimage(REPOSITORY_TRANSACTION_HASH_DOMAIN, &payload).unwrap();
+            let streamed = transaction.canonical_hash().unwrap();
+
+            assert_eq!(
+                streamed,
+                buffered,
+                "`{name}` hashes differently streamed than buffered over its \
+                 {}-byte preimage",
+                payload.len()
+            );
+            assert_eq!(
+                streamed,
+                reference_canonical_hash(&transaction).unwrap(),
+                "`{name}` hashes differently than the cloning whole-tree reference \
+                 every store on disk was written under"
+            );
+        }
+    }
+
+    /// A field that moves moves the hash.
+    ///
+    /// Every byte-identity test in this family proves SAMENESS, and a hash that
+    /// returned a constant would satisfy all of them. This is the other
+    /// direction, and it is what makes them mean anything.
+    #[test]
+    fn a_mutated_field_changes_the_streamed_hash() {
+        type Mutation = (&'static str, fn(&mut RepositoryTransaction) -> bool);
+        let mutations: [Mutation; 5] = [
+            ("reason", |transaction| {
+                transaction.reason.push('!');
+                true
+            }),
+            ("expected_generation", |transaction| {
+                transaction.expected_generation += 1;
+                true
+            }),
+            ("a change's message", |transaction| {
+                let Some(change) = transaction.changes.first_mut() else {
+                    return false;
+                };
+                change.message.push('!');
+                true
+            }),
+            ("dropping a change", |transaction| {
+                transaction.changes.pop().is_some()
+            }),
+            ("duplicating a change", |transaction| {
+                let Some(first) = transaction.changes.first().cloned() else {
+                    return false;
+                };
+                transaction.changes.push(first);
+                true
+            }),
+        ];
+
+        let mut exercised = 0_usize;
+        for (name, transaction) in preimage_corpus() {
+            let before = transaction.canonical_hash().unwrap();
+            for (label, mutate) in &mutations {
+                let mut mutated = transaction.clone();
+                if !mutate(&mut mutated) {
+                    continue;
+                }
+                exercised += 1;
+                assert_ne!(
+                    mutated.canonical_hash().unwrap(),
+                    before,
+                    "mutating {label} on `{name}` left the transaction hash unchanged"
+                );
+            }
+        }
+
+        // The corpus carries shapes with no changes at all, whose three
+        // change-shaped mutations do not apply. Without this the loop could
+        // skip every mutation and report success.
+        assert!(
+            exercised >= 20,
+            "only {exercised} mutations actually applied, so this test is not \
+             exercising what it claims to"
+        );
+    }
+
+    /// The hash does not hold its own preimage.
+    ///
+    /// The quantitative half of the streaming change, and the reason the
+    /// fixture is 400 small changes rather than one large one. The term removed
+    /// is the WHOLE encoding; the term kept is one array element's
+    /// `serde_json::Value` tree. A fixture with few, large changes makes those
+    /// two the same size and the guard cannot fail. Spreading the same payload
+    /// across many changes is what separates them.
+    ///
+    /// The threshold is calibrated against the preimage's own measured length
+    /// rather than a constant, so there is nothing here to drift: buffering a
+    /// preimage costs the preimage, and streaming it costs approximately
+    /// nothing, so the saving is approximately the preimage.
+    #[test]
+    fn the_transaction_hash_does_not_hold_its_own_preimage() {
+        let transaction = large_transaction(400);
+
+        // Warm any lazily-initialized state so it is not charged to one arm.
+        transaction.canonical_hash().unwrap();
+
+        let preimage_len = CanonicalTransaction::new(&transaction)
+            .canonical_preimage()
+            .unwrap()
+            .len();
+
+        let buffered = measure_peak_live_bytes(|| {
+            let payload = CanonicalTransaction::new(&transaction)
+                .canonical_preimage()
+                .unwrap();
+            hash_preimage(REPOSITORY_TRANSACTION_HASH_DOMAIN, &payload).unwrap();
+        });
+        let streamed = measure_peak_live_bytes(|| {
+            transaction.canonical_hash().unwrap();
+        });
+        println!(
+            "preimage {preimage_len} buffered {buffered} streamed {streamed} saved {}",
+            buffered.saturating_sub(streamed)
+        );
+
+        assert!(
+            preimage_len > 0 && buffered > 0 && streamed > 0,
+            "the allocation probe measured nothing, so it cannot fail: preimage \
+             {preimage_len}, buffered {buffered}, streamed {streamed}"
+        );
+        let saved = buffered.saturating_sub(streamed);
+        assert!(
+            saved * 4 >= preimage_len * 3,
+            "hashing streamed rather than buffered saved {saved} bytes of a \
+             {preimage_len}-byte preimage ({buffered} buffered against {streamed} \
+             streamed); the hash is holding its own encoding again"
+        );
+    }
+
+    /// The hand-written field list is the serialized field set, exactly.
+    ///
+    /// `canonical_preimage` writes its own keys, so a field added to the
+    /// `Serialize` impl and not to it would silently drop out of every
+    /// transaction identity, and a field added only to it would silently
+    /// invent one. Neither shows up as a compile error.
+    ///
+    /// Checked against what the serialization actually produces rather than
+    /// against a second hand-written list, because two hand-written lists drift
+    /// together.
+    /// The keys of a canonical object, decoded from the encoding itself.
+    ///
+    /// Written because the first version of the drift guard below searched the
+    /// whole encoding for a length-prefixed key and called that "written". A
+    /// nested object carrying the same key name satisfies that search even when
+    /// the top-level field is gone, so the guard could pass with a field
+    /// dropped. An independent review found it; the corpus's empty shapes are
+    /// the only reason its mutant run went red, which is luck wearing a green
+    /// checkmark.
+    ///
+    /// Decoding is exact where matching was approximate, and it costs a walker
+    /// over a five-tag grammar. It also asserts the encoding is well formed and
+    /// ends where it says it does, which the old search could not see at all.
+    fn top_level_object_keys(encoded: &[u8]) -> Vec<String> {
+        // Every read is bounds-checked with a sentence rather than left to
+        // slice indexing. A field dropped from the writer leaves the object
+        // header promising more fields than were written; the decoder then
+        // reads a length out of value bytes and runs off the end. Panicking
+        // there catches the bug and names nothing, leaving a reader an index
+        // and no idea the header disagreed with the body.
+        fn need(bytes: &[u8], at: usize, want: usize, what: &str) {
+            assert!(
+                at + want <= bytes.len(),
+                "the preimage ended while reading {what}: wanted {want} byte(s) at \
+                 offset {at} of {}. The object header and the fields actually \
+                 written disagree.",
+                bytes.len()
+            );
+        }
+
+        fn read_len(bytes: &[u8], at: &mut usize) -> usize {
+            need(bytes, *at, 8, "a length prefix");
+            let mut buffer = [0_u8; 8];
+            buffer.copy_from_slice(&bytes[*at..*at + 8]);
+            *at += 8;
+            usize::try_from(u64::from_le_bytes(buffer)).expect("a canonical length fits usize")
+        }
+
+        fn skip_value(bytes: &[u8], at: &mut usize) {
+            need(bytes, *at, 1, "a value tag");
+            let tag = bytes[*at];
+            *at += 1;
+            match tag {
+                0 => {}
+                1 => {
+                    need(bytes, *at, 1, "a boolean body");
+                    *at += 1;
+                }
+                2 | 3 => {
+                    let len = read_len(bytes, at);
+                    need(bytes, *at, len, "a number or string body");
+                    *at += len;
+                }
+                4 => {
+                    let items = read_len(bytes, at);
+                    for _ in 0..items {
+                        skip_value(bytes, at);
+                    }
+                }
+                5 => {
+                    let fields = read_len(bytes, at);
+                    for _ in 0..fields {
+                        let len = read_len(bytes, at);
+                        need(bytes, *at, len, "a nested object key");
+                        *at += len;
+                        skip_value(bytes, at);
+                    }
+                }
+                other => panic!("unknown canonical tag {other} at offset {}", *at - 1),
+            }
+        }
+
+        let mut at = 0;
+        need(encoded, at, 1, "the object tag");
+        assert_eq!(encoded[at], 5, "a transaction preimage must be an object");
+        at += 1;
+        let fields = read_len(encoded, &mut at);
+        let mut keys = Vec::with_capacity(fields);
+        for index in 0..fields {
+            let len = read_len(encoded, &mut at);
+            need(
+                encoded,
+                at,
+                len,
+                &format!("top-level key {} of {fields}", index + 1),
+            );
+            keys.push(
+                String::from_utf8(encoded[at..at + len].to_vec())
+                    .expect("a canonical key is UTF-8"),
+            );
+            at += len;
+            skip_value(encoded, &mut at);
+        }
+        assert_eq!(
+            at,
+            encoded.len(),
+            "the preimage carries {} bytes after its object ends",
+            encoded.len() - at
+        );
+        keys
+    }
+
+    /// The hand-written field list is the serialized field set, exactly.
+    ///
+    /// `canonical_preimage` writes its own keys, so a field added to the
+    /// `Serialize` impl and not to it would silently drop out of every
+    /// transaction identity, and a field added only to it would silently
+    /// invent one. Neither shows up as a compile error.
+    ///
+    /// Checked against what the serialization actually produces rather than
+    /// against a second hand-written list, because two hand-written lists drift
+    /// together. Both sides are ordered, so this covers the byte-wise key
+    /// ordering too: `serde_json::Map` yields sorted keys and the decoded side
+    /// is in emission order.
+    #[test]
+    fn the_preimage_field_set_matches_the_serialized_one() {
+        for (name, transaction) in preimage_corpus() {
+            let view = CanonicalTransaction::new(&transaction);
+            let serde_json::Value::Object(serialized) = serde_json::to_value(&view).unwrap() else {
+                panic!("`{name}` does not serialize as an object");
+            };
+            let serialized_keys: Vec<String> = serialized.keys().cloned().collect();
+            let written = top_level_object_keys(&view.canonical_preimage().unwrap());
+            assert_eq!(
+                written, serialized_keys,
+                "`{name}` serializes {serialized_keys:?} but its preimage writes \
+                 {written:?}; a field is in one and not the other, or they are \
+                 written in different orders"
+            );
+        }
+    }
+
+    /// The hand-written container framing is the whole-tree framing.
+    ///
+    /// `canonical_preimage` copies the array and object framing out of
+    /// `append_canonical_json` rather than calling it, so the length prefixes
+    /// at every level are now written in two places. These are the shapes where
+    /// a framing mistake hides: nothing, one thing, and nesting, where an
+    /// off-by-one in a count is still a well-formed encoding of something else.
+    #[test]
+    fn the_hand_written_container_framing_matches_the_whole_tree_framing() {
+        fn seq_matches<T: Serialize>(label: &str, items: &[T]) {
+            let mut incremental = Vec::new();
+            crate::identity::append_canonical_seq(&mut incremental, items).unwrap();
+            let whole = crate::identity::canonical_json_bytes(&items).unwrap();
+            assert_eq!(
+                incremental, whole,
+                "the array framing for {label} differs from the whole-tree walk"
+            );
+        }
+
+        seq_matches("an empty array", &Vec::<u64>::new());
+        seq_matches("one element", &[7_u64]);
+        seq_matches("many elements", &(0..64_u64).collect::<Vec<_>>());
+        seq_matches("nested empty arrays", &[Vec::<u64>::new(), Vec::new()]);
+        seq_matches(
+            "nested arrays of differing length",
+            &[vec![1_u64], vec![], vec![2, 3, 4]],
+        );
+        seq_matches("strings that need length prefixes", &["", "a", "\u{1F9EA}"]);
+        seq_matches("options that flatten to null", &[None, Some(1_u64), None]);
+
+        // The object header is the other half, and an empty object is the case
+        // a count copied from the wrong variable still encodes cleanly.
+        for fields in [0_usize, 1, 2, 17] {
+            let mut header = Vec::new();
+            crate::identity::append_canonical_object_header(&mut header, fields).unwrap();
+            assert_eq!(header[0], 5, "an object must be tagged 5");
+            assert_eq!(
+                &header[1..],
+                (fields as u64).to_le_bytes(),
+                "an object header must carry its field count as a little-endian u64"
+            );
+        }
+    }
+
+    #[test]
+    fn the_canonical_preimage_is_pinned_for_every_corpus_shape() {
+        let corpus = preimage_corpus();
+        assert_eq!(
+            corpus.len(),
+            PINNED_PREIMAGE_DIGESTS.len(),
+            "every corpus shape needs a pin, or a shape can be added and never checked"
+        );
+        // Every shape is measured and printed BEFORE anything is asserted. A
+        // loop that panics on the first mismatch reports one moved digest and
+        // hides the other five, which is the difference between "this field
+        // changed the preimage" and "the encoder was rewritten".
+        let measured: Vec<(&str, String)> = corpus
+            .iter()
+            .map(|(name, transaction)| (*name, preimage_digest(transaction)))
+            .collect();
+        for (name, digest) in &measured {
+            println!("PREIMAGE {name} {digest}");
+        }
+
+        // Each pin is anchored to the retained tree walk as well as to the
+        // encoder that produces it. Without this the corpus would pin whatever
+        // the new encoder emits, which is a check that cannot fail: the encoder
+        // would always agree with a value it produced.
+        let via_tree: Vec<(&str, String)> = corpus
+            .iter()
+            .map(|(name, transaction)| (*name, preimage_digest_via_tree(transaction)))
+            .collect();
+        let diverged: Vec<String> = measured
+            .iter()
+            .zip(via_tree.iter())
+            .filter(|((_, streamed), (_, walked))| streamed != walked)
+            .map(|((name, streamed), (_, walked))| {
+                format!("{name}: streamed {streamed}, tree walk {walked}")
+            })
+            .collect();
+        assert!(
+            diverged.is_empty(),
+            "the streaming encoder and the retained tree walk disagree on {} shapes, so \
+             the pins below anchor the encoder to itself rather than to the encoding:\n  {}",
+            diverged.len(),
+            diverged.join("\n  ")
+        );
+
+        let moved: Vec<String> = measured
+            .iter()
+            .zip(PINNED_PREIMAGE_DIGESTS.iter())
+            .filter_map(|((name, actual), (pinned_name, pinned))| {
+                assert_eq!(name, pinned_name, "corpus and pins are out of order");
+                (actual != pinned).then(|| format!("{name}: pinned {pinned}, measured {actual}"))
+            })
+            .collect();
+        assert!(
+            moved.is_empty(),
+            "the canonical preimage moved for {} of {} shapes. Every transaction \
+             identity in every store on disk is derived from these bytes, so this \
+             is a decision to version, not a value to regenerate.\n  {}",
+            moved.len(),
+            measured.len(),
+            moved.join("\n  ")
+        );
+    }
+
+    /// The pins above can fail.
+    ///
+    /// A corpus of pinned digests is worth nothing until something shows they
+    /// move when the encoder moves. This encodes the same corpus through an
+    /// encoder that differs by exactly one byte of framing, the object tag, and
+    /// requires every shape to disagree.
+    ///
+    /// A shape that agreed would be a shape the pins cannot protect, which is
+    /// worth knowing before the encoder is rewritten rather than after.
+    #[test]
+    fn a_one_byte_encoder_change_moves_every_pinned_preimage() {
+        for (name, transaction) in preimage_corpus() {
+            let view = CanonicalTransaction::new(&transaction);
+            let real = crate::identity::canonical_json_bytes(&view).unwrap();
+            let mutated =
+                crate::identity::canonical_json_bytes_with_one_byte_of_framing_changed(&view)
+                    .unwrap();
+            assert_ne!(
+                real, mutated,
+                "changing the object tag left `{name}`'s preimage identical, so \
+                 the pin on it cannot detect an encoder change"
+            );
+            assert_eq!(
+                real.len(),
+                mutated.len(),
+                "the falsifier must differ by one byte of framing and nothing \
+                 else, or it is testing a different encoder rather than a \
+                 one-byte change to this one ({name})"
+            );
+        }
+    }
+
+    /// Which of the two whole-transaction materializations inside the hash is
+    /// the one worth removing.
+    ///
+    /// `canonical_json_bytes` used to build a `serde_json::Value` tree of the
+    /// whole value and then encode that whole tree into a `Vec<u8>`, with both
+    /// live when the encode returned. FIR-2551 priced the tree at eleven times
+    /// the transaction it encoded and named it as the fix.
+    ///
+    /// Both materializations are gone now. `canonical_hash` builds its preimage
+    /// a field at a time, and the encoder underneath it writes canonical bytes
+    /// straight out of `Serialize` instead of out of a tree, so what is held is
+    /// the payload rather than a picture of it. Measured on this fixture:
+    /// 6_667_601 for the tree alone, 8_765_641 for the tree-and-encoding path
+    /// that `canonical_json_bytes_via_tree` still walks, and 3_747_729 for the
+    /// streaming encoder that replaced it.
+    ///
+    /// The tree walk is kept and measured here on purpose. It is the oracle the
+    /// streaming encoder is checked against elsewhere, and it is what the saving
+    /// below is against; a differential in which both sides go through the new
+    /// code would prove nothing.
+    ///
+    /// Reported, never asserted as a ceiling, for the reason the test above
+    /// gives: a ceiling here pins the encoder and drifts with any serde change.
+    /// Every assertion is a comparison between two figures measured in the same
+    /// run, so none of them can drift.
+    #[test]
+    fn hashing_a_transaction_costs_less_than_the_tree_it_used_to_build() {
+        let transaction = large_transaction(200);
+        transaction.canonical_hash().unwrap();
+
+        let view_and_tree = measure_peak_live_bytes(|| {
+            let tree = serde_json::to_value(CanonicalTransaction::new(&transaction)).unwrap();
+            std::hint::black_box(&tree);
+        });
+        let tree_path = measure_peak_live_bytes(|| {
+            let encoded = crate::identity::canonical_json_bytes_via_tree(
+                &CanonicalTransaction::new(&transaction),
+            )
+            .unwrap();
+            std::hint::black_box(&encoded);
+        });
+        let streamed = measure_peak_live_bytes(|| {
+            let encoded =
+                crate::identity::canonical_json_bytes(&CanonicalTransaction::new(&transaction))
+                    .unwrap();
+            std::hint::black_box(&encoded);
+        });
+        let encoded_len =
+            crate::identity::canonical_json_bytes(&CanonicalTransaction::new(&transaction))
+                .unwrap()
+                .len();
+        let whole_hash = measure_peak_live_bytes(|| {
+            transaction.canonical_hash().unwrap();
+        });
+
+        println!(
+            "tree {view_and_tree} tree_path {tree_path} streamed {streamed} \
+             encoded_len {encoded_len} whole_hash {whole_hash}"
+        );
+
+        assert!(
+            view_and_tree > 0 && tree_path > 0 && streamed > 0 && encoded_len > 0 && whole_hash > 0,
+            "the probe measured nothing, so it cannot fail: tree {view_and_tree}, \
+             tree_path {tree_path}, streamed {streamed}, encoded_len {encoded_len}, \
+             whole_hash {whole_hash}"
+        );
+        assert!(
+            tree_path > view_and_tree,
+            "the tree path must cost more than the tree alone, or it is no longer \
+             holding both the tree and the encoding and this test is measuring the \
+             wrong thing ({tree_path} against {view_and_tree})"
+        );
+        // The tree is the larger of the two. If this ever inverts, the fix that
+        // is worth writing has changed, and it should be re-chosen rather than
+        // carried forward from this measurement.
+        assert!(
+            view_and_tree > encoded_len,
+            "the Value tree {view_and_tree} is no longer larger than the encoding \
+             it produces ({encoded_len}); re-price the fix before removing either"
+        );
+        // The improvement itself, asserted rather than only reported.
+        //
+        // Against the tree ALONE rather than against the tree-and-encoding path,
+        // because the tree is the term that was removed and comparing to it says
+        // exactly that: encoding a transaction now costs less than merely
+        // building the picture it used to be encoded from. Reverting the encoder
+        // puts `streamed` back at `tree_path`, which is larger than
+        // `view_and_tree`, and this fails.
+        assert!(
+            streamed < view_and_tree,
+            "encoding a transaction cost {streamed} bytes against {view_and_tree} for \
+             the `serde_json::Value` tree it is supposed to no longer build. The \
+             canonical encoder is materializing a tree again."
+        );
+        // Calibrated against a figure measured in the SAME run rather than
+        // against a constant, so it cannot drift with serde and cannot be
+        // satisfied by the encoder getting cheaper for other reasons.
+        assert!(
+            whole_hash * 2 < tree_path,
+            "hashing a transaction cost {whole_hash} bytes against {tree_path} \
+             for the whole-tree path it is supposed to avoid. `canonical_hash` is \
+             building the document's `serde_json::Value` tree again rather than one \
+             array element's at a time."
+        );
+    }
+
+    /// Every real payload that hashes through the canonical encoder must encode
+    /// to exactly the bytes the tree walk emits.
+    ///
+    /// BYTES, not hashes, and that is the whole point. FIR-2549 exists because
+    /// the transaction identity differential cannot catch a field reorder: the
+    /// encoding sorts object keys, so a hash comparison normalizes away the one
+    /// difference most likely to appear. Comparing emitted bytes is the only
+    /// comparison that can see it.
+    ///
+    /// Both sides must not go through the new encoder, or the differential
+    /// proves nothing, which is why `canonical_json_bytes_via_tree` is kept.
+    ///
+    /// Coverage is stated rather than implied, and an earlier version of this
+    /// comment overstated it. It claimed the fixtures carried a Git authority
+    /// delta. They did not: all three set it to `None`, so the arm that compared
+    /// it never executed, and the one payload class the encoder rewrite was
+    /// entirely about had no byte-level protection against that rewrite. That is
+    /// the "check that grades nothing and exits 0" class from `docs/traps.md`,
+    /// and an independent review caught it (FIR-2551).
+    ///
+    /// Two things follow. A fixture that carries the Git authority delta is in
+    /// the list below, and the optional arms are now fail-closed: every optional
+    /// field is recorded when it is reached and the test asserts at the end that
+    /// the fixture set collectively reached all of them. A skipped arm is a
+    /// missing anchor, and a missing anchor must fail rather than pass quietly.
+    ///
+    /// `compute_semantic_change_id` is covered here too, since it stopped
+    /// building a `serde_json::Value` tree of its change to delete `id` from
+    /// and became a hand-kept walk over a borrowed view. Every change in every
+    /// fixture has its identity preimage diffed against the retained tree walk
+    /// of the derive with `id` removed, the same oracle the transaction view
+    /// is diffed against; the walk's own module carries the wider corpus.
+    #[test]
+    fn every_canonical_payload_encodes_to_the_same_bytes_as_the_tree_walk() {
+        fn agree<T: serde::Serialize>(what: &str, value: &T) {
+            let streamed = crate::identity::canonical_json_bytes(value)
+                .unwrap_or_else(|error| panic!("{what}: streaming encoder refused: {error}"));
+            let walked = crate::identity::canonical_json_bytes_via_tree(value)
+                .unwrap_or_else(|error| panic!("{what}: tree walk refused: {error}"));
+            assert_eq!(
+                streamed,
+                walked,
+                "{what}: the streaming encoder emits {} bytes and the tree walk emits {}; \
+                 every durable identity derived from this payload would move",
+                streamed.len(),
+                walked.len()
+            );
+            assert!(
+                !streamed.is_empty(),
+                "{what}: encoded to nothing, so this comparison cannot fail"
+            );
+        }
+
+        // Every optional field this test compares, recorded when an arm runs.
+        // The assertion at the end is what makes a skipped arm a failure.
+        let mut reached: BTreeSet<&'static str> = BTreeSet::new();
+
+        let authority_fixture =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(blob_git_authority(
+                RepositoryId::new("repo").unwrap(),
+                b"services:\n  api:\n    build: .\n",
+            )));
+
+        // The merge delta and the sealed observation are the other two arms no
+        // fixture reached. The assertion at the end of this test is what found
+        // them, on its first run, which is the argument for writing it that way.
+        let tails_fixture = {
+            let mut transaction = canonicalizable_transaction();
+            let workspace_id = transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id;
+            transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+                crate::merge::tests::sample_record(transaction.repository_id.clone(), workspace_id),
+            ));
+            transaction.sealed_observation = Some(sealed_observation());
+            transaction
+        };
+
+        for (name, transaction) in [
+            ("canonicalizable transaction", canonicalizable_transaction()),
+            ("workspace transaction", workspace_transaction()),
+            ("large transaction", large_transaction(25)),
+            ("git authority transaction", authority_fixture),
+            ("merge and sealed transaction", tails_fixture),
+        ] {
+            agree(name, &transaction);
+            agree(
+                &format!("{name}, canonical view"),
+                &CanonicalTransaction::new(&transaction),
+            );
+            for (index, change) in transaction.changes.iter().enumerate() {
+                agree(&format!("{name}, change {index}"), change);
+                let streamed = crate::identity::change_identity_preimage(change).unwrap();
+                let walked = crate::identity::change_identity_preimage_via_tree(change).unwrap();
+                assert_eq!(
+                    streamed,
+                    walked,
+                    "{name}, change {index}: the identity preimage walk emits {} bytes and the \
+                     tree walk emits {}; every change identity in every store would move",
+                    streamed.len(),
+                    walked.len()
+                );
+                assert!(
+                    !streamed.is_empty(),
+                    "{name}, change {index}: the identity preimage encoded to nothing, so this \
+                     comparison cannot fail"
+                );
+                reached.insert("change_identity");
+                // `MergeSideValue::entity` and `::relation` hash these standalone
+                // rather than nested, and a `MergeSideValue` stores only the
+                // resulting hash, so anchoring a merge record does not anchor
+                // what it hashed. These do.
+                for (d, delta) in change.entity_deltas.iter().enumerate() {
+                    agree(&format!("{name}, change {index}, entity delta {d}"), delta);
+                    reached.insert("entity_delta");
+                }
+                for (d, delta) in change.relation_deltas.iter().enumerate() {
+                    agree(
+                        &format!("{name}, change {index}, relation delta {d}"),
+                        delta,
+                    );
+                    reached.insert("relation_delta");
+                }
+                for (d, delta) in change.tree_deltas.iter().enumerate() {
+                    agree(&format!("{name}, change {index}, tree delta {d}"), delta);
+                    reached.insert("tree_delta");
+                }
+            }
+            for (index, alias) in transaction.aliases.iter().enumerate() {
+                agree(&format!("{name}, alias {index}"), alias);
+            }
+            for (index, record) in transaction.external_objects.iter().enumerate() {
+                agree(&format!("{name}, external object {index}"), record);
+            }
+            if let Some(delta) = &transaction.git_authority_delta {
+                agree(&format!("{name}, Git authority delta"), delta);
+                reached.insert("git_authority_delta");
+            }
+            if let Some(mutation) = &transaction.workspace_mutation {
+                agree(&format!("{name}, workspace mutation"), mutation);
+                agree(
+                    &format!("{name}, workspace semantic delta"),
+                    &mutation.semantic_delta,
+                );
+                agree(
+                    &format!("{name}, workspace semantic delta as a transaction delta"),
+                    &mutation.semantic_delta.transaction_delta(),
+                );
+                let tree = ResolvedTree::default()
+                    .apply(&mutation.tree_deltas)
+                    .unwrap();
+                agree(&format!("{name}, resolved tree"), &tree);
+                // `MergeSideValue::artifact` hashes one of these on its own.
+                for (a, artifact) in tree.artifacts().enumerate() {
+                    agree(&format!("{name}, resolved artifact {a}"), &artifact);
+                    reached.insert("resolved_artifact");
+                }
+                reached.insert("workspace_mutation");
+            }
+            if let Some(overlay) = &transaction.local_overlay_delta {
+                agree(&format!("{name}, local overlay delta"), overlay);
+                reached.insert("local_overlay_delta");
+            }
+            if let Some(merge) = &transaction.merge_transaction_delta {
+                agree(&format!("{name}, merge transaction delta"), merge);
+                reached.insert("merge_transaction_delta");
+            }
+            if let Some(sealed) = &transaction.sealed_observation {
+                agree(&format!("{name}, sealed observation"), sealed);
+                reached.insert("sealed_observation");
+            }
+        }
+
+        // The identities that hash through this encoder without appearing in
+        // any transaction, so nothing above reaches them.
+        agree(
+            "operation record identity payload",
+            &sample_operation_record().identity_payload(),
+        );
+        agree(
+            "workspace tree snapshot",
+            &crate::workspace_tree::tests::sample_snapshot(),
+        );
+
+        // A relation delta reaches no fixture transaction, and
+        // `MergeSideValue::relation` hashes a `Relation` standalone, so anchor
+        // both the delta and the relation it carries. Built here rather than
+        // pushed onto a fixture change, because a change's id is derived from
+        // its own contents and appending a delta to one would leave a fixture
+        // whose id no longer matches what it holds.
+        let anchored_entity = semantic_entity(0x51, "encode");
+        let anchored_relation = crate::Relation {
+            id: crate::RelationId(Uuid::from_u128(0x52)),
+            kind: crate::RelationKind::Calls,
+            src: crate::GraphNodeId::Entity(anchored_entity.id),
+            dst: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0x53))),
+            confidence: 1.0,
+            origin: crate::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        agree("relation", &anchored_relation);
+        agree(
+            "relation delta",
+            &RelationDelta::Added {
+                new: anchored_relation,
+            },
+        );
+        agree("entity", &anchored_entity);
+        agree(
+            "external reference delta",
+            &ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge")
+                    .unwrap(),
+            },
+        );
+        reached.insert("relation_delta");
+
+        let expected: BTreeSet<&'static str> = [
+            "git_authority_delta",
+            "workspace_mutation",
+            "local_overlay_delta",
+            "merge_transaction_delta",
+            "sealed_observation",
+            "entity_delta",
+            "relation_delta",
+            "tree_delta",
+            "resolved_artifact",
+            "change_identity",
+        ]
+        .into_iter()
+        .collect();
+        let missed: Vec<&&'static str> = expected.difference(&reached).collect();
+        assert!(
+            missed.is_empty(),
+            "no fixture reached {missed:?}, so those arms compared nothing and this test \
+             graded them as passing. Add a fixture that sets them, or remove the arm; a \
+             skipped comparison is a missing anchor, not a green one."
+        );
+    }
+
+    /// Transaction identity must not depend on the order a caller built its
+    /// collections in.
+    ///
+    /// `transaction_hash` canonicalizes by sorting before it serializes, and
+    /// until this test nothing asserted that any of those sorts work. The pinned
+    /// digest in `a_transaction_without_a_merge_keeps_its_pre_merge_identity` is
+    /// built from `workspace_transaction()`, whose `changes`, `aliases`,
+    /// `external_objects` and `ref_mutations` are all empty, so it pins a value
+    /// for a transaction that has nothing to canonicalize. A sort that was
+    /// dropped or keyed wrong keeps that digest green while changing the
+    /// identity of every repository that actually carries history, and identity
+    /// here is durable: it is stored in every `RepositoryCommitReceipt` and
+    /// compared on idempotent replay.
+    ///
+    /// Each collection is reordered on its own so a removed sort fails by name
+    /// rather than as one undifferentiated mismatch.
+    ///
+    /// Not covered, and stated rather than implied: the per-change
+    /// `relation_deltas` and `external_reference_deltas` orderings, which this
+    /// fixture leaves empty, and the workspace semantic delta's own three
+    /// vectors, whose order cannot be varied here because
+    /// `WorkspaceSemanticDelta::validate` REJECTS non-canonical order outright
+    /// rather than canonicalizing it. That last one is guarded by rejection, not
+    /// by invariance, which is a different contract and a different test.
+
+    #[test]
+    fn transaction_identity_ignores_the_order_of_every_collection_it_canonicalizes() {
+        let base = canonicalizable_transaction();
+        base.validate().unwrap();
+        let expected = base.transaction_hash().unwrap();
+
+        let check = |reordered: RepositoryTransaction, collection: &str| {
+            reordered.validate().unwrap_or_else(|error| {
+                panic!("reordering {collection} produced an invalid transaction: {error}")
+            });
+            assert_eq!(
+                reordered.transaction_hash().unwrap(),
+                expected,
+                "transaction identity moved when only the order of {collection} changed, so \
+                 transaction_hash does not canonicalize {collection}"
+            );
+        };
+
+        let mut changes = base.clone();
+        changes.changes.reverse();
+        assert_ne!(
+            changes.changes, base.changes,
+            "the fixture must have >1 change"
+        );
+        check(changes, "changes");
+
+        let mut entity_deltas = base.clone();
+        for change in &mut entity_deltas.changes {
+            assert!(
+                change.entity_deltas.len() > 1,
+                "each fixture change must carry more than one entity delta"
+            );
+            change.entity_deltas.reverse();
+        }
+        check(entity_deltas, "per-change entity deltas");
+
+        let mut change_trees = base.clone();
+        for change in &mut change_trees.changes {
+            assert!(
+                change.tree_deltas.len() > 1,
+                "each fixture change must carry more than one tree delta"
+            );
+            change.tree_deltas.reverse();
+        }
+        check(change_trees, "per-change tree deltas");
+
+        let mut objects = base.clone();
+        objects.external_objects.reverse();
+        assert_ne!(
+            objects.external_objects, base.external_objects,
+            "the fixture must have >1 external object"
+        );
+        check(objects, "external objects");
+
+        let mut aliases = base.clone();
+        aliases.aliases.reverse();
+        assert_ne!(
+            aliases.aliases, base.aliases,
+            "the fixture must have >1 alias"
+        );
+        check(aliases, "aliases");
+
+        let mut refs = base.clone();
+        refs.ref_mutations.reverse();
+        assert_ne!(
+            refs.ref_mutations, base.ref_mutations,
+            "the fixture must have >1 ref mutation"
+        );
+        check(refs, "ref mutations");
+
+        let mut workspace_trees = base.clone();
+        let workspace = workspace_trees.workspace_mutation.as_mut().unwrap();
+        assert!(
+            workspace.tree_deltas.len() > 1,
+            "the fixture workspace must carry more than one tree delta"
+        );
+        workspace.tree_deltas.reverse();
+        check(workspace_trees, "workspace tree deltas");
+    }
+
+    #[test]
+    fn transaction_hash_binds_the_exact_workspace_candidate_tree() {
+        let transaction = workspace_transaction();
+        transaction.validate().unwrap();
+        let original_hash = transaction.transaction_hash().unwrap();
+
+        let mut changed = transaction;
+        let workspace = changed.workspace_mutation.as_mut().unwrap();
+        workspace.tree_deltas[0] = add_artifact(
+            workspace.tree_deltas[0].artifact_id(),
+            b"compose.yaml".to_vec(),
+            0x77,
+            false,
+        );
+        let candidate = ResolvedTree::default()
+            .apply(&workspace.tree_deltas)
+            .unwrap();
+        workspace.new_tree_hash = compute_resolved_tree_hash(&candidate).unwrap();
+
+        changed.validate().unwrap();
+        assert_ne!(changed.transaction_hash().unwrap(), original_hash);
+    }
+
+    #[test]
+    fn git_authority_delta_is_an_atomic_transaction_mutation_without_readding_cas_records() {
+        assert_eq!(REPOSITORY_TRANSACTION_SCHEMA_VERSION, 4);
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let old = blob_git_authority(repository_id.clone(), b"services:\n  old: {}\n");
+        let new = blob_git_authority(repository_id, b"services:\n  new: {}\n");
+
+        let initial =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(old.clone()));
+        assert!(initial.external_objects.is_empty());
+        assert!(!old.closure.objects.is_empty());
+        initial.validate().unwrap();
+
+        let update =
+            authority_only_transaction(GitExternalAuthorityDelta::update(old.clone(), new.clone()));
+        update.validate().unwrap();
+        let update_hash = update.transaction_hash().unwrap();
+        assert_eq!(
+            update_hash.to_string(),
+            "ad3ef05a2450e78e1ed19de548e309408ea840ce8916385f382c89a5aeac33b5",
+            "repository transaction v4 identity is schema-pinned"
+        );
+        assert_ne!(initial.transaction_hash().unwrap(), update_hash);
+
+        let removal = authority_only_transaction(GitExternalAuthorityDelta::remove(new.clone()));
+        removal.validate().unwrap();
+        assert_ne!(
+            update.transaction_hash().unwrap(),
+            removal.transaction_hash().unwrap()
+        );
+
+        let inverse = authority_only_transaction(GitExternalAuthorityDelta::remove(old).inverse());
+        inverse.validate().unwrap();
+        assert_ne!(
+            removal.transaction_hash().unwrap(),
+            inverse.transaction_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn transaction_schema_and_repository_identity_fail_closed_for_git_authority() {
+        let authority = blob_git_authority(RepositoryId::new("repo").unwrap(), b"authority body");
+        let transaction =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(authority.clone()));
+        transaction.validate().unwrap();
+
+        let mut wrong_repository = transaction.clone();
+        wrong_repository.repository_id = RepositoryId::new("other").unwrap();
+        let error = wrong_repository.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match enclosing repository"));
+
+        let mut no_op = transaction.clone();
+        no_op.git_authority_delta = Some(GitExternalAuthorityDelta::update(
+            authority.clone(),
+            authority,
+        ));
+        assert!(no_op.validate().unwrap_err().to_string().contains("no-op"));
+
+        let mut legacy = transaction.clone();
+        legacy.schema_version = 3;
+        assert!(legacy
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported repository transaction version 3"));
+
+        let value = serde_json::to_value(&transaction).unwrap();
+        assert!(value.get("git_authority_delta").is_some());
+        let schema = serde_json::to_value(schemars::schema_for!(RepositoryTransaction)).unwrap();
+        assert!(schema.pointer("/properties/git_authority_delta").is_some());
+    }
+
+    #[test]
+    fn operation_record_validates_and_binds_the_exact_git_authority_delta() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let old = blob_git_authority(repository_id.clone(), b"old");
+        let new = blob_git_authority(repository_id.clone(), b"new");
+        let delta = GitExternalAuthorityDelta::update(old.clone(), new.clone());
+        let transaction = authority_only_transaction(delta.clone());
+        let transaction_hash = transaction.transaction_hash().unwrap();
+        let mut roots_after = roots();
+        roots_after.generation = 8;
+        let operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id,
+            transaction_hash,
+            actor: transaction.actor,
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            git_authority_delta: Some(delta),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            roots_before: roots(),
+            roots_after,
+        };
+        operation.validate().unwrap();
+        let identity = operation.identity_hash().unwrap();
+        assert_eq!(
+            identity.to_string(),
+            "88697dcc0db93d8577850c9500a84f80345185b11782d48ca93cd822966ef8e7",
+            "repository operation v4 identity is schema-pinned"
+        );
+
+        let mut changed = operation.clone();
+        changed.git_authority_delta = Some(GitExternalAuthorityDelta::remove(new.clone()));
+        assert_ne!(changed.identity_hash().unwrap(), identity);
+
+        let mut wrong_repository = operation.clone();
+        wrong_repository.repository_id = RepositoryId::new("other").unwrap();
+        assert!(wrong_repository
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("does not match enclosing repository"));
+
+        let mut malformed = operation;
+        malformed.git_authority_delta = Some(GitExternalAuthorityDelta::update(old.clone(), old));
+        assert!(malformed
+            .identity_hash()
+            .unwrap_err()
+            .to_string()
+            .contains("no-op"));
+    }
+
+    #[test]
+    fn operation_identity_excludes_circular_roots_and_canonicalizes_ref_order() {
+        let target =
+            RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32])));
+        let first = RefMutation {
+            name: RefName::branch(b"a").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        };
+        let second = RefMutation {
+            name: RefName::branch(b"b").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        };
+        let mut roots_after = roots();
+        roots_after.generation = 8;
+        let record = RepositoryOperationRecord {
+            operation_id: OperationId::from_uuid(Uuid::from_u128(41)),
+            repository_id: RepositoryId::new("repo").unwrap(),
+            transaction_hash: Hash256::from_bytes([0x82; 32]),
+            actor: AuthorId::new("actor"),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            git_authority_delta: None,
+            ref_mutations: vec![second, first],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            roots_before: roots(),
+            roots_after,
+        };
+        let expected = record.identity_hash().unwrap();
+
+        let mut equivalent = record.clone();
+        equivalent.ref_mutations.reverse();
+        equivalent.roots_before.history = root(0xa1);
+        equivalent.roots_after.ref_log = root(0xa2);
+        assert_eq!(equivalent.identity_hash().unwrap(), expected);
+    }
+
+    /// Every field of a repository operation record either binds its identity
+    /// or is a named exclusion, and the mirror that carries them is diffed
+    /// POSITIONALLY.
+    ///
+    /// `RepositoryOperationIdentity` is a field list kept by hand against
+    /// `RepositoryOperationRecord`. The hash cannot police it. A field the
+    /// record grows and the mirror never gains simply stops participating, so
+    /// two records differing only in it collide on one ref-log leaf identity,
+    /// and every existing digest stays valid while that happens. A field the
+    /// mirror reorders is invisible outright, because the identity encodes
+    /// through `canonical_json_bytes`, whose object encoder sorts keys.
+    ///
+    /// So this test does two things a hash comparison cannot. It diffs the
+    /// mirror's positional encoding against a reference built element by
+    /// element from the record, where order and element count are both
+    /// load-bearing. And it walks the record field by field, requiring each one
+    /// to move the identity unless it is one of the two exclusions named below.
+    ///
+    /// It fails closed on a new field: the record's own positional arity is
+    /// asserted equal to the number of cases, so a field added to the record
+    /// and not to the table stops this test rather than slipping past it. And
+    /// each case asserts its mutation actually changed the record before
+    /// judging the identity, because a mutation that quietly did nothing would
+    /// otherwise report the field as unbound.
+    #[test]
+    fn operation_identity_mirrors_every_record_field_positionally() {
+        /// Excluded from the identity on purpose, with the reason.
+        const EXCLUDED: [(&str, &str); 2] = [
+            (
+                "roots_before",
+                "the ref-log root is part of the bundle, so binding it is circular",
+            ),
+            (
+                "roots_after",
+                "the ref-log root is part of the bundle, so binding it is circular",
+            ),
+        ];
+
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(9));
+        let (shared_policy, policy, local_overlay_delta) = admission_policy(workspace_id);
+        let mutation = create_workspace_mutation(
+            workspace_id,
+            shared_policy,
+            policy,
+            vec![add_artifact(
+                ArtifactId(Uuid::from_u128(10)),
+                b"compose.yaml".to_vec(),
+                0x41,
+                false,
+            )],
+        );
+        let target =
+            RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32])));
+        let ref_mutation = |name: &[u8], target: RefTarget| RefMutation {
+            name: RefName::branch(name).unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        };
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+
+        let base = RepositoryOperationRecord {
+            operation_id: OperationId::from_uuid(Uuid::from_u128(41)),
+            repository_id: repository_id.clone(),
+            transaction_hash: Hash256::from_bytes([0x82; 32]),
+            actor: AuthorId::new("actor"),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            git_authority_delta: None,
+            ref_mutations: vec![
+                ref_mutation(b"a", target.clone()),
+                ref_mutation(b"b", target.clone()),
+            ],
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: crate::DefaultRefExpectation::MustBeUnset,
+                new_default: Some(RefName::branch(b"a").unwrap()),
+            }),
+            workspace_mutation: Some(mutation),
+            local_overlay_delta: Some(local_overlay_delta),
+            roots_before: roots(),
+            roots_after,
+            merge_transaction_delta: Some(MergeTransactionDelta::open(
+                crate::merge::tests::sample_record(repository_id.clone(), workspace_id),
+            )),
+        };
+        base.validate().unwrap();
+        let baseline = base.identity_hash().unwrap();
+
+        // Every field of RepositoryOperationRecord, in declaration order.
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Box<dyn Fn(&mut RepositoryOperationRecord)>)> = vec![
+            (
+                "operation_id",
+                Box::new(|record| {
+                    record.operation_id = OperationId::from_uuid(Uuid::from_u128(42));
+                }),
+            ),
+            (
+                "repository_id",
+                Box::new(|record| {
+                    record.repository_id = RepositoryId::new("other").unwrap();
+                }),
+            ),
+            (
+                "transaction_hash",
+                Box::new(|record| {
+                    record.transaction_hash = Hash256::from_bytes([0x83; 32]);
+                }),
+            ),
+            (
+                "actor",
+                Box::new(|record| record.actor = AuthorId::new("other-actor")),
+            ),
+            (
+                "committed_at",
+                Box::new(|record| {
+                    record.committed_at = crate::Timestamp::from(
+                        chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:06Z")
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
+                    );
+                }),
+            ),
+            (
+                "git_authority_delta",
+                Box::new(|record| {
+                    let authority = blob_git_authority(record.repository_id.clone(), b"body");
+                    record.git_authority_delta =
+                        Some(GitExternalAuthorityDelta::initialize(authority));
+                }),
+            ),
+            (
+                "ref_mutations",
+                Box::new(|record| {
+                    record.ref_mutations[0].policy = RefUpdatePolicy::ForceWithLease;
+                }),
+            ),
+            (
+                "default_ref_mutation",
+                Box::new(|record| {
+                    record.default_ref_mutation = Some(DefaultRefMutation {
+                        expected: crate::DefaultRefExpectation::MustBeUnset,
+                        new_default: Some(RefName::branch(b"b").unwrap()),
+                    });
+                }),
+            ),
+            (
+                "workspace_mutation",
+                Box::new(|record| {
+                    let workspace_id = record.workspace_mutation.as_ref().unwrap().workspace_id;
+                    let (shared_policy, policy, _) = admission_policy(workspace_id);
+                    record.workspace_mutation = Some(create_workspace_mutation(
+                        workspace_id,
+                        shared_policy,
+                        policy,
+                        vec![add_artifact(
+                            ArtifactId(Uuid::from_u128(11)),
+                            b"Dockerfile".to_vec(),
+                            0x44,
+                            false,
+                        )],
+                    ));
+                }),
+            ),
+            (
+                "local_overlay_delta",
+                Box::new(|record| {
+                    let workspace_id = record.workspace_mutation.as_ref().unwrap().workspace_id;
+                    let overlay = FrozenLocalOverlay::new(
+                        workspace_id,
+                        0,
+                        AdmissionCase::FoldAscii,
+                        Vec::new(),
+                    )
+                    .unwrap();
+                    record.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+                }),
+            ),
+            (
+                "roots_before",
+                Box::new(|record| record.roots_before.history = root(0xa1)),
+            ),
+            (
+                "roots_after",
+                Box::new(|record| record.roots_after.ref_log = root(0xa2)),
+            ),
+            (
+                "merge_transaction_delta",
+                Box::new(|record| {
+                    let existing = record
+                        .merge_transaction_delta
+                        .as_ref()
+                        .unwrap()
+                        .new
+                        .clone()
+                        .unwrap();
+                    record.merge_transaction_delta =
+                        Some(MergeTransactionDelta::drop_record(existing));
+                }),
+            ),
+        ];
+
+        let case_count = cases.len();
+        let canonical = base.canonicalized();
+        assert_eq!(
+            messagepack_array_len(&rmp_serde::to_vec(&canonical).unwrap()),
+            case_count,
+            "RepositoryOperationRecord encodes {} fields but this test covers {case_count}. A \
+             field was added or removed; extend the table above, and decide whether the new \
+             field binds identity or joins EXCLUDED with a reason.",
+            messagepack_array_len(&rmp_serde::to_vec(&canonical).unwrap())
+        );
+
+        // The positional differential. The reference is built element by
+        // element from the record in the record's own declaration order, minus
+        // the exclusions, so a field the mirror moved, dropped or gained shows
+        // up here as a byte difference. The hash cannot show any of the three.
+        let payload = rmp_serde::to_vec(&canonical.identity_payload()).unwrap();
+        let reference = rmp_serde::to_vec(&(
+            &canonical.operation_id,
+            &canonical.repository_id,
+            &canonical.transaction_hash,
+            &canonical.actor,
+            &canonical.committed_at,
+            &canonical.git_authority_delta,
+            &canonical.ref_mutations,
+            &canonical.default_ref_mutation,
+            &canonical.workspace_mutation,
+            &canonical.local_overlay_delta,
+            &canonical.merge_transaction_delta,
+        ))
+        .unwrap();
+        assert_eq!(
+            payload, reference,
+            "RepositoryOperationIdentity no longer mirrors RepositoryOperationRecord element for \
+             element. Its identity hash sorts object keys, so it stayed green through whatever \
+             moved here."
+        );
+        assert_eq!(
+            messagepack_array_len(&payload),
+            case_count - EXCLUDED.len(),
+            "the identity payload's element count is not the record's minus its exclusions"
+        );
+
+        for (field, mutate) in cases {
+            let mut candidate = base.clone();
+            mutate(&mut candidate);
+            assert_ne!(
+                candidate, base,
+                "the `{field}` case did not change the record, so it proves nothing about whether \
+                 `{field}` binds identity"
+            );
+            let moved = candidate.identity_hash().unwrap() != baseline;
+            match EXCLUDED.iter().find(|(name, _)| *name == field) {
+                Some((_, reason)) => assert!(
+                    !moved,
+                    "`{field}` is excluded from the operation identity on purpose ({reason}) and \
+                     has started participating in it"
+                ),
+                None => assert!(
+                    moved,
+                    "`{field}` is a field of RepositoryOperationRecord that does not participate \
+                     in its identity, so two records differing only in `{field}` share one \
+                     ref-log leaf identity. Bind it in RepositoryOperationIdentity, or add it to \
+                     EXCLUDED with the reason."
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_rejects_duplicate_ref_targets() {
+        let name = RefName::branch(b"main").unwrap();
+        let target =
+            RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32])));
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_bytes([1; 16])),
+            repository_id: RepositoryId::new("repo").unwrap(),
+            expected_generation: 7,
+            expected_roots: roots(),
+            actor: AuthorId::new("actor"),
+            reason: "test".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![
+                RefMutation {
+                    name: name.clone(),
+                    expected: RefExpectation::MustNotExist,
+                    new_target: Some(target.clone()),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                },
+                RefMutation {
+                    name,
+                    expected: RefExpectation::MustNotExist,
+                    new_target: Some(target),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                },
+            ],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        };
+        assert!(transaction.validate().is_err());
+    }
+}

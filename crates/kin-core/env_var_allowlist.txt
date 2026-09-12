@@ -93,3 +93,9 @@ KIN_LKG_WORKSPACE
 # first, no runtime behaviour keys on either, and nothing an operator sets.
 KIN_FOLD_SPLIT_REPO
 KIN_FOLD_SPLIT_MODE
+
+# kin-search's soak test reads its seed override directly, inside `#[cfg(test)]
+# mod tests` in crates/kin-search/src/lib.rs, so it never reaches a running kin.
+# kin-search moved into crates/ on 2026-09-11 and this scan now reads it as
+# workspace source; before, the dependency scan saw it the same way.
+KIN_SEARCH_SOAK_SEED

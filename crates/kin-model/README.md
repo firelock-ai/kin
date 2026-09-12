@@ -1,0 +1,111 @@
+# kin-model
+
+> Canonical types and domain models shared across the Kin stack.
+
+`kin-model` holds the canonical shared types for Kin's semantic repository
+substrate.
+
+It defines the graph objects that the public Kin stack uses across the local
+engine, CLI, daemon, MCP server, projection layer, and supporting crates:
+
+- entities, relations, revisions, and retrieval keys
+- exact tree entries and deltas for every tracked path, regardless of language
+- sessions, intents, locks, traffic reports, and coordination events
+- review, work, provenance, verification, and temporal records
+- projection, reconciliation, preset, and policy types
+
+This crate is intentionally small and dependency-light. It is the schema and
+domain boundary for the open Kin local substrate, not the hosted KinLab control
+plane. It sits on `kin-blobs` for content-addressable identity and `kin-vector`
+for embedding vectors, and the layers above it, `kin-db` and `kin` included,
+take their types from here instead of redefining them.
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+
+## What is Kin?
+
+Kin is a graph-native code repository for people and AI agents: your code as a graph of
+entities, relations, and intents, not a pile of files and diffs. AI agents and humans
+navigate it semantically, with provenance, review, and governance built in. It coexists
+with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+
+Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+
+## Build
+
+```bash
+cargo build
+cargo test
+```
+
+The toolchain is pinned in `rust-toolchain.toml` so a local build matches CI.
+
+## Changing a persisted type
+
+Types reachable from a snapshot, delta, or operation record are persisted by
+`kin-db` as compact MessagePack, and that encoding writes a struct as an array,
+so a field is identified by its position and never by its name. Two rules
+follow. A new field goes last, because appending is additive and an older
+record simply runs out of array elements. And `skip_serializing_if` belongs
+only on trailing fields, paired with `#[serde(default)]`, because a skipped
+field shortens the array. Break either rule and every following value shifts
+into the wrong slot, which decodes as the wrong type or, worse, as a plausible
+wrong value.
+
+Both rules are enforced rather than trusted. `tests/persisted_schema.rs` denies
+a non-trailing `skip_serializing_if` by source scan and round-trips the
+skipping values themselves, and `.github/workflows/kin-db-compat.yml` runs the
+downstream `kin-db` suite against the change, because this repository's own
+tests cannot observe an existing store decoding wrongly. The full rule lives in
+the crate docs at the top of `src/lib.rs`.
+
+## Versioning & release policy
+
+`kin-model` is the **release/version source of truth** for the canonical Kin
+types. Downstream crates (`kin`, `kin-db`, `kin-bench`, and more) pin it from the
+`kin` cargo registry, so its version is a compatibility contract, not just a label.
+
+**Semver (pre-1.0).** While the crate is `0.MINOR.PATCH`:
+
+- **MINOR bump** (`0.2.x` to `0.3.0`) for any **API-affecting / breaking** change:
+  renamed/removed/retyped public items, changed serialization, new required
+  fields. Cargo treats `0.2` and `0.3` as incompatible, so this is what forces
+  downstream consumers to move deliberately.
+- **PATCH bump** (`0.2.0` to `0.2.1`) for additive, backward-compatible changes and
+  fixes (new optional items, docs, internals).
+
+**The registry is immutable.** A published `(name, version)` can never be
+overwritten. So **every change you intend to publish must carry a new, not-yet-
+published version**. There is no way to ship a fix under an already-published
+number. `scripts/publish-kinlab-crates.sh` refuses to re-publish an existing
+version (it reads the index first and skips), and CI fails the release run when
+`src/` changes without a version move: `registry-publish.yml` delegates to
+kin-actions' shared `cargo-registry-release.yml` workflow, whose
+`check-version-bump.py` gate enforces the bump.
+
+**Downstream bump + smoke process.** When you make a breaking (MINOR) bump:
+
+1. Bump `version` in `Cargo.toml`.
+2. Update the affected `req` values in [`downstream-pins.json`](downstream-pins.json),
+   the declared contract of which version each downstream consumer pins. This
+   is the explicit, reviewable signal that those repos must move.
+   `scripts/check-downstream-pins.sh` fails CI if any declared pin cannot accept
+   the version you are about to publish.
+3. After the new version publishes, each downstream repo bumps its `kin-model`
+   pin and runs the fresh-cache consumer smoke
+   (`scripts/registry-consumer-smoke.sh <version>`), which builds a throwaway
+   consumer against the published registry from an empty cache, proving the new
+   release actually resolves and builds, not just that it packaged.
+
+Two of these gates run in this repository's CI, both through
+`registry-publish.yml`: the version-bump check (kin-actions'
+`check-version-bump.py` inside the shared `cargo-registry-release.yml`
+workflow) and `scripts/check-downstream-pins.sh` in the workflow's test
+command. `scripts/check-version-bump.sh` and `scripts/registry-consumer-smoke.sh`
+are local and downstream tools, useful before you push and after a publish;
+neither is wired into CI here.
+
+## License
+
+[Apache-2.0](LICENSE).

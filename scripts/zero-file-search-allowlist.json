@@ -1591,6 +1591,88 @@
         "read",
         "write"
       ]
+    },
+    {
+      "file": "crates/kin-blobs/src/lib.rs",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. Content-addressable object store: it writes, verifies, reads back and garbage-collects blobs under Kin's own object directory by the SHA-256 name a caller supplies, and its collector walks that object directory, never a user's tree.",
+      "owner": "kin-blobs",
+      "expiration": "2027-09-24",
+      "allow_fn": [
+        "delete",
+        "ensure_directory_metadata",
+        "ensure_shard_dir",
+        "exists",
+        "gc",
+        "list_hashes",
+        "open",
+        "prune_empty_shards",
+        "quarantine",
+        "read_unverified",
+        "sync_dir",
+        "validate_dir_type",
+        "write",
+        "write_body"
+      ],
+      "allow_match": [
+        "std::fs::{self, File}"
+      ]
+    },
+    {
+      "file": "crates/kin-search/src/lib.rs",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions persist, reload, archive and retire kin-search's own index files. Its BM25 search runs over documents a caller hands it and stays graded.",
+      "owner": "kin-search",
+      "expiration": "2027-10-29",
+      "allow_fn": [
+        "archive_corrupt_index",
+        "kinseg_sibling_files",
+        "load_persisted",
+        "load_segmented",
+        "open_with_persistence",
+        "persist_monolithic",
+        "retire_segmented_artifacts",
+        "sync_parent_dir",
+        "unique_tmp_path",
+        "version_of_manifest",
+        "write_and_promote",
+        "write_file_durably"
+      ]
+    },
+    {
+      "file": "crates/kin-search/src/mapped.rs",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions open, map and write kin-search's own segment and manifest files. The mapped reader's lookups and ranking stay graded.",
+      "owner": "kin-search",
+      "expiration": "2027-10-29",
+      "allow_fn": [
+        "open_archiving",
+        "read_manifest_gens",
+        "write_mapped_streaming"
+      ],
+      "allow_match": [
+        "let file = std::fs::File::open(path).map_err(|err| format!(\"unreadable: {err}\"))?"
+      ]
+    },
+    {
+      "file": "crates/kin-vector/src/lib.rs",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions take kin-vector's advisory write lock and persist, recover and replace its own HNSW index and vector store atomically. Its search runs over vectors already in memory and stays graded.",
+      "owner": "kin-vector",
+      "expiration": "2027-11-26",
+      "allow_fn": [
+        "acquire_write_lock",
+        "clear_recovery_candidate",
+        "fsync_and_rename",
+        "load_from_disk",
+        "load_proven_recovery_bytes",
+        "load_recovery_marker",
+        "open_container",
+        "promote_recovery_candidate",
+        "recover_from_tmp",
+        "sync_directory",
+        "write_bytes_with_fsync"
+      ],
+      "allow_match": [
+        "fs2::FileExt",
+        "std::{cmp::Reverse, fs, fs::File, fs::OpenOptions}"
+      ]
     }
   ]
 }

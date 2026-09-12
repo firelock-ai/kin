@@ -38,3 +38,15 @@ crates/kin-cli/src/resource_profile.rs
 # toolchain still wins, and a second call is a no-op so a re-exec cannot grow
 # `PATH` without end.
 crates/kin-core/src/tool_prefix.rs
+
+# A conscious exception, not a precedent: test setup does not qualify here, and
+# these three would otherwise take their configuration by argument. kin-vector is
+# a standalone publishable crate below kin-core, so it cannot take kin-core as a
+# dev-dependency for EnvVarGuard, and each file is its own test binary setting
+# KIN_VECTOR_SIMD before the library's OnceLock samples it once. It moved into
+# crates/ on 2026-09-11 with its own test discipline. Follow-up: the three tests
+# take the SIMD selection by argument, in a kin-vector pull request inside this
+# workspace, and these three lines go.
+crates/kin-vector/tests/hnsw_determinism_simd.rs
+crates/kin-vector/tests/hnsw_simd_query_path_parity.rs
+crates/kin-vector/tests/simd_scalar_reachable.rs

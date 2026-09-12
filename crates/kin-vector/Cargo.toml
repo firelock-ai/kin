@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-vector"
+version = "0.2.1"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+description = "Pure-Rust HNSW approximate nearest-neighbor search. No C++ FFI, no platform-specific build scripts"
+repository = "https://github.com/firelock-ai/kin-vector"
+
+[lib]
+doctest = false
+
+[features]
+default = ["simd"]
+# SIMD distance kernel (aarch64 NEON). Compiled in AND gated ON by default: on
+# aarch64 the NEON kernel is the default result path now that its scalar parity and
+# CPU efficiency are measured and approved. The ~2-ulp delta from the scalar
+# reduction is characterized and bounded in the `simd` tests and only ever
+# transposes effectively-equidistant neighbors. Fall back to the scalar reduction
+# for A/B (or a bit-identical-to-frozen-benchmark run) by setting `KIN_VECTOR_SIMD`
+# to `0`, `false`, `no`, or `off`. With this feature disabled the crate compiles to
+# the scalar reduction only, byte-for-byte unchanged. See `cosine_distance`.
+simd = []
+
+[dependencies]
+fs2 = "0.4"
+hashbrown = { version = "0.15", features = ["serde"] }
+memmap2 = "0.9"
+parking_lot = "0.12"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+rmp-serde = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
