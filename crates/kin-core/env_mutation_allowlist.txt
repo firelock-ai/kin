@@ -71,3 +71,11 @@ crates/kin-vector tests-only
 # Follow-up: the probes take their configuration by argument, in a kin-infer
 # pull request inside this workspace, and this line goes.
 crates/kin-infer tests-only
+
+# kin-db, imported 2026-09-11, in the crate-scoped form this file now carries.
+# Every environment write in it is inside a `#[cfg(test)]` module or a tests/
+# binary: embed/mod.rs from line 4454, search/text.rs from line 538, and three
+# probes. kin-db is a standalone publishable crate below kin-core and cannot take
+# kin-core as a dev-dependency for EnvVarGuard, so its TEST code is exempt and its
+# product code stays graded. Follow-up: take the configuration by argument.
+crates/kin-db tests-only

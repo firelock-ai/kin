@@ -12,6 +12,10 @@ allowed_files=(
   "crates/kin-cli/src/backend.rs"
   "crates/kin-cli/src/commands/init.rs"
   "crates/kin-daemon/src/api.rs"
+  # kin-db defines SnapshotManager here, so this file IS the runtime internal the
+  # rule protects. It moved into crates/ on 2026-09-11; while kin-db was a registry
+  # dependency the scan never reached its source at all.
+  "crates/kin-db/src/storage/snapshot.rs"
   "crates/kin-daemon/src/state.rs"
   "crates/kin-migrate/src/executor.rs"
 )
