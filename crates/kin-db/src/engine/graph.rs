@@ -4807,7 +4807,7 @@ impl InMemoryGraph {
     ///
     /// Downloads the model from HuggingFace on first call (~270 MB).
     /// Subsequent calls return the cached instance.
-    #[cfg(feature = "embeddings")]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn get_embedder(&self) -> Result<Arc<CodeEmbedder>, KinDbError> {
         let mut guard = self.embedder.lock();
         if let Some(ref e) = *guard {
@@ -12045,6 +12045,8 @@ mod tests {
     #[cfg(feature = "vector")]
     #[test]
     fn a_surviving_revision_key_does_not_resolve_a_retired_entity() {
+        #[cfg(feature = "embeddings")]
+        let _download_guard = crate::embed::EMBED_MODEL_DOWNLOAD_LOCK.lock();
         let graph = InMemoryGraph::new();
         let file = FilePathId::new("src/retired.rs");
         let entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);

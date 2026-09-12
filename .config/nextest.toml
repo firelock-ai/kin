@@ -1,6 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
+# Test scheduling and flake quarantine.
+#
+# nextest runs tests in separate processes. Tests that load the default model
+# share its HuggingFace cache, whose download lock times out before a cold
+# download can finish. Serialize those consumers without retrying failures.
+[test-groups.model-download]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kin-db) & (test(=embed::tests::default_dimensions_match_default_model) | test(=engine::graph::tests::test_vector_index_dimension_mismatch_auto_recovery) | test(=engine::graph::tests::a_surviving_revision_key_does_not_resolve_a_retired_entity))'
+test-group = 'model-download'
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kin-db::embed_oom_cpu_fallback) | binary_id(=kin-db::embedding_sanity) | binary_id(=kin-db::embed_hybrid_parity) | binary_id(=kin-db::embed_budget_profile) | binary_id(=kin-db::metal_seq_len_regression)'
+test-group = 'model-download'
+
 # Flake quarantine, and the two verdicts one execution produces.
 #
 # A job-level retry restarts the check clock, which is what a merge-queue
@@ -20,9 +36,9 @@
 # The last one decides the shape of this file. nextest IGNORES keys it does not
 # know, so quarantine bookkeeping cannot live in this table as extra fields: a
 # typo would be silently dropped and the row would still read complete. The
-# bookkeeping is therefore a comment line in a fixed format above each override,
-# and scripts/check-quarantine.py refuses the file unless every override carries
-# one and the comment and the filter name the same test.
+# bookkeeping is therefore a comment line in a fixed format above each retry
+# override. scripts/check-quarantine.py requires that comment and the filter to
+# name the same test. Scheduling-only overrides above do not grant retries.
 #
 # The blocking verdict is this profile: a quarantined test that passes on retry
 # does not fail the run, so it stops ejecting queue entries and stops reddening

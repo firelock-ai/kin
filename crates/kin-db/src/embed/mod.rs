@@ -593,14 +593,16 @@ const DEFAULT_REVISION: &str = "main";
 /// Serializes `--lib` unit tests that build a real [`CodeEmbedder`] against
 /// the shared on-disk HuggingFace Hub cache
 /// (`default_dimensions_match_default_model` here and
-/// `test_vector_index_dimension_mismatch_auto_recovery` in `engine::graph`;
-/// both resolve `DEFAULT_MODEL_ID`/`DEFAULT_REVISION`). `cargo test` runs
+/// the vector-index tests in `engine::graph`; all resolve
+/// `DEFAULT_MODEL_ID`/`DEFAULT_REVISION`). `cargo test` runs
 /// unit tests from one binary concurrently by default, and two threads
 /// racing `hf_hub`'s first-time blob download for the same repo+revision
 /// can corrupt the shared cache directory. Holding this lock around
 /// embedder construction means the first test performs the real download
 /// and every later test observes an already-warm cache: no network race,
 /// and the model is fetched once per test run instead of once per test.
+/// nextest uses separate processes, coordinated by the `model-download` test
+/// group in `.config/nextest.toml`.
 #[cfg(all(test, feature = "embeddings"))]
 pub(crate) static EMBED_MODEL_DOWNLOAD_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 

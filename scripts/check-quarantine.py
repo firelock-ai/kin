@@ -101,7 +101,7 @@ QUARANTINE_MAX_DAYS = 14
 QUARANTINE_MAX_ROWS = 5
 QUARANTINE_PROMOTION_DAYS = 7
 
-# The bookkeeping comment that must sit above every override. Keys are matched
+# The bookkeeping comment above every quarantine override. Keys are matched
 # individually rather than as one line pattern, so a row missing exactly one of
 # them is refused by the arm that owns that key instead of by a shapeless
 # "malformed comment".
@@ -136,21 +136,31 @@ class Row:
 
 
 def parse_rows(text):
-    """Pair each `[[profile.default.overrides]]` with the comment above it.
+    """Pair quarantine overrides with their bookkeeping comments.
 
     Textual on purpose. tomllib discards comments, and the comment is where the
     bookkeeping lives, so a TOML-only read would report every row as having no
     ticket. tomllib still runs, in `load_config`, to prove the file is valid
-    TOML and to read the values; this pass only supplies what tomllib throws
-    away.
+    TOML. Scheduling-only overrides assign a declared test group without
+    retries; they do not belong to quarantine.
     """
 
+    config = tomllib.loads(text)
+    groups = config.get("test-groups", {})
+    profile = config.get("profile", {}).get("default", {})
+    if profile.get("retries", 0) != 0:
+        raise AssertionError(
+            "global-retries: default-profile retries apply to every test without "
+            "quarantine metadata; declare retries only on ticketed test overrides"
+        )
+    overrides = iter(profile.get("overrides", []))
     rows = []
     lines = text.splitlines()
     index = 0
     for number, line in enumerate(lines, start=1):
         if line.strip() != "[[profile.default.overrides]]":
             continue
+        override = next(overrides)
         meta = {}
         # Walk back over the contiguous comment block above the table header.
         for above in range(number - 2, -1, -1):
@@ -162,6 +172,13 @@ def parse_rows(text):
                 if found:
                     meta = found
                     break
+        if (
+            not meta
+            and set(override) == {"filter", "test-group"}
+            and isinstance(override["test-group"], str)
+            and override["test-group"] in groups
+        ):
+            continue
         filter_expr = None
         retries = None
         for below in range(number, len(lines)):
@@ -476,6 +493,38 @@ def run_controls():
                 f"{findings + warnings}, so every mutation below would be red "
                 "for the wrong reason"
             )
+
+        scheduling = """
+[test-groups.model-download]
+max-threads = 1
+[[profile.default.overrides]]
+filter = 'binary_id(=pkg::target) & test(=a_test_that_is_defined)'
+test-group = 'model-download'
+"""
+        findings, warnings = grade(scheduling + clean)
+        if findings or warnings or len(parse_rows(scheduling + clean)) != 1:
+            raise AssertionError(
+                "control failed: a scheduling-only group was treated as quarantine"
+            )
+        for untracked in (
+            scheduling + "retries = 2\n",
+            scheduling.replace("test-group = 'model-download'", "test-group = 'unknown'"),
+        ):
+            findings, _ = grade(untracked)
+            if not any(finding.startswith("no-ticket:") for finding in findings):
+                raise AssertionError(
+                    "control failed: a retry or unknown group bypassed quarantine validation"
+                )
+        for retries in ("2", '{ count = 2, backoff = "fixed", delay = "1s" }'):
+            try:
+                parse_rows(scheduling + f"\n[profile.default]\nretries = {retries}\n")
+            except AssertionError as error:
+                if not str(error).startswith("global-retries:"):
+                    raise
+            else:
+                raise AssertionError(
+                    "control failed: inherited global retries bypassed quarantine validation"
+                )
 
         mutations = {
             "no-ticket": clean.replace("ticket=FIR-1 ", ""),
