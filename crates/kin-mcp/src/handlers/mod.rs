@@ -6125,6 +6125,76 @@ mod tests {
         assert!(text.contains("committed") || text.contains("applied") || text.contains("receipt"));
     }
 
+    #[tokio::test]
+    async fn repeated_mutate_request_ids_are_not_deduplicated() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let entity = placement_free_entity("RepeatMutationEntity");
+        store.upsert_entity(&entity).unwrap();
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("repeat mutation documentation".into());
+        let args = HashMap::from([
+            ("request_id".to_string(), serde_json::json!("same-request")),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "description": "update entity docs",
+                    "payload": { "Entity": updated },
+                }]),
+            ),
+        ]);
+        for attempt in 0..2 {
+            let result = sessions::handle_mutate(
+                &args,
+                &store,
+                &sessions,
+                SessionAuthorityMode::OfflineFallback,
+            )
+            .await
+            .unwrap();
+            if attempt == 0 {
+                assert_ne!(result.is_error, Some(true), "{}", tool_result_text(&result));
+                let receipt: serde_json::Value =
+                    serde_json::from_str(&tool_result_text(&result)).unwrap();
+                assert_eq!(receipt["request_id"], "same-request");
+            } else {
+                assert_eq!(result.is_error, Some(true));
+                assert!(tool_result_text(&result).contains("no-op"));
+            }
+        }
+        let transactions = sessions.list_transactions();
+        assert_eq!(transactions.len(), 2);
+        assert_ne!(
+            transactions[0].transaction_id,
+            transactions[1].transaction_id
+        );
+        assert_eq!(
+            transactions
+                .iter()
+                .filter(|tx| tx.state == "committed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            transactions
+                .iter()
+                .filter(|tx| tx.state == "aborted")
+                .count(),
+            1
+        );
+        let definition = crate::tools::tool_definitions()
+            .tools
+            .into_iter()
+            .find(|tool| tool.name == "kin_mutate")
+            .unwrap();
+        assert!(!definition.annotations.read_only_hint);
+        assert!(definition.annotations.destructive_hint);
+        assert!(!definition.annotations.idempotent_hint,
+            "a repeated request starts a new transaction instead of replaying its receipt; the hint must not promise idempotence");
+    }
+
     /// A payload-less entity update carrying the body and nothing else.
     ///
     /// The shape the belt actually sends: an agent knows the entity and the new

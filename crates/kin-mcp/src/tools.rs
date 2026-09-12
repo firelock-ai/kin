@@ -365,11 +365,8 @@ pub fn unserved_tools_named_in(
 /// is a different question and FIR-2480 owns it; this makes the surface stop
 /// contradicting itself whatever that answer turns out to be.
 /// `search_is_served` decides which route the note names. On a profile that
-/// serves [`crate::handlers::tool_search`], telling the reader to restart the
-/// server on `full` would be the worse of two available answers and the one the
-/// agent cannot act on mid-session: the tool it was pointed at is one call away.
-/// Every other profile keeps the wording it had, so `agent-default`'s served
-/// bytes do not move.
+/// serves [`crate::handlers::tool_search`], schemas can be discovered immediately,
+/// but invoking a withheld tool still requires a profile that serves it.
 fn unserved_cross_reference_note(named: &[String], search_is_served: bool) -> String {
     let (subject, object, possessive, schema) = if named.len() == 1 {
         ("This tool is", "it", "its", "schema")
@@ -378,8 +375,8 @@ fn unserved_cross_reference_note(named: &[String], search_is_served: bool) -> St
     };
     let reach = if search_is_served {
         format!(
-            "Call {search} for {possessive} full {schema}, then call {object} on the next turn, \
-             or set KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) to serve {object} here.",
+            "Call {search} for {possessive} full {schema}. Discovery does not enable {object}; \
+             use KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) on a connection that serves {object}.",
             search = crate::handlers::tool_search::TOOL_NAME,
         )
     } else {
@@ -1197,7 +1194,10 @@ fn registered_tools() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_mutate".into(),
                 description: crate::handlers::sessions::MUTATE_DESC.into(),
-                annotations: destructive_idempotent("Atomically mutate graph"),
+                annotations: ToolAnnotations {
+                    idempotent_hint: false,
+                    ..destructive_idempotent("Atomically mutate graph")
+                },
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3330,9 +3330,8 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
     /// at it rather than at a server restart.
     ///
     /// The FIR-3031 rule is that no served description may name a withheld tool
-    /// in silence. On this profile the honest answer to "where is it" changed:
-    /// the tool is one call away, and telling an agent mid-session to restart
-    /// the server on `full` is advice it cannot act on.
+    /// in silence. Search exposes the definition and profile eligibility; the
+    /// result does not make a withheld tool callable on this connection.
     #[test]
     fn the_cross_reference_note_names_the_search_tool_where_it_is_served() {
         let registered: Vec<String> = tool_definitions()

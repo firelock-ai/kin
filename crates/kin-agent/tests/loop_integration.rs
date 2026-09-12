@@ -2627,3 +2627,767 @@ fn the_loop_drives_a_real_kin_mcp_server() {
         "the real server must carry a _kin envelope: {row}"
     );
 }
+
+struct CountingStep {
+    route: &'static str,
+    status: u16,
+    response: Value,
+    delay: Duration,
+}
+fn count_step(route: &'static str, response: Value) -> CountingStep {
+    CountingStep {
+        route,
+        status: 200,
+        response,
+        delay: Duration::ZERO,
+    }
+}
+fn counted_prompt(tokens: usize) -> Vec<CountingStep> {
+    vec![
+        count_step(
+            "/apply-template",
+            json!({"prompt":"rendered complete request"}),
+        ),
+        count_step("/tokenize", json!({"tokens":vec![1;tokens]})),
+    ]
+}
+struct CountingEndpoint {
+    base_url: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Vec<(String, Value)>>>,
+}
+impl CountingEndpoint {
+    fn start(steps: Vec<CountingStep>) -> Self {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for step in steps {
+                let mut stream = loop {
+                    if stopped.load(Ordering::SeqCst) {
+                        return seen;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2))
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let route = line.split_whitespace().nth(1).unwrap().to_string();
+                assert_eq!(route, step.route);
+                let mut size = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        size = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).unwrap();
+                seen.push((route, serde_json::from_slice(&bytes).unwrap()));
+                std::thread::sleep(step.delay);
+                let response = step.response.to_string();
+                let _=write!(stream,"HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",step.status,response.len(),response);
+            }
+            seen
+        });
+        Self {
+            base_url,
+            stop,
+            handle: Some(handle),
+        }
+    }
+    fn requests(mut self) -> Vec<(String, Value)> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+impl Drop for CountingEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+fn accounting_config(base_url: &str) -> (tempfile::TempDir, AgentConfig) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp.jsonl");
+    let mut cfg = config(
+        &repo,
+        &dir.path().join("out"),
+        base_url,
+        mcp_command(&server, &log),
+    );
+    cfg.context.tokens = 8192;
+    (dir, cfg)
+}
+fn last_accounting(outcome: &kin_agent::RunOutcome) -> &Value {
+    &outcome.result["kin_agent"]["context"]["last_request_accounting"]
+}
+
+fn assert_rejected_completion_usage(
+    outcome: &kin_agent::RunOutcome,
+    total: Value,
+    rejected: Value,
+) {
+    assert_eq!(outcome.result["usage"], total);
+    let transcript = read_jsonl(&outcome.transcript_path);
+    let result = transcript
+        .iter()
+        .find(|row| row["type"] == "result")
+        .unwrap();
+    assert_eq!(result["usage"], total);
+    assert_eq!(
+        result["kin_agent"]["stop_reason"],
+        "context_accounting_failed"
+    );
+    assert_eq!(
+        result["kin_agent"]["context"]["last_request_accounting"]["exact"],
+        false
+    );
+    assert_eq!(
+        result["kin_agent"]["context"]["last_request_accounting"]["admitted"],
+        false
+    );
+    let trace = read_jsonl(&outcome.trace_path);
+    let failures: Vec<_> = trace
+        .iter()
+        .filter(|row| row["event"] == "context_accounting_failed")
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["completion_rejected"], true);
+    assert_eq!(failures[0]["observed_usage"], rejected);
+}
+
+#[test]
+fn complete_request_count_includes_schema_overhead_before_first_generation() {
+    let endpoint = CountingEndpoint::start(counted_prompt(7800));
+    let (_dir, cfg) = accounting_config(&endpoint.base_url);
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::ContextBudget);
+    assert_eq!(last_accounting(&outcome)["prompt_tokens"], 7800);
+    assert_eq!(last_accounting(&outcome)["admitted"], false);
+    let seen = endpoint.requests();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].1["tools"].as_array().unwrap().len() > 1);
+    assert_eq!(seen[0].1["tool_choice"], "auto");
+    assert_eq!(seen[0].1["max_tokens"], 1024);
+}
+
+#[test]
+fn added_repository_tools_and_tool_history_are_counted_in_the_generation_body() {
+    let mut script = counted_prompt(100);
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage(
+            "Lookup",
+            Some(tool_call(
+                "c1",
+                "mcp__kin_alpha__semantic_locate",
+                json!({"symbol":"greet"}),
+            )),
+            100,
+            20,
+        ),
+    ));
+    script.extend(counted_prompt(700));
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage("Found it", None, 700, 20),
+    ));
+    let endpoint = CountingEndpoint::start(script);
+    let (dir, mut cfg) = accounting_config(&endpoint.base_url);
+    cfg.repo = fixture_repo_named(dir.path(), "alpha");
+    let beta = fixture_repo_named(dir.path(), "beta");
+    let server = write_fake_mcp_server(dir.path());
+    cfg.extra_servers.push(kin_agent::ServerSpec {
+        repo: beta,
+        mcp_command: mcp_command(&server, &dir.path().join("beta-log.jsonl")),
+    });
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::Success);
+    let seen = endpoint.requests();
+    assert_eq!(seen.len(), 6);
+    assert_eq!(seen[0].1, seen[2].1);
+    assert_eq!(seen[3].1, seen[5].1);
+    let tools = seen[0].1["tools"].to_string();
+    assert!(tools.contains("mcp__kin_alpha__semantic_locate"));
+    assert!(tools.contains("mcp__kin_beta__semantic_locate"));
+    assert_eq!(seen[0].1["tools"], seen[3].1["tools"]);
+    assert_eq!(seen[0].1["messages"].as_array().unwrap().len(), 2);
+    let history = seen[3].1["messages"].as_array().unwrap();
+    assert_eq!(history.len(), 4);
+    assert!(history[2].get("tool_calls").is_some());
+    assert_eq!(history[3]["role"], "tool");
+    assert_eq!(
+        last_accounting(&outcome)["method"],
+        "llama_cpp_template_tokenize"
+    );
+    assert_eq!(last_accounting(&outcome)["exact"], true);
+}
+
+#[test]
+fn unsupported_counting_is_explicit_heuristic_and_still_bounds_output() {
+    for status in [404, 405, 501] {
+        let mut unavailable = count_step("/apply-template", json!({"error":"unsupported"}));
+        unavailable.status = status;
+        let endpoint = CountingEndpoint::start(vec![
+            unavailable,
+            count_step("/v1/chat/completions", completion("Fallback", None)),
+        ]);
+        let (_dir, cfg) = accounting_config(&endpoint.base_url);
+        let outcome =
+            kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+        assert_eq!(outcome.status, ExitStatus::Success);
+        let accounting = last_accounting(&outcome);
+        assert_eq!(accounting["method"], "heuristic");
+        assert_eq!(accounting["exact"], false);
+        assert!(accounting["fallback_reason"]
+            .as_str()
+            .unwrap()
+            .contains(&status.to_string()));
+        let seen = endpoint.requests();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].1["max_tokens"], 1024);
+        assert!(accounting["prompt_tokens"].as_u64().unwrap() + 1024 <= 8192);
+    }
+}
+
+#[test]
+fn count_errors_do_not_fall_back_or_generate_and_do_not_report_exactness() {
+    let mut server_error = count_step("/apply-template", json!({"error":"failure"}));
+    server_error.status = 500;
+    let cases = vec![
+        vec![server_error],
+        vec![count_step("/apply-template", json!({"wrong":"shape"}))],
+        vec![
+            count_step("/apply-template", json!({"prompt":"text"})),
+            count_step("/tokenize", json!({"tokens":["wrong"]})),
+        ],
+        vec![
+            count_step("/apply-template", json!({"prompt":"text"})),
+            count_step("/tokenize", json!({"tokens":[]})),
+        ],
+    ];
+    for script in cases {
+        let length = script.len();
+        let endpoint = CountingEndpoint::start(script);
+        let (_dir, cfg) = accounting_config(&endpoint.base_url);
+        let outcome =
+            kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+        assert_eq!(outcome.status, ExitStatus::EndpointError);
+        assert_eq!(
+            outcome.result["kin_agent"]["stop_reason"],
+            "context_accounting_failed"
+        );
+        assert_eq!(last_accounting(&outcome)["exact"], false);
+        assert_eq!(last_accounting(&outcome)["admitted"], false);
+        let seen = endpoint.requests();
+        assert_eq!(seen.len(), length);
+        assert!(seen
+            .iter()
+            .all(|(route, _)| route != "/v1/chat/completions"));
+    }
+}
+
+#[test]
+fn near_limit_final_answer_is_tool_free_recounted_and_output_bounded() {
+    let mut script = counted_prompt(100);
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage(
+            "Lookup",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({"symbol":"greet"}),
+            )),
+            100,
+            20,
+        ),
+    ));
+    script.extend(counted_prompt(8000));
+    script.extend(counted_prompt(8000));
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage("Short final", None, 8000, 100),
+    ));
+    let endpoint = CountingEndpoint::start(script);
+    let (_dir, mut cfg) = accounting_config(&endpoint.base_url);
+    cfg.max_tool_calls = 1;
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::CapReached);
+    assert_eq!(outcome.final_text, "Short final");
+    let seen = endpoint.requests();
+    assert_eq!(seen.len(), 8);
+    assert!(seen[3].1.get("tools").is_none());
+    assert!(seen[3].1.get("tool_choice").is_none());
+    assert_eq!(seen[3].1["max_tokens"], 1024);
+    assert_eq!(seen[5].1["max_tokens"], 192);
+    assert_eq!(seen[5].1, seen[7].1);
+    assert!(seen
+        .iter()
+        .all(|(_, body)| body.get("max_completion_tokens").is_none()));
+    assert_eq!(last_accounting(&outcome)["max_tokens"], 192);
+    assert_eq!(
+        last_accounting(&outcome)["output_token_parameter"],
+        "max_tokens"
+    );
+    assert_eq!(last_accounting(&outcome)["admitted"], true);
+}
+
+// Environment configuration is exercised in a child test process, never changed under
+// concurrently running tests. The child uses the same public run entrypoint as a caller.
+fn output_parameter_child(test_name: &str, parameter: &str) -> bool {
+    if std::env::var("KIN_AGENT_OUTPUT_PARAMETER_TEST_CHILD").as_deref() == Ok(test_name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env("KIN_AGENT_OUTPUT_PARAMETER_TEST_CHILD", test_name)
+        .env("KIN_AGENT_OUTPUT_TOKEN_PARAMETER", parameter)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[test]
+fn modern_output_parameter_survives_recount_and_rejects_reported_overrun() {
+    if output_parameter_child(
+        "modern_output_parameter_survives_recount_and_rejects_reported_overrun",
+        "max_completion_tokens",
+    ) {
+        return;
+    }
+    for output in [192, 193] {
+        let mut script = counted_prompt(100);
+        script.push(count_step(
+            "/v1/chat/completions",
+            completion_with_usage(
+                "Lookup",
+                Some(tool_call(
+                    "accepted",
+                    "mcp__kin__semantic_locate",
+                    json!({"query":"greet"}),
+                )),
+                100,
+                20,
+            ),
+        ));
+        script.extend(counted_prompt(8000));
+        script.extend(counted_prompt(8000));
+        script.push(count_step(
+            "/v1/chat/completions",
+            completion_with_usage("Short final", None, 8000, output),
+        ));
+        let endpoint = CountingEndpoint::start(script);
+        let (dir, mut cfg) = accounting_config(&endpoint.base_url);
+        cfg.max_tool_calls = 1;
+        let outcome =
+            kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+        let seen = endpoint.requests();
+        assert_eq!(seen.len(), 8);
+        assert_eq!(seen[0].1, seen[2].1);
+        assert!(seen[0].1.get("tools").is_some());
+        assert!(seen[3].1.get("tools").is_none());
+        assert!(seen[3].1.get("tool_choice").is_none());
+        assert_eq!(seen[3].1["max_completion_tokens"], 1024);
+        assert_eq!(seen[5].1["max_completion_tokens"], 192);
+        assert_eq!(seen[5].1, seen[7].1);
+        assert!(seen
+            .iter()
+            .all(|(_, body)| body.get("max_tokens").is_none()));
+        assert_eq!(
+            mcp_log(&dir.path().join("mcp.jsonl"))
+                .iter()
+                .filter(|call| call["tool"] == "semantic_locate")
+                .count(),
+            1
+        );
+        let transcript = read_jsonl(&outcome.transcript_path);
+        let init = transcript
+            .iter()
+            .find(|row| row["subtype"] == "init")
+            .unwrap();
+        assert_eq!(
+            init["kin_agent"]["output_token_parameter"],
+            "max_completion_tokens"
+        );
+        if output == 192 {
+            assert_eq!(outcome.status, ExitStatus::CapReached);
+            assert_eq!(outcome.final_text, "Short final");
+            assert_eq!(last_accounting(&outcome)["max_tokens"], 192);
+            assert_eq!(
+                last_accounting(&outcome)["output_token_parameter"],
+                "max_completion_tokens"
+            );
+        } else {
+            assert_eq!(outcome.status, ExitStatus::EndpointError);
+            assert!(outcome.final_text.contains("exceeds admitted bound 192"));
+            assert_rejected_completion_usage(
+                &outcome,
+                json!({"input_tokens":8100,"output_tokens":213}),
+                json!({"input_tokens":8000,"output_tokens":193}),
+            );
+            assert_eq!(outcome.result["num_turns"], 1);
+        }
+    }
+}
+
+#[test]
+fn invalid_output_parameter_fails_before_any_run_io() {
+    if output_parameter_child(
+        "invalid_output_parameter_fails_before_any_run_io",
+        "max_output_tokens",
+    ) {
+        return;
+    }
+    let endpoint = CountingEndpoint::start(Vec::new());
+    let (dir, cfg) = accounting_config(&endpoint.base_url);
+    let out = cfg.out_dir.clone();
+    let result = kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp);
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("KIN_AGENT_OUTPUT_TOKEN_PARAMETER must be max_tokens or max_completion_tokens"));
+    assert!(!out.exists());
+    assert!(!dir.path().join("mcp.jsonl").exists());
+    assert!(endpoint.requests().is_empty());
+}
+
+#[test]
+fn unsupported_counter_cannot_bypass_first_request_heuristic_admission() {
+    let mut step = count_step("/apply-template", json!({"error":"unsupported"}));
+    step.status = 404;
+    let endpoint = CountingEndpoint::start(vec![step]);
+    let (_dir, mut cfg) = accounting_config(&endpoint.base_url);
+    cfg.context.tokens = 1100;
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::ContextBudget);
+    assert_eq!(last_accounting(&outcome)["exact"], false);
+    assert_eq!(last_accounting(&outcome)["admitted"], false);
+    assert_eq!(endpoint.requests().len(), 1);
+}
+
+#[test]
+fn counting_and_generation_share_the_run_deadline() {
+    let mut script = counted_prompt(100);
+    script[0].delay = Duration::from_millis(150);
+    script[1].delay = Duration::from_millis(150);
+    let mut slow = count_step(
+        "/v1/chat/completions",
+        completion_with_usage("Too late", None, 100, 20),
+    );
+    slow.delay = Duration::from_millis(700);
+    script.push(slow);
+    let endpoint = CountingEndpoint::start(script);
+    let (_dir, mut cfg) = accounting_config(&endpoint.base_url);
+    cfg.deadline = Duration::from_millis(600);
+    let started = std::time::Instant::now();
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::Deadline);
+    assert!(
+        started.elapsed() < Duration::from_millis(950),
+        "counting must not add a second generation deadline"
+    );
+    let seen = endpoint.requests();
+    assert_eq!(seen.len(), 3);
+}
+
+#[test]
+fn server_output_over_the_admitted_bound_is_rejected() {
+    let mut script = counted_prompt(100);
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage(
+            "Unbounded",
+            Some(tool_call(
+                "rejected",
+                "mcp__kin__semantic_locate",
+                json!({"query":"greet"}),
+            )),
+            100,
+            1025,
+        ),
+    ));
+    let endpoint = CountingEndpoint::start(script);
+    let (dir, cfg) = accounting_config(&endpoint.base_url);
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::EndpointError);
+    assert_eq!(last_accounting(&outcome)["exact"], false);
+    assert_eq!(last_accounting(&outcome)["admitted"], false);
+    assert!(outcome.final_text.contains("exceeds admitted bound"));
+    let usage = json!({"input_tokens":100,"output_tokens":1025});
+    assert_rejected_completion_usage(&outcome, usage.clone(), usage);
+    assert_eq!(outcome.result["kin_agent"]["tool_calls"], 0);
+    assert_eq!(outcome.result["num_turns"], 0);
+    assert!(!mcp_log(&dir.path().join("mcp.jsonl"))
+        .iter()
+        .any(|call| call["tool"] == "semantic_locate"));
+    assert_eq!(endpoint.requests().len(), 3);
+}
+
+#[test]
+fn changed_prompt_usage_invalidates_the_selected_counting_contract() {
+    let mut script = counted_prompt(100);
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage(
+            "Different prompt",
+            Some(tool_call(
+                "rejected",
+                "mcp__kin__semantic_locate",
+                json!({"query":"greet"}),
+            )),
+            101,
+            20,
+        ),
+    ));
+    let endpoint = CountingEndpoint::start(script);
+    let (dir, cfg) = accounting_config(&endpoint.base_url);
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::EndpointError);
+    assert_eq!(
+        outcome.result["kin_agent"]["stop_reason"],
+        "context_accounting_failed"
+    );
+    assert!(outcome
+        .final_text
+        .contains("differs from admitted template count"));
+    assert_eq!(last_accounting(&outcome)["exact"], false);
+    let usage = json!({"input_tokens":101,"output_tokens":20});
+    assert_rejected_completion_usage(&outcome, usage.clone(), usage);
+    assert_eq!(outcome.result["kin_agent"]["tool_calls"], 0);
+    assert_eq!(outcome.result["num_turns"], 0);
+    assert!(!mcp_log(&dir.path().join("mcp.jsonl"))
+        .iter()
+        .any(|call| call["tool"] == "semantic_locate"));
+    assert_eq!(endpoint.requests().len(), 3);
+}
+
+#[test]
+fn rejected_final_completion_keeps_prior_and_rejected_usage_without_dispatch() {
+    for (input, output) in [(201, 20), (200, 1025)] {
+        let mut script = counted_prompt(100);
+        script.push(count_step(
+            "/v1/chat/completions",
+            completion_with_usage(
+                "Lookup",
+                Some(tool_call(
+                    "accepted",
+                    "mcp__kin__semantic_locate",
+                    json!({"query":"greet"}),
+                )),
+                100,
+                20,
+            ),
+        ));
+        script.extend(counted_prompt(200));
+        script.push(count_step(
+            "/v1/chat/completions",
+            completion_with_usage(
+                "Rejected final",
+                Some(tool_call(
+                    "rejected",
+                    "mcp__kin__semantic_locate",
+                    json!({"query":"greet"}),
+                )),
+                input,
+                output,
+            ),
+        ));
+        let endpoint = CountingEndpoint::start(script);
+        let (dir, mut cfg) = accounting_config(&endpoint.base_url);
+        cfg.max_tool_calls = 1;
+        let outcome =
+            kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+        assert_eq!(outcome.status, ExitStatus::EndpointError);
+        assert_rejected_completion_usage(
+            &outcome,
+            json!({"input_tokens":100+input,"output_tokens":20+output}),
+            json!({"input_tokens":input,"output_tokens":output}),
+        );
+        assert_eq!(outcome.result["kin_agent"]["tool_calls"], 1);
+        assert_eq!(outcome.result["num_turns"], 1);
+        assert_eq!(
+            mcp_log(&dir.path().join("mcp.jsonl"))
+                .iter()
+                .filter(|call| call["tool"] == "semantic_locate")
+                .count(),
+            1
+        );
+        let transcript = read_jsonl(&outcome.transcript_path);
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|row| row["type"] == "assistant")
+                .count(),
+            1
+        );
+        let seen = endpoint.requests();
+        assert_eq!(seen.len(), 6);
+        assert!(seen[5].1.get("tools").is_none());
+    }
+}
+
+#[test]
+fn changing_final_template_cannot_escape_recount_admission() {
+    let mut script = counted_prompt(100);
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage(
+            "Lookup",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({"symbol":"greet"}),
+            )),
+            100,
+            20,
+        ),
+    ));
+    script.extend(counted_prompt(8000));
+    script.extend(counted_prompt(8100));
+    script.extend(counted_prompt(8150));
+    let endpoint = CountingEndpoint::start(script);
+    let (_dir, mut cfg) = accounting_config(&endpoint.base_url);
+    cfg.max_tool_calls = 1;
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::EndpointError);
+    assert!(outcome.final_text.contains("did not stabilize"));
+    assert_eq!(last_accounting(&outcome)["admitted"], false);
+    let seen = endpoint.requests();
+    assert_eq!(seen.len(), 9);
+    assert_eq!(seen[3].1["max_tokens"], 1024);
+    assert_eq!(seen[5].1["max_tokens"], 192);
+    assert_eq!(seen[7].1["max_tokens"], 92);
+    assert_eq!(
+        seen.iter()
+            .filter(|(route, _)| route == "/v1/chat/completions")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn final_request_without_output_room_is_not_generated() {
+    let mut script = counted_prompt(100);
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage(
+            "Lookup",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({"symbol":"greet"}),
+            )),
+            100,
+            20,
+        ),
+    ));
+    script.extend(counted_prompt(8192));
+    let endpoint = CountingEndpoint::start(script);
+    let (_dir, mut cfg) = accounting_config(&endpoint.base_url);
+    cfg.max_tool_calls = 1;
+    let outcome =
+        kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
+    assert_eq!(outcome.status, ExitStatus::CapReached);
+    assert!(outcome.final_text.contains("no admitted output room"));
+    assert_eq!(last_accounting(&outcome)["admitted"], false);
+    assert_eq!(endpoint.requests().len(), 5);
+}
+
+#[test]
+fn configured_output_reserve_reaches_admission_transcript_and_generation() {
+    let mut script = counted_prompt(100);
+    script.push(count_step(
+        "/v1/chat/completions",
+        completion_with_usage("Reasoning budget configured", None, 100, 20),
+    ));
+    let endpoint = CountingEndpoint::start(script);
+    let (_dir, mut cfg) = accounting_config(&endpoint.base_url);
+    cfg.context.tokens = 65536;
+    let outcome = kin_agent::run_with_options(
+        cfg,
+        kin_agent::RunOptions {
+            accounting: kin_agent::RequestAccounting::LlamaCpp,
+            output_reserve_tokens: Some(32768),
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome.status, ExitStatus::Success);
+    let seen = endpoint.requests();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[0].1["max_tokens"], 32768);
+    assert_eq!(seen[0].1, seen[2].1);
+    assert_eq!(last_accounting(&outcome)["max_tokens"], 32768);
+    assert_eq!(
+        outcome.result["kin_agent"]["context"]["reserve_tokens"],
+        32768
+    );
+    let transcript = read_jsonl(&outcome.transcript_path);
+    let init = transcript
+        .iter()
+        .find(|row| row["subtype"] == "init")
+        .unwrap();
+    assert_eq!(init["kin_agent"]["output_reserve_tokens"], 32768);
+}
+
+#[test]
+fn invalid_output_reserve_fails_before_any_run_io() {
+    for reserve in [0, 8192, 8193, u64::MAX] {
+        let endpoint = CountingEndpoint::start(Vec::new());
+        let (_dir, cfg) = accounting_config(&endpoint.base_url);
+        let out = cfg.out_dir.clone();
+        let result = kin_agent::run_with_options(
+            cfg,
+            kin_agent::RunOptions {
+                accounting: kin_agent::RequestAccounting::LlamaCpp,
+                output_reserve_tokens: Some(reserve),
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("output reserve must be positive and below"));
+        assert!(!out.exists());
+        assert!(endpoint.requests().is_empty());
+    }
+}
