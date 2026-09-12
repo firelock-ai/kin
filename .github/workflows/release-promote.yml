@@ -31,8 +31,9 @@ on:
   schedule:
     - cron: "9,24,39,54 * * * *"
   # For a captain who has just published a record and does not want to wait a
-  # quarter of an hour. Typed rather than a workflow_dispatch: a dispatch takes
-  # a ref, and this job reaches a credential that can flip a release.
+  # quarter of an hour. Typed rather than branch-selectable, because a plain
+  # dispatch takes a ref, and this job reaches a credential that can flip a
+  # release and, since the alarm moved to kin-infra, the release App key.
   repository_dispatch:
     types: [release_promote]
 
@@ -67,13 +68,31 @@ jobs:
       # One release flip and one body edit.
       contents: write
       # The alarm, which is the only thing standing between a forgotten release
-      # and a rail that is quietly one version behind forever.
+      # and a rail that is quietly one version behind forever. It lands on
+      # firelock-ai/kin-infra through the App token minted below rather than
+      # through this token, which cannot reach another repository.
       issues: write
     steps:
       - name: Checkout release policy
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      # Minted before the plan, because the plan's open-issue lookup reads the
+      # alarm repository and a private repository read with the workflow token
+      # answers 404, which the sweep would take for "no alarm open" and open a
+      # fresh one every quarter hour. A mint that fails fails this run, loudly.
+      - name: Mint the alarm token, issues only, this repository and kin-infra
+        id: alarm-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            kin-infra
+          permission-issues: write
 
       # Judge every held release, and write down what was decided before
       # anything is changed. The plan is a file rather than a set of step
@@ -88,6 +107,8 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          KIN_ALARM_REPO: firelock-ai/kin-infra
+          KIN_ALARM_TOKEN: ${{ steps.alarm-token.outputs.token }}
           KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
         run: |
           set -euo pipefail
@@ -190,7 +211,9 @@ jobs:
       - name: Report releases still waiting for first-contact proof
         if: ${{ always() && steps.plan.outcome == 'success' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
           KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
         run: |
           set -euo pipefail
@@ -199,24 +222,29 @@ jobs:
           IFS=$'\t' read -r action number title < "$RUNNER_TEMP/alarm-decision.txt"
           case "$action" in
             open)
-              # The label is how the next sweep finds this issue in a bounded
-              # read rather than paging every open issue, so it has to exist
+              # The labels are how the next sweep finds this issue in a bounded
+              # read rather than paging every open issue, so they have to exist
               # before the issue does. `--force` makes this idempotent; a
               # missing label would otherwise fail the create and leave the
               # alarm silent, which is the one outcome this job exists to
-              # prevent.
-              gh label create release-proof --repo "$GITHUB_REPOSITORY" --force \
+              # prevent. The second label names this repository, because
+              # kin-infra collects every repository's alarms.
+              gh label create release-proof --repo "$ALARM_REPO" --force \
                 --color B60205 \
                 --description "A published release is waiting for first-contact proof"
-              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
-                --label release-proof --body-file "$RUNNER_TEMP/alarm-body.md"
+              gh label create "$ALARM_LABEL" --repo "$ALARM_REPO" --force \
+                --color 5319E7 \
+                --description "Alarms raised by ${GITHUB_REPOSITORY}'s workflows"
+              gh issue create --repo "$ALARM_REPO" --title "$title" \
+                --label release-proof --label "$ALARM_LABEL" \
+                --body-file "$RUNNER_TEMP/alarm-body.md"
               ;;
             update)
-              gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
+              gh issue comment "$number" --repo "$ALARM_REPO" \
                 --body-file "$RUNNER_TEMP/alarm-body.md"
               ;;
             close)
-              gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+              gh issue close "$number" --repo "$ALARM_REPO" \
                 --comment "Every published release now carries complete first-contact proof, or is already GitHub Latest."
               ;;
             none)

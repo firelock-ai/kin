@@ -64,13 +64,24 @@ on:
     # Offset from the train (7,22,37,52) and recovery (3,18,33,48) so the
     # sentinel reads a settled rail rather than one mid-reconcile.
     - cron: "11,41 * * * *"
-  workflow_dispatch:
+  # Typed rather than a branch-selectable dispatch, because the two alarm jobs
+  # below reach the release App key to file their alarms on kin-infra, and the
+  # authority guard refuses that key beside a dispatch that lets a branch pick
+  # the workflow file it runs. The `release-tag` Environment admits main alone,
+  # so a patrol runs from main or not at all. Start one by hand with:
+  #   gh api repos/firelock-ai/kin/dispatches -f event_type=release-sentinel
+  repository_dispatch:
+    types: [release-sentinel]
 
 # Read-only by default, so a job that says nothing can do nothing. `patrol`
 # escalates on its own job below and the credential check never does;
 # `credential-alarm` and `mechanical-patrol` each escalate only to what their
 # own alarm needs (issues: write, plus actions: read for the mechanical
-# patrol's run lookups).
+# patrol's run lookups). Their alarms live on firelock-ai/kin-infra rather
+# than on this repository's public issue tab, and this token cannot write to
+# another repository, so each of those jobs mints a release App token carrying
+# issues: write on this repository and kin-infra and nothing else. A mint that
+# fails is that job's own loud failure; neither falls back to this token.
 permissions:
   contents: read
 
@@ -119,6 +130,9 @@ jobs:
     # always success; only the meaning of a 'false' output changes here, from
     # quiet to loud).
     if: always()
+    # The release App credentials resolve only inside this Environment, which
+    # admits main alone; every trigger on this file runs from main.
+    environment: release-tag
     permissions:
       contents: read
       issues: write
@@ -133,14 +147,31 @@ jobs:
       - name: Prove the judge still grades its own fixtures
         run: python3 scripts/release-sentinel-credential-alarm.py --self-test
 
+      - name: Mint the alarm token, issues only, this repository and kin-infra
+        id: alarm-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            kin-infra
+          permission-issues: write
+
       - name: Alarm or clear, based on whether the patrol has a credential
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
+          ENABLED: ${{ needs.preflight.outputs.enabled }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 scripts/release-sentinel-credential-alarm.py \
-            --repo "${{ github.repository }}" \
-            --enabled "${{ needs.preflight.outputs.enabled }}" \
-            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --repo "$ALARM_REPO" \
+            --label "$ALARM_LABEL" \
+            --enabled "$ENABLED" \
+            --run-url "$RUN_URL"
 
   patrol:
     name: Patrol the release rail
@@ -356,6 +387,9 @@ jobs:
   # `needs:` on `preflight`, and never gates on its output.
   mechanical-patrol:
     name: Patrol the RC-Build-to-Release-Cut handoff mechanically
+    # The release App credentials resolve only inside this Environment, which
+    # admits main alone; every trigger on this file runs from main.
+    environment: release-tag
     permissions:
       contents: read
       issues: write
@@ -371,7 +405,30 @@ jobs:
       - name: Prove the judge still grades its own fixtures
         run: python3 scripts/release-rail-parked-alarm.py --self-test
 
+      - name: Mint the alarm token, issues only, this repository and kin-infra
+        id: alarm-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            kin-infra
+          permission-issues: write
+
+      # The run lookups read this repository with the workflow token, and only
+      # the calls that touch the alarm repository swap in the App token, which
+      # the script does itself from KIN_ALARM_TOKEN.
       - name: Patrol RC Build for a parked rail
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release-rail-parked-alarm.py --repo "${{ github.repository }}"
+          KIN_ALARM_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          SOURCE_REPO: ${{ github.repository }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
+        run: |
+          python3 scripts/release-rail-parked-alarm.py \
+            --repo "$SOURCE_REPO" \
+            --alarm-repo "$ALARM_REPO" \
+            --label "$ALARM_LABEL"

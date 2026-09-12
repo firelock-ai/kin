@@ -39,6 +39,9 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The release App credentials resolve only inside this Environment, which
+    # admits main alone; both triggers on this file run from main.
+    environment: release-tag
     steps:
       - name: Resolve exact retry candidate
         id: resolve
@@ -381,6 +384,79 @@ jobs:
             >/dev/null
           echo "Requested bounded automatic retry for Release run ${RUN_ID}."
 
+      # The alert below lands on firelock-ai/kin-infra rather than on this
+      # repository's public issue tab, and the workflow token cannot write to
+      # another repository, so the two steps that touch the alarm mint their
+      # own App token carrying issues: write on this repository and kin-infra
+      # and nothing else. Placed after the retry on purpose: a mint that fails
+      # fails the run loudly, and it must cost the alarm surface alone, never
+      # the retry that is this controller's actual job.
+      - name: Mint the alarm token, issues only, this repository and kin-infra
+        id: alarm-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            kin-infra
+          permission-issues: write
+
+      # The close path the alert never had. Its title names one tag, so the
+      # one fact that can close it truthfully is a Release run on that tag
+      # concluding success, which this reads off the same listing the resolve
+      # step reads, every tick. A tag abandoned instead never ships; the hand
+      # that records the abandonment closes its alarm.
+      - name: Close blocked-release alarms whose tag has since shipped
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALARM_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prefix="Release blocked after automatic retries: "
+          open="$(GH_TOKEN="$ALARM_TOKEN" gh issue list \
+            --repo "$ALARM_REPO" \
+            --label "$ALARM_LABEL" \
+            --state open \
+            --limit 100 \
+            --json number,title \
+            --jq --arg p "$prefix" \
+              '.[] | select(.title | startswith($p)) | "\(.number)\t\(.title[($p | length):])"')"
+          if [ -z "$open" ]; then
+            echo "no blocked-release alarm is open"
+            exit 0
+          fi
+          runs="$(gh api "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100")"
+          while IFS=$'\t' read -r number tag; do
+            [ -n "$number" ] || continue
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "#${number} names no release tag (${tag}); left alone"
+              continue
+            fi
+            url="$(jq -r --arg tag "$tag" '
+              [
+                .workflow_runs[] |
+                select(
+                  .head_branch == $tag and
+                  .event == "push" and
+                  .status == "completed" and
+                  .conclusion == "success" and
+                  .path == ".github/workflows/release.yml"
+                )
+              ] | sort_by(.created_at) | last | .html_url // empty' <<< "$runs")"
+            if [ -z "$url" ]; then
+              echo "${tag} has no successful Release run yet; #${number} stays open"
+              continue
+            fi
+            GH_TOKEN="$ALARM_TOKEN" gh issue close "$number" --repo "$ALARM_REPO" \
+              --comment "${tag} shipped: its Release run concluded success at ${url}."
+            echo "closed alarm #${number} for ${tag}"
+          done <<< "$open"
+
       - name: Alert after automatic retries are exhausted
         if: >-
           steps.resolve.outputs.needed == 'true' &&
@@ -390,7 +466,12 @@ jobs:
           ) &&
           steps.record.outputs.abandoned != 'true'
         env:
+          # The workflow token reads this repository's release state below; only
+          # the issue calls, which touch the alarm repository, use the App token.
           GH_TOKEN: ${{ github.token }}
+          ALARM_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.resolve.outputs.tag }}
           SHA: ${{ steps.resolve.outputs.sha }}
@@ -482,8 +563,16 @@ jobs:
           fi
 
           title="Release blocked after automatic retries: ${TAG}"
-          existing="$(gh issue list \
-            --repo "$REPO" \
+          # The label names this repository on kin-infra, which collects every
+          # repository's alarms. Created before it is read, and --force keeps
+          # that idempotent, because an alarm that fails to file is the one
+          # outcome this step exists to prevent.
+          GH_TOKEN="$ALARM_TOKEN" gh label create "$ALARM_LABEL" --repo "$ALARM_REPO" --force \
+            --color 5319E7 \
+            --description "Alarms raised by ${REPO}'s workflows"
+          existing="$(GH_TOKEN="$ALARM_TOKEN" gh issue list \
+            --repo "$ALARM_REPO" \
+            --label "$ALARM_LABEL" \
             --state open \
             --search "\"${title}\" in:title" \
             --json number,title \
@@ -504,9 +593,10 @@ jobs:
               printf '\n%s\n\n' "$release_state"
               printf 'The tag and any immutable public artifacts remain in place.\n'
             } > "$body"
-            gh issue create \
-              --repo "$REPO" \
+            GH_TOKEN="$ALARM_TOKEN" gh issue create \
+              --repo "$ALARM_REPO" \
               --title "$title" \
+              --label "$ALARM_LABEL" \
               --body-file "$body" \
               >/dev/null
           fi
