@@ -19,7 +19,10 @@ use kin_model::{
 use serde::{Deserialize, Serialize};
 
 pub struct ActiveRepositoryAuthority {
-    manager: RepositoryAuthorityManager<LocalFileBackend>,
+    /// Shared rather than owned, so a server that has already paid for one open
+    /// reads through it here instead of opening the same publication a second
+    /// time. See [`ActiveRepositoryAuthority::from_shared`].
+    manager: std::sync::Arc<RepositoryAuthorityManager<LocalFileBackend>>,
     payload_stats: Option<AuthorityPayloadStats>,
     pub(crate) repository_id: RepositoryId,
     pub(crate) workspace_id: WorkspaceId,
@@ -379,15 +382,41 @@ impl ActiveRepositoryAuthority {
             .context("open repository-v6 authority through retained local binding")?;
 
         Ok(Self {
-            manager,
+            manager: std::sync::Arc::new(manager),
             payload_stats,
             repository_id,
             workspace_id,
         })
     }
 
+    /// Read through an authority a server already has open, without opening a
+    /// second one over the same durable bytes.
+    ///
+    /// Nothing is skipped: the manager handed in is the result of one full
+    /// validating open, and this type reads the same durable state through it.
+    /// The caller owns the freshness argument stated at
+    /// [`RequestRepositoryAuthority::shared`].
+    ///
+    /// The payload receipt travels with the manager because it describes the
+    /// open that produced it. A status report answered from a borrowed authority
+    /// therefore still names the payload it was read from, rather than dropping
+    /// the field because the reading came from someone else's open.
+    pub fn from_shared(
+        manager: std::sync::Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+        payload_stats: Option<AuthorityPayloadStats>,
+        repository_id: RepositoryId,
+        workspace_id: WorkspaceId,
+    ) -> Self {
+        Self {
+            manager,
+            payload_stats,
+            repository_id,
+            workspace_id,
+        }
+    }
+
     pub(crate) fn manager(&self) -> &RepositoryAuthorityManager<LocalFileBackend> {
-        &self.manager
+        self.manager.as_ref()
     }
 
     /// Persist the current workspace base graph as an idempotent acceleration

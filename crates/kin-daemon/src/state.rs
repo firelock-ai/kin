@@ -5335,7 +5335,7 @@ impl DaemonState {
         // of an unpersisted generation-zero authority. Use the receipt from
         // this same recovery to refuse an intact namespace whose authority
         // record disappeared without paying for a second load or lock.
-        let (authority, _authority_payload_stats) = phases
+        let (authority, authority_payload_stats) = phases
             .record("authority_open", || {
                 kin_core::open_persisted_local_repository_authority(
                     repository_id.clone(),
@@ -5761,6 +5761,11 @@ impl DaemonState {
             state.projection_authority.install_opened(
                 published,
                 Arc::new(authority),
+                // The receipt this same recovery returned. A reader that borrows
+                // the manager reports the payload it actually read from, so the
+                // status route's payload line survives the borrow instead of
+                // going missing because someone else paid for the open.
+                Some(authority_payload_stats),
                 repository_id,
                 workspace_id,
             );
