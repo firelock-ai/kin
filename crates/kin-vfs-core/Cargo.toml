@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-vfs-core"
+description = "Virtual filesystem core: ContentProvider trait, file tree, LRU cache"
+version = "0.4.25"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+repository = "https://github.com/firelock-ai/kin-vfs"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+lru = "0.18"
+parking_lot = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rmp-serde = "1"

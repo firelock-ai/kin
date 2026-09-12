@@ -20,6 +20,7 @@ ALLOWED_ACTORS = frozenset({"troyjr4103", "kin-release-bot[bot]"})
 ALLOWED_SOURCES = {
     "kin-blobs": "firelock-ai/kin-blobs",
     "kin-db": "firelock-ai/kin-db",
+    "kin-infer": "firelock-ai/kin-infer",
     "kin-lsp": "firelock-ai/kin-lsp",
     "kin-model": "firelock-ai/kin-model",
     "kin-search": "firelock-ai/kin-search",

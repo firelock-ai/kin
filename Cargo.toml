@@ -6,9 +6,12 @@ resolver = "2"
 members = [
     # Kin libraries, developed here and published as independent packages.
     "crates/kin-blobs",
+    "crates/kin-infer",
+    "crates/kin-lsp",
     "crates/kin-model",
     "crates/kin-search",
     "crates/kin-vector",
+    "crates/kin-vfs-core",
     "crates/kin-core",
     "crates/kin-parser",
     "crates/kin-index",
@@ -157,19 +160,36 @@ kin-daemon-spawn = { path = "crates/kin-daemon-spawn" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
-kin-lsp = { version = "=0.7.19", registry = "kin" }
+kin-lsp = { path = "crates/kin-lsp", version = "=0.7.19", registry = "kin" }
+# Named here for the first time. Until this import kin-infer arrived only through
+# kin-db's features and one direct pin in crates/kin-migrate, which asked for
+# `>=0.2.1`; a workspace member can say `{ workspace = true }` only for a name this
+# table carries, so that pin becomes the inherited one and its requirement tightens
+# to the version in crates/, like every other library here. `default-features =
+# false` carries kin-migrate's own intent forward: a no-op today, since kin-infer
+# declares `default = []`, and the guarantee still standing if it ever gains one.
+kin-infer = { path = "crates/kin-infer", version = "=0.2.44", registry = "kin", default-features = false }
 # Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
-# `[target.'cfg(...)']`-gated, so listing "metal" here forces the macOS-only kin-infer/metal
-# backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
-# additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
-# binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
+# `[target.'cfg(...)']`-gated, so listing "metal" here asks for the macOS-only
+# kin-infer/metal backend on every target. Metal is re-enabled additively on macOS via a
+# `[target.'cfg(target_os = "macos")'.dependencies]` block in the binary/runtime crates
+# (kin-cli, kin-daemon). Feature unification makes that additive.
+#
+# This comment used to add "incl. Linux, where it cannot compile". That was stale and is
+# dropped. Every metal and accelerate site in kin-infer is gated
+# `all(feature = ..., target_os = "macos")`, including the `pub mod metal_backend;`
+# declaration, and the metal, objc2 and block crates are declared only under
+# `[target.'cfg(target_os = "macos")'.dependencies]`, so off macOS the feature turns on
+# nothing rather than failing to build. The rule above stands on its own reason, which is
+# that a workspace entry cannot be target-gated and so would state a macOS choice for
+# every target.
 kin-db = { version = "=0.7.112", registry = "kin", default-features = false }
 # Pinned to the exact version kin-db builds its name-token index with. A
 # per-token name query hits that index only when the token came out of the same
 # tokenizer, so a version skew here would be a silent recall loss rather than a
 # build failure.
 kin-search = { path = "crates/kin-search", version = "=0.1.9", registry = "kin" }
-kin-vfs-core = { version = "=0.4.25", registry = "kin" }
+kin-vfs-core = { path = "crates/kin-vfs-core", version = "=0.4.25", registry = "kin" }
 # Reached transitively through kin-db and kin-model rather than by any crate
 # here naming it. It still needs an entry, because a workspace member can only
 # say `{ workspace = true }` for a name this table carries.
@@ -187,12 +207,21 @@ kin-vector = { path = "crates/kin-vector", version = "=0.2.1", registry = "kin" 
 #   kin-model  "=0.7.28"   crates/kin-model  0.7.28
 #   kin-search "0.1.9"     crates/kin-search 0.1.9
 #   kin-vector "=0.2.1"    crates/kin-vector 0.2.1
+#   kin-infer  "0.2.44"    crates/kin-infer  0.2.44
+#
+# kin-lsp and kin-vfs-core are deliberately NOT here, and that was measured
+# rather than assumed. No registry crate depends on either, and kin's own crates
+# reach both by path, so nothing requests them from the registry for a patch to
+# redirect. Removing candidate rows for the two and re-locking moved no line of
+# the lock and produced no cargo output at all, so a row for either would have
+# been decoration carrying a reason it did not have.
 #
 # A patch whose version does not satisfy the requirement is ignored SILENTLY
 # and the build succeeds against the registry copy, so `cargo tree -d` listing
 # no Kin library twice is the check that this table is doing anything at all.
 [patch.kin]
 kin-blobs = { path = "crates/kin-blobs" }
+kin-infer = { path = "crates/kin-infer" }
 kin-model = { path = "crates/kin-model" }
 kin-search = { path = "crates/kin-search" }
 kin-vector = { path = "crates/kin-vector" }

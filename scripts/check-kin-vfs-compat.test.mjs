@@ -246,6 +246,48 @@ test('refuses a lock pair it cannot resolve to exactly one entry each', () => {
   );
 });
 
+// kin-vfs-core moved into crates/kin-vfs-core on 2026-09-11, so Kin's lock no
+// longer carries a `source` line for it. The comparison still has to happen:
+// the shipped kin-vfs binaries are built from the pinned kin-vfs checkout, and
+// that checkout's kin-vfs-core must be the one Kin builds with.
+test('accepts Kin resolving kin-vfs-core from this workspace', () => {
+  assert.equal(
+    compareVfsCore(
+      lockWith([{ name: VFS_CORE, version: '0.4.25', source: null }]),
+      lockWith([{ name: VFS_CORE, version: '0.4.25', source: null }]),
+    ),
+    '0.4.25',
+  );
+});
+
+test('still catches the lock-moved-pin-did-not shape on a workspace member', () => {
+  assert.throws(
+    () =>
+      compareVfsCore(
+        lockWith([{ name: VFS_CORE, version: '0.4.25', source: null }]),
+        lockWith([{ name: VFS_CORE, version: '0.4.24', source: null }]),
+      ),
+    /resolves kin-vfs-core 0\.4\.25, but the pinned kin-vfs checkout builds 0\.4\.24/,
+  );
+});
+
+// The transitional case this import creates and PR C ends: a registry copy
+// beside the workspace one is two packages with one name, and the gate must not
+// pick either and call it agreement.
+test('refuses a Kin lock carrying both a workspace and a registry kin-vfs-core', () => {
+  assert.throws(
+    () =>
+      compareVfsCore(
+        lockWith([
+          { name: VFS_CORE, version: '0.4.25', source: null },
+          { name: VFS_CORE, version: '0.4.24', source: REGISTRY },
+        ]),
+        lockWith([{ name: VFS_CORE, version: '0.4.25', source: null }]),
+      ),
+    /found 2 and 1/,
+  );
+});
+
 test('fails closed when the pinned lock cannot be read', async () => {
   await assert.rejects(
     () =>

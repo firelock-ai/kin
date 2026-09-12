@@ -285,19 +285,115 @@ mod tests {
         found
     }
 
-    /// Workspace-relative paths exempted because the write is product behavior.
-    fn load_mutation_allowlist(manifest: &std::path::Path) -> std::collections::BTreeSet<String> {
-        let mut allowed = std::collections::BTreeSet::new();
-        allowed.insert(SANCTIONED_MUTATION_SITE.to_string());
-        if let Ok(text) = std::fs::read_to_string(manifest.join(MUTATION_ALLOWLIST_FILE)) {
-            for line in text.lines() {
-                let line = line.trim();
-                if !line.is_empty() && !line.starts_with('#') {
-                    allowed.insert(line.to_string());
+    /// The parsed allowlist. `paths` are exact workspace-relative files whose
+    /// write is product behavior. `tests_only_crates` holds `crates/<name>/`
+    /// prefixes whose TEST code is exempt as a whole, for a crate that sits below
+    /// kin-core and so cannot take `EnvVarGuard` as a dev-dependency: its
+    /// `tests/` binaries and its top-level `#[cfg(test)]` items, and nothing else.
+    /// Product code in such a crate stays graded, and every other crate keeps
+    /// exact-path semantics.
+    struct MutationAllowlist {
+        paths: std::collections::BTreeSet<String>,
+        tests_only_crates: std::collections::BTreeSet<String>,
+    }
+
+    /// Parse `env_mutation_allowlist.txt`. A line is either an exact path or
+    /// `crates/<name> tests-only`; anything else shaped like the second form is
+    /// refused rather than read as a path that matches nothing.
+    fn parse_mutation_allowlist(text: &str) -> MutationAllowlist {
+        let mut allow = MutationAllowlist {
+            paths: std::collections::BTreeSet::from([SANCTIONED_MUTATION_SITE.to_string()]),
+            tests_only_crates: std::collections::BTreeSet::new(),
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                [path] => {
+                    allow.paths.insert((*path).to_string());
                 }
+                [krate, "tests-only"]
+                    if krate.starts_with("crates/")
+                        && !krate.ends_with('/')
+                        && krate.matches('/').count() == 1 =>
+                {
+                    allow.tests_only_crates.insert(format!("{krate}/"));
+                }
+                _ => panic!(
+                    "{MUTATION_ALLOWLIST_FILE}: cannot read {line:?}; a line is one \
+                     workspace-relative path, or `crates/<name> tests-only`"
+                ),
             }
         }
-        allowed
+        allow
+    }
+
+    fn load_mutation_allowlist(manifest: &std::path::Path) -> MutationAllowlist {
+        let text =
+            std::fs::read_to_string(manifest.join(MUTATION_ALLOWLIST_FILE)).unwrap_or_default();
+        parse_mutation_allowlist(&text)
+    }
+
+    /// Line ranges, 1-based and inclusive, of the top-level `#[cfg(test)]` items
+    /// in `text` that open a block: from the attribute through the item's closing
+    /// brace. It leans on rustfmt, which CI enforces: a top-level item's closing
+    /// brace is a `}` alone at column 0. Whatever fools it ends a range early and
+    /// so grades more, never less; a `#[cfg(test)] mod x;` declaration is not a
+    /// block, and the file it names is graded as product code.
+    fn top_level_cfg_test_ranges(text: &str) -> Vec<(usize, usize)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut ranges = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i] == "#[cfg(test)]" {
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].starts_with("#[") {
+                    j += 1;
+                }
+                if j < lines.len()
+                    && !lines[j].starts_with(char::is_whitespace)
+                    && lines[j].ends_with('{')
+                {
+                    if let Some(close) = (j + 1..lines.len()).find(|&k| lines[k] == "}") {
+                        ranges.push((i + 1, close + 1));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        ranges
+    }
+
+    /// The writes the scan reports in one file. Pure, so the arms below can hand
+    /// it files that do not exist.
+    fn offending_writes(
+        relative: &str,
+        text: &str,
+        allow: &MutationAllowlist,
+    ) -> Vec<(usize, String)> {
+        if allow.paths.contains(relative) {
+            return Vec::new();
+        }
+        let hits = scan_env_mutations(text);
+        let Some(krate) = allow
+            .tests_only_crates
+            .iter()
+            .find(|k| relative.starts_with(k.as_str()))
+        else {
+            return hits;
+        };
+        if relative[krate.len()..].starts_with("tests/") {
+            return Vec::new();
+        }
+        let tests = top_level_cfg_test_ranges(text);
+        hits.into_iter()
+            .filter(|(line, _)| !tests.iter().any(|(lo, hi)| (lo..=hi).contains(&line)))
+            .collect()
     }
 
     /// No source in the workspace writes the environment table on its own.
@@ -346,13 +442,13 @@ mod tests {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                if allowed.contains(relative.as_str()) {
+                if allowed.paths.contains(relative.as_str()) {
                     continue;
                 }
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                for (line, needle) in scan_env_mutations(&text) {
+                for (line, needle) in offending_writes(&relative, &text, &allowed) {
                     offenders.push(format!("{relative}:{line} {needle}"));
                 }
             }
@@ -368,5 +464,83 @@ mod tests {
              Product code that writes the environment as real behavior belongs in \
              crates/kin-core/{MUTATION_ALLOWLIST_FILE}. Offenders: {offenders:#?}"
         );
+    }
+
+    // The three arms the tests-only form has to hold, on inputs built here.
+    // The needle is assembled so this file's own text stays a plain example.
+    fn write_line() -> String {
+        format!("    std::env::set_{}(\"KIN_EXAMPLE\", \"1\");", "var")
+    }
+
+    fn fixture_in_test_module() -> String {
+        format!(
+            "pub fn f() {{}}\n\n#[cfg(test)]\nmod tests {{\n    fn g() {{\n{}\n    }}\n}}\n",
+            write_line()
+        )
+    }
+
+    #[test]
+    fn a_product_write_in_a_tests_only_crate_is_still_flagged() {
+        let allow = parse_mutation_allowlist("crates/kin-infer tests-only\n");
+        let product = format!("pub fn f() {{\n{}\n}}\n", write_line());
+        assert_eq!(
+            offending_writes("crates/kin-infer/src/lib.rs", &product, &allow).len(),
+            1
+        );
+        // And a write after the test module closes is product code again.
+        let after = format!(
+            "{}pub fn h() {{\n{}\n}}\n",
+            fixture_in_test_module(),
+            write_line()
+        );
+        assert_eq!(
+            offending_writes("crates/kin-infer/src/lib.rs", &after, &allow).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_test_module_write_outside_a_tests_only_crate_is_flagged() {
+        let allow = parse_mutation_allowlist("crates/kin-infer tests-only\n");
+        assert_eq!(
+            offending_writes(
+                "crates/kin-cli/src/lib.rs",
+                &fixture_in_test_module(),
+                &allow
+            )
+            .len(),
+            1
+        );
+        let product = format!("pub fn f() {{\n{}\n}}\n", write_line());
+        assert_eq!(
+            offending_writes("crates/kin-cli/tests/probe.rs", &product, &allow).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_test_module_write_in_a_tests_only_crate_passes() {
+        let allow = parse_mutation_allowlist("crates/kin-infer tests-only\n");
+        assert!(offending_writes(
+            "crates/kin-infer/src/lib.rs",
+            &fixture_in_test_module(),
+            &allow
+        )
+        .is_empty());
+        let product = format!("pub fn f() {{\n{}\n}}\n", write_line());
+        assert!(offending_writes("crates/kin-infer/tests/probe.rs", &product, &allow).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_tests_only_line_is_refused() {
+        for bad in [
+            "kin-infer tests-only",
+            "crates/kin-infer/ tests-only",
+            "crates/kin-infer tests-only extra",
+            "crates/kin-infer/src tests-only",
+        ] {
+            let result = std::panic::catch_unwind(|| parse_mutation_allowlist(bad));
+            assert!(result.is_err(), "{bad:?} must be refused");
+        }
     }
 }

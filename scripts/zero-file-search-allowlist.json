@@ -1673,6 +1673,139 @@
         "fs2::FileExt",
         "std::{cmp::Reverse, fs, fs::File, fs::OpenOptions}"
       ]
+    },
+    {
+      "file": "crates/kin-infer/src/lib.rs",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions open and map model weights and read their safetensors index from the path a caller names, an input boundary for inference.",
+      "owner": "kin-infer",
+      "expiration": "2027-12-17",
+      "allow_fn": [
+        "load_sharded_index",
+        "load_weight_bytes"
+      ]
+    },
+    {
+      "file": "crates/kin-infer/src/resource.rs",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions are hardware and quota probes (sysctl, cgroup cpu.max and memory.max, /proc/meminfo), one body per platform, read to size batches to the host; the same class as the crates/kin-cli/src/capability.rs entry.",
+      "owner": "kin-infer",
+      "expiration": "2027-12-17",
+      "allow_fn": [
+        "read_i64_file",
+        "read_u64_file"
+      ],
+      "allow_match": [
+        "if let Ok(contents) = std::fs::read_to_string(\"/sys/fs/cgroup/cpu.max\") {",
+        "if let Ok(contents) = std::fs::read_to_string(\"/sys/fs/cgroup/memory.max\") {",
+        "let contents = std::fs::read_to_string(\"/proc/meminfo\").ok()?",
+        "let out = std::process::Command::new(\"ioreg\")",
+        {
+          "expr": "let out = std::process::Command::new(\"sysctl\")",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-vfs-core/src/containment.rs",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. Security boundary: the pinned function canonicalizes a path and refuses one that escapes the projection root. It decides whether a path may be served, never what it holds.",
+      "owner": "kin-vfs-core",
+      "expiration": "2028-02-25",
+      "allow_fn": [
+        "resolve"
+      ]
+    },
+    {
+      "file": "crates/kin-infer/src/watchdog.rs",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. The one site is the orphan watchdog's std::process::abort(), which the matcher reads as a subprocess; it ends this process and starts none.",
+      "owner": "kin-infer",
+      "expiration": "2027-12-17",
+      "allow_match": [
+        "std::process::abort()"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/discovery.rs",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. detect_version runs '<server> --version' on a language server that discovery already found, to report its version, and nothing else.",
+      "owner": "kin-lsp",
+      "expiration": "2028-01-28",
+      "allow_match": [
+        "std::process::Command::new(path)"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/lifecycle.rs",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. The language-server spawn, which is what an LSP client is. Enrichment writes type-resolved relations INTO the graph; the server is an ingestion input, never the answer to a query.",
+      "owner": "kin-lsp",
+      "expiration": "2028-01-28",
+      "allow_match": [
+        "std::process::Stdio",
+        "tokio::process::{Child, ChildStderr, Command}",
+        "Command::new(command)",
+        "std::process::id()"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/client.rs",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. The ChildStdin and ChildStdout pipe types of the JSON-RPC channel to the language server lifecycle.rs spawned; types, not a spawn.",
+      "owner": "kin-lsp",
+      "expiration": "2028-01-28",
+      "allow_match": [
+        "tokio::process::ChildStdin",
+        {
+          "expr": "tokio::process::ChildStdout",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/enrichment_integrity_tests.rs",
+      "reason": "Not runtime. lib.rs declares it '#[cfg(test)] mod enrichment_integrity_tests;', so it compiles only into tests; it writes a throwaway source file for a peer server to read. The checker's test rule matches '_test.rs' and not '_tests.rs', and the file keeps its imported name. It moved into crates/ on 2026-09-11.",
+      "owner": "kin-lsp",
+      "expiration": "2028-01-28"
+    },
+    {
+      "file": "crates/kin-vfs-core/src/provider.rs",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. read_dir and read_link here are METHODS of the ContentProvider trait, a virtual filesystem over graph-owned content: a name collision with std::fs, not a call to it.",
+      "owner": "kin-vfs-core",
+      "expiration": "2028-02-25",
+      "allow_match": [
+        {
+          "expr": "read_dir(",
+          "count": 2
+        },
+        {
+          "expr": "read_link(",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-vfs-core/src/tree.rs",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. Calls the ContentProvider trait's read_dir and read_link on its provider; trait methods over graph-owned content, not std::fs.",
+      "owner": "kin-vfs-core",
+      "expiration": "2028-02-25",
+      "allow_match": [
+        "read_dir(&rel)",
+        {
+          "expr": "read_link(",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-vfs-core/src/writer.rs",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. Implements the ContentProvider trait's read_dir and read_link, and answers them from self.graph, which is graph-backed; a name collision with std::fs.",
+      "owner": "kin-vfs-core",
+      "expiration": "2028-02-25",
+      "allow_match": [
+        {
+          "expr": "read_dir(",
+          "count": 2
+        },
+        {
+          "expr": "read_link(",
+          "count": 2
+        }
+      ]
     }
   ]
 }
