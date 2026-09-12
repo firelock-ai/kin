@@ -26,8 +26,8 @@ pub mod transcript;
 mod tests;
 
 pub use context::{ContextSource, ContextWindow};
-pub use provider::{Provider, ProviderConfig, ProviderError};
-pub use run::{run, DEFAULT_SYSTEM_PROMPT};
+pub use provider::{Provider, ProviderConfig, ProviderError, RequestAccounting};
+pub use run::{run, run_with_accounting, run_with_options, RunOptions, DEFAULT_SYSTEM_PROMPT};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -110,7 +110,8 @@ pub struct AgentConfig {
     pub max_tool_calls: u32,
     /// The whole run's wall-clock budget, including every wait on the endpoint.
     pub deadline: Duration,
-    /// The model's context window. Every request the loop sends stays inside it.
+    /// The model's context window. Admission uses the selected template count or a
+    /// labeled heuristic; a heuristic is not a guarantee for every tokenizer.
     pub context: ContextWindow,
     /// The most bytes of one tool result the model is sent. `None` derives the ceiling from
     /// the context window.

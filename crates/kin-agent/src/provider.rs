@@ -9,7 +9,7 @@
 //! process listing or a transcript.
 
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -25,8 +25,20 @@ pub enum ProviderError {
     Body { url: String, source: reqwest::Error },
     #[error("the chat endpoint answered with no choices")]
     NoChoices,
+    #[error("request context accounting failed: {0}")]
+    Accounting(String),
+    #[error("request context accounting failed: {reason}")]
+    RejectedCompletion { reason: String, usage: Usage },
     #[error("the environment variable {name} names an API key but is not set")]
     MissingKey { name: String },
+    #[error("KIN_AGENT_OUTPUT_TOKEN_PARAMETER must be max_tokens or max_completion_tokens")]
+    InvalidOutputTokenParameter,
+}
+
+impl ProviderError {
+    pub(crate) fn is_accounting_failure(&self) -> bool {
+        matches!(self, Self::Accounting(_) | Self::RejectedCompletion { .. })
+    }
 }
 
 /// How to reach a model.
@@ -117,13 +129,108 @@ pub struct Completion {
     pub api_ms: u128,
 }
 
+/// Opt-in counting uses the selected server's rendered text and tokenizer contract.
+/// Generic endpoints retain explicitly heuristic accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAccounting {
+    Heuristic,
+    LlamaCpp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputTokenParameter {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl OutputTokenParameter {
+    fn select(base_url: &str, override_value: Option<&str>) -> Result<Self, ProviderError> {
+        match override_value {
+            Some("max_tokens") => Ok(Self::MaxTokens),
+            Some("max_completion_tokens") => Ok(Self::MaxCompletionTokens),
+            Some(_) => Err(ProviderError::InvalidOutputTokenParameter),
+            None => {
+                let openai = reqwest::Url::parse(base_url).is_ok_and(|url| {
+                    url.host_str()
+                        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+                });
+                Ok(if openai {
+                    Self::MaxCompletionTokens
+                } else {
+                    Self::MaxTokens
+                })
+            }
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
+/// The exact generation body retained across admission and dispatch.
+pub(crate) struct ChatRequest {
+    body: Value,
+    counted_prompt_tokens: Option<u64>,
+    output_token_parameter: OutputTokenParameter,
+}
+impl ChatRequest {
+    pub(crate) fn expect_prompt_tokens(&mut self, tokens: u64) {
+        self.counted_prompt_tokens = Some(tokens);
+    }
+    pub(crate) fn max_tokens(&self) -> u64 {
+        self.output_bound().expect("bounded request")
+    }
+    fn output_bound(&self) -> Option<u64> {
+        self.body
+            .get(self.output_token_parameter())
+            .and_then(Value::as_u64)
+    }
+    pub(crate) fn output_token_parameter(&self) -> &'static str {
+        self.output_token_parameter.key()
+    }
+    pub(crate) fn set_max_tokens(&mut self, tokens: u64) {
+        let parameter = self.output_token_parameter();
+        self.body[parameter] = json!(tokens);
+        self.counted_prompt_tokens = None;
+    }
+    pub(crate) fn heuristic_tokens(&self) -> u64 {
+        let bytes = self.body.to_string().len() as u64;
+        let messages = self.body["messages"].as_array().map_or(0, Vec::len) as u64;
+        crate::context::estimate_tokens(bytes).saturating_add(messages.saturating_mul(8))
+    }
+}
+
+pub(crate) enum PromptCount {
+    Counted(u64),
+    Unsupported(String),
+}
+
 pub struct Provider {
     client: reqwest::blocking::Client,
     config: ProviderConfig,
+    output_token_parameter: OutputTokenParameter,
 }
 
 impl Provider {
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
+        let override_value = match std::env::var("KIN_AGENT_OUTPUT_TOKEN_PARAMETER") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err(ProviderError::InvalidOutputTokenParameter),
+        };
+        Self::new_with_output_token_override(config, override_value.as_deref())
+    }
+
+    fn new_with_output_token_override(
+        config: ProviderConfig,
+        override_value: Option<&str>,
+    ) -> Result<Self, ProviderError> {
+        let output_token_parameter =
+            OutputTokenParameter::select(&config.base_url, override_value)?;
         let client = reqwest::blocking::Client::builder()
             .timeout(config.request_timeout)
             .build()
@@ -131,7 +238,15 @@ impl Provider {
                 url: config.base_url.clone(),
                 source,
             })?;
-        Ok(Provider { client, config })
+        Ok(Provider {
+            client,
+            config,
+            output_token_parameter,
+        })
+    }
+
+    pub(crate) fn output_token_parameter(&self) -> &'static str {
+        self.output_token_parameter.key()
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -193,7 +308,16 @@ impl Provider {
         tools: &[Value],
         limit: Duration,
     ) -> Result<Completion, ProviderError> {
-        let url = self.config.chat_url();
+        let request = self.request_body(messages, tools, None);
+        self.complete_request_within(&request, limit)
+    }
+
+    fn request_body(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        max_tokens: Option<u64>,
+    ) -> ChatRequest {
         let mut body = json!({
             "model": self.config.model,
             "messages": messages,
@@ -207,11 +331,123 @@ impl Provider {
             body["tool_choice"] = json!("auto");
         }
 
+        if let Some(max_tokens) = max_tokens {
+            body[self.output_token_parameter()] = json!(max_tokens);
+        }
+        ChatRequest {
+            body,
+            counted_prompt_tokens: None,
+            output_token_parameter: self.output_token_parameter,
+        }
+    }
+
+    pub(crate) fn prepare_request(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        max_tokens: u64,
+    ) -> ChatRequest {
+        self.request_body(messages, tools, Some(max_tokens))
+    }
+
+    /// Apply the same complete body generation will receive. Special tokens are already
+    /// represented in the selected template contract: do not add another BOS here.
+    /// Only an explicit unsupported route permits heuristic fallback. Other failures stop
+    /// admission, including malformed success responses and tokenizer errors.
+    pub(crate) fn count_prompt_within(
+        &self,
+        request: &ChatRequest,
+        limit: Duration,
+    ) -> Result<PromptCount, ProviderError> {
+        let deadline = Instant::now() + limit;
+        let template_url = format!("{}/apply-template", self.config.origin());
+        let template = match self.accounting_json(&template_url, &request.body, deadline)? {
+            Ok(value) => value,
+            Err(reason) => return Ok(PromptCount::Unsupported(reason)),
+        };
+        let prompt = template
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Accounting("apply-template returned no text prompt".into())
+            })?;
+        let tokenize_url = format!("{}/tokenize", self.config.origin());
+        let tokenized = match self.accounting_json(&tokenize_url, &json!({
+            "content": prompt, "add_special": false, "parse_special": true, "with_pieces": false,
+        }), deadline)? {
+            Ok(value) => value,
+            Err(reason) => return Ok(PromptCount::Unsupported(reason)),
+        };
+        let tokens = tokenized
+            .get("tokens")
+            .and_then(Value::as_array)
+            .filter(|tokens| tokens.iter().all(|token| token.as_u64().is_some()))
+            .ok_or_else(|| {
+                ProviderError::Accounting("tokenize returned no valid token ID array".into())
+            })?;
+        if !prompt.is_empty() && tokens.is_empty() {
+            return Err(ProviderError::Accounting(
+                "tokenize returned zero tokens for a nonempty prompt".into(),
+            ));
+        }
+        Ok(PromptCount::Counted(tokens.len() as u64))
+    }
+
+    fn accounting_json(
+        &self,
+        url: &str,
+        body: &Value,
+        deadline: Instant,
+    ) -> Result<Result<Value, String>, ProviderError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderError::Accounting(
+                "counting deadline exhausted".into(),
+            ));
+        }
+        let response = self
+            .request(self.client.post(url))
+            .timeout(remaining)
+            .json(body)
+            .send()
+            .map_err(|source| ProviderError::Transport {
+                url: url.into(),
+                source,
+            })?;
+        let status = response.status();
+        if [404, 405, 501].contains(&status.as_u16()) {
+            return Ok(Err(format!(
+                "{url} does not support counting (HTTP {})",
+                status.as_u16()
+            )));
+        }
+        if !status.is_success() {
+            return Err(ProviderError::Status {
+                url: url.into(),
+                status: status.as_u16(),
+                body: truncate(&response.text().unwrap_or_default(), 400),
+            });
+        }
+        response
+            .json()
+            .map(Ok)
+            .map_err(|source| ProviderError::Body {
+                url: url.into(),
+                source,
+            })
+    }
+
+    pub(crate) fn complete_request_within(
+        &self,
+        request: &ChatRequest,
+        limit: Duration,
+    ) -> Result<Completion, ProviderError> {
+        let url = self.config.chat_url();
         let started = std::time::Instant::now();
         let response = self
             .request(self.client.post(&url))
             .timeout(limit)
-            .json(&body)
+            .json(&request.body)
             .send()
             .map_err(|source| ProviderError::Transport {
                 url: url.clone(),
@@ -243,6 +479,25 @@ impl Provider {
                 output_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
             })
             .unwrap_or_default();
+        if let (Some(expected), Some(actual)) = (request.counted_prompt_tokens, usage.input_tokens)
+        {
+            if actual != expected {
+                return Err(ProviderError::RejectedCompletion {
+                    reason: format!("generation prompt usage {actual} differs from admitted template count {expected}"),
+                    usage,
+                });
+            }
+        }
+        if let (Some(bound), Some(actual)) = (request.output_bound(), usage.output_tokens) {
+            if actual > bound {
+                return Err(ProviderError::RejectedCompletion {
+                    reason: format!(
+                        "generation output usage {actual} exceeds admitted bound {bound}"
+                    ),
+                    usage,
+                });
+            }
+        }
         Ok(Completion {
             choice,
             usage,
@@ -367,4 +622,155 @@ fn truncate(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     text.chars().take(limit).collect::<String>() + "..."
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn output_parameter_uses_the_exact_parsed_host_and_explicit_override() {
+        for (base_url, override_value, expected) in [
+            ("https://api.openai.com/v1", None, "max_completion_tokens"),
+            (
+                "https://API.OPENAI.COM:443/v1",
+                None,
+                "max_completion_tokens",
+            ),
+            ("https://api.openai.com.example/v1", None, "max_tokens"),
+            ("https://other-api.openai.com/v1", None, "max_tokens"),
+            ("https://api.openai.com@localhost/v1", None, "max_tokens"),
+            (
+                "http://localhost/v1?host=api.openai.com",
+                None,
+                "max_tokens",
+            ),
+            ("http://localhost/v1", None, "max_tokens"),
+            (
+                "https://api.openai.com/v1",
+                Some("max_tokens"),
+                "max_tokens",
+            ),
+            (
+                "http://localhost/v1",
+                Some("max_completion_tokens"),
+                "max_completion_tokens",
+            ),
+        ] {
+            let provider = Provider::new_with_output_token_override(
+                ProviderConfig {
+                    base_url: base_url.into(),
+                    // A local model alias must not decide the protocol dialect.
+                    model: "o3".into(),
+                    api_key: None,
+                    temperature: None,
+                    request_timeout: Duration::from_secs(2),
+                },
+                override_value,
+            )
+            .unwrap();
+            let mut request =
+                provider.prepare_request(&[json!({"role":"user","content":"hello"})], &[], 1024);
+            assert_eq!(request.output_token_parameter(), expected, "{base_url}");
+            assert_eq!(request.body[expected], 1024);
+            request.expect_prompt_tokens(100);
+            request.set_max_tokens(192);
+            assert_eq!(request.max_tokens(), 192);
+            assert_eq!(request.counted_prompt_tokens, None);
+            let other = if expected == "max_tokens" {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert!(request.body.get(other).is_none());
+            let unbounded = provider.request_body(&[], &[], None);
+            assert_eq!(unbounded.output_bound(), None);
+            assert!(unbounded.body.get(expected).is_none());
+            assert!(unbounded.body.get(other).is_none());
+        }
+        for invalid in ["", "max_output_tokens", "max_tokens ", "MAX_TOKENS"] {
+            assert!(matches!(
+                OutputTokenParameter::select("https://api.openai.com/v1", Some(invalid)),
+                Err(ProviderError::InvalidOutputTokenParameter)
+            ));
+        }
+    }
+
+    #[test]
+    fn retained_template_count_uses_the_generation_body_and_no_extra_bos() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/llama_template_count.json"))
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server_fixture = fixture.clone();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (route, key) in [
+                ("/apply-template", "template_response"),
+                ("/tokenize", "tokenize_response"),
+                ("/v1/chat/completions", "completion_response"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.split_whitespace().nth(1), Some(route));
+                let mut size = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        size = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).unwrap();
+                seen.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+                let body = server_fixture[key].to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+            seen
+        });
+        let provider = Provider::new(ProviderConfig {
+            base_url,
+            model: "fixture".into(),
+            api_key: None,
+            temperature: None,
+            request_timeout: Duration::from_secs(2),
+        })
+        .unwrap();
+        let mut request = ChatRequest {
+            body: fixture["request"].clone(),
+            counted_prompt_tokens: None,
+            output_token_parameter: OutputTokenParameter::MaxTokens,
+        };
+        let PromptCount::Counted(tokens) = provider
+            .count_prompt_within(&request, Duration::from_secs(2))
+            .unwrap()
+        else {
+            panic!("expected retained template count")
+        };
+        assert_eq!(tokens, 481);
+        request.expect_prompt_tokens(tokens);
+        let completed = provider
+            .complete_request_within(&request, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(completed.usage.input_tokens, Some(tokens));
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0], fixture["request"]);
+        assert_eq!(seen[0], seen[2]);
+        assert_eq!(seen[1]["content"], fixture["template_response"]["prompt"]);
+        assert_eq!(seen[1]["add_special"], false);
+        assert_eq!(seen[1]["parse_special"], true);
+        assert_eq!(seen[1]["with_pieces"], false);
+    }
 }

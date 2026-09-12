@@ -423,8 +423,7 @@ jobs:
             --label "$ALARM_LABEL" \
             --state open \
             --limit 100 \
-            --json number,title \
-            --jq --arg p "$prefix" \
+            --json number,title | jq -r --arg p "$prefix" \
               '.[] | select(.title | startswith($p)) | "\(.number)\t\(.title[($p | length):])"')"
           if [ -z "$open" ]; then
             echo "no blocked-release alarm is open"

@@ -22,29 +22,10 @@ kin_buildinfo::embed_update_build_identity!(
     kin_db::GraphSnapshot::CURRENT_VERSION
 );
 
-/// What `kin` says about itself, and the everyday path, above the command list.
-///
-/// The command surface is wide because it spans version control, semantic
-/// query, sessions, and operations, and clap renders subcommands as one
-/// undifferentiated block with no grouping primitive. Naming the everyday path
-/// is what separates it from the benchmarking, hosted-release, and diagnostic
-/// commands beside it.
-///
-/// This is `before_help` rather than `after_help`, which is where it used to
-/// be, because position was hiding it. The subcommand list runs to eighty
-/// entries, so on an eighty-column, fifty-row terminal a reader who typed
-/// `kin` saw commands from the fifth line to the ninety-second and never
-/// reached the orientation below them without scrolling back. The lines a
-/// first-time reader needs now come first, and the wide list follows.
-///
-/// The first line is the brand canon's Category line, taken verbatim. The line
-/// it replaces, "Kin semantic VCS", is the "semantic version control"
-/// construction the canon lists under "Retired - do not ship", and it was the
-/// first thing `kin --help` printed. A surface needing a headline takes a
-/// locked line rather than getting a new one, so this is that line and not a
-/// rewrite of it.
+/// First-use guidance precedes the complete command index. The first line is
+/// the brand canon's plain category, shared with the terminal version display.
 const ORIENTATION: &str = "\
-A graph-native code repository for people and AI agents.
+A new way to store and manage code for people and AI.
 
 Start here:
   kin init            admit an existing or new repository
@@ -54,11 +35,207 @@ Start here:
   kin log / kin diff  read the immutable change log and exact changes
 
 Ask the graph:
-  kin locate / search / trace / impact / refs / context";
+  kin locate / search / trace / impact / refs / context
+
+Use an editor or AI:
+  kin open code        open an editor in a session workspace
+  kin with codex       launch an assistant in a session workspace
+  kin mcp start --help  inspect MCP options and tool profiles";
+
+/// Clap groups arguments, but only has one heading for all subcommands. The
+/// root template uses the metadata-derived index without changing its parser.
+const ROOT_HELP_TEMPLATE: &str = "\
+{before-help}{usage-heading} {usage}
+
+Options:
+{options}{after-help}
+";
+
+const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Get started",
+        &[
+            "setup",
+            "init",
+            "clone",
+            "migrate",
+            "status",
+            "capabilities",
+            "languages",
+            "help",
+        ],
+    ),
+    (
+        "Understand code",
+        &[
+            "overview",
+            "locate",
+            "search",
+            "trace",
+            "path",
+            "context",
+            "refs",
+            "impact",
+            "trace-data-flow",
+            "deps",
+            "xref",
+            "history",
+            "blame",
+            "dead-code",
+            "scope",
+        ],
+    ),
+    (
+        "Edit and record changes",
+        &[
+            "admit",
+            "reconcile",
+            "rename",
+            "commit",
+            "diff",
+            "log",
+            "branch",
+            "checkout",
+            "merge",
+            "conflicts",
+            "resolve",
+            "stash",
+            "rollback",
+            "purge-ignored",
+        ],
+    ),
+    (
+        "Use editors and AI",
+        &[
+            "open",
+            "with",
+            "shell",
+            "exec",
+            "agent",
+            "assistant",
+            "mcp",
+            "vfs",
+        ],
+    ),
+    (
+        "Coordinate work",
+        &[
+            "work", "feature", "todo", "spec", "note", "intent", "traffic", "notify",
+        ],
+    ),
+    (
+        "Review and protect",
+        &[
+            "review",
+            "verify",
+            "approvals",
+            "security",
+            "audit",
+            "backup",
+            "secret",
+            "allow",
+        ],
+    ),
+    (
+        "Share and interoperate",
+        &["auth", "remote", "push", "pull", "git", "eject"],
+    ),
+    (
+        "Deliver releases",
+        &[
+            "publish",
+            "semver",
+            "release",
+            "tag",
+            "pipeline",
+            "hosted-release",
+        ],
+    ),
+    (
+        "Diagnose and tune",
+        &[
+            "doctor",
+            "graph",
+            "embed",
+            "cache",
+            "locate-debug",
+            "bench",
+            "support",
+            "telemetry",
+            "resources",
+            "daemon",
+            "registry",
+            "update",
+            "completions",
+        ],
+    ),
+];
+
+fn grouped_commands_help(root: &clap::Command, groups: &[(&str, &[&str])]) -> String {
+    fn append_group(output: &mut String, heading: &str, members: Vec<clap::Command>) {
+        if members.is_empty() {
+            return;
+        }
+        let mut group = clap::Command::new("kin")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .help_template("{subcommands}")
+            .subcommands(
+                members
+                    .into_iter()
+                    .enumerate()
+                    .map(|(order, command)| command.display_order(order)),
+            );
+        output.push_str(heading);
+        output.push_str(":\n");
+        output.push_str(group.render_help().to_string().trim_end());
+        output.push_str("\n\n");
+    }
+
+    let visible: Vec<_> = root
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut output = String::new();
+    for (heading, names) in groups {
+        let members = names
+            .iter()
+            .filter_map(|name| {
+                visible
+                    .iter()
+                    .find(|command| command.get_name() == *name)
+                    .filter(|command| seen.insert(command.get_name()))
+                    .map(|command| (*command).clone())
+            })
+            .collect();
+        append_group(&mut output, heading, members);
+    }
+    // A newly added command remains visible even before it has a category.
+    // The exhaustive mapping test still requires its category before landing.
+    let remaining = visible
+        .into_iter()
+        .filter(|command| !seen.contains(command.get_name()))
+        .cloned()
+        .collect();
+    append_group(&mut output, "Other commands", remaining);
+    output
+}
+
+fn command_index() -> &'static str {
+    static INDEX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        // Build from the enum, not Cli, whose after-help calls this function.
+        let mut command = Command::augment_subcommands(clap::Command::new("kin"));
+        command.build();
+        grouped_commands_help(&command, COMMAND_GROUPS)
+    })
+}
 
 /// What follows the command list: where to read the rest.
 const AFTER_HELP: &str = "\
-`kin capabilities` prints the full readiness matrix, `--json` for machines.";
+`kin <command> --help` explains each command and its subcommands.
+`kin capabilities` prints repository replacement readiness, `--json` for machines.";
 
 /// The `[OPEN GATE]` legend, which is only true while something carries the
 /// marker.
@@ -85,9 +262,9 @@ fn after_help() -> String {
         })
         .unwrap_or(false);
     if gated {
-        format!("{AFTER_HELP}{OPEN_GATE_LEGEND}")
+        format!("{}{AFTER_HELP}{OPEN_GATE_LEGEND}", command_index())
     } else {
-        AFTER_HELP.to_string()
+        format!("{}{AFTER_HELP}", command_index())
     }
 }
 
@@ -97,6 +274,7 @@ fn after_help() -> String {
     version = kin_buildinfo::version(),
     before_help = ORIENTATION,
     after_help = after_help(),
+    help_template = ROOT_HELP_TEMPLATE,
 )]
 struct Cli {
     /// Write a machine-readable execution profile to this JSON file
@@ -2248,10 +2426,10 @@ enum McpAction {
         /// Tool surface to serve: `agent-default` (the curated agent belt,
         /// and the default), `agent-query` (that belt without the session and
         /// transaction tools, for a client that only queries), `agent-search`
-        /// (the measured always-on set, with every other tool reached through
-        /// `kin_tool_search`), `full` (every tool, roughly 12k extra tokens of
-        /// schemas per session), `benchmark`, or `context-bench`. Overrides
-        /// KIN_MCP_TOOL_PROFILE.
+        /// (the measured always-on set plus registry discovery through
+        /// `kin_tool_search`; discovery does not enable withheld tools), `full`
+        /// (every tool; schema token cost depends on the model), `benchmark`,
+        /// or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE.
         #[arg(long = "tool-profile", value_name = "PROFILE")]
         tool_profile: Option<String>,
         /// Never start or revive a daemon from this server: bind only a daemon
@@ -2869,7 +3047,7 @@ fn version_lines(version: &str) -> Vec<String> {
 }
 
 /// The canon Category line, shared by `--help` and `--version`.
-const CATEGORY_LINE: &str = "A graph-native code repository for people and AI agents.";
+const CATEGORY_LINE: &str = "A new way to store and manage code for people and AI.";
 
 /// What `kin --version` prints.
 ///
@@ -5667,7 +5845,7 @@ mod tests {
         // one that could.
         assert_eq!(
             lines[2],
-            "A graph-native code repository for people and AI agents."
+            "A new way to store and manage code for people and AI."
         );
         assert_eq!(lines[3], "dca8e950e99f6a1cb9afe4359611e2da288004f2");
         assert_eq!(lines[4], "detached 2026-09-06T08:24:29Z");
@@ -6388,12 +6566,11 @@ mod tests {
                 .find("Start here:")
                 .expect("help carries the orientation");
             let commands = help
-                .find("Commands:")
+                .find("Get started:")
                 .expect("help carries the command list");
             assert!(
                 orientation < commands,
-                "the orientation is at byte {orientation} and the command list at {commands}, so \
-                 a reader meets eighty subcommands before the five lines that orient them"
+                "the orientation must precede the task-grouped command index"
             );
         });
     }
@@ -6411,7 +6588,7 @@ mod tests {
             let mut command = Cli::command();
             let help = command.render_long_help().to_string();
             assert!(
-                help.starts_with("A graph-native code repository for people and AI agents."),
+                help.starts_with("A new way to store and manage code for people and AI."),
                 "help opens with {:?}",
                 help.lines().next().unwrap_or_default()
             );
@@ -6889,3 +7066,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod help_tests;

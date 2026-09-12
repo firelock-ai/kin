@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (531 total, 357 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (534 total, 360 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -50,6 +50,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_ACTOR` | string | *(unset)* | operational | actor identity recorded in provenance |
+| `KIN_AGENT_CONTEXT_ACCOUNTING` | enum | heuristic | correctness | agent request accounting: heuristic estimates the prepared request; llama_cpp uses the selected server's rendered prompt and tokenizer |
+| `KIN_AGENT_OUTPUT_RESERVE_TOKENS` | usize | *(unset)* | correctness | override the agent's output token reserve; must be positive and below the context window, and unset uses the configured context's answer reserve |
+| `KIN_AGENT_OUTPUT_TOKEN_PARAMETER` | enum | *(unset)* | correctness | override the completion request's output-limit field; unset selects max_completion_tokens for api.openai.com and max_tokens for compatible endpoints |
 | `KIN_AGENT_PURE_KIN` | bool | false | operational | lock `kin agent run` to Kin tools only: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes |
 | `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN` | bool | false | operational | allow the CLI to bootstrap an admin-scoped daemon |
 | `KIN_ALLOW_MASS_DELETION` | bool | false | correctness | permit reconcile to apply mass deletions (data-destructive) |

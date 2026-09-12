@@ -8220,6 +8220,75 @@ def recovery_step_script(release_recovery: str, anchor: str) -> str:
     return textwrap.dedent(step[step.index(marker) + len(marker) :])
 
 
+def assert_recovery_closes_only_shipped_alarms(release_recovery: str) -> None:
+    script = recovery_step_script(
+        release_recovery,
+        "      - name: Close blocked-release alarms whose tag has since shipped\n",
+    )
+    with tempfile.TemporaryDirectory(prefix="kin-recovery-close-") as directory:
+        root = Path(directory)
+        gh = root / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import argparse, json, os, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "if args[:2] == ['issue', 'list']:\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    for flag in ('--repo', '--label', '--state', '--limit', '--json', '--jq'):\n"
+            "        parser.add_argument(flag)\n"
+            "    parser.parse_args(args[2:])\n"
+            "    if os.environ.get('LIST_FAIL') == '1': sys.exit(23)\n"
+            "    print(os.environ['ISSUES'])\n"
+            "elif args[0] == 'api':\n"
+            "    print(os.environ['RUNS'])\n"
+            "elif args[:2] == ['issue', 'close']:\n"
+            "    with open(os.environ['CLOSED'], 'a') as f: f.write(json.dumps(args) + '\\n')\n"
+            "else: sys.exit('unexpected gh invocation: ' + repr(args))\n",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+        closed = root / "closed.jsonl"
+        prefix = "Release blocked after automatic retries: "
+        issues = [
+            {"number": 1, "title": prefix + "v0.7.17"},
+            {"number": 2, "title": prefix + "v0.7.18"},
+            {"number": 3, "title": "Unrelated v0.7.17"},
+            {"number": 4, "title": prefix + "not-a-tag"},
+        ]
+        shipped = {
+            "head_branch": "v0.7.17", "event": "push", "status": "completed",
+            "conclusion": "success", "path": ".github/workflows/release.yml",
+            "created_at": "2026-01-01T00:00:00Z", "html_url": "https://example.test/release/17",
+        }
+        env = {
+            **os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+            "GH_TOKEN": "fixture", "ALARM_TOKEN": "fixture", "ALARM_REPO": "fixture/infra", "LIST_FAIL": "0",
+            "ALARM_LABEL": "kin", "REPO": "fixture/kin", "CLOSED": str(closed),
+            "ISSUES": json.dumps(issues), "RUNS": json.dumps({"workflow_runs": [shipped]}),
+        }
+        cases = [
+            ({}, ["1"], 0),
+            ({"ISSUES": "[]"}, [], 0),
+            ({"LIST_FAIL": "1"}, [], 23),
+        ]
+        for field, value in (("conclusion", "failure"), ("status", "in_progress"),
+                             ("event", "workflow_dispatch"), ("path", "other.yml")):
+            cases.append(({"RUNS": json.dumps({"workflow_runs": [{**shipped, field: value}]})}, [], 0))
+        for overrides, expected, code in cases:
+            closed.unlink(missing_ok=True)
+            result = subprocess.run(["bash", "-c", script], env={**env, **overrides},
+                                    capture_output=True, text=True)
+            assert result.returncode == code, result.stderr
+            calls = [json.loads(line) for line in closed.read_text().splitlines()] if closed.exists() else []
+            assert [call[2] for call in calls] == expected, calls
+            if calls:
+                assert shipped["html_url"] in calls[0][-1]
+        broken = script.replace(' | jq -r --arg p "$prefix"', ' \\\n  --jq --arg p "$prefix"')
+        assert broken != script, "recovery alarm filter mutation did not apply"
+        result = subprocess.run(["bash", "-c", broken], env=env, capture_output=True, text=True)
+        assert result.returncode != 0 and "argument --jq" in result.stderr, result.stderr
+
+
 def recovery_escalation_source(release_recovery: str) -> str:
     """Extract the escalation step exactly as the recovery controller runs it."""
 
@@ -12220,6 +12289,7 @@ def main() -> None:
         ),
     )
 
+    assert_recovery_closes_only_shipped_alarms(release_recovery)
     assert_recovery_abandonment_stand_down(release_recovery)
     expect_assertion(
         "recovery repeats its stand-down condition only in comments",
