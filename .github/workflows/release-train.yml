@@ -1001,10 +1001,29 @@ jobs:
           fi
 
           decision="$work/decision.json"
+          # Whether the workflow that owns a staged transition is switched on.
+          # A `tag_staged` hold is the cut proving a candidate, which takes far
+          # longer than four cycles, and cycles are workflow_run firings rather
+          # than clock ticks. It is a rail standing still only when the cut is
+          # off, which is the first thing the staged alarm body tells a reader
+          # to check; the decision now reads it rather than leaving it to a
+          # human after the issue is already open. Any answer but a known state,
+          # including a failed read, becomes `unreadable`, which the script
+          # counts exactly as it counted a staged hold before, so this can never
+          # quiet the alarm by failing.
+          cut_state="$(gh api "repos/${REPO}/actions/workflows/release-cut.yml" \
+            --jq .state 2>/dev/null | head -1 | tr -d '"[:space:]')" || true
+          case "$cut_state" in
+            active|disabled_manually|disabled_inactivity|disabled_fork) ;;
+            *) cut_state=unreadable ;;
+          esac
+          echo "release-cut.yml state: $cut_state"
+
           node scripts/release-hold-alarm.mjs \
             --markers "$MARKERS" \
             --issue "$issue_arg" \
-            --threshold "$THRESHOLD" > "$decision"
+            --threshold "$THRESHOLD" \
+            --cut-state "$cut_state" > "$decision"
           jq -c . "$decision"
 
           action="$(jq -er .action "$decision")"
