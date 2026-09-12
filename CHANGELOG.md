@@ -12,7 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Compact MCP response envelopes and preserve diagnostic causes (#1773)
+- docs(claude): add plugin requirements (#1774)
+- fix(cli): show continue alias in resolve help (#1776)
+- Package release-matched desktop MCP binaries and maintainer metadata (#1777)
 
+
+### Changed
+
+- Show the `--continue` alias in `kin resolve --help`.
 
 ## [0.7.16] - 2026-09-12
 
