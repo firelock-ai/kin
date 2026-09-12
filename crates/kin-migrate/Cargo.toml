@@ -19,7 +19,7 @@ kin-git = { workspace = true }
 kin-parser = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
-kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
+kin-infer = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }

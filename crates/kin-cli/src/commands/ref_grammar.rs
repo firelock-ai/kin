@@ -161,8 +161,14 @@ impl<'a> Authority<'a> {
             } => Ok((lease, workspace_id)),
             Self::Deferred { source, opened } => {
                 if opened.get().is_none() {
-                    let opens_before =
-                        super::repository_authority::repository_authority_opens_on_this_thread();
+                    // Counted on kin-core's funnel rather than on this crate's
+                    // own wrapper counter. Every path into KinDB's recovery
+                    // reaches that funnel, and a server resolving this authority
+                    // may open through another crate's wrapper, which this
+                    // crate's counter cannot see. Read from the wrapper counter,
+                    // the first read at a publication reported that nothing was
+                    // opened while a whole-store open had just been paid for it.
+                    let opens_before = kin_core::authority_opens();
                     let started = std::time::Instant::now();
                     let authority = source.open().map_err(|error| {
                         ref_error(
@@ -172,9 +178,7 @@ impl<'a> Authority<'a> {
                     })?;
                     let cost = AuthorityOpen {
                         waited: started.elapsed(),
-                        opened_here:
-                            super::repository_authority::repository_authority_opens_on_this_thread()
-                                > opens_before,
+                        opened_here: kin_core::authority_opens() > opens_before,
                         shared: source.is_shared(),
                     };
                     let lease = authority.manager().read_authority();

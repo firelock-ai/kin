@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (530 total, 357 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (531 total, 357 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -50,6 +50,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_ACTOR` | string | *(unset)* | operational | actor identity recorded in provenance |
+| `KIN_AGENT_PURE_KIN` | bool | false | operational | lock `kin agent run` to Kin tools only: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes |
 | `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN` | bool | false | operational | allow the CLI to bootstrap an admin-scoped daemon |
 | `KIN_ALLOW_MASS_DELETION` | bool | false | correctness | permit reconcile to apply mass deletions (data-destructive) |
 | `KIN_ALLOW_OFFLINE_RESTORE` | bool | false | operational | allow restoring a backup without remote verification |

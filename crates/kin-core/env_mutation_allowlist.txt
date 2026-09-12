@@ -6,6 +6,17 @@
 # `kin_core::test_env::EnvVarGuard`, or the configuration is taken by argument.
 #
 # `crates/kin-core/src/test_env.rs` is the guard itself and is exempt in code.
+#
+# A line may also read `crates/<name> tests-only`, which exempts that crate's
+# TEST code as a whole: its `tests/` binaries and its top-level `#[cfg(test)]`
+# items, and nothing else. Product code in such a crate stays graded, and every
+# other crate keeps exact-path semantics. It exists for one class only, a crate
+# that sits BELOW kin-core and so cannot take `EnvVarGuard` as a dev-dependency,
+# and it is narrower than the per-file form it replaces: a per-file line on a
+# 7,500-line `src/lib.rs` would also excuse a future write in that file's
+# product code, which is the write this scan exists to catch. Anything else
+# shaped like `<something> tests-only` is refused rather than read as a path
+# that matches nothing.
 
 # `kin mcp start` binds the process to the daemon it resolved, and drops the pin
 # when the workspace moves off the bound repository. The variable is the
@@ -39,28 +50,32 @@ crates/kin-cli/src/resource_profile.rs
 # `PATH` without end.
 crates/kin-core/src/tool_prefix.rs
 
-# A conscious exception, not a precedent: test setup does not qualify here, and
-# these three would otherwise take their configuration by argument. kin-vector is
-# a standalone publishable crate below kin-core, so it cannot take kin-core as a
-# dev-dependency for EnvVarGuard, and each file is its own test binary setting
-# KIN_VECTOR_SIMD before the library's OnceLock samples it once. It moved into
-# crates/ on 2026-09-11 with its own test discipline. Follow-up: the three tests
-# take the SIMD selection by argument, in a kin-vector pull request inside this
-# workspace, and these three lines go.
-crates/kin-vector/tests/hnsw_determinism_simd.rs
-crates/kin-vector/tests/hnsw_simd_query_path_parity.rs
-crates/kin-vector/tests/simd_scalar_reachable.rs
+# The two imported crates that write the environment in their own tests, and a
+# conscious exception rather than a precedent. Both are standalone publishable
+# crates that sit below kin-core, so neither can take kin-core as a
+# dev-dependency for `EnvVarGuard`, and both moved into `crates/` on 2026-09-11
+# with their own test discipline. Product code in each stays graded.
+#
+# kin-vector: three test binaries, each setting KIN_VECTOR_SIMD before the
+# library's OnceLock samples it once. These were three per-file lines when
+# kin-vector landed; the crate-scoped form replaces them because it is the
+# narrower statement, not the wider one. Follow-up: the three tests take the
+# SIMD selection by argument, in a kin-vector pull request inside this
+# workspace, and this line goes.
+crates/kin-vector tests-only
 
-# kin-db, imported 2026-09-11. Every write in these five is inside a
-# `#[cfg(test)]` module or a tests/ binary: embed/mod.rs from line 4454,
-# search/text.rs from line 538, and the three probes. kin-db is a standalone
-# publishable crate below kin-core and cannot take kin-core as a dev-dependency
-# for EnvVarGuard. These five lines are TEMPORARY: they become the single
-# crate-scoped entry `crates/kin-db tests-only` when the pull request that adds
-# that form lands, so product code in embed/mod.rs and search/text.rs stops being
-# excused. Follow-up per crate: take the configuration by argument.
-crates/kin-db/src/embed/mod.rs
-crates/kin-db/src/search/text.rs
-crates/kin-db/tests/embed_hybrid_parity.rs
-crates/kin-db/tests/embed_oom_cpu_fallback.rs
-crates/kin-db/tests/metal_seq_len_regression.rs
+# kin-infer: writes in `#[cfg(test)] mod tests` inside `src/lib.rs` and in three
+# `tests/` binaries (the long-sequence Metal parity probe, the resident-stack
+# parity probe and the sequence-length regression). A per-file line on that
+# `src/lib.rs` would excuse every future write in 7,500 lines of product code.
+# Follow-up: the probes take their configuration by argument, in a kin-infer
+# pull request inside this workspace, and this line goes.
+crates/kin-infer tests-only
+
+# kin-db, imported 2026-09-11, in the crate-scoped form this file now carries.
+# Every environment write in it is inside a `#[cfg(test)]` module or a tests/
+# binary: embed/mod.rs from line 4454, search/text.rs from line 538, and three
+# probes. kin-db is a standalone publishable crate below kin-core and cannot take
+# kin-core as a dev-dependency for EnvVarGuard, so its TEST code is exempt and its
+# product code stays graded. Follow-up: take the configuration by argument.
+crates/kin-db tests-only

@@ -236,6 +236,7 @@ jobs:
             --crate kin-blobs
             --crate kin-model
             --crate kin-db
+            --crate kin-infer
             --crate kin-lsp
             --crate kin-search
             --crate kin-vector

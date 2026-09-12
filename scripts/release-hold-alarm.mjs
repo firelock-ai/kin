@@ -29,11 +29,16 @@ export const DEFAULT_THRESHOLD = 4;
 
 export const MARKER_SCHEMA = "kin.release-hold.v1";
 
+// The one workflow state in which a staged hold is work in flight rather than a
+// rail standing still. Read from the Actions API by the job that runs this
+// script, and passed in, so this file stays a pure function over its inputs.
+export const CUT_STATE_ACTIVE = "active";
+
 // A marker this reader cannot vouch for is not a quiet rail and it is not a
 // held one either. It breaks the streak and it never closes an open alarm,
 // because an unreadable observation and an observed all-clear are different
 // findings and only one of them is safe to act on.
-function classify(marker) {
+function classify(marker, cutState) {
   if (!marker || typeof marker !== "object") return "unreadable";
   if (marker.unreadable === true) return "unreadable";
   if (marker.schema !== MARKER_SCHEMA) return "unreadable";
@@ -41,13 +46,35 @@ function classify(marker) {
   if (marker.state === "clear") return "clear";
   if (marker.state !== "held") return "unreadable";
   if (!Number.isInteger(marker.drift) || marker.drift < 0) return "unreadable";
+  // A staged hold is the cut proving a candidate, not the train declining to
+  // mint, but only while the workflow that owns that transition is switched on.
+  // Measured on the v0.7.15 release: the bump merged at 21:32:11Z and four
+  // consecutive `tag_staged` markers arrived by 21:53:09Z, 9m33s apart end to
+  // end, because every one of those cycles was a `workflow_run` firing on a
+  // completed CI run somewhere in the fleet rather than the quarter-hourly
+  // cron. The cut had not even chosen a candidate yet: its own decision line
+  // still read "no complete green sha carries 0.7.15 yet; still being graded",
+  // and its candidate build alone takes about fifty minutes. So the threshold
+  // counts runs, whose rate is fleet traffic, and no count can be tuned to a
+  // release's latency.
+  //
+  // `cutState` is what keeps this from silencing the failure the body below
+  // documents. On 2026-09-07 a staged hold alarmed truthfully because
+  // release-cut.yml was switched off, so the staged tag was never going to be
+  // minted. That is the FIRST thing the staged body tells a reader to check,
+  // and this is that check promoted into the decision: staged is progress only
+  // while the cut is `active`, and a cut that is disabled, or whose state could
+  // not be read, counts exactly as it did before.
+  if (marker.reason === STAGED_REASON && cutState === CUT_STATE_ACTIVE) {
+    return "staged_in_progress";
+  }
   return marker.drift > 0 ? "held_with_drift" : "held_idle";
 }
 
-function leadingHeldWithDrift(markers) {
+function leadingHeldWithDrift(markers, cutState) {
   let count = 0;
   for (const marker of markers) {
-    if (classify(marker) !== "held_with_drift") break;
+    if (classify(marker, cutState) !== "held_with_drift") break;
     count += 1;
   }
   return count;
@@ -94,7 +121,7 @@ function describeFailedRelease(marker) {
 // cause was reachable in two API calls that nothing told them to make.
 export const STAGED_REASON = "tag_staged";
 
-export function buildBody(marker, consecutive, threshold) {
+export function buildBody(marker, consecutive, threshold, cutState) {
   const drift = marker.drift;
   const blocking = marker.blocking_tag || "an unresolved tag";
   const latest = marker.latest_tag || "an unread Latest";
@@ -157,12 +184,28 @@ export function buildBody(marker, consecutive, threshold) {
     );
     lines.push("```");
     lines.push("");
-    lines.push(
-      "`disabled_manually` is the whole answer: no candidate can exist until " +
-        "that workflow is enabled. Enabling it opens a window in which the " +
-        "cut proves whatever is newest and green, so it is a decision to take " +
-        "deliberately rather than an automatic repair.",
-    );
+    // This paragraph used to assert `disabled_manually` outright, which made
+    // the issue state a diagnosis nothing had measured: kin#1750 told a reader
+    // the cut was switched off while the API read it `active`. The job now
+    // reads that state before deciding, so the body reports what it read.
+    const readState = cutState || "unreadable";
+    if (readState === "disabled_manually" || readState === "disabled_inactivity") {
+      lines.push(
+        `This alarm read that workflow's state as \`${readState}\`, and that is ` +
+          "the whole answer: no candidate can exist until it is enabled. " +
+          "Enabling it opens a window in which the cut proves whatever is " +
+          "newest and green, so it is a decision to take deliberately rather " +
+          "than an automatic repair.",
+      );
+    } else {
+      lines.push(
+        `This alarm read that workflow's state as \`${readState}\`, so a switch ` +
+          "that is off is not the answer here, and the two commands above are " +
+          "where to start instead. A staged hold never reaches this body while " +
+          "that state reads `active`, so either the read failed or the cut " +
+          "changed state between the read and now.",
+      );
+    }
   } else {
     lines.push(describeFailedRelease(marker));
     lines.push("");
@@ -192,11 +235,11 @@ export function buildBody(marker, consecutive, threshold) {
   return lines.join("\n");
 }
 
-export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD }) {
+export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD, cutState = null }) {
   const list = Array.isArray(markers) ? markers : [];
   const open = issue && typeof issue === "object" && issue.number ? issue : null;
   const newest = list[0];
-  const state = classify(newest);
+  const state = classify(newest, cutState);
 
   if (state === "unreadable") {
     return {
@@ -237,6 +280,19 @@ export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD }) {
     return { action: "quiet", reason: "rail_healthy", detail: "The train resolved drift and proceeded." };
   }
 
+  if (state === "staged_in_progress") {
+    // Quiet, and an open alarm is left exactly where it is. Only the train's own
+    // all-clear closes one, and a staged hold is not an all-clear.
+    return {
+      action: "quiet",
+      reason: "staged_in_progress",
+      detail:
+        "The next version is staged on main and the cut is switched on, so a " +
+        "workflow owns this transition and the rail is moving. A staged hold " +
+        "counts toward the alarm only while release-cut.yml is not active.",
+    };
+  }
+
   if (state === "held_idle") {
     return {
       action: "quiet",
@@ -247,7 +303,7 @@ export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD }) {
     };
   }
 
-  const consecutive = leadingHeldWithDrift(list);
+  const consecutive = leadingHeldWithDrift(list, cutState);
   if (consecutive < threshold) {
     return {
       action: "quiet",
@@ -260,7 +316,7 @@ export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD }) {
     };
   }
 
-  const body = buildBody(newest, consecutive, threshold);
+  const body = buildBody(newest, consecutive, threshold, cutState);
   if (open) {
     return {
       action: "update",
@@ -283,12 +339,16 @@ export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD }) {
 }
 
 function parseArgs(argv) {
-  const args = { markers: null, issue: null, threshold: DEFAULT_THRESHOLD };
+  const args = { markers: null, issue: null, threshold: DEFAULT_THRESHOLD, cutState: null };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--markers") args.markers = argv[++index];
     else if (flag === "--issue") args.issue = argv[++index];
     else if (flag === "--threshold") args.threshold = Number.parseInt(argv[++index], 10);
+    // Absent, or any value but "active", leaves a staged hold counting exactly
+    // as it did before, so a caller that cannot read the cut's state never
+    // quiets the alarm by omission.
+    else if (flag === "--cut-state") args.cutState = argv[++index] ?? null;
     else throw new Error(`unknown argument: ${flag}`);
   }
   if (!args.markers) throw new Error("--markers <path> is required");
@@ -309,7 +369,7 @@ function main(argv) {
   // which is a different statement from having never looked. An absent path
   // would be the second, so the caller has to spell the first.
   const issue = !args.issue || args.issue === "none" ? null : readJson(args.issue);
-  process.stdout.write(`${JSON.stringify(decide({ markers, issue, threshold: args.threshold }), null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(decide({ markers, issue, threshold: args.threshold, cutState: args.cutState }), null, 2)}\n`);
 }
 
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {

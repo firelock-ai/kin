@@ -100,6 +100,37 @@ KIN_FOLD_SPLIT_MODE
 # workspace source; before, the dependency scan saw it the same way.
 KIN_SEARCH_SOAK_SEED
 
+# kin-infer's own test binaries read these directly, in crates/kin-infer/tests/:
+# the embed scale-hang harness, the determinism probe and the batch probes. None
+# is compiled into a running kin, and nothing an operator sets. kin-infer moved
+# into crates/ on 2026-09-11; before that the dependency scan read only what a
+# consumer's source named, and kin's source names none of them.
+KIN_EMBED_PIPELINE
+KIN_INFER_DETERMINISM_CHILD
+KIN_INFER_DETERMINISM_CONTENTION
+KIN_INFER_DETERMINISM_GATE
+KIN_INFER_PROBE_MODEL_DIR
+KIN_SCALE_BATCHES
+KIN_SCALE_BATCH_TOKENS
+KIN_SCALE_MAX_SECS
+KIN_SCALE_SEQ_LEN
+KIN_SCALE_SPAWN_THREAD
+KIN_SCALE_STALL_SECS
+
+# Stays OUT of the registry, and this is the one of kin-infer's six embed
+# watchdog knobs that the workspace scan can see. All six are already in
+# dependency_env_allowlist.txt with a reachability note, and
+# `the_unreachable_watchdog_knobs_stay_out_of_the_registry` in env_registry.rs
+# asserts they are allowlisted AND unregistered, because neither kin nor the
+# pinned kin-db constructs EmbedConfig or EmbedWatchdog, so nothing in a kin
+# process reads any of them. Importing the crate did not change that; it changed
+# which scan reads the file. Only this one is visible here because
+# crates/kin-infer/src/watchdog.rs reads all six through helper functions that
+# take the name as an argument, while crates/kin-infer/tests/embed_scale_hang.rs
+# spells this one out. Register it in env_registry.rs on the day the watchdog is
+# wired up, which is what that test exists to remind the next reader to do.
+KIN_EMBED_ORPHAN_CHECK
+
 # kin-db's own test code reads these fifteen directly, all under `#[cfg(test)]`
 # in crates/kin-db/src or in crates/kin-db/tests, so none reaches a running kin:
 # the clock-half and replay-wall fixtures, the static-writer multi-process probe,

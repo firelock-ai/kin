@@ -358,3 +358,89 @@ test('the alarm job result overrides missing or stale markers after finalizer or
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// The v0.7.15 release, replayed from the markers the train actually wrote.
+// Measured from each run's own `release-hold-marker` artifact: the bump merged
+// at 21:32:11Z and these four staged markers were observed between 21:43:36Z
+// and 21:53:09Z, 9m33s end to end, because every one of those cycles was a
+// `workflow_run` firing on a completed CI run somewhere in the fleet. The cut
+// had not chosen a candidate yet, and its candidate build alone takes about
+// fifty minutes. The fourth of them opened kin#1750.
+function stagedV0715({ drift, runId, observedAt, mainSha }) {
+  return {
+    ...staged({ drift, blocking: 'v0.7.15', latest: 'v0.7.13' }),
+    detail: 'v0.7.15 is already staged on main; tag reconciliation owns the next transition',
+    run_id: runId,
+    run_url: `https://github.com/firelock-ai/kin/actions/runs/${runId}`,
+    main_sha: mainSha,
+    observed_at: observedAt,
+  };
+}
+
+const V0715_STAGED_SEQUENCE = [
+  stagedV0715({ drift: 44, runId: '34651465000', observedAt: '2026-09-11T21:53:09Z', mainSha: '42f0a1e0e00000000000000000000000000000ab' }),
+  stagedV0715({ drift: 44, runId: '34651353446', observedAt: '2026-09-11T21:52:03Z', mainSha: '42f0a1e0e00000000000000000000000000000ab' }),
+  stagedV0715({ drift: 44, runId: '34651339407', observedAt: '2026-09-11T21:51:28Z', mainSha: '42f0a1e0e00000000000000000000000000000ab' }),
+  stagedV0715({ drift: 43, runId: '34650711251', observedAt: '2026-09-11T21:43:36Z', mainSha: '27a542c7600000000000000000000000000000ab' }),
+];
+
+test('the v0.7.15 staged wait stays quiet while the cut is switched on', () => {
+  const decision = decide({ markers: V0715_STAGED_SEQUENCE, issue: null, cutState: 'active' });
+  assert.equal(decision.action, 'quiet');
+  assert.equal(decision.reason, 'staged_in_progress');
+});
+
+test('the same sequence opened an issue before the cut state was consulted', () => {
+  // The falsification: today's counting, which is what an omitted cut state
+  // still reproduces exactly, reaches the threshold on this very sequence.
+  const decision = decide({ markers: V0715_STAGED_SEQUENCE, issue: null });
+  assert.equal(decision.action, 'open');
+  assert.equal(decision.reason, 'hold_established');
+  assert.equal(decision.consecutive, DEFAULT_THRESHOLD);
+});
+
+test('a staged hold still alarms when the cut is switched off', () => {
+  // 2026-09-07: the staged tag was never going to be minted because
+  // release-cut.yml was disabled, and the alarm was right to ring.
+  for (const cutState of ['disabled_manually', 'disabled_inactivity', 'unreadable', null]) {
+    const decision = decide({ markers: V0715_STAGED_SEQUENCE, issue: null, cutState });
+    assert.equal(decision.action, 'open', `cut state ${cutState} must still alarm`);
+    assert.equal(decision.reason, 'hold_established');
+  }
+});
+
+test('an active cut does not quiet a hold that is not staged', () => {
+  const markers = [held(), held(), held(), held()];
+  const decision = decide({ markers, issue: null, cutState: 'active' });
+  assert.equal(decision.action, 'open');
+  assert.equal(decision.reason, 'hold_established');
+  assert.equal(decision.consecutive, DEFAULT_THRESHOLD);
+});
+
+test('a staged cycle breaks a streak of declined mints rather than extending it', () => {
+  const markers = [V0715_STAGED_SEQUENCE[0], held(), held(), held(), held()];
+  const decision = decide({ markers, issue: null, cutState: 'active' });
+  assert.equal(decision.action, 'quiet');
+  assert.equal(decision.reason, 'staged_in_progress');
+});
+
+test('a staged hold leaves an open alarm exactly where it is', () => {
+  // Only the train's own all-clear closes one. A staged hold is not an
+  // all-clear, so it neither closes nor updates.
+  const decision = decide({ markers: V0715_STAGED_SEQUENCE, issue: OPEN_ISSUE, cutState: 'active' });
+  assert.equal(decision.action, 'quiet');
+  assert.equal(decision.reason, 'staged_in_progress');
+});
+
+test('the staged body reports the cut state that was read, not an assumed one', () => {
+  // kin#1750 told a reader the cut was disabled_manually while the API read it
+  // active. The body states what the job measured.
+  const off = decide({ markers: V0715_STAGED_SEQUENCE, issue: null, cutState: 'disabled_manually' });
+  assert.match(off.body, /read that workflow's state as `disabled_manually`, and that is/);
+  assert.match(off.body, /no candidate can exist until it is enabled/);
+
+  const unknown = decide({ markers: V0715_STAGED_SEQUENCE, issue: null, cutState: null });
+  assert.match(unknown.body, /read that workflow's state as `unreadable`/);
+  assert.match(unknown.body, /a switch that is off is not the answer here/);
+  assert.doesNotMatch(unknown.body, /`disabled_manually`, and that is the whole answer/);
+});

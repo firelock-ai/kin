@@ -476,8 +476,23 @@ daemon, so the next begin names a session that no longer exists. The check requi
 the edit to commit through Kin anyway: the harness has to open a new session, and
 the file, `get_entity_source`, the durability block and the edit's own provenance
 must agree. It is the one place where kin-mcp's refusal wording meets kin-agent's
-reading of it. The suite sets `KIN_REGISTRY_PATH` under its scratch home, because
-`KIN_HOME` does not move the supervisor.
+reading of it. `pure_kin_mutate_lands` runs the same binary a second time under
+`KIN_AGENT_PURE_KIN`, whose belt carries no `edit_file` and no `write_file` at
+all, and requires one `kin_mutate` naming the ENTITY to commit: the file and
+`get_entity_source` carry it, durability reads `recorded`, the run records
+`entities_changed` and no file, and `kin log` carries the agent's own summary
+rather than the bare transaction line. Its load-bearing assertion is that the
+call went out under a session the harness supplied. `kin_session_start` is
+harness-owned, so the model never sees the session the run opened, and a
+mutation with none used to fall back to the MCP server's in-process registry,
+which in daemon mode is not the authority: it invented an id the daemon had
+never heard of and the transaction begin one call later refused it. Both
+hermetic suites were green through that, for the same reason they were green
+through FIR-3550: kin-agent's scripted MCP server has no session authority and
+kin-mcp's tests run where its own registry IS the authority, so only the real
+binaries together can see the fallback between them. The suite sets
+`KIN_REGISTRY_PATH` under its scratch home, because `KIN_HOME` does not move the
+supervisor.
 
 `eject_journal_repro.py` covers the eject archive round trip the rc0552n green
 stranger lost on 0.5.52 (FIR-2664). A finished `kin eject` left its journal in

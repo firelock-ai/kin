@@ -424,6 +424,22 @@ jobs:
           run_nonempty_target "kin-vector library" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-vector --lib
+          # kin-vfs-core, for the same reason and a sharper one. Its own
+          # repository ran `cargo test -p kin-vfs-core` on `windows-latest` as a
+          # REQUIRED check on every pull request, not a nightly cron, and that
+          # leg went with the rest of that CI when the crate moved here.
+          # `containment.rs` is why it mattered: `host_relative` has a
+          # `cfg(not(unix))` arm that REFUSES a path whose bytes are not UTF-8
+          # rather than lossily decoding it into a different file, and that arm
+          # is dead code on every other runner. Windows test execution still
+          # moves from pre-merge to this job, which runs on a push to main;
+          # `windows-cross-check` compiles the crate on the pull-request path
+          # through kin-cli and kin-daemon but runs nothing. kin-infer and
+          # kin-lsp are not here: neither had Windows CI and neither carries a
+          # `cfg(windows)` arm.
+          run_nonempty_target "kin-vfs-core library" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-vfs-core --lib
           # Stays in this job rather than moving to the CLI one: the npm proof
           # above asserts that the compatibility wrapper finds its sibling
           # daemon, and this is the unit case for the discovery it depends on.
@@ -1885,7 +1901,7 @@ jobs:
                   print(name)
           LIBS
           count="$(wc -l < "$RUNNER_TEMP/libraries.txt" | tr -d ' ')"
-          if [ "$count" -lt 4 ]; then
+          if [ "$count" -lt 7 ]; then
             echo "::error title=No Kin libraries resolved::read $count from the root manifest"
             echo "Every leg below iterates this list, so an empty or short one" >&2
             echo "would grade nothing and report success." >&2
@@ -3000,7 +3016,7 @@ jobs:
                   print(name)
           LIBS
           count="$(wc -l < "$RUNNER_TEMP/libraries.txt" | tr -d ' ')"
-          if [ "$count" -lt 4 ]; then
+          if [ "$count" -lt 7 ]; then
             echo "::error title=No Kin libraries resolved::read $count from the root manifest"
             exit 1
           fi

@@ -2396,7 +2396,7 @@ class WorkflowContractTests(unittest.TestCase):
         the two on every publish and produced a wave head that could not pass
         its own gate. The gate below holds it unless the decision step says the
         registry and the pin already agree, and an unconditional
-        `--crate kin-vfs-core` beside the other six takes this red.
+        `--crate kin-vfs-core` beside the other seven takes this red.
         """
 
         decision = step_block(
@@ -2426,7 +2426,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('if [ "$VFS_CORE_ROLL" = "true" ]; then', update)
         self.assertIn("crate_args+=( --crate kin-vfs-core )", update)
 
-        # The six uncoupled crates are in the unconditional array; the coupled
+        # The seven uncoupled crates are in the unconditional array; the coupled
         # one is not. Reading the array literal rather than the whole step is
         # what makes an unconditional kin-vfs-core visible here.
         array = update.split("crate_args=(", 1)[1].split(")", 1)[0]

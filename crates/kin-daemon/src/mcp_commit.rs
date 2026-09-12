@@ -552,6 +552,7 @@ fn commit_exact_transaction_inner(
     })
     .map_err(|error| format!("load exact MCP commit base: {error}"))?;
     require_bound_authority_revision(state, &base, &transaction_id)?;
+    let requested_message = requested_commit_message(arguments);
     let plan = match timed_commit_phase("plan_transaction", || {
         plan_exact_transaction(
             state,
@@ -561,6 +562,7 @@ fn commit_exact_transaction_inner(
             &actor,
             operation_id,
             &base,
+            requested_message.as_deref(),
         )
     }) {
         Ok(plan) => plan,
@@ -1160,6 +1162,7 @@ fn plan_exact_transaction(
     actor: &CommitActor,
     operation_id: OperationId,
     base: &NativeCommitBase,
+    requested_message: Option<&str>,
 ) -> Result<ExactMcpPlan, String> {
     let prospective = kin_db::InMemoryGraph::from_snapshot(base.graph.to_snapshot())
         .map_err(|error| format!("create prospective exact graph: {error}"))?;
@@ -1532,7 +1535,7 @@ fn plan_exact_transaction(
             kin_model::Timestamp::now(),
             actor.author.clone(),
             &authored_files,
-            &|carried| commit_message(&transaction.transaction_id, carried),
+            &|carried| commit_message(&transaction.transaction_id, requested_message, carried),
             base,
             Some(Arc::clone(held_authority)),
         )
@@ -1580,6 +1583,26 @@ fn plan_exact_transaction(
 /// always exact, so a truncated sample never understates the fold.
 const CARRIED_SAMPLE: usize = 10;
 
+/// The change message the commit call asked this commit to record, if it asked
+/// for one.
+///
+/// Read off the call rather than off the staged operations on purpose. Each
+/// operation carries its own `description`, which says what that one operation
+/// does; a change is the whole set, and the subject a human reads in history is
+/// a statement about the set. Deriving one from the other would also rewrite
+/// the message of every commit already in flight, and this argument is meant to
+/// add a way to say something, not to change what silence means.
+///
+/// Trimmed, and an all-whitespace message is read as none, so a caller cannot
+/// publish a blank subject line by accident.
+fn requested_commit_message(arguments: &HashMap<String, serde_json::Value>) -> Option<String> {
+    let message = arguments
+        .get("message")
+        .and_then(serde_json::Value::as_str)?
+        .trim();
+    (!message.is_empty()).then(|| message.to_string())
+}
+
 /// The message one MCP commit publishes, stating what it folded in.
 ///
 /// A commit that carried nothing gets the bare transaction line it has always
@@ -1595,9 +1618,20 @@ const CARRIED_SAMPLE: usize = 10;
 /// two different sources, and the entities inside those files keep the
 /// authorship they already had rather than silently becoming this agent's work,
 /// because no operation here wrote them.
-fn commit_message(transaction_id: &str, carried: &[RepoPath]) -> String {
+///
+/// A caller that named its own message gets that message as the subject, with
+/// the transaction line kept underneath rather than dropped: the id is how an
+/// operator ties a change back to the call that made it, and an agent's subject
+/// is what a human reads first. A caller that named none sees exactly what it
+/// saw before this argument existed, which is why the whole shape hangs off
+/// `Option` instead of a default string.
+fn commit_message(transaction_id: &str, requested: Option<&str>, carried: &[RepoPath]) -> String {
+    let transaction_line = format!("MCP transaction {transaction_id}");
     if carried.is_empty() {
-        return format!("MCP transaction {transaction_id}");
+        return match requested {
+            Some(message) => format!("{message}\n\n{transaction_line}"),
+            None => transaction_line,
+        };
     }
     let count = carried.len();
     let files = if count == 1 { "file" } else { "files" };
@@ -1610,8 +1644,20 @@ fn commit_message(transaction_id: &str, carried: &[RepoPath]) -> String {
     if count > CARRIED_SAMPLE {
         sample.push_str(&format!(", and {} more", count - CARRIED_SAMPLE));
     }
+    // The subject still declares the fold even when the caller named a message,
+    // because the fold is the thing a reader of a subject-only history most
+    // needs to be warned about and least able to ask a follow-up question
+    // about. The caller's own words open the body instead, where they are the
+    // first thing read once the subject has been.
+    let subject = format!(
+        "MCP transaction {transaction_id} (also admitted {count} pending working-tree {files})"
+    );
+    let preamble = match requested {
+        Some(message) => format!("{message}\n\n"),
+        None => String::new(),
+    };
     format!(
-        "MCP transaction {transaction_id} (also admitted {count} pending working-tree {files})\n\n\
+        "{subject}\n\n{preamble}\
          The workspace already held admitted working-tree content its base change did not carry, \
          so this change publishes that content beside the staged operations rather than reverting \
          it, and re-derives its semantics from the exact bytes published here, because a change \
@@ -8658,6 +8704,98 @@ pub(crate) mod tests {
             change.message,
             format!("MCP transaction {transaction_id}"),
             "a clean commit's message stays byte-identical"
+        );
+    }
+
+    /// A caller that names its change gets its own words as the subject.
+    ///
+    /// Until this argument existed every MCP change in history read
+    /// "MCP transaction <uuid>", which says which call made the change and
+    /// nothing about what the change does. An agent that has just decided what
+    /// it is doing is the one party that knows, so the commit call takes the
+    /// sentence and the transaction line moves below it, where an operator can
+    /// still tie the change back to the call.
+    ///
+    /// Paired with `a_commit_from_a_clean_workspace_declares_no_fold_at_all`
+    /// directly above, which is the control: the same commit with no `message`
+    /// records the bare transaction line byte for byte, so this argument adds a
+    /// way to say something rather than changing what silence means.
+    #[test]
+    fn a_commit_records_the_message_its_caller_named() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+
+        let sessions = test_sessions();
+        let (transaction_id, mut arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        arguments.insert(
+            "message".to_string(),
+            serde_json::json!("Return two from value"),
+        );
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+
+        let change_id = commit_reply(&result)["change_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let change = state
+            .graph
+            .get_entity_history(&entity.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the entity it wrote");
+        assert_eq!(
+            change.message,
+            format!("Return two from value\n\nMCP transaction {transaction_id}"),
+            "the caller's sentence is the subject and the transaction line stays underneath"
+        );
+    }
+
+    /// A blank message is no message, not a blank subject line.
+    ///
+    /// A client that always sends the field and sometimes has nothing to put in
+    /// it would otherwise publish a change whose subject is empty and whose
+    /// first readable line is the transaction id, which is strictly worse than
+    /// the line it replaced.
+    #[test]
+    fn a_whitespace_only_message_records_the_bare_transaction_line() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+
+        let sessions = test_sessions();
+        let (transaction_id, mut arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        arguments.insert("message".to_string(), serde_json::json!("   \n  "));
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+
+        let change_id = commit_reply(&result)["change_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let change = state
+            .graph
+            .get_entity_history(&entity.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the entity it wrote");
+        assert_eq!(
+            change.message,
+            format!("MCP transaction {transaction_id}"),
+            "an all-whitespace message is read as none"
         );
     }
 

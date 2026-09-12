@@ -75,7 +75,10 @@ pub(crate) fn discover_for_process() -> Result<Option<RequestRepositoryAuthority
 pub const HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 enum ActiveRepositoryAuthorityManager {
-    Local(RepositoryAuthorityManager<LocalFileBackend>),
+    /// Shared rather than owned, so a server that has already paid for one open
+    /// reads through it here instead of opening the same publication a second
+    /// time. See [`ActiveRepositoryAuthority::from_shared`].
+    Local(Arc<RepositoryAuthorityManager<LocalFileBackend>>),
     Hosted {
         manager: RepositoryAuthorityManager<dyn StorageBackend>,
         backend: Arc<dyn StorageBackend>,
@@ -430,11 +433,39 @@ impl ActiveRepositoryAuthority {
             ))
         })?;
         Ok(Self {
-            manager: ActiveRepositoryAuthorityManager::Local(manager),
+            manager: ActiveRepositoryAuthorityManager::Local(Arc::new(manager)),
             repository_id: binding.repository_id().clone(),
             workspace_id: Some(binding.workspace_id()),
             hosted_head: None,
         })
+    }
+
+    /// Read through an authority a server already has open, without opening a
+    /// second one over the same durable bytes.
+    ///
+    /// Nothing is skipped here. The manager handed in is the result of one full
+    /// validating open, so every body read through it was verified by that open
+    /// exactly as it would have been by one of this type's own. What the caller
+    /// owns is the freshness argument, the same one
+    /// [`RequestRepositoryAuthority::shared`] states: the manager must have been
+    /// loaded at a durable publication whose record was read BEFORE that load,
+    /// and it may be handed here only while the record still reads the same.
+    ///
+    /// Deliberately not counted in [`REPOSITORY_AUTHORITY_OPEN_COUNT`] or in the
+    /// per-thread counter beside it. Those count whole-store opens, which is
+    /// what a reader pays for. A borrow pays for none, and counting one there
+    /// would make the number that names the cost climb while nothing was spent.
+    pub fn from_shared(
+        manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+        repository_id: RepositoryId,
+        workspace_id: WorkspaceId,
+    ) -> Self {
+        Self {
+            manager: ActiveRepositoryAuthorityManager::Local(manager),
+            repository_id,
+            workspace_id: Some(workspace_id),
+            hosted_head: None,
+        }
     }
 
     /// Bind an already-opened hosted authority to the exact default-ref tree
