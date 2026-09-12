@@ -6,11 +6,9 @@
 // The v0.5.40 archive was four executables and no words. Both arms of the
 // isolated stranger run installed it successfully and both scored the packaging
 // below the binaries, for the same reason: a stranger's first two decisions,
-// where the executables go and what to do with the shared library, are
-// unguided, and no `kin` command can advise them before `kin` is on PATH. One
-// arm extracted to `~/.local/lib` and symlinked into `/usr/local/bin`, the other
-// to `/opt/kin`, and neither could have known the shim is expected at
-// `~/.kin/lib`.
+// where the executables go are unguided, and no `kin` command can advise them
+// before `kin` is on PATH. One arm extracted to `~/.local/lib` and symlinked
+// into `/usr/local/bin`, and the other to `/opt/kin`.
 //
 // Both arms were also told to verify against `checksums-sha256.txt` and found
 // only the per-archive sidecar. That sidecar covers the tarball; this file
@@ -19,8 +17,8 @@
 //
 // The names considered here are the ones `scripts/release-archive-shape.cjs`
 // admits at the archive root and the ones `kin update` skips by name. The
-// artifact bytes decide whether the optional projection pair is documented, so
-// this generator cannot claim that a matrix-skipped component was packaged.
+// artifact bytes decide the runtime inventory, so this generator cannot claim
+// that a retired component was packaged.
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -47,7 +45,6 @@ const shim = windows
     : "libkin_vfs_shim.so";
 
 const binDir = windows ? "%USERPROFILE%\\.kin\\bin" : "~/.kin/bin";
-const libDir = windows ? "%USERPROFILE%\\.kin\\lib" : "~/.kin/lib";
 
 function hasRegularFile(name) {
   try {
@@ -67,23 +64,15 @@ for (const required of [cli, daemon]) {
   }
 }
 
-const hasVfs = hasRegularFile(vfs);
-const hasShim = hasRegularFile(shim);
-if (hasVfs !== hasShim) {
+const retiredProjectionFiles = [vfs, shim].filter(hasRegularFile);
+if (retiredProjectionFiles.length !== 0) {
   console.error(
-    `release archive VFS executable and shim must be packaged together: ${vfs}=${hasVfs}, ${shim}=${hasShim}`,
-  );
-  process.exit(1);
-}
-const hasProjection = hasVfs && hasShim;
-if (!windows && !hasProjection) {
-  console.error(
-    `release archive for ${target} is missing its mandatory VFS executable and shim`,
+    `release archive carries retired VFS runtime artifact(s): ${retiredProjectionFiles.join(", ")}`,
   );
   process.exit(1);
 }
 
-const executableNames = [cli, daemon, ...(hasProjection ? [vfs] : [])];
+const executableNames = [cli, daemon];
 const inlineNames = executableNames
   .map((name) => `\`${name}\``)
   .map((name, index, names) => {
@@ -98,40 +87,11 @@ const makeBinDirCommand = windows ? `mkdir "${binDir}"` : `mkdir -p ${binDir}`;
 const copyExecutablesCommand = windows
   ? executableNames.map((name) => `copy ${name} "${binDir}\\${name}"`).join("\n    ")
   : `cp ${copyNames} ${binDir}/`;
-const makeLibDirCommand = windows ? `mkdir "${libDir}"` : `mkdir -p ${libDir}`;
-const copyShimCommand = windows
-  ? `copy ${shim} "${libDir}\\${shim}"`
-  : `cp ${shim} ${libDir}/`;
 
 const runtimeFiles = [
   `- \`${cli}\` is the command line interface. Start here.`,
   `- \`${daemon}\` serves one repository's graph.\n  \`${cli}\` starts it for you; you do not run it by hand.`,
 ];
-if (hasProjection) {
-  runtimeFiles.push(
-    `- \`${vfs}\` is the filesystem projection driver, which makes graph-backed\n  files look like ordinary files to any tool. It is optional. The CLI and the\n  daemon are fully functional without it.`,
-    `- \`${shim}\` is the library \`${vfs}\` injects. It belongs in\n  \`${libDir}\`, not beside the binaries. See INSTALL.md.`,
-  );
-}
-
-const projectionBoundary = hasProjection
-  ? ""
-  : `\nTransparent filesystem projection is not shipped on native Windows. Use WSL2\nfor the full Kin experience, including projection.`;
-
-const projectionInstall = hasProjection
-  ? `## 2. The shared library
-
-\`${shim}\` is not a program and does not go on PATH. It is injected into other
-processes by the projection driver, and Kin looks for it at one place:
-
-    ${makeLibDirCommand}
-    ${copyShimCommand}
-
-If you skip this, everything except filesystem projection still works, and
-\`kin doctor\` will tell you the shim is missing and offer to copy it from this
-archive for you.`
-  : `Transparent filesystem projection is not shipped on native Windows. Use WSL2
-for the full Kin experience, including projection.`;
 
 const readme = `# Kin ${version} (${target})
 
@@ -141,7 +101,8 @@ about a repository from a graph rather than from raw file search.
 This archive carries these runtime files:
 
 ${runtimeFiles.join("\n")}
-${projectionBoundary}
+
+Deprecated VFS executables and preload shims are not included in release archives.
 
 ## After installing
 
@@ -193,8 +154,6 @@ these files land together:
     ${copyExecutablesCommand}
 
 Then add that directory to PATH.
-
-${projectionInstall}
 
 ## Then
 

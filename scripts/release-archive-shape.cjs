@@ -43,17 +43,14 @@ const MAX_BUNDLE_DEPTH = 6;
 // The set is an upper bound rather than a checklist. Which components are
 // mandatory is decided by the packaging step's own presence assertions and by
 // the publish job's per-artifact required list; what this decides is only which
-// names may appear at all, which is why the Windows projection components sit
-// here even though that leg ships them opportunistically. Adding a component to
-// a release archive means adding it to the updater's platform component list
-// and to this set together.
+// names may appear at all. Adding a component to a release archive means adding
+// it to the updater's platform component list and to this set together.
 // Documentation members every archive carries, on every platform.
 //
 // The v0.5.40 archive was four executables and no words, and both strangers who
 // installed it scored the packaging below the binaries for exactly that reason.
-// A stranger's first two decisions, where the three executables go and what to
-// do with the shared library, are both unguided, and no `kin` command can
-// advise them before `kin` is on PATH. These three files are the answer that
+// A stranger must decide where the two executable runtime files go before
+// `kin` is on PATH and can offer advice. These three files are the answer that
 // travels with the bytes.
 //
 // They are members of the archive and nothing installs them: `kin update` skips
@@ -70,21 +67,9 @@ const MAX_BUNDLE_DEPTH = 6;
 const DOC_FILES = Object.freeze(["README.md", "INSTALL.md", "checksums-sha256.txt"]);
 
 const ROOT_FILES_BY_FAMILY = {
-  darwin: Object.freeze([
-    "kin",
-    "kin-daemon",
-    "kin-vfs",
-    "libkin_vfs_shim.dylib",
-    ...DOC_FILES,
-  ]),
-  linux: Object.freeze(["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so", ...DOC_FILES]),
-  windows: Object.freeze([
-    "kin.exe",
-    "kin-daemon.exe",
-    "kin-vfs.exe",
-    "kin_vfs_shim.dll",
-    ...DOC_FILES,
-  ]),
+  darwin: Object.freeze(["kin", "kin-daemon", ...DOC_FILES]),
+  linux: Object.freeze(["kin", "kin-daemon", ...DOC_FILES]),
+  windows: Object.freeze(["kin.exe", "kin-daemon.exe", ...DOC_FILES]),
 };
 
 // Whether a target triple is one whose archive may carry the notification

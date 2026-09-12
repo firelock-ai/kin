@@ -25,15 +25,12 @@ const MACOS_ARTIFACT = "kin-macos-x86_64";
 const LINUX_ARTIFACT = "kin-linux-x86_64";
 const WINDOWS_ARTIFACT = "kin-windows-x86_64";
 
-// Verbatim `tar -tzf kin-macos-x86_64.tar.gz` output from the release build that
-// this guard rejected, including its interleaved directory records and the
-// bundle's signature payload. Fixtures are derived from it rather than from an
-// idealized listing so the accepted shape is the shape a release actually has.
+// The future macOS archive shape, including its interleaved directory records
+// and the bundle's signature payload. Fixtures model the archive layout the
+// release workflow must publish, not a hand-picked subset of its files.
 const MACOS_LISTING = [
   "kin-macos-x86_64/",
   "kin-macos-x86_64/kin",
-  "kin-macos-x86_64/kin-vfs",
-  "kin-macos-x86_64/libkin_vfs_shim.dylib",
   "kin-macos-x86_64/KinNotifier.app/",
   "kin-macos-x86_64/kin-daemon",
   "kin-macos-x86_64/KinNotifier.app/Contents/",
@@ -47,18 +44,16 @@ const MACOS_LISTING = [
   "kin-macos-x86_64/KinNotifier.app/Contents/_CodeSignature/CodeResources",
 ];
 
-// The same archive one release earlier, before the notification bundle shipped.
+// Linux archives have no bundle and carry only the supported runtime pair.
 const LINUX_LISTING = [
   "kin-linux-x86_64/",
   "kin-linux-x86_64/kin",
-  "kin-linux-x86_64/kin-vfs",
-  "kin-linux-x86_64/libkin_vfs_shim.so",
   "kin-linux-x86_64/kin-daemon",
 ];
 
 // The Windows zip is compressed from `<artifact>/*`, so its members carry no
 // artifact prefix at all.
-const WINDOWS_LISTING = ["kin.exe", "kin-daemon.exe", "kin-vfs.exe"];
+const WINDOWS_LISTING = ["kin.exe", "kin-daemon.exe"];
 
 // Documentation members ride on every family, so the per-family admitted root
 // sets below are the components plus these, sorted. They are admitted at the
@@ -66,11 +61,9 @@ const WINDOWS_LISTING = ["kin.exe", "kin-daemon.exe", "kin-vfs.exe"];
 // inventory by its own component list and refuses any other name, which is how
 // v0.6.2 refused v0.6.3 on `checksums-sha256.txt`.
 const DOC_FILES = ["INSTALL.md", "README.md", "checksums-sha256.txt"].sort();
-const MACOS_COMPONENTS = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"].sort();
-const LINUX_COMPONENTS = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"].sort();
-// Sorted the way the classifier returns names, which puts the bare CLI between
-// the hyphenated binaries and the underscored shim.
-const WINDOWS_COMPONENTS = ["kin-daemon.exe", "kin-vfs.exe", "kin.exe", "kin_vfs_shim.dll"].sort();
+const MACOS_COMPONENTS = ["kin", "kin-daemon"].sort();
+const LINUX_COMPONENTS = ["kin", "kin-daemon"].sort();
+const WINDOWS_COMPONENTS = ["kin-daemon.exe", "kin.exe"].sort();
 const MACOS_FILES = [...MACOS_COMPONENTS, ...DOC_FILES].sort();
 const LINUX_FILES = [...LINUX_COMPONENTS, ...DOC_FILES].sort();
 const WINDOWS_FILES = [...WINDOWS_COMPONENTS, ...DOC_FILES].sort();
@@ -128,11 +121,30 @@ test("a macOS target carries the bundle and no other target does", () => {
   assert.throws(() => targetCarriesNotifierBundle(""), /requires a target triple/);
 });
 
-test("the released macOS archive listing is accepted whole", () => {
+test("the supported macOS archive listing is accepted whole", () => {
   assertReleaseArchiveMemberPaths(MACOS_LISTING, {
     artifact: MACOS_ARTIFACT,
     target: MACOS_TARGET,
   });
+});
+
+test("deprecated VFS binaries and shims are refused on every platform", () => {
+  const cases = [
+    [MACOS_LISTING, MACOS_ARTIFACT, MACOS_TARGET, "kin-vfs"],
+    [MACOS_LISTING, MACOS_ARTIFACT, MACOS_TARGET, "libkin_vfs_shim.dylib"],
+    [LINUX_LISTING, LINUX_ARTIFACT, LINUX_TARGET, "kin-vfs"],
+    [LINUX_LISTING, LINUX_ARTIFACT, LINUX_TARGET, "libkin_vfs_shim.so"],
+    [WINDOWS_LISTING, WINDOWS_ARTIFACT, WINDOWS_TARGET, "kin-vfs.exe"],
+    [WINDOWS_LISTING, WINDOWS_ARTIFACT, WINDOWS_TARGET, "kin_vfs_shim.dll"],
+  ];
+  for (const [listing, artifact, target, retired] of cases) {
+    const member = target.includes("-windows-") ? retired : `${artifact}/${retired}`;
+    assert.throws(
+      () => assertReleaseArchiveMemberPaths([...listing, member], { artifact, target }),
+      /declares unexpected file/,
+      `${target} archive admitted retired ${retired}`
+    );
+  }
 });
 
 test("prefixed Unix and unprefixed Windows listings are both accepted", () => {
