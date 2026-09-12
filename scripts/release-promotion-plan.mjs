@@ -276,6 +276,12 @@ export async function buildPlan({
   api,
   judge,
   alarmTitle = ALARM_TITLE,
+  // The alarm issue lives on firelock-ai/kin-infra, not beside the releases it
+  // reports on, so the open-issue lookup goes through a client bound to that
+  // repository and its own token. Defaulting to `api` keeps a caller that
+  // passes one client reading the alarm where the releases are, which is what
+  // every fixture in the test file does.
+  alarmApi = api,
   now = Date.now(),
   log = () => {},
 }) {
@@ -314,7 +320,7 @@ export async function buildPlan({
     judgements.push(judgement);
   }
 
-  const issues = await api('/issues?state=open&per_page=100&labels=release-proof');
+  const issues = await alarmApi('/issues?state=open&per_page=100&labels=release-proof');
   const openIssue =
     (Array.isArray(issues) ? issues : []).find((issue) => issue?.title === alarmTitle) ?? null;
   const plan = planPromotion(judgements, { now, openIssue });
@@ -346,6 +352,12 @@ function githubApi(repository, token, fetchImpl = fetch) {
 export async function main({
   repository = process.env.GITHUB_REPOSITORY,
   token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN,
+  // Where the alarm issue lives and the credential that can read it there.
+  // Both or neither: an alarm repository read with the release token would
+  // 404 on a private repository and the sweep would open a duplicate alarm
+  // every tick, so half a configuration is refused rather than half-applied.
+  alarmRepository = process.env.KIN_ALARM_REPO,
+  alarmToken = process.env.KIN_ALARM_TOKEN,
   out = process.env.KIN_PROMOTION_PLAN,
   fetchImpl = fetch,
   log = (line) => process.stderr.write(`${line}\n`),
@@ -353,11 +365,16 @@ export async function main({
   if (!out) {
     throw new Error('no plan path given; set KIN_PROMOTION_PLAN');
   }
+  if (Boolean(alarmRepository) !== Boolean(alarmToken)) {
+    throw new Error('KIN_ALARM_REPO and KIN_ALARM_TOKEN must be set together or not at all');
+  }
   const api = githubApi(repository, token, fetchImpl);
+  const alarmApi = alarmRepository ? githubApi(alarmRepository, alarmToken, fetchImpl) : api;
   const { main: judgeCandidate } = await import('./check-release-proof-artifacts.mjs');
   const plan = await buildPlan({
     repository,
     api,
+    alarmApi,
     judge: (sha) =>
       judgeCandidate({
         sha,

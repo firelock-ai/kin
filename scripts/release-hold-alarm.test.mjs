@@ -323,12 +323,26 @@ test('the workflow opens and updates crash alarms with a loud accurate diagnosti
       const result = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: {
         ...process.env, work: root, decision: filename, action: decision.action, reason: decision.reason,
         REPO: 'firelock-ai/kin', title: ALARM_TITLE,
+        // The alarm lives on kin-infra under this repository's label, and the
+        // workflow reaches it through a token minted for that alone. The arm
+        // must file there, never back on REPO.
+        ALARM_REPO: 'firelock-ai/kin-infra', ALARM_LABEL: 'kin',
       } });
       assert.equal(result.status, 1, result.stdout + result.stderr);
       assert.equal(result.stderr, '');
       assert.match(result.stdout, /::error::Release rail.*reconcile_failed/);
       assert.doesNotMatch(result.stdout, /consecutive cycles|blocking tag|two ways out/);
-      assert.match(fs.readFileSync(path.join(root, 'gh-calls'), 'utf8'), issue ? /issue edit 4242/ : /issue create/);
+      const calls = fs.readFileSync(path.join(root, 'gh-calls'), 'utf8');
+      assert.match(
+        calls,
+        issue
+          ? /issue edit 4242 --repo firelock-ai\/kin-infra --body-file/
+          : /issue create --repo firelock-ai\/kin-infra --title .* --label kin --body-file/,
+      );
+      // A create or edit routed back to the source repository is the public
+      // alarm this change exists to end; kin-infra's name starts with kin's,
+      // so the boundary after the name is what tells the two apart.
+      assert.doesNotMatch(calls, /--repo firelock-ai\/kin(\s|$)/m);
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

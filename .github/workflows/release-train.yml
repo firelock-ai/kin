@@ -878,9 +878,15 @@ jobs:
     # and hide the distinction. The alarm would have read as working and been
     # structurally unable to fire.
     if: always() && needs.reconcile.result != 'skipped'
+    # The release App credentials resolve only inside this Environment, which
+    # admits main alone; every trigger on this file runs from main.
+    environment: release-tag
     permissions:
       # Reading prior cycles' markers, and nothing else, needs actions:read.
-      # Nothing in this job writes to a branch, a tag, or a pull request.
+      # Nothing in this job writes to a branch, a tag, or a pull request. The
+      # alarm lands on firelock-ai/kin-infra through the App token minted
+      # below rather than through this token, which cannot reach another
+      # repository.
       actions: read
       contents: read
       issues: write
@@ -897,6 +903,20 @@ jobs:
         with:
           sparse-checkout: scripts
           persist-credentials: false
+
+      # issues: write on this repository and kin-infra and nothing else. A mint
+      # that fails fails this job loudly, which is the alarm's own shape.
+      - name: Mint the alarm token, issues only, this repository and kin-infra
+        id: alarm-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            kin-infra
+          permission-issues: write
 
       - name: Gather this cycle and the cycles before it
         id: history
@@ -973,20 +993,30 @@ jobs:
 
       - name: Decide whether the rail is quietly held, and say so if it is
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
           REPO: ${{ github.repository }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
           MARKERS: ${{ steps.history.outputs.markers }}
           THRESHOLD: "4"
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/release-hold-history"
 
+          # The label names this repository on kin-infra, which collects every
+          # repository's alarms. Created before it is read, and --force keeps
+          # that idempotent, so a missing label can never fail the create.
+          gh label create "$ALARM_LABEL" --repo "$ALARM_REPO" --force \
+            --color 5319E7 \
+            --description "Alarms raised by ${REPO}'s workflows"
+
           # The one title the alarm ever carries. GitHub's title search is fuzzy,
           # so the exact-title filter after it is what keeps this idempotent: a
           # fuzzy hit on a differently titled issue would edit the wrong one.
           title="Release rail is held with releasable drift"
           existing="$(gh issue list \
-            --repo "$REPO" \
+            --repo "$ALARM_REPO" \
+            --label "$ALARM_LABEL" \
             --state open \
             --search "\"$title\" in:title" \
             --json number,title \
@@ -1035,7 +1065,8 @@ jobs:
             open)
               body="$work/body.md"
               jq -er .body "$decision" > "$body"
-              gh issue create --repo "$REPO" --title "$title" --body-file "$body" >/dev/null
+              gh issue create --repo "$ALARM_REPO" --title "$title" \
+                --label "$ALARM_LABEL" --body-file "$body" >/dev/null
               echo "::error::Release rail requires attention (${reason}). Opened the tracking issue with the observed failure or hold and its recovery path."
               exit 1
               ;;
@@ -1043,7 +1074,7 @@ jobs:
               body="$work/body.md"
               jq -er .body "$decision" > "$body"
               number="$(jq -er .issue "$decision")"
-              gh issue edit "$number" --repo "$REPO" --body-file "$body" >/dev/null
+              gh issue edit "$number" --repo "$ALARM_REPO" --body-file "$body" >/dev/null
               echo "::error::Release rail still requires attention (${reason}); issue #${number} carries the current failure or hold."
               exit 1
               ;;
@@ -1051,8 +1082,8 @@ jobs:
               number="$(jq -er .issue "$decision")"
               comment="$work/comment.md"
               jq -er .comment "$decision" > "$comment"
-              gh issue comment "$number" --repo "$REPO" --body-file "$comment" >/dev/null
-              gh issue close "$number" --repo "$REPO" >/dev/null
+              gh issue comment "$number" --repo "$ALARM_REPO" --body-file "$comment" >/dev/null
+              gh issue close "$number" --repo "$ALARM_REPO" >/dev/null
               echo "Closed rail-hold issue #${number}: the train is minting again."
               ;;
             *)

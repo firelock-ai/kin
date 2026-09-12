@@ -443,6 +443,99 @@ test('buildPlan finds the open alarm by its exact title and nothing else', async
   assert.equal(other.alarm, 'open');
 });
 
+// The alarm issue lives on firelock-ai/kin-infra, not beside the releases. The
+// open-issue lookup has to go through the client bound to that repository, or
+// the sweep reads the wrong repository's issues, finds nothing every tick, and
+// opens a fresh alarm each time. The release client here answers the issue
+// lookup with an exact-title match that must NOT be adopted; only the alarm
+// client's answer counts.
+test('buildPlan reads the open alarm through the alarm client, never the release client', async () => {
+  const releaseReads = [];
+  const alarmReads = [];
+  const record = (log, answers) => async (path) => {
+    log.push(path);
+    return stubApi(answers)(path);
+  };
+  const plan = await buildPlan({
+    repository: 'firelock-ai/kin',
+    api: record(releaseReads, {
+      ...listing({ published_at: ago(DEFAULT_ALARM_AFTER_MINUTES + 1) }),
+      '/issues?': [{ number: 99, title: ALARM_TITLE }],
+    }),
+    alarmApi: record(alarmReads, { '/issues?': [{ number: 12, title: ALARM_TITLE }] }),
+    judge: async () => {
+      throw new Error('pending');
+    },
+    now: NOW,
+  });
+  assert.equal(plan.openIssue, 12);
+  assert.equal(plan.alarm, 'update');
+  assert.ok(alarmReads.some((path) => path.startsWith('/issues?')), 'the alarm client was never asked');
+  assert.ok(
+    !releaseReads.some((path) => path.startsWith('/issues?')),
+    'the release client must not be asked for issues once an alarm client exists',
+  );
+});
+
+test('main refuses half an alarm configuration rather than half-applying it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-promoter-'));
+  const out = path.join(dir, 'plan.json');
+  for (const half of [{ alarmRepository: 'firelock-ai/kin-infra' }, { alarmToken: 'app' }]) {
+    await assert.rejects(
+      main({ repository: 'firelock-ai/kin', token: 'x', out, log: () => {}, ...half }),
+      /KIN_ALARM_REPO and KIN_ALARM_TOKEN must be set together/,
+    );
+  }
+});
+
+// The wiring main() does with both halves set: the issue lookup goes to the
+// alarm repository with the alarm token as its bearer, and the release reads
+// keep the release token. Read off the URLs and headers the fetch actually
+// received, because that is the only place the two clients differ.
+test('main binds the alarm lookup to the alarm repository and token', async () => {
+  const previous = process.env.KIN_RELEASE_REQUIRE;
+  process.env.KIN_RELEASE_REQUIRE = 'preflight';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-promoter-'));
+  const out = path.join(dir, 'plan.json');
+  const sha = 'a'.repeat(40);
+  const requests = [];
+  try {
+    await main({
+      repository: 'firelock-ai/kin',
+      token: 'release-token',
+      alarmRepository: 'firelock-ai/kin-infra',
+      alarmToken: 'alarm-token',
+      out,
+      log: () => {},
+      fetchImpl: async (url, init = {}) => {
+        requests.push({ url, authorization: init.headers?.authorization });
+        const answer = (body) => ({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: async () => body,
+          text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+        });
+        if (url.includes('/releases?')) return answer([release()]);
+        if (url.includes('/git/ref/tags/')) return answer({ object: { type: 'commit', sha } });
+        if (url.includes('/issues?')) return answer([]);
+        return { ok: false, status: 404, statusText: 'Not Found', text: async () => '' };
+      },
+    });
+  } finally {
+    if (previous === undefined) delete process.env.KIN_RELEASE_REQUIRE;
+    else process.env.KIN_RELEASE_REQUIRE = previous;
+  }
+  const issueReads = requests.filter((entry) => entry.url.includes('/issues?'));
+  assert.equal(issueReads.length, 1);
+  assert.match(issueReads[0].url, /^https:\/\/api\.github\.com\/repos\/firelock-ai\/kin-infra\/issues\?/);
+  assert.equal(issueReads[0].authorization, 'Bearer alarm-token');
+  const releaseReads = requests.filter((entry) => entry.url.includes('/releases?'));
+  assert.ok(releaseReads.length >= 1);
+  assert.match(releaseReads[0].url, /^https:\/\/api\.github\.com\/repos\/firelock-ai\/kin\/releases\?/);
+  assert.equal(releaseReads[0].authorization, 'Bearer release-token');
+});
+
 test('buildPlan refuses without a repository', async () => {
   await assert.rejects(
     buildPlan({ api: stubApi({}), judge: async () => ({}) }),
