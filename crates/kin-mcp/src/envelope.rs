@@ -44,7 +44,8 @@ use crate::types::{ContentBlock, ToolCallResult};
 /// Version 2 carries codes and fields only. The sentences version 1 repeated on
 /// every response are gone: the verdict and completeness notes, the durability,
 /// behind and coverage notes, the watcher-loss disclosure, the entity-count
-/// scope and the hydration remedy. `_kin.verdict.limiting_factor` is the clause
+/// scope and the hydration remedy. Specific diagnostic causes remain as fields.
+/// `_kin.verdict.limiting_factor` is the clause
 /// codes joined by `"; "`, every code is one of [`crate::verdict::CLAUSE_CODES`],
 /// and a tool that changes state carries [`Envelope::for_state_change`]. What
 /// each code means is written once, in `docs/mcp-tools.md`.
@@ -1481,6 +1482,13 @@ pub struct WatcherLossObservation {
     /// Wall-clock time of the newest loss, RFC 3339, when the record named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    /// The backend's cause for a recorded loss, when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Why the durable loss record could not be read. Its presence means the
+    /// counters are unknown, not evidence that every loss was recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
 }
 
 impl WatcherLossObservation {
@@ -1502,19 +1510,28 @@ impl WatcherLossObservation {
             .get("recovered_through")
             .and_then(Value::as_u64)
             .unwrap_or_default();
+        let read_error = loss
+            .get("read_error")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         // The producer already omits the block on a store that owes no
         // recovery, so this is not the only gate. It is what makes the two
         // sides agree by construction rather than by convention: a reader keyed
         // on the block's mere presence would refuse forever the day any
         // producer published a settled record, and nothing in this crate would
         // notice.
-        if generation <= recovered_through {
+        if generation <= recovered_through && read_error.is_none() {
             return None;
         }
         Some(Self {
             generation,
             recovered_through,
             at: loss.get("at").and_then(Value::as_str).map(str::to_string),
+            reason: loss
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            read_error,
         })
     }
 
@@ -1524,6 +1541,12 @@ impl WatcherLossObservation {
     /// it, because a reader told only that an answer is inconclusive has nothing
     /// to do about it.
     pub fn limiting_factor(&self) -> String {
+        if self.read_error.is_some() {
+            return "watcher_loss_unreadable: the durable watcher-loss record could not be read, \
+                    so whether any lost events remain unrecovered is unknown; run `kin admit` \
+                    to admit the complete exact tree and rewrite the record"
+                .to_string();
+        }
         let at = match self.at.as_deref() {
             Some(at) => format!(", most recently {at}"),
             None => String::new(),
@@ -1821,8 +1844,8 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
 /// What this store's creation-time replay record says.
 ///
 /// The safe action for each standing is a fixed mapping written once, in
-/// `docs/mcp-tools.md`, and `kin doctor` names the read failure behind an
-/// `unreadable` record; neither rides the envelope.
+/// `docs/mcp-tools.md`. An `unreadable` record retains its specific read failure
+/// as data; the fixed recovery advice does not ride the envelope.
 ///
 /// A boolean was the whole defect. `Behind`, `Ahead`, `Unstamped` and
 /// `Unreadable` need four different actions and only one of them is safe to
@@ -1850,6 +1873,9 @@ pub struct HydrationSemanticsObservation {
     /// and could be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_under: Option<u32>,
+    /// The concrete read failure for an unreadable record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemanticsObservation {
@@ -1861,8 +1887,8 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
         use kin_core::hydration_semantics::HydrationStanding as Standing;
         // One arm per variant, so a new standing has to be projected here
         // rather than silently inheriting whichever default it fell through to.
-        let (created_under, derives) = match standing {
-            Standing::Current { version } => (Some(*version), *version),
+        let (created_under, derives, reason) = match standing {
+            Standing::Current { version } => (Some(*version), *version, None),
             Standing::Behind {
                 created_under,
                 derives,
@@ -1870,14 +1896,15 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
             | Standing::Ahead {
                 created_under,
                 derives,
-            } => (Some(*created_under), *derives),
-            Standing::Unstamped { derives } => (None, *derives),
-            Standing::Unreadable { derives, .. } => (None, *derives),
+            } => (Some(*created_under), *derives, None),
+            Standing::Unstamped { derives } => (None, *derives, None),
+            Standing::Unreadable { derives, reason } => (None, *derives, Some(reason.clone())),
         };
         Self {
             standing: standing.label().to_string(),
             derives,
             created_under,
+            reason,
         }
     }
 }
@@ -6572,11 +6599,10 @@ mod tests {
         .expect("the envelope serializes");
         assert_eq!(gap["hydration_semantics"]["standing"], "unreadable");
         assert_eq!(gap["hydration_semantics"]["derives"], 10);
+        assert_eq!(gap["hydration_semantics"]["reason"], "truncated");
         assert!(
-            gap["hydration_semantics"].get("reason").is_none()
-                && gap["hydration_semantics"].get("remedy").is_none(),
-            "the read failure and the safe action are `kin doctor`'s to name; the envelope \
-             carries the standing: {gap}"
+            gap["hydration_semantics"].get("remedy").is_none(),
+            "the actual read failure survives without repeated recovery advice: {gap}"
         );
         assert!(
             gap["hydration_semantics"].get("created_under").is_none(),
@@ -6592,6 +6618,7 @@ mod tests {
         .expect("the envelope serializes");
         assert_eq!(current["hydration_semantics"]["standing"], "current");
         assert_eq!(current["hydration_semantics"]["created_under"], 10);
+        assert!(current["hydration_semantics"].get("reason").is_none());
         assert!(
             current["hydration_semantics"].get("remedy").is_none(),
             "no standing publishes advice on the wire, a current store least of all: {current}"

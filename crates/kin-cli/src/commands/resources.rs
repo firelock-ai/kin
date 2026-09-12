@@ -570,6 +570,16 @@ pub struct WatcherLossState {
     /// record could not be read, which is itself a reported state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    /// The watcher backend's own cause for a recorded loss, when it supplied
+    /// one. This is structured so machine clients do not have to parse the
+    /// human disclosure below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Why the durable watcher-loss record could not be read. When present,
+    /// the generation and recovery counters are floor values rather than an
+    /// observed healthy state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
     /// The whole disclosure, verbatim, so one producer states this on every
     /// surface rather than three renderers composing three sentences.
     pub disclosure: String,

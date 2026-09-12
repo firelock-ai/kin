@@ -29,6 +29,10 @@ const NOT_CLAUSES: &[(&str, &str)] = &[
     ),
     ("phase", "startup_binding.rs: a startup progress label"),
     (
+        "scope",
+        "handlers/review.rs: a replacement parameter example in path-anchor deprecations",
+    ),
+    (
         "spine_unavailable",
         "handlers/review.rs: the cross_repo_impact_status payload field",
     ),

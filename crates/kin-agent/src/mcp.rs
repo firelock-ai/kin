@@ -98,12 +98,8 @@ impl ToolOutcome {
 
     /// The named reason an absence cannot be trusted, when the server named one.
     ///
-    /// Read from the two fields Kin sends: `_kin.verdict.limiting_factor`, the
-    /// one verdict's codes, and `negative.trust_reason`, the absence gate's own
-    /// reason. Nothing else is consulted. A key the server never sends is a
-    /// reader that always answers "unnamed": this read `negative.limiting_factor`
-    /// while every real response carried `trust_reason`, so the model was told
-    /// on every untrusted absence that Kin had not named the factor.
+    /// Prefer `_kin.verdict.limiting_factor`, the combined verdict's codes,
+    /// and fall back to `negative.trust_reason`, the absence gate's own reason.
     pub fn limiting_factor(&self) -> Option<String> {
         let from_verdict = self
             .envelope

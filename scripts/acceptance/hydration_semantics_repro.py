@@ -318,17 +318,16 @@ def envelope_problems(payload, standing, created_under=None, derives=None):
             "created_under is %r, wanted %r"
             % (observation.get("created_under"), created_under)
         )
-    # Envelope v2 sends the standing as the code and no sentence beside it. The
-    # safe action per standing is written once in docs/mcp-tools.md, and
-    # `kin graph status` and `kin doctor` still print it, graded above by exact
-    # equality against CANONICAL_REMEDY. Advice or a read failure back on the MCP
-    # observation is the v1 shape returning.
-    for key in ("reason", "remedy"):
-        if key in observation:
-            problems.append(
-                "the MCP observation carries %s %r; envelope v2 sends the standing only"
-                % (key, observation[key])
-            )
+    # Fixed recovery advice lives in docs and the human CLI. A concrete record
+    # read failure remains data and must survive the compact envelope.
+    if standing == "unreadable":
+        reason = observation.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            problems.append("an unreadable MCP record carries no concrete read failure")
+    elif "reason" in observation:
+        problems.append("a readable MCP record carries an unexpected read failure")
+    if "remedy" in observation:
+        problems.append("the MCP observation carries repeated recovery advice")
     return problems
 
 
@@ -1608,6 +1607,8 @@ def self_test():
 
     def envelope_payload(standing, created_under=None, derives=10, **overrides):
         observation = {"standing": WIRE_STANDING[standing], "derives": derives}
+        if standing == "unreadable":
+            observation["reason"] = "truncated"
         if created_under is not None:
             observation["created_under"] = created_under
         observation.update(overrides)
@@ -1659,7 +1660,13 @@ def self_test():
     rejects("envelope unstamped with a fabricated version", envelope_problems(fabricated, "absent", None, 10))
 
     reasoned = envelope_payload("unreadable", reason="schema kin.hydration-semantics.v2 is not v1")
-    rejects("envelope unreadable carrying a read failure on MCP", envelope_problems(reasoned, "unreadable", None, 10))
+    expect("envelope unreadable retains its specific read failure", envelope_problems(reasoned, "unreadable", None, 10), [])
+    for reason in (None, "", 42):
+        missing_reason = envelope_payload("unreadable", reason=reason)
+        rejects("envelope unreadable without a usable read failure", envelope_problems(missing_reason, "unreadable", None, 10))
+    missing_reason = envelope_payload("unreadable")
+    del missing_reason["_kin"][OBSERVATION]["reason"]
+    rejects("envelope unreadable missing its read failure", envelope_problems(missing_reason, "unreadable", None, 10))
 
     # One field each, for the same reason the verdict arms below carry
     # single-field inputs: the two mutants above move the version AND the advice,

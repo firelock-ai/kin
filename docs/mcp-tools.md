@@ -49,14 +49,16 @@ The envelope's fields:
   `no_admission_recorded`), or `stale` when a status sample replays an earlier
   observation.
 - `watcher_loss`: present when the filesystem watcher lost events no admission has
-  covered; `kin admit` on the repository clears it.
+  covered or its durable loss record is unreadable. `reason` retains the backend's
+  cause; `read_error` retains a record read failure, whose counters are unknown.
+  `kin admit` on the repository clears the gap after a complete admission.
 - `hydration_semantics`: the store's replay-semantics `standing`. For `behind`, re-ingest
   the repository with `kin init` into a fresh store recorded under this build's replay
   semantics. For `ahead`, upgrade this Kin build to at least the one that created the
   store, rather than re-ingesting with the older replay version. For `unstamped` or
   `unreadable`, upgrade Kin to the newest build first, because a record this build cannot
-  read can belong to a store a newer build created; `kin doctor` names why an
-  `unreadable` record could not be read.
+  read can belong to a store a newer build created. An `unreadable` record keeps
+  its concrete read failure in `reason`, also shown by `kin doctor`.
 - `degraded`: honest flags (`daemon_unreachable`, `no_repository`, `embed_worker_failed`,
   `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`,
   `daemon_killed_by_memory`, `sweep_suspended`, `memory_pressure`), each present only
@@ -186,6 +188,7 @@ in `negative.trust_reason`. The list is closed: a code not in it is never sent, 
 | `walk_bounded` | The walk stopped at a work bound before its frontier emptied, so a route may exist beyond what was explored. |
 | `walk_depth_bounded` | The walk stopped at max_depth before its frontier emptied; raise max_depth. |
 | `watcher_events_lost` | The filesystem watcher lost events no admission has covered; `kin admit` clears it. |
+| `watcher_loss_unreadable` | The durable watcher-loss record could not be read, so recovery is unknown; `kin admit` rewrites it after a complete admission. |
 | `withheld_candidates` | Same-name candidates are held out of the counts and carried in `candidates`. |
 | `working_copy_unmeasured` | Nothing has measured the working copy, so whether graph truth is level with it is unknown. |
 <!-- clause-codes:end -->

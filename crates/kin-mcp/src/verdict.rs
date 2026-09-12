@@ -374,6 +374,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "The filesystem watcher lost events no admission has covered; `kin admit` clears it.",
     },
     ClauseCode {
+        code: "watcher_loss_unreadable",
+        meaning: "The durable watcher-loss record could not be read, so recovery is unknown; `kin admit` rewrites it after a complete admission.",
+    },
+    ClauseCode {
         code: "withheld_candidates",
         meaning: "Same-name candidates are held out of the counts and carried in `candidates`.",
     },
@@ -1685,6 +1689,7 @@ mod tests {
                 "generation": 2,
                 "recovered_through": 0,
                 "at": "2026-09-09T06:00:00Z",
+                "reason": "rescan: kernel dropped",
                 "disclosure": "the filesystem watcher lost events (loss generation 2, recovered \
                                through 0)",
             })
@@ -1727,6 +1732,10 @@ mod tests {
                 .expect("a standing loss is read off the wire");
             assert_eq!(observed.generation, 2);
             assert_eq!(observed.recovered_through, 0);
+            assert_eq!(
+                serde_json::to_value(observed).unwrap()["reason"],
+                "rescan: kernel dropped"
+            );
 
             let verdict = Verdict::compute(
                 "find_references",
@@ -1763,6 +1772,36 @@ mod tests {
                 }),
                 "and the one command that clears it by the code's written meaning"
             );
+        }
+
+        #[test]
+        fn an_unreadable_loss_record_keeps_its_error_and_refuses_certification() {
+            let envelope = envelope_with(Some(json!({
+                "generation": 0,
+                "recovered_through": 0,
+                "read_error": "invalid watcher-loss schema",
+            })));
+            assert!(envelope.watcher_loss.is_some());
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("an unreadable loss record needs a verdict")
+            .to_value();
+            assert_eq!(verdict["state"], INCONCLUSIVE);
+            assert!(verdict["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .split(CLAUSE_SEPARATOR)
+                .any(|code| code == "watcher_loss_unreadable"));
+            let written = serde_json::to_value(envelope.for_state_change()).unwrap();
+            assert_eq!(
+                written["watcher_loss"]["read_error"],
+                "invalid watcher-loss schema"
+            );
+            assert!(written["watcher_loss"].get("reason").is_none());
         }
 
         /// The bound on all of it. A record a completed full admission covered

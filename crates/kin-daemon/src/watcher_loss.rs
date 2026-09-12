@@ -328,20 +328,25 @@ pub fn standing(
     let read_back = read(layout);
     let disclosure = read_back.describe(working_dir)?;
     // An unreadable record names no generation, and zero is what a healthy store
-    // reports. The disclosure above carries what is actually known, so the
-    // numbers stay at their floor rather than inventing a reading.
-    let (generation, recovered_through, at) = match &read_back {
+    // reports. Keep those counters at their floor, and publish the read failure
+    // separately so a machine reader cannot mistake them for an all-clear.
+    let (generation, recovered_through, at, reason, read_error) = match &read_back {
         WatcherLossRead::Recorded(recorded) => (
             recorded.generation,
             recorded.recovered_through,
             Some(recorded.at.to_rfc3339()),
+            recorded.reason.clone(),
+            None,
         ),
-        WatcherLossRead::Absent | WatcherLossRead::Unreadable(_) => (0, 0, None),
+        WatcherLossRead::Unreadable(error) => (0, 0, None, None, Some(error.clone())),
+        WatcherLossRead::Absent => (0, 0, None, None, None),
     };
     Some(kin_cli::commands::resources::WatcherLossState {
         generation,
         recovered_through,
         at,
+        reason,
+        read_error,
         disclosure,
     })
 }
@@ -425,6 +430,12 @@ mod tests {
             disclosure.contains("generation 1"),
             "the disclosure carries the generation: {disclosure}"
         );
+        let surface = standing(&layout, dir.path()).expect("a standing loss reaches health");
+        assert_eq!(surface.generation, 1);
+        assert_eq!(surface.recovered_through, 0);
+        assert_eq!(surface.reason.as_deref(), Some("rescan: kernel dropped"));
+        assert_eq!(surface.read_error, None);
+        assert_eq!(surface.disclosure, disclosure);
     }
 
     /// The generation advances rather than being assigned, so a watcher whose
@@ -525,10 +536,18 @@ mod tests {
         std::fs::write(record_path(&layout), b"{ truncated").unwrap();
 
         let read_back = read(&layout);
-        assert!(matches!(read_back, WatcherLossRead::Unreadable(_)));
+        let error = match &read_back {
+            WatcherLossRead::Unreadable(error) => error.clone(),
+            other => panic!("expected an unreadable record, got {other:?}"),
+        };
         assert!(read_back.recovery_required());
         assert!(read_back.describe(dir.path()).is_some());
         assert_eq!(capture(&layout), RecoveryCapture::Unreadable);
+        let surface = standing(&layout, dir.path()).expect("an unreadable record reaches health");
+        assert_eq!(surface.generation, 0);
+        assert_eq!(surface.recovered_through, 0);
+        assert_eq!(surface.reason, None);
+        assert_eq!(surface.read_error.as_deref(), Some(error.as_str()));
 
         record_recovery(&layout, RecoveryCapture::Unreadable);
         assert!(
