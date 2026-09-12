@@ -622,13 +622,25 @@ jobs:
               version: block.match(/^version = "([^"]+)"/m)?.[1],
               source: block.match(/^source = "([^"]+)"/m)?.[1] ?? null,
             }));
+          // Kin's side is the kin-vfs-core Kin BUILDS WITH, wherever it comes from. It
+          // used to come only from the registry; since the crate moved into
+          // crates/kin-vfs-core it has no `source` line at all, the shape a workspace
+          // member has in any lock. Both are accepted, and the question is unchanged:
+          // the shipped kin-vfs binaries are built from the pinned kin-vfs checkout, and
+          // if that checkout builds a different kin-vfs-core than Kin does, the release
+          // is wrong. The pinned side keeps the strict `source === null` rule, because
+          // that lock is the kin-vfs repository's own and its member entry is the one
+          // being compared. scripts/check-kin-vfs-compat.mjs is the pull-request
+          // counterpart and carries the same rule with its own tests.
           const kinVfsCore = lockPackages(path.join(process.cwd(), "Cargo.lock"))
-            .filter((pkg) => pkg.name === "kin-vfs-core" && pkg.source?.startsWith("sparse+"));
+            .filter((pkg) => pkg.name === "kin-vfs-core"
+              && (pkg.source === null || pkg.source.startsWith("sparse+")));
           const pinnedVfsCore = lockPackages(path.join(process.cwd(), "kin-vfs", "Cargo.lock"))
             .filter((pkg) => pkg.name === "kin-vfs-core" && pkg.source === null);
           if (kinVfsCore.length !== 1 || pinnedVfsCore.length !== 1) {
             throw new Error(
-              `expected one registry Kin kin-vfs-core and one pinned local kin-vfs-core; ` +
+              `expected one Kin kin-vfs-core, from the registry or from this workspace, ` +
+              `and one pinned local kin-vfs-core; ` +
               `found ${kinVfsCore.length} and ${pinnedVfsCore.length}`
             );
           }
