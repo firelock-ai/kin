@@ -68,7 +68,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
                 name: format!("entity_{i}"),
                 language: LanguageId::Rust,
                 fingerprint: test_fingerprint(),
-                file_origin: Some(FilePathId::new(&format!("src/mod_{}.rs", i / 100))),
+                file_origin: Some(FilePathId::new(format!("src/mod_{}.rs", i / 100))),
                 span: None,
                 signature: format!("fn entity_{i}()"),
                 visibility: Visibility::Public,
