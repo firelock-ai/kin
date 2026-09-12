@@ -809,6 +809,13 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/advisory-sweep.yml": {
         "sweep": "Sweep advisories",
     },
+    # The typed-dispatch proof that the alarm credential can open and close an
+    # issue on kin-infra. It publishes no required context and runs on no
+    # pull-request or merge-group event; registered so its job NAME cannot
+    # appear unreviewed.
+    ".github/workflows/alarm-dry-run.yml": {
+        "dry-run": "Open and close one alarm on kin-infra",
+    },
     ".github/workflows/approve-to-merge.yml": {
         "gate": None,
     },
@@ -8462,16 +8469,32 @@ def write_recovery_gh_stub(binaries: Path) -> None:
                       printf '%s\n' "$body"
                     fi
                     ;;
+                  label)
+                    # The alert creates its source-repository label on the
+                    # alarm repository before the issue that carries it.
+                    shift
+                    if [ "$1" = create ]; then
+                      printf '%s' "$2" > "$FIXTURE/label-created"
+                    fi
+                    exit 0
+                    ;;
                   issue)
                     shift
                     case "$1" in
                       list) exit 0 ;;
                       create)
                         shift
+                        # The token the create authenticated with is the one
+                        # fact that separates an alarm filed through the
+                        # release App from one that fell back to the workflow
+                        # token, so it is recorded beside the arguments.
+                        printf '%s' "${GH_TOKEN:-}" > "$FIXTURE/issue-token"
                         while [ $# -gt 0 ]; do
                           case "$1" in
                             --title) shift; printf '%s' "$1" > "$FIXTURE/issue-title" ;;
                             --body-file) shift; cp "$1" "$FIXTURE/issue-body" ;;
+                            --repo) shift; printf '%s' "$1" > "$FIXTURE/issue-repo" ;;
+                            --label) shift; printf '%s' "$1" > "$FIXTURE/issue-label" ;;
                           esac
                           shift
                         done
@@ -8555,6 +8578,13 @@ def execute_recovery_escalation(
                 "UNKNOWN": classifier_outputs.get("unknown", ""),
                 "REPEATED": classifier_outputs.get("repeated", ""),
                 "DISTINCT": classifier_outputs.get("distinct", ""),
+                # The alarm lives on kin-infra and is filed through the App
+                # token the job minted for it, never through the workflow
+                # token above. Distinct fixture values, so the recorded create
+                # can only match by using each for what it is for.
+                "ALARM_TOKEN": RECOVERY_ALARM_FIXTURE_TOKEN,
+                "ALARM_REPO": RECOVERY_ALARM_FIXTURE_REPO,
+                "ALARM_LABEL": RECOVERY_ALARM_FIXTURE_LABEL,
             }
         )
         completed = subprocess.run(
@@ -8567,7 +8597,41 @@ def execute_recovery_escalation(
         )
         body_path = root / "issue-body"
         body = body_path.read_text(encoding="utf-8") if body_path.exists() else ""
+        if body_path.exists():
+            assert_recovery_alert_filed_on_alarm_repository(root)
         return completed, body
+
+
+RECOVERY_ALARM_FIXTURE_TOKEN = "alarm-fixture-token"
+RECOVERY_ALARM_FIXTURE_REPO = "firelock-ai/kin-infra"
+RECOVERY_ALARM_FIXTURE_LABEL = "kin"
+
+
+def assert_recovery_alert_filed_on_alarm_repository(root: Path) -> None:
+    """Every alert the recovery controller files lands on kin-infra, labelled
+    with the source repository, through the alarm token and no other.
+
+    Read off what the stub recorded rather than off the workflow text, so a
+    create that quietly went back to `--repo "$REPO"` or to the workflow token
+    fails here even when every string the text checks pin is still present.
+    """
+
+    recorded = {
+        name: (root / name).read_text(encoding="utf-8") if (root / name).exists() else None
+        for name in ("issue-repo", "issue-label", "issue-token", "label-created")
+    }
+    expected = {
+        "issue-repo": RECOVERY_ALARM_FIXTURE_REPO,
+        "issue-label": RECOVERY_ALARM_FIXTURE_LABEL,
+        "issue-token": RECOVERY_ALARM_FIXTURE_TOKEN,
+        "label-created": RECOVERY_ALARM_FIXTURE_LABEL,
+    }
+    for name, want in expected.items():
+        if recorded[name] != want:
+            raise AssertionError(
+                "recovery alert was not filed on the alarm repository through the "
+                f"alarm token: {name} recorded {recorded[name]!r}, expected {want!r}"
+            )
 
 
 def assert_recovery_escalation_classifies(release_recovery: str) -> None:
@@ -14140,9 +14204,15 @@ def main() -> None:
             f"release workflow; release={sorted(vfs_refs)}, "
             f"install-proof={sorted(install_proof_vfs_expected)}"
         )
+    # The Kin-side filter moved when kin-vfs-core became a workspace member: a
+    # member carries no `source` line, so a registry-only filter finds zero and the
+    # gate throws in the release build job, after the tag exists. What is pinned here
+    # is the pair of shapes Kin's side must accept, not the old spelling of it, and
+    # the pinned side's strict rule is pinned separately below so loosening it still
+    # has to be a deliberate edit to this list.
     for policy in (
         "Verified Kin/kin-vfs release compatibility at kin-vfs-core",
-        'pkg.name === "kin-vfs-core" && pkg.source?.startsWith("sparse+")',
+        'pkg.source === null || pkg.source.startsWith("sparse+")',
         'pkg.name === "kin-vfs-core" && pkg.source === null',
         "update the immutable kin-vfs pin",
     ):

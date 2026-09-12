@@ -706,6 +706,35 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
         let unknown = classes_in_state(&required, states, "unknown");
         let present = classes_in_state(&requested, states, "present");
 
+        // `unproduced` carries two reasons and only one of them is a statement
+        // about the source, so the two take different sentences. A class this
+        // build mints for no language at all has no resolved site to blame, and
+        // telling a reader the linker dropped sites it resolved sends them
+        // hunting a linker bug that is not there.
+        let build_gap = |class: &str| -> bool {
+            coverage
+                .get("unproduced_evidence")
+                .and_then(Value::as_object)
+                .and_then(|evidence| evidence.get(class))
+                .and_then(|evidence| evidence.get("this_build_mints_no_entity_level_edge_for"))
+                .is_some()
+        };
+        let (unminted, unproduced): (Vec<&str>, Vec<&str>) =
+            unproduced.into_iter().partition(|class| build_gap(class));
+
+        if !unminted.is_empty() {
+            // The build, and not this graph either. The class is one this build
+            // mints for none of the languages in scope, decided from the linker
+            // before any scanning, so the absence says nothing about what the
+            // source contains and the sentence must not pretend otherwise.
+            let missing = unminted.join(", ");
+            gaps.push(format!(
+                "cross_file_edges_unproduced: this build mints no entity-level {missing} edge \
+                 for {language} at all, so no graph it builds holds one and a use that reaches \
+                 the target through {missing} could not have been found whatever the source \
+                 contains, and the gap is in this build, not in the code"
+            ));
+        }
         if !unproduced.is_empty() {
             // The build, not the code. The scan completed, saw no entity-rooted
             // edge of the class at all, and the parse side shows sites the

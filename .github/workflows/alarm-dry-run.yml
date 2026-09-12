@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Alarm Dry Run
+
+# Proves the cross-repository alarm credential end to end. It mints the same
+# issues-only release App token every alarm job in this repository mints,
+# opens one clearly marked issue on firelock-ai/kin-infra carrying this
+# repository's label, reads it back, closes it, and reads that back too. No
+# alarm job can be made to do that without a real failure to report.
+#
+# `repository_dispatch` rather than a branch-selectable dispatch, for the reason
+# advisory-sweep.yml gives: this job reaches the release App key, and the
+# authority guard refuses that key beside a dispatch that lets a branch pick
+# the workflow file it runs. The `release-tag` Environment admits main alone,
+# so this runs from main or not at all. Trigger it with:
+#
+#   gh api repos/firelock-ai/kin/dispatches -f event_type=alarm-dry-run
+#
+# A mint that fails because kin-infra is not among the installation's selected
+# repositories fails this run at the first step, which is the answer the dry run
+# exists to give; nothing here falls back to the workflow token, which cannot
+# reach another repository at all.
+on:
+  repository_dispatch:
+    types: [alarm-dry-run]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kin-alarm-dry-run
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    name: Open and close one alarm on kin-infra
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-tag
+    steps:
+      - name: Mint the alarm token, issues only, this repository and kin-infra
+        id: alarm-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            kin-infra
+          permission-issues: write
+
+      # Every assertion reads the issue back through the API rather than
+      # trusting the exit code of the write before it: a 200 from a create is
+      # not the same fact as an issue that is open and labelled.
+      - name: Open one alarm, read it back, close it, read that back
+        env:
+          GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
+          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_LABEL: ${{ github.event.repository.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ALARM_LABEL" --repo "$ALARM_REPO" --force \
+            --color 5319E7 \
+            --description "Alarms raised by ${GITHUB_REPOSITORY}'s workflows"
+          title="Alarm dry run from ${GITHUB_REPOSITORY}: safe to ignore"
+          body="This issue proves the cross-repository alarm credential from ${RUN_URL}. It closes itself in the same run."
+          url="$(gh issue create --repo "$ALARM_REPO" --title "$title" \
+            --label "$ALARM_LABEL" --body "$body")"
+          number="${url##*/}"
+          case "$number" in
+            ''|*[!0-9]*)
+              echo "::error::issue create returned no issue number: ${url}"
+              exit 1
+              ;;
+          esac
+          readback="$(gh issue view "$number" --repo "$ALARM_REPO" \
+            --json state,labels \
+            --jq '.state + " " + ([.labels[].name] | join(","))')"
+          echo "after create: ${ALARM_REPO}#${number} ${readback}"
+          if [ "${readback%% *}" != OPEN ]; then
+            echo "::error::${ALARM_REPO}#${number} is not OPEN after create: ${readback}"
+            exit 1
+          fi
+          case ",${readback#* }," in
+            *",${ALARM_LABEL},"*) ;;
+            *)
+              echo "::error::${ALARM_REPO}#${number} does not carry label ${ALARM_LABEL}: ${readback}"
+              exit 1
+              ;;
+          esac
+          gh issue close "$number" --repo "$ALARM_REPO" \
+            --comment "Dry run complete: this credential can open and close an alarm here."
+          closed="$(gh issue view "$number" --repo "$ALARM_REPO" --json state --jq .state)"
+          if [ "$closed" != CLOSED ]; then
+            echo "::error::${ALARM_REPO}#${number} is not CLOSED after close: ${closed}"
+            exit 1
+          fi
+          echo "dry run green: ${ALARM_REPO}#${number} opened with label ${ALARM_LABEL} and closed"

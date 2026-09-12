@@ -642,13 +642,41 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     };
     let unproduced = in_state("unproduced");
     if !unproduced.is_empty() {
-        let missing = unproduced.join(", ");
-        return Reading::Inconclusive(vec![format!(
-            "cross_file_edges_unproduced: this build produced no entity-level {missing} edge for \
-             {language} although the source carries {missing} sites the linker resolved, so a \
-             use that reaches the target through {missing} could not have been found, and the gap \
-             is in the linker, not in the code"
-        )]);
+        // `unproduced` carries two reasons and only one of them is a statement
+        // about the source, so they take different sentences here exactly as
+        // they do in the absence gate. A class this build mints for no language
+        // at all has no resolved site to blame, and the older sentence would
+        // send a reader hunting a linker bug that is not there.
+        let build_gap = |class: &str| -> bool {
+            coverage
+                .get("unproduced_evidence")
+                .and_then(Value::as_object)
+                .and_then(|evidence| evidence.get(class))
+                .and_then(|evidence| evidence.get("this_build_mints_no_entity_level_edge_for"))
+                .is_some()
+        };
+        let (unminted, unproduced): (Vec<&str>, Vec<&str>) =
+            unproduced.into_iter().partition(|class| build_gap(class));
+        let mut clauses = Vec::new();
+        if !unminted.is_empty() {
+            let missing = unminted.join(", ");
+            clauses.push(format!(
+                "cross_file_edges_unproduced: this build mints no entity-level {missing} edge \
+                 for {language} at all, so no graph it builds holds one and a use that reaches \
+                 the target through {missing} could not have been found whatever the source \
+                 contains, and the gap is in this build, not in the code"
+            ));
+        }
+        if !unproduced.is_empty() {
+            let missing = unproduced.join(", ");
+            clauses.push(format!(
+                "cross_file_edges_unproduced: this build produced no entity-level {missing} edge \
+                 for {language} although the source carries {missing} sites the linker resolved, \
+                 so a use that reaches the target through {missing} could not have been found, \
+                 and the gap is in the linker, not in the code"
+            ));
+        }
+        return Reading::Inconclusive(clauses);
     }
     let absent = in_state("absent");
     if !absent.is_empty() {
@@ -1918,6 +1946,62 @@ mod tests {
         assert!(
             seen > 0,
             "no clause was produced by any shape, so this asserted nothing"
+        );
+    }
+
+    /// `unproduced` carries two reasons, and this reading says which one it has.
+    ///
+    /// The state was minted for a linker that resolved import sites and emitted
+    /// no entity-level edge for any of them. A class this build mints for no
+    /// language at all arrives at the same state by a different road, and the
+    /// sentence written for the first is false for the second: there are no
+    /// resolved sites to blame, and a reader who believes there are goes hunting
+    /// a linker bug that is not there. Both arms run, because a split that only
+    /// ever renders one of its branches is not a split, and the payload's own
+    /// evidence is what decides which arm this is rather than the language name.
+    #[test]
+    fn the_reading_says_which_of_the_two_reasons_unproduced_carries() {
+        let mut payload = populated_reference_payload("unproduced");
+        payload["edge_coverage"]["language"] = json!("Rust");
+
+        let Reading::Inconclusive(linker) = edge_coverage_reading("find_references", &payload)
+        else {
+            panic!("an unproduced class bounds the answer: {payload}");
+        };
+        assert!(
+            linker
+                .iter()
+                .any(|clause| clause.contains("although the source carries")),
+            "with nothing saying the build mints none, the linker sentence stands: {linker:?}"
+        );
+
+        payload["edge_coverage"]["unproduced_evidence"] = json!({
+            "imports": {
+                "this_build_mints_no_entity_level_edge_for": ["Rust"],
+                "entity_level_import_edges": 0,
+            }
+        });
+        let Reading::Inconclusive(build) = edge_coverage_reading("find_references", &payload)
+        else {
+            panic!("the class still bounds the answer: {payload}");
+        };
+        assert!(
+            build
+                .iter()
+                .any(|clause| clause.contains("mints no entity-level imports edge for Rust at all")),
+            "the build gap gets its own words: {build:?}"
+        );
+        assert!(
+            !build
+                .iter()
+                .any(|clause| clause.contains("the source carries")),
+            "a class no build mints has no resolved site to blame: {build:?}"
+        );
+        assert!(
+            build
+                .iter()
+                .all(|clause| clause.starts_with("cross_file_edges_unproduced:")),
+            "the label is what a consumer keys on and it does not change: {build:?}"
         );
     }
 

@@ -342,7 +342,13 @@ default-branch ancestry, absence of any successful attempt, and absence of an
 active release before requesting `rerun-failed-jobs`. The initial attempt plus
 two retries is the hard cap. Cancellation is treated as an operator stop and is
 never retried. If all three attempts fail, the controller opens one
-`Release blocked after automatic retries` issue and stops.
+`Release blocked after automatic retries` issue and stops. That issue, like
+every alarm the release workflows raise, lives on the private ops repository
+`firelock-ai/kin-infra` under a label carrying this repository's name, not on
+this repository's public issue tab; the controller reaches it with a release
+App token that holds `issues: write` on the two repositories and nothing else.
+On a later tick, once a Release run for that tag concludes success, the
+controller closes the issue with one line naming that run.
 
 The issue compares the complete failing job/step set across attempts. A repeated
 set is reported as a **repeated failure signature**, not as proof of a

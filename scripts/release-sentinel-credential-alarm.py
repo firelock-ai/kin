@@ -50,6 +50,10 @@ CLEAR = "CLEAR"
 
 ALARM_TITLE = "Release Sentinel has no credential to patrol with"
 
+# The alarm lives on firelock-ai/kin-infra beside every other repository's alarms,
+# and the label passed as --label is how a reader tells whose each one is.
+LABEL_COLOR = "5319E7"
+
 
 class Unreadable(Exception):
     """A `gh` call failed or answered with nothing usable."""
@@ -85,6 +89,17 @@ def find_issue(repo, gh_fn=gh):
     return None
 
 
+def ensure_label(repo, label, gh_fn=gh):
+    """Create the source-repository label on the alarm repository, idempotently.
+
+    Created before the issue rather than assumed, because a create against a missing
+    label fails, and an alarm that fails to file is the one outcome this script exists
+    to prevent. `--force` makes an existing label a no-op.
+    """
+    gh_fn(["label", "create", label, "--repo", repo, "--force", "--color", LABEL_COLOR,
+           "--description", "Alarms raised by the %s repository's workflows" % label])
+
+
 def judge(enabled):
     """Pure. `enabled` is the exact string release-sentinel.yml's `preflight` job
     outputs: 'true' when the secret is present, anything else otherwise."""
@@ -116,7 +131,9 @@ def render_alarm_body(run_url):
     return "\n".join(lines) + "\n"
 
 
-def run_alarm(repo, enabled, run_url, dry_run=False, gh_fn=gh):
+def run_alarm(repo, enabled, run_url, dry_run=False, gh_fn=gh, label=None):
+    """`repo` is where the alarm issue lives (the alarm repository, not necessarily the
+    repository whose sentinel this is); `label` names the source repository on it."""
     verdict = judge(enabled)
     print("VERDICT %s (preflight enabled=%r)" % (verdict, enabled))
 
@@ -133,7 +150,11 @@ def run_alarm(repo, enabled, run_url, dry_run=False, gh_fn=gh):
             gh_fn(["issue", "comment", str(existing), "--repo", repo, "--body", body])
             print("updated tracking issue #%s" % existing)
         else:
-            number = gh_fn(["issue", "create", "--repo", repo, "--title", ALARM_TITLE, "--body", body])
+            create = ["issue", "create", "--repo", repo, "--title", ALARM_TITLE, "--body", body]
+            if label:
+                ensure_label(repo, label, gh_fn=gh_fn)
+                create += ["--label", label]
+            number = gh_fn(create)
             print("opened tracking issue %s" % number.strip())
     else:
         if existing:
@@ -164,10 +185,14 @@ class _FakeGh:
         self.open_issue = existing_issue  # None, or an int issue number
         self.closed_issue = None
         self.comments = []
+        self.labels = []
 
     def __call__(self, args):
         self.calls.append(args)
         cmd = args[0] if args else ""
+        if cmd == "label" and args[1] == "create":
+            self.labels.append(args[2])
+            return ""
         if cmd == "issue" and args[1] == "list":
             rows = [{"number": self.open_issue, "title": ALARM_TITLE}] if self.open_issue else []
             return json.dumps(rows)
@@ -206,6 +231,34 @@ def self_test():
     check("first ALARM creates an issue", fake.open_issue == fake.next_number)
     check("first ALARM never closes", fake.closed_issue is None)
     check("first ALARM posts no comment (nothing existed to comment on)", fake.comments == [])
+    check("an unlabelled ALARM touches no label", fake.labels == [])
+
+    # The alarm repository and the source label, as release-sentinel.yml passes them:
+    # every call lands on the repository given, the label is created before the issue
+    # that carries it, and the create is the only call that carries it.
+    fake_labelled = _FakeGh(existing_issue=None)
+    run_alarm("firelock-ai/kin-infra", "false", "https://example/runs/5",
+              gh_fn=fake_labelled, label="kin")
+    labelled_create = [c for c in fake_labelled.calls if c[:2] == ["issue", "create"]]
+    check("a labelled ALARM creates exactly one issue", len(labelled_create) == 1)
+    check("the labelled create lands on the alarm repository",
+          labelled_create and labelled_create[0][2:4] == ["--repo", "firelock-ai/kin-infra"])
+    check("the labelled create carries the source label",
+          labelled_create and "--label" in labelled_create[0]
+          and labelled_create[0][labelled_create[0].index("--label") + 1] == "kin")
+    check("the label is created on the alarm repository before the issue",
+          fake_labelled.labels == ["kin"]
+          and fake_labelled.calls.index(["label", "create", "kin", "--repo", "firelock-ai/kin-infra",
+                                         "--force", "--color", LABEL_COLOR, "--description",
+                                         "Alarms raised by the kin repository's workflows"])
+          < fake_labelled.calls.index(labelled_create[0]))
+
+    fake_labelled_repeat = _FakeGh(existing_issue=556)
+    run_alarm("firelock-ai/kin-infra", "false", "https://example/runs/6",
+              gh_fn=fake_labelled_repeat, label="kin")
+    check("a labelled repeat ALARM comments and never relabels or recreates",
+          fake_labelled_repeat.labels == [] and len(fake_labelled_repeat.comments) == 1
+          and [c for c in fake_labelled_repeat.calls if c[:2] == ["issue", "create"]] == [])
 
     # A second ALARM while one is already open: comments on it, creates no duplicate.
     fake2 = _FakeGh(existing_issue=555)
@@ -251,6 +304,9 @@ def main(argv):
                          help="the exact string release-sentinel.yml's preflight job output; "
                               "'true' means a credential is present")
     parser.add_argument("--run-url", default="")
+    parser.add_argument("--label", default=None,
+                        help="the source-repository label to put on a newly opened alarm; "
+                             "created on --repo first when given")
     parser.add_argument("--dry-run", action="store_true", help="judge and print, touch no issue")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv[1:])
@@ -261,7 +317,8 @@ def main(argv):
         parser.error("--enabled is required unless --self-test")
 
     try:
-        verdict = run_alarm(args.repo, args.enabled, args.run_url, dry_run=args.dry_run)
+        verdict = run_alarm(args.repo, args.enabled, args.run_url, dry_run=args.dry_run,
+                            label=args.label)
     except Unreadable as exc:
         print("VERDICT UNREADABLE %s" % exc)
         return 2

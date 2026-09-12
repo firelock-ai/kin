@@ -118,9 +118,17 @@ enum ClassState {
     Absent,
     /// The scan stopped on its budget before it could observe one.
     Unknown,
-    /// The scan completed, observed no entity-rooted edge of this class at all,
-    /// and the language's parse side shows sites of the class that the linker
-    /// resolved into no entity-level edge.
+    /// The class exists in no form this build could have produced for the
+    /// language, for either of two reasons.
+    ///
+    /// One: the scan completed, observed no entity-rooted edge of this class at
+    /// all, and the language's parse side shows sites of the class that the
+    /// linker resolved into no entity-level edge.
+    ///
+    /// Two: this build cannot mint the class for the language at all, which
+    /// [`cannot_mint_entity_level`] reads from the linker. That case needs no
+    /// scan and is not weakened by one that stopped early, so it is decided
+    /// before the states are published rather than inferred from counts.
     ///
     /// Not `Absent`, because `Absent` reads as a completed observation about the
     /// code, and this is a completed observation about the build: the sites are
@@ -327,6 +335,35 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
                 *state = ClassState::Unproduced;
                 unproduced_evidence.insert(class_name(*kind).to_string(), evidence);
             }
+        }
+        // The other reason a class reads `unproduced`: this build mints no
+        // entity-level edge of it for one of the languages in scope, which is
+        // decided from the linker rather than from counts. Said in the payload,
+        // because "unproduced" carries two reasons now and a reader acting on
+        // one of them must be able to tell which they have.
+        for (kind, _) in merged
+            .iter()
+            .filter(|(kind, state)| {
+                *state == ClassState::Unproduced
+                    && observed_languages
+                        .iter()
+                        .any(|language| cannot_mint_entity_level(*language, *kind))
+            })
+            .map(|(kind, state)| (*kind, *state))
+            .collect::<Vec<_>>()
+        {
+            let languages: Vec<String> = observed_languages
+                .iter()
+                .filter(|language| cannot_mint_entity_level(**language, kind))
+                .map(|language| format!("{language:?}"))
+                .collect();
+            unproduced_evidence.insert(
+                class_name(kind).to_string(),
+                json!({
+                    "this_build_mints_no_entity_level_edge_for": languages,
+                    "entity_level_import_edges": 0,
+                }),
+            );
         }
     }
 
@@ -918,6 +955,46 @@ pub(crate) mod test_support {
     }
 }
 
+/// Whether this build demonstrably cannot mint an entity-rooted edge of `kind`
+/// for `language`, whatever any repository holds.
+///
+/// A fact about the build, read from the linker rather than assumed here, and
+/// deliberately one-sided: a language is named only where the source proves the
+/// edge impossible, so every language this list does not name is scanned for
+/// exactly as before.
+///
+/// An entity-level `Imports` edge needs two halves, and either can be missing.
+/// First the specifier has to resolve to a file this repository holds:
+/// `resolve_module_path` in `kin_index::linker` sends a Python source file to
+/// `resolve_python_module_import`, joins a `.`-prefixed specifier onto the
+/// importer's directory with extension and index probing, and otherwise tries a
+/// repo-local header, a monorepo package, a Java dotted package and a Go module
+/// path, in that order. Rust `use` paths take none of those branches, which is
+/// why a Rust store reports its import statements parsed and none resolved.
+/// Second, the importing file has to carry a module entity, which
+/// `make_entity_import_relations` uses as the edge's source and
+/// `module_entity_by_file` reads as the first `EntityKind::Module` entity in the
+/// file: the cpp, hcl, javascript, python, rust and typescript adapters emit
+/// one, and go, java, kotlin, php and swift do not, so those five cannot source
+/// the edge however well their specifiers resolve.
+///
+/// `Calls` and `References` are never named here. Calls are minted from call
+/// sites for every language that parses them, and whether a reference edge can
+/// exist is a fact about the language server that `reference_enrichment`
+/// already carries.
+fn cannot_mint_entity_level(language: LanguageId, kind: RelationKind) -> bool {
+    kind == RelationKind::Imports
+        && matches!(
+            language,
+            LanguageId::Rust
+                | LanguageId::Go
+                | LanguageId::Java
+                | LanguageId::Kotlin
+                | LanguageId::Swift
+                | LanguageId::Php
+        )
+}
+
 /// The reference classes among `kinds`, in the order given. Other relation kinds
 /// are dropped: containment and definition edges never cross a file boundary, so
 /// including them would let an intra-file fact stand in for a cross-file one.
@@ -1056,8 +1133,14 @@ fn observe_language<S: EntityStore>(
                     }
                 }
                 for entity in &candidates {
+                    // Only the classes this build could mint for the language
+                    // hold the search open. A class it cannot mint is already
+                    // decided, and waiting for a witness that cannot exist is
+                    // what spent the whole budget and then reported every other
+                    // class unknown.
                     if states
                         .iter()
+                        .filter(|(kind, _)| !cannot_mint_entity_level(language, *kind))
                         .all(|(_, state)| *state == ClassState::Present)
                     {
                         break;
@@ -1128,6 +1211,20 @@ fn observe_language<S: EntityStore>(
             // stays unknown rather than being reported absent from a scan that
             // never ran.
             Err(_) => budget_exhausted = true,
+        }
+    }
+
+    // Decided by the build, not by the scan, so it holds whether or not the
+    // walk above ran at all and whether or not it finished.
+    //
+    // A witness still wins. The table describes what this build's linker mints,
+    // and a graph that demonstrably holds such an edge is reporting what it
+    // holds; overriding an observed `present` here would be a claim about the
+    // graph that the graph itself refutes, which is the failure this module
+    // exists to prevent rather than commit.
+    for (kind, state) in states.iter_mut() {
+        if *state != ClassState::Present && cannot_mint_entity_level(language, *kind) {
+            *state = ClassState::Unproduced;
         }
     }
 
@@ -1251,6 +1348,110 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         }
+    }
+
+    /// A class this build cannot mint for the language is decided by the build
+    /// rather than by the scan: it reads `unproduced` with the reason named, it
+    /// no longer holds the search open for a witness that cannot exist, and the
+    /// classes the build CAN mint are observed to the end.
+    ///
+    /// The shape this exists for was measured on a 5,088-entity Rust store: the
+    /// search spent all 4,096 entities of its budget looking for an entity-level
+    /// `Imports` edge the linker has no branch to mint for Rust, reported
+    /// `budget_exhausted`, and left every other class `unknown`, so a
+    /// default-kinds `find_references` was inconclusive on the budget whatever
+    /// the graph held.
+    ///
+    /// Breaking it: stop excluding the class from the search and it reads
+    /// `absent`, a statement about the code, for a class no repository could
+    /// have carried.
+    #[test]
+    fn a_class_this_build_cannot_mint_is_unproduced_and_spends_no_budget() {
+        let store = InMemoryGraph::new();
+        let caller = entity("open_store", "src/engine/open.rs", LanguageId::Rust);
+        let target = entity("read_header", "src/storage/header.rs", LanguageId::Rust);
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let coverage = observe_cross_file_reference_coverage(
+            &store,
+            &target,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        );
+        assert_eq!(coverage["classes"]["imports"], json!("unproduced"));
+        assert_eq!(coverage["classes"]["calls"], json!("present"));
+        assert_eq!(coverage["budget_exhausted"], json!(false));
+        assert_eq!(
+            coverage["unproduced_evidence"]["imports"]["this_build_mints_no_entity_level_edge_for"],
+            json!(["Rust"]),
+            "the payload says which of the state's two reasons this is: {coverage}"
+        );
+    }
+
+    /// The table is one-sided on purpose. A language this build CAN mint the
+    /// class for is scanned exactly as it was, in both directions: a real
+    /// cross-file import edge still reads `present`, and a graph that merely
+    /// holds none still reads `absent` rather than the build's own gap.
+    ///
+    /// Both arms are here because only the second can catch the table. A
+    /// witness beats the table by design, so naming a language in the table
+    /// leaves the first arm green and proves nothing about it; where no witness
+    /// exists, the table alone decides the answer, and that is the input a
+    /// mutation of the table has to move.
+    #[test]
+    fn a_language_this_build_can_mint_for_is_scanned_as_before() {
+        let store = InMemoryGraph::new();
+        let importer = entity("save_note", "nk/storage.py", LanguageId::Python);
+        let target = entity("parse_note", "nk/parsing.py", LanguageId::Python);
+        store.upsert_entity(&importer).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&relation(importer.id, target.id, RelationKind::Imports))
+            .unwrap();
+
+        let coverage = observe_cross_file_reference_coverage(
+            &store,
+            &target,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        );
+        assert_eq!(coverage["classes"]["imports"], json!("present"));
+        assert_eq!(coverage["unproduced_evidence"]["imports"], json!(null));
+
+        // The arm that can actually catch the table: no witness anywhere, so
+        // nothing beats it to the answer. `absent` is a statement about this
+        // graph, and a language the table does not name keeps it.
+        let bare = InMemoryGraph::new();
+        let caller = entity("save_note", "nk/storage.py", LanguageId::Python);
+        let lonely = entity("parse_note", "nk/parsing.py", LanguageId::Python);
+        let sibling = entity("helper", "nk/storage.py", LanguageId::Python);
+        bare.upsert_entity(&caller).unwrap();
+        bare.upsert_entity(&lonely).unwrap();
+        bare.upsert_entity(&sibling).unwrap();
+        bare.upsert_relation(&relation(caller.id, sibling.id, RelationKind::Calls))
+            .unwrap();
+
+        let coverage = observe_cross_file_reference_coverage(
+            &bare,
+            &lonely,
+            &[RelationKind::Calls, RelationKind::Imports],
+        );
+        assert_eq!(
+            coverage["classes"]["imports"],
+            json!("absent"),
+            "a language the table does not name keeps the graph's own answer: {coverage}"
+        );
+        assert_eq!(coverage["unproduced_evidence"], Value::Null, "{coverage}");
     }
 
     /// The FIR-2353 shape: entities and intra-file edges only. Every requested

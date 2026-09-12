@@ -9209,10 +9209,26 @@ mod tests {
         );
         assert_eq!(response["negative"]["trust"], "inconclusive");
         // And the edge gap LEADS, ahead of the ambient path's own cross-repo
-        // binding gap, because it is the factor that limited this answer.
+        // binding gap, because it is the factor that limited this answer. Of
+        // the two edge clauses the class this build mints for no Rust program
+        // comes first, and the classes the graph simply holds none of still
+        // follow it.
         assert!(
-            trust_reason(&response).starts_with("cross_file_edges_absent"),
+            trust_reason(&response).starts_with("cross_file_edges_unproduced"),
             "{}",
+            trust_reason(&response)
+        );
+        assert!(
+            trust_reason(&response).contains("cross_file_edges_absent"),
+            "the classes the graph holds none of are still named: {}",
+            trust_reason(&response)
+        );
+        // The half that makes the leading clause honest: no build mints that
+        // class here, so there is no resolved site to blame and the sentence
+        // must claim nothing about what the source contains.
+        assert!(
+            !trust_reason(&response).contains("the source carries"),
+            "a class no build mints has no resolved site to blame: {}",
             trust_reason(&response)
         );
     }
