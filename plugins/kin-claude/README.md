@@ -36,6 +36,11 @@ Every response names the graph state that produced it, and an empty result says 
 absence can be trusted. A graph gap is reported as a gap rather than filled in from raw file
 search.
 
+## Requirements
+
+Node 20 or newer for `npx`, and network access on the first run to fetch the Kin release.
+macOS, Linux, and Windows x64 are supported. On Windows, WSL2 is the recommended path.
+
 ## Links
 
 - Repository: https://github.com/firelock-ai/kin
