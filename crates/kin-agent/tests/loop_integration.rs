@@ -309,7 +309,7 @@ def call(name, args):
         if args.get("query") == "nothing at all":
             return payload({"results": [], "_kin": ENVELOPE,
                             "negative": {"safe_to_conclude_absent": False,
-                                         "limiting_factor": "markdown bodies are not indexed"}})
+                                         "trust_reason": "coverage_partial: markdown bodies are not indexed"}})
         return payload({"results": [{"name": "greet", "path": "src/greet.py", "line": 1}],
                         "_kin": ENVELOPE})
     if name == "get_entity_source":
@@ -1798,7 +1798,7 @@ fn an_untrusted_absence_is_handed_to_the_model_as_unknown_with_the_named_gap() {
     assert_eq!(row["negative"]["safe_to_conclude_absent"], false);
     assert_eq!(
         row["negative"]["limiting_factor"],
-        "markdown bodies are not indexed"
+        "coverage_partial: markdown bodies are not indexed"
     );
 }
 
