@@ -201,7 +201,7 @@ fn well_formed_arguments_are_not_reported_as_malformed() {
 }
 
 fn test_belt() -> Belt {
-    Belt::new(vec![kin_tool(0, "semantic_locate", None)])
+    Belt::with_file_tools(vec![kin_tool(0, "semantic_locate", None)])
 }
 
 /// One belt entry as a run would build it: bare name from the server, exposed name from
@@ -292,6 +292,189 @@ fn harness_owned_tools_never_reach_the_model() {
     }
     assert!(!belt::is_harness_owned("semantic_locate"));
     assert!(!belt::is_harness_owned("get_context_pack"));
+    assert!(!belt::is_harness_owned("kin_mutate"));
+}
+
+#[test]
+fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
+    let tool = crate::belt::KinTool {
+        server: 0,
+        bare: "kin_mutate".into(),
+        exposed: "mcp__kin__kin_mutate".into(),
+        description: "Atomically mutate graph".into(),
+        schema: json!({ "type": "object" }),
+    };
+    let belt = Belt::pure_kin(vec![tool]);
+    assert!(!belt.has_file_tools());
+    assert_eq!(belt.names().len(), 1);
+    assert!(belt.names().contains("mcp__kin__kin_mutate"));
+    assert!(!belt.names().contains("edit_file"));
+    assert!(!belt.names().contains("write_file"));
+
+    let Route::Refused(refusal) = belt.route("edit_file") else {
+        panic!("edit_file must be refused on pure kin belt");
+    };
+    assert!(
+        refusal.contains("kin_mutate"),
+        "refusal should point to kin_mutate: {refusal}"
+    );
+
+    let Route::Refused(refusal_write) = belt.route("write_file") else {
+        panic!("write_file must be refused on pure kin belt");
+    };
+    assert!(
+        refusal_write.contains("kin_mutate"),
+        "refusal should point to kin_mutate: {refusal_write}"
+    );
+
+    // What the model is actually shown. `names` and `route` are the harness's
+    // own view; `to_specs` is the tools array that goes out on every turn, and a
+    // tool absent from the first two but present in the third is a tool the
+    // model will call.
+    let specs = belt.to_specs(None);
+    let served: Vec<&str> = specs
+        .iter()
+        .filter_map(|spec| spec["function"]["name"].as_str())
+        .collect();
+    assert_eq!(
+        served,
+        vec!["mcp__kin__kin_mutate"],
+        "a pure Kin belt serves the Kin tools and nothing else"
+    );
+    assert!(belt.schema_for("edit_file").is_none());
+    assert!(belt.schema_for("write_file").is_none());
+
+    // The control: the same tools on the belt that keeps them. Without this the
+    // assertions above would pass just as well against a belt that lost its
+    // file tools by accident, or against a `to_specs` that stopped emitting
+    // anything at all.
+    let tool = crate::belt::KinTool {
+        server: 0,
+        bare: "kin_mutate".into(),
+        exposed: "mcp__kin__kin_mutate".into(),
+        description: "Atomically mutate graph".into(),
+        schema: json!({ "type": "object" }),
+    };
+    let with_files = Belt::with_file_tools(vec![tool]);
+    assert!(with_files.has_file_tools());
+    assert!(with_files.names().contains("edit_file"));
+    assert!(with_files.names().contains("write_file"));
+    assert!(matches!(
+        with_files.route("edit_file"),
+        Route::Local(crate::belt::LocalTool::Edit)
+    ));
+    let with_file_specs = with_files.to_specs(None);
+    let served: Vec<&str> = with_file_specs
+        .iter()
+        .filter_map(|spec| spec["function"]["name"].as_str())
+        .collect();
+    assert_eq!(
+        served,
+        vec!["mcp__kin__kin_mutate", "edit_file", "write_file"]
+    );
+}
+
+/// `KIN_AGENT_PURE_KIN` means what kin-core's env registry says a boolean means.
+///
+/// Read through the pure function rather than the process environment, because
+/// tests share one process and a test that sets an environment variable races
+/// every other test that reads it.
+#[test]
+fn the_pure_kin_switch_reads_booleans_the_way_the_env_registry_does() {
+    for on in ["1", "true", "yes", "on", "TRUE", " On "] {
+        assert!(
+            belt::pure_kin_requested(Some(on)),
+            "{on:?} should lock the belt"
+        );
+    }
+    // The case this replaced: the old reading treated everything except `0`
+    // and `false` as on, so an operator who wrote `off` got the locked belt.
+    for off in ["0", "false", "no", "off", "OFF", "", "maybe"] {
+        assert!(
+            !belt::pure_kin_requested(Some(off)),
+            "{off:?} should leave the full belt"
+        );
+    }
+    assert!(
+        !belt::pure_kin_requested(None),
+        "unset leaves the full belt"
+    );
+}
+
+/// The built-in prompt describes only the write tools the belt actually carries.
+///
+/// A prompt naming a tool the belt lacks is a false instruction: under
+/// `--tool-profile agent-query` no `kin_mutate` is served, and a model told to
+/// call it spends its turns being refused.
+#[test]
+fn the_system_prompt_names_only_the_write_tools_the_belt_carries() {
+    let mutate = kin_tool(0, "kin_mutate", None);
+    let locate = kin_tool(0, "semantic_locate", None);
+
+    let entity =
+        crate::run::system_prompt_for(&Belt::pure_kin(vec![mutate.clone(), locate.clone()]));
+    assert!(entity.contains("mcp__kin__kin_mutate") && entity.contains("name the entity"));
+
+    let files = crate::run::system_prompt_for(&Belt::with_file_tools(vec![locate.clone()]));
+    assert!(files.contains("edit_file") && files.contains("write_file"));
+    assert!(!files.contains("kin_mutate"), "{files}");
+
+    let read_only = crate::run::system_prompt_for(&Belt::pure_kin(vec![locate.clone()]));
+    assert!(
+        read_only.contains("no tool that changes code"),
+        "{read_only}"
+    );
+    assert!(
+        !read_only.contains("kin_mutate") && !read_only.contains("edit_file"),
+        "{read_only}"
+    );
+
+    // Every shape keeps the shared head and tail, so only the one paragraph moved.
+    for prompt in [&entity, &files, &read_only] {
+        assert!(prompt.contains("Kin is your only way to look at the repository"));
+        assert!(prompt.contains("Work in small steps"));
+    }
+}
+
+/// The harness supplies the session `kin_mutate` needs and the model cannot see.
+///
+/// `kin_session_start` is harness-owned, so the model never learns the session
+/// id the run opened. Sending `kin_mutate` without one used to fall through to
+/// the MCP server's own in-process registry, which in daemon mode is not the
+/// authority: it invents an id the daemon has never heard of and
+/// `kin_transaction_begin` refuses it. On a pure-Kin belt that is the only write
+/// tool there is, so the belt would have had no way to commit at all.
+#[test]
+fn the_harness_fills_in_the_session_a_mutate_needs_and_leaves_every_other_call_alone() {
+    let mutate = json!({ "operations": [{ "verb": "update", "target": "Widget", "body": "x" }] });
+    let sent = crate::run::with_harness_session(&mutate, "kin_mutate", Some("sess-1"));
+    assert_eq!(sent["session_id"], json!("sess-1"));
+    assert_eq!(sent["operations"], mutate["operations"]);
+
+    // A session the model named itself survives, so a caller's mistake earns
+    // the refusal it should rather than a silent correction.
+    let named = json!({ "operations": [], "session_id": "the-model-said-this" });
+    let sent = crate::run::with_harness_session(&named, "kin_mutate", Some("sess-1"));
+    assert_eq!(sent["session_id"], json!("the-model-said-this"));
+
+    // An empty one is not a session. A model that emits the key with nothing in
+    // it has named nothing, and filling it is the same correction as filling an
+    // absent key.
+    let blank = json!({ "operations": [], "session_id": "  " });
+    let sent = crate::run::with_harness_session(&blank, "kin_mutate", Some("sess-1"));
+    assert_eq!(sent["session_id"], json!("sess-1"));
+
+    // The controls. Every other tool keeps the exact arguments the model wrote,
+    // and a run holding no session of its own invents nothing to fill with.
+    let read = json!({ "entity_id": "abc" });
+    assert_eq!(
+        crate::run::with_harness_session(&read, "get_entity_source", Some("sess-1")),
+        read
+    );
+    assert_eq!(
+        crate::run::with_harness_session(&mutate, "kin_mutate", None),
+        mutate
+    );
 }
 
 #[test]
@@ -312,7 +495,7 @@ fn a_second_repository_of_the_same_name_gets_its_own_label() {
 
 #[test]
 fn tool_prefixes_separate_two_servers_and_a_bare_name_names_both() {
-    let belt = Belt::new(vec![
+    let belt = Belt::with_file_tools(vec![
         kin_tool(0, "semantic_locate", Some("alpha")),
         kin_tool(1, "semantic_locate", Some("beta")),
     ]);

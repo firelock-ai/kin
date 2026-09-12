@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 67 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 68 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -322,7 +322,7 @@ reported rather than served as a confident answer.
 ---
 
 ## 5. Semantic Transactions
-*Tools:* `kin_transaction_begin`, `kin_transaction_stage`, `kin_transaction_validate`, `kin_transaction_commit`, `kin_transaction_abort`
+*Tools:* `kin_transaction_begin`, `kin_transaction_stage`, `kin_transaction_validate`, `kin_transaction_commit`, `kin_transaction_abort`, `kin_mutate`
 
 - **`kin_transaction_begin`**: Start a transaction context.
 - **`kin_transaction_stage`**: Stage changes to the transaction. Each staged operation is one of six disjoint shapes, and the verb decides which:
@@ -333,7 +333,10 @@ reported rather than served as a confident answer.
   - `rename` (or `move`) with `target` and `destination` both repository-relative paths relocates a tracked file. Entity ids, history, and incoming references survive the move.
   - A structured entity or relation mutation carries an explicit `payload`, for callers that already hold Kin's own entity and relation objects.
 - **`kin_transaction_validate`**: Run constraints and validation against staged changes.
-- **`kin_transaction_commit` / `kin_transaction_abort`**: Commit changes to the branch head or discard them.
+- **`kin_transaction_commit` / `kin_transaction_abort`**: Commit changes to the branch head or discard them. An optional `message` on the commit becomes the change's subject in history; without one the change records only `MCP transaction <id>`, which names the call and not the work.
+- **`kin_mutate`**: Atomically validate and commit a batch of graph mutations in a single call, the one-shot front for an agent that already knows what it is changing. It begins, stages and commits in one round trip, aborts cleanly on a refusal, and takes the change message as `summary`. Every refusal is a structured tool error the caller can retry from.
+
+A body that came back marked `... [truncated]` is refused by both `kin_transaction_stage` and `kin_mutate` rather than committed. Bodies rendered inside search results, context packs and trace steps are capped at 40 lines or 2400 characters, and committing one of those would replace the entity's whole span with the part that fit. `get_entity_source` serves an entity's complete span and applies no line or character cap of its own; read the body there.
 
 ---
 

@@ -1185,9 +1185,45 @@ fn registered_tools() -> ToolsListResult {
                             "type": "array",
                             "description": "Optional exact mutation operations to stage atomically in this commit request",
                             "items": transaction_operation_schema()
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Optional change message: one sentence in your own words saying what this change does, which becomes the subject a human reads in history. Omit it and the change records only the transaction id, which names the call and not the work."
                         }
                     },
                     "required": ["transaction_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_mutate".into(),
+                description: crate::handlers::sessions::MUTATE_DESC.into(),
+                annotations: destructive_idempotent("Atomically mutate graph"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operations": {
+                            "type": "array",
+                            "description": "Array of mutation operations to validate and commit atomically",
+                            "items": transaction_operation_schema()
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional owning session UUID"
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Optional target scope or workspace identifier (defaults to 'repository')"
+                        },
+                        "request_id": {
+                            "type": "string",
+                            "description": "Optional client request id, carried into the receipt so you can match the answer to your call; nothing deduplicates on it"
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Optional change message: one sentence in your own words saying what this change does, which becomes the subject a human reads in history. Omit it and the change records only the transaction id, which names the call and not the work."
+                        }
+                    },
+                    "required": ["operations"]
                 }),
             },
             ToolDefinition {
@@ -1714,6 +1750,7 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "kin_transaction_begin",
         "kin_transaction_stage",
         "kin_transaction_commit",
+        "kin_mutate",
         // Without abort, an agent that decides against a transaction, or that
         // wants to start clean after a refusal, has no way out of the one it
         // holds: begin/stage/commit can only push work forward. A write profile
@@ -2269,6 +2306,7 @@ mod tests {
     const WRITING_TOOLS: &[&str] = &[
         "kin_annotation_add",
         "kin_annotation_mark_resolved",
+        "kin_mutate",
         "kin_register_intent",
         "kin_release_intent",
         "kin_review_assign",
@@ -2306,6 +2344,7 @@ mod tests {
     /// the annotation; `kin_review_unassign` removes the assignment.
     const DESTRUCTIVE_TOOLS: &[&str] = &[
         "kin_annotation_mark_resolved",
+        "kin_mutate",
         "kin_review_discuss_resolve",
         "kin_review_unassign",
         "kin_transaction_abort",
@@ -2657,8 +2696,8 @@ mod tests {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
         // + 1 get_entity_sources + 2 exact artifact tools
-        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search = 67
-        assert_eq!(list.tools.len(), 67);
+        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search + 1 kin_mutate = 68
+        assert_eq!(list.tools.len(), 68);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -2886,11 +2925,10 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             list.tools.iter().map(|t| t.name.as_str()).collect();
         let profile = agent_default_tool_names();
 
-        // 21 since trace_path joined: a route query between two entities is the
-        // question the wedge is asked most, and it was the one tool the belt
-        // could not answer with fewer than five calls.
+        // 22 since kin_mutate joined: atomic one-shot mutation lets agents commit
+        // graph edits without multi-step transaction ceremonies.
         assert!(
-            profile.len() >= 10 && profile.len() <= 21,
+            profile.len() >= 10 && profile.len() <= 22,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -3045,6 +3083,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         assert_eq!(
             removed,
             vec![
+                "kin_mutate",
                 "kin_session_end",
                 "kin_session_heartbeat",
                 "kin_session_start",

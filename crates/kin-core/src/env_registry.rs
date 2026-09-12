@@ -318,6 +318,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_MCP_KIN_BINARY", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "explicit native Kin binary used by the @kinlab/kin-mcp wrapper" },
     EnvVarSpec { name: "KIN_MCP_RELEASE_BASE_URL", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "release mirror base URL used by the @kinlab/kin-mcp wrapper" },
     EnvVarSpec { name: "KIN_MCP_AUTO_INIT", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup" },
+    EnvVarSpec { name: "KIN_AGENT_PURE_KIN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "lock `kin agent run` to Kin tools only: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes" },
 
     // ---- diagnostics / benchmarking ------------------------------------------
     EnvVarSpec { name: "KIN_LOCATE_DEBUG", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "emit locate pipeline debug output" },
