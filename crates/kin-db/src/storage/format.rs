@@ -3141,10 +3141,12 @@ mod tests {
             "GraphSnapshot's encoded arity moved; the envelope decoder's field \
              indices are stale"
         );
-        assert!(
-            REPOSITORY_AUTHORITY_FIELD_INDEX < GRAPH_SNAPSHOT_FIELD_COUNT,
-            "the envelope index must name a field that exists"
-        );
+        const {
+            assert!(
+                REPOSITORY_AUTHORITY_FIELD_INDEX < GRAPH_SNAPSHOT_FIELD_COUNT,
+                "the envelope index must name a field that exists"
+            );
+        }
     }
 
     #[test]

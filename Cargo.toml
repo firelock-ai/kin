@@ -196,7 +196,6 @@ kin-vfs-core = { path = "crates/kin-vfs-core", version = "=0.4.25", registry = "
 # say `{ workspace = true }` for a name this table carries.
 kin-vector = { path = "crates/kin-vector", version = "=0.2.1", registry = "kin" }
 
-
 [profile.release]
 opt-level = 3
 lto = "fat"

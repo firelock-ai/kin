@@ -18163,7 +18163,9 @@ mod tests {
         for (label, mutate) in cases {
             let graph = InMemoryGraph::new();
             let before = entity_in_edited_file("target_symbol", file, "blob-1", 10);
-            graph.batch_upsert_entities(&[before.clone()]).unwrap();
+            graph
+                .batch_upsert_entities(std::slice::from_ref(&before))
+                .unwrap();
             for path in [file, "src/moved.rs"] {
                 graph.admit_artifact_for_test(
                     path,
@@ -20177,7 +20179,9 @@ mod tests {
         assert_eq!(before.total, entities.len());
 
         let fresh = test_entity_with_id(0x2416_8888, "fresh");
-        graph.batch_upsert_entities(&[fresh.clone()]).unwrap();
+        graph
+            .batch_upsert_entities(std::slice::from_ref(&fresh))
+            .unwrap();
         let grown = graph.embedding_status();
         assert_eq!(grown.total, before.total + 1);
         assert_eq!((grown.indexed, grown.total), probe_coverage(&graph));
@@ -20736,17 +20740,19 @@ mod tests {
         // is not produced by entity_embed_tier (it is assigned to revision keys
         // in embed_sort_key_for) but is pinned in the chain so the overall
         // ordering contract is encoded in one place.
-        assert!(
-            embed_tier::PUBLIC_API < embed_tier::PUBLIC_SOURCE
-                && embed_tier::PUBLIC_SOURCE < embed_tier::CRATE_SOURCE
-                && embed_tier::CRATE_SOURCE < embed_tier::INTERNAL_SOURCE
-                && embed_tier::INTERNAL_SOURCE < embed_tier::PRIVATE_SOURCE
-                && embed_tier::PRIVATE_SOURCE < embed_tier::TEST
-                && embed_tier::TEST < embed_tier::DOCS
-                && embed_tier::DOCS < embed_tier::OTHER
-                && embed_tier::OTHER < embed_tier::REVISION,
-            "tier lattice must stay strictly ordered public-API → revision"
-        );
+        const {
+            assert!(
+                embed_tier::PUBLIC_API < embed_tier::PUBLIC_SOURCE
+                    && embed_tier::PUBLIC_SOURCE < embed_tier::CRATE_SOURCE
+                    && embed_tier::CRATE_SOURCE < embed_tier::INTERNAL_SOURCE
+                    && embed_tier::INTERNAL_SOURCE < embed_tier::PRIVATE_SOURCE
+                    && embed_tier::PRIVATE_SOURCE < embed_tier::TEST
+                    && embed_tier::TEST < embed_tier::DOCS
+                    && embed_tier::DOCS < embed_tier::OTHER
+                    && embed_tier::OTHER < embed_tier::REVISION,
+                "tier lattice must stay strictly ordered public-API → revision"
+            );
+        };
 
         // The rung the carry depends on: EVERY live tier embeds before any
         // revision key. Without this a test, docs, generated or vendored

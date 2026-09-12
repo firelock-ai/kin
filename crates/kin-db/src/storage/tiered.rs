@@ -1790,7 +1790,7 @@ mod tests {
         // cold tier and is appended after the hot results before sorting.
         let dir = TempDir::new().unwrap();
         let cold_exact = test_entity_with_id(0xaa, "parse");
-        let tiered = open_cold_only(&dir, &[cold_exact.clone()]);
+        let tiered = open_cold_only(&dir, std::slice::from_ref(&cold_exact));
 
         let hot_substring = test_entity_with_id(0x02, "reparser");
         tiered.hot.upsert_entity(&hot_substring).unwrap();

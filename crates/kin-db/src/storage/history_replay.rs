@@ -2202,10 +2202,12 @@ mod tests {
         const TRUNK: usize = 1_200;
         const TIPS: usize = 40;
 
-        assert!(
-            TRUNK + 1 + TIPS > PROGRESS_MIN_TOTAL,
-            "the fixture must cross the progress threshold to exercise reporting"
-        );
+        const {
+            assert!(
+                TRUNK + 1 + TIPS > PROGRESS_MIN_TOTAL,
+                "the fixture must cross the progress threshold to exercise reporting"
+            );
+        }
 
         let (changes, targets) = deep_history(TRUNK, TIPS);
         assert_eq!(changes.len(), TRUNK + 1 + TIPS);
