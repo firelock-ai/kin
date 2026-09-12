@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Show the `--continue` alias in `kin resolve --help`.
+
 ## [0.7.16] - 2026-09-12
 
 ### Changed

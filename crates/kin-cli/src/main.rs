@@ -781,7 +781,7 @@ enum Command {
         #[arg(long)]
         all_theirs: bool,
         /// Complete the merge after all conflicts are resolved
-        #[arg(long, alias = "continue")]
+        #[arg(long, visible_alias = "continue")]
         do_continue: bool,
         /// Abort the merge and discard conflict state
         #[arg(long)]
