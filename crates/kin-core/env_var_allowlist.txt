@@ -37,6 +37,9 @@ KIN_HEAP_PHASES
 # and no runtime behaviour keys on it. It exists because the synthetic fixtures
 # price a shape rather than a repository.
 KIN_HEAP_REPO
+# Read only by the ignored real-repository admission heap profile. This selects
+# a disposable measurement corpus; no product runtime reads it.
+KIN_HEAP_PROFILE_REPO
 # Size and target the FIR-2729 increment-2 scale measurement, which is #[ignore]d
 # and reports rather than asserting a ceiling. REPO names a real Git worktree to
 # clone and admit, and COMMITS and STEPS size the synthetic arm it falls back to.
