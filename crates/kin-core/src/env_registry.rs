@@ -319,6 +319,9 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_MCP_RELEASE_BASE_URL", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "release mirror base URL used by the @kinlab/kin-mcp wrapper" },
     EnvVarSpec { name: "KIN_MCP_AUTO_INIT", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup" },
     EnvVarSpec { name: "KIN_AGENT_PURE_KIN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "lock `kin agent run` to Kin tools only: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes" },
+    EnvVarSpec { name: "KIN_AGENT_CONTEXT_ACCOUNTING", kind: Kind::OneOf(&["heuristic", "llama_cpp"]), default: "heuristic", sensitivity: Sensitivity::Correctness, summary: "agent request accounting: heuristic estimates the prepared request; llama_cpp uses the selected server's rendered prompt and tokenizer" },
+    EnvVarSpec { name: "KIN_AGENT_OUTPUT_RESERVE_TOKENS", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Correctness, summary: "override the agent's output token reserve; must be positive and below the context window, and unset uses the configured context's answer reserve" },
+    EnvVarSpec { name: "KIN_AGENT_OUTPUT_TOKEN_PARAMETER", kind: Kind::OneOf(&["max_tokens", "max_completion_tokens"]), default: "", sensitivity: Sensitivity::Correctness, summary: "override the completion request's output-limit field; unset selects max_completion_tokens for api.openai.com and max_tokens for compatible endpoints" },
 
     // ---- diagnostics / benchmarking ------------------------------------------
     EnvVarSpec { name: "KIN_LOCATE_DEBUG", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "emit locate pipeline debug output" },
