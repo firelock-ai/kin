@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
+use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, SourceSpan, Visibility};
 use tree_sitter::Tree;
 
 use crate::adapter::{
@@ -142,7 +142,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
                 extract_calls_from_context(node, source, &name, None, relations);
             }
@@ -157,7 +158,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
                 // Emit Implements relations for #[derive(...)] traits.
                 for trait_name in extract_derive_traits(node, source) {
@@ -183,7 +185,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
 
                 // Emit Implements relations for #[derive(...)] traits.
@@ -215,7 +218,8 @@ fn extract_rust_node(
                                     visibility: detect_rust_visibility(node, source),
                                     doc_summary: None,
                                     fingerprint: compute_fingerprint(&variant, source),
-                                    span: span_from_node(&variant, file_id),
+                                    span: rust_item_span(&variant, file_id, source),
+                                    declaration_line: Some(variant.start_position().row as u32),
                                 });
                                 relations.push(ExtractedRelation {
                                     site: None,
@@ -242,7 +246,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
             }
         }
@@ -256,7 +261,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
             }
         }
@@ -270,7 +276,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
             }
         }
@@ -284,7 +291,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
             }
         }
@@ -332,7 +340,8 @@ fn extract_rust_node(
                                 visibility: detect_rust_visibility(&member, source),
                                 doc_summary: extract_doc_comment(&member, source),
                                 fingerprint: compute_fingerprint(&member, source),
-                                span: span_from_node(&member, file_id),
+                                span: rust_item_span(&member, file_id, source),
+                                declaration_line: Some(member.start_position().row as u32),
                             });
                             extract_calls_from_context(
                                 &member,
@@ -386,7 +395,8 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
+                    declaration_line: Some(node.start_position().row as u32),
                 });
             }
             // Descend into an inline module body so functions, impls, and nested
@@ -424,7 +434,8 @@ fn extract_rust_node(
                         visibility,
                         doc_summary: extract_doc_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
+                        span: rust_item_span(node, file_id, source),
+                        declaration_line: Some(node.start_position().row as u32),
                     });
                 }
             }
@@ -438,49 +449,34 @@ fn extract_rust_node(
 /// a struct or enum. Returns a list of trait name strings.
 fn extract_derive_traits(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut traits = Vec::new();
-    // Check preceding attribute_item siblings
-    let mut prev = node.prev_sibling();
-    while let Some(p) = prev {
-        if p.kind() == "attribute_item" {
-            let text = p.utf8_text(source).unwrap_or("");
-            // Match #[derive(Trait1, Trait2, ...)]
-            if let Some(start) = text.find("derive(") {
-                let after = &text[start + 7..];
-                if let Some(end) = after.find(')') {
-                    let inner = &after[..end];
-                    for t in inner.split(',') {
-                        let t = t.trim();
-                        if !t.is_empty() {
-                            traits.push(t.to_string());
-                        }
-                    }
-                }
-            }
-        } else {
-            break;
+    for trivia in leading_trivia(node, source) {
+        if trivia.kind() == "attribute_item" {
+            derive_traits_in(trivia.utf8_text(source).unwrap_or(""), &mut traits);
         }
-        prev = p.prev_sibling();
     }
     // Also check child attributes (tree-sitter sometimes nests them)
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "attribute_item" {
-            let text = child.utf8_text(source).unwrap_or("");
-            if let Some(start) = text.find("derive(") {
-                let after = &text[start + 7..];
-                if let Some(end) = after.find(')') {
-                    let inner = &after[..end];
-                    for t in inner.split(',') {
-                        let t = t.trim();
-                        if !t.is_empty() {
-                            traits.push(t.to_string());
-                        }
-                    }
+            derive_traits_in(child.utf8_text(source).unwrap_or(""), &mut traits);
+        }
+    }
+    traits
+}
+
+/// The trait names inside one attribute's text when it is a `#[derive(..)]`.
+fn derive_traits_in(text: &str, into: &mut Vec<String>) {
+    if let Some(start) = text.find("derive(") {
+        let after = &text[start + 7..];
+        if let Some(end) = after.find(')') {
+            for t in after[..end].split(',') {
+                let t = t.trim();
+                if !t.is_empty() {
+                    into.push(t.to_string());
                 }
             }
         }
     }
-    traits
 }
 
 fn detect_rust_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
@@ -525,27 +521,95 @@ fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
     crate::adapter::declaration_signature(node, source)
 }
 
-fn extract_doc_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
-    // Collect preceding line_comment nodes that start with ///
-    let mut comments = Vec::new();
+/// An outer line doc comment is exactly three slashes. `////` is a plain
+/// comment in Rust, however often it is used to draw a rule above an item.
+fn is_outer_doc_line(text: &str) -> bool {
+    text.starts_with("///") && !text.starts_with("////")
+}
+
+/// An outer block doc comment opens with `/**` followed by anything but
+/// another `*` or an immediate close: `/***` and `/**/` are plain comments.
+fn is_outer_doc_block(text: &str) -> bool {
+    text.starts_with("/**") && !text.starts_with("/***") && text != "/**/"
+}
+
+/// The doc comments and outer attributes that belong to an item, in source
+/// order, read from the siblings above it.
+///
+/// One walk serves the span, the doc summary and the derive list, so the
+/// three cannot disagree about which lines belong to an item. It walks past
+/// an ordinary comment sitting between a doc comment and its item, because
+/// rustc attaches the doc comment across it, but an ordinary comment never
+/// starts the run: the first node returned is always a doc comment or an
+/// attribute. Inner doc comments (`//!`, `/*!`) and inner attributes
+/// (`#![..]`, a different node kind) belong to the enclosing item and end
+/// the walk.
+fn leading_trivia<'a>(node: &tree_sitter::Node<'a>, source: &[u8]) -> Vec<tree_sitter::Node<'a>> {
+    let mut run = Vec::new();
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
-        if p.kind() == "line_comment" {
-            let text = p.utf8_text(source).unwrap_or("");
-            if text.starts_with("///") {
-                comments.push(text.trim_start_matches('/').trim().to_string());
-            } else {
-                break;
+        let owned = match p.kind() {
+            "attribute_item" => true,
+            "line_comment" => {
+                let text = p.utf8_text(source).unwrap_or("");
+                if text.starts_with("//!") {
+                    break;
+                }
+                is_outer_doc_line(text)
             }
-        } else {
-            break;
-        }
+            "block_comment" => {
+                let text = p.utf8_text(source).unwrap_or("");
+                if text.starts_with("/*!") {
+                    break;
+                }
+                is_outer_doc_block(text)
+            }
+            _ => break,
+        };
+        run.push((p, owned));
         prev = p.prev_sibling();
+    }
+    // The run was read bottom-up; the ordinary comments above the topmost
+    // owned node are not the item's.
+    while matches!(run.last(), Some((_, false))) {
+        run.pop();
+    }
+    run.into_iter().rev().map(|(node, _)| node).collect()
+}
+
+/// The span of a Rust item including the doc comments and outer attributes
+/// above it, so a body read or written through the entity carries its
+/// documentation. The entity's id does not key on this span's start; see
+/// `declaration_line` on `ExtractedEntity`.
+fn rust_item_span(node: &tree_sitter::Node, file_id: &FilePathId, source: &[u8]) -> SourceSpan {
+    let mut span = span_from_node(node, file_id);
+    if let Some(first) = leading_trivia(node, source).first() {
+        let start = first.start_position();
+        span.start_byte = first.start_byte();
+        span.start_line = start.row as u32;
+        span.start_col = start.column as u32;
+    }
+    span
+}
+
+fn extract_doc_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut comments = Vec::new();
+    for trivia in leading_trivia(node, source) {
+        let text = trivia.utf8_text(source).unwrap_or("");
+        match trivia.kind() {
+            "line_comment" if is_outer_doc_line(text) => {
+                comments.push(text.trim_start_matches('/').trim().to_string());
+            }
+            "block_comment" if is_outer_doc_block(text) => {
+                let cleaned = text.trim_start_matches("/**").trim_end_matches("*/").trim();
+                comments.push(cleaned.to_string());
+            }
+            _ => {}
+        }
     }
     if comments.is_empty() {
         None
     } else {
-        comments.reverse();
         Some(comments.join(" "))
     }
 }
@@ -1373,6 +1437,168 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }
             func.doc_summary.as_deref(),
             Some("Adds two numbers together. Returns the sum.")
         );
+    }
+
+    /// The span covers the docs and attributes; the id keys on the declaration.
+    ///
+    /// The id assertion is the one the captain's ruling rests on: an entity's id
+    /// hashes its file, kind, name and a line, and that line stays the `pub fn`
+    /// line however much documentation sits above it, so a store built before
+    /// this rule addresses the same entity after it.
+    #[test]
+    fn the_span_covers_the_docs_while_the_id_keys_on_the_declaration_line() {
+        let adapter = RustAdapter;
+        let source = br#"
+/// Calculates the square of a number.
+#[inline]
+#[must_use]
+pub fn square(x: i32) -> i32 {
+    x * x
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("math.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "square")
+            .expect("should find square");
+        assert_eq!(func.span.start_line, 1);
+        assert_eq!(func.declaration_line, Some(4));
+        let text = std::str::from_utf8(&source[func.span.start_byte..func.span.end_byte]).unwrap();
+        assert!(text.starts_with("/// Calculates"), "{text}");
+        assert!(
+            text.contains("#[must_use]") && text.ends_with('}'),
+            "{text}"
+        );
+        assert_eq!(
+            func.doc_summary.as_deref(),
+            Some("Calculates the square of a number.")
+        );
+
+        let entity = func.clone().into_entity_with_source(
+            kin_model::LanguageId::Rust,
+            &file_id,
+            Some(source),
+        );
+        let at_declaration = kin_model::EntityId::from_content("math.rs", "square", "Function", 4);
+        let at_span_start = kin_model::EntityId::from_content("math.rs", "square", "Function", 1);
+        assert_eq!(
+            entity.id, at_declaration,
+            "the id must key on the pub fn line"
+        );
+        assert_ne!(entity.id, at_span_start);
+        assert_eq!(
+            entity
+                .metadata
+                .extra
+                .get(crate::extract::DECLARATION_LINE_KEY),
+            Some(&serde_json::Value::from(4u32))
+        );
+        assert_eq!(entity.span.as_ref().map(|span| span.start_line), Some(1));
+    }
+
+    /// An item with nothing above it records no declaration line: its span already
+    /// starts there, and the metadata key exists only for the widened case.
+    #[test]
+    fn an_undocumented_item_keeps_its_span_and_records_no_declaration_line() {
+        let adapter = RustAdapter;
+        let source = b"pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("math.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output.entities.iter().find(|e| e.name == "add").unwrap();
+        assert_eq!(func.span.start_line, 0);
+        assert_eq!(func.declaration_line, Some(0));
+        let entity = func.clone().into_entity_with_source(
+            kin_model::LanguageId::Rust,
+            &file_id,
+            Some(source),
+        );
+        assert_eq!(
+            entity.id,
+            kin_model::EntityId::from_content("math.rs", "add", "Function", 0)
+        );
+        assert!(!entity
+            .metadata
+            .extra
+            .contains_key(crate::extract::DECLARATION_LINE_KEY));
+    }
+
+    /// Only real outer doc comments and outer attributes join an item.
+    ///
+    /// `////` rules, `/**/` and `/***` are plain comments in Rust; `//!` and
+    /// `/*!` document the enclosing item; `#![..]` is an inner attribute. None
+    /// of them may widen the span or become a summary.
+    #[test]
+    fn only_outer_doc_comments_and_attributes_join_the_span() {
+        let adapter = RustAdapter;
+        let cases: [(&[u8], u32); 5] = [
+            (b"//// rule above\nfn ruled() {}\n", 1),
+            (b"/**/\nfn empty_block() {}\n", 1),
+            (b"/*** banner ***/\nfn bannered() {}\n", 1),
+            (b"//! inner doc\nfn innered() {}\n", 1),
+            (b"#![allow(dead_code)]\nfn inner_attr() {}\n", 1),
+        ];
+        for (source, expected_line) in cases {
+            let tree = adapter.parse(source).unwrap();
+            let file_id = FilePathId::new("t.rs");
+            let output = adapter.extract(&tree, source, &file_id).unwrap();
+            let func = output
+                .entities
+                .iter()
+                .find(|e| e.kind == EntityKind::Function)
+                .unwrap();
+            let shown = String::from_utf8_lossy(source);
+            assert_eq!(func.span.start_line, expected_line, "{shown}");
+            assert_eq!(func.declaration_line, Some(expected_line), "{shown}");
+            assert_eq!(func.doc_summary, None, "{shown}");
+            let text =
+                std::str::from_utf8(&source[func.span.start_byte..func.span.end_byte]).unwrap();
+            assert!(text.starts_with("fn "), "{shown} -> {text}");
+        }
+    }
+
+    /// An ordinary comment between a doc comment and its item is walked past by
+    /// the span, the summary and the derive list alike, as rustc attaches the doc.
+    #[test]
+    fn an_ordinary_comment_between_a_doc_comment_and_its_item_is_walked_past() {
+        let adapter = RustAdapter;
+        let source = br#"/// A point.
+// keep the derive list short
+#[derive(Clone, Debug)]
+/** With a block doc too. */
+pub struct Point {
+    x: i32,
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("p.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let point = output.entities.iter().find(|e| e.name == "Point").unwrap();
+        assert_eq!(point.span.start_line, 0);
+        assert_eq!(point.declaration_line, Some(4));
+        assert_eq!(
+            point.doc_summary.as_deref(),
+            Some("A point. With a block doc too.")
+        );
+        let implements: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Implements && r.src_name == "Point")
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert_eq!(implements, ["Clone", "Debug"]);
+
+        // The control: a plain comment directly above an undocumented item
+        // neither starts the span nor becomes a summary.
+        let source = b"// not a doc\nfn plain() {}\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let plain = output.entities.iter().find(|e| e.name == "plain").unwrap();
+        assert_eq!(plain.span.start_line, 1);
+        assert_eq!(plain.doc_summary, None);
     }
 
     #[test]

@@ -139,6 +139,7 @@ fn extract_hcl_block(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -156,6 +157,7 @@ fn extract_hcl_block(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -170,6 +172,7 @@ fn extract_hcl_block(
                     doc_summary: extract_description_attr(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -184,6 +187,7 @@ fn extract_hcl_block(
                     doc_summary: extract_description_attr(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -198,6 +202,7 @@ fn extract_hcl_block(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Extract source attribute as an import
@@ -238,6 +243,7 @@ fn extract_hcl_block(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -276,6 +282,7 @@ fn extract_locals_block(
                         doc_summary: extract_preceding_comment(&child, source),
                         fingerprint: compute_fingerprint(&child, source),
                         span: span_from_node(&child, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -358,6 +365,7 @@ fn extract_hcl_top_attribute(
                 doc_summary: extract_preceding_comment(node, source),
                 fingerprint: compute_fingerprint(node, source),
                 span: span_from_node(node, file_id),
+                declaration_line: None,
             });
         }
     }

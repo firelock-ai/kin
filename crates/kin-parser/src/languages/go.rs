@@ -445,6 +445,7 @@ fn extract_go_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 let mut ref_seen = std::collections::HashSet::new();
                 extract_calls_from_body(
@@ -488,6 +489,7 @@ fn extract_go_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Emit Contains relation from receiver type to method
@@ -548,6 +550,7 @@ fn extract_go_node(
                                         doc_summary: member.doc_summary.clone(),
                                         fingerprint: member.fingerprint.clone(),
                                         span: member.span.clone(),
+                                        declaration_line: None,
                                     });
                                     relations.push(ExtractedRelation {
                                         site: None,
@@ -611,6 +614,7 @@ fn extract_go_node(
                             doc_summary: extract_preceding_comment(node, source),
                             fingerprint: compute_fingerprint(&spec, source),
                             span: span_from_node(&spec, file_id),
+                            declaration_line: None,
                         });
                     }
                 }
@@ -635,6 +639,7 @@ fn extract_go_node(
                             doc_summary: extract_preceding_comment(node, source),
                             fingerprint: compute_fingerprint(&spec, source),
                             span: span_from_node(&spec, file_id),
+                            declaration_line: None,
                         });
 
                         // A package-level const/var initializer references the

@@ -168,6 +168,7 @@ fn extract_swift_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Extract inheritance (superclass, protocol conformance)
@@ -210,6 +211,7 @@ fn extract_swift_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Protocol inheritance
@@ -253,6 +255,7 @@ fn extract_swift_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 if let Some(cls) = class_ctx {
@@ -285,6 +288,7 @@ fn extract_swift_node(
                 doc_summary: extract_preceding_comment(node, source),
                 fingerprint: compute_fingerprint(node, source),
                 span: span_from_node(node, file_id),
+                declaration_line: None,
             });
 
             if let Some(cls) = class_ctx {
@@ -312,6 +316,7 @@ fn extract_swift_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 relations.push(ExtractedRelation {
@@ -353,6 +358,7 @@ fn extract_swift_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 if let Some(cls) = class_ctx {
@@ -380,6 +386,7 @@ fn extract_swift_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -402,6 +409,7 @@ fn extract_swift_node(
                         doc_summary: None,
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
 
                     if let Some(cls) = class_ctx {

@@ -122,6 +122,7 @@ impl LanguageAdapter for JavaScriptAdapter {
                 doc_summary: None,
                 fingerprint: compute_fingerprint(&root, source),
                 span: span_from_node(&root, file_id),
+                declaration_line: None,
             });
         }
 
@@ -1100,6 +1101,7 @@ impl JsOwners {
                 doc_summary: None,
                 fingerprint: compute_fingerprint(site, source),
                 span: span_from_node(site, file_id),
+                declaration_line: None,
             });
         }
     }
@@ -1472,6 +1474,7 @@ pub(super) fn extract_js_property_definition(
         doc_summary: extract_preceding_comment(stmt, source),
         fingerprint: compute_fingerprint(stmt, source),
         span: span_from_node(stmt, file_id),
+        declaration_line: None,
     });
     relations.push(ExtractedRelation {
         site: None,
@@ -1508,6 +1511,7 @@ fn extract_js_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 // Extract calls within function body
                 extract_calls_from_context(node, source, &name, None, relations);
@@ -1608,6 +1612,7 @@ fn extract_js_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(&declarator, source),
                     span: span_from_node(&declarator, file_id),
+                    declaration_line: None,
                 });
                 if let Some(value_node) = value_node.filter(is_js_function_like_node) {
                     let context_name = name_node.utf8_text(source).unwrap_or("");
@@ -1665,6 +1670,7 @@ fn extract_js_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     // The exported value's body, which nothing else walks.
                     //
@@ -1955,6 +1961,7 @@ fn extract_js_assignment_target(
                     doc_summary: extract_preceding_comment(stmt, source),
                     fingerprint: compute_fingerprint(stmt, source),
                     span: span_from_node(stmt, file_id),
+                    declaration_line: None,
                 });
                 relations.push(ExtractedRelation {
                     site: None,
@@ -2005,6 +2012,7 @@ fn extract_js_assignment_target(
                 doc_summary: extract_preceding_comment(stmt, source),
                 fingerprint: compute_fingerprint(stmt, source),
                 span: span_from_node(stmt, file_id),
+                declaration_line: None,
             });
             // The factory an export is built from is the one edge that makes
             // it reachable: `exports.etag` calls `createETagGenerator`. The
@@ -2035,6 +2043,7 @@ fn extract_js_assignment_target(
                     doc_summary: extract_preceding_comment(&function_node, source),
                     fingerprint: compute_fingerprint(&function_node, source),
                     span: span_from_node(&function_node, file_id),
+                    declaration_line: None,
                 });
                 extract_calls_from_context(&function_node, source, &property_name, None, relations);
             }
@@ -2069,6 +2078,7 @@ fn extract_js_assignment_target(
         doc_summary: extract_preceding_comment(stmt, source),
         fingerprint: compute_fingerprint(stmt, source),
         span: span_from_node(stmt, file_id),
+        declaration_line: None,
     });
     extract_calls_from_context(value, source, &name, None, relations);
 }
@@ -2146,6 +2156,7 @@ pub(super) fn extract_js_object_methods(
             doc_summary: extract_preceding_comment(&function_node, source),
             fingerprint: compute_fingerprint(&function_node, source),
             span: span_from_node(&function_node, file_id),
+            declaration_line: None,
         });
         relations.push(ExtractedRelation {
             site: None,
@@ -2179,6 +2190,7 @@ fn extract_js_class_like(
         doc_summary: extract_preceding_comment(node, source),
         fingerprint: compute_fingerprint(node, source),
         span: span_from_node(node, file_id),
+        declaration_line: None,
     });
 
     // Extract Extends relation for class inheritance.
@@ -2251,6 +2263,7 @@ fn extract_js_class_like(
             doc_summary: extract_preceding_comment(&member, source),
             fingerprint: compute_fingerprint(&member, source),
             span: span_from_node(&member, file_id),
+            declaration_line: None,
         });
         relations.push(ExtractedRelation {
             site: None,

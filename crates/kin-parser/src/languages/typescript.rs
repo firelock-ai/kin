@@ -155,6 +155,7 @@ pub(super) fn extract_typescript_tree(
             doc_summary: None,
             fingerprint: compute_fingerprint(&root, source),
             span: span_from_node(&root, file_id),
+            declaration_line: None,
         });
     }
 
@@ -216,6 +217,7 @@ fn extract_ts_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 // Extract calls within function body
                 extract_calls_from_context(node, source, &name, None, relations);
@@ -245,6 +247,7 @@ fn extract_ts_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -259,6 +262,7 @@ fn extract_ts_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -274,6 +278,7 @@ fn extract_ts_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 // Extract enum members as EnumVariant entities
                 if let Some(body) = node.child_by_field_name("body") {
@@ -298,6 +303,7 @@ fn extract_ts_node(
                                     doc_summary: extract_preceding_comment(&member, source),
                                     fingerprint: compute_fingerprint(&member, source),
                                     span: span_from_node(&member, file_id),
+                                    declaration_line: None,
                                 });
                                 relations.push(ExtractedRelation {
                                     site: None,
@@ -389,6 +395,7 @@ fn extract_ts_node(
                             doc_summary: extract_preceding_comment(node, source),
                             fingerprint: compute_fingerprint(&declarator, source),
                             span: span_from_node(&declarator, file_id),
+                            declaration_line: None,
                         });
                         if let Some(value_node) = value_node.filter(is_ts_function_like_node) {
                             let context_name = name_node.utf8_text(source).unwrap_or("");
@@ -454,6 +461,7 @@ fn extract_ts_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     // The exported value's body, which nothing else walks. The
                     // JavaScript adapter carries the same line beside the same
@@ -496,6 +504,7 @@ fn extract_ts_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -545,6 +554,7 @@ fn extract_ts_class_like(
         doc_summary: extract_preceding_comment(node, source),
         fingerprint: compute_fingerprint(node, source),
         span: span_from_node(node, file_id),
+        declaration_line: None,
     });
 
     // Extract heritage (extends/implements)
@@ -628,6 +638,7 @@ fn extract_ts_class_member(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 relations.push(ExtractedRelation {
                     site: None,

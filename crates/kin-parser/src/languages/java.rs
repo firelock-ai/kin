@@ -115,6 +115,7 @@ fn extract_java_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Extract superclass
@@ -184,6 +185,7 @@ fn extract_java_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Records cannot extend a superclass, but they may implement interfaces.
@@ -234,6 +236,7 @@ fn extract_java_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -249,6 +252,7 @@ fn extract_java_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -263,6 +267,7 @@ fn extract_java_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 // Extract enum constants as EnumVariant entities
                 if let Some(body) = node.child_by_field_name("body") {
@@ -287,6 +292,7 @@ fn extract_java_node(
                                     doc_summary: extract_preceding_comment(&member, source),
                                     fingerprint: compute_fingerprint(&member, source),
                                     span: span_from_node(&member, file_id),
+                                    declaration_line: None,
                                 });
                                 relations.push(ExtractedRelation {
                                     site: None,
@@ -319,6 +325,7 @@ fn extract_java_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
@@ -356,6 +363,7 @@ fn extract_java_node(
                                 doc_summary: None,
                                 fingerprint: compute_fingerprint(node, source),
                                 span: span_from_node(node, file_id),
+                                declaration_line: None,
                             });
                         }
                     }

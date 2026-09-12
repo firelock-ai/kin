@@ -321,6 +321,7 @@ impl LanguageAdapter for PythonAdapter {
                 doc_summary: extract_module_docstring(&root, source),
                 fingerprint: compute_fingerprint(&root, source),
                 span: span_from_node(&root, file_id),
+                declaration_line: None,
             });
         }
 
@@ -411,6 +412,7 @@ fn extract_py_node(
                     doc_summary: extract_docstring(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 // Extract calls within function/method body
                 let receiver_types = python_receiver_types(node, source);
@@ -452,6 +454,7 @@ fn extract_py_node(
                     doc_summary: extract_docstring(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Extract base classes
@@ -603,6 +606,7 @@ fn extract_py_node(
                     doc_summary: None,
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
