@@ -11,7 +11,13 @@ import './resolve-release-intent.test.mjs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { classifyPath as intentClassifyPath, decideReleaseIntent } from './release-intent.mjs';
+import {
+  classifyPath as intentClassifyPath,
+  decideReleaseIntent,
+  readWorkspaceMembers,
+  readPackageIdentity,
+  expectedLocalVersion,
+} from './release-intent.mjs';
 import { classifyPath as versionClassifyPath } from './check-release-version.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -86,6 +92,97 @@ test('a stranded release outranks an out-of-sync surface in the report', () => {
   });
   assert.equal(verdict.stranded, true);
   assert.equal(verdict.exitCode, 1);
+});
+
+// --------------------------------------------------------------------------
+// Independent-vs-workspace local package versions (kin#1747).
+//
+// kin-blobs, kin-model, kin-search and kin-vector became workspace members
+// with their OWN `version = "x"` instead of `version.workspace = true`, so a
+// Cargo.lock entry for one of them legitimately disagrees with the workspace
+// version. These three functions are the pure core of telling the two kinds
+// of local package apart; the fixture-backed tests further down exercise them
+// through the full CLI the way the mint actually invokes it.
+// --------------------------------------------------------------------------
+
+test('readWorkspaceMembers reads a multi-line array with a leading comment', () => {
+  const text = [
+    '[workspace]',
+    'resolver = "2"',
+    'members = [',
+    '    # Kin libraries, developed here and published as independent packages.',
+    '    "crates/kin-blobs",',
+    '    "crates/kin-model",',
+    '    "tests/integration",',
+    ']',
+    '',
+    '[workspace.package]',
+    'version = "0.7.16"',
+  ].join('\n');
+  assert.deepEqual(readWorkspaceMembers(text), [
+    'crates/kin-blobs',
+    'crates/kin-model',
+    'tests/integration',
+  ]);
+});
+
+test('readWorkspaceMembers reads a single-line array', () => {
+  const text = '[workspace]\nmembers = ["crates/a", "crates/b"]\n\n[workspace.package]\nversion = "1.0.0"\n';
+  assert.deepEqual(readWorkspaceMembers(text), ['crates/a', 'crates/b']);
+});
+
+test('readWorkspaceMembers returns nothing for a manifest with no [workspace] members', () => {
+  // The shape of the minimal fixtures below (`releasedRepository`): only
+  // `[workspace.package]`, no `[workspace]` at all. The gate must fall back
+  // to comparing every local package against the workspace version, exactly
+  // as it did before kin#1747, rather than treat an absent list as zero
+  // members and refuse to compare anything.
+  assert.deepEqual(readWorkspaceMembers('[workspace.package]\nversion = "1.2.3"\n'), []);
+});
+
+test('readPackageIdentity reports an explicit version', () => {
+  assert.deepEqual(
+    readPackageIdentity('[package]\nname = "kin-blobs"\nversion = "0.1.5"\nedition = "2021"\n'),
+    { name: 'kin-blobs', explicitVersion: '0.1.5' },
+  );
+});
+
+test('readPackageIdentity reports no explicit version for version.workspace = true', () => {
+  assert.deepEqual(
+    readPackageIdentity('[package]\nname = "kin-core"\nversion.workspace = true\n'),
+    { name: 'kin-core', explicitVersion: null },
+  );
+});
+
+test('readPackageIdentity ignores fields outside [package]', () => {
+  // A dependency section can carry its own inline `version = "x"` for an
+  // unrelated crate; only a version line inside this manifest's OWN
+  // [package] table describes this package's identity.
+  const text = [
+    '[package]',
+    'name = "kin-cli"',
+    'version.workspace = true',
+    '',
+    '[dependencies]',
+    'kin-spine = { path = "../kin-spine", version = "9.9.9" }',
+  ].join('\n');
+  assert.deepEqual(readPackageIdentity(text), { name: 'kin-cli', explicitVersion: null });
+});
+
+test('expectedLocalVersion prefers an independent member\'s own version', () => {
+  const members = new Map([['kin-blobs', '0.1.5']]);
+  assert.deepEqual(expectedLocalVersion('kin-blobs', members, '0.7.16'), {
+    expected: '0.1.5',
+    independent: true,
+  });
+});
+
+test('expectedLocalVersion falls back to the workspace version for an unlisted or workspace-versioned member', () => {
+  const members = new Map([['kin-blobs', '0.1.5']]);
+  assert.deepEqual(expectedLocalVersion('kin-core', members, '0.7.16'), {
+    expected: '0.7.16',
+    independent: false,
+  });
 });
 
 // --------------------------------------------------------------------------
@@ -306,5 +403,200 @@ test('the gate runs from a copy reached through a symlinked directory', () => {
     fs.readFileSync(outputs, 'utf8'),
     /should_tag=/,
     'the gate wrote no outputs, so the mint would read an empty tag',
+  );
+});
+
+// --------------------------------------------------------------------------
+// The gate against a workspace shaped like today's real one: a `[workspace]`
+// members list where some crates carry their own explicit version (kin-blobs,
+// as of kin#1747) and some inherit the workspace version (kin-core). This is
+// the shape `releasedRepository()` above predates, so it stays as a separate
+// fixture rather than a change to that one, and every test above keeps
+// passing against a manifest with no `[workspace]` members list at all.
+// --------------------------------------------------------------------------
+
+function workspaceCargoToml(version, members) {
+  const list = members.map((m) => `    "${m}",`).join('\n');
+  return `[workspace]\nmembers = [\n${list}\n]\n\n[workspace.package]\nversion = "${version}"\n`;
+}
+
+// Bump every release surface a real release commit touches EXCEPT Cargo.lock
+// and fuzz/Cargo.lock, which each test below writes itself since those two
+// are what is under test.
+function bumpCommonReleaseSurfaces(root, version, previousVersion) {
+  write(
+    root,
+    'crates/kin-cli/Cargo.toml',
+    `[dependencies]\nkin-spine = { path = "../kin-spine", version = "${version}" }\n`,
+  );
+  write(
+    root,
+    'CHANGELOG.md',
+    `## [${version}]\n\n- next\n\n## [${previousVersion}]\n\n- released\n`,
+  );
+  for (const pkg of ['kin-mcp', 'kin', 'boundary-contracts']) {
+    write(root, `packages/${pkg}/package.json`, JSON.stringify({ version }, null, 2));
+  }
+}
+
+function releasedWorkspaceRepository(version = '1.2.3') {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-intent-workspace-'));
+  git(root, ['init', '--quiet', '--initial-branch=main']);
+  git(root, ['config', 'user.name', 'Test']);
+  git(root, ['config', 'user.email', 'test@example.invalid']);
+  write(root, 'Cargo.toml', workspaceCargoToml(version, ['crates/kin-core', 'crates/kin-blobs']));
+  write(root, 'crates/kin-core/Cargo.toml', '[package]\nname = "kin-core"\nversion.workspace = true\n');
+  write(root, 'crates/kin-blobs/Cargo.toml', '[package]\nname = "kin-blobs"\nversion = "0.1.5"\n');
+  write(
+    root,
+    'Cargo.lock',
+    `[[package]]\nname = "kin-core"\nversion = "${version}"\n\n[[package]]\nname = "kin-blobs"\nversion = "0.1.5"\n`,
+  );
+  write(root, 'fuzz/Cargo.lock', `[[package]]\nname = "kin-parser"\nversion = "${version}"\n`);
+  write(
+    root,
+    'crates/kin-cli/Cargo.toml',
+    `[dependencies]\nkin-spine = { path = "../kin-spine", version = "${version}" }\n`,
+  );
+  write(root, 'CHANGELOG.md', `## [${version}]\n\n- released\n`);
+  for (const pkg of ['kin-mcp', 'kin', 'boundary-contracts']) {
+    write(root, `packages/${pkg}/package.json`, JSON.stringify({ version }, null, 2));
+  }
+  git(root, ['add', '-A']);
+  git(root, ['commit', '--quiet', '-m', `Release Kin v${version}`]);
+  git(root, ['tag', `v${version}`]);
+  return root;
+}
+
+test('the local lock entries summary counts workspace-versioned and independent members apart', () => {
+  const root = releasedWorkspaceRepository();
+  const run = runGateAsMintDoes(root);
+  assert.match(run.stdout, /local lock entries: 2 \(1 workspace-versioned, 1 independent\)/);
+});
+
+test('an independently versioned member keeps its own version through a workspace bump', () => {
+  // This is the exact kin#1750 failure: kin-blobs stays at 0.1.5 while the
+  // workspace moves to 1.2.4, and that must be accepted, not refused.
+  const root = releasedWorkspaceRepository();
+  write(root, 'Cargo.toml', workspaceCargoToml('1.2.4', ['crates/kin-core', 'crates/kin-blobs']));
+  write(
+    root,
+    'Cargo.lock',
+    '[[package]]\nname = "kin-core"\nversion = "1.2.4"\n\n[[package]]\nname = "kin-blobs"\nversion = "0.1.5"\n',
+  );
+  write(root, 'fuzz/Cargo.lock', '[[package]]\nname = "kin-parser"\nversion = "1.2.4"\n');
+  bumpCommonReleaseSurfaces(root, '1.2.4', '1.2.3');
+  git(root, ['add', '-A']);
+  git(root, ['commit', '--quiet', '-m', 'Release Kin v1.2.4']);
+
+  const run = runGateAsMintDoes(root);
+  assert.doesNotMatch(run.stdout, /FAIL:.*kin-blobs/);
+  assert.match(run.outputs, /should_tag=true/);
+  assert.match(run.outputs, /tag=v1\.2\.4/);
+});
+
+test('an independent member whose lock disagrees with its own manifest fails naming both versions', () => {
+  const root = releasedWorkspaceRepository();
+  write(root, 'Cargo.toml', workspaceCargoToml('1.2.4', ['crates/kin-core', 'crates/kin-blobs']));
+  // Neither kin-blobs' own manifest version (0.1.5) nor the workspace version
+  // (1.2.4): a genuine mismatch, not the independence the previous test proves.
+  write(
+    root,
+    'Cargo.lock',
+    '[[package]]\nname = "kin-core"\nversion = "1.2.4"\n\n[[package]]\nname = "kin-blobs"\nversion = "0.1.6"\n',
+  );
+  write(root, 'fuzz/Cargo.lock', '[[package]]\nname = "kin-parser"\nversion = "1.2.4"\n');
+  bumpCommonReleaseSurfaces(root, '1.2.4', '1.2.3');
+  git(root, ['add', '-A']);
+  git(root, ['commit', '--quiet', '-m', 'Release Kin v1.2.4']);
+
+  const failed = runGateExpectingFailure(root);
+  assert.ok(failed, 'the gate exited 0 on an independent member lock mismatch');
+  assert.match(
+    failed.stdout,
+    /Cargo\.lock local package kin-blobs is 0\.1\.6, its own manifest is 0\.1\.5/,
+  );
+  assert.doesNotMatch(failed.stdout, /kin-blobs is 0\.1\.6, workspace is/);
+});
+
+test('a workspace-versioned member at the wrong version still fails', () => {
+  // The independence rule must not mask an ordinary dropped bump: kin-blobs
+  // is correctly untouched, but kin-core's move to 1.2.4 never landed.
+  const root = releasedWorkspaceRepository();
+  write(root, 'Cargo.toml', workspaceCargoToml('1.2.4', ['crates/kin-core', 'crates/kin-blobs']));
+  write(
+    root,
+    'Cargo.lock',
+    '[[package]]\nname = "kin-core"\nversion = "1.2.3"\n\n[[package]]\nname = "kin-blobs"\nversion = "0.1.5"\n',
+  );
+  write(root, 'fuzz/Cargo.lock', '[[package]]\nname = "kin-parser"\nversion = "1.2.4"\n');
+  bumpCommonReleaseSurfaces(root, '1.2.4', '1.2.3');
+  git(root, ['add', '-A']);
+  git(root, ['commit', '--quiet', '-m', 'Release Kin v1.2.4']);
+
+  const failed = runGateExpectingFailure(root);
+  assert.ok(failed, 'the gate exited 0 on a dropped workspace-versioned bump');
+  assert.match(
+    failed.stdout,
+    /Cargo\.lock local package kin-core is 1\.2\.3, workspace is 1\.2\.4/,
+  );
+});
+
+test('the fuzz lock applies the same independent-vs-workspace rule as the main lock', () => {
+  // kin-parser is workspace-versioned in the real repo today, but the fuzz
+  // block must reach that conclusion through the same member lookup as the
+  // main lock, not by always comparing to the workspace version. Declaring it
+  // independent here proves the rule, not the name, decides the comparison.
+  const root = releasedWorkspaceRepository();
+  write(
+    root,
+    'Cargo.toml',
+    workspaceCargoToml('1.2.4', ['crates/kin-core', 'crates/kin-blobs', 'crates/kin-parser']),
+  );
+  write(root, 'crates/kin-parser/Cargo.toml', '[package]\nname = "kin-parser"\nversion = "0.9.0"\n');
+  write(
+    root,
+    'Cargo.lock',
+    '[[package]]\nname = "kin-core"\nversion = "1.2.4"\n\n' +
+      '[[package]]\nname = "kin-blobs"\nversion = "0.1.5"\n\n' +
+      '[[package]]\nname = "kin-parser"\nversion = "0.9.0"\n',
+  );
+  write(root, 'fuzz/Cargo.lock', '[[package]]\nname = "kin-parser"\nversion = "0.9.0"\n');
+  bumpCommonReleaseSurfaces(root, '1.2.4', '1.2.3');
+  git(root, ['add', '-A']);
+  git(root, ['commit', '--quiet', '-m', 'Release Kin v1.2.4']);
+
+  const run = runGateAsMintDoes(root);
+  assert.doesNotMatch(run.stdout, /fuzz\/Cargo\.lock local package kin-parser/);
+  assert.match(run.outputs, /should_tag=true/);
+});
+
+test('a fuzz lock entry that disagrees with an independent member\'s manifest fails naming both', () => {
+  const root = releasedWorkspaceRepository();
+  write(
+    root,
+    'Cargo.toml',
+    workspaceCargoToml('1.2.4', ['crates/kin-core', 'crates/kin-blobs', 'crates/kin-parser']),
+  );
+  write(root, 'crates/kin-parser/Cargo.toml', '[package]\nname = "kin-parser"\nversion = "0.9.0"\n');
+  write(
+    root,
+    'Cargo.lock',
+    '[[package]]\nname = "kin-core"\nversion = "1.2.4"\n\n' +
+      '[[package]]\nname = "kin-blobs"\nversion = "0.1.5"\n\n' +
+      '[[package]]\nname = "kin-parser"\nversion = "0.9.0"\n',
+  );
+  // Wrong on both counts: neither kin-parser's own 0.9.0 nor the 1.2.4
+  // workspace version.
+  write(root, 'fuzz/Cargo.lock', '[[package]]\nname = "kin-parser"\nversion = "0.8.0"\n');
+  bumpCommonReleaseSurfaces(root, '1.2.4', '1.2.3');
+  git(root, ['add', '-A']);
+  git(root, ['commit', '--quiet', '-m', 'Release Kin v1.2.4']);
+
+  const failed = runGateExpectingFailure(root);
+  assert.ok(failed, 'the gate exited 0 on a fuzz-lock mismatch against an independent manifest');
+  assert.match(
+    failed.stdout,
+    /fuzz\/Cargo\.lock local package kin-parser is 0\.8\.0, its own manifest is 0\.9\.0/,
   );
 });
