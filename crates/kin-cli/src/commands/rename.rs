@@ -280,9 +280,11 @@ where
         // and a scoped pass never claims it: the declaration is a site in the
         // entity's own span by definition, and a scoped span is a reference
         // somewhere else.
+        let declaration_span =
+            declaration_search_span(recorded_declaration_line(&group.entity), span, body);
         let mut passes: Vec<(&kin_model::SourceSpan, usize, bool)> = Vec::new();
         if group.expected > 0 || group.declaration {
-            passes.push((span, group.expected, true));
+            passes.push((&declaration_span, group.expected, true));
         }
         for (scoped_span, scoped_expected) in &group.scoped {
             if scoped_span.file != *file {
@@ -1005,7 +1007,8 @@ where
     })?;
     let body = load_cached_body(tree, file, bodies, load_source)?;
     let leaf = entity_leaf(&candidate.name);
-    let occurrences = find_token_occurrences(body, leaf, span, candidate.language)?;
+    let search = declaration_search_span(recorded_declaration_line(candidate), span, body);
+    let occurrences = find_token_occurrences(body, leaf, &search, candidate.language)?;
     let Some(declaration) = occurrences.first() else {
         bail!(
             "graph declaration {} named '{}' has no exact identifier token in its repository-CAS span",
@@ -1082,6 +1085,54 @@ struct TokenOccurrence {
     start_col: u32,
     end_line: u32,
     end_col: u32,
+}
+
+/// The 0-based declaration line the parser recorded for an entity whose span
+/// starts above it, on its doc comment or attributes.
+fn recorded_declaration_line(entity: &Entity) -> Option<u64> {
+    entity
+        .metadata
+        .extra
+        .get(kin_parser::DECLARATION_LINE_KEY)
+        .and_then(|line| line.as_u64())
+}
+
+/// The bytes of an entity's span from its own declaration onward.
+///
+/// A Rust item's span begins at its doc comment and attributes, and a doc
+/// comment can name the item it documents, so the first occurrence of the
+/// name inside the whole span may be prose. The declaration token, and the
+/// occurrence count the rename authority requires, are sought from the
+/// recorded declaration line. An entity without that record searches its
+/// span unchanged, and so does one whose record does not fall inside it.
+fn declaration_search_span(
+    declaration_line: Option<u64>,
+    span: &SourceSpan,
+    content: &str,
+) -> SourceSpan {
+    let Some(line) = declaration_line else {
+        return span.clone();
+    };
+    let mut start = 0usize;
+    let mut row = 0u64;
+    for (index, byte) in content.bytes().enumerate() {
+        if row == line {
+            start = index;
+            break;
+        }
+        if byte == b'\n' {
+            row += 1;
+            start = index + 1;
+        }
+    }
+    if row != line || start <= span.start_byte || start >= span.end_byte {
+        return span.clone();
+    }
+    let mut narrowed = span.clone();
+    narrowed.start_byte = start;
+    narrowed.start_line = line as u32;
+    narrowed.start_col = 0;
+    narrowed
 }
 
 fn find_token_occurrences(
@@ -1211,6 +1262,38 @@ fn normalize_repo_hint(hint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A doc comment that names its own function must not be where rename
+    /// finds the declaration token, or the cursor on the `fn` line stops
+    /// resolving and the authority count gains a prose occurrence.
+    #[test]
+    fn the_declaration_token_is_sought_below_a_doc_comment_that_names_it() {
+        let file = FilePathId::new("src/lib.rs");
+        let source = "/// value returns the value.\n#[inline]\nfn value() -> u32 { 1 }\n";
+        let whole = SourceSpan {
+            file,
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 2,
+            end_col: 23,
+        };
+        // Without the record the first occurrence is the prose on line 1.
+        let unchanged = declaration_search_span(None, &whole, source);
+        let first = find_token_occurrences(source, "value", &unchanged, LanguageId::Rust).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0].start_line, 1);
+        // With it the search starts at the declaration and finds `fn value` alone.
+        let narrowed = declaration_search_span(Some(2), &whole, source);
+        assert_eq!(narrowed.start_byte, source.find("fn value").unwrap());
+        let found = find_token_occurrences(source, "value", &narrowed, LanguageId::Rust).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].start_line, 3);
+        // A record outside the span leaves the span alone.
+        let outside = declaration_search_span(Some(9), &whole, source);
+        assert_eq!(outside.start_byte, 0);
+    }
 
     #[test]
     fn token_occurrences_are_byte_exact_and_identifier_bounded() {

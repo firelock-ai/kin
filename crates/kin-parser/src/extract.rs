@@ -32,6 +32,14 @@ pub const FILE_PARSED_IMPORT_STATEMENTS_KEY: &str = "file_parsed_import_statemen
 /// reader treats it as unmeasured rather than as zero.
 pub const FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY: &str = "file_parsed_external_module_imports";
 
+/// The 0-based line of an entity's own declaration, recorded when its span
+/// starts above it on a doc comment or an attribute. The entity id keys on
+/// this line, so widening a span over an item's documentation never re-mints
+/// the item's id, and a reader that must find the declaration inside the span
+/// (rename's cursor and authority passes) starts here rather than at the
+/// span's first byte. Absent when the span starts at the declaration.
+pub const DECLARATION_LINE_KEY: &str = "declaration_line";
+
 /// Reserved parser-to-linker control record: at least one source-level call in
 /// this file could not be represented with a statically proven named target.
 /// This includes wholly unrepresentable callees and receiver calls whose leaf
@@ -52,6 +60,12 @@ pub struct ExtractedEntity {
     pub doc_summary: Option<String>,
     pub fingerprint: SemanticFingerprint,
     pub span: SourceSpan,
+    /// The 0-based line of the declaration itself when `span` starts above
+    /// it: a Rust item's doc comments and outer attributes belong to its span,
+    /// and its id must not move when they do. `None` means the span starts at
+    /// the declaration. The id is minted from this line, never from the
+    /// widened span start.
+    pub declaration_line: Option<u32>,
 }
 
 impl ExtractedEntity {
@@ -74,12 +88,21 @@ impl ExtractedEntity {
                 serde_json::Value::String(preview),
             );
         }
-        let entity_id = EntityId::from_content(
-            &file_id.0,
-            &self.name,
-            &format!("{:?}", self.kind),
-            self.span.start_line,
-        );
+        // The id keys on the declaration line. A span that begins above it, on
+        // the item's documentation, says so in the metadata for the readers that
+        // need the declaration rather than the span's first byte.
+        let id_line = self.declaration_line.unwrap_or(self.span.start_line);
+        if self
+            .declaration_line
+            .is_some_and(|line| line != self.span.start_line)
+        {
+            metadata.extra.insert(
+                DECLARATION_LINE_KEY.into(),
+                serde_json::Value::from(id_line),
+            );
+        }
+        let entity_id =
+            EntityId::from_content(&file_id.0, &self.name, &format!("{:?}", self.kind), id_line);
         Entity {
             id: entity_id,
             kind: self.kind,

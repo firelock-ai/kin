@@ -1675,8 +1675,12 @@ mod tests {
     // reconcile paths agree and identical content produces identical IDs across
     // machines and checkout locations.
 
+    // `add` carries a doc comment and an attribute on purpose: a Rust item's
+    // span starts on those, and the id must still key on the `pub fn` line.
     const REL_RUST_SRC: &[u8] = b"pub struct Point { x: f64, y: f64 }\n\
 impl Point { pub fn origin() -> Point { Point { x: 0.0, y: 0.0 } } }\n\
+/// Adds two numbers.\n\
+#[inline]\n\
 pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
 
     fn write_repo_file(root: &Path, rel: &str, content: &[u8]) -> std::path::PathBuf {
@@ -1711,21 +1715,33 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
         assert_eq!(indexed.file_id.0, "src/geo/point.rs");
 
         let mut checked = 0;
+        let mut widened = 0;
         for entity in &indexed.entities {
             let Some(span) = entity.span.as_ref() else {
                 continue;
             };
+            // The id keys on the declaration line, which the parser records
+            // when the span starts above it on a doc comment or attribute.
+            let id_line = entity
+                .metadata
+                .extra
+                .get(kin_parser::DECLARATION_LINE_KEY)
+                .and_then(|line| line.as_u64())
+                .map_or(span.start_line, |line| {
+                    widened += 1;
+                    line as u32
+                });
             let relative = kin_model::EntityId::from_content(
                 "src/geo/point.rs",
                 &entity.name,
                 &format!("{:?}", entity.kind),
-                span.start_line,
+                id_line,
             );
             let absolute = kin_model::EntityId::from_content(
                 &abs.display().to_string(),
                 &entity.name,
                 &format!("{:?}", entity.kind),
-                span.start_line,
+                id_line,
             );
             assert_eq!(
                 entity.id, relative,
@@ -1741,6 +1757,10 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
             checked += 1;
         }
         assert!(checked >= 2, "expected at least two spanned entities");
+        assert_eq!(
+            widened, 1,
+            "the documented `add` must record its declaration line, or this test no longer exercises a widened span"
+        );
     }
 
     #[test]

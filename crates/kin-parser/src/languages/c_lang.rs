@@ -412,6 +412,7 @@ fn extract_c_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 extract_calls_from_body(node, source, &name, relations);
             }
@@ -458,6 +459,7 @@ fn extract_c_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -548,6 +550,7 @@ fn extract_declaration(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 return;
             }
@@ -566,6 +569,7 @@ fn extract_declaration(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -602,6 +606,7 @@ fn extract_type_specifier(
         doc_summary: extract_preceding_comment(span_node, source),
         fingerprint: compute_fingerprint(span_node, source),
         span: span_from_node(span_node, file_id),
+        declaration_line: None,
     };
     if specifier.child_by_field_name("body").is_some() {
         entities.push(entity);
@@ -736,6 +741,7 @@ fn extract_type_definition(
                 doc_summary: extract_preceding_comment(node, source),
                 fingerprint: compute_fingerprint(node, source),
                 span: span_from_node(node, file_id),
+                declaration_line: None,
             });
         }
         return;
@@ -768,6 +774,7 @@ fn extract_type_definition(
             doc_summary: extract_preceding_comment(node, source),
             fingerprint: compute_fingerprint(node, source),
             span: span_from_node(node, file_id),
+            declaration_line: None,
         };
         if defined_here {
             entities.push(entity);

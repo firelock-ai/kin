@@ -133,6 +133,7 @@ fn extract_kotlin_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Extract inheritance from delegation_specifier children
@@ -171,6 +172,7 @@ fn extract_kotlin_node(
                                             doc_summary: None,
                                             fingerprint: compute_fingerprint(&member, source),
                                             span: span_from_node(&member, file_id),
+                                            declaration_line: None,
                                         });
                                         relations.push(ExtractedRelation {
                                             site: None,
@@ -215,6 +217,7 @@ fn extract_kotlin_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 // Recurse into object body
@@ -283,6 +286,7 @@ fn extract_kotlin_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 if let Some(cls) = class_ctx {
@@ -311,6 +315,7 @@ fn extract_kotlin_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 relations.push(ExtractedRelation {
                     site: None,
@@ -353,6 +358,7 @@ fn extract_kotlin_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 if let Some(cls) = class_ctx {
@@ -379,6 +385,7 @@ fn extract_kotlin_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }

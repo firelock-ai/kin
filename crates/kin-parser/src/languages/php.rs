@@ -133,6 +133,7 @@ fn extract_php_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     extract_calls_from_body(node, source, &name, relations);
                 }
@@ -156,6 +157,7 @@ fn extract_php_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     if let Some(cls) = class_ctx {
                         relations.push(ExtractedRelation {
@@ -184,6 +186,7 @@ fn extract_php_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
 
                     // Extract base class (extends)
@@ -240,6 +243,7 @@ fn extract_php_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
 
                     // Recurse into interface body
@@ -268,6 +272,7 @@ fn extract_php_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
 
                     // Recurse into trait body
@@ -296,6 +301,7 @@ fn extract_php_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -320,6 +326,7 @@ fn extract_php_node(
                                 doc_summary: None,
                                 fingerprint: compute_fingerprint(node, source),
                                 span: span_from_node(node, file_id),
+                                declaration_line: None,
                             });
                         }
                     }

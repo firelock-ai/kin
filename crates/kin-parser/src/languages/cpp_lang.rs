@@ -141,6 +141,7 @@ fn extract_cpp_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 if let Some(cls) = class_ctx {
@@ -173,6 +174,7 @@ fn extract_cpp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -193,6 +195,7 @@ fn extract_cpp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -223,6 +226,7 @@ fn extract_cpp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -239,6 +243,7 @@ fn extract_cpp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                 }
             }
@@ -268,6 +273,7 @@ fn extract_cpp_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
             }
         }
@@ -284,6 +290,7 @@ fn extract_cpp_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
 
                 let src_name = class_ctx
@@ -367,6 +374,7 @@ fn extract_cpp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
 
                     // tree-sitter leaves a macro's replacement list as an opaque
@@ -433,6 +441,7 @@ fn extract_class_or_struct(
         doc_summary: extract_preceding_comment(node, source),
         fingerprint: compute_fingerprint(node, source),
         span: span_from_node(node, file_id),
+        declaration_line: None,
     });
 
     // Extract base classes from base_class_clause

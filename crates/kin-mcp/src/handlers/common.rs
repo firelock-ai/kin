@@ -1838,7 +1838,25 @@ pub fn presentation_span_lines(span: &SourceSpan) -> (u32, u32) {
 /// 1-based presentation start line for an entity, or `None` when the entity
 /// carries no span. A spanless entity has no line to report, and reporting `0`
 /// or `1` for one would be a fabricated position.
+///
+/// When the parser widened an item's span to include its doc comments and outer
+/// attributes it stored the actual declaration line in entity metadata under
+/// [`kin_parser::DECLARATION_LINE_KEY`]. That value takes precedence here so
+/// every surface (`kin impact`, `kin refs`, MCP `get_entity_source`) points at
+/// the declaration keyword, not at the first `///` above it.
 pub fn entity_presentation_start_line(entity: &Entity) -> Option<u32> {
+    // Prefer the parser-recorded declaration line when it exists.  The key is
+    // only written when the span starts above the declaration (doc comments or
+    // attributes), so its presence means the span's own start_line is the
+    // first trivia line, not the declaration.
+    if let Some(decl_line) = entity
+        .metadata
+        .extra
+        .get(kin_parser::DECLARATION_LINE_KEY)
+        .and_then(|v| v.as_u64())
+    {
+        return Some(presentation_line(decl_line as u32));
+    }
     entity
         .span
         .as_ref()

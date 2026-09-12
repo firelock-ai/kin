@@ -145,6 +145,7 @@ fn extract_csharp_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 if let Some(parent) = namespace_ctx {
                     relations.push(ExtractedRelation {
@@ -197,6 +198,7 @@ fn extract_csharp_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 if let Some(parent) = namespace_ctx.or(type_ctx) {
                     relations.push(ExtractedRelation {
@@ -258,6 +260,7 @@ fn extract_csharp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -284,6 +287,7 @@ fn extract_csharp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -309,6 +313,7 @@ fn extract_csharp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -334,6 +339,7 @@ fn extract_csharp_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -578,6 +584,7 @@ fn extract_ruby_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 if let Some(parent) = container_ctx {
                     relations.push(ExtractedRelation {
@@ -648,6 +655,7 @@ fn extract_ruby_node(
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
+                    declaration_line: None,
                 });
                 if let Some(owner_name) = owner {
                     relations.push(ExtractedRelation {
@@ -688,6 +696,7 @@ fn extract_ruby_node(
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
+                        declaration_line: None,
                     });
                     if let Some(owner) = container_ctx {
                         relations.push(ExtractedRelation {
