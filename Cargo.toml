@@ -209,11 +209,12 @@ kin-vector = { path = "crates/kin-vector", version = "=0.2.1", registry = "kin" 
 #   kin-vector "=0.2.1"    crates/kin-vector 0.2.1
 #   kin-infer  "0.2.44"    crates/kin-infer  0.2.44
 #
-# kin-lsp and kin-vfs-core are here for the other half of the same problem. No
-# registry crate depends on either, but kin-cli and kin-daemon do, and without a
-# row each their entries above would still resolve by path while the registry
-# kin-db pulled nothing: the rows make the patch table the one place a reader
-# checks, and `cargo tree -d` is what proves none of them is silently dropped.
+# kin-lsp and kin-vfs-core are deliberately NOT here, and that was measured
+# rather than assumed. No registry crate depends on either, and kin's own crates
+# reach both by path, so nothing requests them from the registry for a patch to
+# redirect. Removing candidate rows for the two and re-locking moved no line of
+# the lock and produced no cargo output at all, so a row for either would have
+# been decoration carrying a reason it did not have.
 #
 # A patch whose version does not satisfy the requirement is ignored SILENTLY
 # and the build succeeds against the registry copy, so `cargo tree -d` listing
@@ -221,11 +222,9 @@ kin-vector = { path = "crates/kin-vector", version = "=0.2.1", registry = "kin" 
 [patch.kin]
 kin-blobs = { path = "crates/kin-blobs" }
 kin-infer = { path = "crates/kin-infer" }
-kin-lsp = { path = "crates/kin-lsp" }
 kin-model = { path = "crates/kin-model" }
 kin-search = { path = "crates/kin-search" }
 kin-vector = { path = "crates/kin-vector" }
-kin-vfs-core = { path = "crates/kin-vfs-core" }
 
 [profile.release]
 opt-level = 3
