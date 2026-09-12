@@ -1,0 +1,1846 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+use memmap2::Mmap;
+use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::engine::InMemoryGraph;
+use crate::error::KinDbError;
+use crate::storage::format::GraphSnapshot;
+use crate::storage::mmap;
+use crate::store::EntityStore;
+use crate::types::*;
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_RECOVERY_BEFORE_OPEN_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+fn set_after_recovery_before_open_hook(hook: impl FnOnce() + 'static) {
+    AFTER_RECOVERY_BEFORE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_recovery_before_open_hook() {
+    AFTER_RECOVERY_BEFORE_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_after_recovery_before_open_hook() {}
+
+/// System memory information used to configure tier sizes.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemMemInfo {
+    /// Total physical RAM in bytes.
+    pub total_ram: u64,
+    /// Available (free + reclaimable) RAM in bytes.
+    pub available_ram: u64,
+}
+
+impl SystemMemInfo {
+    /// Detect current system memory using sysinfo.
+    pub fn detect() -> Self {
+        use sysinfo::System;
+        let sys = System::new_with_specifics(
+            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+        );
+        Self {
+            total_ram: sys.total_memory(),
+            available_ram: sys.available_memory(),
+        }
+    }
+}
+
+/// Configuration for the tiered storage engine.
+#[derive(Debug, Clone)]
+pub struct TieredConfig {
+    /// Maximum bytes for the hot (in-memory) tier.
+    /// If None, auto-detected from available RAM (50% of free).
+    pub max_hot_bytes: Option<usize>,
+    /// Estimated bytes per entity (used for capacity decisions).
+    /// Default: 200 bytes (conservative for typical code entities).
+    pub bytes_per_entity: usize,
+}
+
+impl Default for TieredConfig {
+    fn default() -> Self {
+        Self {
+            max_hot_bytes: None,
+            bytes_per_entity: 200,
+        }
+    }
+}
+
+impl TieredConfig {
+    /// Compute the effective hot tier budget in bytes.
+    pub fn effective_hot_bytes(&self) -> usize {
+        self.max_hot_bytes.unwrap_or_else(|| {
+            let info = SystemMemInfo::detect();
+            // Use 50% of available RAM for the hot tier
+            (info.available_ram / 2) as usize
+        })
+    }
+
+    /// How many entities fit in the hot tier?
+    pub fn hot_capacity(&self) -> usize {
+        self.effective_hot_bytes() / self.bytes_per_entity
+    }
+}
+
+/// Strategy for loading graph data based on available memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStrategy {
+    /// Graph fits in memory — load everything into InMemoryGraph.
+    FullLoad,
+    /// Graph too large — keep mmap open, InMemoryGraph holds hot subset.
+    MmapBacked,
+}
+
+/// Tiered graph storage: a hot in-memory tier plus a cold mmap tier.
+///
+/// **Status: implemented but not yet wired into the default load/serve path.**
+/// The live runtime path ([`crate::storage::SnapshotManager`]) always fully
+/// deserializes a snapshot into a single [`InMemoryGraph`]; it never constructs
+/// a `TieredGraph`, and the cold mmap tier is not consulted when serving graph
+/// truth. This type exists so an oversized-graph path can be adopted later, but
+/// until it is wired into the serve path (and validated against a measured
+/// memory ceiling) it backs no production read. Treat it as a candidate
+/// mechanism, not a shipping capability.
+///
+/// # Intended mechanism
+///
+/// 1. On open, compare the snapshot file size against available RAM.
+/// 2. If it fits (estimated in-memory size within the hot budget), fully
+///    deserialize into [`InMemoryGraph`] — identical to the non-tiered path.
+/// 3. If it does not fit, keep the mmap open and hydrate a bounded hot subset.
+///    Cold lookups fall back to the mmap-backed snapshot, leaving the OS page
+///    cache to keep hot pages resident and page cold data back from disk.
+///
+/// The design bet behind the `MmapBacked` strategy is that mmap plus the OS
+/// page cache can stand in for an explicit eviction policy. That is a design
+/// intent, not a benchmarked guarantee: the actual graph size this sustains is
+/// unmeasured, so this type makes no specific large-graph capacity claim.
+pub struct TieredGraph {
+    /// Hot tier: in-memory graph for fast indexed access.
+    hot: Arc<InMemoryGraph>,
+    /// Cold tier: memory-mapped snapshot file (if graph exceeds hot budget).
+    /// The Mmap is kept alive so the OS can page data in/out.
+    _cold_mmap: RwLock<Option<Mmap>>,
+    /// The deserialized cold snapshot (lazily loaded from mmap).
+    /// This is only populated when strategy is MmapBacked.
+    cold_snapshot: RwLock<Option<GraphSnapshot>>,
+    /// The hot subset we own authoritatively for mmap-backed save reconciliation.
+    managed_scope: RwLock<Option<ManagedHotScope>>,
+    /// What strategy was selected.
+    strategy: LoadStrategy,
+    /// Path to the snapshot file.
+    path: PathBuf,
+    /// Configuration.
+    config: TieredConfig,
+    /// System memory info at startup (for diagnostics).
+    mem_info: SystemMemInfo,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ManagedHotScope {
+    entity_ids: HashSet<EntityId>,
+    relation_ids: HashSet<RelationId>,
+    external_reference_ids: HashSet<ExternalReferenceId>,
+}
+
+impl ManagedHotScope {
+    fn from_snapshot(snapshot: &GraphSnapshot) -> Self {
+        let mut scope = Self::default();
+        scope.record_snapshot(snapshot);
+        scope
+    }
+
+    fn record_snapshot(&mut self, snapshot: &GraphSnapshot) {
+        self.entity_ids.extend(snapshot.entities.keys().copied());
+        self.relation_ids.extend(snapshot.relations.keys().copied());
+        self.external_reference_ids
+            .extend(snapshot.external_references.keys().copied());
+    }
+}
+
+impl TieredGraph {
+    /// Open a tiered graph from a snapshot file.
+    ///
+    /// Auto-detects available RAM and chooses the appropriate loading strategy.
+    pub fn open(path: impl Into<PathBuf>, config: TieredConfig) -> Result<Self, KinDbError> {
+        let path = path.into();
+        let mem_info = SystemMemInfo::detect();
+        ensure_recoverable_snapshot_file(&path)?;
+
+        if !path_entry_exists(&path, "tiered snapshot")? {
+            // No snapshot file — start with an empty graph
+            return Ok(Self {
+                hot: Arc::new(InMemoryGraph::new()),
+                _cold_mmap: RwLock::new(None),
+                cold_snapshot: RwLock::new(None),
+                managed_scope: RwLock::new(None),
+                strategy: LoadStrategy::FullLoad,
+                path,
+                config,
+                mem_info,
+            });
+        }
+
+        // Hold the no-follow regular-file descriptor used for both strategy
+        // selection and the mmap branch. A path swap after recovery validation
+        // can therefore only make a later safe open fail, never map a symlink
+        // target or block on a FIFO.
+        run_after_recovery_before_open_hook();
+        let file = mmap::open_regular_nofollow(&path, "tiered snapshot")?;
+        let file_size = file
+            .metadata()
+            .map_err(|e| {
+                KinDbError::StorageError(format!("failed to stat {}: {e}", path.display()))
+            })?
+            .len();
+
+        let hot_budget = config.effective_hot_bytes() as u64;
+
+        // Heuristic: the deserialized graph is ~2-4x larger than the JSON on disk.
+        // Use 4x as a conservative multiplier.
+        let estimated_in_memory = file_size * 4;
+
+        if estimated_in_memory <= hot_budget {
+            // Fits in memory — full load
+            let snapshot = load_snapshot_from_disk(&path)?;
+            let graph = hydrate_graph(snapshot)?;
+            Ok(Self {
+                hot: Arc::new(graph),
+                _cold_mmap: RwLock::new(None),
+                cold_snapshot: RwLock::new(None),
+                managed_scope: RwLock::new(None),
+                strategy: LoadStrategy::FullLoad,
+                path,
+                config,
+                mem_info,
+            })
+        } else {
+            // Too large — use mmap-backed strategy
+            let mmap = unsafe {
+                Mmap::map(&file).map_err(|e| {
+                    KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
+                })?
+            };
+
+            // Advise the kernel that we'll access this randomly
+            #[cfg(unix)]
+            {
+                mmap.advise(memmap2::Advice::Random).ok();
+            }
+
+            // Deserialize the snapshot from the mmap.
+            // The OS page cache handles which pages are resident.
+            let snapshot = GraphSnapshot::from_bytes(&mmap)?;
+
+            // Load a hot subset into InMemoryGraph for indexed queries.
+            // Take the first N entities that fit in our budget.
+            let hot_capacity = config.hot_capacity();
+            let graph = hydrate_graph_partial(&snapshot, hot_capacity)?;
+            let hot_snapshot = graph.to_snapshot();
+
+            Ok(Self {
+                hot: Arc::new(graph),
+                _cold_mmap: RwLock::new(Some(mmap)),
+                cold_snapshot: RwLock::new(Some(snapshot)),
+                managed_scope: RwLock::new(Some(ManagedHotScope::from_snapshot(&hot_snapshot))),
+                strategy: LoadStrategy::MmapBacked,
+                path,
+                config,
+                mem_info,
+            })
+        }
+    }
+
+    /// Open with default configuration (auto-detect everything).
+    pub fn open_auto(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
+        Self::open(path, TieredConfig::default())
+    }
+
+    /// Which loading strategy was chosen?
+    pub fn strategy(&self) -> LoadStrategy {
+        self.strategy
+    }
+
+    /// System memory info detected at startup.
+    pub fn mem_info(&self) -> &SystemMemInfo {
+        &self.mem_info
+    }
+
+    /// Get the hot tier graph for direct access.
+    pub fn hot_graph(&self) -> &Arc<InMemoryGraph> {
+        &self.hot
+    }
+
+    /// Number of entities in the hot tier.
+    pub fn hot_entity_count(&self) -> usize {
+        self.hot.entity_count()
+    }
+
+    /// Total number of entities (hot + cold).
+    pub fn total_entity_count(&self) -> usize {
+        match &*self.cold_snapshot.read() {
+            Some(snap) => snap.entities.len(),
+            None => self.hot.entity_count(),
+        }
+    }
+
+    /// Total number of relations (hot + cold).
+    pub fn total_relation_count(&self) -> usize {
+        match &*self.cold_snapshot.read() {
+            Some(snap) => snap.relations.len(),
+            None => self.hot.relation_count(),
+        }
+    }
+
+    /// Look up an entity, checking hot tier first, then cold.
+    pub fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, KinDbError> {
+        // Hot path: check in-memory graph first
+        if let Some(entity) = self.hot.get_entity(id)? {
+            return Ok(Some(entity));
+        }
+
+        // Cold path: check mmap-backed snapshot
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
+            if let Some(entity) = snap.entities.get(id) {
+                return Ok(Some(entity.clone()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Look up a relation by ID, checking cold snapshot directly.
+    /// (The GraphStore trait has no single-relation getter, so this
+    /// is only available when using TieredGraph directly.)
+    pub fn get_relation_by_id(&self, id: &RelationId) -> Option<Relation> {
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
+            snap.relations.get(id).cloned()
+        } else {
+            // FullLoad mode — no cold snapshot, relations are in hot tier.
+            // We'd need to scan all entities' relations, which is expensive.
+            // For FullLoad, callers should use get_relations() on the hot graph.
+            None
+        }
+    }
+
+    /// Get outgoing relations for an entity from both tiers.
+    pub fn get_relations(
+        &self,
+        entity_id: &EntityId,
+        kinds: &[RelationKind],
+    ) -> Result<Vec<Relation>, KinDbError> {
+        let mut results = self.hot.get_relations(entity_id, kinds)?;
+
+        // Check cold tier for additional relations
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
+            if let Some(rel_ids) = snap.outgoing.get(entity_id) {
+                for rel_id in rel_ids {
+                    // Skip if already in hot results
+                    if results.iter().any(|r| r.id == *rel_id) {
+                        continue;
+                    }
+                    if let Some(rel) = snap.relations.get(rel_id) {
+                        if kinds.is_empty() || kinds.contains(&rel.kind) {
+                            results.push(rel.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Search entities by name pattern across both tiers.
+    ///
+    /// Hot and cold matches are merged under a single ranking rather than
+    /// concatenated: every match is keyed by its name-match relevance (exact
+    /// name match ahead of partial match) with the entity id as a total
+    /// tie-break. The id tie-break keeps the order deterministic even though
+    /// the cold tier is iterated in HashMap order.
+    pub fn query_entities_by_name(&self, pattern: &str) -> Result<Vec<Entity>, KinDbError> {
+        let filter = EntityFilter {
+            name_pattern: Some(pattern.to_string()),
+            ..Default::default()
+        };
+        let mut results = self.hot.query_entities(&filter)?;
+
+        // Also search cold tier
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
+            let pattern_lower = pattern.to_lowercase();
+            for entity in snap.entities.values() {
+                if entity.name.to_lowercase().contains(&pattern_lower) {
+                    // Skip duplicates from hot tier
+                    if !results.iter().any(|e| e.id == entity.id) {
+                        results.push(entity.clone());
+                    }
+                }
+            }
+        }
+
+        // Merge hot + cold under one ranking. `sort_by` is stable, and the
+        // explicit id tie-break makes the result independent of both the input
+        // order and HashMap iteration order.
+        results.sort_by(|a, b| {
+            name_match_rank(&a.name, pattern)
+                .cmp(&name_match_rank(&b.name, pattern))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        Ok(results)
+    }
+
+    /// Get the snapshot file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Save the current hot graph to disk atomically.
+    ///
+    /// For MmapBacked strategy, this merges hot changes with cold data
+    /// before writing.
+    pub fn save(&self) -> Result<(), KinDbError> {
+        let hot_snapshot = self.hot.to_snapshot();
+        let snapshot = if self.strategy == LoadStrategy::MmapBacked {
+            let cold = load_snapshot_from_disk(&self.path)?;
+            let scope = self
+                .managed_scope
+                .read()
+                .clone()
+                .unwrap_or_else(|| ManagedHotScope::from_snapshot(&hot_snapshot));
+            merge_hot_into_cold(cold, hot_snapshot.clone(), &scope)?
+        } else {
+            hot_snapshot.clone()
+        };
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to create directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        mmap::atomic_write(&self.path, &snapshot)?;
+
+        if self.strategy == LoadStrategy::MmapBacked {
+            self.refresh_cold_state()?;
+            let mut scope = self.managed_scope.write();
+            scope
+                .get_or_insert_with(ManagedHotScope::default)
+                .record_snapshot(&hot_snapshot);
+        }
+
+        Ok(())
+    }
+
+    fn refresh_cold_state(&self) -> Result<(), KinDbError> {
+        let (mmap, snapshot) = mmap_snapshot_file(&self.path)?;
+        *self._cold_mmap.write() = Some(mmap);
+        *self.cold_snapshot.write() = Some(snapshot);
+        Ok(())
+    }
+}
+
+/// Relevance rank of an entity name against a query pattern. Lower is better:
+/// an exact (case-insensitive) full-name match ranks ahead of a partial match.
+/// Mirrors the pattern interpretation used by `matches_filter` so hot-tier and
+/// cold-tier matches are ranked on the same scale.
+fn name_match_rank(name: &str, pattern: &str) -> u8 {
+    let pat = pattern.to_lowercase();
+    let name = name.to_lowercase();
+    let bare = pat.trim_start_matches('*').trim_end_matches('*');
+    if name == bare {
+        0
+    } else {
+        1
+    }
+}
+
+/// Hydrate a full InMemoryGraph from a snapshot.
+fn hydrate_graph(snapshot: GraphSnapshot) -> Result<InMemoryGraph, KinDbError> {
+    InMemoryGraph::from_snapshot(snapshot)
+}
+
+/// Hydrate a partial InMemoryGraph with at most `max_entities` entities.
+///
+/// Loads entities and their connected relations up to the capacity limit.
+fn hydrate_graph_partial(
+    snapshot: &GraphSnapshot,
+    max_entities: usize,
+) -> Result<InMemoryGraph, KinDbError> {
+    let mut hot = GraphSnapshot::empty();
+    hot.entities = snapshot
+        .entities
+        .values()
+        .take(max_entities)
+        .map(|entity| (entity.id, entity.clone()))
+        .collect();
+    let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
+
+    // Load relations whose entity endpoints are all in the hot set. External
+    // endpoints needed by those relations join the same managed scope, while
+    // unrelated standalone references remain cold.
+    for relation in snapshot.relations.values() {
+        let endpoints = [relation.src, relation.dst];
+        let touches_hot_entity = endpoints
+            .iter()
+            .any(|node| matches!(node, GraphNodeId::Entity(id) if hot_entity_ids.contains(id)));
+        let all_endpoints_admitted = endpoints.iter().all(|node| match node {
+            GraphNodeId::Entity(id) => hot_entity_ids.contains(id),
+            GraphNodeId::ExternalReference(id) => snapshot.external_references.contains_key(id),
+            _ => false,
+        });
+        if touches_hot_entity && all_endpoints_admitted {
+            for node in endpoints {
+                if let GraphNodeId::ExternalReference(id) = node {
+                    let reference = snapshot.external_references.get(&id).ok_or_else(|| {
+                        KinDbError::StorageError(format!(
+                            "tiered relation {} references missing external endpoint {id}",
+                            relation.id
+                        ))
+                    })?;
+                    hot.external_references.insert(id, reference.clone());
+                }
+            }
+            hot.relations.insert(relation.id, relation.clone());
+        }
+    }
+
+    rebuild_relation_indexes(&mut hot);
+    hydrate_graph(hot)
+}
+
+fn merge_hot_into_cold(
+    mut cold: GraphSnapshot,
+    hot: GraphSnapshot,
+    scope: &ManagedHotScope,
+) -> Result<GraphSnapshot, KinDbError> {
+    // A tier merge produces a snapshot whose graph is not the one any section
+    // was resolved for, and this is not a published authority snapshot, so the
+    // section is dropped rather than carried into a claim nobody checked. The
+    // version follows the contents: no section means v13.
+    cold.materialized_graph = None;
+    cold.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
+    let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
+    let deleted_managed_entities: HashSet<_> = scope
+        .entity_ids
+        .difference(&hot_entity_ids)
+        .copied()
+        .collect();
+    let hot_external_reference_ids: HashSet<_> = hot.external_references.keys().copied().collect();
+    let deleted_managed_external_references: HashSet<_> = scope
+        .external_reference_ids
+        .difference(&hot_external_reference_ids)
+        .copied()
+        .collect();
+
+    cold.entities
+        .retain(|entity_id, _| !scope.entity_ids.contains(entity_id));
+    cold.external_references.retain(|external_reference_id, _| {
+        !scope.external_reference_ids.contains(external_reference_id)
+    });
+    cold.relations.retain(|relation_id, relation| {
+        !scope.relation_ids.contains(relation_id)
+            && !endpoint_was_deleted(
+                relation.src,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            )
+            && !endpoint_was_deleted(
+                relation.dst,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            )
+    });
+    cold.entities.extend(hot.entities);
+    cold.external_references.extend(hot.external_references);
+    cold.relations
+        .extend(hot.relations.into_iter().filter(|(_, relation)| {
+            !endpoint_was_deleted(
+                relation.src,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            ) && !endpoint_was_deleted(
+                relation.dst,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            )
+        }));
+    cold.changes.extend(hot.changes);
+    cold.change_children.extend(hot.change_children);
+    cold.work_items.extend(hot.work_items);
+    cold.annotations.extend(hot.annotations);
+
+    // Merge Vec fields by deduplicating instead of replacing
+    if !hot.work_links.is_empty() {
+        for link in hot.work_links {
+            if !cold.work_links.contains(&link) {
+                cold.work_links.push(link);
+            }
+        }
+    }
+
+    cold.test_cases.extend(hot.test_cases);
+    cold.assertions.extend(hot.assertions);
+    cold.verification_runs.extend(hot.verification_runs);
+
+    if !hot.mock_hints.is_empty() {
+        let existing: HashSet<_> = cold.mock_hints.iter().map(|m| m.hint_id).collect();
+        cold.mock_hints.extend(
+            hot.mock_hints
+                .into_iter()
+                .filter(|m| !existing.contains(&m.hint_id)),
+        );
+    }
+
+    cold.contracts.extend(hot.contracts);
+    cold.actors.extend(hot.actors);
+
+    if !hot.delegations.is_empty() {
+        let existing: HashSet<_> = cold.delegations.iter().map(|d| d.delegation_id).collect();
+        cold.delegations.extend(
+            hot.delegations
+                .into_iter()
+                .filter(|d| !existing.contains(&d.delegation_id)),
+        );
+    }
+    if !hot.approvals.is_empty() {
+        let existing: HashSet<_> = cold.approvals.iter().map(|a| a.approval_id).collect();
+        cold.approvals.extend(
+            hot.approvals
+                .into_iter()
+                .filter(|a| !existing.contains(&a.approval_id)),
+        );
+    }
+    if !hot.audit_events.is_empty() {
+        let existing: HashSet<_> = cold.audit_events.iter().map(|e| e.event_id).collect();
+        cold.audit_events.extend(
+            hot.audit_events
+                .into_iter()
+                .filter(|e| !existing.contains(&e.event_id)),
+        );
+    }
+    if !hot.shallow_files.is_empty() {
+        let incoming: HashSet<_> = hot
+            .shallow_files
+            .iter()
+            .map(|f| f.file_id.clone())
+            .collect();
+        cold.shallow_files
+            .retain(|f| !incoming.contains(&f.file_id));
+        cold.shallow_files.extend(hot.shallow_files);
+    }
+    if !hot.structured_artifacts.is_empty() {
+        let incoming: HashSet<_> = hot
+            .structured_artifacts
+            .iter()
+            .map(|artifact| artifact.file_id.clone())
+            .collect();
+        cold.structured_artifacts
+            .retain(|artifact| !incoming.contains(&artifact.file_id));
+        cold.structured_artifacts.extend(hot.structured_artifacts);
+    }
+    if !hot.opaque_artifacts.is_empty() {
+        let incoming: HashSet<_> = hot
+            .opaque_artifacts
+            .iter()
+            .map(|artifact| artifact.file_id.clone())
+            .collect();
+        cold.opaque_artifacts
+            .retain(|artifact| !incoming.contains(&artifact.file_id));
+        cold.opaque_artifacts.extend(hot.opaque_artifacts);
+    }
+
+    let mut artifacts: Vec<_> = cold.resolved_tree.into_artifacts().collect();
+    for incoming in hot.resolved_tree.into_artifacts() {
+        artifacts.retain(|artifact| {
+            artifact.artifact_id != incoming.artifact_id && artifact.path != incoming.path
+        });
+        artifacts.push(incoming);
+    }
+    cold.resolved_tree = ResolvedTree::from_artifacts(artifacts).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "tiered repository-tree merge violates identity/path authority: {error}"
+        ))
+    })?;
+    cold.sessions.extend(hot.sessions);
+    cold.intents.extend(hot.intents);
+
+    if !hot.downstream_warnings.is_empty() {
+        let existing: HashSet<_> = cold.downstream_warnings.iter().cloned().collect();
+        cold.downstream_warnings.extend(
+            hot.downstream_warnings
+                .into_iter()
+                .filter(|w| !existing.contains(w)),
+        );
+    }
+    rebuild_relation_indexes(&mut cold);
+    cold.validate_storage_admission()?;
+    Ok(cold)
+}
+
+fn endpoint_was_deleted(
+    node: GraphNodeId,
+    deleted_entities: &HashSet<EntityId>,
+    deleted_external_references: &HashSet<ExternalReferenceId>,
+) -> bool {
+    match node {
+        GraphNodeId::Entity(id) => deleted_entities.contains(&id),
+        GraphNodeId::ExternalReference(id) => deleted_external_references.contains(&id),
+        _ => false,
+    }
+}
+
+fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {
+    let mut outgoing = HashMap::<EntityId, Vec<RelationId>>::new();
+    let mut incoming = HashMap::<EntityId, Vec<RelationId>>::new();
+
+    for relation in snapshot.relations.values() {
+        if let Some(src) = relation.src.as_entity() {
+            outgoing.entry(src).or_default().push(relation.id);
+        }
+        if let Some(dst) = relation.dst.as_entity() {
+            incoming.entry(dst).or_default().push(relation.id);
+        }
+    }
+
+    snapshot.outgoing = outgoing;
+    snapshot.incoming = incoming;
+}
+
+fn promote_recovery_snapshot(
+    path: &Path,
+    primary_error: Option<&KinDbError>,
+) -> Result<(), KinDbError> {
+    let tmp_path = mmap::recovery_tmp_path(path);
+    if !tmp_path.exists() {
+        return Err(match primary_error {
+            Some(err) => KinDbError::StorageError(format!(
+                "failed to open {} and no recovery snapshot exists: {err}",
+                path.display()
+            )),
+            None => KinDbError::StorageError(format!(
+                "snapshot {} is missing and recovery snapshot {} is not present",
+                path.display(),
+                tmp_path.display()
+            )),
+        });
+    }
+
+    mmap::load_recovery_candidate(path).map_err(|tmp_err| {
+        let prefix = match primary_error {
+            Some(primary_err) => format!(
+                "failed to open primary snapshot {}: {primary_err}; ",
+                path.display()
+            ),
+            None => format!("primary snapshot {} is missing; ", path.display()),
+        };
+        KinDbError::StorageError(format!(
+            "{prefix}recovery snapshot {} is invalid: {tmp_err}",
+            tmp_path.display()
+        ))
+    })?;
+
+    mmap::promote_recovery_candidate(path).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "loaded recovery snapshot {} but failed to promote it to {}: {err}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn ensure_recoverable_snapshot_file(path: &Path) -> Result<(), KinDbError> {
+    if path_entry_exists(path, "tiered snapshot")? {
+        match mmap::MmapReader::open(path) {
+            Ok(_) => Ok(()),
+            Err(err) => promote_recovery_snapshot(path, Some(&err)),
+        }
+    } else {
+        let tmp_path = mmap::recovery_tmp_path(path);
+        if path_entry_exists(&tmp_path, "tiered recovery snapshot")? {
+            promote_recovery_snapshot(path, None)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn path_entry_exists(path: &Path, role: &str) -> Result<bool, KinDbError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(KinDbError::StorageError(format!(
+            "failed to inspect {role} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn load_snapshot_from_disk(path: &Path) -> Result<GraphSnapshot, KinDbError> {
+    ensure_recoverable_snapshot_file(path)?;
+    if !path_entry_exists(path, "tiered snapshot")? {
+        return Ok(GraphSnapshot::empty());
+    }
+    mmap::MmapReader::open(path)
+}
+
+fn mmap_snapshot_file(path: &Path) -> Result<(Mmap, GraphSnapshot), KinDbError> {
+    ensure_recoverable_snapshot_file(path)?;
+    run_after_recovery_before_open_hook();
+    let file = mmap::open_regular_nofollow(path, "tiered mmap snapshot")?;
+    let mmap = unsafe {
+        Mmap::map(&file).map_err(|e| {
+            KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
+        })?
+    };
+
+    #[cfg(unix)]
+    {
+        mmap.advise(memmap2::Advice::Random).ok();
+    }
+
+    let snapshot = GraphSnapshot::from_bytes(&mmap)?;
+    Ok((mmap, snapshot))
+}
+
+/// Diagnostic: print tiered storage status.
+impl std::fmt::Display for TieredGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_gb = self.mem_info.total_ram as f64 / (1024.0 * 1024.0 * 1024.0);
+        let avail_gb = self.mem_info.available_ram as f64 / (1024.0 * 1024.0 * 1024.0);
+        let hot_mb = self.config.effective_hot_bytes() as f64 / (1024.0 * 1024.0);
+
+        write!(
+            f,
+            "TieredGraph(strategy={:?}, hot={}/{} entities, RAM={:.1}GB total/{:.1}GB free, hot_budget={:.0}MB)",
+            self.strategy,
+            self.hot_entity_count(),
+            self.total_entity_count(),
+            total_gb,
+            avail_gb,
+            hot_mb,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    #[cfg(feature = "vector")]
+    use crate::storage::{build_entity_hash_map, compute_graph_root_hash, verify_subgraph};
+    #[cfg(feature = "vector")]
+    use crate::vector::VectorIndex;
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/main.rs")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    fn test_entity_with_language(name: &str, path: &str, language: LanguageId) -> Entity {
+        Entity {
+            file_origin: Some(FilePathId::new(path)),
+            language,
+            signature: format!("fn {name}()"),
+            ..test_entity(name)
+        }
+    }
+
+    fn test_relation(src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn test_external_relation(
+        src: EntityId,
+        dst: ExternalReferenceId,
+        import_source: &str,
+    ) -> Relation {
+        Relation {
+            id: RelationId::from_content(&src.to_string(), &dst.to_string(), "imports"),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::ExternalReference(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: Some(import_source.to_string()),
+            evidence: Vec::new(),
+        }
+    }
+
+    fn force_mmap_config_with_full_hot(path: &Path) -> TieredConfig {
+        let file_size = std::fs::metadata(path).unwrap().len() as usize;
+        TieredConfig {
+            max_hot_bytes: Some(file_size.saturating_mul(4).saturating_sub(1).max(1)),
+            bytes_per_entity: 1,
+        }
+    }
+
+    #[test]
+    fn system_mem_info_detects() {
+        let info = SystemMemInfo::detect();
+        // Sanity checks — any real machine has > 0 RAM
+        assert!(info.total_ram > 0);
+        assert!(info.available_ram > 0);
+        assert!(info.available_ram <= info.total_ram);
+    }
+
+    #[test]
+    fn tiered_config_defaults() {
+        let config = TieredConfig::default();
+        assert_eq!(config.bytes_per_entity, 200);
+        assert!(config.effective_hot_bytes() > 0);
+        assert!(config.hot_capacity() > 0);
+    }
+
+    #[test]
+    fn tiered_config_explicit_budget() {
+        let config = TieredConfig {
+            max_hot_bytes: Some(1_000_000), // 1MB
+            bytes_per_entity: 200,
+        };
+        assert_eq!(config.effective_hot_bytes(), 1_000_000);
+        assert_eq!(config.hot_capacity(), 5_000);
+    }
+
+    #[test]
+    fn open_nonexistent_creates_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tiered = TieredGraph::open_auto(&path).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::FullLoad);
+        assert_eq!(tiered.total_entity_count(), 0);
+        assert_eq!(tiered.hot_entity_count(), 0);
+    }
+
+    #[test]
+    fn full_load_small_graph() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // Write a small snapshot
+        let e1 = test_entity("alpha");
+        let e2 = test_entity("beta");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(e1.id, e1.clone()), (e2.id, e2.clone())]
+            .into_iter()
+            .collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        // Open — should full-load since it's tiny
+        let tiered = TieredGraph::open_auto(&path).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::FullLoad);
+        assert_eq!(tiered.total_entity_count(), 2);
+
+        // Entity lookup works
+        let found = tiered.get_entity(&e1.id).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn mmap_backed_with_tiny_budget() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // Write a snapshot with several entities
+        let entities: Vec<Entity> = (0..100)
+            .map(|i| test_entity(&format!("entity_{i}")))
+            .collect();
+        let entity_map: HashMap<EntityId, Entity> =
+            entities.iter().map(|e| (e.id, e.clone())).collect();
+
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entity_map;
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        // Force MmapBacked by setting an impossibly small budget (1 byte)
+        let config = TieredConfig {
+            max_hot_bytes: Some(1),
+            bytes_per_entity: 200,
+        };
+        let tiered = TieredGraph::open(&path, config).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        // Total count sees all entities via cold tier
+        assert_eq!(tiered.total_entity_count(), 100);
+
+        // Hot tier has 0 entities (budget = 1 byte / 200 = 0 capacity)
+        assert_eq!(tiered.hot_entity_count(), 0);
+
+        // But we can still look up any entity via cold tier
+        let first = &entities[0];
+        let found = tiered.get_entity(&first.id).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, first.name);
+    }
+
+    #[test]
+    fn mmap_backed_partial_hot_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // Write 50 entities
+        let entities: Vec<Entity> = (0..50).map(|i| test_entity(&format!("fn_{i}"))).collect();
+        let entity_map: HashMap<EntityId, Entity> =
+            entities.iter().map(|e| (e.id, e.clone())).collect();
+
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entity_map;
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        // Budget: 10 entities worth (10 * 200 = 2000 bytes budget, but file is bigger)
+        // We need to trick the heuristic: file_size * 4 > budget
+        // The file is ~10KB+, so budget needs to be < file_size * 4
+        let config = TieredConfig {
+            max_hot_bytes: Some(10), // Very small — forces mmap
+            bytes_per_entity: 1,     // So hot_capacity = 10 entities
+        };
+        let tiered = TieredGraph::open(&path, config).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        // Hot tier loaded at most 10 entities
+        assert!(tiered.hot_entity_count() <= 10);
+
+        // Total count is still 50
+        assert_eq!(tiered.total_entity_count(), 50);
+    }
+
+    #[test]
+    fn mmap_backed_open_recovers_from_valid_tmp_when_primary_is_corrupted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = mmap::recovery_tmp_path(&path);
+
+        let entity = test_entity("recover_mmap");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = [(entity.id, entity.clone())].into_iter().collect();
+        mmap::atomic_write(&path, &snapshot).unwrap();
+        mmap::write_recovery_candidate(&path, &snapshot).unwrap();
+
+        let mut corrupt_bytes = std::fs::read(&path).unwrap();
+        let mid = corrupt_bytes.len() / 2;
+        corrupt_bytes[mid] ^= 0xFF;
+        std::fs::write(&path, corrupt_bytes).unwrap();
+
+        let tiered = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(1),
+                bytes_per_entity: 200,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        let recovered = tiered.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(recovered.name, "recover_mmap");
+        assert!(path.exists(), "primary snapshot should be promoted");
+        assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+    }
+
+    #[test]
+    fn mmap_backed_open_recovers_from_valid_tmp_when_primary_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = mmap::recovery_tmp_path(&path);
+
+        let entity = test_entity("recover_missing_primary");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = [(entity.id, entity.clone())].into_iter().collect();
+        mmap::write_recovery_candidate(&path, &snapshot).unwrap();
+
+        let tiered = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(1),
+                bytes_per_entity: 200,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        let recovered = tiered.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(recovered.name, "recover_missing_primary");
+        assert!(
+            path.exists(),
+            "missing primary snapshot should be recreated from tmp"
+        );
+        assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+    }
+
+    #[test]
+    fn mmap_backed_open_rejects_unproven_tmp_when_primary_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = mmap::recovery_tmp_path(&path);
+
+        let entity = test_entity("unproven_recovery");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = [(entity.id, entity)].into_iter().collect();
+        std::fs::write(&tmp_path, snapshot.to_bytes().unwrap()).unwrap();
+
+        let err = match TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(1),
+                bytes_per_entity: 200,
+            },
+        ) {
+            Ok(_) => panic!("expected unproven recovery snapshot to fail tiered open"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unproven without a valid marker"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tiered_open_rejects_symlink_swapped_after_recovery_validation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let victim = dir.path().join("victim.kndb");
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&victim, &bytes).unwrap();
+        let raced_path = path.clone();
+        set_after_recovery_before_open_hook(move || {
+            std::fs::remove_file(&raced_path).unwrap();
+            symlink(&victim, &raced_path).unwrap();
+        });
+
+        let error = match TieredGraph::open(&path, TieredConfig::default()) {
+            Ok(_) => panic!("tiered open must not follow a post-validation symlink swap"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("tiered snapshot"),
+            "unexpected post-validation symlink error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn mmap_backed_reopen_preserves_mixed_language_truth_and_vector_mappings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let vector_path = dir.path().join("vectors.usearch");
+
+        let graph = InMemoryGraph::new();
+        let rust_entity = test_entity_with_language("compileRust", "src/lib.rs", LanguageId::Rust);
+        let ts_entity = test_entity_with_language("renderTs", "web/app.ts", LanguageId::TypeScript);
+        let py_entity = test_entity_with_language("trainPy", "tools/train.py", LanguageId::Python);
+        let relation = test_relation(rust_entity.id, ts_entity.id);
+
+        graph.upsert_entity(&rust_entity).unwrap();
+        graph.upsert_entity(&ts_entity).unwrap();
+        graph.upsert_entity(&py_entity).unwrap();
+        graph.upsert_relation(&relation).unwrap();
+
+        let snapshot = graph.to_snapshot();
+        let root_before = compute_graph_root_hash(&snapshot);
+        mmap::atomic_write(&path, &snapshot).unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors
+            .upsert(rust_entity.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        vectors
+            .upsert(ts_entity.id, &[0.92, 0.08, 0.0, 0.0])
+            .unwrap();
+        vectors.upsert(py_entity.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let results_before = vectors.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        vectors.save(&vector_path).unwrap();
+
+        let reopened = TieredGraph::open(&path, force_mmap_config_with_full_hot(&path)).unwrap();
+        assert_eq!(reopened.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(reopened.hot_entity_count(), reopened.total_entity_count());
+
+        let reopened_snapshot = reopened.hot.to_snapshot();
+        let root_after = compute_graph_root_hash(&reopened_snapshot);
+        assert_eq!(root_before, root_after);
+
+        let filter = EntityFilter {
+            languages: Some(vec![LanguageId::Rust, LanguageId::TypeScript]),
+            ..Default::default()
+        };
+        let filtered = reopened.hot.query_entities(&filter).unwrap();
+        let filtered_ids: HashSet<_> = filtered.into_iter().map(|entity| entity.id).collect();
+        assert_eq!(filtered_ids.len(), 2);
+        assert!(filtered_ids.contains(&rust_entity.id));
+        assert!(filtered_ids.contains(&ts_entity.id));
+        assert!(!filtered_ids.contains(&py_entity.id));
+
+        let hashes = build_entity_hash_map(&reopened_snapshot);
+        let report = verify_subgraph(&rust_entity.id, &reopened_snapshot, &hashes).unwrap();
+        assert!(report.is_valid);
+        assert!(report.tampered.is_empty());
+
+        let relations = reopened
+            .get_relations(&rust_entity.id, &[RelationKind::Calls])
+            .unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].dst, GraphNodeId::Entity(ts_entity.id));
+        assert_eq!(
+            reopened.get_entity(&py_entity.id).unwrap().unwrap().name,
+            "trainPy"
+        );
+
+        let loaded_vectors = VectorIndex::load_from_disk(&vector_path).unwrap();
+        let results_after = loaded_vectors
+            .search_similar(&[1.0, 0.0, 0.0, 0.0], 2)
+            .unwrap();
+        assert_eq!(results_after, results_before);
+        assert_eq!(results_after[0].0, RetrievalKey::from(rust_entity.id));
+        assert_eq!(results_after[1].0, RetrievalKey::from(ts_entity.id));
+    }
+
+    #[test]
+    fn save_and_reload_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // Create tiered graph, add entities, save
+        let tiered = TieredGraph::open_auto(&path).unwrap();
+        let e = test_entity("roundtrip");
+        let id = e.id;
+        tiered.hot.upsert_entity(&e).unwrap();
+        tiered.save().unwrap();
+
+        // Reload
+        let tiered2 = TieredGraph::open_auto(&path).unwrap();
+        let found = tiered2.get_entity(&id).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "roundtrip");
+    }
+
+    #[test]
+    fn mmap_backed_save_persists_entity_deletion_and_refreshes_current_view() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let e1 = test_entity("alpha");
+        let e2 = test_entity("beta");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(e1.id, e1.clone()), (e2.id, e2.clone())]
+            .into_iter()
+            .collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        tiered.hot.remove_entity(&e1.id).unwrap();
+        tiered.save().unwrap();
+
+        assert!(tiered.get_entity(&e1.id).unwrap().is_none());
+        assert!(tiered.get_entity(&e2.id).unwrap().is_some());
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        assert!(reopened.get_entity(&e1.id).unwrap().is_none());
+        assert!(reopened.get_entity(&e2.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn mmap_backed_save_persists_relation_deletion() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let e1 = test_entity("caller");
+        let e2 = test_entity("callee");
+        let rel = test_relation(e1.id, e2.id);
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(e1.id, e1.clone()), (e2.id, e2.clone())]
+            .into_iter()
+            .collect();
+        snap.relations = [(rel.id, rel.clone())].into_iter().collect();
+        rebuild_relation_indexes(&mut snap);
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        tiered.hot.remove_relation(&rel.id).unwrap();
+        tiered.save().unwrap();
+
+        assert!(tiered.get_relation_by_id(&rel.id).is_none());
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        assert!(reopened.get_relation_by_id(&rel.id).is_none());
+        assert!(reopened
+            .get_relations(&e1.id, &[RelationKind::Calls])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn mmap_backed_hydrates_relation_bound_external_reference_scope_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let entity = test_entity("external_client");
+        let bound = ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let standalone =
+            ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge").unwrap();
+        let relation = test_external_relation(entity.id, bound.id, "requests.get");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(entity.id, entity);
+        snapshot.external_references.insert(bound.id, bound.clone());
+        snapshot
+            .external_references
+            .insert(standalone.id, standalone.clone());
+        snapshot.relations.insert(relation.id, relation.clone());
+        rebuild_relation_indexes(&mut snapshot);
+        mmap::atomic_write(&path, &snapshot).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(
+            tiered.hot.get_external_reference(&bound.id),
+            Some(bound.clone()),
+            "a relation-bound endpoint must hydrate with its managed relation"
+        );
+        assert_eq!(
+            tiered.hot.get_external_reference(&standalone.id),
+            None,
+            "an unrelated standalone record must remain cold"
+        );
+        assert_eq!(
+            tiered.hot.to_snapshot().relations.get(&relation.id),
+            Some(&relation)
+        );
+        {
+            let scope_guard = tiered.managed_scope.read();
+            let scope = scope_guard
+                .as_ref()
+                .expect("mmap mode records managed scope");
+            assert!(scope.external_reference_ids.contains(&bound.id));
+            assert!(!scope.external_reference_ids.contains(&standalone.id));
+        }
+
+        tiered.save().unwrap();
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        let reopened_snapshot = reopened.cold_snapshot.read();
+        let reopened_snapshot = reopened_snapshot.as_ref().unwrap();
+        assert_eq!(
+            reopened_snapshot.external_references.get(&bound.id),
+            Some(&bound)
+        );
+        assert_eq!(
+            reopened_snapshot.external_references.get(&standalone.id),
+            Some(&standalone),
+            "saving the managed subset must preserve unrelated cold records"
+        );
+        assert_eq!(
+            reopened_snapshot.relations.get(&relation.id),
+            Some(&relation)
+        );
+    }
+
+    #[test]
+    fn mmap_backed_save_merges_external_reference_add_remove_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let entity = test_entity("external_mutator");
+        let old_bound =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let untouched_cold =
+            ExternalReference::new_resolved("npm-package-v1", "left-pad", "default").unwrap();
+        let old_relation = test_external_relation(entity.id, old_bound.id, "requests.get");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(entity.id, entity.clone());
+        snapshot
+            .external_references
+            .insert(old_bound.id, old_bound.clone());
+        snapshot
+            .external_references
+            .insert(untouched_cold.id, untouched_cold.clone());
+        snapshot
+            .relations
+            .insert(old_relation.id, old_relation.clone());
+        rebuild_relation_indexes(&mut snapshot);
+        mmap::atomic_write(&path, &snapshot).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        let new_bound =
+            ExternalReference::new_resolved("python-module-v1", "urllib", "open").unwrap();
+        let new_standalone =
+            ExternalReference::new_resolved("npm-package-v1", "@kin/runtime", "connect").unwrap();
+        let new_relation = test_external_relation(entity.id, new_bound.id, "urllib.open");
+        tiered
+            .hot
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: vec![
+                    RelationDelta::Removed {
+                        old: old_relation.clone(),
+                    },
+                    RelationDelta::Added {
+                        new: new_relation.clone(),
+                    },
+                ],
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: vec![
+                    ExternalReferenceDelta::Removed {
+                        old: old_bound.clone(),
+                    },
+                    ExternalReferenceDelta::Added {
+                        new: new_bound.clone(),
+                    },
+                    ExternalReferenceDelta::Added {
+                        new: new_standalone.clone(),
+                    },
+                ],
+            })
+            .unwrap();
+        tiered.save().unwrap();
+
+        {
+            let saved = tiered.cold_snapshot.read();
+            let saved = saved.as_ref().unwrap();
+            assert!(!saved.external_references.contains_key(&old_bound.id));
+            assert!(!saved.relations.contains_key(&old_relation.id));
+            assert_eq!(
+                saved.external_references.get(&untouched_cold.id),
+                Some(&untouched_cold),
+                "an unmanaged cold standalone record must not be replaced by the hot subset"
+            );
+            assert_eq!(
+                saved.external_references.get(&new_bound.id),
+                Some(&new_bound)
+            );
+            assert_eq!(
+                saved.external_references.get(&new_standalone.id),
+                Some(&new_standalone)
+            );
+            assert_eq!(saved.relations.get(&new_relation.id), Some(&new_relation));
+        }
+
+        tiered
+            .hot
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Removed {
+                    old: new_standalone.clone(),
+                }],
+            })
+            .unwrap();
+        tiered.save().unwrap();
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        let reopened_snapshot = reopened.cold_snapshot.read();
+        let reopened_snapshot = reopened_snapshot.as_ref().unwrap();
+        assert!(!reopened_snapshot
+            .external_references
+            .contains_key(&old_bound.id));
+        assert!(!reopened_snapshot
+            .external_references
+            .contains_key(&new_standalone.id));
+        assert_eq!(
+            reopened_snapshot
+                .external_references
+                .get(&untouched_cold.id),
+            Some(&untouched_cold)
+        );
+        assert_eq!(
+            reopened_snapshot.external_references.get(&new_bound.id),
+            Some(&new_bound)
+        );
+        assert_eq!(
+            reopened_snapshot.relations.get(&new_relation.id),
+            Some(&new_relation)
+        );
+    }
+
+    #[test]
+    fn mmap_backed_save_persists_entity_updates_without_resurrecting_old_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mut entity = test_entity("before");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(entity.id, entity.clone())].into_iter().collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        entity.name = "after".to_string();
+        entity.signature = "fn after()".to_string();
+        tiered.hot.upsert_entity(&entity).unwrap();
+        tiered.save().unwrap();
+
+        let current = tiered.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(current.name, "after");
+        assert!(tiered.query_entities_by_name("before").unwrap().is_empty());
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        let reloaded = reopened.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(reloaded.name, "after");
+        assert!(reopened
+            .query_entities_by_name("before")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn mmap_backed_save_rebuilds_cross_scope_adjacency_after_partial_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let entities: Vec<Entity> = (0..6).map(|i| test_entity(&format!("node_{i}"))).collect();
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entities
+            .iter()
+            .map(|entity| (entity.id, entity.clone()))
+            .collect();
+        for src in &entities {
+            for dst in &entities {
+                if src.id != dst.id {
+                    let rel = test_relation(src.id, dst.id);
+                    snap.relations.insert(rel.id, rel);
+                }
+            }
+        }
+        rebuild_relation_indexes(&mut snap);
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let tiered = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(3),
+                bytes_per_entity: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(tiered.hot_entity_count(), 3);
+
+        let loaded = tiered.hot.list_all_entities().unwrap();
+        let probe = loaded.first().unwrap();
+        let expected = snap.outgoing.get(&probe.id).unwrap().len();
+        assert_eq!(
+            tiered
+                .get_relations(&probe.id, &[RelationKind::Calls])
+                .unwrap()
+                .len(),
+            expected
+        );
+
+        tiered.save().unwrap();
+
+        let reopened = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(3),
+                bytes_per_entity: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .get_relations(&probe.id, &[RelationKind::Calls])
+                .unwrap()
+                .len(),
+            expected
+        );
+    }
+
+    #[test]
+    fn mmap_backed_save_removes_cold_relations_for_deleted_loaded_entity() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let entities: Vec<Entity> = (0..4)
+            .map(|i| test_entity(&format!("entity_{i}")))
+            .collect();
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entities
+            .iter()
+            .map(|entity| (entity.id, entity.clone()))
+            .collect();
+        for src in &entities {
+            for dst in &entities {
+                if src.id != dst.id {
+                    let rel = test_relation(src.id, dst.id);
+                    snap.relations.insert(rel.id, rel);
+                }
+            }
+        }
+        rebuild_relation_indexes(&mut snap);
+        let original_relation_count = snap.relations.len();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = TieredConfig {
+            max_hot_bytes: Some(2),
+            bytes_per_entity: 1,
+        };
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(tiered.hot_entity_count(), 2);
+
+        let deleted = tiered.hot.list_all_entities().unwrap()[0].id;
+        tiered.hot.remove_entity(&deleted).unwrap();
+        tiered.save().unwrap();
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        assert!(reopened.get_entity(&deleted).unwrap().is_none());
+        assert!(reopened.get_relations(&deleted, &[]).unwrap().is_empty());
+        assert_eq!(reopened.total_relation_count(), original_relation_count - 6);
+        assert!(reopened
+            .cold_snapshot
+            .read()
+            .as_ref()
+            .unwrap()
+            .relations
+            .values()
+            .all(|relation| {
+                relation.src.as_entity() != Some(deleted)
+                    && relation.dst.as_entity() != Some(deleted)
+            }));
+    }
+
+    #[test]
+    fn display_shows_diagnostics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tiered = TieredGraph::open_auto(&path).unwrap();
+        let display = format!("{tiered}");
+        assert!(display.contains("FullLoad"));
+        assert!(display.contains("hot=0/0"));
+        assert!(display.contains("RAM="));
+    }
+
+    #[test]
+    fn search_spans_both_tiers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // Create 20 entities — only load 5 hot
+        let entities: Vec<Entity> = (0..20)
+            .map(|i| test_entity(&format!("searchable_fn_{i}")))
+            .collect();
+        let entity_map: HashMap<EntityId, Entity> =
+            entities.iter().map(|e| (e.id, e.clone())).collect();
+
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entity_map;
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = TieredConfig {
+            max_hot_bytes: Some(1), // Force mmap
+            bytes_per_entity: 1,
+        };
+        let tiered = TieredGraph::open(&path, config).unwrap();
+
+        // Search should find entities from cold tier
+        let results = tiered.query_entities_by_name("searchable_fn_1").unwrap();
+        // Should find searchable_fn_1, searchable_fn_10-19
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|e| e.name == "searchable_fn_1"));
+    }
+
+    fn test_entity_with_id(id_seed: u128, name: &str) -> Entity {
+        Entity {
+            id: EntityId(uuid::Uuid::from_u128(id_seed)),
+            ..test_entity(name)
+        }
+    }
+
+    /// Open a tiered graph whose snapshot file holds `cold` entities, forced
+    /// fully cold (hot tier empty) so the cold path is exercised in isolation.
+    /// A hot budget below `bytes_per_entity` yields a hot capacity of zero, so
+    /// no cold entity is duplicated into the hot tier.
+    fn open_cold_only(dir: &TempDir, cold: &[Entity]) -> TieredGraph {
+        let path = dir.path().join("graph.kndb");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = cold.iter().map(|e| (e.id, e.clone())).collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+        let config = TieredConfig {
+            max_hot_bytes: Some(1),
+            bytes_per_entity: 2,
+        };
+        let tiered = TieredGraph::open(&path, config).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(tiered.hot_entity_count(), 0, "cold set must stay cold-only");
+        tiered
+    }
+
+    /// Open a tiered graph in FullLoad mode (everything hot, no cold tier) from
+    /// a snapshot holding `hot` entities.
+    fn open_hot_only(dir: &TempDir, hot: &[Entity]) -> TieredGraph {
+        let path = dir.path().join("graph.kndb");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = hot.iter().map(|e| (e.id, e.clone())).collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+        let config = TieredConfig {
+            max_hot_bytes: Some(1_000_000_000),
+            bytes_per_entity: 1,
+        };
+        let tiered = TieredGraph::open(&path, config).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::FullLoad);
+        tiered
+    }
+
+    #[test]
+    fn query_by_name_hot_only_keeps_rank() {
+        let dir = TempDir::new().unwrap();
+        let token = test_entity_with_id(0x01, "parseTableFromHtml");
+        let exact = test_entity_with_id(0xff, "parse");
+        let tiered = open_hot_only(&dir, &[token.clone(), exact.clone()]);
+
+        let names: Vec<String> = tiered
+            .query_entities_by_name("parse")
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, vec!["parse", "parseTableFromHtml"]);
+    }
+
+    #[test]
+    fn query_by_name_cold_only_ranks_exact_first() {
+        let dir = TempDir::new().unwrap();
+        // Exact match has the larger id so a bare id-sort would bury it.
+        let exact = test_entity_with_id(0xff, "parse");
+        let substring = test_entity_with_id(0x01, "reparser");
+        let tiered = open_cold_only(&dir, &[exact.clone(), substring.clone()]);
+
+        let names: Vec<String> = tiered
+            .query_entities_by_name("parse")
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["parse", "reparser"],
+            "exact cold match should outrank substring cold match"
+        );
+    }
+
+    #[test]
+    fn query_by_name_merges_hot_and_cold_under_one_ranking() {
+        // Cold tier holds the exact name match; hot tier holds a substring
+        // match. The exact match must come first even though it lives in the
+        // cold tier and is appended after the hot results before sorting.
+        let dir = TempDir::new().unwrap();
+        let cold_exact = test_entity_with_id(0xaa, "parse");
+        let tiered = open_cold_only(&dir, &[cold_exact.clone()]);
+
+        let hot_substring = test_entity_with_id(0x02, "reparser");
+        tiered.hot.upsert_entity(&hot_substring).unwrap();
+
+        let results = tiered.query_entities_by_name("parse").unwrap();
+        let names: Vec<String> = results.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["parse", "reparser"],
+            "exact cold match must outrank substring hot match"
+        );
+    }
+
+    #[test]
+    fn query_by_name_mixed_tiers_deterministic_across_calls() {
+        // Several same-rank matches split across hot and cold tiers must come
+        // back in a byte-identical order on every call — the cold tier is
+        // iterated in HashMap order, so determinism comes from the id
+        // tie-break, not iteration order.
+        let dir = TempDir::new().unwrap();
+        let cold: Vec<Entity> = (0..16u128)
+            .map(|i| test_entity_with_id(0x100 + i, "handler"))
+            .collect();
+        let tiered = open_cold_only(&dir, &cold);
+        for i in 0..16u128 {
+            tiered
+                .hot
+                .upsert_entity(&test_entity_with_id(0x200 + i, "handler"))
+                .unwrap();
+        }
+
+        let first: Vec<EntityId> = tiered
+            .query_entities_by_name("handler")
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(first.len(), 32);
+        // Order is strictly id-ascending (all entities share one rank).
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "mixed-tier order must be id-ascending");
+        for _ in 0..8 {
+            let again: Vec<EntityId> = tiered
+                .query_entities_by_name("handler")
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            assert_eq!(again, first, "mixed-tier order must be deterministic");
+        }
+    }
+}
