@@ -2441,7 +2441,7 @@ impl InMemoryGraph {
             },
             None => TextIndex::new().ok(),
         };
-        let graph = Self {
+        Self {
             entities: RwLock::new(EntityData {
                 entities: HashMap::new(),
                 entity_revisions: HashMap::new(),
@@ -2526,9 +2526,7 @@ impl InMemoryGraph {
             fail_next_transaction_derived_cleanup: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_text_rebuild: AtomicBool::new(false),
-        };
-
-        graph
+        }
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
@@ -8513,7 +8511,7 @@ impl EntityStore for InMemoryGraph {
 
         // Keep text index in sync (commit is deferred — call flush_text_index())
         if let Some(ref ti) = self.text_index {
-            let _ = ti.remove_batch(ids)?;
+            ti.remove_batch(ids)?;
             self.text_dirty.store(true, Ordering::Release);
         }
 
@@ -8525,7 +8523,7 @@ impl EntityStore for InMemoryGraph {
                 eq.remove(&RetrievalKey::Entity(*id));
             }
             if let Some(ref vi) = *self.vector_index.lock() {
-                let _ = vi.remove_batch(ids)?;
+                vi.remove_batch(ids)?;
             }
             self.mark_vector_full_reconcile();
         }
