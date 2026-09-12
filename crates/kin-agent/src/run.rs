@@ -36,6 +36,33 @@ When a Kin result is empty, read what Kin says about that emptiness. If it repor
 absence cannot be trusted, the honest answer is that you do not know, and you should say \
 what the gap is. Never turn an untrusted absence into a claim that something does not exist.
 
+To change code, name the entity you are changing. mcp__kin__kin_mutate takes an operations \
+array and stages and commits it in one call: for an entity the graph already holds, one \
+operation with verb 'update', target set to the entity id mcp__kin__semantic_locate or \
+mcp__kin__find_references handed you (a name works only when it is unique), body set to \
+that entity's complete new source text, and description saying what that one operation \
+does. Pass a summary too: one sentence in your own words saying what the whole change does, \
+which becomes the subject a human reads in history. Read the entity's exact current source \
+with mcp__kin__get_entity_source first and send the whole body back, not a fragment: the \
+body replaces the entity's entire span. A body that came back marked '... [truncated]' is \
+not the entity's source and staging one is refused. A file the graph has never seen is verb \
+'create' with target set to its repository-relative path, and a tracked file you are \
+rewriting whole is verb 'replace' with the same. If mcp__kin__kin_mutate refuses, the reason \
+comes back in the result: fix what it names and call it again.
+
+Your tools are the ones on your belt and no others. If edit_file or write_file are among \
+them you may use them, and if they are not, they do not exist for you: this repository is a \
+graph, and a change to it is a change to an entity.
+
+Work in small steps. Call one or two tools, read what came back, then decide. When you have \
+the answer, say it in plain text without calling a tool.";
+
+/// Where the code-changing paragraph of [`DEFAULT_SYSTEM_PROMPT`] starts and ends.
+const CHANGE_PARAGRAPH_START: &str = "To change code, name the entity";
+const CHANGE_PARAGRAPH_END: &str = "Work in small steps.";
+
+/// The code-changing paragraph for a belt with file tools and no `kin_mutate`.
+const FILE_TOOLS_PARAGRAPH: &str = "\
 To change code, use edit_file for a surgical change to an existing file and write_file to \
 create a new one. Read the exact current text through Kin first so your edit matches byte \
 for byte. You never open, stage or commit a transaction yourself, and those tools are not \
@@ -48,8 +75,47 @@ complete new text as your edit left it, and committed the same way.
 Your tools are the mcp__kin__ ones named above plus edit_file and write_file. You have no \
 others.
 
-Work in small steps. Call one or two tools, read what came back, then decide. When you have \
-the answer, say it in plain text without calling a tool.";
+";
+
+/// The code-changing paragraph for a belt that carries no write tool at all.
+const READ_ONLY_PARAGRAPH: &str = "\
+This run carries no tool that changes code. Answer from what Kin tells you, and when the \
+task needs a change, say exactly what the change is instead of making it.
+
+Your tools are the mcp__kin__ ones named above. You have no others.
+
+";
+
+/// The built-in system prompt for this belt.
+///
+/// The paragraph about changing code has to describe the write tools the model
+/// actually has, because a prompt that names a tool the belt does not carry is a
+/// false instruction: under `--tool-profile agent-query` the server serves no
+/// `kin_mutate`, and a model told to call it spends its turns being refused.
+/// `kin_mutate` on the belt keeps the entity paragraph; file tools without it get
+/// the file paragraph; a belt with neither is told the run is read-only.
+pub fn system_prompt_for(belt: &Belt) -> String {
+    if belt.has_kin_tool("kin_mutate") {
+        return DEFAULT_SYSTEM_PROMPT.to_string();
+    }
+    let (Some(start), Some(end)) = (
+        DEFAULT_SYSTEM_PROMPT.find(CHANGE_PARAGRAPH_START),
+        DEFAULT_SYSTEM_PROMPT.find(CHANGE_PARAGRAPH_END),
+    ) else {
+        return DEFAULT_SYSTEM_PROMPT.to_string();
+    };
+    let paragraph = if belt.has_file_tools() {
+        FILE_TOOLS_PARAGRAPH
+    } else {
+        READ_ONLY_PARAGRAPH
+    };
+    format!(
+        "{}{}{}",
+        &DEFAULT_SYSTEM_PROMPT[..start],
+        paragraph,
+        &DEFAULT_SYSTEM_PROMPT[end..]
+    )
+}
 
 /// One attached graph server and the repository it serves.
 ///
@@ -130,6 +196,19 @@ struct Counters {
     saw_usage: bool,
     api_ms: u128,
     edits: Vec<String>,
+    /// Entities the model named to `kin_mutate`, in the order it named them.
+    ///
+    /// Kept apart from `edits` rather than folded into it, because the two are
+    /// different kinds of thing and a reader downstream cannot tell them apart
+    /// once they are in one list. `edits` holds repository-relative (or, with
+    /// several repositories attached, absolute) file paths and is published as
+    /// `files_changed`, which `loop_integration` asserts is a path. An entity
+    /// target is a UUID or a name and resolves against the graph, not the
+    /// filesystem, so putting one in that list would publish a path that is not
+    /// a path. On a pure-Kin belt `files_changed` is empty and this is the list
+    /// with the work in it, which is the shape the thesis wants: the run
+    /// records which entity changed, and the file it landed in is derived.
+    entity_edits: Vec<String>,
 }
 
 impl Counters {
@@ -153,6 +232,7 @@ impl Counters {
             saw_usage: false,
             api_ms: 0,
             edits: Vec::new(),
+            entity_edits: Vec::new(),
         }
     }
 
@@ -195,8 +275,42 @@ impl Counters {
             "skipped_calls": self.skipped_calls,
             "session_heartbeats": self.session_heartbeats,
             "files_changed": self.edits,
+            "entities_changed": self.entity_edits,
         })
     }
+}
+
+/// The arguments a Kin call goes out with, with the harness's own session id
+/// filled in where the tool needs one and the model could not have known it.
+///
+/// `kin_mutate` is the only model-facing tool that opens a transaction, and the
+/// daemon resolves a transaction against a session it already holds.
+/// `kin_session_start` is harness-owned (`belt::is_harness_owned`), so it never
+/// reaches the model and the model cannot name the session the harness opened.
+/// Without this, an unnamed session fell through to the MCP server's own
+/// in-process registry, which in daemon mode is not the authority: it would
+/// invent an id the daemon has never heard of and `kin_transaction_begin` would
+/// refuse it, so the one write tool on a pure-Kin belt could never commit.
+///
+/// A session the model DID name is left exactly as it wrote it. Overriding one
+/// would hide a caller's mistake behind a silent correction, and the refusal it
+/// earns says more than a commit against a session it did not ask for.
+pub(crate) fn with_harness_session(arguments: &Value, tool: &str, session: Option<&str>) -> Value {
+    let (Some(session), "kin_mutate") = (session, tool) else {
+        return arguments.clone();
+    };
+    let mut arguments = arguments.clone();
+    let Some(map) = arguments.as_object_mut() else {
+        return arguments;
+    };
+    let already_named = map
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !already_named {
+        map.insert("session_id".into(), Value::String(session.to_string()));
+    }
+    arguments
 }
 
 /// Why a run stopped, as the result record states it.
@@ -263,6 +377,12 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         "context_source": config.context.source.label(),
         "max_result_bytes": result_ceiling,
         "tool_profile": config.tool_profile.clone().unwrap_or_else(|| "server-default".into()),
+        // Which belt this run actually had, recorded beside the server profile
+        // because they are different settings and a reader of one run's
+        // provenance has no other way to tell them apart. On a pure-Kin belt
+        // there is no edit_file and no write_file at all, so a change in that
+        // run went through Kin or it did not happen.
+        "belt": if belt::Belt::pure_kin_default() { "pure-kin" } else { "kin-plus-file-tools" },
         "policy": "no-shell-no-file-search",
         "mcp_command": config.mcp_command.join(" "),
     });
@@ -366,7 +486,22 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
             });
         }
     }
-    let belt = Belt::new(kin_tools);
+    // `KIN_AGENT_PURE_KIN` is the whole switch, read once here so the trace
+    // above and the belt below cannot disagree about which one this run had.
+    //
+    // Deliberately not `--tool-profile pure-kin`. That flag names the MCP
+    // SERVER'S surface and `kin agent run` forwards it verbatim to `kin mcp
+    // start`, whose accepted tokens are agent-default, agent-query,
+    // agent-search, full and benchmark. A value none of those match falls back
+    // to the curated default, so overloading it would ask for a belt and
+    // quietly reconfigure the server as well: two settings moved by one word,
+    // one of them not the one the operator meant.
+    let pure_kin = belt::Belt::pure_kin_default();
+    let belt = if pure_kin {
+        Belt::pure_kin(kin_tools)
+    } else {
+        Belt::with_file_tools(kin_tools)
+    };
     let repo_roots: Vec<std::path::PathBuf> =
         servers.iter().map(|server| server.repo.clone()).collect();
     let repo_note = multi.then(|| repo_path_note(&repo_roots));
@@ -395,7 +530,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
     let mut system_prompt = config
         .system_prompt
         .clone()
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        .unwrap_or_else(|| system_prompt_for(&belt));
     // The repository roots are a fact about this run that the model cannot infer, and
     // without them it cannot address the second repository at all, so the note is appended
     // to an operator-supplied prompt as well as to the built-in one.
@@ -705,9 +840,14 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                     )
                                 }
                                 Ok(()) => {
-                                    let outcome = servers[server_index]
-                                        .client
-                                        .call_tool(&name, &call.arguments);
+                                    let session = servers[server_index].session.clone();
+                                    let arguments = with_harness_session(
+                                        &call.arguments,
+                                        &name,
+                                        session.as_deref(),
+                                    );
+                                    let outcome =
+                                        servers[server_index].client.call_tool(&name, &arguments);
                                     match outcome {
                                         Err(err) => {
                                             // The server died or stopped answering. Nothing
@@ -770,7 +910,14 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 "surface": "kin",
                                                 "server": server_name,
                                                 "tool": name,
-                                                "args": call.arguments,
+                                                // What went out, not what the
+                                                // model wrote, because the two
+                                                // differ once the harness fills
+                                                // in a session the model cannot
+                                                // see, and a trace that shows
+                                                // the second explains neither a
+                                                // refusal nor a commit.
+                                                "args": arguments,
                                                 "wall_ms": outcome.wall_ms as u64,
                                                 "is_error": outcome.is_error,
                                                 "policy": "allowed",
@@ -781,6 +928,48 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 "result_bytes": result_bytes,
                                                 "shown_bytes": shown_bytes,
                                             }))?;
+                                            // What a Kin-only run changed, read
+                                            // off the call the model made. The
+                                            // graph is the record of the change
+                                            // itself; this is the run's own
+                                            // account of what it asked for, and
+                                            // without it a pure-Kin run reports
+                                            // no edits at all, because the two
+                                            // local tools are what used to fill
+                                            // that list and this belt has
+                                            // neither. Only a call that came
+                                            // back clean counts: a refused
+                                            // mutate changed nothing, and a run
+                                            // that listed its refusals as edits
+                                            // would overstate itself in exactly
+                                            // the place a reader checks.
+                                            if name == "kin_mutate" && !outcome.is_error {
+                                                if let Some(ops) = call
+                                                    .arguments
+                                                    .get("operations")
+                                                    .and_then(Value::as_array)
+                                                {
+                                                    for op in ops {
+                                                        let Some(target) = op
+                                                            .get("target")
+                                                            .and_then(Value::as_str)
+                                                            .map(str::trim)
+                                                            .filter(|target| !target.is_empty())
+                                                        else {
+                                                            continue;
+                                                        };
+                                                        if !counters
+                                                            .entity_edits
+                                                            .iter()
+                                                            .any(|seen| seen == target)
+                                                        {
+                                                            counters
+                                                                .entity_edits
+                                                                .push(target.to_string());
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             (annotated, outcome.is_error)
                                         }
                                     }
