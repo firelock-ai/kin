@@ -587,8 +587,14 @@ fn an_untrusted_absence_is_read_off_the_payload() {
             "type": "text",
             "text": json!({
                 "results": [],
-                "_kin": { "envelope_version": "1", "runtime": "RepoDaemon", "semantic_coverage": 0.4 },
-                "negative": { "safe_to_conclude_absent": false, "limiting_factor": "python bodies are not indexed" }
+                "_kin": {
+                    "envelope_version": 2, "runtime": "repo-daemon", "semantic_coverage": 0.4,
+                    "verdict": { "state": "inconclusive", "limiting_factor": "coverage_partial" }
+                },
+                "negative": {
+                    "safe_to_conclude_absent": false,
+                    "trust_reason": "coverage_partial: the semantic index is incomplete"
+                }
             }).to_string()
         }],
         "isError": false
@@ -597,11 +603,12 @@ fn an_untrusted_absence_is_read_off_the_payload() {
     assert_eq!(outcome.safe_to_conclude_absent(), Some(false));
     assert_eq!(
         outcome.limiting_factor().as_deref(),
-        Some("python bodies are not indexed")
+        Some("coverage_partial"),
+        "the verdict's codes are the factor a reader acts on"
     );
     assert!(!outcome.unreadable);
     let summary = outcome.envelope_summary().expect("an envelope was present");
-    assert_eq!(summary["runtime"], "RepoDaemon");
+    assert_eq!(summary["runtime"], "repo-daemon");
 }
 
 #[test]
@@ -899,4 +906,78 @@ fn a_session_reply_names_its_idle_window_or_none() {
         None
     );
     assert_eq!(session_idle_timeout(&reply("not json")), None);
+}
+
+/// The reader reads the two fields Kin sends: the verdict's codes first, and the
+/// absence gate's own reason when no verdict rides the response.
+#[test]
+fn limiting_factor_reads_the_verdict_codes_then_the_trust_reason() {
+    let response = |kin: serde_json::Value, negative: serde_json::Value| {
+        unwrap_tool_result(
+            &json!({
+                "content": [{
+                    "type": "text",
+                    "text": json!({ "results": [], "_kin": kin, "negative": negative }).to_string()
+                }],
+                "isError": false
+            }),
+            1,
+        )
+    };
+    let both = response(
+        json!({
+            "envelope_version": 2,
+            "runtime": "repo-daemon",
+            "verdict": { "state": "inconclusive", "limiting_factor": "coverage_partial; retrieval_degraded" }
+        }),
+        json!({
+            "safe_to_conclude_absent": false,
+            "trust_reason": "coverage_partial: the semantic index is incomplete"
+        }),
+    );
+    assert_eq!(
+        both.limiting_factor().as_deref(),
+        Some("coverage_partial; retrieval_degraded")
+    );
+    let reason_only = response(
+        json!({ "envelope_version": 2, "runtime": "repo-daemon" }),
+        json!({
+            "safe_to_conclude_absent": false,
+            "trust_reason": "coverage_partial: the semantic index is incomplete"
+        }),
+    );
+    assert_eq!(
+        reason_only.limiting_factor().as_deref(),
+        Some("coverage_partial: the semantic index is incomplete")
+    );
+}
+
+/// A key Kin never sends is not read. `negative.limiting_factor` was read while
+/// every real response carried `trust_reason`, so the model was told the factor
+/// was unnamed on every untrusted absence; this pins that the old keys stay dead.
+#[test]
+fn limiting_factor_ignores_keys_the_server_never_sends() {
+    let outcome = unwrap_tool_result(
+        &json!({
+            "content": [{
+                "type": "text",
+                "text": json!({
+                    "results": [],
+                    "_kin": { "envelope_version": 2, "runtime": "repo-daemon" },
+                    "negative": {
+                        "safe_to_conclude_absent": false,
+                        "limiting_factor": "python bodies are not indexed",
+                        "reason": "x",
+                        "why": "y",
+                        "explanation": "z",
+                        "missing_edge_classes": ["calls"]
+                    }
+                })
+                .to_string()
+            }],
+            "isError": false
+        }),
+        1,
+    );
+    assert_eq!(outcome.limiting_factor(), None);
 }
