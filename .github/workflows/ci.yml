@@ -986,7 +986,13 @@ jobs:
     # Read the runner a run actually resolved from the jobs API `labels` field,
     # never from this line.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    # 20 until the hosted object-store publication step below, which builds
+    # kin-cli under a second feature set that clippy's artifacts cannot serve.
+    # Raised rather than moving that step somewhere cheaper on purpose: the two
+    # names main requires are this one and the sharded test job, so a guard that
+    # lands anywhere else is advisory and an armed auto-merge would land past
+    # it red.
+    timeout-minutes: 30
     # FIR-2744. This job shares `check`'s cargo cache key, and with
     # `add-rust-environment-hash-key` off nothing else would notice the two
     # declaring different cargo profiles, so they must declare the same one or
@@ -1317,6 +1323,55 @@ jobs:
               exit 1
             fi
             cargo test -p kin-remote --features gcs --locked --lib "$test_name" \
+              -- --exact --nocapture --test-threads=1
+          done
+
+      # The other half of the same gap, one crate up. `kin-cli` composes that
+      # validated destination into the subcommand a hosted worker actually runs,
+      # behind the same non-default `gcs` feature, and the same three jobs miss
+      # it for the same three reasons: clippy above compiles the suite without
+      # running it, the nextest job below runs a changed-crate scope with
+      # default features, and docker.yml's real fake-gcs-server acceptance
+      # carries no pull-request trigger since FIR-2815. Without this step the
+      # wiring that lets a hosted worker publish into a bucket at all would be
+      # graded by nothing on the pull request that changes it, and rediscovered
+      # a release later.
+      #
+      # `tests/hosted_publication_object_store.rs` is `#![cfg(feature = "gcs")]`
+      # as a whole file, which is what makes the count below exact: that
+      # binary's listing IS the gated set, so a case added there and not added
+      # here makes the two disagree and this step fails. Same assertion as the
+      # kin-remote step above, and for the same reason: a hand-maintained list
+      # with no count beside it drifts, and the drift is silent.
+      #
+      # It costs a kin-cli build under a second feature set, which clippy's
+      # artifacts cannot serve. That is why this job's timeout moved to 30
+      # minutes with it.
+      - name: Test hosted object-store publication wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing="$(cargo test -p kin-cli --features gcs --locked \
+            --test hosted_publication_object_store -- --list | tr -d '\r')"
+          tests=(
+            an_unreachable_bucket_is_indeterminate_and_names_its_service
+            the_google_convention_alone_points_the_client_at_the_same_endpoint
+            verification_reaches_the_same_object_store_and_records_its_service
+          )
+          listed="$(printf '%s\n' "$listing" | awk '/^[A-Za-z0-9_]+: test$/ { count += 1 } END { print count + 0 }')"
+          if [ "$listed" -ne "${#tests[@]}" ]; then
+            echo "::error title=Ungraded object-store publication test::the suite lists $listed test(s) and this step enumerates ${#tests[@]}; add the new one here or this step grades it by nothing"
+            exit 1
+          fi
+          for test_name in "${tests[@]}"
+          do
+            matches="$(printf '%s\n' "$listing" | awk -v expected="$test_name: test" '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [ "$matches" -ne 1 ]; then
+              echo "::error title=Missing object-store publication test::$test_name listed $matches time(s)"
+              exit 1
+            fi
+            cargo test -p kin-cli --features gcs --locked \
+              --test hosted_publication_object_store "$test_name" \
               -- --exact --nocapture --test-threads=1
           done
 

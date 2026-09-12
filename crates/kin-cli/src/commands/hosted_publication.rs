@@ -58,6 +58,7 @@ use kin_remote::first_publication::{
     publish_first_repository_observed, read_pinned_published_authority, FirstPublicationError,
     FirstPublicationIntent, FirstPublicationMode, SourceBodyClosure,
 };
+use kin_remote::first_publication_gcs::{GcsDestination, GcsEndpoint, GcsEndpointOverride};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -387,14 +388,82 @@ pub enum DestinationSpec {
     Gcs { bucket: String, prefix: String },
 }
 
-impl DestinationSpec {
-    /// Open a backend for this destination.
+/// The two operator levers that point a hosted publication somewhere other than
+/// the real object store.
+///
+/// Taken by argument rather than read where it is used. `kin-core`'s
+/// `test_env` module states the reason in full: the process environment is one
+/// table shared by every thread, so a test that mutates it is read by every
+/// test running beside it, and "when the code under test resolves configuration
+/// that other code under test also resolves, the fix is to take that
+/// configuration by argument and leave the environment alone." So this carries
+/// the values and [`DestinationEnv::from_process`] is the one site in this
+/// module that reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DestinationEnv {
+    /// `KIN_GCS_ENDPOINT`, Kin's own lever.
+    pub kin_gcs_endpoint: Option<String>,
+    /// `STORAGE_EMULATOR_HOST`, the Google-client convention.
+    pub storage_emulator_host: Option<String>,
+}
+
+impl DestinationEnv {
+    /// Read both levers out of the process environment.
+    pub fn from_process() -> Self {
+        Self {
+            kin_gcs_endpoint: std::env::var("KIN_GCS_ENDPOINT").ok(),
+            storage_emulator_host: std::env::var("STORAGE_EMULATOR_HOST").ok(),
+        }
+    }
+
+    /// Which endpoint an object-store destination is opened against.
     ///
-    /// Called more than once per run on purpose. The measurement pass builds its
-    /// own handle rather than reusing the one the publication went through, so a
-    /// backend answering from a cache it populated while writing cannot satisfy
-    /// the readback.
-    fn open(&self) -> Result<Arc<dyn StorageBackend>> {
+    /// Precedence deliberately mirrors `kin_daemon::gcs_endpoint::resolve`:
+    /// `KIN_GCS_ENDPOINT` wins, `STORAGE_EMULATOR_HOST` is honoured so one
+    /// exported variable points both halves of a local stack at the same
+    /// emulator, and an empty or whitespace-only value counts as unset the way
+    /// Kin's other read sites treat one. The daemon holds its own copy because
+    /// it also probes the endpoint for reachability at startup and this does
+    /// not; the parsing itself is `kin-remote`'s, so the two agree on what a
+    /// value means even where they disagree on what to do about it.
+    ///
+    /// Neither set is the real service with application default credentials. A
+    /// value that is present and unparseable is a refusal, never a silent
+    /// fall-through to real Google Cloud Storage.
+    fn endpoint(&self) -> Result<GcsEndpoint> {
+        let named = [
+            ("KIN_GCS_ENDPOINT", self.kin_gcs_endpoint.as_deref()),
+            (
+                "STORAGE_EMULATOR_HOST",
+                self.storage_emulator_host.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(source, raw)| {
+            let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
+            Some((source, value))
+        });
+        match named {
+            None => Ok(GcsEndpoint::ProductionAdc),
+            Some((source, value)) => Ok(GcsEndpoint::Emulator(GcsEndpointOverride::parse(
+                value, source,
+            )?)),
+        }
+    }
+}
+
+impl DestinationSpec {
+    /// Validate this destination and settle every choice about where it points,
+    /// without opening anything.
+    ///
+    /// Everything that can be refused is refused here, before a client exists
+    /// and before an import is spent: the filesystem root's shape, the bucket
+    /// and prefix grammar, the endpoint override, and the artifact-identifier
+    /// budget. That last one matters most. The identifier is composed after a
+    /// publication has already committed, so a prefix that cannot compose one
+    /// would otherwise produce a publication that succeeded and a receipt that
+    /// could not be written.
+    fn resolve(&self, env: &DestinationEnv, repository_id: &RepositoryId) -> Result<Destination> {
         match self {
             Self::Filesystem { root } => {
                 if !root.is_absolute() {
@@ -403,21 +472,122 @@ impl DestinationSpec {
                         root.display()
                     );
                 }
+                Ok(Destination::Filesystem { root: root.clone() })
+            }
+            Self::Gcs { bucket, prefix } => {
+                let destination = GcsDestination::new(bucket, prefix)?;
+                destination.check_artifact_id_budget(ARTIFACT_ID_PREFIX, repository_id.as_str())?;
+                Ok(Destination::ObjectStore {
+                    destination,
+                    endpoint: env.endpoint()?,
+                    repository_id: repository_id.as_str().to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// A destination whose every refusal has already been spent, able to hand out a
+/// fresh backend handle.
+#[derive(Debug)]
+enum Destination {
+    Filesystem {
+        root: PathBuf,
+    },
+    ObjectStore {
+        destination: GcsDestination,
+        endpoint: GcsEndpoint,
+        /// Named here because the artifact-identifier budget was checked against
+        /// this exact identity, and opening the destination checks it again.
+        repository_id: String,
+    },
+}
+
+/// A backend handle, and which service it talks to.
+struct OpenedDestination {
+    backend: Arc<dyn StorageBackend>,
+    /// `None` for a filesystem destination, whose scope already names the exact
+    /// root it wrote to.
+    service: Option<DestinationService>,
+}
+
+impl Destination {
+    /// Open a backend for this destination.
+    ///
+    /// Called more than once per run on purpose. The measurement pass builds its
+    /// own handle rather than reusing the one the publication went through, so a
+    /// backend answering from a cache it populated while writing cannot satisfy
+    /// the readback. The object-store arm builds a fresh client each time for
+    /// the same reason.
+    fn open(&self) -> Result<OpenedDestination> {
+        match self {
+            Self::Filesystem { root } => {
                 fs::create_dir_all(root)
                     .with_context(|| format!("create destination root {}", root.display()))?;
-                Ok(Arc::new(LocalFileBackend::new(root.clone())))
+                Ok(OpenedDestination {
+                    backend: Arc::new(LocalFileBackend::new(root.clone())),
+                    service: None,
+                })
             }
-            Self::Gcs { .. } => bail!(
-                "destination_backend_unavailable: this build publishes to a filesystem \
-                 destination only, and hosted object-store publication is a separate acceptance"
+            #[cfg(feature = "gcs")]
+            Self::ObjectStore {
+                destination,
+                endpoint,
+                repository_id,
+            } => {
+                let opened =
+                    destination.open(endpoint, ARTIFACT_ID_PREFIX, repository_id.as_str())?;
+                // The class is read back off the value that built the client
+                // rather than derived a second time here, because a second
+                // derivation site is a second place for an emulator to be
+                // recorded as production. Compared against the endpoint this
+                // run resolved so the two cannot drift apart silently.
+                if opened.endpoint_class != endpoint.class() {
+                    bail!(
+                        "the opened destination reports the {} service while this run resolved \
+                         the {} one",
+                        opened.endpoint_class.as_str(),
+                        endpoint.class().as_str()
+                    );
+                }
+                Ok(OpenedDestination {
+                    backend: opened.backend,
+                    service: Some(DestinationService {
+                        class: opened.endpoint_class.as_str().to_string(),
+                        endpoint_url: opened.endpoint_url,
+                    }),
+                })
+            }
+            // The refusal names what it refused. Every field of the resolved
+            // destination is already validated by the time it gets here, so an
+            // operator who reaches this message learns that their configuration
+            // was fine and their binary was not, which is a different fix from
+            // the one a bare capability refusal sends them looking for.
+            #[cfg(not(feature = "gcs"))]
+            Self::ObjectStore {
+                destination,
+                endpoint,
+                repository_id,
+            } => bail!(
+                "destination_backend_unavailable: this build carries no object-store client, so \
+                 it publishes to a filesystem destination only. The hosted worker is the \
+                 container image, which builds this binary with `--features kin-daemon/gcs`. \
+                 Refused {} for repository {repository_id} against the {} service",
+                destination.scope(),
+                endpoint.class().as_str()
             ),
         }
     }
 
+    /// The destination scope, as it appears inside an artifact identifier.
+    ///
+    /// The object-store arm defers to the validated destination's own rendering
+    /// rather than repeating the format, so the string whose length the budget
+    /// was checked against is the string that reaches the identifier.
     fn scope(&self) -> String {
         match self {
             Self::Filesystem { root } => format!("fs:{}", root.display()),
-            Self::Gcs { bucket, prefix } => format!("gcs:{bucket}/{prefix}"),
+            Self::ObjectStore { destination, .. } => destination.scope(),
         }
     }
 }
@@ -704,6 +874,28 @@ pub struct EchoedInput {
     pub expected_refs: Option<ExpectedRefs>,
 }
 
+/// Which service an object-store destination's handles actually talked to.
+///
+/// Neither measured nor echoed, and kept out of both objects for that reason.
+/// It was not read out of destination storage, and it did not come from the
+/// manifest: it is this process's own resolved configuration, reported by the
+/// value that built the client.
+///
+/// Emitted only for an object-store destination. A filesystem scope already
+/// names the exact root that was written to, while `gcs:<bucket>/<prefix>` says
+/// nothing about whether that bucket was the real service or an emulator
+/// standing in for it, and a receipt that cannot tell those apart is a receipt
+/// for a publication nobody can find.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationService {
+    /// `production-adc` or `emulator`, as `GcsEndpointClass` names them.
+    pub class: String,
+    /// The override's normalized base URL, present only for an emulator.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint_url: Option<String>,
+}
+
 /// One field on which the destination disagreed with the intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -724,6 +916,10 @@ pub struct EvidenceRecord {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub measured: Option<MeasuredAuthority>,
     pub echoed: EchoedInput,
+    /// Present only for an object-store destination, so a filesystem run's
+    /// record is byte-identical to what this adapter has always written.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub destination_service: Option<DestinationService>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub differences: Vec<Difference>,
     /// Why a run without measured authority ended the way it did, verbatim.
@@ -1267,13 +1463,13 @@ enum DestinationReading {
 /// opens a new one from the destination specification, so a backend that would
 /// answer from state it cached while writing cannot satisfy this readback.
 fn measure_destination(
-    destination: &DestinationSpec,
+    destination: &Destination,
     repository_id: &RepositoryId,
     mode: PublicationMode,
     snapshot_sha256: String,
     snapshot_sha256_source: SnapshotDigestSource,
 ) -> Result<DestinationReading> {
-    let backend = destination.open()?;
+    let backend = destination.open()?.backend;
     match backend.load_snapshot_cursor(repository_id.as_str()) {
         Ok(None) => return Ok(DestinationReading::Absent),
         Ok(Some(_)) => {}
@@ -1345,7 +1541,7 @@ fn measure_destination(
 /// refused here when it would exceed what a hosted store accepts, so the reason
 /// is visible in this process rather than as an invalid field at the store.
 fn compose_artifact_id(
-    destination: &DestinationSpec,
+    destination: &Destination,
     repository_id: &RepositoryId,
     generation: u64,
 ) -> Result<String> {
@@ -1587,6 +1783,7 @@ fn resolve_against_intent(
     manifest: &Manifest,
     intent: &IntentRecord,
     reading: DestinationReading,
+    service: Option<DestinationService>,
 ) -> EvidenceRecord {
     let base = EvidenceRecord {
         schema: EVIDENCE_SCHEMA.to_string(),
@@ -1595,6 +1792,7 @@ fn resolve_against_intent(
         operation: manifest.operation.clone(),
         measured: None,
         echoed: echoed_input(manifest),
+        destination_service: service,
         differences: Vec::new(),
         detail: None,
     };
@@ -1637,29 +1835,39 @@ fn resolve_against_intent(
 
 /// Build the reserved repository's durable graph authority.
 pub fn run_publish(args: PublishArgs) -> Result<i32> {
+    run_publish_with_env(args, &DestinationEnv::from_process())
+}
+
+/// [`run_publish`] with the destination's endpoint levers supplied rather than
+/// read, so a test drives them without touching the process environment.
+pub fn run_publish_with_env(args: PublishArgs, env: &DestinationEnv) -> Result<i32> {
     let (manifest, repository_id, mode) = read_checked_manifest(
         &args.manifest,
         &args.expect_repository_id,
         &args.expect_mode,
     )?;
     let expected_intent = reconcile_expected_intent(&manifest, Some(args.intent_out.as_path()))?;
+    let resolved = manifest.destination.resolve(env, &repository_id)?;
     // Opened before any source work, so an unavailable destination is reported
-    // without first spending an import on it.
-    manifest.destination.open()?;
+    // without first spending an import on it. The service it names is carried
+    // through every record this run writes.
+    let service = resolved.open()?.service;
 
     if let Some(intent) = expected_intent.as_ref() {
         let reading = measure_destination(
-            &manifest.destination,
+            &resolved,
             &repository_id,
             mode,
             intent.intended_snapshot_sha256.clone(),
             SnapshotDigestSource::Intent,
         )?;
         if !matches!(reading, DestinationReading::Absent) {
-            let record = resolve_against_intent(&manifest, intent, reading);
+            let record = resolve_against_intent(&manifest, intent, reading, service);
             return finish(&args.evidence_out, record);
         }
-    } else if let Some(record) = refuse_a_stranger(&manifest, &repository_id)? {
+    } else if let Some(record) =
+        refuse_a_stranger(&manifest, &repository_id, &resolved, service.clone())?
+    {
         return finish(&args.evidence_out, record);
     }
 
@@ -1680,7 +1888,7 @@ pub fn run_publish(args: PublishArgs) -> Result<i32> {
         (branch, head, bindings)
     };
 
-    let destination = manifest.destination.open()?;
+    let destination = resolved.open()?.backend;
     let mut written_intent: Option<IntentRecord> = None;
     let result = publish_first_repository_observed(
         source,
@@ -1721,7 +1929,7 @@ pub fn run_publish(args: PublishArgs) -> Result<i32> {
     match (&result, &written_intent) {
         (Ok(receipt), _) => {
             let reading = measure_destination(
-                &manifest.destination,
+                &resolved,
                 &repository_id,
                 mode,
                 receipt.snapshot_sha256.to_string(),
@@ -1778,6 +1986,7 @@ pub fn run_publish(args: PublishArgs) -> Result<i32> {
                     operation: manifest.operation.clone(),
                     measured: Some(*measured),
                     echoed: echoed_input(&manifest),
+                    destination_service: service,
                     differences,
                     detail,
                 },
@@ -1788,13 +1997,13 @@ pub fn run_publish(args: PublishArgs) -> Result<i32> {
         // decides the outcome, not the error text.
         (Err(error), Some(intent)) => {
             let reading = measure_destination(
-                &manifest.destination,
+                &resolved,
                 &repository_id,
                 mode,
                 intent.intended_snapshot_sha256.clone(),
                 SnapshotDigestSource::Intent,
             )?;
-            let mut record = resolve_against_intent(&manifest, intent, reading);
+            let mut record = resolve_against_intent(&manifest, intent, reading, service);
             record.detail = Some(match record.detail.take() {
                 Some(detail) => format!("{detail}; publication reported: {error}"),
                 None => format!("publication reported: {error}"),
@@ -1817,8 +2026,10 @@ pub fn run_publish(args: PublishArgs) -> Result<i32> {
 fn refuse_a_stranger(
     manifest: &Manifest,
     repository_id: &RepositoryId,
+    destination: &Destination,
+    service: Option<DestinationService>,
 ) -> Result<Option<EvidenceRecord>> {
-    let backend = manifest.destination.open()?;
+    let backend = destination.open()?.backend;
     let (outcome, detail) = match backend.load_snapshot_cursor(repository_id.as_str()) {
         Ok(None) => return Ok(None),
         Ok(Some(_)) => (
@@ -1836,6 +2047,7 @@ fn refuse_a_stranger(
         operation: manifest.operation.clone(),
         measured: None,
         echoed: echoed_input(manifest),
+        destination_service: service,
         differences: Vec::new(),
         detail: Some(detail),
     }))
@@ -1843,6 +2055,12 @@ fn refuse_a_stranger(
 
 /// Read a destination against a durable intent, and write nothing.
 pub fn run_verify(args: VerifyArgs) -> Result<i32> {
+    run_verify_with_env(args, &DestinationEnv::from_process())
+}
+
+/// [`run_verify`] with the destination's endpoint levers supplied rather than
+/// read, so a test drives them without touching the process environment.
+pub fn run_verify_with_env(args: VerifyArgs, env: &DestinationEnv) -> Result<i32> {
     let (manifest, repository_id, mode) = read_checked_manifest(
         &args.manifest,
         &args.expect_repository_id,
@@ -1855,13 +2073,368 @@ pub fn run_verify(args: VerifyArgs) -> Result<i32> {
              expected authority or in an intent file"
             )
         })?;
+    let resolved = manifest.destination.resolve(env, &repository_id)?;
+    // One open before the measurement, for the service it names. The
+    // measurement builds its own handle regardless, so this does not become the
+    // handle anything is read through.
+    let service = resolved.open()?.service;
     let reading = measure_destination(
-        &manifest.destination,
+        &resolved,
         &repository_id,
         mode,
         intent.intended_snapshot_sha256.clone(),
         SnapshotDigestSource::Intent,
     )?;
-    let record = resolve_against_intent(&manifest, &intent, reading);
+    let record = resolve_against_intent(&manifest, &intent, reading, service);
     finish(&args.evidence_out, record)
+}
+
+// ---------------------------------------------------------------------------
+// Resolving a destination
+// ---------------------------------------------------------------------------
+
+/// Every refusal a destination can carry, and the endpoint precedence behind an
+/// object-store one.
+///
+/// All of it runs without the `gcs` feature, because none of it needs a client:
+/// `GcsDestination`, `GcsEndpoint` and their refusals are compiled
+/// unconditionally by `kin-remote` and only the client construction is gated. So
+/// these are graded by the ordinary changed-crate test job on every pull
+/// request, and the gated cases beside them in
+/// `tests/hosted_first_publication.rs` are the small remainder that needs a
+/// client.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RESERVED: &str = "9f1c2e04-3b7a-4d21-9c55-0ab61d7e8f30";
+    const BUCKET: &str = "kin-hosted-prod";
+    const PREFIX: &str = "publications/v1";
+
+    fn reserved() -> RepositoryId {
+        RepositoryId::new(RESERVED).expect("the fixture identity is a repository id")
+    }
+
+    fn levers(kin: Option<&str>, google: Option<&str>) -> DestinationEnv {
+        DestinationEnv {
+            kin_gcs_endpoint: kin.map(str::to_owned),
+            storage_emulator_host: google.map(str::to_owned),
+        }
+    }
+
+    fn object_store(bucket: &str, prefix: &str) -> DestinationSpec {
+        DestinationSpec::Gcs {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+        }
+    }
+
+    fn class_of(endpoint: &GcsEndpoint) -> &'static str {
+        endpoint.class().as_str()
+    }
+
+    #[test]
+    fn neither_lever_set_is_the_real_service() {
+        let endpoint = levers(None, None)
+            .endpoint()
+            .expect("no lever is not an error");
+        assert_eq!(class_of(&endpoint), "production-adc");
+        assert_eq!(endpoint.url(), None, "production carries no override URL");
+    }
+
+    #[test]
+    fn kins_own_lever_wins_over_the_google_convention() {
+        // Both set, pointing at different emulators. The daemon resolves this
+        // the same way, and a run that took the other one would publish
+        // somewhere no reader looks while every message still named the bucket.
+        let endpoint = levers(Some("http://127.0.0.1:4443"), Some("http://127.0.0.1:9199"))
+            .endpoint()
+            .expect("both levers parse");
+        assert_eq!(endpoint.url(), Some("http://127.0.0.1:4443"));
+
+        // Positive control: with Kin's lever absent the Google convention is
+        // honoured, so the assertion above is about precedence and not about
+        // the second lever being ignored altogether.
+        let fallback = levers(None, Some("http://127.0.0.1:9199"))
+            .endpoint()
+            .expect("the google convention parses");
+        assert_eq!(fallback.url(), Some("http://127.0.0.1:9199"));
+        assert_eq!(class_of(&fallback), "emulator");
+    }
+
+    #[test]
+    fn bracketed_ipv6_is_an_emulator_and_invalid_overrides_never_select_adc() {
+        let endpoint = levers(Some("http://[::1]:4443"), None).endpoint().unwrap();
+        assert_eq!(endpoint.url(), Some("http://[::1]:4443"));
+        assert_eq!(class_of(&endpoint), "emulator");
+        for invalid in [
+            "http://[::1",
+            "http://[::1]x:4443",
+            "http://host:0",
+            "http://host/path",
+        ] {
+            assert!(
+                levers(Some(invalid), Some("http://127.0.0.1:4443"))
+                    .endpoint()
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_lever_counts_as_unset() {
+        for value in ["", "   ", "\t\n"] {
+            let endpoint = levers(Some(value), None)
+                .endpoint()
+                .unwrap_or_else(|error| panic!("{value:?} must count as unset, got {error:#}"));
+            assert_eq!(
+                class_of(&endpoint),
+                "production-adc",
+                "{value:?} must leave the real service selected"
+            );
+        }
+        // The whitespace also falls through to the second lever rather than
+        // shadowing it, which is the case an "is it set" check gets wrong.
+        let endpoint = levers(Some("  "), Some("http://127.0.0.1:9199"))
+            .endpoint()
+            .expect("the google convention parses");
+        assert_eq!(endpoint.url(), Some("http://127.0.0.1:9199"));
+    }
+
+    #[test]
+    fn an_unparseable_lever_never_falls_back_to_the_real_service() {
+        let error = levers(Some("http://host:4443/objects"), None)
+            .endpoint()
+            .expect_err("an endpoint carrying a path is not an endpoint");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("KIN_GCS_ENDPOINT"),
+            "the refusal names the variable to fix: {rendered}"
+        );
+        assert!(
+            rendered.contains("carries a path"),
+            "the refusal names what is wrong with it: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_relative_filesystem_root_is_refused_before_anything_is_opened() {
+        let spec = DestinationSpec::Filesystem {
+            root: PathBuf::from("relative/destination"),
+        };
+        let error = spec
+            .resolve(&DestinationEnv::default(), &reserved())
+            .expect_err("a relative root names a different directory per caller");
+        assert!(
+            format!("{error:#}").contains("must be an absolute path"),
+            "got {error:#}"
+        );
+
+        // Positive control: the same call with an absolute root resolves, so the
+        // refusal above is about the path and not about the arguments.
+        let spec = DestinationSpec::Filesystem {
+            root: PathBuf::from("/tmp/kin-hosted-destination"),
+        };
+        spec.resolve(&DestinationEnv::default(), &reserved())
+            .expect("an absolute root resolves");
+    }
+
+    #[test]
+    fn a_bucket_or_prefix_outside_the_grammar_is_refused_at_resolution() {
+        // A prefix that is not already in normal form names a different object
+        // than it appears to, because the object store drops empty segments
+        // while the scope this adapter renders keeps whatever was written. The
+        // receipt would then name a location that is not the key.
+        let cases = [
+            ("A", PREFIX, "bucket"),
+            (BUCKET, "a//b", "prefix"),
+            (BUCKET, "/leading", "prefix"),
+            (BUCKET, "trailing/", "prefix"),
+        ];
+        for (bucket, prefix, half) in cases {
+            match object_store(bucket, prefix).resolve(&DestinationEnv::default(), &reserved()) {
+                Ok(resolved) => {
+                    panic!("{bucket:?}/{prefix:?} must be refused, resolved to {resolved:?}")
+                }
+                Err(error) => {
+                    let rendered = format!("{error:#}");
+                    assert!(
+                        rendered.contains(half),
+                        "the refusal names which half failed, expected {half:?} in {rendered}"
+                    );
+                }
+            }
+        }
+
+        // Positive control: the same call with both halves in the grammar
+        // resolves, so every refusal above is about the value under test.
+        object_store(BUCKET, PREFIX)
+            .resolve(&DestinationEnv::default(), &reserved())
+            .expect("a well formed bucket and prefix resolve");
+    }
+
+    #[test]
+    fn an_identifier_that_cannot_be_composed_is_refused_before_a_publication_commits() {
+        // The budget is spent here rather than after the compare-and-swap,
+        // because the identifier is composed from the scope once the
+        // publication has already committed. A prefix this long otherwise
+        // produces a publication that succeeded and a receipt nobody can write.
+        let long_prefix = "p".repeat(180);
+        let error = object_store(BUCKET, &long_prefix)
+            .resolve(&DestinationEnv::default(), &reserved())
+            .expect_err("a destination over the identifier budget must not resolve");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&ARTIFACT_ID_MAX_BYTES.to_string()),
+            "the refusal names the budget it broke: {rendered}"
+        );
+
+        // Positive control: one byte under the same shape resolves, so the
+        // refusal is about the length rather than about the prefix's contents.
+        let composed = format!(
+            "{ARTIFACT_ID_PREFIX}:gcs:{BUCKET}/p/{RESERVED}@{}",
+            u64::MAX
+        );
+        let room = ARTIFACT_ID_MAX_BYTES - (composed.len() - 1);
+        object_store(BUCKET, &"p".repeat(room))
+            .resolve(&DestinationEnv::default(), &reserved())
+            .expect("a destination exactly at the budget resolves");
+    }
+
+    /// One evidence record with no measurement, built by hand so nothing in it
+    /// is a timestamp or a digest over a temporary directory.
+    ///
+    /// A record from a real run cannot be frozen: `observed_at` moves and
+    /// `artifact_id` carries the run's own destination root, so a golden over
+    /// one would be re-blessed on every change rather than read. This is the
+    /// same struct through the same encoder, and it is what makes the assertion
+    /// below a byte comparison rather than a shape comparison.
+    fn absent_record(service: Option<DestinationService>) -> EvidenceRecord {
+        EvidenceRecord {
+            schema: EVIDENCE_SCHEMA.to_string(),
+            outcome: Outcome::Absent,
+            repository_id: RESERVED.to_string(),
+            operation: OperationBinding {
+                org_id: "org-7f3c".to_string(),
+                operation_id: "2a91c3f0-51bd-4e77-9a06-8c4127de35b1".to_string(),
+                operation_revision: 7,
+                request_hash: "5f2c81a3".to_string(),
+                holder_id: "worker-3".to_string(),
+                fencing_token: 4,
+            },
+            measured: None,
+            echoed: EchoedInput {
+                source_input_hash: "a71b0f5c".to_string(),
+                requested_default_branch: "trunk".to_string(),
+                expected_refs: None,
+            },
+            destination_service: service,
+            differences: Vec::new(),
+            detail: Some("destination holds no publication".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_filesystem_evidence_record_is_byte_identical_to_what_this_adapter_has_always_written() {
+        // The hosted control plane's decoder refuses an unknown top-level
+        // field, so every filesystem record this adapter writes has to encode
+        // exactly as it did before object-store publication existed. This is
+        // that guarantee as a byte comparison: no `destination_service` key,
+        // and nothing else moved to make room for it.
+        let rendered =
+            serde_json::to_string_pretty(&absent_record(None)).expect("encode the record");
+        assert_eq!(
+            rendered,
+            r#"{
+  "schema": "kin.hosted-first-publication-evidence.v1",
+  "outcome": "absent",
+  "repository_id": "9f1c2e04-3b7a-4d21-9c55-0ab61d7e8f30",
+  "operation": {
+    "org_id": "org-7f3c",
+    "operation_id": "2a91c3f0-51bd-4e77-9a06-8c4127de35b1",
+    "operation_revision": 7,
+    "request_hash": "5f2c81a3",
+    "holder_id": "worker-3",
+    "fencing_token": 4
+  },
+  "echoed": {
+    "source_input_hash": "a71b0f5c",
+    "requested_default_branch": "trunk",
+    "expected_refs": null
+  },
+  "detail": "destination holds no publication"
+}"#
+        );
+    }
+
+    #[test]
+    fn an_object_store_record_names_the_service_and_adds_nothing_else() {
+        let rendered = serde_json::to_string_pretty(&absent_record(Some(DestinationService {
+            class: "emulator".to_string(),
+            endpoint_url: Some("http://127.0.0.1:4443".to_string()),
+        })))
+        .expect("encode the record");
+        assert_eq!(
+            rendered,
+            r#"{
+  "schema": "kin.hosted-first-publication-evidence.v1",
+  "outcome": "absent",
+  "repository_id": "9f1c2e04-3b7a-4d21-9c55-0ab61d7e8f30",
+  "operation": {
+    "org_id": "org-7f3c",
+    "operation_id": "2a91c3f0-51bd-4e77-9a06-8c4127de35b1",
+    "operation_revision": 7,
+    "request_hash": "5f2c81a3",
+    "holder_id": "worker-3",
+    "fencing_token": 4
+  },
+  "echoed": {
+    "source_input_hash": "a71b0f5c",
+    "requested_default_branch": "trunk",
+    "expected_refs": null
+  },
+  "destination_service": {
+    "class": "emulator",
+    "endpoint_url": "http://127.0.0.1:4443"
+  },
+  "detail": "destination holds no publication"
+}"#
+        );
+
+        // A production destination carries no override URL, and the key is
+        // absent rather than null, so a decoder reading it as optional sees the
+        // same shape a filesystem record has for every other optional field.
+        let production = serde_json::to_string(&absent_record(Some(DestinationService {
+            class: "production-adc".to_string(),
+            endpoint_url: None,
+        })))
+        .expect("encode the record");
+        assert!(
+            production.contains(r#""destination_service":{"class":"production-adc"}"#),
+            "got {production}"
+        );
+    }
+
+    #[test]
+    fn the_resolved_scope_is_the_string_the_budget_was_checked_against() {
+        let resolved = object_store(BUCKET, PREFIX)
+            .resolve(&DestinationEnv::default(), &reserved())
+            .expect("a well formed destination resolves");
+        assert_eq!(resolved.scope(), format!("gcs:{BUCKET}/{PREFIX}"));
+        // The identifier the run will compose after a publication commits, at
+        // the widest generation a bucket can assign. The budget was checked
+        // against exactly this string, so a run that resolves cannot later fail
+        // to write its own receipt.
+        let widest = format!(
+            "{ARTIFACT_ID_PREFIX}:{}/{RESERVED}@{}",
+            resolved.scope(),
+            u64::MAX
+        );
+        assert!(
+            widest.len() <= ARTIFACT_ID_MAX_BYTES,
+            "a resolved destination always fits its identifier, got {} bytes",
+            widest.len()
+        );
+    }
 }
