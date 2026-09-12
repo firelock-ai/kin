@@ -14,9 +14,9 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --test ./test/index.test.js",
+    "test": "node --test ./test/index.test.js ../../scripts/mcpb/test-build.mjs",
     "test:unit": "node --test ./test/index.test.js",
-    "lint": "node --check ./bin/kin-mcp.js && node --check ./src/index.js && node --check ./test/index.test.js && node --check ./test/smoke-first-run.mjs",
+    "lint": "node --check ./bin/kin-mcp.js && node --check ./src/index.js && node --check ./test/index.test.js && node --check ./test/smoke-first-run.mjs && node --check ../../scripts/mcpb/test-build.mjs",
     "smoke": "node ./test/smoke-first-run.mjs"
   },
   "engines": {

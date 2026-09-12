@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "kin",
   "display_name": "Kin",
-  "version": "0.5.27",
+  "version": "0.0.0",
   "description": "Kin keeps a living map of the software itself so humans and agents can understand what every change touches. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
   "author": {
     "name": "Firelock, LLC",

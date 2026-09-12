@@ -3,7 +3,6 @@ import cp from 'node:child_process';
 import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -472,35 +471,27 @@ async function buildReleaseArchive(
   return { archiveBytes, archiveName, checksum, kinBytes, daemonBytes };
 }
 
-function startReleaseServer(version, archiveName, archiveBytes, checksum) {
-  const server = http.createServer((req, res) => {
-    if (req.url === `/v${version}/${archiveName}`) {
-      res.writeHead(200, { 'content-type': 'application/octet-stream' });
-      res.end(archiveBytes);
-      return;
+function mockReleaseFetch(t, version, archiveName, archiveBytes, checksum) {
+  const baseUrl = 'https://releases.example.invalid';
+  t.mock.method(globalThis, 'fetch', async url => {
+    if (url === `${baseUrl}/v${version}/${archiveName}`) {
+      return new Response(archiveBytes, { headers: { 'content-type': 'application/octet-stream' } });
     }
-    if (req.url === `/v${version}/${archiveName}.sha256`) {
-      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end(`${checksum}  ${archiveName}\n`);
-      return;
+    if (url === `${baseUrl}/v${version}/${archiveName}.sha256`) {
+      return new Response(`${checksum}  ${archiveName}\n`);
     }
-    res.writeHead(404);
-    res.end('not found');
+    return new Response('not found', { status: 404, statusText: 'Not Found' });
   });
-  return server;
+  return baseUrl;
 }
 
-test('ensureKinBinary downloads kin and its daemon from a release asset', async () => {
+test('ensureKinBinary downloads kin and its daemon from a release asset', async t => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-download-'));
   const assetName = 'kin-linux-x86_64';
   const version = '9.9.9-test';
   const { archiveBytes, archiveName, checksum, kinBytes, daemonBytes } =
     await buildReleaseArchive(tmpDir, assetName);
-  const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
-
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const baseUrl = mockReleaseFetch(t, version, archiveName, archiveBytes, checksum);
   const env = {
     KIN_MCP_CACHE_DIR: tmpDir,
     KIN_MCP_RELEASE_BASE_URL: baseUrl
@@ -529,22 +520,17 @@ test('ensureKinBinary downloads kin and its daemon from a release asset', async 
     assert.equal(await exists(daemonPath), true);
     assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
   } finally {
-    await new Promise(resolve => server.close(resolve));
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
 
-test('ensureKinBinary installs the flat native Windows zip and .exe pair', async () => {
+test('ensureKinBinary installs the flat native Windows zip and .exe pair', async t => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-windows-download-'));
   const assetName = 'kin-windows-x86_64';
   const version = '9.9.9-test';
   const { archiveBytes, archiveName, checksum, kinBytes, daemonBytes } =
     await buildReleaseArchive(tmpDir, assetName, { platform: 'win32' });
-  const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
-
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const baseUrl = mockReleaseFetch(t, version, archiveName, archiveBytes, checksum);
   const env = await environmentWithHostileTar(tmpDir, {
     KIN_MCP_CACHE_DIR: tmpDir,
     KIN_MCP_RELEASE_BASE_URL: baseUrl
@@ -565,7 +551,6 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
     assert.equal(path.basename(daemonPath), 'kin-daemon.exe');
     assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
   } finally {
-    await new Promise(resolve => server.close(resolve));
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
@@ -578,17 +563,13 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
 test(
   'ensureKinBinary unpacks the Unix archive with an absolute tar under a hostile PATH',
   { skip: process.platform === 'win32' },
-  async () => {
+  async t => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-hostile-tar-'));
     const assetName = 'kin-linux-x86_64';
     const version = '9.9.9-test';
     const { archiveBytes, archiveName, checksum, kinBytes, daemonBytes } =
       await buildReleaseArchive(tmpDir, assetName);
-    const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
-
-    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const baseUrl = mockReleaseFetch(t, version, archiveName, archiveBytes, checksum);
     const env = await environmentWithHostileTar(tmpDir, {
       KIN_MCP_CACHE_DIR: tmpDir,
       KIN_MCP_RELEASE_BASE_URL: baseUrl
@@ -606,13 +587,12 @@ test(
       const daemonPath = resolveDaemonBinaryPath(binaryPath);
       assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
     } finally {
-      await new Promise(resolve => server.close(resolve));
-      await fs.rm(tmpDir, { recursive: true, force: true });
+        await fs.rm(tmpDir, { recursive: true, force: true });
     }
   }
 );
 
-test('ensureKinBinary fails with a precise message when the archive omits kin-daemon', async () => {
+test('ensureKinBinary fails with a precise message when the archive omits kin-daemon', async t => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-nodaemon-'));
   const assetName = 'kin-linux-x86_64';
   const version = '9.9.9-test';
@@ -621,11 +601,7 @@ test('ensureKinBinary fails with a precise message when the archive omits kin-da
     assetName,
     { includeDaemon: false }
   );
-  const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
-
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const baseUrl = mockReleaseFetch(t, version, archiveName, archiveBytes, checksum);
   const env = {
     KIN_MCP_CACHE_DIR: tmpDir,
     KIN_MCP_RELEASE_BASE_URL: baseUrl
@@ -637,7 +613,37 @@ test('ensureKinBinary fails with a precise message when the archive omits kin-da
       /kin-daemon/
     );
   } finally {
-    await new Promise(resolve => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('ensureKinBinary rejects a failed archive response', async t => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-http-error-'));
+  t.mock.method(globalThis, 'fetch', async () =>
+    new Response('not found', { status: 404, statusText: 'Not Found' }));
+  try {
+    await assert.rejects(ensureKinBinary({
+      env: { KIN_MCP_CACHE_DIR: tmpDir }, platform: 'linux', arch: 'x64', version: '9.9.9-test'
+    }), /failed to download .*404 Not Found/);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('ensureKinBinary rejects archive bytes that disagree with the checksum', async t => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-corrupt-'));
+  const version = '9.9.9-test';
+  const { archiveBytes, archiveName } = await buildReleaseArchive(tmpDir, 'kin-linux-x86_64');
+  const baseUrl = mockReleaseFetch(t, version, archiveName, archiveBytes, '0'.repeat(64));
+  try {
+    await assert.rejects(ensureKinBinary({
+      env: { KIN_MCP_CACHE_DIR: tmpDir, KIN_MCP_RELEASE_BASE_URL: baseUrl },
+      platform: 'linux', arch: 'x64', version
+    }), /checksum mismatch/i);
+    assert.equal(await exists(resolveCachedBinaryPath({
+      env: { KIN_MCP_CACHE_DIR: tmpDir }, platform: 'linux', arch: 'x64', version
+    })), false);
+  } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
