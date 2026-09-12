@@ -102,9 +102,26 @@ pub fn qualify(
     // (FIR-2672), and a class the build could not produce reads `unproduced`
     // rather than `absent`, so the sentence below can say which it was.
     let decided = decided_by(tool, payload, envelope);
+    // `unproduced` carries two reasons and only one of them is about the
+    // linker, so they render as different sentences. A class this build mints
+    // for no language at all has no resolved site to blame, and saying the
+    // source carries sites the linker resolved would be a claim about code this
+    // observation never made.
+    let build_gap = |class: &str| -> bool {
+        observed
+            .and_then(|coverage| coverage.get("unproduced_evidence"))
+            .and_then(|evidence| evidence.get(class))
+            .and_then(|evidence| evidence.get("this_build_mints_no_entity_level_edge_for"))
+            .is_some()
+    };
+    let unminted: Vec<&'static str> = decided
+        .iter()
+        .filter(|class| state_of(class) == Some("unproduced") && build_gap(class))
+        .map(|class| edge_class_noun(class))
+        .collect();
     let unproduced: Vec<&'static str> = decided
         .iter()
-        .filter(|class| state_of(class) == Some("unproduced"))
+        .filter(|class| state_of(class) == Some("unproduced") && !build_gap(class))
         .map(|class| edge_class_noun(class))
         .collect();
     let missing: Vec<&'static str> = decided
@@ -123,7 +140,7 @@ pub fn qualify(
     // is whatever the verdict actually disclosed. This is also the whole of the
     // language-scoped path: `semantic_search` reads no edge class, so its
     // qualifier always renders from the disclosed signals.
-    if missing.is_empty() && unproduced.is_empty() {
+    if missing.is_empty() && unproduced.is_empty() && unminted.is_empty() {
         let subject = absence_subject(tool);
         let disclosed = negative
             .get("degraded_signals")
@@ -181,8 +198,27 @@ pub fn qualify(
             )
         }
     };
-    let short_all: Vec<&str> = unproduced.iter().chain(missing.iter()).copied().collect();
+    let short_all: Vec<&str> = unminted
+        .iter()
+        .chain(unproduced.iter())
+        .chain(missing.iter())
+        .copied()
+        .collect();
     let mut said = Vec::new();
+    if !unminted.is_empty() {
+        let tail = if unproduced.is_empty() && missing.is_empty() {
+            stand_in(&short_all)
+        } else {
+            String::new()
+        };
+        said.push(format!(
+            "{indent}{QUALIFIER_MARK} {subject}: this build mints no entity-level {} edge for \
+             {language} at all, and the graph therefore holds none to find, {}. The gap is in \
+             this build, not in the code.{tail}",
+            unminted.join(" or "),
+            absence_direction(tool)
+        ));
+    }
     if !unproduced.is_empty() {
         let tail = if missing.is_empty() {
             stand_in(&short_all)

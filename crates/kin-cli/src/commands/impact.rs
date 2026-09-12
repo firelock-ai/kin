@@ -1221,15 +1221,27 @@ mod tests {
         .expect("impact response");
         let rendered = response.lines.join("\n");
 
+        let build_gap = rendered
+            .find("mints no entity-level import edge for Rust")
+            .unwrap_or_else(|| panic!("the class no build mints must be named: {rendered}"));
         let class_gap = rendered
-            .find("holds no cross-file import or reference edges")
+            .find("holds no cross-file reference edges")
             .unwrap_or_else(|| panic!("the short classes decide and must be named: {rendered}"));
         let worker = rendered.find("embed_worker_failed").unwrap_or_else(|| {
             panic!("the failed worker must stay named beside the class gap: {rendered}")
         });
         assert!(
-            class_gap < worker,
-            "the structural gap leads and the run degradation follows: {rendered}"
+            build_gap < class_gap && class_gap < worker,
+            "the structural gaps lead and the run degradation follows: {rendered}"
+        );
+        // `unproduced` carries two reasons and only one of them is about the
+        // source. This build mints no entity-level import edge for Rust at all,
+        // so there is no resolved site to blame, and rendering the linker's
+        // sentence over this class would be a claim about code the observation
+        // never made.
+        assert!(
+            !rendered.contains("although the source carries"),
+            "a class no build mints has no resolved import site to blame: {rendered}"
         );
     }
 
