@@ -31,7 +31,7 @@
 //! - `negative.safe_to_conclude_absent` / `negative.trust` / `negative.advice`
 //!   are built from the gap list this module contributes to, so they are correct
 //!   by construction rather than patched afterwards.
-//! - `_kin.completeness.bound`, `counted.exact` and `note` are capped by
+//! - `_kin.completeness.bound` and `counted.exact` are capped by
 //!   [`Verdict::project_onto_completeness`].
 //! - `_kin.completeness.status`, `classes`, `decided_by` and `limits` stay raw
 //!   observation. `status` answers "was the substrate whole", which is a
@@ -68,27 +68,397 @@ const VERDICT_LIMIT: &str = "verdict_inconclusive";
 /// a boundary inferred from it is a boundary a human never chose.
 pub(crate) const CLAUSE_SEPARATOR: &str = "; ";
 
+/// One code the verdict can carry, with what it means.
+///
+/// `meaning` is the one sentence Kin writes for the code, once, and
+/// `docs/mcp-tools.md` carries the same table: a test holds the two equal, so
+/// the docs cannot drift from the list the verdict reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClauseCode {
+    /// The code as it appears in `_kin.verdict.limiting_factor`.
+    pub code: &'static str,
+    /// What it means, in one sentence.
+    pub meaning: &'static str,
+}
+
+/// Every code `_kin.verdict.limiting_factor` and `negative.trust_reason` can
+/// carry, in code order.
+///
+/// Closed: a clause whose label is not here is sent as [`UNLISTED_CLAUSE_CODE`]
+/// rather than minted, and `every_clause_label_a_producer_writes_is_listed`
+/// scans this crate's sources so a producer that writes a new label fails CI
+/// until the label is listed here and in the docs.
+pub const CLAUSE_CODES: &[ClauseCode] = &[
+    ClauseCode {
+        code: "absence_coverage_unmeasured",
+        meaning: "No coverage class was measured for the answer's language, so an empty result cannot be separated from a declaration the extractor never admitted.",
+    },
+    ClauseCode {
+        code: "absence_coverage_unreported",
+        meaning: "The answer did not report which languages its absence claim spans or whether this build resolves them.",
+    },
+    ClauseCode {
+        code: "absence_scope_empty",
+        meaning: "The graph holds no entity at all under the filter the query applied, so an empty result describes the index rather than the code.",
+    },
+    ClauseCode {
+        code: "answer_coverage_unmeasured",
+        meaning: "No coverage class was measured for the answer's language, so its rows are a floor.",
+    },
+    ClauseCode {
+        code: "answer_coverage_unreported",
+        meaning: "The answer did not report which languages its rows span or whether this build resolves them, so its rows are a floor.",
+    },
+    ClauseCode {
+        code: "answer_truncated",
+        meaning: "The answer stopped early and returned part of what it found, so its counts are a floor.",
+    },
+    ClauseCode {
+        code: "caller_arrival_state_unknown",
+        meaning: "The answer reported a caller-arrival state this build does not recognise, so an empty reference list cannot be read as whole.",
+    },
+    ClauseCode {
+        code: "caller_arrival_unmeasured",
+        meaning: "The set of files that can reach the focal could not be established, because the language links no imports across files in this graph.",
+    },
+    ClauseCode {
+        code: "caller_arrival_unresolved",
+        meaning: "Some files that can reach the focal have callers the graph did not resolve, so the reference list is a floor.",
+    },
+    ClauseCode {
+        code: "counts_are_a_floor",
+        meaning: "The answer's own accounting reports its numbers as a lower bound.",
+    },
+    ClauseCode {
+        code: "coverage_absent",
+        meaning: "No entity in the store carries an embedding, so an empty semantic result means nothing was ranked.",
+    },
+    ClauseCode {
+        code: "coverage_graph_body_gap",
+        meaning: "Some graph-owned source paths carry no body, so their entities rank on text fallback.",
+    },
+    ClauseCode {
+        code: "coverage_partial",
+        meaning: "The semantic index is incomplete, so an empty result may mean not indexed rather than not present.",
+    },
+    ClauseCode {
+        code: "coverage_role_filter_withheld",
+        meaning: "Test-role source paths were withheld from ranking; pass include_tests to rank them.",
+    },
+    ClauseCode {
+        code: "coverage_unknown",
+        meaning: "Embedding coverage was not reported, so an empty result may mean not indexed rather than not present.",
+    },
+    ClauseCode {
+        code: "cross_file_edges_absent",
+        meaning: "The graph was not observed to hold cross-file edges of a requested class for the language, so a use reaching the target through that class could not have been found; the gap is in extraction or enrichment rather than in the code, and the classes that are present do not stand in for it.",
+    },
+    ClauseCode {
+        code: "cross_file_edges_unproduced",
+        meaning: "The build produced no entity-level edge of a requested class, either because no build mints that class for the language or because the linker resolved its sites without emitting one; the gap is in extraction, not in the code.",
+    },
+    ClauseCode {
+        code: "cross_repo_authority_incomplete",
+        meaning: "The cross-repo spine's topology or the requested relation subtype is incomplete at its revision.",
+    },
+    ClauseCode {
+        code: "cross_repo_authority_missing",
+        meaning: "The answer did not report cross-repo authority.",
+    },
+    ClauseCode {
+        code: "cross_repo_authority_unknown",
+        meaning: "The answer reported a cross-repo authority status this build does not recognise.",
+    },
+    ClauseCode {
+        code: "cross_repo_not_configured",
+        meaning: "No cross-repo spine is configured, so the answer is scoped to this repository.",
+    },
+    ClauseCode {
+        code: "cross_repo_unavailable",
+        meaning: "A configured cross-repo spine could not answer and named no condition.",
+    },
+    ClauseCode {
+        code: "degraded",
+        meaning: "The daemon reported a degraded signal; `_kin.degraded` names which.",
+    },
+    ClauseCode {
+        code: "dependency_outside_graph",
+        meaning: "The question names a dependency this repository imports and this graph holds no definitions for, so the answer may live outside what was searched.",
+    },
+    ClauseCode {
+        code: "dependency_scan_incomplete",
+        meaning: "The scan of unadmitted imports hit its budget before it checked all of them.",
+    },
+    ClauseCode {
+        code: "dependency_scan_unavailable",
+        meaning: "The store could not say which of its imports are unadmitted.",
+    },
+    ClauseCode {
+        code: "depth_zero",
+        meaning: "The walk expanded no edges, so an empty neighbourhood is not evidence of isolation.",
+    },
+    ClauseCode {
+        code: "edge_coverage_budget_exhausted",
+        meaning: "The coverage scan for the language stopped before it could establish what the graph holds.",
+    },
+    ClauseCode {
+        code: "edge_coverage_unknown",
+        meaning: "Whether the graph holds cross-file edges of a requested class for the language could not be established.",
+    },
+    ClauseCode {
+        code: "edge_coverage_unreported",
+        meaning: "The answer did not report whether the graph holds the cross-file edges it depends on.",
+    },
+    ClauseCode {
+        code: "entity_index_unresolved",
+        meaning: "Nothing resolves the program behind the parsed declarations, so an empty name or kind filter cannot separate a missing declaration from one the extractor did not admit.",
+    },
+    ClauseCode {
+        code: "enumeration_shifted",
+        meaning: "The file gained or lost entities between pages, so the pages do not assemble into one state; walk again from the start.",
+    },
+    ClauseCode {
+        code: "file_bytes_unadmitted",
+        meaning: "The working copy holds content at this path that graph truth does not carry, so the spans describe earlier bytes; `kin reconcile` takes the edit.",
+    },
+    ClauseCode {
+        code: "file_coverage_unreported",
+        meaning: "The answer did not report whether a language adapter parsed the file.",
+    },
+    ClauseCode {
+        code: "file_not_parsed",
+        meaning: "No language adapter produced a layout for the file, so an empty enumeration is a fact about extraction coverage, not the file.",
+    },
+    ClauseCode {
+        code: "file_parse_failed",
+        meaning: "The adapter could not parse the file, so the entities the graph still carries for it describe an earlier state.",
+    },
+    ClauseCode {
+        code: "file_parse_state_unknown",
+        meaning: "The answer reported a parse state this build does not recognise.",
+    },
+    ClauseCode {
+        code: "file_parsed_partially",
+        meaning: "The adapter hit parse errors in the file, so its entities are a floor.",
+    },
+    ClauseCode {
+        code: "file_spans_stale",
+        meaning: "Some entity spans in the file were derived from bytes the repository tree no longer holds at this path.",
+    },
+    ClauseCode {
+        code: "focal_not_in_graph",
+        meaning: "The focal entity was not found, so an empty neighbourhood is not evidence that it is isolated.",
+    },
+    ClauseCode {
+        code: "focal_resolution_ambiguous",
+        meaning: "The focal name resolved to several entities and only one was answered for.",
+    },
+    ClauseCode {
+        code: "focal_resolution_unreported",
+        meaning: "The answer did not report how many entities the focal could have resolved to, so it may describe a same-named sibling.",
+    },
+    ClauseCode {
+        code: "graph_admission_unrecorded",
+        meaning: "The daemon reports no complete admission of the repository into graph truth, so how far the graph is behind is unmeasured.",
+    },
+    ClauseCode {
+        code: "graph_behind_working_tree",
+        meaning: "Host paths on disk have never been admitted; `_kin.behind` counts them.",
+    },
+    ClauseCode {
+        code: "graph_empty",
+        meaning: "The graph that answered holds no entities, so it cannot speak for the repository yet; ask again once its graph is loaded.",
+    },
+    ClauseCode {
+        code: "graph_not_loaded",
+        meaning: "The daemon reports no graph loaded, so an empty structural result is not authoritative.",
+    },
+    ClauseCode {
+        code: "graph_uninitialized",
+        meaning: "The daemon has not confirmed its first reconciliation or snapshot load.",
+    },
+    ClauseCode {
+        code: "lexical_fallback_matched_nothing",
+        meaning: "A phrase query matched no name, and the per-token fallback ranks by word overlap rather than meaning.",
+    },
+    ClauseCode {
+        code: "method_call_resolution_incomplete",
+        meaning: "Receiver-method calls are linked by bare name and may be unresolved, so an empty result is not authoritative for a method.",
+    },
+    ClauseCode {
+        code: "name_filter_narrowed_to_zero",
+        meaning: "The name pattern selects declarations and the query's other filters removed every one of them.",
+    },
+    ClauseCode {
+        code: "offline_fallback",
+        meaning: "The in-process fallback graph answered, not the daemon's graph truth.",
+    },
+    ClauseCode {
+        code: "page_bounded",
+        meaning: "The response holds one page of the file; follow `next_cursor` to the end before reading the set as whole.",
+    },
+    ClauseCode {
+        code: "ranking_is_bounded",
+        meaning: "A ranking is a bounded candidate set, so a name absent from it may belong to an entity the query never ranked.",
+    },
+    ClauseCode {
+        code: "reference_enrichment_no_language_server",
+        meaning: "An adapter is wired for the language but no language server for it is installed on this host.",
+    },
+    ClauseCode {
+        code: "reference_enrichment_unsupported",
+        meaning: "This build cannot link cross-file references for the language, so an unused symbol cannot be told from an unlinked one.",
+    },
+    ClauseCode {
+        code: "relevance_floor_unmeasured",
+        meaning: "Every returned row was a fallback neighbour and no calibrated threshold says any of them answers the concept.",
+    },
+    ClauseCode {
+        code: "response_bounded",
+        meaning: "The response budget withheld part of the answer; `_kin.response` names what was cut.",
+    },
+    ClauseCode {
+        code: "retrieval_degraded",
+        meaning: "The query reported degradations; the payload's `degradations` names them.",
+    },
+    ClauseCode {
+        code: "selected_graph_sample_stale",
+        meaning: "The selected graph could not be sampled live, so the counters replay an earlier observation; `_kin.freshness` has its age.",
+    },
+    ClauseCode {
+        code: "semantic_authoritative",
+        meaning: "Certifying: daemon-owned truth with complete embedding coverage. Appears only when trust is authoritative.",
+    },
+    ClauseCode {
+        code: "spine_root_stale",
+        meaning: "The cross-repo spine's recorded root for this repository is stale.",
+    },
+    ClauseCode {
+        code: "structural_authoritative",
+        meaning: "Certifying: the daemon's graph is initialized and loaded. Appears only when trust is authoritative.",
+    },
+    ClauseCode {
+        code: "substrate_partial",
+        meaning: "A coverage class the answer depended on was observed absent; `_kin.completeness.classes` names it.",
+    },
+    ClauseCode {
+        code: "substrate_unknown",
+        meaning: "The coverage classes the answer depended on were not all observed present; `_kin.completeness.classes` names them.",
+    },
+    ClauseCode {
+        code: "trace_spine_clipped",
+        meaning: "The per-step cap cut the walk's fan-out, so the chain is one route among those the cap kept and a missing hop was not looked for.",
+    },
+    ClauseCode {
+        code: "trace_walk_degraded",
+        meaning: "The walk reported degradations, so it did not complete under its own work bounds.",
+    },
+    ClauseCode {
+        code: "trace_walk_truncated",
+        meaning: "The walk hit a per-step or total cap before examining everything an empty chain would have to rule out.",
+    },
+    ClauseCode {
+        code: "unlisted_clause",
+        meaning: "A reason this build carries no code for. The blocks the verdict's `inputs` name hold its facts. Seeing it is a Kin defect.",
+    },
+    ClauseCode {
+        code: "walk_bounded",
+        meaning: "The walk stopped at a work bound before its frontier emptied, so a route may exist beyond what was explored.",
+    },
+    ClauseCode {
+        code: "walk_depth_bounded",
+        meaning: "The walk stopped at max_depth before its frontier emptied; raise max_depth.",
+    },
+    ClauseCode {
+        code: "watcher_events_lost",
+        meaning: "The filesystem watcher lost events no admission has covered; `kin admit` clears it.",
+    },
+    ClauseCode {
+        code: "watcher_loss_unreadable",
+        meaning: "The durable watcher-loss record could not be read, so recovery is unknown; `kin admit` rewrites it after a complete admission.",
+    },
+    ClauseCode {
+        code: "withheld_candidates",
+        meaning: "Same-name candidates are held out of the counts and carried in `candidates`.",
+    },
+    ClauseCode {
+        code: "working_copy_unmeasured",
+        meaning: "Nothing has measured the working copy, so whether graph truth is level with it is unknown.",
+    },
+];
+
+/// The listed code a clause with an unlisted label is sent as.
+pub const UNLISTED_CLAUSE_CODE: &str = "unlisted_clause";
+
+/// The code a response the size budget bounded carries in the verdict.
+const RESPONSE_BOUNDED_CODE: &str = "response_bounded";
+
 /// The limiting factor a response bounded by the size budget carries.
 const RESPONSE_BOUNDED_FACTOR: &str = "response_bounded: the response budget withheld part of \
                                        this answer, so its counts are a lower bound and its \
                                        absence claims are not authoritative";
 
-/// The one sentence a reader acts on, carrying every reason the inputs gave.
+/// The factor a reader acts on: the code of every reason the inputs gave.
 ///
 /// The most pessimistic input decides the STATE; it does not make the other
 /// inputs vanish. When the coverage reading and the run's own degradations both
 /// refused, a factor that kept only the first sent a reader to fix the edge gap
 /// and never told them the embedding worker had died, which is a second thing
-/// wrong with the same answer (FIR-2672). So the factor is one sentence of
-/// clauses, one per reason, in the readings' order: the absence gate's own
-/// composition first, then the coverage observation, withheld rows, the run's
-/// degradations and the completeness signal. Each clause is `label: text` and a
-/// label appears once, because the absence gate already composes the class gap
-/// and the degradations that the later readings repeat as named inputs.
+/// wrong with the same answer (FIR-2672). So the factor carries one code per
+/// reason, in the readings' order: the absence gate's own composition first,
+/// then the coverage observation, withheld rows, the run's degradations and the
+/// completeness signal, joined by [`CLAUSE_SEPARATOR`]. A code appears once,
+/// because the absence gate already composes the class gap and the degradations
+/// that the later readings repeat as named inputs.
+///
+/// The code is the label each clause was written under, and it is all that is
+/// sent. Every fact the clause's sentence stated is a field of the block its
+/// input names, and what the code means is written once, in
+/// `docs/mcp-tools.md`, from [`CLAUSE_CODES`].
 fn compose_limiting_factor(readings: &[(&str, Reading)]) -> Option<String> {
-    Some(compose_clauses(readings))
-        .filter(|clauses| !clauses.is_empty())
-        .map(|clauses| clauses.join(CLAUSE_SEPARATOR))
+    let mut codes: Vec<&'static str> = Vec::new();
+    for clause in compose_clauses(readings) {
+        let code = listed_code(&clause_label(&clause));
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    (!codes.is_empty()).then(|| codes.join(CLAUSE_SEPARATOR))
+}
+
+/// The closed-list code for a clause label, or [`UNLISTED_CLAUSE_CODE`].
+///
+/// A label the list does not carry is a producer that wrote a code nobody
+/// documented. It still refuses the answer, because the reading that carried it
+/// refused, but it is sent as the one listed code that says so rather than as a
+/// code no reader can look up.
+fn listed_code(label: &str) -> &'static str {
+    match CLAUSE_CODES.iter().find(|entry| entry.code == label) {
+        Some(entry) => entry.code,
+        None => {
+            tracing::warn!(
+                label,
+                "a verdict clause carries a label the closed code list does not; it is sent as \
+                 unlisted_clause"
+            );
+            UNLISTED_CLAUSE_CODE
+        }
+    }
+}
+
+/// `code` first, then every code `existing` already carries, each once.
+///
+/// The factor is codes joined by [`CLAUSE_SEPARATOR`] and no code holds the
+/// separator, so splitting it recovers exactly the codes that were joined.
+fn lead_with_code(existing: Option<&str>, code: &'static str) -> String {
+    let mut codes = vec![code];
+    for existing in existing.unwrap_or_default().split(CLAUSE_SEPARATOR) {
+        let existing = existing.trim();
+        if !existing.is_empty() && !codes.contains(&existing) {
+            codes.push(existing);
+        }
+    }
+    codes.join(CLAUSE_SEPARATOR)
 }
 
 /// The factor's clauses, deduplicated by label, in the readings' order.
@@ -332,8 +702,8 @@ impl Verdict {
 
     /// Cap the completeness signal's verdict-shaped fields at this verdict.
     ///
-    /// Only ever downgrades. `bound`, `counted.exact` and `note` are what a
-    /// reader acts on, so they follow the one verdict; `status`, `classes`,
+    /// Only ever downgrades. `bound` and `counted.exact` are what a reader acts
+    /// on, so they follow the one verdict; `status`, `classes`,
     /// `decided_by` and `limits` are the observation the verdict was computed
     /// from and stay exactly as measured.
     /// The qualifiers that stop the `edge_coverage` block licensing a
@@ -426,48 +796,16 @@ impl Verdict {
         {
             completeness.limits.push(VERDICT_LIMIT.to_string());
         }
-        completeness.note = format!(
-            "The counts here are a lower bound, because this response's one verdict is \
-             inconclusive. Limiting factor: {}.",
-            self.limiting_factor.as_deref().unwrap_or("unreported")
-        );
     }
 
     /// Serialize for embedding under `_kin.verdict`.
     pub fn to_value(&self) -> Value {
-        // The note says the same thing the tri-state says, because it used to
-        // say something else. It promised "an absence in it is authoritative"
-        // on `certified` alone, so a caller whose answer carried five rows and
-        // claimed no absence read that promise beside a `false` flag in the
-        // same object, which is the contradiction FIR-2673 opens with. Each
-        // case now gets the sentence that is true for it.
-        let note = match (self.certified, self.absence_claim) {
-            (true, AbsenceClaim::NotApplicable) => "Every input that could qualify this answer \
-                 agreed, so the counts here are the whole set. This answer returned rows and \
-                 claims no absence, so there is no absence in it to conclude anything from."
-                .to_string(),
-            (true, _) => "Every input that could qualify this answer agreed, so the counts here \
-                 are the whole set and an absence in it is authoritative."
-                .to_string(),
-            (false, AbsenceClaim::NotApplicable) => format!(
-                "Treat this answer as a lower bound. It returned rows and claims no absence, so \
-                 the limit is on how many, not on whether something is missing. Limiting factor: \
-                 {}.",
-                self.limiting_factor.as_deref().unwrap_or("unreported")
-            ),
-            (false, _) => format!(
-                "Treat this answer as a lower bound and do not act on an absence in it. Limiting \
-                 factor: {}.",
-                self.limiting_factor.as_deref().unwrap_or("unreported")
-            ),
-        };
         json!({
             "state": if self.certified { CERTIFIED } else { INCONCLUSIVE },
             "absence_claim": self.absence_claim.as_str(),
             "safe_to_conclude_absent": self.absence_claim.legacy_bool(),
             "limiting_factor": self.limiting_factor.clone().map(Value::String).unwrap_or(Value::Null),
             "inputs": Value::Object(self.inputs.clone()),
-            "note": note,
         })
     }
 }
@@ -1000,24 +1338,14 @@ pub fn mark_response_bounded(annotated: &mut Value) {
     {
         verdict.insert("state".to_string(), json!(INCONCLUSIVE));
         verdict.insert("safe_to_conclude_absent".to_string(), json!(false));
-        // The budget cut leads the sentence and the reasons already in it
-        // follow, the same way the absence object below keeps its own; a factor
-        // that was replaced outright lost every other reason the answer had.
-        let factor = match verdict.get("limiting_factor").and_then(Value::as_str) {
-            Some(existing) if existing.contains(RESPONSE_BOUNDED_FACTOR) => existing.to_string(),
-            Some(existing) if !existing.is_empty() => {
-                format!("{RESPONSE_BOUNDED_FACTOR}; {existing}")
-            }
-            _ => RESPONSE_BOUNDED_FACTOR.to_string(),
-        };
-        verdict.insert("limiting_factor".to_string(), json!(factor.clone()));
-        verdict.insert(
-            "note".to_string(),
-            json!(format!(
-                "Treat this answer as a lower bound and do not act on an absence in it. Limiting \
-                 factor: {factor}."
-            )),
+        // The budget cut leads and the codes already there follow, the same way
+        // the absence object below keeps its own reasons; a factor that was
+        // replaced outright lost every other reason the answer had.
+        let factor = lead_with_code(
+            verdict.get("limiting_factor").and_then(Value::as_str),
+            RESPONSE_BOUNDED_CODE,
         );
+        verdict.insert("limiting_factor".to_string(), json!(factor));
         if let Some(inputs) = verdict.get_mut("inputs").and_then(Value::as_object_mut) {
             inputs.insert("response_budget".to_string(), json!(INCONCLUSIVE));
         }
@@ -1119,15 +1447,6 @@ pub fn disagreements(response: &Value) -> Vec<String> {
                 "_kin.completeness.counted.exact is true under an inconclusive _kin.verdict"
                     .to_string(),
             );
-        }
-        if let Some(note) = completeness.get("note").and_then(Value::as_str) {
-            if note.contains("the whole set") && !certified {
-                found.push(
-                    "_kin.completeness.note claims the whole set under an inconclusive \
-                     _kin.verdict"
-                        .to_string(),
-                );
-            }
         }
     }
 
@@ -1300,9 +1619,16 @@ mod tests {
                 Some(INCONCLUSIVE)
             );
             let factor = verdict.limiting_factor.as_deref().unwrap_or_default();
+            assert_eq!(
+                factor.split(CLAUSE_SEPARATOR).next(),
+                Some("graph_empty"),
+                "the factor must name the gap: {factor}"
+            );
             assert!(
-                factor.starts_with("graph_empty:") && factor.contains("ask again"),
-                "the factor must name the gap and what to do about it: {factor}"
+                CLAUSE_CODES
+                    .iter()
+                    .any(|entry| entry.code == "graph_empty" && entry.meaning.contains("ask again")),
+                "and the code's one written meaning must say what to do about it"
             );
             assert!(
                 !factor.contains("graph_admission"),
@@ -1363,6 +1689,7 @@ mod tests {
                 "generation": 2,
                 "recovered_through": 0,
                 "at": "2026-09-09T06:00:00Z",
+                "reason": "rescan: kernel dropped",
                 "disclosure": "the filesystem watcher lost events (loss generation 2, recovered \
                                through 0)",
             })
@@ -1405,6 +1732,10 @@ mod tests {
                 .expect("a standing loss is read off the wire");
             assert_eq!(observed.generation, 2);
             assert_eq!(observed.recovered_through, 0);
+            assert_eq!(
+                serde_json::to_value(observed).unwrap()["reason"],
+                "rescan: kernel dropped"
+            );
 
             let verdict = Verdict::compute(
                 "find_references",
@@ -1425,17 +1756,52 @@ mod tests {
                 .as_str()
                 .expect("a refusing verdict names its factor");
             assert!(
-                factor.contains("watcher_events_lost:"),
-                "the clause is labelled so it survives composition: {factor}"
+                factor
+                    .split(CLAUSE_SEPARATOR)
+                    .any(|code| code == "watcher_events_lost"),
+                "the code survives composition: {factor}"
+            );
+            assert_eq!(
+                envelope.watcher_loss.as_ref().map(|loss| loss.generation),
+                Some(2),
+                "the reader is told the generation by `_kin.watcher_loss` beside the code"
             );
             assert!(
-                factor.contains("generation 2"),
-                "the factor carries the generation: {factor}"
+                CLAUSE_CODES.iter().any(|entry| {
+                    entry.code == "watcher_events_lost" && entry.meaning.contains("kin admit")
+                }),
+                "and the one command that clears it by the code's written meaning"
             );
-            assert!(
-                factor.contains("kin admit"),
-                "a reader told only that this is inconclusive has nothing to do: {factor}"
+        }
+
+        #[test]
+        fn an_unreadable_loss_record_keeps_its_error_and_refuses_certification() {
+            let envelope = envelope_with(Some(json!({
+                "generation": 0,
+                "recovered_through": 0,
+                "read_error": "invalid watcher-loss schema",
+            })));
+            assert!(envelope.watcher_loss.is_some());
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("an unreadable loss record needs a verdict")
+            .to_value();
+            assert_eq!(verdict["state"], INCONCLUSIVE);
+            assert!(verdict["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .split(CLAUSE_SEPARATOR)
+                .any(|code| code == "watcher_loss_unreadable"));
+            let written = serde_json::to_value(envelope.for_state_change()).unwrap();
+            assert_eq!(
+                written["watcher_loss"]["read_error"],
+                "invalid watcher-loss schema"
             );
+            assert!(written["watcher_loss"].get("reason").is_none());
         }
 
         /// The bound on all of it. A record a completed full admission covered
@@ -1585,7 +1951,6 @@ mod tests {
                 counted: None,
                 reference_resolution: None,
                 limits: Vec::new(),
-                note: "Every class this answer depended on was observed present.".to_string(),
             }
         }
 
@@ -1802,18 +2167,14 @@ mod tests {
             json!("not_applicable"),
             "a populated answer claims no absence: {verdict}"
         );
-        let note = verdict["note"].as_str().expect("a note");
         assert!(
-            !note.contains("absence in it is authoritative"),
-            "the note promised an authoritative absence to an answer claiming none: {note}"
-        );
-        assert!(
-            note.contains("claims no absence"),
-            "and it should say which case this is: {note}"
+            verdict.get("note").is_none(),
+            "v2 carries no sentence, so none can promise an absence the answer does not claim: \
+             {verdict}"
         );
         // The legacy bool stays false here, and that is correct rather than a
         // bug: it is now DEFINED from the tri-state, so it can no longer
-        // contradict the note beside it.
+        // contradict the claim beside it.
         assert_eq!(
             verdict["safe_to_conclude_absent"],
             json!(false),
@@ -1851,11 +2212,8 @@ mod tests {
         assert_eq!(verdict["limiting_factor"], Value::Null, "{verdict}");
         assert_eq!(verdict["safe_to_conclude_absent"], json!(true), "{verdict}");
         assert!(
-            verdict["note"]
-                .as_str()
-                .expect("a note")
-                .contains("absence in it is authoritative"),
-            "{verdict}"
+            verdict.get("note").is_none(),
+            "the authoritative absence is the two fields above, never a sentence: {verdict}"
         );
     }
 
@@ -1898,13 +2256,18 @@ mod tests {
         ];
         let factor = compose_limiting_factor(&readings).expect("two inputs refused");
         assert_eq!(
-            factor.matches("retrieval_degraded:").count(),
+            factor
+                .split(CLAUSE_SEPARATOR)
+                .filter(|code| *code == "retrieval_degraded")
+                .count(),
             1,
             "the gap the trust_reason and the degradations reading both carry is said once: \
              {factor}"
         );
         assert!(
-            factor.contains("response_bounded:"),
+            factor
+                .split(CLAUSE_SEPARATOR)
+                .any(|code| code == "response_bounded"),
             "and the trust_reason's other clause survives rather than being swallowed: {factor}"
         );
     }
@@ -2005,6 +2368,35 @@ mod tests {
         );
     }
 
+    /// A label the closed list does not carry goes out as the one listed code
+    /// that says so. It still refuses, because the reading that carried it
+    /// refused, and it is never minted as a code no reader can look up.
+    #[test]
+    fn an_unlisted_label_is_sent_as_unlisted_clause_and_still_refuses() {
+        let readings = [
+            (
+                "degradations",
+                Reading::Inconclusive(vec![
+                    "not_a_listed_code: a producer nobody registered".to_string()
+                ]),
+            ),
+            (
+                "completeness",
+                Reading::Inconclusive(vec![
+                    "counts_are_a_floor: the numbers are a floor".to_string()
+                ]),
+            ),
+        ];
+        let factor = compose_limiting_factor(&readings).expect("two inputs refused");
+        assert_eq!(factor, "unlisted_clause; counts_are_a_floor");
+        assert!(
+            CLAUSE_CODES
+                .iter()
+                .any(|entry| entry.code == UNLISTED_CLAUSE_CODE),
+            "the fallback is itself a listed code"
+        );
+    }
+
     /// FIR-2672, second finding. A verdict with two independent reasons names
     /// both: the class gap decided the state and the failed embedding worker
     /// stayed in the sentence after it, and the gap the absence gate and the
@@ -2040,12 +2432,7 @@ mod tests {
             ("completeness", Reading::Silent),
         ];
         let factor = compose_limiting_factor(&readings).expect("two inputs refused");
-        assert_eq!(
-            factor,
-            "cross_file_edges_absent: the graph holds no cross-file imports edges for python; \
-             retrieval_degraded: this query reported degradations [embed_worker_failed], so it \
-             did not run at full capability"
-        );
+        assert_eq!(factor, "cross_file_edges_absent; retrieval_degraded");
         assert!(
             compose_limiting_factor(&[
                 ("absence_gate", Reading::Certified),
@@ -2080,43 +2467,50 @@ mod tests {
         );
         let factor = verdict["limiting_factor"].as_str().expect("named");
         let class_gap = factor
-            .find("cross_file_edges_absent:")
+            .find("cross_file_edges_absent")
             .unwrap_or_else(|| panic!("the class gap is named: {factor}"));
         let degraded = factor
-            .find("retrieval_degraded:")
+            .find("retrieval_degraded")
             .unwrap_or_else(|| panic!("the degradation stays named beside it: {factor}"));
         assert!(class_gap < degraded, "the structural gap leads: {factor}");
         assert_eq!(
-            factor.matches("cross_file_edges_absent:").count(),
+            factor
+                .split(CLAUSE_SEPARATOR)
+                .filter(|code| *code == "cross_file_edges_absent")
+                .count(),
             1,
-            "one fact, one clause: {factor}"
+            "one fact, one code: {factor}"
         );
-        // WHICH of the two clauses survives is decided by the readings array's
-        // order, not by the dedupe rule, and nothing else asserts it. The
-        // absence gate precedes the coverage reading, and its clause is the
-        // specific one: it names the language and says which classes do not
-        // stand in for the missing one. Swap the two in `compute` and both the
-        // assertion above and `every_refusing_input_keeps_its_clause_in_the_factor`
-        // stay green while every real reader quietly gets the shorter clause.
-        // Both clauses name the language, so that is not the difference. The
-        // absence gate's says where the gap IS, in extraction rather than in
-        // the caller's code, and why the classes that ARE present do not stand
-        // in for the missing one. The coverage reading's says only that the
-        // edges were not observed. A reader who acts on the first does not go
-        // looking through their own source; a reader who acts on the second
-        // might.
+        // Under envelope v1 the two readings carried two sentences for this one
+        // gap and the readings' order decided which survived dedupe: the absence
+        // gate's, which said the gap is in extraction rather than in the caller's
+        // code and why the present classes do not stand in for the missing one, or
+        // the coverage reading's, which said only that the edges were not
+        // observed. Under v2 both collapse to one code, so what a reader is told
+        // no longer depends on that order; it depends on the code's one written
+        // meaning, which is what has to carry the two things the specific
+        // sentence carried.
+        let meaning = CLAUSE_CODES
+            .iter()
+            .find(|entry| entry.code == "cross_file_edges_absent")
+            .map(|entry| entry.meaning)
+            .expect("the class gap is a listed code");
         assert!(
-            factor.contains("rather than in the code"),
-            "the surviving clause is the absence gate's, which tells the reader the gap is not \
-             in their code. Which of the two survives is decided by the readings array's ORDER, \
-             not by the dedupe rule, so reordering `compute` silently downgrades what every \
-             reader sees while every other assertion here stays green: {factor}"
+            meaning.contains("rather than in the code"),
+            "the code's meaning tells the reader the gap is not in their code: {meaning}"
         );
         assert!(
-            factor.contains("do not stand in for"),
-            "and why the classes that are present do not compensate: {factor}"
+            meaning.contains("do not stand in for"),
+            "and why the classes that are present do not compensate: {meaning}"
         );
-        assert!(factor.contains("embed_worker:failed"), "{factor}");
+        // The degradation's own label rides the payload, which is where the
+        // `retrieval_degraded` code sends a reader.
+        assert!(
+            crate::negative::payload_degradation_labels(&payload)
+                .iter()
+                .any(|label| label == "embed_worker:failed"),
+            "{factor}"
+        );
     }
 
     /// A response whose blocks all agree with a certified verdict.
@@ -2183,7 +2577,6 @@ mod tests {
             "negative.advice certifies an absence under an inconclusive _kin.verdict",
             "_kin.completeness.bound reads exact under an inconclusive _kin.verdict",
             "_kin.completeness.counted.exact is true under an inconclusive _kin.verdict",
-            "_kin.completeness.note claims the whole set under an inconclusive _kin.verdict",
         ] {
             assert!(
                 found.iter().any(|message| message == expected),
@@ -2393,12 +2786,17 @@ mod tests {
             .as_str()
             .expect("an inconclusive verdict names its factor");
         assert!(
-            factor.contains("retrieval_degraded:"),
-            "the factor must carry the degradation clause: {factor}"
+            factor
+                .split(CLAUSE_SEPARATOR)
+                .any(|code| code == "retrieval_degraded"),
+            "the factor must carry the degradation code: {factor}"
         );
         assert!(
-            factor.contains(mismatch_reason),
-            "the factor must name the producer mismatch itself: {factor}"
+            CLAUSE_CODES.iter().any(|entry| {
+                entry.code == "retrieval_degraded" && entry.meaning.contains("degradations")
+            }) && mismatch_reason.contains("producer"),
+            "and the code's written meaning must send the reader to the degradations, where the \
+             mismatch {mismatch_reason} itself is recorded"
         );
 
         // The separating control: query-shape guidance is a real degradation
@@ -2829,10 +3227,15 @@ mod tests {
             let factor = verdict["limiting_factor"]
                 .as_str()
                 .expect("an inconclusive verdict names its limiting factor");
-            assert!(
-                factor.starts_with(leading) && factor.contains("imports"),
-                "{state}: the factor leads with the class's own state and names the class: \
-                 {factor}"
+            assert_eq!(
+                factor.split(CLAUSE_SEPARATOR).next(),
+                Some(leading),
+                "{state}: the factor leads with the class's own state: {factor}"
+            );
+            assert_eq!(
+                populated_reference_payload(state)["edge_coverage"]["classes"]["imports"],
+                json!(state),
+                "{state}: and the class is named by the block the code points at"
             );
             for input in ["withheld_candidates", "degradations"] {
                 assert_ne!(
@@ -3029,11 +3432,14 @@ mod tests {
             response["_kin"]["verdict"]["limiting_factor"]
                 .as_str()
                 .unwrap()
-                .matches("response_bounded:")
+                .split(CLAUSE_SEPARATOR)
+                .filter(|code| *code == "response_bounded")
                 .count(),
             1,
             "the convergence loop may reapply the downgrade without repeating its factor"
         );
+        // The absence object keeps its sentences until PR 2 moves negative.rs, so
+        // its reason is still `label: text` clauses and is counted as such.
         assert_eq!(
             response["negative"]["trust_reason"]
                 .as_str()
@@ -3091,9 +3497,10 @@ mod tests {
             factor.contains("dependency_outside_graph"),
             "the clause carries its own label: {factor}"
         );
-        assert!(
-            factor.contains("`Router` from `router`"),
-            "and it names the module, which is what a reader acts on: {factor}"
+        assert_eq!(
+            payload["outside_graph"]["symbols"],
+            json!([{ "symbol": "Router", "modules": ["router"] }]),
+            "and the block the code points at names the module, which is what a reader acts on"
         );
 
         // The same verdict takes `complete` and `exact` off the completeness
@@ -3107,7 +3514,6 @@ mod tests {
             counted: Some(json!({ "exact": true })),
             reference_resolution: None,
             limits: Vec::new(),
-            note: "Every input that could qualify this answer agreed.".to_string(),
         });
         verdict.project_onto_completeness(&mut completeness);
         let completeness = completeness.expect("the block survives projection");

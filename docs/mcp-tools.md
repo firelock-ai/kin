@@ -14,11 +14,16 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 
 ## Every Answer Names Its Authority: the `_kin` Envelope
 
-Every tool response carries a `_kin` envelope (version 1) that names what produced the
+Every tool response carries a `_kin` envelope (version 2) that names what produced the
 answer and how far to trust it. The contract behind it is simple: there is no
 configuration under which the server backfills a semantic answer from raw file search
 behind a successful response. An answer is graph-backed and names the graph state that
 produced it, or the gap is reported as a gap.
+
+The envelope carries codes and counts, not sentences. Version 1 repeated a sentence beside
+most blocks on every response; version 2 sends only the fields those sentences restated,
+and what each code means is written here, once. `kin status`, `kin graph status` and
+`kin doctor` still print their own sentences for people.
 
 The envelope's fields:
 
@@ -26,8 +31,34 @@ The envelope's fields:
   in-process store, explicitly a fallback surface and labeled as one).
 - `graph_as_of` and `graph_state`: the snapshot generation that answered, plus
   reconciliation status, entity count, and loaded/initialized flags when known.
-- `semantic_coverage`: `indexed`, `total`, `pending`, and `complete` for the embedding
-  signal, carried only when the daemon computed it and never fabricated here.
+  `entity_count` counts every entity node the daemon holds, including external reference
+  targets this repository does not define; `kin graph status` prints the smaller count of
+  definitions the repository owns and names the excluded targets on its own line.
+- `semantic_coverage`: `indexed`, `total`, `pending` and `complete` for the embedding
+  signal, with `limited_by` naming every reason `complete` is false. Carried only when the
+  daemon computed it and never fabricated here.
+- `durability`: a `state` over the live and durable entity and relation counts behind it.
+  `recorded` means durable authority carries everything that answered. `live_uncommitted`
+  means some of it is not committed yet and is lost when the daemon exits, so commit to
+  record it. `unknown` means the counts could not be reconciled; `kin status` reads
+  durable authority directly.
+- `behind`: present when the working copy holds content graph truth never took, or when
+  nothing has measured it (`measured: false`). Answers cover admitted content only;
+  `kin admit` takes the paths now, and a commit takes them anyway.
+- `freshness`: whether this daemon recorded a complete admission (`recorded` or
+  `no_admission_recorded`), or `stale` when a status sample replays an earlier
+  observation.
+- `watcher_loss`: present when the filesystem watcher lost events no admission has
+  covered or its durable loss record is unreadable. `reason` retains the backend's
+  cause; `read_error` retains a record read failure, whose counters are unknown.
+  `kin admit` on the repository clears the gap after a complete admission.
+- `hydration_semantics`: the store's replay-semantics `standing`. For `behind`, re-ingest
+  the repository with `kin init` into a fresh store recorded under this build's replay
+  semantics. For `ahead`, upgrade this Kin build to at least the one that created the
+  store, rather than re-ingesting with the older replay version. For `unstamped` or
+  `unreadable`, upgrade Kin to the newest build first, because a record this build cannot
+  read can belong to a store a newer build created. An `unreadable` record keeps
+  its concrete read failure in `reason`, also shown by `kin doctor`.
 - `degraded`: honest flags (`daemon_unreachable`, `no_repository`, `embed_worker_failed`,
   `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`,
   `daemon_killed_by_memory`, `sweep_suspended`, `memory_pressure`), each present only
@@ -54,18 +85,113 @@ Every retrieval answer, empty or not, also carries `_kin.verdict`, the one verdi
 for the response. It is computed from every block that qualifies the answer and the
 most pessimistic input wins: a requested edge class that `_kin.completeness.classes`
 records as anything but `present` makes the verdict `inconclusive`, with
-`limiting_factor` naming the class and its state. `absent` means the scan completed
+`limiting_factor` naming the class's code. `absent` means the scan completed
 and found no such cross-file edge, `unknown` means the scan stopped on its budget,
 and `unproduced` means the scan completed, saw no entity-level edge of the class at
 all, and the source carries sites of it that the linker resolved, so the gap is in
 the build rather than in the code. A verdict that certifies over a recorded limit
 was the shipped 0.5.52 behaviour (FIR-2672) and is now a contract violation the
-tests scan for. `limiting_factor` is one sentence of `label: text` clauses, one per
+tests scan for.
+
+`limiting_factor` is `null` on a certified answer. Otherwise it is the code of every
 input that refused, in the order the verdict weighs them (the absence gate's own
-composition, then the coverage observation, withheld rows, the run's own
-degradations and the completeness signal), each label once. The first clause is
-what decided the state and the rest are the other things wrong with the same
-answer, so a class gap never hides a dead embedding worker.
+composition, then the coverage observation, withheld rows, the run's own degradations
+and the completeness signal), joined by `"; "`, each code once. No code contains the
+separator, so splitting on it is safe. The first code is what decided the state and the
+rest are the other things wrong with the same answer, so a class gap never hides a dead
+embedding worker. The facts behind each code are fields of the blocks the verdict's
+`inputs` name. When `state` is `inconclusive`, treat the counts as a lower bound and do
+not act on an absence in the answer.
+
+`_kin.completeness` beside it carries `status`, `bound` (`exact` or `at_least`),
+`substrate`, `classes`, `decided_by`, `limits`, `counted` and `reference_resolution`.
+
+A tool that changes state, which is every session and transaction tool, carries only
+`envelope_version`, `runtime` and `degraded`, plus `behind` or `watcher_loss` when
+either holds. The store readings ride `kin_graph_status` and every read.
+
+Every code `limiting_factor` carries is below, and so is every label that leads a clause
+in `negative.trust_reason`. The list is closed: a code not in it is never sent, and
+`unlisted_clause` in its place is a Kin defect worth reporting.
+
+<!-- clause-codes:begin -->
+| Code | Meaning |
+|---|---|
+| `absence_coverage_unmeasured` | No coverage class was measured for the answer's language, so an empty result cannot be separated from a declaration the extractor never admitted. |
+| `absence_coverage_unreported` | The answer did not report which languages its absence claim spans or whether this build resolves them. |
+| `absence_scope_empty` | The graph holds no entity at all under the filter the query applied, so an empty result describes the index rather than the code. |
+| `answer_coverage_unmeasured` | No coverage class was measured for the answer's language, so its rows are a floor. |
+| `answer_coverage_unreported` | The answer did not report which languages its rows span or whether this build resolves them, so its rows are a floor. |
+| `answer_truncated` | The answer stopped early and returned part of what it found, so its counts are a floor. |
+| `caller_arrival_state_unknown` | The answer reported a caller-arrival state this build does not recognise, so an empty reference list cannot be read as whole. |
+| `caller_arrival_unmeasured` | The set of files that can reach the focal could not be established, because the language links no imports across files in this graph. |
+| `caller_arrival_unresolved` | Some files that can reach the focal have callers the graph did not resolve, so the reference list is a floor. |
+| `counts_are_a_floor` | The answer's own accounting reports its numbers as a lower bound. |
+| `coverage_absent` | No entity in the store carries an embedding, so an empty semantic result means nothing was ranked. |
+| `coverage_graph_body_gap` | Some graph-owned source paths carry no body, so their entities rank on text fallback. |
+| `coverage_partial` | The semantic index is incomplete, so an empty result may mean not indexed rather than not present. |
+| `coverage_role_filter_withheld` | Test-role source paths were withheld from ranking; pass include_tests to rank them. |
+| `coverage_unknown` | Embedding coverage was not reported, so an empty result may mean not indexed rather than not present. |
+| `cross_file_edges_absent` | The graph was not observed to hold cross-file edges of a requested class for the language, so a use reaching the target through that class could not have been found; the gap is in extraction or enrichment rather than in the code, and the classes that are present do not stand in for it. |
+| `cross_file_edges_unproduced` | The build produced no entity-level edge of a requested class, either because no build mints that class for the language or because the linker resolved its sites without emitting one; the gap is in extraction, not in the code. |
+| `cross_repo_authority_incomplete` | The cross-repo spine's topology or the requested relation subtype is incomplete at its revision. |
+| `cross_repo_authority_missing` | The answer did not report cross-repo authority. |
+| `cross_repo_authority_unknown` | The answer reported a cross-repo authority status this build does not recognise. |
+| `cross_repo_not_configured` | No cross-repo spine is configured, so the answer is scoped to this repository. |
+| `cross_repo_unavailable` | A configured cross-repo spine could not answer and named no condition. |
+| `degraded` | The daemon reported a degraded signal; `_kin.degraded` names which. |
+| `dependency_outside_graph` | The question names a dependency this repository imports and this graph holds no definitions for, so the answer may live outside what was searched. |
+| `dependency_scan_incomplete` | The scan of unadmitted imports hit its budget before it checked all of them. |
+| `dependency_scan_unavailable` | The store could not say which of its imports are unadmitted. |
+| `depth_zero` | The walk expanded no edges, so an empty neighbourhood is not evidence of isolation. |
+| `edge_coverage_budget_exhausted` | The coverage scan for the language stopped before it could establish what the graph holds. |
+| `edge_coverage_unknown` | Whether the graph holds cross-file edges of a requested class for the language could not be established. |
+| `edge_coverage_unreported` | The answer did not report whether the graph holds the cross-file edges it depends on. |
+| `entity_index_unresolved` | Nothing resolves the program behind the parsed declarations, so an empty name or kind filter cannot separate a missing declaration from one the extractor did not admit. |
+| `enumeration_shifted` | The file gained or lost entities between pages, so the pages do not assemble into one state; walk again from the start. |
+| `file_bytes_unadmitted` | The working copy holds content at this path that graph truth does not carry, so the spans describe earlier bytes; `kin reconcile` takes the edit. |
+| `file_coverage_unreported` | The answer did not report whether a language adapter parsed the file. |
+| `file_not_parsed` | No language adapter produced a layout for the file, so an empty enumeration is a fact about extraction coverage, not the file. |
+| `file_parse_failed` | The adapter could not parse the file, so the entities the graph still carries for it describe an earlier state. |
+| `file_parse_state_unknown` | The answer reported a parse state this build does not recognise. |
+| `file_parsed_partially` | The adapter hit parse errors in the file, so its entities are a floor. |
+| `file_spans_stale` | Some entity spans in the file were derived from bytes the repository tree no longer holds at this path. |
+| `focal_not_in_graph` | The focal entity was not found, so an empty neighbourhood is not evidence that it is isolated. |
+| `focal_resolution_ambiguous` | The focal name resolved to several entities and only one was answered for. |
+| `focal_resolution_unreported` | The answer did not report how many entities the focal could have resolved to, so it may describe a same-named sibling. |
+| `graph_admission_unrecorded` | The daemon reports no complete admission of the repository into graph truth, so how far the graph is behind is unmeasured. |
+| `graph_behind_working_tree` | Host paths on disk have never been admitted; `_kin.behind` counts them. |
+| `graph_empty` | The graph that answered holds no entities, so it cannot speak for the repository yet; ask again once its graph is loaded. |
+| `graph_not_loaded` | The daemon reports no graph loaded, so an empty structural result is not authoritative. |
+| `graph_uninitialized` | The daemon has not confirmed its first reconciliation or snapshot load. |
+| `lexical_fallback_matched_nothing` | A phrase query matched no name, and the per-token fallback ranks by word overlap rather than meaning. |
+| `method_call_resolution_incomplete` | Receiver-method calls are linked by bare name and may be unresolved, so an empty result is not authoritative for a method. |
+| `name_filter_narrowed_to_zero` | The name pattern selects declarations and the query's other filters removed every one of them. |
+| `offline_fallback` | The in-process fallback graph answered, not the daemon's graph truth. |
+| `page_bounded` | The response holds one page of the file; follow `next_cursor` to the end before reading the set as whole. |
+| `ranking_is_bounded` | A ranking is a bounded candidate set, so a name absent from it may belong to an entity the query never ranked. |
+| `reference_enrichment_no_language_server` | An adapter is wired for the language but no language server for it is installed on this host. |
+| `reference_enrichment_unsupported` | This build cannot link cross-file references for the language, so an unused symbol cannot be told from an unlinked one. |
+| `relevance_floor_unmeasured` | Every returned row was a fallback neighbour and no calibrated threshold says any of them answers the concept. |
+| `response_bounded` | The response budget withheld part of the answer; `_kin.response` names what was cut. |
+| `retrieval_degraded` | The query reported degradations; the payload's `degradations` names them. |
+| `selected_graph_sample_stale` | The selected graph could not be sampled live, so the counters replay an earlier observation; `_kin.freshness` has its age. |
+| `semantic_authoritative` | Certifying: daemon-owned truth with complete embedding coverage. Appears only when trust is authoritative. |
+| `spine_root_stale` | The cross-repo spine's recorded root for this repository is stale. |
+| `structural_authoritative` | Certifying: the daemon's graph is initialized and loaded. Appears only when trust is authoritative. |
+| `substrate_partial` | A coverage class the answer depended on was observed absent; `_kin.completeness.classes` names it. |
+| `substrate_unknown` | The coverage classes the answer depended on were not all observed present; `_kin.completeness.classes` names them. |
+| `trace_spine_clipped` | The per-step cap cut the walk's fan-out, so the chain is one route among those the cap kept and a missing hop was not looked for. |
+| `trace_walk_degraded` | The walk reported degradations, so it did not complete under its own work bounds. |
+| `trace_walk_truncated` | The walk hit a per-step or total cap before examining everything an empty chain would have to rule out. |
+| `unlisted_clause` | A reason this build carries no code for. The blocks the verdict's `inputs` name hold its facts. Seeing it is a Kin defect. |
+| `walk_bounded` | The walk stopped at a work bound before its frontier emptied, so a route may exist beyond what was explored. |
+| `walk_depth_bounded` | The walk stopped at max_depth before its frontier emptied; raise max_depth. |
+| `watcher_events_lost` | The filesystem watcher lost events no admission has covered; `kin admit` clears it. |
+| `watcher_loss_unreadable` | The durable watcher-loss record could not be read, so recovery is unknown; `kin admit` rewrites it after a complete admission. |
+| `withheld_candidates` | Same-name candidates are held out of the counts and carried in `candidates`. |
+| `working_copy_unmeasured` | Nothing has measured the working copy, so whether graph truth is level with it is unknown. |
+<!-- clause-codes:end -->
 
 An empty graph is a gap, not a zero. When the graph that answered holds no entities,
 `_kin.verdict` is `inconclusive` with a `graph_empty` clause, on `kin_graph_status` as on

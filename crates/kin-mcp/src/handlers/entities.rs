@@ -6073,12 +6073,6 @@ impl GraphStatusReport {
         {
             return Err("_kin semantic_coverage disagrees with selected-graph status".to_string());
         }
-        if coverage.note.is_some() == complete {
-            return Err(
-                "_kin semantic_coverage.note must be present exactly when coverage is incomplete"
-                    .to_string(),
-            );
-        }
         match (&self.stale, &envelope.freshness) {
             (
                 Some(stale),
@@ -9840,11 +9834,9 @@ mod tests {
             response["_kin"]["completeness"]
         );
         assert!(
-            !response["_kin"]["completeness"]["note"]
-                .as_str()
-                .unwrap()
-                .contains("the whole set"),
-            "no block may call this the whole set: {}",
+            response["_kin"]["completeness"].get("note").is_none()
+                && response["_kin"]["completeness"]["bound"] == "at_least",
+            "no block may call this the whole set: no bound or sentence may call this whole: {}",
             response["_kin"]["completeness"]
         );
         assert!(
@@ -9995,11 +9987,9 @@ mod tests {
             response["_kin"]["completeness"]
         );
         assert!(
-            !response["_kin"]["completeness"]["note"]
-                .as_str()
-                .unwrap()
-                .contains("the whole set"),
-            "the note that called four wrong dead-code rows the whole set: {}",
+            response["_kin"]["completeness"].get("note").is_none()
+                && response["_kin"]["completeness"]["bound"] == "at_least",
+            "the note that called four wrong dead-code rows the whole set: no bound or sentence may call this whole: {}",
             response["_kin"]["completeness"]
         );
         assert!(
@@ -12706,7 +12696,7 @@ mod tests {
             &ResponseBudget::default(),
         );
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["_kin"]["envelope_version"], serde_json::json!(1));
+        assert_eq!(value["_kin"]["envelope_version"], serde_json::json!(2));
         assert_eq!(
             value["_kin"]["degraded"]["offline_fallback"],
             serde_json::json!(true)

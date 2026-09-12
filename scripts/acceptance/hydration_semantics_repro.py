@@ -318,21 +318,16 @@ def envelope_problems(payload, standing, created_under=None, derives=None):
             "created_under is %r, wanted %r"
             % (observation.get("created_under"), created_under)
         )
+    # Fixed recovery advice lives in docs and the human CLI. A concrete record
+    # read failure remains data and must survive the compact envelope.
     if standing == "unreadable":
         reason = observation.get("reason")
         if not isinstance(reason, str) or not reason.strip():
-            problems.append("an unreadable record published no read failure")
+            problems.append("an unreadable MCP record carries no concrete read failure")
     elif "reason" in observation:
-        problems.append("a %s standing published a reason: %r" % (standing, observation["reason"]))
-    expected = CANONICAL_REMEDY[standing]
-    if expected is None:
-        if "remedy" in observation:
-            problems.append("a current store published a remedy: %r" % (observation["remedy"],))
-    elif observation.get("remedy") != expected:
-        problems.append(
-            "the %s remedy is not canonical; got %r, wanted %r"
-            % (standing, observation.get("remedy"), expected)
-        )
+        problems.append("a readable MCP record carries an unexpected read failure")
+    if "remedy" in observation:
+        problems.append("the MCP observation carries repeated recovery advice")
     return problems
 
 
@@ -1612,13 +1607,10 @@ def self_test():
 
     def envelope_payload(standing, created_under=None, derives=10, **overrides):
         observation = {"standing": WIRE_STANDING[standing], "derives": derives}
+        if standing == "unreadable":
+            observation["reason"] = "truncated"
         if created_under is not None:
             observation["created_under"] = created_under
-        if standing == "unreadable":
-            observation["reason"] = "schema kin.hydration-semantics.v2 is not v1"
-        remedy = CANONICAL_REMEDY[standing]
-        if remedy is not None:
-            observation["remedy"] = remedy
         observation.update(overrides)
         degraded = {} if standing == "current" else {FLAG: True}
         return {"_kin": {"degraded": degraded, OBSERVATION: observation}}
@@ -1667,13 +1659,14 @@ def self_test():
     fabricated = envelope_payload("absent", created_under=10)
     rejects("envelope unstamped with a fabricated version", envelope_problems(fabricated, "absent", None, 10))
 
-    for label, reason in (("omitted", None), ("empty", "   ")):
-        blank = envelope_payload("unreadable")
-        if reason is None:
-            blank["_kin"][OBSERVATION].pop("reason")
-        else:
-            blank["_kin"][OBSERVATION]["reason"] = reason
-        rejects("envelope unreadable with a %s reason" % label, envelope_problems(blank, "unreadable", None, 10))
+    reasoned = envelope_payload("unreadable", reason="schema kin.hydration-semantics.v2 is not v1")
+    expect("envelope unreadable retains its specific read failure", envelope_problems(reasoned, "unreadable", None, 10), [])
+    for reason in (None, "", 42):
+        missing_reason = envelope_payload("unreadable", reason=reason)
+        rejects("envelope unreadable without a usable read failure", envelope_problems(missing_reason, "unreadable", None, 10))
+    missing_reason = envelope_payload("unreadable")
+    del missing_reason["_kin"][OBSERVATION]["reason"]
+    rejects("envelope unreadable missing its read failure", envelope_problems(missing_reason, "unreadable", None, 10))
 
     # One field each, for the same reason the verdict arms below carry
     # single-field inputs: the two mutants above move the version AND the advice,

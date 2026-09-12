@@ -97,26 +97,28 @@ impl ToolOutcome {
     }
 
     /// The named reason an absence cannot be trusted, when the server named one.
+    ///
+    /// Prefer `_kin.verdict.limiting_factor`, the combined verdict's codes,
+    /// and fall back to `negative.trust_reason`, the absence gate's own reason.
     pub fn limiting_factor(&self) -> Option<String> {
-        let negative = self.negative.as_ref()?;
-        for key in ["limiting_factor", "reason", "why", "explanation"] {
-            if let Some(text) = negative.get(key).and_then(Value::as_str) {
-                return Some(text.to_string());
-            }
+        let from_verdict = self
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.get("verdict"))
+            .and_then(|verdict| verdict.get("limiting_factor"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|factor| !factor.is_empty());
+        if let Some(factor) = from_verdict {
+            return Some(factor.to_string());
         }
-        // Some shapes name the gap as a list of missing edge classes.
-        for key in ["missing_edge_classes", "gaps", "missing"] {
-            if let Some(items) = negative.get(key).and_then(Value::as_array) {
-                let named: Vec<String> = items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(ToString::to_string))
-                    .collect();
-                if !named.is_empty() {
-                    return Some(named.join(", "));
-                }
-            }
-        }
-        None
+        self.negative
+            .as_ref()
+            .and_then(|negative| negative.get("trust_reason"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(ToString::to_string)
     }
 
     /// Degraded components the envelope named, empty when it named none.
