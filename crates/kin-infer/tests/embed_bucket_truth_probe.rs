@@ -13,7 +13,7 @@
 //   cargo test -p kin-infer --features metal --release \
 //       --test embed_bucket_truth_probe -- --nocapture
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -27,12 +27,12 @@ fn probe_model_dir() -> String {
     std::env::var("KIN_INFER_PROBE_MODEL_DIR").unwrap_or_else(|_| MODEL_DIR.to_string())
 }
 
-fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn synth(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {
             1 + ((i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503))
+                .wrapping_add(seed.wrapping_mul(40503))
                 % 20000)
         })
         .collect();

@@ -14,7 +14,7 @@
 // nondeterminism. The model lives outside the repo; the test skips when absent.
 //
 //   cargo test --features metal --release --test embed_resident_stack_parity -- --nocapture
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use kin_infer::{BertConfig, BertModel};
 use std::fs;
@@ -54,12 +54,12 @@ fn load_probe_model() -> Option<(String, BertModel)> {
     None
 }
 
-fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn synth(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {
             1 + ((i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503))
+                .wrapping_add(seed.wrapping_mul(40503))
                 % 20000)
         })
         .collect();

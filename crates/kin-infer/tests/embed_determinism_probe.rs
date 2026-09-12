@@ -38,7 +38,7 @@
 // gate flake, and CI has no model so it skips anyway. The gate is opt-in so the
 // citable run is a deliberate, lock-held measurement, not a CI coin-flip.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::fs;
 use std::path::Path;
@@ -77,12 +77,12 @@ fn load() -> Option<BertModel> {
 
 /// Deterministic token-id sequence in a conservative vocab band, avoiding 0. Same
 /// generator as embed_byte_determinism.rs so both tests probe the same inputs.
-fn synth(len: usize, salt: u32) -> Vec<u32> {
+fn synth(len: usize, seed: u32) -> Vec<u32> {
     (0..len)
         .map(|i| {
             1 + ((i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503))
+                .wrapping_add(seed.wrapping_mul(40503))
                 % 20000)
         })
         .collect()

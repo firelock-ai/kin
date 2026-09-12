@@ -13,7 +13,7 @@
 //! is compared element-wise against the CPU reference computed with identical
 //! Q/K/V/mask/scale/alibi inputs.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use kin_infer::gpu::{CpuCompute, GpuCompute};
 use kin_infer::metal_backend::MetalCompute;

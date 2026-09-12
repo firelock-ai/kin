@@ -24,7 +24,7 @@
 //   cargo test -p kin-infer --release --features metal \
 //     --test bufferpool_stale_read_repro -- --ignored --nocapture
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use kin_infer::gpu::{create_compute, GpuBackend};
 

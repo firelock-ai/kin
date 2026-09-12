@@ -16,7 +16,7 @@
 //
 // Skips cleanly when the model or an accelerator is unavailable.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::fs;
 use std::path::Path;
@@ -32,9 +32,9 @@ fn probe_model_dir() -> String {
 
 /// Deterministic in-band token ids of length `len`, all-ones mask (no padding
 /// inside the sequence — the worst case for the attention kernels).
-fn seq(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn seq(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
-        .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(salt)) % 20000)
+        .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(seed)) % 20000)
         .collect();
     (ids, vec![1u32; len])
 }

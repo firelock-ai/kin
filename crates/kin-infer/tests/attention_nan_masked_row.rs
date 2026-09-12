@@ -77,7 +77,7 @@ fn cpu_softmax_masked_rows_parallel_path_is_finite() {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 #[ignore = "on-GPU Metal-vs-CPU softmax parity at long sequence + masked rows"]
 fn metal_softmax_long_seq_masked_parity() {

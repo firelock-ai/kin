@@ -23,7 +23,7 @@
 //
 // Skips cleanly when the model is absent.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,12 +36,12 @@ type Entity = (Vec<u32>, Vec<u32>);
 
 const MODEL_DIR: &str = "/tmp/swerank";
 
-fn synth_sequence(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn synth_sequence(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {
             let h = (i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503));
+                .wrapping_add(seed.wrapping_mul(40503));
             1 + (h % 20000)
         })
         .collect();
@@ -233,22 +233,22 @@ fn embed_length_bucketing_ab() {
     // size (160), binned into coarse length buckets {64,128,256,512,1024} so the
     // group count stays small (bounded per-forward overhead) — the production scheme.
     let mut corpus_b: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
-    let mut salt = 5000u32;
+    let mut seed = 5000u32;
     let push_n =
-        |corpus: &mut Vec<(Vec<u32>, Vec<u32>)>, count: usize, len: usize, salt: &mut u32| {
+        |corpus: &mut Vec<(Vec<u32>, Vec<u32>)>, count: usize, len: usize, seed: &mut u32| {
             for _ in 0..count {
-                corpus.push(synth_sequence(len, *salt));
-                *salt += 1;
+                corpus.push(synth_sequence(len, *seed));
+                *seed += 1;
             }
         };
     // long tail: lots of short, few long (typical of code entities)
-    push_n(&mut corpus_b, 40, 16, &mut salt);
-    push_n(&mut corpus_b, 35, 32, &mut salt);
-    push_n(&mut corpus_b, 30, 48, &mut salt);
-    push_n(&mut corpus_b, 25, 96, &mut salt);
-    push_n(&mut corpus_b, 15, 160, &mut salt);
-    push_n(&mut corpus_b, 10, 300, &mut salt);
-    push_n(&mut corpus_b, 5, 512, &mut salt);
+    push_n(&mut corpus_b, 40, 16, &mut seed);
+    push_n(&mut corpus_b, 35, 32, &mut seed);
+    push_n(&mut corpus_b, 30, 48, &mut seed);
+    push_n(&mut corpus_b, 25, 96, &mut seed);
+    push_n(&mut corpus_b, 15, 160, &mut seed);
+    push_n(&mut corpus_b, 10, 300, &mut seed);
+    push_n(&mut corpus_b, 5, 512, &mut seed);
     let n_b = corpus_b.len();
     let useful_b: usize = corpus_b.iter().map(|(i, _)| i.len()).sum();
     let maxlen_b = corpus_b.iter().map(|(i, _)| i.len()).max().unwrap();

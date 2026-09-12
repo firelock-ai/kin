@@ -37,8 +37,10 @@ fn embed(model: &BertModel, tokenizer: &Tokenizer, text: &str) -> Vec<f32> {
     let enc = tokenizer.encode(text, true).expect("tokenize");
     let ids: Vec<u32> = enc.get_ids().to_vec();
     let mask: Vec<u32> = enc.get_attention_mask().to_vec();
-    let out = model.forward(&[ids], &[mask]).expect("forward");
-    out.into_iter().next().expect("one embedding")
+    let input_ids = vec![ids];
+    let input_masks = vec![mask];
+    let mut out = model.forward(&input_ids, &input_masks).expect("forward");
+    out.pop().expect("one embedding")
 }
 
 #[test]

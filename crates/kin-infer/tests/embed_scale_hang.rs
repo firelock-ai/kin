@@ -22,7 +22,7 @@
 //
 // Skips cleanly when the model is absent.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::fs;
 use std::path::Path;
@@ -35,12 +35,12 @@ const MODEL_DIR: &str = "/tmp/swerank";
 
 /// Deterministic token sequence of length `len`. Ids stay inside a conservative
 /// vocab band so the embedding lookup never indexes out of bounds.
-fn synth_sequence(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn synth_sequence(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {
             let h = (i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503));
+                .wrapping_add(seed.wrapping_mul(40503));
             1 + (h % 20000)
         })
         .collect();

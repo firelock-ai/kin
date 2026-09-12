@@ -12,7 +12,7 @@
 //   cargo test -p kin-infer --features metal --release \
 //       --test embed_smallbatch_pad_probe -- --nocapture
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::fs;
 use std::path::Path;
@@ -21,12 +21,12 @@ use kin_infer::{BertConfig, BertModel};
 
 const MODEL_DIR: &str = "/tmp/swerank";
 
-fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn synth(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {
             1 + ((i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503))
+                .wrapping_add(seed.wrapping_mul(40503))
                 % 20000)
         })
         .collect();

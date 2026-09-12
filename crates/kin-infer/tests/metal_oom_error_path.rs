@@ -38,7 +38,7 @@
 //! would SIGSEGV instead of returning a recoverable `Err`. Reaching the
 //! assertion at all means the nil was caught at the allocation boundary.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use kin_infer::gpu::GpuCompute;
 use kin_infer::metal_backend::MetalCompute;

@@ -36,19 +36,19 @@
 //   KIN_INFER_MMA=0 cargo test -p kin-infer --features metal --release \
 //       --test embed_batch_size_invariance_probe -- --nocapture
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use kin_infer::{BertConfig, BertModel};
 use std::fs;
 use std::path::Path;
 
 /// Deterministic synthetic token sequence of length `len` (salt varies content).
-fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn synth(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {
             1 + ((i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503))
+                .wrapping_add(seed.wrapping_mul(40503))
                 % 20000)
         })
         .collect();
@@ -120,7 +120,7 @@ fn run_for_model(model_dir: &str) {
 
     // Each config: (label, predicted regime, batch token_ids, batch masks).
     // The target is always index 0; fillers ride alongside to drive max_len/total_rows.
-    let f = |len: usize, salt: u32| synth(len, salt);
+    let f = |len: usize, seed: u32| synth(len, seed);
     type Batch = (&'static str, &'static str, Vec<Vec<u32>>, Vec<Vec<u32>>);
     let mk = |label, regime, items: Vec<(Vec<u32>, Vec<u32>)>| -> Batch {
         let ids = items.iter().map(|(i, _)| i.clone()).collect();

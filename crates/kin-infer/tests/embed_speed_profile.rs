@@ -20,7 +20,7 @@
 //
 // It skips cleanly when the model is absent so it never breaks `cargo test`.
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::fs;
 use std::path::Path;
@@ -42,12 +42,12 @@ fn probe_model_dir() -> String {
 /// are kept inside a conservative vocab band so the embedding lookup never
 /// indexes out of bounds, with an attention mask that is all-ones (no padding)
 /// so every position participates — the worst case for the attention kernels.
-fn synth_sequence(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
+fn synth_sequence(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {
             let h = (i as u32)
                 .wrapping_mul(2654435761)
-                .wrapping_add(salt.wrapping_mul(40503));
+                .wrapping_add(seed.wrapping_mul(40503));
             // Keep well within a typical BERT/nomic vocab (>30k); avoid 0 (often [PAD]).
             1 + (h % 20000)
         })
@@ -58,12 +58,10 @@ fn synth_sequence(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
 
 /// Embed one sequence through the real model forward pass.
 fn embed_one(model: &BertModel, ids: &[u32], mask: &[u32]) -> Vec<f32> {
-    model
-        .forward(&[ids.to_vec()], &[mask.to_vec()])
-        .expect("forward")
-        .into_iter()
-        .next()
-        .expect("one embedding")
+    let input_ids = vec![ids.to_vec()];
+    let input_masks = vec![mask.to_vec()];
+    let mut out = model.forward(&input_ids, &input_masks).expect("forward");
+    out.pop().expect("one embedding")
 }
 
 fn print_pooled_output_stats(label: &str) {

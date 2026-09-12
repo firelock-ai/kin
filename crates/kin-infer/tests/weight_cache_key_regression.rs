@@ -5,7 +5,7 @@
 // return a stale buffer. The key must also fold in the first/last element bit
 // patterns so a reused pointer holding different content misses the cache.
 //
-// `metal_backend` is `#![cfg(feature = "metal")]` and its caches need a live
+// `metal_backend` is `#![cfg(all(feature = "metal", target_os = "macos"))]` and its caches need a live
 // `MetalCompute` (Device::system_default), so the real `MetalCompute::weight_cache_key`
 // / `concat_cache_key` that `buf_cached`/`buf_cached_concat` call are GPU-feature gated.
 // This mirrors their derivation to assert the same contract on the CPU.
