@@ -42,6 +42,12 @@ cannot drift apart.
 | PHP | ✓ | calls, contains, extends, implements, references | ✓ (phpunit) | ✓ | ✗ |
 | HCL / Terraform | ✓ | imports, references | ✗ | ✓ | ✗ |
 
+C# and Ruby currently use dedicated semantic adapters for entities, relations,
+imports, and documentation, but those adapters do not yet implement
+test-framework detection. Their extracted parse output therefore leaves the
+test list empty. This differs from adapters such as Python and Swift, which
+include framework-aware detection for pytest and XCTest respectively.
+
 ## Shallow syntax support
 
 The shallow tier exists in the pipeline but currently routes no extensions.
