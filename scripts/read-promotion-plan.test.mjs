@@ -21,8 +21,8 @@ import {
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kin-promotion-'));
 
 const HELD_BODY = `${PENDING_MARKER}
-> This release passed the automated preflight on the exact bytes it ships. The
-> first-install checks that measure what a new user meets have not run for it yet.
+> **First-contact proof pending.** This release cleared the machine preflight on its
+> own bytes.
 
 ## What changed
 
@@ -64,7 +64,7 @@ test('renderAlarm writes the body and returns the decision with its title', () =
 
 test('stripPendingNotice removes the block this chain wrote and nothing else', () => {
   const stripped = stripPendingNotice(HELD_BODY);
-  assert.doesNotMatch(stripped, /automated preflight/);
+  assert.doesNotMatch(stripped, /First-contact proof pending/);
   assert.doesNotMatch(stripped, new RegExp(PENDING_MARKER.replace(/[-[\]{}()*+?.,\\^$|#]/g, '\\$&')));
   // The human's own notes survive. A strip that took the whole body would lose
   // the release notes, which is a worse failure than leaving the notice.
@@ -128,8 +128,15 @@ test('stripPendingNotice strips the notice release.yml actually writes', () => {
   // fixture that never built.
   assert.ok(body.length >= 2, `extracted ${body.length} notice line(s) from release.yml`);
   assert.ok(
-    body.some((line) => line.includes('automated preflight')),
-    `the extracted block is not the notice: ${JSON.stringify(body)}`,
+    body.some((line) => line.includes('${marker}')),
+    `the extracted block does not carry the marker: ${JSON.stringify(body)}`,
+  );
+  // The ruling this shape exists to hold: the writer emits the marker and no
+  // visible sentence at all, so a reader is never told a proof is pending.
+  assert.deepEqual(
+    body.filter((line) => line.trimStart().startsWith('>')),
+    [],
+    `release.yml still writes a visible proof notice: ${JSON.stringify(body)}`,
   );
 
   const notice = body.join('\n').replace('${marker}', PENDING_MARKER);
@@ -231,4 +238,22 @@ test('the promotions CLI emits the tab-separated lines the workflow reads', () =
     env: { ...process.env, KIN_PROMOTION_PLAN: plan },
   });
   assert.equal(out, 'v9.9.9\tlocal\n');
+});
+
+// The permanent summary is not about the proof, so a promotion must not take it
+// away. It is unquoted and sits above the marker, and stripPendingNotice cuts
+// forward from the marker, which is exactly what keeps it.
+test('the two-line summary above the marker survives the strip', () => {
+  const summary = 'A graph-native code repository for people and AI agents.\nv1.2.3 lands 4 changes, listed below.\n';
+  const notes = '## Notes\n\n- a real change\n';
+  // A modern body: summary, then the marker, then the notes.
+  const modern = `${summary}\n${PENDING_MARKER}\n\n${notes}`;
+  assert.equal(stripPendingNotice(modern), `${summary}\n${notes}`);
+
+  // And a legacy body, where the quoted notice below the marker still goes.
+  const legacy = `${summary}\n${PENDING_MARKER}\n> **First-contact proof pending.** old\n> wording\n\n${notes}`;
+  const strippedLegacy = stripPendingNotice(legacy);
+  assert.equal(strippedLegacy, `${summary}\n${notes}`);
+  assert.doesNotMatch(strippedLegacy, /First-contact proof pending/);
+  assert.match(strippedLegacy, /A graph-native code repository/);
 });

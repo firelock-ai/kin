@@ -1635,6 +1635,42 @@ jobs:
             --input ./CHANGELOG.md \
             --output ./release-notes.md
 
+      # Two lines about the release itself, permanent and unquoted, above
+      # everything else a reader meets. The first is the category line from
+      # docs/brand/tokens/canon.json verbatim, which is the line that leads the
+      # developer surfaces and a release page is one. The second says what this
+      # release carries, counted from the changelog section the step above
+      # extracted, which is the changes since the previous tag. Neither line
+      # mentions proof state, and nothing here is a benchmark, a latency or a
+      # completeness figure, so the canon's numbers rule is untouched.
+      #
+      # These lines are NOT quoted, on purpose. stripPendingNotice cuts forward
+      # from the pending marker and stops at the first line that is neither a
+      # quote nor blank, so an unquoted summary above the marker survives a
+      # promotion while the marker below it is removed.
+      - name: Put the release's own two lines on top of the notes
+        run: |
+          set -euo pipefail
+          # `grep -c` prints 0 and exits 1 when nothing matches, so the fallback
+          # must add no second line of its own.
+          changes="$(grep -c '^- ' ./release-notes.md || :)"
+          case "$changes" in ''|*[!0-9]*) changes=0 ;; esac
+          if [ "$changes" -eq 0 ]; then
+            carries="The changes in this release are listed below."
+          elif [ "$changes" -eq 1 ]; then
+            carries="${GITHUB_REF_NAME} lands 1 change, listed below."
+          else
+            carries="${GITHUB_REF_NAME} lands ${changes} changes, listed below."
+          fi
+          {
+            echo "A graph-native code repository for people and AI agents."
+            echo "$carries"
+            echo
+            cat ./release-notes.md
+          } > "$RUNNER_TEMP/release-notes-summary.md"
+          mv "$RUNNER_TEMP/release-notes-summary.md" ./release-notes.md
+          head -3 ./release-notes.md
+
       - name: Aggregate per-artifact checksums
         run: |
           set -euo pipefail
@@ -2671,18 +2707,20 @@ jobs:
           # cannot drift into an idempotency check that never matches. There is
           # no other expansion in this text.
           #
-          # Two plain lines, and they stay a quoted block on purpose. The marker
-          # is an HTML comment, so a reader never sees it while every watcher
-          # still keys on it: release-promote.yml greps the body for it and
-          # scripts/release-promotion-plan.mjs exports it as PENDING_MARKER.
-          # stripPendingNotice removes the marker line and then every following
-          # line that is a quote or blank, so a summary written as anything but
-          # a quoted block would survive the strip and go on claiming a pending
-          # proof after the proof landed.
+          # The marker and nothing else. A reader is never told that a proof is
+          # pending, because that sentence said nothing they could act on and
+          # cost them five lines before the first word about the release. The
+          # state itself is unchanged and still machine-readable here, which is
+          # where every watcher already reads it: release-promote.yml greps the
+          # body for it, scripts/release-promotion-plan.mjs exports it as
+          # PENDING_MARKER, and the grep above keys on it for idempotency. It is
+          # an HTML comment, so it renders as nothing at all.
+          #
+          # stripPendingNotice cuts FORWARD from the marker, so the two-line
+          # summary written above the notes survives a promotion untouched,
+          # while this marker and any legacy quoted block below it are removed.
           cat > "$RUNNER_TEMP/release-body.md" <<NOTE
           ${marker}
-          > This release passed the automated preflight on the exact bytes it ships. The
-          > first-install checks that measure what a new user meets have not run for it yet.
 
           NOTE
           printf '%s\n' "$body" >> "$RUNNER_TEMP/release-body.md"
