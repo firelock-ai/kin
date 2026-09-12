@@ -4807,7 +4807,7 @@ impl InMemoryGraph {
     ///
     /// Downloads the model from HuggingFace on first call (~270 MB).
     /// Subsequent calls return the cached instance.
-    #[cfg(feature = "embeddings")]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn get_embedder(&self) -> Result<Arc<CodeEmbedder>, KinDbError> {
         let mut guard = self.embedder.lock();
         if let Some(ref e) = *guard {
