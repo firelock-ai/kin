@@ -14140,9 +14140,15 @@ def main() -> None:
             f"release workflow; release={sorted(vfs_refs)}, "
             f"install-proof={sorted(install_proof_vfs_expected)}"
         )
+    # The Kin-side filter moved when kin-vfs-core became a workspace member: a
+    # member carries no `source` line, so a registry-only filter finds zero and the
+    # gate throws in the release build job, after the tag exists. What is pinned here
+    # is the pair of shapes Kin's side must accept, not the old spelling of it, and
+    # the pinned side's strict rule is pinned separately below so loosening it still
+    # has to be a deliberate edit to this list.
     for policy in (
         "Verified Kin/kin-vfs release compatibility at kin-vfs-core",
-        'pkg.name === "kin-vfs-core" && pkg.source?.startsWith("sparse+")',
+        'pkg.source === null || pkg.source.startsWith("sparse+")',
         'pkg.name === "kin-vfs-core" && pkg.source === null',
         "update the immutable kin-vfs pin",
     ):

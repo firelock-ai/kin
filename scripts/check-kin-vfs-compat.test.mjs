@@ -274,6 +274,37 @@ test('still catches the lock-moved-pin-did-not shape on a workspace member', () 
 // The transitional case this import creates and PR C ends: a registry copy
 // beside the workspace one is two packages with one name, and the gate must not
 // pick either and call it agreement.
+// release.yml and rc-build.yml carry their own copy of this comparison inline, in
+// the release build job, which runs AFTER the tag exists. When kin-vfs-core moved
+// into crates/ their filter stopped finding it, and nothing on a pull request would
+// have said so, because THIS gate was fixed first. So the rule is asserted against
+// the shipped workflow text rather than against a copy of it: the filter is read out
+// of the file and exercised on both lock shapes.
+for (const workflow of ['.github/workflows/release.yml', '.github/workflows/rc-build.yml']) {
+  test(`${workflow} accepts a workspace-sourced kin-vfs-core on Kin's side`, () => {
+    const text = fs.readFileSync(path.join(ROOT, workflow), 'utf8');
+    const match = text.match(
+      /const kinVfsCore = lockPackages\([^;]*?\)\s*\.filter\(\(pkg\) =>([\s\S]*?)\);/,
+    );
+    assert.ok(match, `${workflow} no longer carries a kinVfsCore filter this test can read`);
+    // eslint-disable-next-line no-new-func
+    const filter = new Function('pkg', `return (${match[1].trim()});`);
+    const workspaceMember = { name: VFS_CORE, version: '0.4.25', source: null };
+    const registryCopy = { name: VFS_CORE, version: '0.4.25', source: REGISTRY };
+    const notOurs = { name: 'lru', version: '0.18.2', source: REGISTRY };
+    assert.equal(filter(workspaceMember), true, 'a workspace member must be Kin\'s copy');
+    assert.equal(filter(registryCopy), true, 'a registry package must still be Kin\'s copy');
+    assert.equal(filter(notOurs), false, 'another package must not be');
+    // And the pinned side stays strict, so the kin-vfs checkout's own member entry is
+    // what it compares against rather than anything the registry happens to carry.
+    assert.match(
+      text,
+      /pinnedVfsCore = lockPackages\([\s\S]*?pkg\.source === null\);/,
+      `${workflow}'s pinned side must keep the strict source === null rule`,
+    );
+  });
+}
+
 test('refuses a Kin lock carrying both a workspace and a registry kin-vfs-core', () => {
   assert.throws(
     () =>
