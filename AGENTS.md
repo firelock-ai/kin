@@ -1,10 +1,9 @@
 # AGENTS.md
 
 This repository (`kin`) is part of the Kin ecosystem. The canonical source of truth for cross-repo
-thesis, boundaries, lane arbitration and commit hygiene is the umbrella workspace's
+thesis, boundaries, shared resources and commit hygiene is the umbrella workspace's
 **`kin-ecosystem/AGENTS.md`** (also symlinked as `kin-ecosystem/CLAUDE.md`), and it is loaded
-automatically when you work inside the umbrella. Read it before making architectural or process
-decisions. `CLAUDE.md` at this repo's root is a regular file that imports this one, because Claude Code reads
+automatically when you work inside the umbrella. Consult the relevant sections when needed. `CLAUDE.md` at this repo's root is a regular file that imports this one, because Claude Code reads
 that filename and this repository's source is archived into kin-infra's promotion bundle, whose
 validator refuses any non-regular entry; a symlink there failed production image promotion of
 v0.6.4 after the release was already public. Edit this file, never that one, and keep every
@@ -16,7 +15,7 @@ tracked path in this repository a regular file.
 reconcile, review, provenance, execution, and the bundled seam packages and crates under `crates/`
 and `packages/`. Work belongs here when it changes local semantic repo truth, projections or
 reconcile, CLI, daemon or MCP behaviour, or provenance, review and execution semantics. Graph
-internals go in `kin-db`; hosted collaboration goes in `kinlab`.
+internals belong in the bundled `crates/kin-db`; hosted collaboration belongs in `kinlab`.
 
 The graph is the authority. Runtime query paths must not answer by grepping, walking or ranking raw
 filesystem contents, and `scripts/zero_file_search_guard.sh` is the gate that enforces it. When a
@@ -25,21 +24,21 @@ raw file search.
 
 ## The inner loop
 
-Two commands, both run from the umbrella root, both printing the path, sha and branch they resolved
-before they grade anything:
+The main task implements and integrates changes. Native subagents may handle independent research,
+implementation or review with clear file ownership. A worktree isolates a change without requiring
+a separate execution session.
 
-```bash
-bin/kin-parity            # builds kin and kin-daemon here, runs the release's own acceptance
-bin/kin-precheck kin      # runs the lint, policy and guard gates ci.yml grades on
-```
+Run checks appropriate to the affected behavior. The umbrella helpers `bin/kin-parity` and
+`bin/kin-precheck kin` support acceptance and lint/policy checks. Pass the checkout explicitly when
+needed and verify the printed path, revision and branch. Run targeted crate tests for behavior
+changes; hosted CI owns the full-workspace run.
 
-`bin/kin-parity` takes no gpu and no daemon lock and uses a scratch `KIN_HOME`. `bin/kin-precheck`
-enumerates the gate list out of this repo's own `.github/workflows/ci.yml` rather than a remembered
-copy, and refuses with no tally when a gate could not run. Beside them run `cargo test -p <crate>`
-for the crates you touched. Do not reproduce the full workspace suite locally; hosted CI is the gate
-of record for that.
+On the shared machine, heavy Rust commands go through `.kin-coord/bin/heavy-slot.sh` to respect
+builder capacity. Where the existing helpers take a `<lane>` argument, use a descriptive work
+label. It identifies the checkout or operation, not an agent session.
 
-The two required CI gates run, in substance:
+Main CI includes the following commands. Read `.github/workflows/ci.yml` for the current flags
+and the jobs that apply to a change:
 
 ```bash
 cargo fmt -- --check
@@ -50,7 +49,7 @@ python3 scripts/check-quarantine.py
 bash scripts/zero_file_search_guard.sh
 ```
 
-Both legs matter, including the case where nextest is green and the separate doctest pass is not.
+A nextest pass does not include the separate doctest run.
 Set `KIN_EMBED_BACKEND=cpu` for any gate; `bin/kin-lane run` does it for a heavy command. The
 default is `auto`, which batches on the host's one Metal device, and concurrent gates sharing it
 fail on host load rather than on their diff. cpu and metal differ in the last ULPs of every vector,
@@ -97,5 +96,6 @@ FIR-2815 and preserved only for a one-step rollback. Seven required contexts on 
 `MCP surface contract`. Commit with `git commit -s`, and keep assistant-session traces out of the
 PR title and body, which
 `PR text hygiene` refuses. From the umbrella root, `bin/kin-lane merge enqueue kin <lane> <pr>`
-records the row and `bin/kin-lane merge land kin <lane> <pr>` merges once every check has concluded
-with zero failures.
+records the row and can arm auto-merge. `bin/kin-lane merge land kin <lane> <pr>` checks the complete
+check set before landing. The main task reviews and integrates the result; no separate worker
+session or handoff is required.
