@@ -50,3 +50,17 @@ crates/kin-core/src/tool_prefix.rs
 crates/kin-vector/tests/hnsw_determinism_simd.rs
 crates/kin-vector/tests/hnsw_simd_query_path_parity.rs
 crates/kin-vector/tests/simd_scalar_reachable.rs
+
+# kin-db, imported 2026-09-11. Every write in these five is inside a
+# `#[cfg(test)]` module or a tests/ binary: embed/mod.rs from line 4454,
+# search/text.rs from line 538, and the three probes. kin-db is a standalone
+# publishable crate below kin-core and cannot take kin-core as a dev-dependency
+# for EnvVarGuard. These five lines are TEMPORARY: they become the single
+# crate-scoped entry `crates/kin-db tests-only` when the pull request that adds
+# that form lands, so product code in embed/mod.rs and search/text.rs stops being
+# excused. Follow-up per crate: take the configuration by argument.
+crates/kin-db/src/embed/mod.rs
+crates/kin-db/src/search/text.rs
+crates/kin-db/tests/embed_hybrid_parity.rs
+crates/kin-db/tests/embed_oom_cpu_fallback.rs
+crates/kin-db/tests/metal_seq_len_regression.rs

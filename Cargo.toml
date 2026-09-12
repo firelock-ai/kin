@@ -6,6 +6,7 @@ resolver = "2"
 members = [
     # Kin libraries, developed here and published as independent packages.
     "crates/kin-blobs",
+    "crates/kin-db",
     "crates/kin-model",
     "crates/kin-search",
     "crates/kin-vector",
@@ -163,7 +164,7 @@ kin-lsp = { version = "=0.7.19", registry = "kin" }
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
-kin-db = { version = "=0.7.112", registry = "kin", default-features = false }
+kin-db = { path = "crates/kin-db", version = "=0.7.114", registry = "kin", default-features = false }
 # Pinned to the exact version kin-db builds its name-token index with. A
 # per-token name query hits that index only when the token came out of the same
 # tokenizer, so a version skew here would be a silent recall loss rather than a

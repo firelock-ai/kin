@@ -37,7 +37,6 @@ use std::path::{Path, PathBuf};
 /// kin-model in this tree rather than dragging a second one in. Empty is the
 /// end state, and the pull request that imports a library deletes its row.
 const TRANSITIONAL_REGISTRY_LIBRARIES: &[(&str, &str)] = &[
-    ("kin-db", "imported by PR C of the workspace consolidation"),
     (
         "kin-infer",
         "imported by PR B of the workspace consolidation",

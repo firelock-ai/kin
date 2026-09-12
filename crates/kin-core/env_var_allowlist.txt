@@ -99,3 +99,25 @@ KIN_FOLD_SPLIT_MODE
 # kin-search moved into crates/ on 2026-09-11 and this scan now reads it as
 # workspace source; before, the dependency scan saw it the same way.
 KIN_SEARCH_SOAK_SEED
+
+# kin-db's own test code reads these fifteen directly, all under `#[cfg(test)]`
+# in crates/kin-db/src or in crates/kin-db/tests, so none reaches a running kin:
+# the clock-half and replay-wall fixtures, the static-writer multi-process probe,
+# the embedding budget and sanity probes, and the two ticket-named repro fixtures.
+# kin-db moved into crates/ on 2026-09-11, so this scan reads it as workspace
+# source for the first time; the dependency scan already saw the same names.
+KIN_CLOCKHALF_CHURN
+KIN_CLOCKHALF_COMMITS
+KIN_CLOCKHALF_FILES
+KIN_CLOCKHALF_FLAT
+KIN_DB_STATIC_WRITER_BARRIER
+KIN_DB_STATIC_WRITER_NAME
+KIN_DB_STATIC_WRITER_OUTPUT
+KIN_DB_STATIC_WRITER_PATH
+KIN_EMBED_PROFILE_N
+KIN_EMBED_SANITY_GRAPH
+KIN_FIR2334_REPO
+KIN_FIR2334_STORE
+KIN_FIR3064_REPO
+KIN_FIR3064_STORE
+KIN_REPLAYWALL_COMMITS

@@ -3,11 +3,11 @@
 
 [package]
 name = "kin-db"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.7.114"
+edition = "2021"
+license = "Apache-2.0"
 description = "Embeddable code graph database for Kin: entities, relations, vector and text search, snapshots"
-repository.workspace = true
+repository = "https://github.com/firelock-ai/kin-db"
 
 [lib]
 doctest = false
@@ -47,7 +47,7 @@ rustc-hash = "2.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
-libc = { workspace = true }
+libc = "0.2"
 bincode = "1"
 rmp = "0.8"
 rmp-serde = "1"
