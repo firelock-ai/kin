@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.16] - 2026-09-12
+
+### Changed
+
+- Record kin-vfs as parked in the ecosystem manifest and kin's own docs (#1748)
+- Refuse a scope spelled in none of the documented forms instead of reading it as a path (#1749)
+- Key the footprint publish cadence by store root (#1751)
+- Mark the four file-path tool parameters deprecated and say so in the answer (#1752)
+- Take the loopback fixture's accepted socket out of non-blocking mode (#1753)
+- Bring kin-blobs, kin-model, kin-search and kin-vector into the workspace with their history (#1747)
+- Lock the Kin agent belt to Kin tools and let a mutation name its own change (#1738)
+- Anchor a review note on the entity that holds the line it names (#1759)
+- Count a staged release hold as work in flight while the cut is switched on (#1757)
+- Read the query and command authority wrappers through the daemon's held open (#1761)
+- Bring kin-infer, kin-lsp and kin-vfs-core into the workspace with their history (#1758)
+- Compare the kin-vfs-core the release builds with, wherever it comes from (#1763)
+- Stop the witness search spending its budget on a class no build can mint (FIR-3541) (#1764)
+- Raise release alarms on kin-infra through an issues-only App token (#1762)
+- Lead a release with what it is, not with what has not been measured (#1760)
+- Name the namespace an entity lives in, one rule per language (#1767)
+- Consolidate kin-db into the workspace (Tranche 3) (#1768)
+- Give a Rust entity's span its doc comment and attributes, and keep its id on the declaration (#1766)
+- Lead a release with what it is, and stop publishing a pending-proof sentence (#1769)
+- Let the release-intent gate accept independently versioned crates (#1765)
+
+
 ## [0.7.15] - 2026-09-11
 
 ### Changed
