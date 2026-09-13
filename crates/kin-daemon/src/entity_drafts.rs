@@ -317,13 +317,15 @@ impl DraftStore {
                 if !write {
                     return Ok(None);
                 }
-                let mut builder = std::fs::DirBuilder::new();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = std::fs::DirBuilder::new();
                     builder.mode(0o700);
+                    builder.create(&self.root).map_err(io)?;
                 }
-                builder.create(&self.root).map_err(io)?;
+                #[cfg(not(unix))]
+                std::fs::DirBuilder::new().create(&self.root).map_err(io)?;
             }
             Err(error) => return Err(io(error)),
         }
@@ -700,13 +702,15 @@ fn parse_record_name(name: &str) -> Option<(uuid::Uuid, u64)> {
 }
 
 fn regular_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
         options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        options
     }
-    options
+    #[cfg(not(unix))]
+    OpenOptions::new()
 }
 
 fn read_regular(path: &Path) -> Result<Vec<u8>> {
