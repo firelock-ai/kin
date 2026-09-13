@@ -329,9 +329,14 @@ enum Command {
         #[arg(long = "adopt-repository-id", value_name = "ID")]
         adopt_repository_id: Option<String>,
     },
-    /// Show coherent repository-v6 workspace status
+    /// Read canonical repository/workspace status without admitting host files
+    ///
+    /// Does not start a daemon, inspect working-copy contents, or require an
+    /// author. Run `kin admit` to admit files explicitly. Exit 0 means canonical
+    /// authority was read successfully, not that the projection is current.
     Status {
-        /// Output machine-readable JSON for editor integrations
+        /// Output the unchanged kin.status.v3 canonical-authority JSON report;
+        /// projection freshness is not certified by this report
         #[arg(long, default_value_t = false)]
         json: bool,
         /// Seconds to keep re-reading while embedding coverage is only
@@ -3254,11 +3259,6 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 Command::Status { json, wait_quiesce } => {
-                    // A working copy nothing admitted is an answer, not an
-                    // error, and it travels in the exit code the way a parked
-                    // merge and an unrouted `kin path` already do. The report is
-                    // printed either way; the code says whether any of it
-                    // describes the files on disk.
                     let code =
                         commands::status::run(json, std::time::Duration::from_secs(wait_quiesce))
                             .await?;
