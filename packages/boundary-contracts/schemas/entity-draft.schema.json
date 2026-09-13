@@ -1,0 +1,184 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "kin.entity.draft.v1"
+    },
+    "draft_id": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "entity_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "owner": {
+          "const": "local-bearer-v1"
+        }
+      },
+      "required": [
+        "repository_id",
+        "workspace_id",
+        "entity_id",
+        "owner"
+      ],
+      "additionalProperties": false
+    },
+    "original_body": {
+      "type": "string"
+    },
+    "original_source_base": {
+      "$ref": "kin://contracts/entity-source-base"
+    },
+    "body": {
+      "type": "string"
+    },
+    "previous_record_hash": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      ]
+    },
+    "request_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "pending_apply": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "arguments": {
+              "type": "object"
+            },
+            "draft_revision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "requested_revision": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "requested_revision",
+            "draft_revision",
+            "session_id",
+            "request_id",
+            "arguments"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "applied_receipt": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "attempt": {
+              "type": "object",
+              "properties": {
+                "session_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+                },
+                "request_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "arguments": {
+                  "type": "object"
+                },
+                "draft_revision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "requested_revision": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "requested_revision",
+                "draft_revision",
+                "session_id",
+                "request_id",
+                "arguments"
+              ],
+              "additionalProperties": false
+            },
+            "receipt": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "attempt",
+            "receipt"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "content_revision": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "required": [
+    "schema",
+    "draft_id",
+    "revision",
+    "content_revision",
+    "scope",
+    "original_body",
+    "original_source_base",
+    "body",
+    "previous_record_hash",
+    "request_hash",
+    "pending_apply",
+    "applied_receipt"
+  ],
+  "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Durable entity draft v1"
+}

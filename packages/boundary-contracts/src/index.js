@@ -10,6 +10,9 @@ const schemaDir = path.join(root, 'schemas');
 let schemaCachePromise;
 
 const schemaFiles = {
+  mcpEnvelopeV2: 'mcp-envelope-v2.schema.json',
+  entityDraft: 'entity-draft.schema.json',
+  entityDraftCapabilities: 'entity-draft-capabilities.schema.json',
   entitySourceBase: 'entity-source-base.schema.json',
   workspaceContext: 'workspace-context.schema.json',
   scmContext: 'scm-context.schema.json',
@@ -37,6 +40,7 @@ const schemaFiles = {
 };
 
 const schemaIdMap = {
+  'kin://contracts/entity-source-base': 'entitySourceBase',
   'kin://contracts/directory-entry': 'directoryEntry'
 };
 
@@ -72,6 +76,30 @@ export async function validateContract(name, payload) {
     ok: errors.length === 0,
     errors
   };
+}
+
+/**
+ * Validate an MCP object response without widening its domain contract.
+ * Only the reserved top-level `_kin` key is separated. All remaining keys
+ * reach the ordinary validator, including unknown keys that it must refuse.
+ * A direct daemon/domain response may omit metadata. Present metadata must
+ * satisfy the supported envelope version; additive metadata is retained.
+ * Neither this shape check nor an envelope makes a draft current or applied.
+ */
+export async function validateMcpContract(name, response) {
+  let payload = response;
+  let envelope = null;
+  const errors = [];
+  if (isPlainObject(response) && Object.prototype.hasOwnProperty.call(response, '_kin')) {
+    const { _kin, ...domain } = response;
+    payload = domain;
+    envelope = _kin;
+    const checked = await validateContract('mcpEnvelopeV2', envelope);
+    errors.push(...checked.errors.map(error => error.replace(/^\$/, '$._kin')));
+  }
+  const checked = await validateContract(name, payload);
+  errors.push(...checked.errors);
+  return { ok: errors.length === 0, errors, payload, envelope };
 }
 
 /**
