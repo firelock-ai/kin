@@ -170,9 +170,8 @@ fn grouped_help_keeps_task_groups_and_global_options_at_narrow_and_wide_widths()
 fn grouped_help_preserves_clap_long_row_wrapping() {
     fn command_row(help: &str, name: &str) -> String {
         let mut lines = help.lines().skip_while(|line| {
-            !line
-                .strip_prefix("  ")
-                .is_some_and(|row| row.split_whitespace().next() == Some(name))
+            line.strip_prefix("  ")
+                .is_none_or(|row| row.split_whitespace().next() != Some(name))
         });
         let mut row = vec![lines.next().expect("command row exists")];
         for line in lines {
