@@ -100,7 +100,7 @@ kin clone <url> [path] [options]
 
 ### `kin status`
 
-Show coherent repository-v6 workspace status
+Read canonical repository/workspace status without admitting host files
 
 ```
 kin status [options]
@@ -1494,6 +1494,13 @@ kin mcp start [options]
 | `--repo <path>` |  | Bind this server to a specific Kin repository instead of relying on the launching process's working directory. Overrides KIN_MCP_REPO. Use this for a global agent-CLI MCP entry that may launch outside any Kin repository (e.g. an umbrella workspace root). |
 | `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `agent-query` (that belt without the session and transaction tools, for a client that only queries), `agent-search` (the measured always-on set, with every other tool reached through `kin_tool_search`), `full` (every tool, roughly 12k extra tokens of schemas per session), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
 | `--no-spawn` |  | Never start or revive a daemon from this server: bind only a daemon that is already running, and answer graph tool calls with an honest "no daemon is running" error otherwise. This is the probe mode for watchdogs and boot-time checks (equivalent to KIN_NO_DAEMON=1): the MCP handshake and tool list are served in full, and nothing heavy is ever spawned by the check itself. |
+
+`get_entity_source` and its `get_entity_body` alias ask the selected repository daemon on
+every call, including retries after a source gap. A committed generation does not describe
+every live semantic derivation: the daemon may repair an entity's span against canonical
+workspace bytes before a semantic commit. The source response still verifies that the span
+belongs to those bytes; an unresolved mismatch remains an error. Retrying a read does not
+admit files or create a commit, and a successful precommit read is not durable publication.
 
 ### `kin assistant`
 

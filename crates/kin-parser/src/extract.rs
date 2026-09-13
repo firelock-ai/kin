@@ -50,6 +50,13 @@ pub const DECLARATION_LINE_KEY: &str = "declaration_line";
 pub const CALL_EXTRACTION_INCOMPLETE_MARKER_V1: &str =
     "kin-internal://call-extraction-coverage/incomplete-v1";
 
+/// Scoped negative coverage record. `src_name` and `site` identify the
+/// declaration and syntax that could not be fully resolved. `receiver` carries
+/// only the known syntactic callee name, if extraction retained one; it is not
+/// a proven runtime target. All linker consumers still treat this as incomplete.
+pub const CALL_EXTRACTION_INCOMPLETE_MARKER_V2: &str =
+    "kin-internal://call-extraction-coverage/incomplete-v2";
+
 /// Raw extracted entity before ID assignment.
 #[derive(Debug, Clone)]
 pub struct ExtractedEntity {
@@ -322,8 +329,42 @@ pub fn call_extraction_incomplete_marker() -> ExtractedRelation {
     }
 }
 
+/// Record a gap whose syntax is owned by one declaration. A missing callee
+/// withdraws that caller's negative name evidence; a known name only records a
+/// resolution gap. This never certifies exhaustive runtime-call coverage.
+pub fn scoped_call_extraction_incomplete_marker(
+    source: String,
+    site: RelationSite,
+    known_callee: Option<String>,
+) -> ExtractedRelation {
+    ExtractedRelation {
+        site: Some(site),
+        receiver: known_callee,
+        src_name: source,
+        dst_name: CALL_EXTRACTION_INCOMPLETE_MARKER_V2.into(),
+        ..call_extraction_incomplete_marker()
+    }
+}
+
+/// Whether a marker has the scoped v2 payload shape. Consumers must separately
+/// prove that its owner and site agree with current declaration identities.
+pub fn is_scoped_call_extraction_incomplete_marker(relation: &ExtractedRelation) -> bool {
+    relation.kind == RelationKind::DependsOn
+        && relation.dst_name == CALL_EXTRACTION_INCOMPLETE_MARKER_V2
+        && relation.import_source.is_none()
+        && relation.call_shape.is_none()
+        && !relation.src_name.is_empty()
+        && relation.site.is_some()
+}
+
 /// Whether a raw parser relation is the reserved negative call-coverage record.
 pub fn is_call_extraction_incomplete_marker(relation: &ExtractedRelation) -> bool {
+    if relation.kind == RelationKind::DependsOn
+        && relation.dst_name == CALL_EXTRACTION_INCOMPLETE_MARKER_V2
+    {
+        // Even a malformed scoped payload is negative evidence, never a graph edge.
+        return true;
+    }
     relation.kind == RelationKind::DependsOn
         && relation.src_name.is_empty()
         && relation.dst_name == CALL_EXTRACTION_INCOMPLETE_MARKER_V1

@@ -1,0 +1,47 @@
+{
+  "_kin": {
+    "degraded": {
+      "embed_persistence_unavailable": false,
+      "embed_worker_failed": false,
+      "mass_deletion_blocked": false
+    },
+    "durability": {
+      "durable_entities": 2,
+      "durable_relations": 1,
+      "live_entities": 2,
+      "live_only_entities": 0,
+      "live_only_relations": 0,
+      "live_relations": 1,
+      "state": "recorded"
+    },
+    "envelope_version": 2,
+    "freshness": {
+      "state": "no_admission_recorded"
+    },
+    "graph_as_of": {
+      "generation": 1
+    },
+    "graph_state": {
+      "entity_count": 2,
+      "initialized": true,
+      "loaded": true,
+      "reconciliation_status": "idle"
+    },
+    "hydration_semantics": {
+      "created_under": 11,
+      "derives": 11,
+      "standing": "current"
+    },
+    "runtime": "repo-daemon"
+  },
+  "apply_supported": true,
+  "durable_save_supported": true,
+  "limits": {
+    "body_bytes": 8388608,
+    "drafts": 4096,
+    "revisions": 65536,
+    "total_bytes": 536870912
+  },
+  "refusal": null,
+  "schema": "kin.entity.draft.capabilities.v1"
+}

@@ -14,11 +14,18 @@ import {
   hostedRepositoryTransferSeam,
   loadAllSchemas,
   loadSchema,
-  validateContract
+  validateContract,
+  validateMcpContract
 } from '../src/index.js';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = path.resolve(packageRoot, '../..');
+
+test('MCP discovery and public source-base schemas agree', async () => {
+  const discovery = JSON.parse(await fs.readFile(path.join(repositoryRoot,
+    'crates/kin-mcp/src/source_base.schema.json'), 'utf8'));
+  assert.deepEqual(discovery, await loadSchema('entitySourceBase'));
+});
 
 test('all schemas load', async () => {
   const schemas = await loadAllSchemas();
@@ -1227,4 +1234,158 @@ test('a graph export names the sequence it was cut at', async () => {
     false,
     'without it a client cannot tell which events it already has'
   );
+});
+
+
+test('entity source bases preserve exact identity and reject future or dropped fields', async () => {
+  const base = {
+    schema: 'kin.entity.source_base.v1',
+    context: {
+      repository_id: 'editor-test', workspace_id: '11111111-1111-4111-8111-111111111111',
+      workspace_generation: 7, workspace_head_hash: 'ab'.repeat(32), workspace_tree_hash: 'cd'.repeat(32)
+    },
+    entity_id: '22222222-2222-4222-8222-222222222222', artifact_id: '33333333-3333-4333-8333-333333333333',
+    source_blob_hash: 'ef'.repeat(32), start_byte: 0, end_byte: 32, body_hash: '12'.repeat(32)
+  };
+  await assertContract('entitySourceBase', base);
+  for (const changed of [
+    {...base, schema: 'kin.entity.source_base.v2'},
+    {...base, expected_base: 'unsupported'},
+    {...base, context: {...base.context, expected_base: 'unsupported'}},
+    {...base, source_blob_hash: 'silently invalid digest'},
+    {...base, body_hash: undefined}
+  ]) {
+    assert.equal((await validateContract('entitySourceBase', changed)).ok, false);
+  }
+});
+
+test('durable drafts retain invalid and empty text with a closed original-source identity', async () => {
+  const id = '11111111-1111-4111-8111-111111111111';
+  const draft = {
+    schema: 'kin.entity.draft.v1', draft_id: id, revision: 1, content_revision: 1,
+    scope: {repository_id: 'draft-fixture', workspace_id: id, entity_id: id, owner: 'local-bearer-v1'},
+    original_body: 'fn original() {}', body: 'fn incomplete( {\r\n café 🧭\0',
+    original_source_base: {
+      schema: 'kin.entity.source_base.v1', context: {repository_id: 'draft-fixture', workspace_id: id,
+        workspace_generation: 1, workspace_head_hash: 'ab'.repeat(32), workspace_tree_hash: 'cd'.repeat(32)},
+      entity_id: id, artifact_id: id, source_blob_hash: 'ef'.repeat(32),
+      start_byte: 0, end_byte: 16, body_hash: '12'.repeat(32)
+    }, previous_record_hash: null, request_hash: 'ab'.repeat(32), pending_apply: null, applied_receipt: null
+  };
+  await assertContract('entityDraft', draft);
+  await assertContract('entityDraft', {...draft, body: ''});
+  for (const changed of [
+    {...draft, schema: 'kin.entity.draft.v2'}, {...draft, revision: 0}, {...draft, draft_id: '../outside'},
+    {...draft, owner: 'caller-supplied'}, {...draft, scope: {...draft.scope, owner: 'other'}},
+    {...draft, original_source_base: {...draft.original_source_base, expected_base: 'unknown'}},
+    {...draft, pending_apply: {session_id: id, request_id: 'retry', arguments: {}, ignored: true}}
+  ]) assert.equal((await validateContract('entityDraft', changed)).ok, false);
+});
+
+test('draft capabilities distinguish supported saves from explicit platform refusal', async () => {
+  const capabilities = {schema: 'kin.entity.draft.capabilities.v1', durable_save_supported: true,
+    apply_supported: false, limits: {body_bytes: 8388608, total_bytes: 536870912, drafts: 4096, revisions: 65536}, refusal: null};
+  await assertContract('entityDraftCapabilities', capabilities);
+  await assertContract('entityDraftCapabilities', {...capabilities, durable_save_supported: false,
+    refusal: {code: 'draft_durability_unsupported', message: 'Verified directory synchronization is unavailable.'}});
+  assert.equal((await validateContract('entityDraftCapabilities', {...capabilities, durable_save_supported: 'yes'})).ok, false);
+});
+
+
+// Captured from actual stdio MCP using the persisted local draft implementation.
+async function draftWireFixture(tool) {
+  return JSON.parse(await fs.readFile(path.join(packageRoot, 'test/fixtures',
+    `${tool}-mcp-v2.json`), 'utf8'));
+}
+
+test('real MCP draft wire separates reserved metadata from the closed domain', async () => {
+  for (const [tool, name] of [
+    ['kin_draft_read', 'entityDraft'], ['kin_draft_capabilities', 'entityDraftCapabilities']
+  ]) {
+    const wire = await draftWireFixture(tool);
+    const before = structuredClone(wire);
+    // The original failure remains a negative: domain-only validators do not
+    // accept transport metadata, including on a nested EntityDraft record.
+    const bare = await validateContract(name, wire);
+    assert.equal(bare.ok, false);
+    assert.ok(bare.errors.includes('$: unexpected property _kin'));
+    const result = await validateMcpContract(name, wire);
+    assert.equal(result.ok, true, result.errors.join('\n'));
+    const {_kin, ...domain} = wire;
+    assert.deepEqual(result.payload, domain);
+    assert.deepEqual(result.envelope, _kin);
+    assert.deepEqual(wire, before, 'wire content must remain intact');
+    assert.equal((await validateContract(name, result.payload)).ok, true);
+    const direct = await validateMcpContract(name, domain);
+    assert.equal(direct.ok, true);
+    assert.equal(direct.envelope, null);
+  }
+});
+
+test('MCP draft metadata refuses unsupported discriminants and malformed known fields', async () => {
+  const wire = await draftWireFixture('kin_draft_read');
+  for (const envelope of [
+    null, [], 'metadata', {},
+    {...wire._kin, envelope_version: 1}, {...wire._kin, envelope_version: 3},
+    {...wire._kin, envelope_version: '2'}, {...wire._kin, runtime: 'other-daemon'},
+    {...wire._kin, runtime: null}, {...wire._kin, degraded: undefined},
+    {...wire._kin, degraded: []}, {...wire._kin, degraded: {daemon_unreachable: 'false'}},
+    {...wire._kin, graph_state: {loaded: 'true'}},
+    {...wire._kin, semantic_coverage: {indexed: 0, total: 0, pending: 0, complete: 'true'}},
+    {...wire._kin, behind: {unadmitted_paths: 0}},
+    {...wire._kin, durability: {state: 'recorded', live_entities: -1}}
+  ]) {
+    const checked = await validateMcpContract('entityDraft', {...wire, _kin: envelope});
+    assert.equal(checked.ok, false, JSON.stringify(envelope));
+    assert.ok(checked.errors.some(error => error.startsWith('$._kin')));
+  }
+});
+
+test('MCP metadata stays additive without discarding unknown domain fields or nested guards', async () => {
+  const wire = await draftWireFixture('kin_draft_read');
+  const envelope = {...wire._kin, future_observation: {state: 'unrecognized', body: 'retained'},
+    degraded: {...wire._kin.degraded, future_warning: true}};
+  const accepted = await validateMcpContract('entityDraft', {...wire, _kin: envelope});
+  assert.equal(accepted.ok, true, accepted.errors.join('\n'));
+  assert.deepEqual(accepted.envelope, envelope);
+  for (const changed of [
+    {...wire, expected_base: 'unsupported'}, {...wire, owner: 'caller'},
+    {...wire, scope: {...wire.scope, _kin: envelope}},
+    {...wire, original_source_base: {...wire.original_source_base, _kin: envelope}},
+    {...wire, original_source_base: {...wire.original_source_base,
+      context: {...wire.original_source_base.context, expected_base: 'unsupported'}}}
+  ]) {
+    const checked = await validateMcpContract('entityDraft', changed);
+    assert.equal(checked.ok, false, JSON.stringify(changed));
+    const {_kin, ...allDomainKeys} = changed;
+    assert.deepEqual(checked.payload, allDomainKeys, 'only reserved top-level metadata may be separated');
+  }
+});
+
+test('MCP envelope discriminants match the canonical producer', async () => {
+  const envelope = await loadSchema('mcpEnvelopeV2');
+  const producer = await fs.readFile(path.join(repositoryRoot, 'crates/kin-mcp/src/envelope.rs'), 'utf8');
+  assert.equal(envelope.properties.envelope_version.const,
+    Number(producer.match(/pub const ENVELOPE_VERSION: u32 = (\d+);/)[1]));
+  assert.deepEqual(envelope.properties.runtime.enum, ['repo-daemon', 'offline-in-process']);
+  assert.match(producer, /#\[serde\(rename_all = "kebab-case"\)\][\s\S]*?pub enum Runtime/);
+  assert.match(producer, /pub runtime: Runtime/);
+  assert.match(producer, /pub degraded: Degraded/);
+  assert.deepEqual(envelope.required, ['envelope_version', 'runtime', 'degraded']);
+});
+
+
+test('MCP response accounting validates the canonical serialized budget field names', async () => {
+  const envelope = JSON.parse(await fs.readFile(path.join(packageRoot,
+    'test/fixtures/mcp-budget-envelope-v2.json'), 'utf8'));
+  await assertContract('mcpEnvelopeV2', envelope);
+  const budget = await fs.readFile(path.join(repositoryRoot, 'crates/kin-mcp/src/budget.rs'), 'utf8');
+  assert.match(budget, /#\[serde\(rename = "chars_before_budget"\)\]\s+pub chars_before: usize/);
+  assert.match(budget, /#\[serde\(rename = "chars_after_budget", default\)\]\s+pub chars_after: usize/);
+  const {chars_before_budget, chars_after_budget, ...rest} = envelope.response;
+  for (const response of [
+    {...rest, chars_before: chars_before_budget, chars_after: chars_after_budget},
+    {...envelope.response, chars_before_budget: '9200'},
+    {...envelope.response, chars_after_budget: -1}
+  ]) assert.equal((await validateContract('mcpEnvelopeV2', {...envelope, response})).ok, false);
 });

@@ -1,0 +1,583 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Additive Kin MCP metadata envelope v2",
+  "description": "Reserved top-level response metadata from kin-mcp Envelope. Unknown metadata is preserved and not interpreted as authority or an editing constraint. Domain payload schemas remain closed.",
+  "type": "object",
+  "properties": {
+    "envelope_version": {
+      "type": "integer",
+      "const": 2
+    },
+    "runtime": {
+      "type": "string",
+      "enum": [
+        "repo-daemon",
+        "offline-in-process"
+      ]
+    },
+    "degraded": {
+      "type": "object",
+      "properties": {
+        "daemon_unreachable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "embed_worker_failed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "embed_persistence_unavailable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "mass_deletion_blocked": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "offline_fallback": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "workspace_mismatch": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "daemon_killed_by_memory": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "sweep_suspended": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "memory_pressure": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "relation_census_loss": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hydration_semantics_stale": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enrichment_shortfall": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "no_repository": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": true
+    },
+    "graph_state": {
+      "type": "object",
+      "properties": {
+        "reconciliation_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entity_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "entity_count_scope": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loaded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "initialized": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": true
+    },
+    "durability": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string"
+            },
+            "live_entities": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "durable_entities": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "live_only_entities": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "live_relations": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "durable_relations": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "live_only_relations": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "hydration_semantics": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "standing": {
+              "type": "string"
+            },
+            "derives": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "created_under": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "standing",
+            "derives"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "semantic_coverage": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "indexed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "pending": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "embedding_state_reported": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limited_by": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "read_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "graph_body_gap_paths": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "indexed",
+            "total",
+            "pending",
+            "complete"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "behind": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "unadmitted_paths": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "measured": {
+              "type": "boolean"
+            },
+            "since": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sample": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "measured_age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "unadmitted_paths",
+            "measured"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "freshness": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string"
+            },
+            "at": {
+              "type": "string"
+            },
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "basis": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "settled_age_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "observed_authority_epoch": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "live_attempts": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "watcher_loss": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "generation": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "recovered_through": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "read_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "generation",
+            "recovered_through"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "completeness": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "bound": {
+              "type": "string"
+            },
+            "substrate": {
+              "type": "string"
+            },
+            "classes": {
+              "type": "object"
+            },
+            "decided_by": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "counted": {},
+            "reference_resolution": {},
+            "limits": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "status",
+            "bound",
+            "substrate",
+            "classes",
+            "decided_by"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "response": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "chars_before_budget": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "chars_after_budget": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bounded": {
+              "type": "boolean"
+            },
+            "compact": {
+              "type": "boolean"
+            },
+            "primary_collection": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "primary_rows": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "max_chars",
+            "chars_before_budget",
+            "chars_after_budget",
+            "bounded",
+            "compact"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "answered_by": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "pid": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "repo_root": {
+              "type": "string"
+            },
+            "repo_id": {
+              "type": "string"
+            },
+            "uptime_seconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pid",
+            "repo_root",
+            "repo_id",
+            "uptime_seconds"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "graph_as_of": {
+      "description": "Opaque optional JSON marker in canonical Envelope; interpreting it requires the producing surface contract."
+    },
+    "verdict": {
+      "description": "Opaque optional JSON in canonical Envelope; shape validation alone does not certify answer authority."
+    }
+  },
+  "required": [
+    "envelope_version",
+    "runtime",
+    "degraded"
+  ],
+  "additionalProperties": true
+}

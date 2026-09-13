@@ -119,10 +119,10 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 
 /// Honest JSON Schema for one transaction operation.
 ///
-/// The product daemon accepts six materially different shapes. A source-body
+/// The product daemon accepts seven materially different shapes. A source-body
 /// edit, a new source file, a rewritten source file, a retirement, and a rename
-/// are all intentionally payload-less; structured entity/relation mutations
-/// require `payload`. Keeping these as disjoint `oneOf` branches prevents MCP
+/// are all intentionally payload-less; guarded body edits and structured
+/// entity/relation mutations require `payload`. Disjoint `oneOf` branches prevent MCP
 /// clients from being told that the preferred source-edit form is invalid.
 ///
 /// No two branches can match one operation: the five payload-less branches
@@ -265,6 +265,24 @@ fn transaction_operation_schema() -> serde_json::Value {
                 "additionalProperties": false
             },
             {
+                "title": "Guarded entity source body edit",
+                "type": "object",
+                "properties": {
+                    "verb": { "type": "string", "enum": ["update", "modify"] },
+                    "target": { "type": "string", "format": "uuid", "description": "The exact entity UUID in source_base." },
+                    "body": { "type": "string", "minLength": 1 },
+                    "description": { "type": "string" },
+                    "payload": {
+                        "type": "object",
+                        "properties": { "EntitySourceBase": crate::source_base::source_base_schema() },
+                        "required": ["EntitySourceBase"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["verb", "target", "body", "payload", "description"],
+                "additionalProperties": false
+            },
+            {
                 "title": "Structured entity or relation mutation",
                 "type": "object",
                 "properties": {
@@ -282,6 +300,10 @@ fn transaction_operation_schema() -> serde_json::Value {
                     },
                     "payload": {
                         "type": "object",
+                        "oneOf": [
+                            { "required": ["Entity"], "properties": { "Entity": { "type": "object" } }, "additionalProperties": false },
+                            { "required": ["Relation"], "properties": { "Relation": { "type": "object" } }, "additionalProperties": false }
+                        ],
                         "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}."
                     },
                     "body": {
@@ -365,11 +387,8 @@ pub fn unserved_tools_named_in(
 /// is a different question and FIR-2480 owns it; this makes the surface stop
 /// contradicting itself whatever that answer turns out to be.
 /// `search_is_served` decides which route the note names. On a profile that
-/// serves [`crate::handlers::tool_search`], telling the reader to restart the
-/// server on `full` would be the worse of two available answers and the one the
-/// agent cannot act on mid-session: the tool it was pointed at is one call away.
-/// Every other profile keeps the wording it had, so `agent-default`'s served
-/// bytes do not move.
+/// serves [`crate::handlers::tool_search`], schemas can be discovered immediately,
+/// but invoking a withheld tool still requires a profile that serves it.
 fn unserved_cross_reference_note(named: &[String], search_is_served: bool) -> String {
     let (subject, object, possessive, schema) = if named.len() == 1 {
         ("This tool is", "it", "its", "schema")
@@ -378,8 +397,8 @@ fn unserved_cross_reference_note(named: &[String], search_is_served: bool) -> St
     };
     let reach = if search_is_served {
         format!(
-            "Call {search} for {possessive} full {schema}, then call {object} on the next turn, \
-             or set KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) to serve {object} here.",
+            "Call {search} for {possessive} full {schema}. Discovery does not enable {object}; \
+             use KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) on a connection that serves {object}.",
             search = crate::handlers::tool_search::TOOL_NAME,
         )
     } else {
@@ -476,6 +495,7 @@ pub fn name_set(names: &[&str]) -> std::collections::HashSet<String> {
 /// depend on where a new tool is inserted in the registry below.
 pub fn tool_definitions() -> ToolsListResult {
     let mut list = registered_tools();
+    list.tools.extend(crate::entity_drafts::tool_definitions());
     list.tools.sort_by(|left, right| left.name.cmp(&right.name));
     list
 }
@@ -1034,6 +1054,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "session_id": { "type": "string", "description": "Optional caller-allocated UUID for authenticated daemon registration, including the original UUID when resuming an unpublished keyed mutation after restart. An already registered UUID refuses; offline use is unsupported." },
                         "vendor": { "type": "string", "description": "Vendor identifier (claude-code, codex, gemini-cli, etc.)" },
                         "client_name": { "type": "string", "description": "Human-readable client name" },
                         "transport": { "type": "string", "description": "Connection type: mcp, cli, wrapper, or ui", "default": "mcp" },
@@ -1197,7 +1218,10 @@ fn registered_tools() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_mutate".into(),
                 description: crate::handlers::sessions::MUTATE_DESC.into(),
-                annotations: destructive_idempotent("Atomically mutate graph"),
+                annotations: ToolAnnotations {
+                    idempotent_hint: false,
+                    ..destructive_idempotent("Atomically mutate graph")
+                },
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1208,22 +1232,32 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "session_id": {
                             "type": "string",
-                            "description": "Optional owning session UUID"
+                            "description": "Owning session UUID; required when request_id is supplied"
                         },
                         "scope": {
                             "type": "string",
-                            "description": "Optional target scope or workspace identifier (defaults to 'repository')"
+                            "description": "Scope metadata for unkeyed calls; keyed v1 accepts only repository (the daemon-bound workspace)"
                         },
                         "request_id": {
                             "type": "string",
-                            "description": "Optional client request id, carried into the receipt so you can match the answer to your call; nothing deduplicates on it"
+                            "minLength": 1,
+                            "maxLength": 256,
+                            "description": "Optional opaque nonblank UTF-8 key (at most 256 bytes). A supporting authenticated daemon durably binds the complete request in this repository and session. Identical retries return the original kin.mutate.receipt.v1 receipt and original authority roots; different arguments refuse. Preserve session_id across retries and MCP restart. Offline and older daemons refuse keyed calls. Without this key calls remain non-idempotent."
                         },
                         "summary": {
                             "type": "string",
                             "description": "Optional change message: one sentence in your own words saying what this change does, which becomes the subject a human reads in history. Omit it and the change records only the transaction id, which names the call and not the work."
                         }
                     },
-                    "required": ["operations"]
+                    "required": ["operations"],
+                    "allOf": [{
+                        "if": { "required": ["request_id"] },
+                        "then": {
+                            "required": ["session_id"],
+                            "properties": { "scope": { "const": "repository" } },
+                            "propertyNames": { "enum": ["operations", "session_id", "scope", "request_id", "summary"] }
+                        }
+                    }]
                 }),
             },
             ToolDefinition {
@@ -2304,6 +2338,9 @@ mod tests {
     /// with whatever the registry claims and could never disagree with it. Each
     /// name here was classified by reading its handler.
     const WRITING_TOOLS: &[&str] = &[
+        "kin_draft_apply",
+        "kin_draft_create",
+        "kin_draft_save",
         "kin_annotation_add",
         "kin_annotation_mark_resolved",
         "kin_mutate",
@@ -2343,6 +2380,7 @@ mod tests {
     /// replace a state field in place; `kin_annotation_mark_resolved` deletes
     /// the annotation; `kin_review_unassign` removes the assignment.
     const DESTRUCTIVE_TOOLS: &[&str] = &[
+        "kin_draft_apply",
         "kin_annotation_mark_resolved",
         "kin_mutate",
         "kin_review_discuss_resolve",
@@ -2568,7 +2606,7 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 6, "{tool_name}");
+            assert_eq!(variants.len(), 7, "{tool_name}");
 
             let retirement = variants
                 .iter()
@@ -2696,8 +2734,9 @@ mod tests {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
         // + 1 get_entity_sources + 2 exact artifact tools
-        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search + 1 kin_mutate = 68
-        assert_eq!(list.tools.len(), 68);
+        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search + 1 kin_mutate
+        // + 6 durable entity draft tools = 74
+        assert_eq!(list.tools.len(), 74);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -3330,9 +3369,8 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
     /// at it rather than at a server restart.
     ///
     /// The FIR-3031 rule is that no served description may name a withheld tool
-    /// in silence. On this profile the honest answer to "where is it" changed:
-    /// the tool is one call away, and telling an agent mid-session to restart
-    /// the server on `full` is advice it cannot act on.
+    /// in silence. Search exposes the definition and profile eligibility; the
+    /// result does not make a withheld tool callable on this connection.
     #[test]
     fn the_cross_reference_note_names_the_search_tool_where_it_is_served() {
         let registered: Vec<String> = tool_definitions()

@@ -20,7 +20,7 @@ use crate::collision::{
     check_signature_change, check_visibility_change, CollisionCheck, MergeConflict,
     MergeConflictKind, TrafficChecker,
 };
-use crate::cross_file::LiveCrossFileLinker;
+use crate::cross_file::{LiveCrossFileLinker, PriorCallSites};
 use crate::error::{ReconcileError, Result};
 use crate::lkg::LkgStore;
 
@@ -722,6 +722,27 @@ impl Reconciler {
         result
     }
 
+    /// Reconcile parsed canonical bytes with the same partial/LKG policy as an
+    /// observed edit, without reading a host path or inferring file removal.
+    /// The caller must bind the indexed blob to its current repository tree.
+    pub fn reconcile_indexed_observation<G: GraphStore>(
+        &mut self,
+        indexed: &kin_index::IndexedFile,
+        blob_store: &BlobStore,
+        graph: &G,
+    ) -> Result<ReconcileResult> {
+        let lkg_snapshot = self.lkg.clone();
+        let file_id = indexed.file_id.clone();
+        let display_path = PathBuf::from(&file_id.0);
+        let result =
+            self.reconcile_observed_edit(indexed, &file_id, &display_path, blob_store, graph);
+        if result.is_err() {
+            self.lkg = lkg_snapshot;
+            self.cross_file.forget_file(&file_id.0);
+        }
+        result
+    }
+
     /// Apply partial admission to observed filesystem edits. Indexed-content
     /// transactions use a separate path that requires a complete file layout.
     fn reconcile_observed_edit<G: GraphStore>(
@@ -792,13 +813,14 @@ impl Reconciler {
         let mut delta = TransactionDelta::default();
         let blob_hash = serde_json::Value::String(indexed.blob_hash.to_string());
 
-        // Every entity id this transaction already speaks for. One delta per
-        // entity is the transaction invariant, so an id enters this set the
-        // moment a delta names it and no later delta may name it again.
-        let mut claimed: HashSet<EntityId> = HashSet::new();
+        // Reserve carry-forward identities across the whole parse before any
+        // edit can consume an unchanged sibling's identity. Also reserve those
+        // ids against newly added declarations at their former positions.
+        let matches = match_declarations(&existing, &indexed.entities, file_id);
+        let mut claimed: HashSet<EntityId> = matches.iter().flatten().map(|old| old.id).collect();
 
         // Process new entities from the parse
-        for new_entity in &indexed.entities {
+        for (new_entity, existing_match) in indexed.entities.iter().zip(matches) {
             // Validate entity based on policy strictness.
             if let Some(reason) = validate_entity(new_entity) {
                 match self.policy.validation_strictness {
@@ -818,52 +840,8 @@ impl Reconciler {
                 }
             }
 
-            // A graph-authoritative planner may deliberately retain an
-            // existing identity while changing its source name (rename is the
-            // canonical case). Parser-produced identities normally differ
-            // after such a source edit, so the planner must explicitly remap
-            // the parsed entity before reaching this boundary. Honor that
-            // exact id first, while still requiring the entity kind to match;
-            // ordinary filesystem reconciliation continues to match by name
-            // and kind as before.
-            //
-            // Every pass skips an entity another parsed declaration already
-            // claimed, so the match is one-to-one. Identity is derived from the
-            // declaration's start line, so an edit above a declaration retires
-            // the id the graph holds for it and drops it to the passes below.
-            // A file that declares one name twice, which a cfg-gated pair and a
-            // Python `@overload` group both do routinely, would otherwise
-            // collapse both halves onto whichever half the graph returned
-            // first.
-            //
-            // Name and kind alone cannot tell one member of such a group from
-            // another, and `get_file_entities` returns graph-query order rather
-            // than declaration order, so a line-shifting edit anywhere above the
-            // group rotated its members onto each other: three declarations came
-            // back as three modifications reporting signature transitions none
-            // of them underwent, in mutually contradictory directions. The
-            // declaration's own signature is what distinguishes group members,
-            // so it is consulted before falling back to name and kind, and the
-            // fallback pairs by nearest declaration position rather than by
-            // whatever order the graph happened to return.
-            let existing_match = existing
-                .iter()
-                .find(|entity| {
-                    entity.id == new_entity.id
-                        && entity.kind == new_entity.kind
-                        && !claimed.contains(&entity.id)
-                })
-                .or_else(|| {
-                    nearest_unclaimed(&existing, new_entity, &claimed, |candidate, parsed| {
-                        candidate.signature == parsed.signature
-                    })
-                })
-                .or_else(|| nearest_unclaimed(&existing, new_entity, &claimed, |_, _| true));
-
             match existing_match {
                 Some(old) => {
-                    claimed.insert(old.id);
-
                     let mut updated = new_entity.clone();
                     updated.id = old.id;
                     updated.lineage_parent = old.lineage_parent;
@@ -902,12 +880,9 @@ impl Reconciler {
                     }
                 }
                 None => {
-                    // New entity. Identity is derived from the file, name,
-                    // kind, and start line, so two declarations sharing all
-                    // four are one entity as far as the graph can tell and only
-                    // the first of them can be carried.
                     let mut added_entity = new_entity.clone();
-                    if !claimed.insert(added_entity.id) {
+                    // Duplicate parser keys still describe one declaration.
+                    if stable_entity_ids.contains_key(&new_entity.id) {
                         warn!(
                             entity = %added_entity.name,
                             id = %added_entity.id,
@@ -915,11 +890,20 @@ impl Reconciler {
                         );
                         continue;
                     }
+                    // An actual addition can occupy a moved declaration's old
+                    // parser key. Give only the new declaration a fresh id;
+                    // the carried declaration keeps its persisted ancestry.
+                    if existing.iter().any(|old| old.id == added_entity.id)
+                        || claimed.contains(&added_entity.id)
+                    {
+                        added_entity.id = EntityId::new();
+                    }
+                    claimed.insert(added_entity.id);
                     added_entity
                         .metadata
                         .extra
                         .insert("blob_hash".into(), blob_hash.clone());
-                    stable_entity_ids.insert(added_entity.id, added_entity.id);
+                    stable_entity_ids.insert(new_entity.id, added_entity.id);
                     delta.entity_deltas.push(EntityDelta::Added {
                         new: added_entity.clone(),
                     });
@@ -1087,6 +1071,19 @@ impl Reconciler {
                     });
                 }
             } else {
+                // A new edge must derive its identity from the remapped
+                // endpoints too. Its parser id may name the old declaration's
+                // edge at an occupied position, which that declaration keeps.
+                if stable_src != relation.src || stable_dst != relation.dst {
+                    if let (Some(src), Some(dst)) = (stable_src.as_entity(), stable_dst.as_entity())
+                    {
+                        stable_relation.id = RelationId::from_content(
+                            &src.to_string(),
+                            &dst.to_string(),
+                            &format!("{:?}", stable_relation.kind),
+                        );
+                    }
+                }
                 push_relation_addition(
                     graph,
                     &mut held_relations,
@@ -1209,16 +1206,17 @@ impl Reconciler {
         //      re-derived that exact edge from it.
         //   3. `cross_file_source_authoritative`. Parser-derived, sourced by an
         //      entity of this file, destination outside it, the cross-file pass ran,
-        //      and this file's freshly parsed text no longer names that destination
-        //      under any spelling. The case this file's edges could not reach before,
+        //      and current extraction no longer names that destination from this
+        //      caller (or anywhere in the file for non-Calls relations). The case this file's edges could not reach before,
         //      and the one that keeps a deleted cross-file call site from leaving a
         //      permanent edge. It deliberately does NOT fire merely because the pass
         //      failed to re-derive the edge: an init-time batch-linked edge resolved
         //      at a tier the incremental universe cannot reach is still named by the
-        //      source, so it survives. Nor does it fire on a recovered parse, where
-        //      an absent name proves nothing.
+        //      caller, so it survives. Nor does it fire on a recovered parse or
+        //      incomplete/ambiguous call extraction, where absence proves nothing.
         // Everything else is preserved: LSP-enrichment edges, agent-created Manual
         // edges, and any edge this file merely receives rather than sources.
+        let mut prior_call_sites = PriorCallSites::default();
         let mut retired_relation_ids: HashSet<RelationId> = HashSet::new();
         for ((src, dst, kind), relations) in &existing_relations {
             for relation in relations {
@@ -1254,12 +1252,24 @@ impl Reconciler {
                     && cross_file.ran
                     && file_entity_node_ids.contains(src)
                     && !new_relation_keys.contains(&(*src, *dst, *kind))
-                    && dst
-                        .as_entity()
-                        .and_then(|id| graph.get_entity(&id).ok().flatten())
-                        .is_some_and(|entity| {
-                            cross_file.referenced.can_retire(*kind, &entity.name)
-                        });
+                    && src.as_entity().is_some_and(|source| {
+                        dst.as_entity()
+                            .and_then(|id| graph.get_entity(&id).ok().flatten())
+                            .is_some_and(|entity| {
+                                cross_file
+                                    .referenced
+                                    .can_retire_from(source, *kind, &entity.name)
+                                    && (*kind != RelationKind::Calls
+                                        || existing
+                                            .iter()
+                                            .find(|old| old.id == source)
+                                            .is_some_and(|old| {
+                                                prior_call_sites.supports_retirement(
+                                                    relation, old, &entity, blob_store,
+                                                )
+                                            }))
+                            })
+                    });
                 if touches_removed_entity
                     || parser_authoritative
                     || duplicate_parser_relation
@@ -2350,6 +2360,91 @@ fn nearest_unclaimed<'a>(
             // reach.
             (distance.is_none(), distance, candidate.id)
         })
+}
+
+/// Match a complete parse in descending evidence strength. Reserving each tier
+/// globally prevents an edited declaration from stealing an unchanged sibling's
+/// identity merely because the parser visits the edit first.
+fn match_declarations<'a>(
+    existing: &'a [Entity],
+    parsed: &[Entity],
+    file_id: &FilePathId,
+) -> Vec<Option<&'a Entity>> {
+    let mut matches = vec![None; parsed.len()];
+    let mut reserved = HashSet::new();
+
+    // A planner-retained id is explicit ancestry, including across a rename.
+    // Fresh parser ids instead name positions and can collide after a move.
+    for (new, slot) in parsed.iter().zip(&mut matches) {
+        if !has_parser_identity(new, file_id) {
+            if let Some(old) = existing
+                .iter()
+                .find(|old| old.id == new.id && old.kind == new.kind && !reserved.contains(&old.id))
+            {
+                reserved.insert(old.id);
+                *slot = Some(old);
+            }
+        }
+    }
+
+    // The parser behavior hash includes declaration and body tokens, ignoring
+    // comments/formatting. Compare the algorithm and signature too, and do not
+    // treat an uncomputed zero digest as continuity evidence.
+    reserve_declaration_matches(existing, parsed, &mut matches, &mut reserved, |old, new| {
+        old.signature == new.signature
+            && old.language == new.language
+            && old.fingerprint.algorithm == new.fingerprint.algorithm
+            && old.fingerprint.behavior_hash != kin_model::Hash256::from_bytes([0; 32])
+            && old.fingerprint.behavior_hash == new.fingerprint.behavior_hash
+    });
+    reserve_declaration_matches(existing, parsed, &mut matches, &mut reserved, |old, new| {
+        old.signature == new.signature
+    });
+    reserve_declaration_matches(existing, parsed, &mut matches, &mut reserved, |old, new| {
+        old.id == new.id
+    });
+    reserve_declaration_matches(existing, parsed, &mut matches, &mut reserved, |_, _| true);
+    matches
+}
+
+fn reserve_declaration_matches<'a>(
+    existing: &'a [Entity],
+    parsed: &[Entity],
+    matches: &mut [Option<&'a Entity>],
+    reserved: &mut HashSet<EntityId>,
+    accept: impl Fn(&Entity, &Entity) -> bool,
+) {
+    for (new, slot) in parsed.iter().zip(matches) {
+        if slot.is_none() {
+            if let Some(old) = nearest_unclaimed(existing, new, reserved, &accept) {
+                reserved.insert(old.id);
+                *slot = Some(old);
+            }
+        }
+    }
+}
+
+/// Distinguish a fresh parser location key from an identity deliberately
+/// retained by a graph-authoritative planner. Attributes and documentation can
+/// widen the span above the declaration line used by the parser's key.
+fn has_parser_identity(entity: &Entity, file_id: &FilePathId) -> bool {
+    let Some(span) = &entity.span else {
+        return false;
+    };
+    let line = entity
+        .metadata
+        .extra
+        .get(kin_parser::DECLARATION_LINE_KEY)
+        .and_then(|line| line.as_u64())
+        .and_then(|line| u32::try_from(line).ok())
+        .unwrap_or(span.start_line);
+    entity.id
+        == EntityId::from_content(
+            &file_id.0,
+            &entity.name,
+            &format!("{:?}", entity.kind),
+            line,
+        )
 }
 
 /// Collect all unique file origins from both entity sets.

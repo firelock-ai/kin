@@ -420,14 +420,14 @@ pub fn handle_get_entity_source<G: GraphStore>(
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let exact_source = read_entity_source_exact(
-                &HeldSourceAuthority::new(store, repository_authority),
-                &entity,
-                1_000_000,
-            )?
-            .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
+            let held = HeldSourceAuthority::new(store, repository_authority);
+            let exact_source = read_entity_source_exact(&held, &entity, 1_000_000)?
+                .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
+            let source_base =
+                crate::source_base::source_base_for_read(&held, &entity, &exact_source)?;
             let source = LAST_READ_SOURCE.with(|f| f.get());
             let mut value = serde_json::json!({
+                "source_base": source_base,
                 "id": entity.id,
                 "name": entity.name,
                 "kind": entity.kind,
@@ -2406,6 +2406,7 @@ pub async fn handle_find_references<G: GraphStore>(
         store,
         FindReferencesAuthoritySource::Ambient(AmbientCrossRepoBinding::from_env()),
         repository_authority,
+        EntitySourceScope::WorkspaceHead,
     )
     .await
 }
@@ -2428,6 +2429,7 @@ pub async fn handle_find_references_with_ambient_binding<G: GraphStore>(
         store,
         FindReferencesAuthoritySource::Ambient(binding),
         repository_authority,
+        EntitySourceScope::WorkspaceHead,
     )
     .await
 }
@@ -2448,6 +2450,25 @@ pub async fn handle_find_references_with_authority<G: GraphStore>(
         store,
         FindReferencesAuthoritySource::Daemon(authority),
         repository_authority,
+        EntitySourceScope::WorkspaceHead,
+    )
+    .await
+}
+
+/// Daemon-selected historical scope paired with its graph before the read.
+pub async fn handle_find_references_with_authority_at<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    authority: FindReferencesAuthority<'_>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<ToolCallResult> {
+    handle_find_references_with_authority_source(
+        args,
+        store,
+        FindReferencesAuthoritySource::Daemon(authority),
+        repository_authority,
+        source_scope,
     )
     .await
 }
@@ -2457,6 +2478,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     store: &G,
     authority_source: FindReferencesAuthoritySource<'_>,
     repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
 ) -> Result<ToolCallResult> {
     let include_snippets = get_optional_bool(args, "include_snippets", false);
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
@@ -2500,8 +2522,13 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         return Ok(ToolCallResult::error(FIND_REFERENCES_FOCAL_MISS));
     };
 
-    let mut rows =
-        collect_graph_reference_rows(store, &target.id, &relation_kinds, repository_authority)?;
+    let mut rows = collect_graph_reference_rows_at(
+        store,
+        &target.id,
+        &relation_kinds,
+        repository_authority,
+        source_scope,
+    )?;
     // ── Federated Xrefs via Spine ─────────────────────────────────────
     let cross_repo_query = match authority_source {
         FindReferencesAuthoritySource::Ambient(binding) => match binding.repo_id {

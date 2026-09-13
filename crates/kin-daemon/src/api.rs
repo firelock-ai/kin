@@ -3991,6 +3991,12 @@ where
             kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS,
         ));
     }
+    let source_scope = state
+        .source_scope_for_selected_graph(session_id, &selected_graph, authority)
+        .await
+        .ok_or_else(|| {
+            mcp_authority_gap("selected reference source scope expired or was replaced")
+        })?;
     let spine_authority = state.acquire_spine_read_authority().await;
     if state.hosted_spine_readiness_required() && spine_authority.is_none() {
         return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
@@ -4006,7 +4012,7 @@ where
             continue;
         };
         after_root(attempt_number);
-        let result = kin_mcp::handlers::entities::handle_find_references_with_authority(
+        let result = kin_mcp::handlers::entities::handle_find_references_with_authority_at(
             arguments,
             attempt.graph.as_ref(),
             kin_mcp::handlers::entities::FindReferencesAuthority {
@@ -4015,8 +4021,18 @@ where
                 spine,
             },
             repository_authority.as_ref(),
+            source_scope,
         )
         .await;
+        if state
+            .source_scope_for_selected_graph(session_id, &selected_graph, authority)
+            .await
+            != Some(source_scope)
+        {
+            return Err(mcp_authority_gap(
+                "selected reference source scope changed during reconstruction",
+            ));
+        }
         if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
             .await
         {
@@ -4040,7 +4056,7 @@ where
         if let Some((graph, root, certified_age)) =
             prepare_settled_xref_replay(state, &selected_graph, authority)
         {
-            let result = kin_mcp::handlers::entities::handle_find_references_with_authority(
+            let result = kin_mcp::handlers::entities::handle_find_references_with_authority_at(
                 arguments,
                 graph.as_ref(),
                 kin_mcp::handlers::entities::FindReferencesAuthority {
@@ -4049,8 +4065,18 @@ where
                     spine,
                 },
                 repository_authority.as_ref(),
+                source_scope,
             )
             .await;
+            if state
+                .source_scope_for_selected_graph(session_id, &selected_graph, authority)
+                .await
+                != Some(source_scope)
+            {
+                return Err(mcp_authority_gap(
+                    "selected reference source scope changed during reconstruction",
+                ));
+            }
             return serve_settled_replay(result, state, "find_references", certified_age);
         }
     }
@@ -10214,7 +10240,7 @@ fn mcp_tool_mutates_graph(name: &str) -> bool {
     )
 }
 
-fn mcp_session_registry_snapshot(
+pub(crate) fn mcp_session_registry_snapshot(
     state: &DaemonState,
 ) -> Result<kin_mcp::SessionRegistry, (StatusCode, String)> {
     let sessions = state.coordinator.list_sessions().map_err(internal_error)?;
@@ -10314,7 +10340,7 @@ fn expire_orphaned_mcp_transactions(state: &DaemonState, live_session_ids: &Hash
 /// Persist the registry's transactions back into `DaemonState` after a tool call
 /// so begin/stage/validate/commit issued across separate HTTP requests share
 /// state. Counterpart to the restore in `mcp_session_registry_snapshot`.
-fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegistry) {
+pub(crate) fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegistry) {
     let mut store = lock_recover(&state.mcp_transactions);
     // Merge, don't clear: only upsert the transactions this request's registry
     // holds. Clearing would drop a transaction another request begun
@@ -10329,10 +10355,41 @@ fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegi
     crate::state::write_persisted_mcp_transactions(&state.layout, &store);
 }
 
+pub(crate) fn persist_mcp_lifecycle_transactions(
+    state: &DaemonState,
+    registry: &kin_mcp::SessionRegistry,
+) -> crate::error::Result<()> {
+    let mut store = lock_recover(&state.mcp_transactions);
+    let mut next = store.clone();
+    for transaction in registry.list_transactions() {
+        next.insert(transaction.transaction_id.clone(), transaction);
+    }
+    crate::state::write_mcp_transaction_lifecycle(&state.layout, &next, |_phase| {
+        #[cfg(test)]
+        if state
+            .mcp_lifecycle_persist_fail_once
+            .compare_exchange(
+                _phase as u8,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Err(std::io::Error::other(format!(
+                "injected transaction persistence phase {_phase:?}"
+            )));
+        }
+        Ok(())
+    })?;
+    *store = next;
+    Ok(())
+}
+
 /// Drop a transaction from the durable store once it reaches a terminal state
 /// (committed/aborted), so finished transactions do not accumulate. Called only
 /// after the terminal tool call succeeds.
-fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
+pub(crate) fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
     let mut store = lock_recover(&state.mcp_transactions);
     store.remove(transaction_id);
     // Keep the durable mirror in step with the in-memory eviction so a
@@ -10340,7 +10397,7 @@ fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
     crate::state::write_persisted_mcp_transactions(&state.layout, &store);
 }
 
-fn transaction_coordination_context(
+pub(crate) fn transaction_coordination_context(
     state: &DaemonState,
     sessions: &kin_mcp::SessionRegistry,
     arguments: &HashMap<String, serde_json::Value>,
@@ -10404,6 +10461,14 @@ fn transaction_coordination_context(
             Some(kin_mcp::McpMutationPayload::Relation { from, to, .. }) => {
                 push(IntentScope::Entity(*from));
                 push(IntentScope::Entity(*to));
+            }
+            Some(kin_mcp::McpMutationPayload::EntitySourceBase(base)) => {
+                push(IntentScope::Entity(base.entity_id));
+                if let Ok(Some(entity)) = state.graph.get_entity(&base.entity_id) {
+                    if let Some(file) = entity.file_origin {
+                        push(IntentScope::Artifact(file));
+                    }
+                }
             }
             Some(kin_mcp::McpMutationPayload::Blob(_)) => {}
             None => {
@@ -14840,6 +14905,7 @@ fn clamp_disclosure_failure(tool: &str, clamps: &[McpLocalClamp]) -> kin_mcp::To
 /// fit.
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
+    Extension(tokens): Extension<crate::auth_rotation::RotationTokens>,
     State(state): State<Arc<DaemonState>>,
     request: std::result::Result<Json<McpToolCallRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -14869,6 +14935,23 @@ async fn mcp_tools_call(
     // dispatcher, the budget shape and the negative spec all stay keyed on the
     // registered name. Every other name passes through.
     kin_mcp::agent_belt::canonicalize_tool_name(&mut request.name);
+    if kin_mcp::entity_drafts::is_tool(&request.name) {
+        // daemon_auth already classified this non-public route once. Read the
+        // enforcement state without spending another token-rotation accept;
+        // draft ownership does not depend on a transient session lease.
+        let authenticated = tokens.is_enforced();
+        if request.name == "kin_draft_apply" {
+            return crate::entity_drafts::apply(state, request.arguments, authenticated)
+                .await
+                .map(Json);
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            crate::entity_drafts::call(&state, &request.name, &request.arguments, authenticated)
+        })
+        .await
+        .map_err(internal_error)?;
+        return Ok(Json(result));
+    }
     // Bound the WORK before the call runs, and record what was cut so the
     // answer can say so. Applied after canonicalization, because the clamps are
     // keyed on the registered tool name like everything else on this route.
@@ -14881,7 +14964,15 @@ async fn mcp_tools_call(
         kin_mcp::outside_graph::question_argument(&request.arguments).map(str::to_string);
     let disclosing_state = Arc::clone(&state);
     let disclosing_headers = headers.clone();
-    let Json(result) = mcp_tools_call_inner(headers, State(state), Json(request)).await?;
+    let result = if request.name == crate::mcp_mutate::TOOL
+        || (request.name == "kin_mutate" && request.arguments.contains_key("request_id"))
+    {
+        crate::mcp_mutate::call(state, headers, request.arguments, tokens.is_enforced()).await?
+    } else {
+        mcp_tools_call_inner(headers, State(state), Json(request))
+            .await?
+            .0
+    };
     let bounded = bound_mcp_tool_result(result, &tool, &budget);
     let disclosed = disclose_mcp_local_clamps(bounded, &tool, &clamps);
     let graph = match question {
@@ -15175,12 +15266,26 @@ async fn mcp_tools_call_dispatch(
             Ok(authority) => authority,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
-        let result =
-            entity_source_tool_result(kin_cli::commands::graph::build_entity_source_outcome(
-                &repository_authority,
-                graph.as_ref(),
-                entity_id,
-            ));
+        // Use the authority paired with this exact graph selection. A fresh
+        // scope lookup could expire or change and certify a historical body
+        // against today's workspace merely because its bytes still match.
+        let outcome = match graph_authority {
+            RequestGraphAuthority::Head => {
+                kin_cli::commands::graph::build_current_entity_source_outcome(
+                    &repository_authority,
+                    graph.as_ref(),
+                    entity_id,
+                )
+            }
+            RequestGraphAuthority::SessionScope => {
+                kin_cli::commands::graph::build_entity_source_outcome(
+                    &repository_authority,
+                    graph.as_ref(),
+                    entity_id,
+                )
+            }
+        };
+        let result = entity_source_tool_result(outcome);
         return Ok(Json(result));
     }
 
@@ -15559,6 +15664,39 @@ async fn mcp_tools_call_dispatch(
         None
     };
 
+    if mcp_tool_is_transaction(&request.name) {
+        if let Some(transaction_id) = request
+            .arguments
+            .get("transaction_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if let Err(error) = crate::mcp_mutate::ensure_unbound(&state, transaction_id) {
+                return Ok(Json(kin_mcp::ToolCallResult::error(error)));
+            }
+        }
+        let mut transactions = lock_recover(&state.mcp_transactions);
+        let recovered =
+            crate::state::recover_mcp_transaction_lifecycle(&state.layout).and_then(|recovered| {
+                match crate::state::load_persisted_mcp_transactions_checked(&state.layout) {
+                    // Startup recovery can leave an empty live registry even
+                    // after restoring a valid mirror. Always restore that
+                    // acknowledged state before taking a transaction snapshot.
+                    Ok(store) => Ok(Some(store)),
+                    Err(_) if !recovered && request.name == "kin_transaction_commit" => {
+                        // A published commit can replay from its repository receipt
+                        // even when its staging mirror is unreadable. New publication
+                        // still requires the checked fence writer to accept that mirror.
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+        match recovered {
+            Ok(Some(store)) => *transactions = store,
+            Ok(None) => {}
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        }
+    }
     let sessions = mcp_session_registry_snapshot(&state)?;
     if mcp_tool_is_transaction(&request.name) && state.coordination_mode().is_enforcing() {
         if let Some(declared_session) = request
@@ -15693,7 +15831,7 @@ async fn mcp_tools_call_dispatch(
     }
 
     let graph_mutation = mutates.then(|| state.begin_graph_authority_mutation());
-    let result = if transaction_preflight
+    let mut result = if transaction_preflight
         .as_ref()
         .is_some_and(|preflight| !preflight.allowed)
     {
@@ -15829,7 +15967,18 @@ async fn mcp_tools_call_dispatch(
     // Persist transaction state mutated by this call so the next HTTP request
     // (potentially a later stage/commit on the same transaction) sees it.
     if mcp_tool_is_transaction(&request.name) {
-        persist_mcp_transactions(&state, &sessions);
+        if request.name == "kin_transaction_commit" {
+            // Exact commit owns its durable fence and receipt recovery. A
+            // post-publication mirror failure must not roll that commit back.
+            persist_mcp_transactions(&state, &sessions);
+        } else if result.is_error != Some(true) {
+            if let Err(error) = persist_mcp_lifecycle_transactions(&state, &sessions) {
+                result = kin_mcp::ToolCallResult::error(format!(
+                    "{} did not receive a durable acknowledgement: {error}",
+                    request.name
+                ));
+            }
+        }
         // Once a transaction commits or aborts successfully, evict it so the
         // durable store does not grow without bound.
         if result.is_error != Some(true) {
@@ -23664,6 +23813,7 @@ mod tests {
     fn entity_source_tool_result_found_serializes_record_without_error_flag() {
         use kin_cli::commands::graph::{EntitySourceOutcome, GraphSourceRecord};
         let record = GraphSourceRecord {
+            source_base: None,
             id: "id-1".into(),
             name: "target".into(),
             kind: "Function".into(),
@@ -23707,6 +23857,7 @@ mod tests {
         use kin_mcp::handlers::entities::{assemble_entity_sources_response, BatchSourceOptions};
 
         let record = GraphSourceRecord {
+            source_base: None,
             id: "id-1".into(),
             name: "target".into(),
             kind: "Function".into(),
@@ -45357,6 +45508,14 @@ mod tests {
         );
     }
 
+    include!("api/tests/mcp_lifecycle_persistence.rs");
+    include!("api/tests/mcp_mutate_durability.rs");
+    include!("api/tests/mcp_source_base.rs");
+    include!("api/tests/mcp_mutate_source_base.rs");
+    #[cfg(unix)]
+    include!("api/tests/entity_drafts.rs");
+    include!("api/tests/entity_draft_platform.rs");
+
     #[tokio::test]
     async fn mcp_transaction_stage_unknown_id_still_fails() {
         // Persistence must not paper over a genuinely missing transaction.
@@ -55442,6 +55601,239 @@ mod tests {
             RequestGraphAuthority::SessionScope,
         )
         .is_some());
+    }
+
+    #[tokio::test]
+    async fn historical_reference_source_uses_selected_revision_with_and_without_snippets() {
+        let old_body = "def target():\n    return 41\n\ndef caller():\n    return target() + 1\n";
+        let new_body = "# shifted current source\n\ndef target():\n    return 99\n\ndef caller():\n    return target() + 2\n";
+        let state = test_state_with_committed_sources(&[("lib.py", old_body)]);
+        let binding = state.local_repository_authority_binding().unwrap();
+        let old = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &binding,
+            Some("HEAD"),
+        )
+        .unwrap();
+        let authority = projection_repository_authority(&state).unwrap();
+        let historical = Arc::new(kin_core::build_graph_at_ref(&authority.manager, &old).unwrap());
+        let target = historical
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("target".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "target")
+            .unwrap();
+        let app = router(Arc::clone(&state));
+        install_working_copy_file(&state, "lib.py", new_body.as_bytes(), false);
+        let current = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "change and shift source",
+        )
+        .await;
+        assert_ne!(old, current);
+        let session = SessionId::new();
+        state
+            .set_session_scope(&session, old.to_string(), old, historical)
+            .await;
+        for include_snippets in [false, true] {
+            let result = mcp_call_as(
+                app.clone(),
+                "find_references",
+                json!({
+                    "entity_id": target.id.to_string(), "include_snippets": include_snippets,
+                    "relation_kinds": ["calls"]
+                }),
+                session,
+            )
+            .await;
+            assert!(
+                !result.is_error.unwrap_or(false),
+                "{}",
+                mcp_result_text(&result)
+            );
+            let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            let rows = body["references"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{body}");
+            assert_eq!(rows[0]["name"], "caller");
+            if include_snippets {
+                assert!(
+                    rows[0]["snippet"]
+                        .as_str()
+                        .unwrap()
+                        .contains("target() + 1"),
+                    "{body}"
+                );
+                assert!(
+                    !rows[0]["snippet"]
+                        .as_str()
+                        .unwrap()
+                        .contains("target() + 2"),
+                    "{body}"
+                );
+            } else {
+                assert!(rows[0].get("snippet").is_none(), "{body}");
+            }
+        }
+        // A scope with the current revision is still an explicit At read, even
+        // though its source bytes are identical to the workspace's bytes.
+        let authority = projection_repository_authority(&state).unwrap();
+        let current_graph =
+            Arc::new(kin_core::build_graph_at_ref(&authority.manager, &current).unwrap());
+        state
+            .set_session_scope(
+                &session,
+                current.to_string(),
+                current,
+                Arc::clone(&current_graph),
+            )
+            .await;
+        assert_eq!(
+            state
+                .source_scope_for_selected_graph(
+                    Some(&session),
+                    &current_graph,
+                    RequestGraphAuthority::SessionScope
+                )
+                .await,
+            Some(kin_mcp::handlers::common::EntitySourceScope::At(current))
+        );
+
+        // Change only the session head during reconstruction while retaining
+        // the graph Arc: Arc-only validation cannot catch this torn binding.
+        let historical = Arc::new(kin_core::build_graph_at_ref(&authority.manager, &old).unwrap());
+        state
+            .set_session_scope(&session, old.to_string(), old, Arc::clone(&historical))
+            .await;
+        let hook_state = Arc::clone(&state);
+        let error = mcp_find_references_with_stable_authority(
+            &state,
+            Some(&session),
+            Arc::clone(&historical),
+            RequestGraphAuthority::SessionScope,
+            &serde_json::from_value(
+                json!({"entity_id": target.id.to_string(), "include_snippets": true}),
+            )
+            .unwrap(),
+            move |_| {
+                hook_state
+                    .session_scopes
+                    .try_write()
+                    .unwrap()
+                    .get_mut(&session)
+                    .unwrap()
+                    .head = current;
+            },
+        )
+        .await
+        .expect_err("a re-bound scope cannot certify the former revision's body");
+        assert!(
+            error
+                .to_string()
+                .contains("source scope changed during reconstruction"),
+            "{error}"
+        );
+
+        state.clear_session_scope(&session).await;
+        assert_eq!(
+            state
+                .source_scope_for_selected_graph(
+                    Some(&session),
+                    &historical,
+                    RequestGraphAuthority::SessionScope
+                )
+                .await,
+            None
+        );
+        let current_result = mcp_call(app, "find_references", json!({"entity_id": target.id.to_string(), "include_snippets": true, "relation_kinds": ["calls"]})).await;
+        assert!(
+            !current_result.is_error.unwrap_or(false),
+            "{}",
+            mcp_result_text(&current_result)
+        );
+        assert!(mcp_result_text(&current_result).contains("target() + 2"));
+    }
+
+    #[tokio::test]
+    async fn historical_reference_source_scope_rejects_expired_or_replaced_graph() {
+        use kin_mcp::handlers::common::EntitySourceScope;
+        let state = test_state();
+        let session = SessionId::new();
+        let selected = Arc::new(kin_db::InMemoryGraph::new());
+        let revision = SemanticChangeId::from_hash(Hash256::from_bytes([17; 32]));
+        state
+            .set_session_scope(
+                &session,
+                revision.to_string(),
+                revision,
+                Arc::clone(&selected),
+            )
+            .await;
+        assert_eq!(
+            state
+                .source_scope_for_selected_graph(
+                    Some(&session),
+                    &selected,
+                    RequestGraphAuthority::SessionScope
+                )
+                .await,
+            Some(EntitySourceScope::At(revision))
+        );
+        assert_eq!(
+            state.source_scope_for_selected_graph(Some(&session), &state.graph, RequestGraphAuthority::Head).await,
+            None,
+            "a request selected before the session was scoped must not retain a HEAD source binding",
+        );
+        state
+            .session_scopes
+            .write()
+            .await
+            .get_mut(&session)
+            .unwrap()
+            .ttl = std::time::Duration::ZERO;
+        assert_eq!(
+            state
+                .source_scope_for_selected_graph(
+                    Some(&session),
+                    &selected,
+                    RequestGraphAuthority::SessionScope
+                )
+                .await,
+            None
+        );
+        state
+            .set_session_scope(
+                &session,
+                revision.to_string(),
+                revision,
+                Arc::new(kin_db::InMemoryGraph::new()),
+            )
+            .await;
+        assert_eq!(
+            state
+                .source_scope_for_selected_graph(
+                    Some(&session),
+                    &selected,
+                    RequestGraphAuthority::SessionScope
+                )
+                .await,
+            None
+        );
+        assert_eq!(
+            state
+                .source_scope_for_selected_graph(None, &selected, RequestGraphAuthority::Head)
+                .await,
+            None
+        );
+        assert_eq!(
+            state
+                .source_scope_for_selected_graph(None, &state.graph, RequestGraphAuthority::Head)
+                .await,
+            Some(EntitySourceScope::WorkspaceHead)
+        );
     }
 
     #[tokio::test]

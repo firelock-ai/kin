@@ -6,6 +6,21 @@ export interface CommandValidationResult {
 export declare function loadSchema(name: string): Promise<unknown>;
 export declare function loadAllSchemas(): Promise<Record<string, unknown>>;
 export declare function validateContract(name: string, payload: unknown): Promise<CommandValidationResult>;
+/** Additive metadata only; unknown fields never grant source freshness or Apply success. */
+export interface McpEnvelopeV2 {
+  envelope_version: 2;
+  runtime: 'repo-daemon' | 'offline-in-process';
+  degraded: Record<string, unknown>;
+  [key: string]: unknown;
+}
+export interface McpContractValidationResult extends CommandValidationResult {
+  /** Use only after ok; unknown domain keys remain present and cause refusal. */
+  payload: unknown;
+  /** Original metadata when present; null for direct domain/daemon responses. */
+  envelope: unknown;
+}
+export declare function validateMcpContract(name: string, response: unknown): Promise<McpContractValidationResult>;
+
 export declare function assertContract(name: string, payload: unknown): Promise<void>;
 
 export type RepoScopedSemanticToolName =
@@ -1184,3 +1199,60 @@ export type GraphEvent =
       relations_added: number;
       relations_removed: number;
     };
+
+export interface EntitySourceBaseV1 {
+  schema: "kin.entity.source_base.v1";
+  context: {
+    repository_id: string;
+    workspace_id: string;
+    workspace_generation: number;
+    workspace_head_hash: string;
+    workspace_tree_hash: string;
+  };
+  entity_id: string;
+  artifact_id: string;
+  source_blob_hash: string;
+  start_byte: number;
+  end_byte: number;
+  body_hash: string;
+}
+
+
+/** Draft editing state; arbitrary text is not repository publication. */
+export interface EntityDraftV1 {
+  schema: 'kin.entity.draft.v1';
+  draft_id: string;
+  revision: number;
+  /** Revision that last changed body bytes; Apply metadata alone does not change this. */
+  content_revision: number;
+  scope: { repository_id: string; workspace_id: string; entity_id: string; owner: 'local-bearer-v1' };
+  original_body: string;
+  original_source_base: EntitySourceBaseV1;
+  body: string;
+  previous_record_hash: string | null;
+  request_hash: string;
+  pending_apply: EntityDraftApplyAttempt | null;
+  applied_receipt: { attempt: EntityDraftApplyAttempt; receipt: Record<string, unknown> } | null;
+}
+export interface EntityDraftCapabilitiesV1 {
+  schema: 'kin.entity.draft.capabilities.v1';
+  durable_save_supported: boolean;
+  apply_supported: boolean;
+  limits: { body_bytes: number; total_bytes: number; drafts: number; revisions: number };
+  refusal: { code: string; message: string } | null;
+}
+export interface EntityDraftCreate {
+  draft_id: string; original_source_base: EntitySourceBaseV1; original_body: string; body: string;
+}
+export interface EntityDraftSave { draft_id: string; expected_revision: number; body: string }
+export interface EntityDraftRead { draft_id: string; revision?: number }
+export interface EntityDraftList { entity_id?: string; after?: string; limit?: number }
+
+export interface EntityDraftApplyAttempt {
+  requested_revision: number; draft_revision: number; session_id: string; request_id: string; arguments: Record<string, unknown>;
+}
+export interface EntityDraftApply { draft_id: string; expected_revision: number; session_id: string }
+export interface EntityDraftAppliedV1 {
+  schema: 'kin.entity.draft.applied.v1'; draft_id: string; requested_revision: number; applied_draft_revision: number;
+  current_text_applied: boolean; receipt_saved: true; receipt: Record<string, unknown>; draft: EntityDraftV1;
+}

@@ -1275,6 +1275,15 @@ async fn handle_tools_call<G: PersistableMcpStore>(
         }
     }
 
+    if call_params.name == crate::handlers::tool_search::TOOL_NAME {
+        let result = crate::handlers::tool_search::handle_tool_search_with_profile(
+            &call_params.arguments,
+            config.allowed_tools.as_ref(),
+        )
+        .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
+        return offline_envelope_success(id, result, &call_params.name, &budget);
+    }
+
     let mut handler = std::pin::pin!(handle_tool_call(
         &call_params.name,
         &call_params.arguments,
@@ -1409,33 +1418,19 @@ async fn handle_tools_call_daemon(
     // this route the SERVER is daemon-backed, which is what `runtime` reports;
     // `Envelope::daemon_unreachable` keeps the same value for the same reason.
     if call_params.name == crate::handlers::tool_search::TOOL_NAME {
-        let result = crate::handlers::tool_search::handle_tool_search(&call_params.arguments)
-            .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
+        let result = crate::handlers::tool_search::handle_tool_search_with_profile(
+            &call_params.arguments,
+            config.allowed_tools.as_ref(),
+        )
+        .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
         let enveloped =
             envelope::finalize_bounded(result, Envelope::daemon(), &call_params.name, &budget);
         return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
     }
 
-    // `kin_mutate` is expanded here rather than forwarded, and that is a
-    // correctness requirement rather than an optimisation.
-    //
-    // Everything below this point is handed to the daemon under the name the
-    // caller used, and the daemon runs what arrives through
-    // `handlers::handle_tool_call` with `SessionAuthorityMode::OfflineFallback`,
-    // because inside the daemon its own registry IS the authority. A forwarded
-    // `kin_mutate` therefore reaches `handle_mutate` with `uses_daemon()` FALSE
-    // and takes the in-process branch, whose commit has no projection and
-    // correctly refuses a source body rather than reporting a success that
-    // discarded it. And the daemon routes exactly one name,
-    // `kin_transaction_commit`, to its exact-commit path, so a one-shot under
-    // any other name never reaches it at all.
-    //
-    // Expanding on this side sends a begin and a commit under the names the
-    // daemon matches, with the operations inline on the commit, which
-    // `kin_transaction_commit` has always accepted, and with a
-    // `transaction_id`, which is what the daemon's transaction coordination
-    // preflight keys on. A one-shot expanded on the far side would have had
-    // neither.
+    // The one-shot adapter preserves the existing unkeyed begin/commit path.
+    // Keyed requests travel intact under a versioned internal name so an old
+    // daemon refuses the durable contract before any transaction is started.
     if call_params.name == "kin_mutate" {
         let result = crate::handlers::sessions::mutate_through_daemon(&call_params.arguments)
             .await
@@ -2604,6 +2599,75 @@ mod tests {
         let resp = process_daemon_message(msg, &config).await.unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_profile_eligibility_without_activating_tools() {
+        for daemon_route in [false, true] {
+            for filtered in [false, true] {
+                let config = McpServerConfig {
+                    allowed_tools: filtered
+                        .then(|| crate::tools::name_set(crate::tools::agent_search_tool_names())),
+                    agent_belt: filtered,
+                    session_authority_mode: SessionAuthorityMode::OfflineFallback,
+                    ..McpServerConfig::default()
+                };
+                let store = InMemoryGraph::default();
+                let sessions = SessionRegistry::new();
+                let before = handle_tools_list(Some(serde_json::json!(1)), &config);
+                let listed = before.result.as_ref().unwrap()["tools"].as_array().unwrap();
+                let search_description = listed
+                    .iter()
+                    .find(|tool| tool["name"] == "kin_tool_search")
+                    .unwrap()["description"]
+                    .as_str()
+                    .unwrap();
+                assert!(search_description.contains("Discovery does not"));
+                assert!(!search_description.contains("callable definition"));
+                for tool in listed {
+                    assert!(!tool["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("then call it on the next turn"));
+                }
+                let search = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kin_tool_search","arguments":{"need":"impact_analysis","limit":1}}}"#;
+                let response = if daemon_route {
+                    process_daemon_message(search, &config).await
+                } else {
+                    process_message(search, &store, &config, &sessions).await
+                }
+                .expect("search response");
+                let result = response.result.expect("search result");
+                let payload: serde_json::Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().expect("JSON text"))
+                        .unwrap();
+                assert_eq!(payload["matches"][0]["name"], "impact_analysis");
+                assert_eq!(
+                    payload["invocation"]["profile_enabled"]["impact_analysis"],
+                    !filtered
+                );
+                assert_eq!(payload["invocation"]["discovery_changes_profile"], false);
+                assert_eq!(payload["invocation"]["normal_authorization_required"], true);
+                let after = handle_tools_list(Some(serde_json::json!(3)), &config);
+                assert_eq!(before.result, after.result);
+
+                if filtered {
+                    let invoke = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"impact_analysis","arguments":{}}}"#;
+                    let response = if daemon_route {
+                        process_daemon_message(invoke, &config).await
+                    } else {
+                        process_message(invoke, &store, &config, &sessions).await
+                    }
+                    .unwrap();
+                    let result = response.result.unwrap();
+                    assert_eq!(result["isError"], true);
+                    assert!(result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("not enabled in this MCP profile"));
+                }
+            }
+        }
     }
 
     /// The tool registry is answered by this binary on the daemon route, from

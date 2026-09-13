@@ -23,6 +23,8 @@ pub struct AssistantSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpMutationPayload {
+    /// Exact caller-read expectation. Only the daemon can enforce and publish it.
+    EntitySourceBase(crate::source_base::EntitySourceBase),
     Entity(kin_model::Entity),
     Relation {
         from: kin_model::ids::EntityId,
@@ -721,6 +723,17 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
         return Some("missing payload".to_string());
     };
     match payload {
+        McpMutationPayload::EntitySourceBase(base) => {
+            if !matches!(verb.as_str(), "update" | "modify")
+                || op.target != base.entity_id.to_string()
+                || op.body.as_deref().is_none_or(|body| body.trim().is_empty())
+                || op.destination.is_some()
+            {
+                Some("EntitySourceBase requires update/modify, its exact entity UUID as target, a full nonempty body, and no destination".into())
+            } else {
+                base.validate().err()
+            }
+        }
         // Every entity verb but relocation maps to an entity delta
         // (add/modify/remove). A relocation is a statement about a file, and an
         // entity payload cannot carry one: moving a single entity out of the
@@ -777,6 +790,9 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
 /// discovers the contract by looping on retries; naming the full schema once
 /// ends the loop on the first refusal.
 pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one of:\n  \
+     - a guarded entity source edit: {\"verb\": \"update\", \"target\": \"<entity uuid>\", \
+     \"payload\": {\"EntitySourceBase\": <source_base from get_entity_source>}, \
+     \"body\": \"<full new source text>\", \"description\": \"<why>\"}\n  \
      - an entity source edit: {\"verb\": \"update\", \"target\": \"<entity uuid or exact name>\", \
      \"body\": \"<the entity's full new source text>\", \"description\": \"<why>\"}\n  \
      - an entity payload edit: {\"verb\": \"update\", \"target\": \"<entity uuid>\", \

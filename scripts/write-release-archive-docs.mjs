@@ -116,7 +116,7 @@ Then, in a repository:
     kin init
     kin status
 
-\`kin --help\` is a complete command index and ends with a "Start here" block.
+\`kin --help\` starts with first-use guidance and groups the complete command index by task.
 
 ## Verifying these bytes
 

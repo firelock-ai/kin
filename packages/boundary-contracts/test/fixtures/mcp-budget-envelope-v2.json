@@ -1,0 +1,14 @@
+{
+  "envelope_version": 2,
+  "runtime": "repo-daemon",
+  "degraded": {},
+  "response": {
+    "max_chars": 8000,
+    "chars_before_budget": 9200,
+    "chars_after_budget": 7980,
+    "bounded": true,
+    "compact": true,
+    "primary_collection": "entities",
+    "primary_rows": 4
+  }
+}

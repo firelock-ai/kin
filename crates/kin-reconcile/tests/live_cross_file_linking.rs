@@ -412,6 +412,59 @@ fn deleting_a_call_site_removes_only_that_edge() {
 }
 
 #[test]
+fn moving_a_cross_file_call_into_a_wrapper_retires_its_former_source() {
+    let mut repo = LiveRepo::new();
+    repo.commit("parsing.py", PARSING);
+    repo.commit("storage.py", STORAGE);
+    let callee = repo.entity("parsing.py", "parse_note");
+    let original = repo.entity("storage.py", "save_note");
+    assert!(repo.call_edge(original, callee).is_some());
+
+    repo.commit(
+        "storage.py",
+        "from parsing import parse_note\n\n\
+         def save_note(raw):\n    return _validate(raw)\n\n\
+         def _validate(raw):\n    return parse_note(raw)\n",
+    );
+    assert_eq!(repo.entity("storage.py", "save_note"), original);
+    let wrapper = repo.entity("storage.py", "_validate");
+    assert!(repo.call_edge(original, wrapper).is_some());
+    assert_eq!(
+        repo.callers_of(callee),
+        vec![wrapper],
+        "the wrapper's reference cannot preserve a removed call from another entity"
+    );
+}
+
+#[test]
+fn requests_shaped_wrapper_retires_only_its_old_direct_call() {
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "utils.py",
+        "def check_header_validity(header):\n    return header\n",
+    );
+    let original_source = "from utils import check_header_validity\n\nclass PreparedRequest:\n    def prepare_headers(self, headers):\n        for header in headers.items():\n            check_header_validity(header)\n\n    def other(self, dispatch):\n        return dispatch['dynamic']()\n\nAT_MODULE = object()\n";
+    repo.commit("models.py", original_source);
+    let caller = repo.entity("models.py", "PreparedRequest.prepare_headers");
+    let target = repo.entity("utils.py", "check_header_validity");
+    assert!(repo.call_edge(caller, target).is_some());
+    let changed = original_source.replace(
+        "            check_header_validity(header)",
+        "            _wrapper(header)",
+    ) + "\ndef _wrapper(header):\n    return check_header_validity(header)\n";
+    repo.commit("models.py", &changed);
+    assert_eq!(
+        repo.entity("models.py", "PreparedRequest.prepare_headers"),
+        caller
+    );
+    let wrapper = repo.entity("models.py", "_wrapper");
+    assert!(repo.call_edge(caller, wrapper).is_some());
+    assert_eq!(repo.callers_of(target), vec![wrapper]);
+    repo.commit("models.py", original_source);
+    assert_eq!(repo.callers_of(target), vec![caller]);
+}
+
+#[test]
 fn deleting_the_import_retires_its_artifact_edge() {
     let mut repo = LiveRepo::new();
     repo.commit("parsing.py", PARSING);
