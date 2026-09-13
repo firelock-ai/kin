@@ -1,0 +1,75 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "kin.entity.draft.capabilities.v1"
+    },
+    "durable_save_supported": {
+      "type": "boolean"
+    },
+    "apply_supported": {
+      "type": "boolean"
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "body_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "drafts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revisions": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "body_bytes",
+        "total_bytes",
+        "drafts",
+        "revisions"
+      ],
+      "additionalProperties": false
+    },
+    "refusal": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "required": [
+    "schema",
+    "durable_save_supported",
+    "apply_supported",
+    "limits",
+    "refusal"
+  ],
+  "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Durable draft capabilities v1"
+}

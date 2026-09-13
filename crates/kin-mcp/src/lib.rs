@@ -6,6 +6,7 @@ pub mod budget;
 pub mod caller_arrival;
 pub mod daemon_delegate;
 pub mod edge_coverage;
+pub mod entity_drafts;
 pub mod envelope;
 pub mod error;
 pub mod handlers;

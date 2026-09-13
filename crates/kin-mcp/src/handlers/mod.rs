@@ -125,6 +125,12 @@ async fn dispatch_tool_call<G: GraphStore>(
     host: Option<&WorkingCopyProbe>,
 ) -> Result<ToolCallResult> {
     match tool_name {
+        "kin_draft_apply"
+        | "kin_draft_capabilities"
+        | "kin_draft_create"
+        | "kin_draft_save"
+        | "kin_draft_read"
+        | "kin_draft_list" => crate::entity_drafts::forward(tool_name, arguments).await,
         // Exact repository membership and bytes
         "kin_artifact_list" => {
             artifacts::handle_artifact_list(arguments, store, repository_authority)

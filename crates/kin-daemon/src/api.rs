@@ -14935,6 +14935,23 @@ async fn mcp_tools_call(
     // dispatcher, the budget shape and the negative spec all stay keyed on the
     // registered name. Every other name passes through.
     kin_mcp::agent_belt::canonicalize_tool_name(&mut request.name);
+    if kin_mcp::entity_drafts::is_tool(&request.name) {
+        // daemon_auth already classified this non-public route once. Read the
+        // enforcement state without spending another token-rotation accept;
+        // draft ownership does not depend on a transient session lease.
+        let authenticated = tokens.is_enforced();
+        if request.name == "kin_draft_apply" {
+            return crate::entity_drafts::apply(state, request.arguments, authenticated)
+                .await
+                .map(Json);
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            crate::entity_drafts::call(&state, &request.name, &request.arguments, authenticated)
+        })
+        .await
+        .map_err(internal_error)?;
+        return Ok(Json(result));
+    }
     // Bound the WORK before the call runs, and record what was cut so the
     // answer can say so. Applied after canonicalization, because the clamps are
     // keyed on the registered tool name like everything else on this route.
@@ -45495,6 +45512,9 @@ mod tests {
     include!("api/tests/mcp_mutate_durability.rs");
     include!("api/tests/mcp_source_base.rs");
     include!("api/tests/mcp_mutate_source_base.rs");
+    #[cfg(unix)]
+    include!("api/tests/entity_drafts.rs");
+    include!("api/tests/entity_draft_platform.rs");
 
     #[tokio::test]
     async fn mcp_transaction_stage_unknown_id_still_fails() {

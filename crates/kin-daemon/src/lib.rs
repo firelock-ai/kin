@@ -120,6 +120,7 @@ pub mod background_work;
 pub mod commit_deltas;
 pub mod commit_liveness;
 pub mod daemon;
+mod entity_drafts;
 pub mod error;
 pub mod gcs_endpoint;
 pub mod graph_only_members;
