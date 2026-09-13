@@ -15,6 +15,7 @@ pub mod query_tokens;
 pub mod remediation;
 pub mod server;
 pub mod session;
+pub mod source_base;
 pub mod startup_binding;
 pub mod tools;
 pub mod types;

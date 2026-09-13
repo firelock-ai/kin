@@ -62,6 +62,8 @@ pub struct GraphCommandResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphSourceRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_base: Option<kin_mcp::source_base::EntitySourceBase>,
     pub id: String,
     pub name: String,
     pub kind: String,
@@ -1733,6 +1735,26 @@ pub fn build_entity_source_outcome(
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<EntitySourceOutcome> {
+    build_entity_source_outcome_for_view(repository_authority, graph, entity_query, false)
+}
+
+/// A complete single-entity read whose caller already selected the current
+/// HEAD graph. Do not use for historical/session graphs, batches or excerpts.
+/// The caller must carry the graph and its view from the same scope sample.
+pub fn build_current_entity_source_outcome(
+    repository_authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    entity_query: &str,
+) -> Result<EntitySourceOutcome> {
+    build_entity_source_outcome_for_view(repository_authority, graph, entity_query, true)
+}
+
+fn build_entity_source_outcome_for_view(
+    repository_authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    entity_query: &str,
+    mint_current_source_base: bool,
+) -> Result<EntitySourceOutcome> {
     let entity = match resolve_source_entity(graph, entity_query)? {
         Some(e) => e,
         None => {
@@ -1741,7 +1763,12 @@ pub fn build_entity_source_outcome(
             ));
         }
     };
-    entity_source_outcome(repository_authority, graph, &entity)
+    entity_source_outcome(
+        repository_authority,
+        graph,
+        &entity,
+        mint_current_source_base,
+    )
 }
 
 /// The source outcome for an entity the caller already resolved.
@@ -1749,6 +1776,7 @@ fn entity_source_outcome(
     repository_authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     entity: &Entity,
+    mint_current_source_base: bool,
 ) -> Result<EntitySourceOutcome> {
     // A structurally sourceless entity (no file origin or no span) is a valid ID
     // with nothing to return, reported as `NoSource` rather than as the genuine
@@ -1766,7 +1794,12 @@ fn entity_source_outcome(
         )));
     }
 
-    let record = graph_source_record(repository_authority, graph, entity)?;
+    let record = graph_source_record(
+        repository_authority,
+        graph,
+        entity,
+        mint_current_source_base,
+    )?;
     Ok(EntitySourceOutcome::Found(record))
 }
 
@@ -1804,7 +1837,7 @@ pub fn build_graph_source_response(
         });
     }
     let outcome = match resolution.chosen() {
-        Some(entity) => entity_source_outcome(repository_authority, graph, entity)?,
+        Some(entity) => entity_source_outcome(repository_authority, graph, entity, false)?,
         None => EntitySourceOutcome::NotFound(entity_source_not_found_message(entity_query)),
     };
     let choice = crate::entity_identity::choice_note(
@@ -1907,10 +1940,32 @@ fn graph_source_record(
     repository_authority: &super::repository_authority::RequestRepositoryAuthority,
     _graph: &kin_db::InMemoryGraph,
     entity: &Entity,
+    mint_current_source_base: bool,
 ) -> Result<GraphSourceRecord> {
     let authority = repository_authority.open()?;
     let workspace = authority.workspace()?;
-    graph_source_record_from(&authority, &workspace, entity)
+    let mut record = graph_source_record_from(&authority, &workspace, entity)?;
+    if mint_current_source_base && record.span_coherence == "digest_verified" {
+        let path = kin_model::RepoPath::from_utf8(record.file_path.clone())?;
+        let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
+            anyhow::anyhow!("source base artifact is absent from the sampled workspace")
+        })?;
+        if let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry {
+            let context = kin_mcp::source_base::SourceBaseContext::from_workspace(&workspace)
+                .map_err(anyhow::Error::msg)?;
+            record.source_base = Some(
+                kin_mcp::source_base::EntitySourceBase::from_exact_body(
+                    context,
+                    entity,
+                    artifact.artifact_id,
+                    hash,
+                    &record.body,
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+        }
+    }
+    Ok(record)
 }
 
 /// Build an entity's source record through an authority the caller already
@@ -1986,6 +2041,7 @@ pub(crate) fn graph_source_record_bounded_from(
     let body = body.to_string();
     let (start_line, end_line) = presentation_span_lines(span);
     Ok(Some(GraphSourceRecord {
+        source_base: None,
         id: entity.id.to_string(),
         name: entity.name.clone(),
         kind: format!("{:?}", entity.kind),
@@ -5075,9 +5131,22 @@ mod tests {
         match build_entity_source_outcome(&fixture.authority(), &fixture.graph, &id.to_string())
             .unwrap()
         {
-            EntitySourceOutcome::Found(record) => assert_eq!(record.body, body),
+            EntitySourceOutcome::Found(record) => {
+                assert_eq!(record.body, body);
+                assert!(
+                    record.source_base.is_none(),
+                    "an unqualified graph read cannot mint a writable base"
+                );
+            }
             other => panic!("expected Found, got {other:?}"),
         }
+        let cli =
+            build_graph_source_response(&fixture.authority(), &fixture.graph, &id.to_string())
+                .unwrap();
+        assert!(
+            cli.source.unwrap().source_base.is_none(),
+            "CLI source reads may name historical graphs"
+        );
     }
 
     #[test]

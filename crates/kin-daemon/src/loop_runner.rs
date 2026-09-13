@@ -3056,7 +3056,7 @@ fn mark_enrichment_unpublished(state: &DaemonState, file_id: &FilePathId) {
 }
 
 /// Read the marker one previous daemon left, decide each entry against graph
-/// truth, and return host events for the paths whose entities did not survive.
+/// truth, and return canonical paths whose entities did not survive.
 ///
 /// Every entry is checked rather than trusted. A path whose entities a commit
 /// published is resolved and dropped; only a path the graph holds no entity for
@@ -3066,10 +3066,10 @@ fn mark_enrichment_unpublished(state: &DaemonState, file_id: &FilePathId) {
 /// daemon resolves every entry and re-derives none.
 ///
 /// The file is rewritten with what is still owed, so a marker cannot grow
-/// without bound across restarts, and it is rewritten before the events are
+/// without bound across restarts, and it is rewritten before the paths are
 /// returned so a daemon that dies mid-repair does not lose the record of what
 /// it still owed.
-fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<FileEvent>> {
+fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<RepoPath>> {
     use kin_model::EntityStore;
 
     let marker = unpublished_enrichment_marker_path(state);
@@ -3094,9 +3094,8 @@ fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<FileEve
         .into_iter()
         .filter_map(|entity| entity.file_origin)
         .collect();
-    let working_dir = state.layout.working_dir();
     let mut still_owed = Vec::new();
-    let mut events = Vec::new();
+    let mut paths = Vec::new();
     for path in marked {
         let file_id = FilePathId::new(&path);
         if held.contains(&file_id) {
@@ -3111,11 +3110,8 @@ fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<FileEve
         if state.graph.artifact_id_at_path(&repo_path).is_none() {
             continue;
         }
-        let Ok(host_path) = kin_index::host_path_from_repo_path(working_dir, &repo_path) else {
-            continue;
-        };
         still_owed.push(path);
-        events.push(FileEvent::Changed(host_path));
+        paths.push(repo_path);
     }
 
     if let Ok(mut set) = state.unpublished_enrichment.lock() {
@@ -3129,7 +3125,7 @@ fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<FileEve
         }
         Err(error) => debug!(error = %error, "could not encode the unpublished-enrichment marker"),
     }
-    Ok(events)
+    Ok(paths)
 }
 
 /// What one layout backfill pass observed and published.
@@ -3152,9 +3148,9 @@ pub(crate) struct LayoutBackfill {
     /// the tree holds: published as `Partial` rather than `Full`, and owed a
     /// re-derivation. Counted inside `published`.
     pub(crate) stale: usize,
-    /// The host paths whose entities are owed a re-derivation, for the loop to
-    /// enqueue as ordinary `Changed` events.
-    pub(crate) rederive: Vec<PathBuf>,
+    /// Repository paths whose canonical source bytes need semantic re-derivation.
+    /// These are not host observations and must never enqueue filesystem admission.
+    pub(crate) rederive: Vec<RepoPath>,
 }
 
 impl LayoutBackfill {
@@ -3339,17 +3335,13 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
         // nothing else about the store says so (FIR-3201, the restart window of
         // FIR-3208). Publishing `Full` here would certify those spans over
         // bytes they do not describe. The observation is recorded as partial,
-        // with the count, and the path is handed back to the loop as an
-        // ordinary host event so the reconciler re-derives it through the same
-        // bounded admission an edit takes.
+        // with the count, and the repository path is handed back for canonical
+        // re-derivation. A synthetic repair is not a host edit: routing it through
+        // admission could retire a graph-owned artifact whose projection is absent.
         let stale = spans_a_fresh_parse_does_not_reproduce(&entities, &indexed.entities);
         let missing = spans_a_fresh_parse_does_not_reproduce(&indexed.entities, &entities);
         if stale > 0 || missing > 0 {
-            if let Ok(host_path) =
-                kin_index::host_path_from_repo_path(state.layout.working_dir(), &artifact.path)
-            {
-                report.rederive.push(host_path);
-            }
+            report.rederive.push(artifact.path.clone());
             report.stale += 1;
             completeness = ParseCompleteness::Partial(format!(
                 "{stale} of {} entity span(s) the graph holds for this file were not derived from \
@@ -3375,6 +3367,148 @@ pub async fn run_loop(
     run_loop_armed(state, config, cancel, None).await
 }
 
+/// Repair derived semantics from the canonical tree and CAS, without observing
+/// or admitting host paths. The caller owns local repository authority; remote
+/// backend daemons must retain their existing graph-only write boundary.
+async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()> {
+    let mut failures = Vec::new();
+    {
+        // Under the gate every other graph-authority mutation takes,
+        // including the watcher tick, commit and checkout. The drain applies
+        // entity transactions to the live graph, and a mutation outside
+        // the gate can interleave with a commit planning its change from
+        // that same graph.
+        let _coordination = state.coordination_gate.lock().await;
+        if let Err(error) = drain_semantic_debt(state).await {
+            failures.push(error.to_string());
+            warn!(
+                error = %error,
+                "a path whose bytes reached authority without a parse could not be re-parsed \
+                 at startup, so it still answers at the positions its previous bytes held"
+            );
+        }
+    }
+
+    {
+        let _coordination = state.coordination_gate.lock().await;
+        match plan_unpublished_enrichment_repair(state) {
+            Ok(paths) if paths.is_empty() => {
+                debug!("no path is owed a re-derivation from a previous daemon");
+            }
+            Ok(paths) => {
+                warn!(
+                    count = paths.len(),
+                    "a previous daemon derived entities for these paths and ended before a \
+                     commit published them, so nothing can query them; re-deriving them now"
+                );
+                let repaired =
+                    readmit_semantics_for_paths(state, &paths.into_iter().collect()).await;
+                if !repaired.failed.is_empty() {
+                    failures.extend(
+                        repaired
+                            .failed
+                            .iter()
+                            .filter(|failure| !failure.unparseable)
+                            .map(|failure| {
+                                format!("unpublished enrichment repair failed for {}", failure.path)
+                            }),
+                    );
+                    warn!(failed = repaired.failed.len(), "canonical unpublished-enrichment repair remains incomplete; no host admission was scheduled");
+                }
+            }
+            Err(error) => {
+                failures.push(error.to_string());
+                warn!(
+                    error = %error,
+                    "could not plan the unpublished-enrichment repair, so a path missing its \
+                     entities stays unqueryable until it is edited"
+                );
+            }
+        }
+    }
+
+    {
+        let _coordination = state.coordination_gate.lock().await;
+        let report = backfill_missing_file_layouts(state);
+        if let Ok(report) = &report {
+            if report.unreadable > 0 {
+                let message = format!(
+                    "{} admitted source file(s) have no readable canonical parse observation",
+                    report.unreadable
+                );
+                warn!(%message, "canonical layout backfill remains incomplete");
+                failures.push(message);
+            }
+        }
+        match report {
+            Ok(report) if report.published == 0 => {
+                debug!(
+                    observed = report.observed(),
+                    already_published = report.already_published,
+                    unreadable = report.unreadable,
+                    other_facet = report.other_facet,
+                    "every admitted source file already carries its parse observation"
+                );
+            }
+            Ok(report) => {
+                info!(
+                    published = report.published,
+                    already_published = report.already_published,
+                    unreadable = report.unreadable,
+                    other_facet = report.other_facet,
+                    stale = report.stale,
+                    observed = report.observed(),
+                    "published the per-file parse observation for admitted source files that \
+                     carried none, so an enumeration over them can be certified"
+                );
+                if !report.rederive.is_empty() {
+                    warn!(
+                        count = report.rederive.len(),
+                        "these paths hold entity spans that disagree with a fresh parse of \
+                         the tree's bytes; \
+                         their parse observation was published as partial and they are being \
+                         re-derived"
+                    );
+                    let paths = report.rederive.into_iter().collect();
+                    let repaired = readmit_semantics_for_paths(state, &paths).await;
+                    if !repaired.failed.is_empty() {
+                        failures.extend(
+                            repaired
+                                .failed
+                                .iter()
+                                .filter(|failure| !failure.unparseable)
+                                .map(|failure| {
+                                    format!("canonical layout repair failed for {}", failure.path)
+                                }),
+                        );
+                        warn!(
+                            failed = repaired.failed.len(),
+                            "canonical semantic backfill remains incomplete; no host admission was scheduled"
+                        );
+                    }
+                }
+                state.bump_version();
+            }
+            Err(error) => {
+                failures.push(error.to_string());
+                warn!(
+                    error = %error,
+                    "could not publish per-file parse observations, so `list_file_entities` \
+                     cannot certify an enumeration on this store"
+                );
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(DaemonError::SemanticReadmissionFailed(format!(
+            "local canonical startup repair is incomplete: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
 /// Run the loop and report when its file watcher has acknowledged callback delivery.
 ///
 /// The daemon publishes `.kin/daemon.port` only after this fires, so a client
@@ -3396,10 +3530,28 @@ pub async fn run_loop_armed(
     if state.filesystem_reconcile_disabled() {
         info!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
-            "filesystem watcher and reconciliation loop disabled; remote graph remains authoritative"
+            "filesystem watcher and host admission disabled; canonical graph remains authoritative"
         );
-        drop(armed.take());
+        // Disabling a local projection does not disable repair from its own
+        // canonical bytes. A storage backend, however, owns a remote graph:
+        // this loop must not acquire new write authority over it.
         let mut cancel = cancel;
+        if state.storage_backend.is_none() && !*cancel.borrow() {
+            // Readiness waits for canonical repair, never host observation.
+            // Async suspension happens at coordination/reconciler lock waits;
+            // cancellation cannot interrupt a synchronous graph transaction.
+            let repair = tokio::select! {
+                result = repair_canonical_semantics_at_startup(&state) => result,
+                _ = cancel.changed() => return Ok(()),
+            };
+            if let Err(error) = repair {
+                if let Some(armed) = armed.as_mut() {
+                    armed.fail(error.to_string());
+                }
+                return Err(error);
+            }
+        }
+        drop(armed.take());
         while !*cancel.borrow() {
             if cancel.changed().await.is_err() {
                 break;
@@ -3446,21 +3598,10 @@ pub async fn run_loop_armed(
     // publication, and a client finding the port is never waiting on a
     // traversal.
     let mut catch_up_owed = startup_catch_up_window(&state);
-    // Owed once per daemon life, and independent of the catch-up window: the
-    // paths it recovers are exactly the ones whose host modification time puts
-    // them outside that window, which is why the window cannot see them.
-    // The semantic debt one previous daemon left, owed once per daemon life and
-    // before this loop answers anything. A path whose bytes reached authority
-    // without a parse is a wrong answer this daemon is able to know about, and
-    // waiting for the next commit to drain it would serve the previous parse to
-    // every query in between.
-    let mut semantic_debt_drain_owed = true;
-    let mut enrichment_repair_owed = true;
-    // Owed once per daemon life for the same reason and on the same schedule:
-    // a store converted from Git carries entities whose parse observation was
-    // computed at import and never published, so every file answers
-    // `certifies_enumeration: false` until this runs.
-    let mut layout_backfill_owed = true;
+    // Canonical repair is independent of host catch-up and runs once per
+    // daemon life. It pays semantic debt, restores unpublished enrichment,
+    // and backfills parse observations from admitted bytes only.
+    let mut canonical_repair_owed = true;
     if let Some(armed) = armed.as_mut() {
         armed.arm();
     }
@@ -3634,106 +3775,11 @@ pub async fn run_loop_armed(
             }
         }
 
-        // The unpublished-enrichment repair, owed once per daemon life. A
-        // previous daemon recorded the paths it derived entities for; this
-        // checks each against graph truth and re-derives only the ones whose
-        // entities did not survive, which is the exact shape of the FIR-2606
-        // wedge. Loud when it finds anything: a file admitted with no entities
-        // answered every query as an absence, and a store that has been in that
-        // state deserves the count said out loud rather than repaired in
-        // silence.
-        if semantic_debt_drain_owed {
-            semantic_debt_drain_owed = false;
-            // Under the gate every other graph-authority mutation takes,
-            // including the tick below, commit and checkout. The drain applies
-            // entity transactions to the live graph, and a mutation outside
-            // the gate can interleave with a commit planning its change from
-            // that same graph.
-            let _coordination = state.coordination_gate.lock().await;
-            if let Err(error) = drain_semantic_debt(&state).await {
-                warn!(
-                    error = %error,
-                    "a path whose bytes reached authority without a parse could not be re-parsed \
-                     at startup, so it still answers at the positions its previous bytes held"
-                );
-            }
-        }
-
-        if enrichment_repair_owed {
-            enrichment_repair_owed = false;
-            match plan_unpublished_enrichment_repair(&state) {
-                Ok(events) if events.is_empty() => {
-                    debug!("no path is owed a re-derivation from a previous daemon");
-                }
-                Ok(events) => {
-                    warn!(
-                        count = events.len(),
-                        "a previous daemon derived entities for these paths and ended before a \
-                         commit published them, so nothing can query them; re-deriving them now"
-                    );
-                    enqueue_file_events(&mut pending_events, events);
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "could not plan the unpublished-enrichment repair, so a path missing its \
-                         entities stays unqueryable until it is edited"
-                    );
-                }
-            }
-        }
-
-        // The per-file parse observation, owed once per daemon life. A store
-        // built by `kin commit` publishes its layouts as it goes and this pass
-        // finds nothing to do; a store converted from Git has none at all, and
-        // without them `list_file_entities` cannot tell a file an adapter read
-        // completely from one it failed on from one it never looked at.
-        if layout_backfill_owed {
-            layout_backfill_owed = false;
-            match backfill_missing_file_layouts(&state) {
-                Ok(report) if report.published == 0 => {
-                    debug!(
-                        observed = report.observed(),
-                        already_published = report.already_published,
-                        unreadable = report.unreadable,
-                        other_facet = report.other_facet,
-                        "every admitted source file already carries its parse observation"
-                    );
-                }
-                Ok(report) => {
-                    info!(
-                        published = report.published,
-                        already_published = report.already_published,
-                        unreadable = report.unreadable,
-                        other_facet = report.other_facet,
-                        stale = report.stale,
-                        observed = report.observed(),
-                        "published the per-file parse observation for admitted source files that \
-                         carried none, so an enumeration over them can be certified"
-                    );
-                    if !report.rederive.is_empty() {
-                        warn!(
-                            count = report.rederive.len(),
-                            "these paths hold entity spans that disagree with a fresh parse of \
-                             the tree's bytes; \
-                             their parse observation was published as partial and they are being \
-                             re-derived"
-                        );
-                        enqueue_file_events(
-                            &mut pending_events,
-                            report.rederive.into_iter().map(FileEvent::Changed),
-                        );
-                    }
-                    state.bump_version();
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "could not publish per-file parse observations, so `list_file_entities` \
-                         cannot certify an enumeration on this store"
-                    );
-                }
-            }
+        if canonical_repair_owed {
+            canonical_repair_owed = false;
+            // A watched daemon keeps serving explicit graph gaps and can
+            // retry through its existing admission/commit seams.
+            let _ = repair_canonical_semantics_at_startup(&state).await;
         }
 
         // Collect retries first and real watcher notifications second. Dedup once per tick,
@@ -4878,6 +4924,7 @@ mod tests {
     include!("loop_runner/tests/enrichment_churn.rs");
     include!("loop_runner/tests/authority_split.rs");
     include!("loop_runner/tests/admission_worker.rs");
+    include!("loop_runner/tests/graph_only_repair.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
@@ -5531,7 +5578,7 @@ mod tests {
         assert_eq!(report.stale, 1, "{report:?}");
         assert_eq!(report.rederive.len(), 1, "{report:?}");
         assert!(
-            report.rederive[0].ends_with(stale_path),
+            report.rederive[0].as_utf8() == Some(stale_path),
             "the owed re-derivation names the stale path: {report:?}"
         );
 
@@ -6287,6 +6334,210 @@ mod tests {
             "a startup drain pays the parse in the derived graph and leaves the record for the \
              commit that makes it durable"
         );
+    }
+
+    fn copy_canonical_test_store(source: &Path, destination: &Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_canonical_test_store(&entry.path(), &target);
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    async fn assert_canonical_startup_repair_without_projection(marked: bool, graph_only: bool) {
+        let original = tempfile::tempdir().unwrap();
+        let state = open_test_state(&original);
+        let path = "stranded.rs";
+        let content = b"// canonical body\npub fn stranded() -> u32 { 7 }\n";
+        std::fs::write(original.path().join(path), content).unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        // Retained stores predating the debt record recover through the marker
+        // or the missing-layout planner, which this pair tests independently.
+        startup_diagnostic_legacy_without_debt(&state);
+        if marked {
+            mark_enrichment_unpublished(&state, &FilePathId::new(path));
+        }
+        let expected_tree = state.graph.resolved_tree();
+        drop(state);
+        // The watched directory never held the source projection. A real
+        // deletion notification from fixture setup cannot masquerade as repair.
+        let repo = tempfile::tempdir().unwrap();
+        copy_canonical_test_store(&original.path().join(".kin"), &repo.path().join(".kin"));
+        let state = Arc::new(
+            DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap(),
+        );
+        state
+            .filesystem_reconcile_disabled
+            .store(graph_only, Ordering::Relaxed);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        let host = repo.path().join(path);
+        assert!(!host.exists());
+        assert_eq!(state.graph.resolved_tree(), expected_tree);
+        assert_eq!(state.graph.entity_count(), 0);
+        assert!(crate::semantic_debt::outstanding(&state).is_empty());
+        assert_eq!(unpublished_enrichment_marker_path(&state).exists(), marked);
+        assert!(state
+            .graph
+            .get_file_layout(&FilePathId::new(path))
+            .unwrap()
+            .is_none());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut runner = tokio::spawn(run_loop(
+            Arc::clone(&state),
+            LoopConfig::default(),
+            cancel_rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let repaired = loop {
+            let entities = state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(FilePathId::new(path)),
+                    ..Default::default()
+                })
+                .unwrap();
+            if entities.iter().any(|e| {
+                e.name == "stranded"
+                    && e.metadata.extra["blob_hash"] == kin_blobs::digest(content).to_string()
+                    && e.span.as_ref().map(|s| s.start_line) == Some(1)
+            }) {
+                break true;
+            }
+            if state.graph.resolved_tree() != expected_tree
+                || runner.is_finished()
+                || Instant::now() >= deadline
+            {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), &mut runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.graph.resolved_tree(),
+            expected_tree,
+            "canonical startup repair must not admit projection absence as deletion"
+        );
+        assert!(
+            repaired,
+            "the canonical body must be parsed while its projection is absent"
+        );
+        assert!(
+            !host.exists(),
+            "repair must not recreate the host projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_semantic_repair_startup_backfill_preserves_withdrawn_artifact() {
+        assert_canonical_startup_repair_without_projection(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_semantic_repair_startup_recovers_missing_entities_without_projection() {
+        assert_canonical_startup_repair_without_projection(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_semantic_repair_keeps_missing_and_divergent_projections_out_of_admission() {
+        for missing in [true, false] {
+            let repo = tempfile::tempdir().unwrap();
+            let state = open_test_state(&repo);
+            let host = repo.path().join("canonical.rs");
+            std::fs::write(&host, b"pub fn canonical() -> u32 { 7 }\n").unwrap();
+            sync_filesystem_with_graph(&state).await.unwrap();
+            let file_id = FilePathId::new("canonical.rs");
+            let old = state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(file_id.clone()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "canonical")
+                .unwrap();
+            let current = b"// published\npub fn canonical() -> u32 { 8 }\n";
+            std::fs::write(&host, current).unwrap();
+            let admission =
+                exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+            crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(&admission.deltas));
+            let expected_tree = state.graph.resolved_tree();
+            if missing {
+                std::fs::remove_file(&host).unwrap();
+            } else {
+                std::fs::write(&host, b"pub fn unadmitted() -> u32 { 99 }\n").unwrap();
+            }
+            let _coordination = state.coordination_gate.lock().await;
+            drain_semantic_debt(&state).await.unwrap();
+            assert_eq!(
+                state.graph.resolved_tree(),
+                expected_tree,
+                "repair cannot admit host divergence"
+            );
+            let entity = state.graph.get_entity(&old.id).unwrap().unwrap();
+            assert_eq!(entity.name, "canonical");
+            assert_eq!(entity.span.as_ref().unwrap().start_line, 1);
+            assert_eq!(
+                entity.metadata.extra["blob_hash"],
+                kin_blobs::digest(current).to_string()
+            );
+            assert_eq!(
+                host.exists(),
+                !missing,
+                "repair cannot write the projection"
+            );
+            if !missing {
+                assert_eq!(
+                    std::fs::read(&host).unwrap(),
+                    b"pub fn unadmitted() -> u32 { 99 }\n"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_semantic_repair_refuses_a_tree_changed_while_waiting() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let host = repo.path().join("canonical.rs");
+        std::fs::write(&host, b"pub fn original() -> u32 { 1 }\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let lock = state.reconciler.write().await;
+        let paths = BTreeSet::from([RepoPath::from_utf8("canonical.rs").unwrap()]);
+        let mut repair = Box::pin(readmit_semantics_for_paths(&state, &paths));
+        // Poll until it captured the tree and is blocked on the reconciler.
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut repair)
+            .await
+            .is_err());
+        std::fs::write(&host, b"pub fn newer() -> u32 { 2 }\n").unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        let newer_tree = state.graph.resolved_tree();
+        drop(lock);
+        let result = repair.await;
+        assert_eq!(result.enriched, 0);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(state.graph.resolved_tree(), newer_tree);
+        // Actual host admission above stays authoritative; the old parse cannot
+        // apply after its captured artifact was replaced.
+        assert!(state
+            .graph
+            .query_entities(&EntityFilter {
+                name_pattern: Some("newer".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
     }
 
     /// FIR-2317: a background-work supervisor stop parks the reconciliation
@@ -10610,10 +10861,7 @@ mod tests {
 
         let named = owed
             .iter()
-            .map(|event| {
-                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
-                path.file_name().unwrap().to_string_lossy().to_string()
-            })
+            .map(|path| path.as_utf8().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(
             named,
@@ -11013,14 +11261,12 @@ impl SemanticFailure {
 /// after it. This is that half on its own, driven by a caller that already knows
 /// which paths its publication moved.
 ///
-/// Content comes from the body the exact tree names, and the host is re-read
-/// only to prove it still holds that same body, which is the same
-/// [`host_entry_matches_graph`] guard the admission's own enrichment uses: bytes
-/// written after a publication may not enrich against the tree that publication
-/// established. A path the graph no longer carries, a symlink, a Gitlink and a
-/// path with no UTF-8 rendering are skipped rather than failed. None of them is
-/// source owned by that path, and the exact tree already records what each one
-/// is.
+/// Content comes only from the immutable body the exact tree names. Callers hold
+/// `coordination_gate` across planning and application, and every entity delta
+/// rechecks that the captured artifact is still current before it applies. Host
+/// edits belong to a later filesystem observation and cannot supply this parse.
+/// A missing projection therefore cannot retire canonical membership. Symlinks,
+/// Gitlinks and paths without a UTF-8 rendering are not parsed as owned source.
 ///
 /// Failure is reported and never fatal here. Membership is durable before this
 /// runs and a parser may not retract it, which is the invariant stated beside
@@ -11044,6 +11290,12 @@ pub(crate) async fn readmit_semantics_for_paths(
         let Some(artifact) = tree.artifact_at_path(repo_path) else {
             continue;
         };
+        if state.graph.resolved_tree().artifact_at_path(repo_path) != Some(artifact) {
+            if let Some(file_id) = semantic_file_id(repo_path) {
+                outcome.failed.push(SemanticFailure::unresolved(file_id.0));
+            }
+            continue;
+        }
         // Symlinks and Gitlinks are never parsed as source owned by the link
         // path, which is the rule the layout backfill and the admission loop
         // both apply.
@@ -11121,36 +11373,25 @@ pub(crate) async fn readmit_semantics_for_paths(
             continue;
         }
 
-        // The host is consulted for identity only. A working copy that no longer
-        // holds the published body is a path some other writer has moved past,
-        // and enriching from it would publish facets against a tree entry this
-        // publication did not establish.
-        match host_entry_matches_graph(state, &host_path, repo_path) {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    file = %file_id,
-                    "the host entry no longer matches the body this path's exact tree entry \
-                     names, so its semantics were left for the admission that observes those \
-                     bytes"
-                );
-                outcome
-                    .failed
-                    .push(SemanticFailure::unresolved(file_id.0.clone()));
-                continue;
-            }
+        // The parser consumes the exact CAS body, not a second host read. The
+        // same partial/LKG policy still applies to syntactically incomplete bytes.
+        let indexed = match enrichment_pipeline
+            .index_file_content_with_tests(&file_id, &content, body_hash)
+        {
+            Ok(indexed) => indexed.indexed_file,
             Err(error) => {
-                warn!(
-                    file = %file_id,
-                    error = %error,
-                    "could not compare the host entry to graph authority before re-deriving \
-                     this path's semantics"
-                );
+                warn!(file = %file_id, %error, "canonical source could not be parsed");
                 outcome
                     .failed
                     .push(SemanticFailure::unresolved(file_id.0.clone()));
                 continue;
             }
+        };
+        if state.graph.resolved_tree().artifact_at_path(repo_path) != Some(artifact) {
+            outcome
+                .failed
+                .push(SemanticFailure::unresolved(file_id.0.clone()));
+            continue;
         }
 
         if let Err(error) =
@@ -11163,8 +11404,8 @@ pub(crate) async fn readmit_semantics_for_paths(
             );
         }
 
-        let event = FileEvent::Changed(host_path);
-        match reconciler.reconcile_file_change(&event, &state.blobs, state.graph.as_ref()) {
+        match reconciler.reconcile_indexed_observation(&indexed, &state.blobs, state.graph.as_ref())
+        {
             Ok(result) => {
                 let (reconciled, delta) = result.into_parts();
                 if matches!(
@@ -11208,6 +11449,12 @@ pub(crate) async fn readmit_semantics_for_paths(
                     continue;
                 }
                 {
+                    if state.graph.resolved_tree().artifact_at_path(repo_path) != Some(artifact) {
+                        outcome
+                            .failed
+                            .push(SemanticFailure::unresolved(file_id.0.clone()));
+                        continue;
+                    }
                     let derived_entities = !delta.entity_deltas.is_empty();
                     if let Err(error) = persist_partial_observation(&state.layout, &reconciled) {
                         warn!(%error, "partial admission retained all entities because coverage could not persist");
@@ -11457,8 +11704,15 @@ async fn sync_filesystem_with_graph_publishing_inner(
     if state.filesystem_reconcile_disabled() {
         debug!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
-            "filesystem sync skipped; remote graph remains authoritative"
+            "host filesystem sync skipped; canonical graph remains authoritative"
         );
+        if state.storage_backend.is_none() {
+            // The caller holds coordination_gate. Repair already admitted
+            // local bytes before a commit can settle their debt, without
+            // observing or admitting the absent/divergent host projection.
+            let _graph_mutation = state.begin_graph_authority_mutation();
+            drain_semantic_debt(state).await?;
+        }
         return Ok(());
     }
 

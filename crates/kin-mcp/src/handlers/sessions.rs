@@ -74,13 +74,23 @@ you sent: declaring nothing gets you what the store permits, and declaring less 
 keeps your own restriction. capability_policy names what decided each bit, so you can tell \
 a store permission (`store`) from your own self-limit (`client_declared`) from a bit Kin \
 checks nowhere today (`ungated`). Read can_write and can_commit before deciding a write is \
-forbidden; they now report false only when this store really refuses it.";
+forbidden; they now report false only when this store really refuses it. Supply the original \
+session_id UUID to re-register an absent daemon session before resuming an unpublished keyed \
+mutation after restart; an already registered UUID refuses and offline registration is unsupported.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
+    if args
+        .get("session_id")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Ok(ToolCallResult::error(
+            "session_id must be a UUID string when supplied",
+        ));
+    }
     let vendor = get_string_param(args, "vendor")?;
     let client_name = get_string_param(args, "client_name")?;
     let cwd_str = get_string_param(args, "cwd")?;
@@ -96,7 +106,8 @@ pub async fn handle_session_start(
     let capabilities = parse_capabilities(args);
 
     if session_authority_mode.uses_daemon() {
-        let daemon_result = crate::daemon_delegate::forward_session_start(
+        let daemon_result = crate::daemon_delegate::forward_session_start_with_id(
+            args.get("session_id").and_then(serde_json::Value::as_str),
             &vendor,
             &client_name,
             transport_str,
@@ -121,6 +132,9 @@ pub async fn handle_session_start(
         }
     }
 
+    if args.contains_key("session_id") {
+        return Ok(ToolCallResult::error("caller-allocated session_id registration requires an authenticated supporting daemon; offline registration cannot resume a durable keyed request"));
+    }
     // This surface accepts kin_transaction_commit, so a session that declared
     // nothing is not a read-only session and must not be reported as one. The
     // daemon resolves the same question against its store.
@@ -1028,6 +1042,14 @@ fn transaction_touched_scopes<G: GraphStore>(
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*from));
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*to));
             }
+            Some(McpMutationPayload::EntitySourceBase(base)) => {
+                push_scope_once(&mut scopes, kin_model::IntentScope::Entity(base.entity_id));
+                if let Ok(Some(entity)) = store.get_entity(&base.entity_id) {
+                    if let Some(file) = entity.file_origin {
+                        push_scope_once(&mut scopes, kin_model::IntentScope::Artifact(file));
+                    }
+                }
+            }
             Some(McpMutationPayload::Blob(_)) => {}
             None => {
                 if crate::session::is_target_body_update(operation) {
@@ -1332,6 +1354,11 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                         }
                     }
                 }
+                McpMutationPayload::EntitySourceBase(_) => {
+                    return Ok(ToolCallResult::error(
+                        "EntitySourceBase requires the exact daemon commit path",
+                    ));
+                }
                 McpMutationPayload::Blob(_) => {}
             }
         }
@@ -1441,9 +1468,7 @@ fn reject_truncated_bodies(operations: &[McpMutationOperation]) -> std::result::
 /// a request for a blank subject line. Absent, the commit records exactly what
 /// it recorded before this argument existed, so a caller that sends nothing
 /// sees no change at all.
-pub(super) fn commit_message_argument(
-    arguments: &HashMap<String, serde_json::Value>,
-) -> Option<String> {
+pub fn commit_message_argument(arguments: &HashMap<String, serde_json::Value>) -> Option<String> {
     let summary = arguments
         .get("summary")
         .and_then(serde_json::Value::as_str)?
@@ -1460,8 +1485,19 @@ recorded change message instead of the bare transaction line. On success returns
 receipt with status, ops_applied, change_id, and modified_files. Every refusal comes back as a \
 tool error you can read and retry from, never as a protocol fault: a malformed operations array, \
 a body Kin cut short, a failed validation and a refused commit all return the structured reason. \
-A commit that fails to land is aborted; if the abort cannot run because the daemon cannot be \
-reached, or is refused, the answer names the transaction left open.";
+Without request_id, a refused commit is aborted unless it reports source_base_conflict, which \
+retains the attempted operations. If abort cannot run, the answer names the transaction left open. \
+With request_id, an authenticated supporting daemon durably binds the \
+complete request to one transaction before execution. Retry with the same session_id, request_id \
+and arguments to recover the original receipt after a lost response or restart; changed arguments \
+refuse. Keyed success uses schema kin.mutate.receipt.v1 and original authoritative roots_before \
+and roots_after instead of the legacy live-graph new_root_hash. An expired session can recover \
+published work but cannot resume unpublished work. Keyed offline or older-daemon calls refuse. \
+Keyed requests accept only session_id, request_id, operations, scope and summary; unknown fields \
+and unsupported freshness constraints refuse before execution. For caller-read freshness, carry \
+the source_base returned by a current get_entity_source read in an EntitySourceBase operation \
+payload. A new stale request refuses without discarding its operations; an already-published \
+key still recovers its original receipt. Keys are retained within configurable daemon quotas.";
 
 /// Decode and check the operations a `kin_mutate` call carries.
 ///
@@ -1472,7 +1508,7 @@ reached, or is refused, the answer names the transaction left open.";
 /// came back. A JSON-RPC fault leaves the client to decide whether the model
 /// ever sees the reason, while `is_error` puts it in the transcript the next
 /// turn reads.
-fn checked_mutate_operations(
+pub fn checked_mutate_operations(
     arguments: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<&serde_json::Value, ToolCallResult> {
     let Some(ops_val) = arguments.get("operations") else {
@@ -1485,6 +1521,28 @@ fn checked_mutate_operations(
     reject_truncated_bodies(&parsed).map_err(ToolCallResult::error)?;
     Ok(ops_val)
 }
+
+/// A supplied ID always requests the durable daemon contract. Invalid IDs must
+/// never fall through to unkeyed execution. The string is opaque and exact.
+pub fn checked_mutate_request_id(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<&str>, String> {
+    let Some(value) = arguments.get("request_id") else {
+        return Ok(None);
+    };
+    let id = value.as_str().ok_or(
+        "invalid_request_id: request_id must be a nonempty UTF-8 string of at most 256 bytes",
+    )?;
+    if id.trim().is_empty() || id.len() > 256 {
+        return Err(
+            "invalid_request_id: request_id must be a nonempty UTF-8 string of at most 256 bytes"
+                .to_string(),
+        );
+    }
+    Ok(Some(id))
+}
+
+pub const DURABLE_MUTATE_TOOL: &str = "kin_mutate_durable_v1";
 
 /// The session a daemon-owned mutation belongs to, or the refusal that names it.
 ///
@@ -1530,30 +1588,12 @@ fn carry_request_id(result: &mut ToolCallResult, request_id: Option<&str>) {
     }
 }
 
-/// `kin_mutate` against a daemon that owns repository authority, with no graph
-/// store of its own.
+/// Send a one-shot mutation to the daemon's exact repository writer.
 ///
-/// Expanded HERE, on the near side of the forward, and that placement is the
-/// whole point rather than a convenience. In a daemon-backed deployment the MCP
-/// server forwards every tool call it does not answer itself, and the daemon
-/// runs what arrives through `handlers::handle_tool_call` under
-/// `SessionAuthorityMode::OfflineFallback`, because inside the daemon its own
-/// registry IS the authority. A `kin_mutate` that travelled whole would
-/// therefore reach `handle_mutate` with `uses_daemon()` FALSE, take the
-/// in-process branch, and be refused by it: that path has no projection and
-/// correctly declines a source body rather than reporting a success that
-/// discarded it. Meanwhile the daemon routes exactly one name,
-/// `kin_transaction_commit`, to its exact-commit path.
-///
-/// So the one-shot is expanded before the forward, and what crosses to the
-/// daemon is a begin and a commit by those names. The commit carries the
-/// operations inline, which `kin_transaction_commit` has always accepted, and
-/// it carries a `transaction_id`, which is what the daemon's transaction
-/// coordination preflight keys on. A one-shot expanded on the far side would
-/// have had neither.
-///
-/// A refused commit is aborted rather than left open, so a caller that retries
-/// is not accumulating transactions it never asked for.
+/// A keyed call travels intact under the durable protocol's versioned internal
+/// name. An unkeyed call retains the begin/inline-commit expansion and its
+/// historical abort-on-refusal behavior. The offline graph-only handler cannot
+/// promise either exact source projection or durable request identity.
 pub async fn mutate_through_daemon(
     arguments: &HashMap<String, serde_json::Value>,
 ) -> Result<ToolCallResult> {
@@ -1566,13 +1606,8 @@ pub async fn mutate_through_daemon(
     .await
 }
 
-/// The body of [`mutate_through_daemon`], with the forward call injected.
-///
-/// Injected rather than called directly because the three ways a commit can
-/// fail to land (the daemon refuses it, the daemon is gone, the transport
-/// breaks) each have to be followed by an abort, and the only way to prove
-/// that for all three is to script them and watch for the abort. The public
-/// wrapper passes the real delegate; the tests pass a recorder.
+/// Transport injection keeps compatibility and failure behavior testable:
+/// keyed calls never expand or abort after an uncertain transport result.
 pub(super) async fn mutate_through<F, Fut>(
     arguments: &HashMap<String, serde_json::Value>,
     forward: F,
@@ -1581,6 +1616,22 @@ where
     F: Fn(&'static str, HashMap<String, serde_json::Value>) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<Option<ToolCallResult>, String>>,
 {
+    match checked_mutate_request_id(arguments) {
+        Err(error) => return Ok(ToolCallResult::error(error)),
+        Ok(Some(_)) => {
+            if let Err(refusal) = required_session(arguments) {
+                return Ok(refusal);
+            }
+            // The versioned internal name is intentionally unknown to old
+            // daemons. Never fall back to begin/commit after accepting a key.
+            return Ok(match forward(DURABLE_MUTATE_TOOL, arguments.clone()).await {
+                Ok(Some(result)) => result,
+                Ok(None) => ToolCallResult::error("durable_request_daemon_required: keyed kin_mutate requires a daemon supporting kin_mutate_durable_v1; no mutation was started"),
+                Err(error) => ToolCallResult::error(format!("durable_request_outcome_unknown: {error}; retry kin_mutate with the same session_id, request_id and complete arguments; do not begin or abort a replacement transaction")),
+            });
+        }
+        Ok(None) => {}
+    }
     let ops_val = match checked_mutate_operations(arguments) {
         Ok(ops_val) => ops_val,
         Err(refusal) => return Ok(refusal),
@@ -1647,9 +1698,8 @@ where
         commit_args.insert("message".to_string(), serde_json::json!(summary));
     }
 
-    // Every way the commit can fail to land is followed by the same abort: the
-    // daemon refused it, the daemon was gone, or the transport broke. Only a
-    // commit that answered without an error is left alone.
+    // Preserve a source-base conflict so the caller can recover its durable
+    // draft. Other failures retain the existing one-shot abort behavior.
     let mut refusal = match forward("kin_transaction_commit", commit_args).await {
         Ok(Some(mut value)) if value.is_error != Some(true) => {
             carry_request_id(&mut value, request_id.as_deref());
@@ -1659,6 +1709,9 @@ where
         Ok(None) => daemon_required_unavailable("transaction commit"),
         Err(err) => ToolCallResult::error(err),
     };
+    if crate::source_base::is_source_base_conflict(&tool_text(&refusal)) {
+        return Ok(refusal);
+    }
     let abort_args = HashMap::from([
         ("transaction_id".to_string(), serde_json::json!(tx_id)),
         ("session_id".to_string(), serde_json::json!(session_id)),
@@ -1722,6 +1775,12 @@ pub async fn handle_mutate<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     if session_authority_mode.uses_daemon() {
         return mutate_through_daemon(arguments).await;
+    }
+
+    match checked_mutate_request_id(arguments) {
+        Err(error) => return Ok(ToolCallResult::error(error)),
+        Ok(Some(_)) => return Ok(ToolCallResult::error("durable_request_daemon_required: offline graph-only MCP cannot provide durable request_id retries; use an authenticated daemon supporting kin_mutate_durable_v1")),
+        Ok(None) => {}
     }
 
     let ops_val = match checked_mutate_operations(arguments) {

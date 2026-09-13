@@ -20,6 +20,12 @@ import {
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = path.resolve(packageRoot, '../..');
 
+test('MCP discovery and public source-base schemas agree', async () => {
+  const discovery = JSON.parse(await fs.readFile(path.join(repositoryRoot,
+    'crates/kin-mcp/src/source_base.schema.json'), 'utf8'));
+  assert.deepEqual(discovery, await loadSchema('entitySourceBase'));
+});
+
 test('all schemas load', async () => {
   const schemas = await loadAllSchemas();
   assert.ok(schemas.workspaceContext);
@@ -1227,4 +1233,27 @@ test('a graph export names the sequence it was cut at', async () => {
     false,
     'without it a client cannot tell which events it already has'
   );
+});
+
+
+test('entity source bases preserve exact identity and reject future or dropped fields', async () => {
+  const base = {
+    schema: 'kin.entity.source_base.v1',
+    context: {
+      repository_id: 'editor-test', workspace_id: '11111111-1111-4111-8111-111111111111',
+      workspace_generation: 7, workspace_head_hash: 'ab'.repeat(32), workspace_tree_hash: 'cd'.repeat(32)
+    },
+    entity_id: '22222222-2222-4222-8222-222222222222', artifact_id: '33333333-3333-4333-8333-333333333333',
+    source_blob_hash: 'ef'.repeat(32), start_byte: 0, end_byte: 32, body_hash: '12'.repeat(32)
+  };
+  await assertContract('entitySourceBase', base);
+  for (const changed of [
+    {...base, schema: 'kin.entity.source_base.v2'},
+    {...base, expected_base: 'unsupported'},
+    {...base, context: {...base.context, expected_base: 'unsupported'}},
+    {...base, source_blob_hash: 'silently invalid digest'},
+    {...base, body_hash: undefined}
+  ]) {
+    assert.equal((await validateContract('entitySourceBase', changed)).ok, false);
+  }
 });

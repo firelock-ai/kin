@@ -12373,7 +12373,10 @@ fn validate_source_symlink_target_with_windows_rules(
         )));
     }
     let mut resolved: Vec<&str> = path[..path.len().saturating_sub(1)].to_vec();
-    for component in target.split('/') {
+    // A terminal separator requires a directory at the target. Ignore only
+    // that separator for validation; publication keeps the original bytes.
+    let components = target.strip_suffix('/').unwrap_or(target);
+    for component in components.split('/') {
         match component {
             "" => {
                 return Err(KinError::Other(format!(
@@ -13576,6 +13579,75 @@ mod tests {
             true,
         )
         .expect("ordinary relative target should remain valid");
+    }
+
+    #[test]
+    fn directory_symlink_separator_keeps_target_boundaries() {
+        let link_path = ["tests", "certs", "mtls", "client", "ca"];
+        for windows in [false, true] {
+            for target in ["../../expired/ca/", "../../expired/ca", "./", "../"] {
+                validate_source_symlink_target_with_windows_rules(&link_path, target, windows)
+                    .expect("a terminal directory separator must preserve a safe relative target");
+            }
+            for target in [
+                "",
+                "/",
+                "/absolute/",
+                "../../../../../escape/",
+                "../../expired//ca/",
+                "../../expired/ca//",
+                "../../.kin/config/",
+                "../../.git/config/",
+                "../../.kin-session/base.json/",
+                "../../expired/ca\0/",
+                "..\\expired/ca/",
+            ] {
+                assert!(
+                    validate_source_symlink_target_with_windows_rules(&link_path, target, windows)
+                        .is_err(),
+                    "unsafe target {target:?} passed with Windows rules {windows}"
+                );
+            }
+        }
+        for target in ["../../CON/", "../../alternate:stream/", "../../trailing./"] {
+            assert!(
+                validate_source_symlink_target_with_windows_rules(&link_path, target, true)
+                    .is_err(),
+                "trailing separator bypassed Windows component validation for {target:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_preserves_directory_symlink_target_bytes() {
+        // Requests v2.32.5 tracks this directory link with a terminal slash.
+        let root = tempfile::tempdir().unwrap();
+        let link = repo_path("tests/certs/mtls/client/ca".to_string());
+        let certificate = repo_path("tests/certs/expired/ca/ca.pem".to_string());
+        let target = "../../expired/ca/";
+        replace_source_tree(
+            root.path(),
+            [
+                (&certificate, regular(), b"certificate fixture".as_slice()),
+                (&link, symlink(), target.as_bytes()),
+            ],
+            |_| false,
+        )
+        .expect("a safe tracked directory link must materialize with the source tree");
+        let link_path = root.path().join("tests/certs/mtls/client/ca");
+        assert!(std::fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link_path).unwrap().as_os_str(),
+            std::ffi::OsStr::new(target)
+        );
+        assert_eq!(
+            std::fs::read(link_path.join("ca.pem")).unwrap(),
+            b"certificate fixture"
+        );
     }
 
     #[cfg(windows)]

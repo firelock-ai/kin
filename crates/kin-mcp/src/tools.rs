@@ -119,10 +119,10 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 
 /// Honest JSON Schema for one transaction operation.
 ///
-/// The product daemon accepts six materially different shapes. A source-body
+/// The product daemon accepts seven materially different shapes. A source-body
 /// edit, a new source file, a rewritten source file, a retirement, and a rename
-/// are all intentionally payload-less; structured entity/relation mutations
-/// require `payload`. Keeping these as disjoint `oneOf` branches prevents MCP
+/// are all intentionally payload-less; guarded body edits and structured
+/// entity/relation mutations require `payload`. Disjoint `oneOf` branches prevent MCP
 /// clients from being told that the preferred source-edit form is invalid.
 ///
 /// No two branches can match one operation: the five payload-less branches
@@ -265,6 +265,24 @@ fn transaction_operation_schema() -> serde_json::Value {
                 "additionalProperties": false
             },
             {
+                "title": "Guarded entity source body edit",
+                "type": "object",
+                "properties": {
+                    "verb": { "type": "string", "enum": ["update", "modify"] },
+                    "target": { "type": "string", "format": "uuid", "description": "The exact entity UUID in source_base." },
+                    "body": { "type": "string", "minLength": 1 },
+                    "description": { "type": "string" },
+                    "payload": {
+                        "type": "object",
+                        "properties": { "EntitySourceBase": crate::source_base::source_base_schema() },
+                        "required": ["EntitySourceBase"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["verb", "target", "body", "payload", "description"],
+                "additionalProperties": false
+            },
+            {
                 "title": "Structured entity or relation mutation",
                 "type": "object",
                 "properties": {
@@ -282,6 +300,10 @@ fn transaction_operation_schema() -> serde_json::Value {
                     },
                     "payload": {
                         "type": "object",
+                        "oneOf": [
+                            { "required": ["Entity"], "properties": { "Entity": { "type": "object" } }, "additionalProperties": false },
+                            { "required": ["Relation"], "properties": { "Relation": { "type": "object" } }, "additionalProperties": false }
+                        ],
                         "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}."
                     },
                     "body": {
@@ -1031,6 +1053,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "session_id": { "type": "string", "description": "Optional caller-allocated UUID for authenticated daemon registration, including the original UUID when resuming an unpublished keyed mutation after restart. An already registered UUID refuses; offline use is unsupported." },
                         "vendor": { "type": "string", "description": "Vendor identifier (claude-code, codex, gemini-cli, etc.)" },
                         "client_name": { "type": "string", "description": "Human-readable client name" },
                         "transport": { "type": "string", "description": "Connection type: mcp, cli, wrapper, or ui", "default": "mcp" },
@@ -1208,22 +1231,32 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "session_id": {
                             "type": "string",
-                            "description": "Optional owning session UUID"
+                            "description": "Owning session UUID; required when request_id is supplied"
                         },
                         "scope": {
                             "type": "string",
-                            "description": "Optional target scope or workspace identifier (defaults to 'repository')"
+                            "description": "Scope metadata for unkeyed calls; keyed v1 accepts only repository (the daemon-bound workspace)"
                         },
                         "request_id": {
                             "type": "string",
-                            "description": "Optional client request id, carried into the receipt so you can match the answer to your call; nothing deduplicates on it"
+                            "minLength": 1,
+                            "maxLength": 256,
+                            "description": "Optional opaque nonblank UTF-8 key (at most 256 bytes). A supporting authenticated daemon durably binds the complete request in this repository and session. Identical retries return the original kin.mutate.receipt.v1 receipt and original authority roots; different arguments refuse. Preserve session_id across retries and MCP restart. Offline and older daemons refuse keyed calls. Without this key calls remain non-idempotent."
                         },
                         "summary": {
                             "type": "string",
                             "description": "Optional change message: one sentence in your own words saying what this change does, which becomes the subject a human reads in history. Omit it and the change records only the transaction id, which names the call and not the work."
                         }
                     },
-                    "required": ["operations"]
+                    "required": ["operations"],
+                    "allOf": [{
+                        "if": { "required": ["request_id"] },
+                        "then": {
+                            "required": ["session_id"],
+                            "properties": { "scope": { "const": "repository" } },
+                            "propertyNames": { "enum": ["operations", "session_id", "scope", "request_id", "summary"] }
+                        }
+                    }]
                 }),
             },
             ToolDefinition {
@@ -2568,7 +2601,7 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 6, "{tool_name}");
+            assert_eq!(variants.len(), 7, "{tool_name}");
 
             let retirement = variants
                 .iter()

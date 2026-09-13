@@ -1316,12 +1316,31 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     relation_kinds: &[RelationKind],
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<Vec<ReferenceRow>> {
+    collect_graph_reference_rows_at(
+        store,
+        entity_id,
+        relation_kinds,
+        repository_authority,
+        EntitySourceScope::WorkspaceHead,
+    )
+}
+
+/// Reference bodies from the same revision as the caller's selected graph.
+/// A historical graph must carry its committed source scope explicitly.
+pub fn collect_graph_reference_rows_at<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    relation_kinds: &[RelationKind],
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<Vec<ReferenceRow>> {
     collect_reference_rows(
         store,
         entity_id,
         relation_kinds,
         repository_authority,
         ReferenceBodies::Project,
+        source_scope,
     )
 }
 
@@ -1346,6 +1365,7 @@ pub fn collect_graph_reference_members<G: GraphStore>(
         relation_kinds,
         repository_authority,
         ReferenceBodies::Omit,
+        EntitySourceScope::WorkspaceHead,
     )
 }
 
@@ -1362,10 +1382,11 @@ fn reference_row_snippet<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
     bodies: ReferenceBodies,
+    source_scope: EntitySourceScope,
 ) -> Result<Option<Option<String>>> {
     match bodies {
         ReferenceBodies::Project => {
-            match read_bounded_entity_snippet_held(held, entity, EntitySourceScope::WorkspaceHead) {
+            match read_bounded_entity_snippet_held(held, entity, source_scope) {
                 Ok(snippet) => Ok(Some(snippet)),
                 Err(error) if is_absent_at_generation(&error) => Ok(None),
                 Err(error) => Err(error),
@@ -1471,6 +1492,7 @@ fn collect_reference_rows<G: GraphStore>(
     relation_kinds: &[RelationKind],
     repository_authority: Option<&RequestRepositoryAuthority>,
     bodies: ReferenceBodies,
+    source_scope: EntitySourceScope,
 ) -> Result<Vec<ReferenceRow>> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<EntityId, ReferenceRow> = HashMap::new();
@@ -1516,7 +1538,7 @@ fn collect_reference_rows<G: GraphStore>(
         // reported as one. Failing the whole reference set over it -- the shape
         // this had -- made `find_references` unusable on any repository that
         // ever deleted a file.
-        let Some(snippet) = reference_row_snippet(&held, &entity, bodies)? else {
+        let Some(snippet) = reference_row_snippet(&held, &entity, bodies, source_scope)? else {
             continue;
         };
         let entry = grouped
@@ -1624,7 +1646,7 @@ fn collect_reference_rows<G: GraphStore>(
             else {
                 continue;
             };
-            let Some(snippet) = reference_row_snippet(&held, &entity, bodies)? else {
+            let Some(snippet) = reference_row_snippet(&held, &entity, bodies, source_scope)? else {
                 continue;
             };
             let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
@@ -2360,7 +2382,7 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
     }
 
     /// The one instant of workspace authority this request reads at.
-    fn workspace_sample(&self) -> Result<&AuthorityHeadReadSample> {
+    pub(crate) fn workspace_sample(&self) -> Result<&AuthorityHeadReadSample> {
         match self.head_sample.get_or_init(|| {
             self.authority()
                 .and_then(|authority| authority.workspace_sample())

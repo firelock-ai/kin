@@ -1184,3 +1184,20 @@ export type GraphEvent =
       relations_added: number;
       relations_removed: number;
     };
+
+export interface EntitySourceBaseV1 {
+  schema: "kin.entity.source_base.v1";
+  context: {
+    repository_id: string;
+    workspace_id: string;
+    workspace_generation: number;
+    workspace_head_hash: string;
+    workspace_tree_hash: string;
+  };
+  entity_id: string;
+  artifact_id: string;
+  source_blob_hash: string;
+  start_byte: number;
+  end_byte: number;
+  body_hash: string;
+}

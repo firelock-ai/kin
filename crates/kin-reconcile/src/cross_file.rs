@@ -77,30 +77,151 @@ struct PendingFile {
     waiting_on: BTreeSet<String>,
 }
 
-/// Destination names a file's freshly parsed source still mentions, per
-/// relation kind.
+/// Destination names freshly parsed source still mentions, per relation kind,
+/// with caller-specific evidence for Calls.
 ///
 /// This is the evidence a single-file reconcile actually holds about cross-file
 /// edges it did not re-derive: the file's own text. An edge whose destination
 /// this file no longer names anywhere is stale by that evidence and may be
-/// retired; an edge whose destination is still named is preserved even when the
+/// retired. For calls, the reference must belong to that source entity, not a
+/// different caller in the file. A still-named target is preserved even when the
 /// incremental pass failed to re-derive it, so an init-time batch-linked edge
 /// resolved at a tier the incremental universe cannot reach is never deleted by
 /// a pass that merely could not see it.
 #[derive(Debug, Default, Clone)]
 pub struct ReferencedDestinations {
     by_kind: HashMap<RelationKind, HashSet<String>>,
+    /// Complete, unambiguous caller declarations, using the IDs this pass admits.
+    calls_by_source: HashMap<EntityId, HashSet<String>>,
+    /// A call whose source cannot be certified may belong to any caller here.
+    unattributed_calls: HashSet<String>,
+    calls_complete: bool,
+    file_calls_complete: bool,
+    incomplete_sources: HashSet<EntityId>,
     /// False when the parse was not complete, which withdraws all authority:
     /// a recovered tree can omit call sites, so an absent name proves nothing.
     trustworthy: bool,
 }
 
 impl ReferencedDestinations {
-    fn from_extracted(extracted: &[ExtractedRelation], completeness: &ParseCompleteness) -> Self {
+    fn from_extracted(
+        extracted: &[ExtractedRelation],
+        completeness: &ParseCompleteness,
+        entities: &[Entity],
+        imports: &[FileImport],
+    ) -> Self {
+        let mut declarations: HashMap<&str, Vec<&Entity>> = HashMap::new();
+        for entity in entities {
+            declarations.entry(&entity.name).or_default().push(entity);
+        }
+        let mut calls_by_source: HashMap<EntityId, HashSet<String>> = declarations
+            .values()
+            .filter(|matches| matches.len() == 1 && matches[0].span.is_some())
+            .map(|matches| (matches[0].id, HashSet::new()))
+            .collect();
+        calls_by_source.retain(|id, _| {
+            let span = entities
+                .iter()
+                .find(|entity| entity.id == *id)
+                .unwrap()
+                .span
+                .as_ref()
+                .unwrap();
+            !entities.iter().any(|other| {
+                other.id != *id
+                    && other.span.as_ref().is_some_and(|other| {
+                        let overlaps =
+                            span.start_byte < other.end_byte && other.start_byte < span.end_byte;
+                        let nested = (span.start_byte <= other.start_byte
+                            && other.end_byte <= span.end_byte)
+                            || (other.start_byte <= span.start_byte
+                                && span.end_byte <= other.end_byte);
+                        overlaps
+                            && (!nested
+                                || (span.start_byte == other.start_byte
+                                    && span.end_byte == other.end_byte))
+                    })
+            })
+        });
+        let mut unattributed_calls = HashSet::new();
+        let mut calls_complete = true;
+        let mut file_calls_complete = true;
+        let mut incomplete_sources: HashSet<_> = entities
+            .iter()
+            .filter(|entity| entity.signature.starts_with('@'))
+            .map(|entity| entity.id)
+            .collect();
         let mut by_kind: HashMap<RelationKind, HashSet<String>> = HashMap::new();
+        let certified_sources: HashSet<_> = calls_by_source.keys().copied().collect();
+        let source_of = |relation: &ExtractedRelation| -> Option<EntityId> {
+            let matches = declarations.get(relation.src_name.as_str())?;
+            if matches.len() != 1 {
+                return None;
+            }
+            let entity = matches[0];
+            let span = entity.span.as_ref()?;
+            let site = relation.site.as_ref()?;
+            if !(span.start_byte <= site.start_byte
+                && site.start_byte < site.end_byte
+                && site.end_byte <= span.end_byte)
+            {
+                return None;
+            }
+            // Modules/classes may enclose a method, but another declaration at
+            // the same or narrower span makes this site's owner unproven.
+            if entities.iter().any(|other| {
+                other.id != entity.id
+                    && other.span.as_ref().is_some_and(|other| {
+                        other.start_byte <= site.start_byte
+                            && site.end_byte <= other.end_byte
+                            && other.end_byte - other.start_byte <= span.end_byte - span.start_byte
+                    })
+            }) {
+                return None;
+            }
+            certified_sources.contains(&entity.id).then_some(entity.id)
+        };
+        let add_name = |names: &mut HashSet<String>, name: &str| {
+            names.insert(name.to_owned());
+            names.insert(bare_entity_name(name).to_owned());
+            for specifier in imports.iter().flat_map(|import| &import.specifiers) {
+                if specifier.local_name == name {
+                    if let Some(original) = &specifier.original_name {
+                        names.insert(original.clone());
+                        names.insert(bare_entity_name(original).to_owned());
+                    }
+                }
+            }
+        };
         for relation in extracted {
             if kin_parser::is_call_extraction_incomplete_marker(relation) {
+                file_calls_complete = false;
+                if kin_parser::is_scoped_call_extraction_incomplete_marker(relation) {
+                    if let Some(source) = source_of(relation) {
+                        if let Some(name) =
+                            relation.receiver.as_deref().filter(|name| !name.is_empty())
+                        {
+                            add_name(
+                                calls_by_source
+                                    .get_mut(&source)
+                                    .expect("certified declaration"),
+                                name,
+                            );
+                        } else {
+                            incomplete_sources.insert(source);
+                        }
+                        continue;
+                    }
+                }
+                calls_complete = false;
                 continue;
+            }
+            if relation.kind == RelationKind::Calls {
+                let names = match source_of(relation) {
+                    Some(id) => calls_by_source.get_mut(&id).expect("certified declaration"),
+                    None => &mut unattributed_calls,
+                };
+                add_name(names, &relation.dst_name);
             }
             let names = by_kind.entry(relation.kind).or_default();
             names.insert(relation.dst_name.clone());
@@ -108,6 +229,11 @@ impl ReferencedDestinations {
         }
         Self {
             by_kind,
+            calls_by_source,
+            unattributed_calls,
+            calls_complete,
+            file_calls_complete,
+            incomplete_sources,
             trustworthy: matches!(completeness, ParseCompleteness::Full),
         }
     }
@@ -126,13 +252,152 @@ impl ReferencedDestinations {
     /// Requires a complete parse: a recovered tree can drop call sites, and an
     /// absent name would then retire a live edge.
     pub fn can_retire(&self, kind: RelationKind, entity_name: &str) -> bool {
-        self.trustworthy && !self.mentions(kind, entity_name)
+        self.trustworthy
+            && (kind != RelationKind::Calls || self.file_calls_complete)
+            && !self.mentions(kind, entity_name)
+    }
+
+    /// Retire a missing call only from the caller that stopped naming its target.
+    /// A different caller's reference cannot preserve that edge. Unknown source
+    /// ownership, incomplete call extraction and ambiguous declarations withdraw
+    /// negative authority; unresolved destinations that remain named are kept.
+    pub fn can_retire_from(&self, source: EntityId, kind: RelationKind, entity_name: &str) -> bool {
+        if kind != RelationKind::Calls {
+            return self.can_retire(kind, entity_name);
+        }
+        let mentions = |names: &HashSet<String>| {
+            names.contains(entity_name) || names.contains(bare_entity_name(entity_name))
+        };
+        self.trustworthy
+            && self.calls_complete
+            && !self.incomplete_sources.contains(&source)
+            && !mentions(&self.unattributed_calls)
+            && self
+                .calls_by_source
+                .get(&source)
+                .is_some_and(|names| !mentions(names))
     }
 
     /// Whether the parse behind this evidence was complete. A recovered tree
     /// can omit declarations, so nothing may be retired on its silence.
     pub fn is_complete(&self) -> bool {
         self.trustworthy
+    }
+}
+
+/// Prior lexical evidence is read only from the blob recorded on the old
+/// entity. Cache one parse per immutable version, never read its projection.
+/// A scoped current-name absence may retire direct/import-alias syntax only;
+/// it cannot reinterpret an old receiver/alias binding or an evidence-free edge.
+#[derive(Default)]
+pub(crate) struct PriorCallSites {
+    parsed: HashMap<(kin_model::FilePathId, String), Option<kin_index::IndexedFile>>,
+}
+
+impl PriorCallSites {
+    pub(crate) fn supports_retirement(
+        &mut self,
+        relation: &Relation,
+        source: &Entity,
+        target: &Entity,
+        blobs: &kin_blobs::BlobStore,
+    ) -> bool {
+        let Some(span) = source.span.as_ref() else {
+            return false;
+        };
+        let Some(hash) = source
+            .metadata
+            .extra
+            .get("blob_hash")
+            .and_then(|v| v.as_str())
+        else {
+            return false;
+        };
+        let indexed = self
+            .parsed
+            .entry((span.file.clone(), hash.to_owned()))
+            .or_insert_with(|| {
+                let digest = kin_blobs::Hash256::from_hex(hash).ok()?;
+                let bytes = blobs.read(&digest).ok()?;
+                if kin_blobs::digest(&bytes) != digest {
+                    return None;
+                }
+                kin_index::IndexPipeline::new()
+                    .index_file_content_with_tests(&span.file, &bytes, digest)
+                    .ok()
+                    .map(|result| result.indexed_file)
+            });
+        let Some(indexed) = indexed else {
+            return false;
+        };
+        if !matches!(indexed.parse_state, kin_model::ParseState::Valid) {
+            return false;
+        }
+        let mut declarations = indexed.entities.iter().filter(|entity| {
+            entity.name == source.name
+                && entity.kind == source.kind
+                && entity.span.as_ref() == Some(span)
+        });
+        if declarations.next().is_none() || declarations.next().is_some() {
+            return false;
+        }
+        if source.signature.starts_with('@')
+            || indexed.extracted_relations.iter().any(|raw| {
+                kin_parser::is_call_extraction_incomplete_marker(raw)
+                    && (!kin_parser::is_scoped_call_extraction_incomplete_marker(raw)
+                        || (raw.src_name == source.name && raw.receiver.is_none()))
+            })
+        {
+            return false;
+        }
+        let sites: Vec<_> = relation
+            .evidence
+            .iter()
+            .filter_map(|e| e.source_span.as_ref())
+            .collect();
+        if sites.is_empty() {
+            return false;
+        }
+        sites.iter().all(|site| {
+            if site.file != span.file
+                || site.start_byte < span.start_byte
+                || site.end_byte > span.end_byte
+            {
+                return false;
+            }
+            let mut calls = indexed.extracted_relations.iter().filter(|call| {
+                call.kind == RelationKind::Calls
+                    && call.src_name == source.name
+                    && call
+                        .site
+                        .as_ref()
+                        .is_some_and(|callsite| callsite.to_source_span(&span.file) == **site)
+            });
+            let Some(call) = calls.next() else {
+                return false;
+            };
+            if calls.next().is_some()
+                || call.receiver.is_some()
+                || call.dst_name.contains(['.', ':'])
+            {
+                return false;
+            }
+            // A same-spelled direct call or a recorded import alias can support
+            // this target. Unknown assignments / object.alias provenance cannot.
+            call.dst_name == target.name
+                || call.dst_name == bare_entity_name(&target.name)
+                || indexed
+                    .imports
+                    .iter()
+                    .flat_map(|import| &import.specifiers)
+                    .any(|specifier| {
+                        specifier.local_name == call.dst_name
+                            && specifier.original_name.as_ref().is_some_and(|original| {
+                                original == &target.name
+                                    || original == bare_entity_name(&target.name)
+                            })
+                    })
+        })
     }
 }
 
@@ -376,7 +641,8 @@ impl LiveCrossFileLinker {
         imports: &[FileImport],
         completeness: ParseCompleteness,
     ) -> CrossFilePass {
-        let referenced = ReferencedDestinations::from_extracted(extracted, &completeness);
+        let referenced =
+            ReferencedDestinations::from_extracted(extracted, &completeness, entities, imports);
         self.last_files_resolved = 0;
         if !self.seeded {
             return CrossFilePass {
@@ -698,4 +964,317 @@ impl LiveCrossFileLinker {
 fn admitted_artifact_id<G: GraphStore>(graph: &G, path: &str) -> Option<ArtifactId> {
     let repo_path = RepoPath::from_utf8(path.to_string()).ok()?;
     graph.artifact_id_at_path(&repo_path)
+}
+
+#[cfg(test)]
+mod source_evidence_tests {
+    use super::*;
+    use kin_index::{IndexPipeline, IndexedFile};
+    use kin_model::FilePathId;
+
+    fn parsed(source: &str) -> IndexedFile {
+        IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("source_fixture.py"),
+                source.as_bytes(),
+                kin_blobs::digest(source.as_bytes()),
+            )
+            .unwrap()
+            .indexed_file
+    }
+
+    fn identity(file: &IndexedFile, name: &str) -> EntityId {
+        file.entities.iter().find(|e| e.name == name).unwrap().id
+    }
+
+    fn evidence(file: &IndexedFile, completeness: ParseCompleteness) -> ReferencedDestinations {
+        ReferencedDestinations::from_extracted(
+            &file.extracted_relations,
+            &completeness,
+            &file.entities,
+            &file.imports,
+        )
+    }
+
+    #[test]
+    fn qualified_callers_do_not_share_destination_retention() {
+        let file = parsed(
+            "from absent_module import target\n\nclass A:\n    def call(self):\n        return 1\n\nclass B:\n    def call(self):\n        return target()\n",
+        );
+        let observed = evidence(&file, ParseCompleteness::Full);
+        assert!(observed.can_retire_from(identity(&file, "A.call"), RelationKind::Calls, "target"));
+        assert!(!observed.can_retire_from(
+            identity(&file, "B.call"),
+            RelationKind::Calls,
+            "target"
+        ));
+        assert!(!observed.can_retire_from(EntityId::new(), RelationKind::Calls, "target"));
+    }
+
+    #[test]
+    fn unknown_call_site_ownership_preserves_the_named_destination() {
+        for mode in ["unknown-name", "missing-site", "outside-declaration"] {
+            let mut file = parsed("def a():\n    return 1\n\ndef b():\n    return target()\n");
+            let source = identity(&file, "a");
+            assert!(evidence(&file, ParseCompleteness::Full).can_retire_from(
+                source,
+                RelationKind::Calls,
+                "target"
+            ));
+            let relation = file
+                .extracted_relations
+                .iter_mut()
+                .find(|r| r.kind == RelationKind::Calls)
+                .unwrap();
+            match mode {
+                "unknown-name" => relation.src_name = "unbound".into(),
+                "missing-site" => relation.site = None,
+                _ => relation.src_name = "a".into(),
+            }
+            let observed = evidence(&file, ParseCompleteness::Full);
+            assert!(
+                !observed.can_retire_from(source, RelationKind::Calls, "target"),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_source_declarations_do_not_certify_absence() {
+        let mut file = parsed("def caller():\n    return target()\n");
+        let original = identity(&file, "caller");
+        assert!(evidence(&file, ParseCompleteness::Full).can_retire_from(
+            original,
+            RelationKind::Calls,
+            "unmentioned"
+        ));
+        let mut duplicate = file
+            .entities
+            .iter()
+            .find(|e| e.id == original)
+            .unwrap()
+            .clone();
+        duplicate.id = EntityId::new();
+        let other = duplicate.id;
+        file.entities.push(duplicate);
+        let observed = evidence(&file, ParseCompleteness::Full);
+        for id in [original, other] {
+            assert!(!observed.can_retire_from(id, RelationKind::Calls, "target"));
+            assert!(!observed.can_retire_from(id, RelationKind::Calls, "unmentioned"));
+        }
+    }
+
+    #[test]
+    fn import_alias_keeps_an_unresolved_target_for_its_own_caller() {
+        let mut file = parsed(
+            "from absent_module import target as renamed\n\ndef caller():\n    return renamed()\n",
+        );
+        assert!(evidence(&file, ParseCompleteness::Full).can_retire_from(
+            identity(&file, "caller"),
+            RelationKind::Calls,
+            "unmentioned"
+        ));
+        // Some adapters leave the local spelling for the linker to bind.
+        file.extracted_relations
+            .iter_mut()
+            .find(|r| r.kind == RelationKind::Calls)
+            .unwrap()
+            .dst_name = "renamed".into();
+        let observed = evidence(&file, ParseCompleteness::Full);
+        assert!(!observed.can_retire_from(
+            identity(&file, "caller"),
+            RelationKind::Calls,
+            "target"
+        ));
+        assert!(!observed.can_retire_from(
+            identity(&file, "caller"),
+            RelationKind::Calls,
+            "module.target"
+        ));
+    }
+
+    #[test]
+    fn partial_or_incomplete_call_extraction_cannot_retire_on_silence() {
+        let mut file = parsed("def caller():\n    return 1\n");
+        let id = identity(&file, "caller");
+        assert!(evidence(&file, ParseCompleteness::Full).can_retire_from(
+            id,
+            RelationKind::Calls,
+            "target"
+        ));
+        for completeness in [
+            ParseCompleteness::Partial("recovered".into()),
+            ParseCompleteness::Failed("LKG".into()),
+        ] {
+            assert!(!evidence(&file, completeness).can_retire_from(
+                id,
+                RelationKind::Calls,
+                "target"
+            ));
+        }
+        file.extracted_relations
+            .push(kin_parser::call_extraction_incomplete_marker());
+        let observed = evidence(&file, ParseCompleteness::Full);
+        assert!(!observed.can_retire_from(id, RelationKind::Calls, "target"));
+        assert!(!observed.can_retire(RelationKind::Calls, "target"));
+        assert!(
+            observed.is_complete(),
+            "call coverage does not change artifact import parse authority"
+        );
+    }
+    #[test]
+    fn scoped_known_names_and_unknown_calls_have_different_negative_authority() {
+        let file = parsed("def caller(headers):\n    return headers.items()\n\ndef unknown(dispatch):\n    return dispatch['dynamic']()\n\nAT_MODULE = object()\n");
+        let observed = evidence(&file, ParseCompleteness::Full);
+        assert!(observed.can_retire_from(identity(&file, "caller"), RelationKind::Calls, "target"));
+        assert!(!observed.can_retire_from(identity(&file, "caller"), RelationKind::Calls, "items"));
+        assert!(!observed.can_retire_from(
+            identity(&file, "unknown"),
+            RelationKind::Calls,
+            "target"
+        ));
+        assert!(
+            file.extracted_relations
+                .iter()
+                .any(kin_parser::is_call_extraction_incomplete_marker),
+            "broad linker coverage must remain incomplete"
+        );
+    }
+
+    #[test]
+    fn nested_execution_scopes_and_decorators_withdraw_caller_absence() {
+        for source in [
+            "def caller():\n    def nested():\n        return target()\n    return 1\n",
+            "def caller():\n    return lambda: target()\n",
+            "def caller(arg=target()):\n    return 1\n",
+            "@decorator\ndef caller():\n    return 1\n",
+            "@decorator(target())\ndef caller():\n    return 1\n",
+        ] {
+            let file = parsed(source);
+            assert!(
+                !evidence(&file, ParseCompleteness::Full).can_retire_from(
+                    identity(&file, "caller"),
+                    RelationKind::Calls,
+                    "unmentioned"
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn unbound_or_malformed_scoped_gaps_fail_closed_globally() {
+        for mode in [
+            "unknown-owner",
+            "missing-site",
+            "outside-owner",
+            "unknown-payload",
+        ] {
+            let mut file = parsed("def caller(headers):\n    return headers.items()\n");
+            let id = identity(&file, "caller");
+            assert!(evidence(&file, ParseCompleteness::Full).can_retire_from(
+                id,
+                RelationKind::Calls,
+                "target"
+            ));
+            let gap = file
+                .extracted_relations
+                .iter_mut()
+                .find(|r| kin_parser::is_scoped_call_extraction_incomplete_marker(r))
+                .unwrap();
+            match mode {
+                "unknown-owner" => gap.src_name = "missing".into(),
+                "missing-site" => gap.site = None,
+                "outside-owner" => gap.site.as_mut().unwrap().end_byte += 1000,
+                _ => gap.import_source = Some("invalid".into()),
+            }
+            assert!(
+                !evidence(&file, ParseCompleteness::Full).can_retire_from(
+                    id,
+                    RelationKind::Calls,
+                    "target"
+                ),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn prior_retirement_requires_graph_blob_and_lexical_site_provenance() {
+        use kin_model::{RelationEvidence, RelationId, RelationOrigin};
+        let temp = tempfile::TempDir::new().unwrap();
+        let blobs = kin_blobs::BlobStore::new(temp.path().to_path_buf()).unwrap();
+        for (body, allowed) in [
+            (
+                "from absent import target\ndef caller():\n    return target()\n",
+                true,
+            ),
+            (
+                "from absent import target as renamed\ndef caller():\n    return renamed()\n",
+                true,
+            ),
+            ("def caller(object):\n    return object.alias()\n", false),
+            (
+                "def caller():\n    alias = target\n    return alias()\n",
+                false,
+            ),
+        ] {
+            let mut file = parsed(body);
+            let hash = blobs.write(body.as_bytes()).unwrap();
+            let call = file
+                .extracted_relations
+                .iter()
+                .find(|r| r.kind == RelationKind::Calls)
+                .unwrap();
+            let source = file
+                .entities
+                .iter_mut()
+                .find(|e| e.name == "caller")
+                .unwrap();
+            source
+                .metadata
+                .extra
+                .insert("blob_hash".into(), hash.to_string().into());
+            let mut target = source.clone();
+            target.id = EntityId::new();
+            target.name = "target".into();
+            let mut relation = Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: source.id.into(),
+                dst: target.id.into(),
+                confidence: 0.95,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: Some("absent".into()),
+                evidence: vec![RelationEvidence {
+                    source_span: Some(
+                        call.site
+                            .as_ref()
+                            .unwrap()
+                            .to_source_span(&source.span.as_ref().unwrap().file),
+                    ),
+                    ..Default::default()
+                }],
+            };
+            let mut prior = PriorCallSites::default();
+            assert_eq!(
+                prior.supports_retirement(&relation, source, &target, &blobs),
+                allowed,
+                "{body}"
+            );
+            if allowed {
+                relation.evidence[0]
+                    .source_span
+                    .as_mut()
+                    .unwrap()
+                    .start_byte += 1;
+                assert!(!prior.supports_retirement(&relation, source, &target, &blobs));
+                relation.evidence.clear();
+                assert!(!prior.supports_retirement(&relation, source, &target, &blobs));
+                source.metadata.extra.remove("blob_hash");
+                assert!(!prior.supports_retirement(&relation, source, &target, &blobs));
+            }
+        }
+    }
 }

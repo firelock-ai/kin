@@ -170,14 +170,21 @@ SLACK_TEST_REPLACEMENT = ".authority_metadata()"
 # actually scanned now, so each is probed across its production region.
 NARROWED_MODULES = ["crates/kin-daemon-spawn/src/lib.rs"]
 
-# (module, function, pinned expression) for bodies that were exempt by name and
-# are now covered by a pin on the primitive instead. The pin masks two `.exists()`
-# calls; the twenty-four lines around them must be scanned again, which is the
-# whole difference between the two grains. Poison goes just inside the body, on a
-# line that is not the pinned one.
+# (module, function, pinned expression) for boundaries protected by exact pins
+# instead of whole-body exemptions. Include newly classified persistence paths
+# as well as narrowed older exemptions: their surrounding code must remain
+# scanned. Poison goes just inside each body, away from its permitted primitive.
 REGROUND_PINS = [
     ("crates/kin-daemon/src/daemon.rs", "repository_root_missing", ".exists()"),
     ("crates/kin-daemon/src/daemon.rs", "classify_control_plane", ".exists()"),
+    ("crates/kin-daemon/src/state.rs", "load_persisted_mcp_transactions_checked", "std::fs::read(&path)"),
+    ("crates/kin-daemon/src/state.rs", "write_persisted_mcp_transactions_checked", "pending.try_exists()"),
+    ("crates/kin-daemon/src/state.rs", "write_mcp_transaction_lifecycle", "recovery_path.try_exists()"),
+    ("crates/kin-daemon/src/state.rs", "recover_mcp_transaction_lifecycle_with_hook", "std::fs::read(&recovery_path)"),
+    ("crates/kin-daemon/src/state.rs", "write_mcp_transaction_bytes", "std::fs::OpenOptions::new()"),
+    ("crates/kin-daemon/src/mcp_mutate.rs", "read_binding", "std::fs::read(&file)"),
+    ("crates/kin-daemon/src/mcp_mutate.rs", "persist", "std::fs::OpenOptions::new()"),
+    ("crates/kin-daemon/src/mcp_source_base.rs", "require_source_bases", ".metadata()"),
 ]
 
 # The cfg tracker decides which items are production code, and it decided it by
@@ -733,10 +740,9 @@ def main():
                 f.write(original)
         print(f"  narrowed {os.path.basename(rel):15} {'  '.join(marks)}")
 
-    # A pin on a primitive replaced two function-body exemptions. The bodies are
-    # scanned again, which is the only reason the trade is worth making, so
-    # poison each one on a line that is not the pinned one and require the report.
-    # An exemption that had regressed to whole-body would swallow this silently.
+    # Boundary pins permit only justified primitives. Poison the surrounding
+    # bodies and require an actual scan report: a whole-body exemption would
+    # otherwise hide a new source read while leaving the guard green.
     for rel, fn_name, pin in REGROUND_PINS:
         path = os.path.join(root, rel)
         with open(path, "r", encoding="utf-8") as f:
