@@ -100,7 +100,7 @@ kin clone <url> [path] [options]
 
 ### `kin status`
 
-Show coherent repository-v6 workspace status
+Read canonical repository/workspace status without admitting host files
 
 ```
 kin status [options]
