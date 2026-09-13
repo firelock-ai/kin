@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 68 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 74 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -19,6 +19,15 @@ answer and how far to trust it. The contract behind it is simple: there is no
 configuration under which the server backfills a semantic answer from raw file search
 behind a successful response. An answer is graph-backed and names the graph state that
 produced it, or the gap is reported as a gap.
+
+For closed JSON payload contracts, use `validateMcpContract(name, response)` from
+`@kin/boundary-contracts`. It validates the optional reserved top-level `_kin`
+with `mcpEnvelopeV2` and validates all remaining fields against the unchanged
+domain schema. Its successful result retains both `payload` and `envelope`.
+Only that top-level metadata key is separated; arbitrary domain fields and
+nested metadata do not gain an exemption. Additional envelope metadata is
+preserved but does not imply understood authority. A present envelope requires
+version 2, a recognized runtime and the canonical `degraded` object.
 
 The envelope carries codes and counts, not sentences. Version 1 repeated a sentence beside
 most blocks on every response; version 2 sends only the fields those sentences restated,
@@ -526,3 +535,16 @@ Both tools ship in the `agent-default` profile, so an agent configured with
 
 - **`kin_artifact_list`**: List the exact graph-owned repository artifacts at one semantic change. This is the repository-membership surface, so it covers code and every non-code tracked object, including Docker Compose files, Dockerfiles, lockfiles, configuration, binary assets, unsupported languages, symlinks, executable files, and gitlinks. Identity comes from `artifact_id` and never from a path, and a listed artifact is read by passing its `artifact_id` to `kin_artifact_read`. Each row names its path once: `path_label` is the exact path whenever `path_label_lossy` is false, and only a path whose bytes are not valid UTF-8 also carries the byte-exact `path` as a lowercase `bytes_hex` object. Omit `source_change_id` to read the exact current workspace tree.
 - **`kin_artifact_read`**: Read one exact graph-owned repository artifact by stable `artifact_id` or by `path`: the repository-relative string `kin_artifact_list` prints as `path_label` (a leading `/` is tolerated), or the byte-exact `{"bytes_hex": ...}` object for a path whose bytes are not valid UTF-8. A blob or symlink body comes back as `text_utf8` when its bytes are valid UTF-8 and as base64 in `content_base64` when they are not, and `include_bytes: true` adds the base64 for a UTF-8 body too. Gitlinks return their external object identity and have no repository-owned body. The read is bound to the resolved tree entry and fails loudly when the tree, identity, or content-addressed blob is missing. It never reads the working directory.
+
+
+## 12. Durable Entity Drafts
+*Tools:* `kin_draft_capabilities`, `kin_draft_create`, `kin_draft_save`, `kin_draft_read`, `kin_draft_list`, `kin_draft_apply`
+
+Drafts preserve exact editing text independently of parsing and session leases.
+Check capabilities before offering durable Save. Create/save/read/list preserve
+invalid or empty text without publishing graph source. Explicit Apply uses a
+persisted exact source-base expectation and durable keyed mutation; a recovered
+older receipt never marks newer draft text applied. These tools are in the full
+profile, keeping the default 22-tool agent belt unchanged. See the
+[durable draft contract](mcp-entity-drafts.md) for schemas, revision CAS, recovery,
+quota configuration and the explicit initial non-Unix write refusal.

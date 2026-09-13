@@ -495,6 +495,7 @@ pub fn name_set(names: &[&str]) -> std::collections::HashSet<String> {
 /// depend on where a new tool is inserted in the registry below.
 pub fn tool_definitions() -> ToolsListResult {
     let mut list = registered_tools();
+    list.tools.extend(crate::entity_drafts::tool_definitions());
     list.tools.sort_by(|left, right| left.name.cmp(&right.name));
     list
 }
@@ -2337,6 +2338,9 @@ mod tests {
     /// with whatever the registry claims and could never disagree with it. Each
     /// name here was classified by reading its handler.
     const WRITING_TOOLS: &[&str] = &[
+        "kin_draft_apply",
+        "kin_draft_create",
+        "kin_draft_save",
         "kin_annotation_add",
         "kin_annotation_mark_resolved",
         "kin_mutate",
@@ -2376,6 +2380,7 @@ mod tests {
     /// replace a state field in place; `kin_annotation_mark_resolved` deletes
     /// the annotation; `kin_review_unassign` removes the assignment.
     const DESTRUCTIVE_TOOLS: &[&str] = &[
+        "kin_draft_apply",
         "kin_annotation_mark_resolved",
         "kin_mutate",
         "kin_review_discuss_resolve",
@@ -2729,8 +2734,9 @@ mod tests {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
         // + 1 get_entity_sources + 2 exact artifact tools
-        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search + 1 kin_mutate = 68
-        assert_eq!(list.tools.len(), 68);
+        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search + 1 kin_mutate
+        // + 6 durable entity draft tools = 74
+        assert_eq!(list.tools.len(), 74);
     }
 
     /// The reference lists each category's members on a line opening with this

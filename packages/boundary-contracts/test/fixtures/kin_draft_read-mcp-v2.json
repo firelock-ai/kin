@@ -1,0 +1,69 @@
+{
+  "_kin": {
+    "degraded": {
+      "embed_persistence_unavailable": false,
+      "embed_worker_failed": false,
+      "mass_deletion_blocked": false
+    },
+    "durability": {
+      "durable_entities": 2,
+      "durable_relations": 1,
+      "live_entities": 2,
+      "live_only_entities": 0,
+      "live_only_relations": 0,
+      "live_relations": 1,
+      "state": "recorded"
+    },
+    "envelope_version": 2,
+    "freshness": {
+      "state": "no_admission_recorded"
+    },
+    "graph_as_of": {
+      "generation": 1
+    },
+    "graph_state": {
+      "entity_count": 2,
+      "initialized": true,
+      "loaded": true,
+      "reconciliation_status": "idle"
+    },
+    "hydration_semantics": {
+      "created_under": 11,
+      "derives": 11,
+      "standing": "current"
+    },
+    "runtime": "repo-daemon"
+  },
+  "applied_receipt": null,
+  "body": "fn broken( {\r\n  🧭 café\u0000\t",
+  "content_revision": 1,
+  "draft_id": "aaa1b56d-dcac-43fd-a216-222e0e2ce02d",
+  "original_body": "pub fn value() -> u8 { 1 }",
+  "original_source_base": {
+    "artifact_id": "0abbd5f1-9d4c-5f92-b9ef-6ec9c5851886",
+    "body_hash": "38c0be1fe5260f5f6b4f1fd994b2a5868fcd68a02d92d3ab52985be337858109",
+    "context": {
+      "repository_id": "71bd756d-2b04-467a-b704-9e462c03e01b",
+      "workspace_generation": 0,
+      "workspace_head_hash": "a65213832e4a94f0708f9fe2e711cf3a180f9fbeb9398f1d6abf77f4d36d1bb9",
+      "workspace_id": "1e726bbd-1d3d-4f4e-bae0-fe305eebf5d2",
+      "workspace_tree_hash": "0981df7fb1c6a6bfedeac57e950d53cc91d7cf5b21efe7bc9d8c4e5f688961b1"
+    },
+    "end_byte": 26,
+    "entity_id": "b924404d-ccd5-4919-96c3-d1ee69d6d1bb",
+    "schema": "kin.entity.source_base.v1",
+    "source_blob_hash": "f52b1f94317da7228d8a7eb8a8b36b6aa8b2579657bde98330521bc3aa3e2250",
+    "start_byte": 0
+  },
+  "pending_apply": null,
+  "previous_record_hash": null,
+  "request_hash": "8470a73ac447b0fef42dfc5ae7568ad63418bc0b5319cbb14ca059cabf965323",
+  "revision": 1,
+  "schema": "kin.entity.draft.v1",
+  "scope": {
+    "entity_id": "b924404d-ccd5-4919-96c3-d1ee69d6d1bb",
+    "owner": "local-bearer-v1",
+    "repository_id": "71bd756d-2b04-467a-b704-9e462c03e01b",
+    "workspace_id": "1e726bbd-1d3d-4f4e-bae0-fe305eebf5d2"
+  }
+}
