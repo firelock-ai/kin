@@ -135,6 +135,8 @@ pub mod lifecycle;
 mod local_repository_authority;
 pub mod loop_runner;
 mod mcp_commit;
+mod mcp_mutate;
+mod mcp_source_base;
 mod pending_commits;
 pub mod publication_lease;
 pub mod replica_adoption;

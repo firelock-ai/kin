@@ -366,6 +366,7 @@ impl fmt::Debug for RequestRepositoryAuthority {
 /// provenance. Nothing serializes those two reads, so the only fix is to stop
 /// taking two.
 pub(crate) struct AuthorityHeadReadSample {
+    pub source_base_context: Option<crate::source_base::SourceBaseContext>,
     pub tree: ResolvedTree,
     pub tree_hash: Hash256,
     pub generation: u64,
@@ -532,6 +533,7 @@ impl ActiveRepositoryAuthority {
     pub(crate) fn workspace_sample(&self) -> Result<AuthorityHeadReadSample> {
         if let Some(hosted) = &self.hosted_head {
             return Ok(AuthorityHeadReadSample {
+                source_base_context: None,
                 tree: hosted.tree.clone(),
                 tree_hash: hosted.tree_hash,
                 generation: hosted.generation,
@@ -551,6 +553,10 @@ impl ActiveRepositoryAuthority {
         })?;
         let base_change_id = self.resolve_target_in(metadata, target)?;
         Ok(AuthorityHeadReadSample {
+            source_base_context: Some(
+                crate::source_base::SourceBaseContext::from_workspace(&workspace)
+                    .map_err(McpError::Context)?,
+            ),
             tree: workspace.tree.clone(),
             tree_hash: workspace.tree_hash,
             generation: workspace.generation,

@@ -14,7 +14,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kin_model::session::SessionCapabilities;
-use tracing::debug;
 
 use crate::types::{ContentBlock, ToolCallResult};
 
@@ -1036,158 +1035,6 @@ fn optional_u32(args: &HashMap<String, serde_json::Value>, key: &str) -> Option<
     args.get(key)
         .and_then(|value| value.as_u64())
         .map(|value| value as u32)
-}
-
-// ── get_entity_source failure memo ──────────────────────────────────────
-//
-// `get_entity_source` / `get_entity_body` are pure functions of (entity_id,
-// graph generation): for a given graph, an ID either resolves to a body or it
-// does not. The observed agent-loop failure mode is calling the tool on a
-// hallucinated, invented, or stale ID, getting a failure, and then retrying the
-// same ID (or probing adjacent ones), which burns tool-call budget. Memoizing
-// the failure lets an identical repeated call short-circuit locally instead of
-// paying another daemon round-trip.
-//
-// The memo is bounded and keyed by (session, entity_id), and is dropped whenever
-// the graph generation marker advances — a re-index can resurrect a previously
-// absent ID, so a stale negative must not outlive the graph it described.
-
-/// Maximum number of remembered failures across all sessions. Bounds memory for
-/// long-lived agent sessions; eviction is oldest-first.
-const ENTITY_SOURCE_MEMO_CAP: usize = 512;
-
-/// Bounded per-session memo of `get_entity_source` failures, valid for a single
-/// graph generation.
-struct EntitySourceFailureMemo {
-    generation: u64,
-    entries: HashMap<(String, String), String>,
-    order: std::collections::VecDeque<(String, String)>,
-}
-
-impl EntitySourceFailureMemo {
-    fn new(generation: u64) -> Self {
-        Self {
-            generation,
-            entries: HashMap::new(),
-            order: std::collections::VecDeque::new(),
-        }
-    }
-
-    /// Drop every entry and rebind to `generation`.
-    fn reset(&mut self, generation: u64) {
-        self.generation = generation;
-        self.entries.clear();
-        self.order.clear();
-    }
-
-    /// Cached failure message for `key` at `generation`, if any. A generation
-    /// change invalidates the whole memo before the lookup.
-    fn get(&mut self, generation: u64, key: &(String, String)) -> Option<String> {
-        if generation != self.generation {
-            self.reset(generation);
-            return None;
-        }
-        self.entries.get(key).cloned()
-    }
-
-    /// Remember `message` as the failure for `key` at `generation`. First write
-    /// for a key wins; the oldest entry is evicted once the cap is reached.
-    fn insert(&mut self, generation: u64, key: (String, String), message: String) {
-        if generation != self.generation {
-            self.reset(generation);
-        }
-        if self.entries.contains_key(&key) {
-            return;
-        }
-        if self.entries.len() >= ENTITY_SOURCE_MEMO_CAP {
-            if let Some(evicted) = self.order.pop_front() {
-                self.entries.remove(&evicted);
-            }
-        }
-        self.order.push_back(key.clone());
-        self.entries.insert(key, message);
-    }
-}
-
-static ENTITY_SOURCE_MEMO: OnceLock<std::sync::Mutex<EntitySourceFailureMemo>> = OnceLock::new();
-
-fn entity_source_memo() -> &'static std::sync::Mutex<EntitySourceFailureMemo> {
-    ENTITY_SOURCE_MEMO.get_or_init(|| std::sync::Mutex::new(EntitySourceFailureMemo::new(0)))
-}
-
-/// Session identity for the memo key. Mirrors [`with_session_header`]: an
-/// explicit `session_id` argument wins, else `KIN_SESSION_ID`, else a shared
-/// process-global bucket (the common single-session MCP process case).
-fn session_key(arguments: &HashMap<String, serde_json::Value>) -> String {
-    if let Some(session_id) = optional_string(arguments, "session_id") {
-        return session_id.to_string();
-    }
-    if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
-        let trimmed = session_id.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    String::new()
-}
-
-/// Current graph generation from the local marker the daemon maintains at
-/// `<kin_dir>/kindb/head-generation`. Read directly off disk (no daemon round-trip);
-/// a missing or unreadable marker reads as generation 0, which still gives a
-/// stable within-session memo, just without cross-generation invalidation.
-fn current_graph_generation() -> u64 {
-    let Some(kin_dir) = discover_kin_dir() else {
-        return 0;
-    };
-    std::fs::read_to_string(kin_core::KinLayout::new(kin_dir).kindb_head_generation_path())
-        .ok()
-        .and_then(|contents| contents.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-/// Extract a cacheable failure message from a forwarded tool result. Only
-/// error results are cacheable — a success or a non-result is never memoized.
-fn cacheable_failure_message(result: Option<&ToolCallResult>) -> Option<String> {
-    let result = result?;
-    if result.is_error != Some(true) {
-        return None;
-    }
-    result.content.first().map(|block| match block {
-        ContentBlock::Text { text } => text.clone(),
-    })
-}
-
-/// Forward `get_entity_source` / `get_entity_body` through the failure memo.
-///
-/// On a cache hit the remembered failure is returned without contacting the
-/// daemon; otherwise the call is forwarded and a resulting failure is recorded
-/// for the current graph generation. Calls without a concrete `entity_id` are
-/// forwarded unmemoized (there is nothing stable to key on).
-async fn forward_entity_source_memoized(
-    name: &str,
-    arguments: &HashMap<String, serde_json::Value>,
-) -> Result<Option<ToolCallResult>, String> {
-    let Some(entity_id) = optional_string(arguments, "entity_id").map(str::to_string) else {
-        return forward_mcp_tool_call(name, arguments).await;
-    };
-    let key = (session_key(arguments), entity_id);
-    let generation = current_graph_generation();
-
-    if let Ok(mut memo) = entity_source_memo().lock() {
-        if let Some(cached) = memo.get(generation, &key) {
-            debug!(tool = name, "get_entity_source failure served from memo");
-            return Ok(Some(ToolCallResult::error(cached)));
-        }
-    }
-
-    let result = forward_mcp_tool_call(name, arguments).await?;
-
-    if let Some(message) = cacheable_failure_message(result.as_ref()) {
-        if let Ok(mut memo) = entity_source_memo().lock() {
-            memo.insert(generation, key, message);
-        }
-    }
-    Ok(result)
 }
 
 /// Read the capabilities a client declared for itself, or `None` when it
@@ -2309,13 +2156,20 @@ pub async fn forward_tool_call(
                 .transpose()
         }
         "kin_session_start" => {
+            if arguments
+                .get("session_id")
+                .is_some_and(|value| !value.is_string())
+            {
+                return Err("session_id must be a UUID string when supplied".to_string());
+            }
             let vendor = required_string(arguments, "vendor")?;
             let client_name = required_string(arguments, "client_name")?;
             let cwd = required_string(arguments, "cwd")?;
             let transport = optional_string(arguments, "transport").unwrap_or("mcp");
             let pid = optional_u32(arguments, "pid");
             let capabilities = parse_capabilities(arguments);
-            forward_session_start(
+            forward_session_start_with_id(
+                optional_string(arguments, "session_id"),
                 &vendor,
                 &client_name,
                 transport,
@@ -2386,12 +2240,9 @@ pub async fn forward_tool_call(
             Ok(()) => forward_mcp_tool_call(name, arguments).await,
             Err(message) => Ok(Some(ToolCallResult::error(message))),
         },
-        // Short-circuit repeated failures for an identical entity ID within a
-        // session so a hallucinated/stale ID does not burn a daemon round-trip
-        // on every retry.
-        "get_entity_source" | "get_entity_body" => {
-            forward_entity_source_memoized(name, arguments).await
-        }
+        // Source errors describe the selected live graph, not only its committed
+        // generation. Canonical re-derivation can resolve a gap without a commit,
+        // so a retry must ask the current daemon rather than reuse an old failure.
         _ => forward_mcp_tool_call(name, arguments).await,
     }
 }
@@ -2588,6 +2439,21 @@ pub async fn forward_session_start(
     cwd: &str,
     capabilities: Option<&SessionCapabilities>,
 ) -> Result<Option<serde_json::Value>, String> {
+    forward_session_start_with_id(None, vendor, client_name, transport, pid, cwd, capabilities)
+        .await
+}
+
+/// Register the caller's original UUID through the daemon's authenticated
+/// session API. This grants no ownership beyond the daemon's bearer identity.
+pub async fn forward_session_start_with_id(
+    session_id: Option<&str>,
+    vendor: &str,
+    client_name: &str,
+    transport: &str,
+    pid: Option<u32>,
+    cwd: &str,
+    capabilities: Option<&SessionCapabilities>,
+) -> Result<Option<serde_json::Value>, String> {
     let Some(base) = resolved_daemon_base_url().await else {
         return Ok(None);
     };
@@ -2597,6 +2463,9 @@ pub async fn forward_session_start(
         "transport": transport,
         "cwd": cwd,
     });
+    if let Some(session_id) = session_id {
+        body["session_id"] = serde_json::json!(session_id);
+    }
     // Omitted rather than defaulted, so the daemon can tell a client that
     // declared nothing from one that declared itself read-only.
     if let Some(capabilities) = capabilities {
@@ -4571,84 +4440,157 @@ mod tests {
         assert!(validate_stage_arguments(&args).is_ok());
     }
 
+    // Runs the production delegate in a fresh process so its endpoint, marker,
+    // auth and process-global state cannot contaminate concurrently running tests.
     #[test]
-    fn entity_source_failure_memo_hit_then_generation_invalidates() {
-        let mut memo = EntitySourceFailureMemo::new(1);
-        let key = ("session-a".to_string(), "entity-1".to_string());
+    fn precommit_source_failures_are_rechecked_without_a_semantic_commit() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
 
-        // Cold: nothing remembered yet.
-        assert!(memo.get(1, &key).is_none());
-
-        // Record a failure, then the identical (session, id) lookup is a HIT.
-        memo.insert(
-            1,
-            key.clone(),
-            "no entity exists with ID 'entity-1'".to_string(),
-        );
-        assert_eq!(
-            memo.get(1, &key).as_deref(),
-            Some("no entity exists with ID 'entity-1'"),
-        );
-
-        // A different id in the same session is unaffected.
-        let other = ("session-a".to_string(), "entity-2".to_string());
-        assert!(memo.get(1, &other).is_none());
-
-        // A graph-generation bump drops the negative — a re-index may resurrect
-        // the id, so the stale failure must not be served.
-        assert!(memo.get(2, &key).is_none());
-    }
-
-    #[test]
-    fn entity_source_memo_first_write_wins() {
-        let mut memo = EntitySourceFailureMemo::new(0);
-        let key = ("s".to_string(), "id".to_string());
-        memo.insert(0, key.clone(), "first".to_string());
-        memo.insert(0, key.clone(), "second".to_string());
-        assert_eq!(memo.get(0, &key).as_deref(), Some("first"));
-    }
-
-    #[test]
-    fn entity_source_memo_is_bounded_with_oldest_first_eviction() {
-        let mut memo = EntitySourceFailureMemo::new(0);
-        for i in 0..(ENTITY_SOURCE_MEMO_CAP + 5) {
-            memo.insert(0, ("s".to_string(), format!("id-{i}")), format!("fail-{i}"));
+        for marker in [Some("4\n"), None, Some("unreadable-generation\n")] {
+            let repo = tempfile::tempdir().unwrap();
+            let kin_dir = repo.path().join(".kin");
+            std::fs::create_dir_all(kin_dir.join("kindb")).unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(kin_dir.join("kindb/head-generation"), marker).unwrap();
+            }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let server_stop = Arc::clone(&stop);
+            let server_calls = Arc::clone(&calls);
+            let server = std::thread::spawn(move || {
+                while !server_stop.load(Ordering::SeqCst) {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("fixture listener: {error}"),
+                    };
+                    // Accepted sockets can inherit the listener's nonblocking mode.
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    loop {
+                        let mut chunk = [0; 1024];
+                        let received = socket.read(&mut chunk).unwrap();
+                        assert!(received > 0, "fixture request ended before its body");
+                        request.extend_from_slice(&chunk[..received]);
+                        assert!(request.len() <= 8192, "fixture request exceeded its bound");
+                        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            let headers = std::str::from_utf8(&request[..end]).unwrap();
+                            assert!(headers.starts_with("POST /mcp/tools/call "));
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap();
+                            if request.len() >= end + 4 + length {
+                                let body: serde_json::Value =
+                                    serde_json::from_slice(&request[end + 4..end + 4 + length])
+                                        .unwrap();
+                                assert!(body["arguments"]["entity_id"].as_str().is_some());
+                                break;
+                            }
+                        }
+                    }
+                    let call = server_calls.fetch_add(1, Ordering::SeqCst);
+                    let result = if call % 2 == 0 {
+                        ToolCallResult::error(match call / 2 {
+                            0 => "context error: graph authority gap: source span predates workspace bytes",
+                            1 => "no entity exists with this ID",
+                            _ => "entity has no source span",
+                        }.to_string())
+                    } else {
+                        ToolCallResult::text(r#"{"body":"def current(): return 2","span_coherence":"digest_verified"}"#.to_string())
+                    };
+                    let body = serde_json::to_string(&result).unwrap();
+                    write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon_delegate::tests::precommit_source_forwarding_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .current_dir(repo.path())
+                .env("KIN_DAEMON_URL", format!("http://{address}"))
+                .env("KIN_DAEMON_AUTH_TOKEN", "isolated-fixture-token")
+                .env("KIN_HOME", repo.path().join("private-home"))
+                .env(
+                    "KIN_REGISTRY_PATH",
+                    repo.path().join("private-home/registry.toml"),
+                )
+                .env("SOURCE_FORWARDING_TEST_CHILD", "1")
+                .output();
+            stop.store(true, Ordering::SeqCst);
+            server.join().unwrap();
+            let result = result.unwrap();
+            assert!(
+                result.status.success(),
+                "marker {marker:?}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                6,
+                "every source retry must reach the selected daemon"
+            );
+            assert_eq!(
+                std::fs::read_to_string(kin_dir.join("kindb/head-generation"))
+                    .ok()
+                    .as_deref(),
+                marker,
+                "a source query cannot advance committed authority"
+            );
         }
-        assert_eq!(memo.entries.len(), ENTITY_SOURCE_MEMO_CAP);
-        // The five oldest were evicted; the newest survive.
-        for i in 0..5 {
-            assert!(memo.get(0, &("s".to_string(), format!("id-{i}"))).is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess body invoked by precommit_source_failures_are_rechecked_without_a_semantic_commit"]
+    async fn precommit_source_forwarding_child() {
+        assert_eq!(
+            std::env::var("SOURCE_FORWARDING_TEST_CHILD").as_deref(),
+            Ok("1")
+        );
+        for (index, name) in ["get_entity_source", "get_entity_source", "get_entity_body"]
+            .into_iter()
+            .enumerate()
+        {
+            let args = HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(format!("source-{index}")),
+            )]);
+            let before = forward_tool_call(name, &args).await.unwrap().unwrap();
+            assert_eq!(
+                before.is_error,
+                Some(true),
+                "fixture must first report a real gap"
+            );
+            let after = forward_tool_call(name, &args).await.unwrap().unwrap();
+            assert_ne!(
+                after.is_error,
+                Some(true),
+                "source failure outlived its selected graph: {after:?}"
+            );
+            assert!(
+                matches!(&after.content[0], ContentBlock::Text { text } if text.contains("digest_verified") && text.contains("def current()"))
+            );
         }
-        let newest = ENTITY_SOURCE_MEMO_CAP + 4;
-        assert_eq!(
-            memo.get(0, &("s".to_string(), format!("id-{newest}")))
-                .as_deref(),
-            Some(format!("fail-{newest}").as_str()),
-        );
-    }
-
-    #[test]
-    fn only_error_results_are_cacheable() {
-        let err = ToolCallResult::error("boom".to_string());
-        assert_eq!(
-            cacheable_failure_message(Some(&err)).as_deref(),
-            Some("boom")
-        );
-
-        let ok = ToolCallResult::text("{}".to_string());
-        assert!(cacheable_failure_message(Some(&ok)).is_none());
-
-        assert!(cacheable_failure_message(None).is_none());
-    }
-
-    #[test]
-    fn session_key_prefers_explicit_argument() {
-        let mut args = HashMap::new();
-        args.insert(
-            "session_id".to_string(),
-            serde_json::json!("explicit-session"),
-        );
-        assert_eq!(session_key(&args), "explicit-session");
     }
 
     // ── On-demand delegate re-resolution ──────────────────────────────────

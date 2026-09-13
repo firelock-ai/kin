@@ -966,22 +966,17 @@ impl OpenPhases {
 }
 
 /// Load persisted in-flight MCP transactions on daemon startup. A missing file
-/// (clean start) or an unreadable/corrupt one yields an empty set — startup must
-/// never fail on transaction-state recovery — but corruption is surfaced loudly
-/// in the log so the loss is never silent.
+/// (clean start) yields an empty set. An unreadable mirror permits repository
+/// reads and published receipt replay, but new staging changes and all mirror
+/// writers refuse it until the evidence is repaired and the daemon restarted.
 pub(crate) fn load_persisted_mcp_transactions(
     layout: &KinLayout,
 ) -> HashMap<String, kin_mcp::McpTransaction> {
-    let path = mcp_transactions_disk_path(layout);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
-        Err(err) => {
-            warn!(path = %path.display(), error = %err, "failed to read persisted MCP transactions; starting with none");
-            return HashMap::new();
-        }
-    };
-    match serde_json::from_slice::<HashMap<String, kin_mcp::McpTransaction>>(&bytes) {
+    if let Err(error) = recover_mcp_transaction_lifecycle(layout) {
+        warn!(%error, "MCP lifecycle recovery required; preserving transaction evidence and allowing repository reads");
+        return HashMap::new();
+    }
+    match load_persisted_mcp_transactions_checked(layout) {
         Ok(store) => {
             if !store.is_empty() {
                 info!(
@@ -991,11 +986,219 @@ pub(crate) fn load_persisted_mcp_transactions(
             }
             store
         }
-        Err(err) => {
-            warn!(path = %path.display(), error = %err, "persisted MCP transactions are corrupt; starting with none");
+        Err(error) => {
+            warn!(%error, "MCP transaction recovery required; preserving the unreadable mirror");
             HashMap::new()
         }
     }
+}
+
+pub(crate) fn load_persisted_mcp_transactions_checked(
+    layout: &KinLayout,
+) -> Result<HashMap<String, kin_mcp::McpTransaction>> {
+    let path = mcp_transactions_disk_path(layout);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => {
+            return Err(mcp_transaction_recovery_error(&path, err));
+        }
+    };
+    match serde_json::from_slice::<HashMap<String, kin_mcp::McpTransaction>>(&bytes) {
+        Ok(store) => Ok(store),
+        Err(err) => Err(mcp_transaction_recovery_error(&path, err)),
+    }
+}
+
+fn mcp_transaction_recovery_error(
+    path: &std::path::Path,
+    error: impl std::fmt::Display,
+) -> DaemonError {
+    DaemonError::Io(std::io::Error::other(format!(
+        "transaction_recovery_required: cannot recover {}: {error}; preserve this file, restore a verified transaction mirror, and restart the daemon before retrying transaction tools",
+        path.display()
+    )))
+}
+
+fn mcp_lifecycle_recovery_path(layout: &KinLayout) -> std::path::PathBuf {
+    layout.root().join("mcp_transactions.lifecycle.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum McpLifecycleRecovery {
+    Missing,
+    Present { bytes: String },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum McpTransactionWritePhase {
+    Write = 1,
+    Rename = 2,
+    DirectorySync = 3,
+    FileSync = 4,
+    JournalWrite = 5,
+    JournalFileSync = 6,
+    JournalRename = 7,
+    JournalDirectorySync = 8,
+    JournalRemove = 9,
+    AcknowledgementDirectorySync = 10,
+    RecoveryWrite = 11,
+    RecoveryFileSync = 12,
+    RecoveryRename = 13,
+    RecoveryDirectorySync = 14,
+    RecoveryJournalRemove = 15,
+    RecoveryJournalDirectorySync = 16,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MCP_RECOVERY_FAIL_JOURNAL_RECREATION_ONCE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+/// Restore a lifecycle call whose recovery record remains pending.
+/// The recovery record is retained until both the restored mirror and removal
+/// of the record have been flushed. Repeating recovery is therefore safe.
+pub(crate) fn recover_mcp_transaction_lifecycle(layout: &KinLayout) -> Result<bool> {
+    recover_mcp_transaction_lifecycle_with_hook(layout, |_phase| {
+        #[cfg(test)]
+        if matches!(
+            _phase,
+            McpTransactionWritePhase::RecoveryJournalDirectorySync
+        ) && MCP_RECOVERY_FAIL_JOURNAL_RECREATION_ONCE.with(|fault| fault.replace(false))
+        {
+            // The journal has been unlinked. Fail its final directory sync and
+            // make re-creating it fail through the real filesystem writer too.
+            std::fs::create_dir(mcp_transaction_temporary_path(
+                &mcp_lifecycle_recovery_path(layout),
+            ))?;
+            return Err(std::io::Error::other(
+                "injected recovery unlink sync failure with journal re-creation unavailable",
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn recover_mcp_transaction_lifecycle_with_hook(
+    layout: &KinLayout,
+    mut before_phase: impl FnMut(McpTransactionWritePhase) -> std::io::Result<()>,
+) -> Result<bool> {
+    use McpTransactionWritePhase::*;
+    let recovery_path = mcp_lifecycle_recovery_path(layout);
+    let bytes = match std::fs::read(&recovery_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(mcp_transaction_recovery_error(&recovery_path, error)),
+    };
+    let recovery: McpLifecycleRecovery = serde_json::from_slice(&bytes)
+        .map_err(|error| mcp_transaction_recovery_error(&recovery_path, error))?;
+    let mirror = mcp_transactions_disk_path(layout);
+    if let McpLifecycleRecovery::Present { bytes: previous } = recovery {
+        serde_json::from_str::<HashMap<String, kin_mcp::McpTransaction>>(&previous)
+            .map_err(|error| mcp_transaction_recovery_error(&recovery_path, error))?;
+        write_mcp_transaction_bytes(&mirror, previous.as_bytes(), |phase| {
+            before_phase(match phase {
+                Write => RecoveryWrite,
+                FileSync => RecoveryFileSync,
+                Rename => RecoveryRename,
+                DirectorySync => RecoveryDirectorySync,
+                _ => unreachable!("atomic mirror writer emitted a lifecycle phase"),
+            })
+        })?;
+    } else {
+        match std::fs::remove_file(&mirror) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        before_phase(RecoveryDirectorySync)?;
+        sync_directory_metadata(layout.root())?;
+    }
+    let removed = (|| -> Result<()> {
+        before_phase(RecoveryJournalRemove)?;
+        std::fs::remove_file(&recovery_path)?;
+        before_phase(RecoveryJournalDirectorySync)?;
+        sync_directory_metadata(layout.root())?;
+        Ok(())
+    })();
+    if let Err(error) = removed {
+        // Keep recovery discoverable on the next live request as well as after
+        // restart when unlink succeeded but its directory flush did not.
+        if !recovery_path.try_exists()? {
+            write_mcp_transaction_bytes(&recovery_path, &bytes, |_| Ok(()))?;
+        }
+        return Err(mcp_transaction_recovery_error(&recovery_path, error));
+    }
+    Ok(true)
+}
+
+/// Keep the previous mirror recoverable until the new lifecycle state and the
+/// removal of its recovery record are both durable. Publication commits keep
+/// their separate repository receipt/fence protocol.
+pub(crate) fn write_mcp_transaction_lifecycle(
+    layout: &KinLayout,
+    store: &HashMap<String, kin_mcp::McpTransaction>,
+    mut before_phase: impl FnMut(McpTransactionWritePhase) -> std::io::Result<()>,
+) -> Result<()> {
+    use McpTransactionWritePhase::*;
+    load_persisted_mcp_transactions_checked(layout)?;
+    let recovery_path = mcp_lifecycle_recovery_path(layout);
+    if recovery_path.try_exists()? {
+        return Err(mcp_transaction_recovery_error(
+            &recovery_path,
+            "an earlier lifecycle write is still pending",
+        ));
+    }
+    let mirror = mcp_transactions_disk_path(layout);
+    let previous = match std::fs::read_to_string(&mirror) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let recovery = match previous {
+        Some(bytes) => McpLifecycleRecovery::Present { bytes },
+        None => McpLifecycleRecovery::Missing,
+    };
+    let recovery_bytes = serde_json::to_vec(&recovery)
+        .map_err(|error| mcp_transaction_recovery_error(&recovery_path, error))?;
+    let next = serde_json::to_vec(store)
+        .map_err(|error| mcp_transaction_recovery_error(&mirror, error))?;
+    write_mcp_transaction_bytes(&recovery_path, &recovery_bytes, |phase| {
+        before_phase(match phase {
+            Write => JournalWrite,
+            FileSync => JournalFileSync,
+            Rename => JournalRename,
+            DirectorySync => JournalDirectorySync,
+            _ => unreachable!("atomic mirror writer emitted a lifecycle phase"),
+        })
+    })?;
+    let installed = (|| -> Result<()> {
+        write_mcp_transaction_bytes(&mirror, &next, &mut before_phase)?;
+        before_phase(JournalRemove)?;
+        std::fs::remove_file(&recovery_path)?;
+        before_phase(AcknowledgementDirectorySync)?;
+        sync_directory_metadata(layout.root())?;
+        Ok(())
+    })();
+    if let Err(error) = installed {
+        let restored = (|| -> Result<()> {
+            // Removal itself may have succeeded before its directory flush
+            // failed. Reinstate the recovery record before restoring the mirror.
+            if !recovery_path.try_exists()? {
+                write_mcp_transaction_bytes(&recovery_path, &recovery_bytes, |_| Ok(()))?;
+            }
+            recover_mcp_transaction_lifecycle_with_hook(layout, &mut before_phase)?;
+            Ok(())
+        })();
+        return Err(DaemonError::Io(std::io::Error::other(match restored {
+            Ok(()) => format!("transaction_persistence_failed: {error}; previous acknowledged transaction state restored; retry the lifecycle call"),
+            Err(recovery_error) => format!("transaction_recovery_required: {error}; rollback could not be confirmed: {recovery_error}; no durable acknowledgement was issued; preserve {} and retry only after storage recovery", recovery_path.display()),
+        })));
+    }
+    Ok(())
 }
 
 /// Durably mirror the in-memory MCP transaction store to disk. Writes via a
@@ -1018,34 +1221,113 @@ pub(crate) fn write_persisted_mcp_transactions(
 /// Durably mirror MCP transaction state or fail before repository authority is
 /// allowed to move.
 ///
-/// The ordinary non-publication lifecycle wrapper above remains best-effort,
-/// but exact repository commits use this checked boundary for their non-terminal
-/// `committing` fence. The file and containing directory are flushed so a
+/// Exact repository commits use this checked boundary for their non-terminal
+/// `committing` fence; begin/stage/validate/abort use the recoverable lifecycle
+/// writer. The file and containing directory are flushed so a
 /// successful return survives process and power loss on hosts that expose
 /// directory fsync.
 pub(crate) fn write_persisted_mcp_transactions_checked(
     layout: &KinLayout,
     store: &HashMap<String, kin_mcp::McpTransaction>,
 ) -> Result<()> {
+    let pending = mcp_lifecycle_recovery_path(layout);
+    if pending.try_exists()? {
+        return Err(mcp_transaction_recovery_error(
+            &pending,
+            "lifecycle recovery must finish before another transaction write",
+        ));
+    }
+    // Never replace unreadable recovery evidence with the empty startup view.
+    load_persisted_mcp_transactions_checked(layout)?;
     let path = mcp_transactions_disk_path(layout);
     let bytes = serde_json::to_vec(store).map_err(|error| {
         DaemonError::Io(std::io::Error::other(format!(
             "serialize MCP transactions: {error}"
         )))
     })?;
-    let tmp = path.with_extension("json.tmp");
+    write_mcp_transaction_bytes(&path, &bytes, |_| Ok(()))
+}
+
+#[cfg(test)]
+static MCP_TRANSACTION_TEMP_IDS: std::sync::LazyLock<
+    Mutex<HashMap<std::path::PathBuf, uuid::Uuid>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct McpTransactionTempGuard(std::path::PathBuf);
+
+#[cfg(test)]
+impl McpTransactionTempGuard {
+    pub(crate) fn new(path: &std::path::Path) -> Self {
+        let previous = MCP_TRANSACTION_TEMP_IDS
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), uuid::Uuid::new_v4());
+        assert!(
+            previous.is_none(),
+            "temporary path override is already held"
+        );
+        Self(path.to_owned())
+    }
+
+    pub(crate) fn path(&self) -> std::path::PathBuf {
+        mcp_transaction_temporary_path(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for McpTransactionTempGuard {
+    fn drop(&mut self) {
+        MCP_TRANSACTION_TEMP_IDS.lock().unwrap().remove(&self.0);
+    }
+}
+
+fn mcp_transaction_temporary_path(path: &std::path::Path) -> std::path::PathBuf {
+    let id = uuid::Uuid::new_v4();
+    #[cfg(test)]
+    let id = MCP_TRANSACTION_TEMP_IDS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or(id);
+    path.with_extension(format!("json.{id}.tmp"))
+}
+
+fn write_mcp_transaction_bytes(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mut before_phase: impl FnMut(McpTransactionWritePhase) -> std::io::Result<()>,
+) -> Result<()> {
+    let tmp = mcp_transaction_temporary_path(path);
+    let mut owns_tmp = false;
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&bytes)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        owns_tmp = true;
+        before_phase(McpTransactionWritePhase::Write)?;
+        file.write_all(bytes)?;
+        before_phase(McpTransactionWritePhase::FileSync)?;
         file.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
+        before_phase(McpTransactionWritePhase::Rename)?;
+        std::fs::rename(&tmp, path)?;
+        owns_tmp = false;
         if let Some(parent) = path.parent() {
+            before_phase(McpTransactionWritePhase::DirectorySync)?;
             sync_directory_metadata(parent)?;
         }
         Ok(())
     })();
     if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&tmp);
+        if owns_tmp {
+            let _ = std::fs::remove_file(&tmp);
+        }
         return Err(DaemonError::Io(error));
     }
     Ok(())
@@ -3103,9 +3385,18 @@ pub struct DaemonState {
     /// but before the derived graph and terminal transaction state install.
     #[cfg(test)]
     pub(crate) mcp_fail_after_authority_once: AtomicBool,
+    #[cfg(test)]
+    pub(crate) mcp_lifecycle_persist_fail_once: AtomicU8,
     /// Exact MCP commits in flight, keyed by transaction id, so a re-sent commit joins
     /// the one already running instead of running the whole commit a second time.
     pub(crate) inflight_mcp_commits: crate::mcp_commit::InflightMcpCommits,
+    pub(crate) mcp_mutate_requests: Mutex<crate::mcp_mutate::RequestIndex>,
+    #[cfg(test)]
+    pub(crate) mcp_mutate_fail_once: AtomicU8,
+    #[cfg(test)]
+    pub(crate) mcp_mutate_publication_hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    pub(crate) mcp_mutate_publication_reached: AtomicBool,
     /// How many exact MCP commits started, for the tests that prove a re-sent commit
     /// does not start a second one.
     #[cfg(test)]
@@ -5603,7 +5894,16 @@ impl DaemonState {
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
             mcp_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            mcp_lifecycle_persist_fail_once: AtomicU8::new(0),
             inflight_mcp_commits: Default::default(),
+            mcp_mutate_requests: Default::default(),
+            #[cfg(test)]
+            mcp_mutate_fail_once: AtomicU8::new(0),
+            #[cfg(test)]
+            mcp_mutate_publication_hold: Default::default(),
+            #[cfg(test)]
+            mcp_mutate_publication_reached: AtomicBool::new(false),
             #[cfg(test)]
             mcp_commit_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -6012,7 +6312,16 @@ impl DaemonState {
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
             mcp_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            mcp_lifecycle_persist_fail_once: AtomicU8::new(0),
             inflight_mcp_commits: Default::default(),
+            mcp_mutate_requests: Default::default(),
+            #[cfg(test)]
+            mcp_mutate_fail_once: AtomicU8::new(0),
+            #[cfg(test)]
+            mcp_mutate_publication_hold: Default::default(),
+            #[cfg(test)]
+            mcp_mutate_publication_reached: AtomicBool::new(false),
             #[cfg(test)]
             mcp_commit_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -9816,6 +10125,40 @@ impl DaemonState {
         }
 
         (Arc::clone(&self.graph), RequestGraphAuthority::Head)
+    }
+
+    /// Pair a selected graph with the source revision owned by that exact scope.
+    /// Reading the head under the same lock as the Arc comparison prevents a
+    /// rebind from pairing an old graph with a newer session revision. `None`
+    /// means the selected authority expired or was replaced; never fall back
+    /// to workspace source for that graph.
+    pub(crate) async fn source_scope_for_selected_graph(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+        graph: &Arc<kin_db::InMemoryGraph>,
+        authority: RequestGraphAuthority,
+    ) -> Option<kin_mcp::handlers::common::EntitySourceScope> {
+        use kin_mcp::handlers::common::EntitySourceScope;
+        match authority {
+            RequestGraphAuthority::Head => {
+                if let Some(session_id) = session_id {
+                    let scopes = self.session_scopes.read().await;
+                    if scopes
+                        .get(session_id)
+                        .is_some_and(|scope| !scope.is_expired())
+                    {
+                        return None;
+                    }
+                }
+                Arc::ptr_eq(graph, &self.graph).then_some(EntitySourceScope::WorkspaceHead)
+            }
+            RequestGraphAuthority::SessionScope => {
+                let scopes = self.session_scopes.read().await;
+                let scope = scopes.get(session_id?)?;
+                (!scope.is_expired() && Arc::ptr_eq(graph, &scope.cached_graph))
+                    .then_some(EntitySourceScope::At(scope.head))
+            }
+        }
     }
 
     /// Revalidate that a selected request graph is still owned by the same

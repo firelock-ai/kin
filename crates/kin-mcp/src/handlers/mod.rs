@@ -6126,25 +6126,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_mutate_request_ids_are_not_deduplicated() {
+    async fn repeated_unkeyed_mutations_are_not_deduplicated() {
         let store = InMemoryGraph::default();
         let sessions = SessionRegistry::new();
         let entity = placement_free_entity("RepeatMutationEntity");
         store.upsert_entity(&entity).unwrap();
         let mut updated = entity.clone();
         updated.doc_summary = Some("repeat mutation documentation".into());
-        let args = HashMap::from([
-            ("request_id".to_string(), serde_json::json!("same-request")),
-            (
-                "operations".to_string(),
-                serde_json::json!([{
-                    "verb": "update",
-                    "target": entity.id.to_string(),
-                    "description": "update entity docs",
-                    "payload": { "Entity": updated },
-                }]),
-            ),
-        ]);
+        let args = HashMap::from([(
+            "operations".to_string(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": entity.id.to_string(),
+                "description": "update entity docs",
+                "payload": { "Entity": updated },
+            }]),
+        )]);
         for attempt in 0..2 {
             let result = sessions::handle_mutate(
                 &args,
@@ -6158,7 +6155,7 @@ mod tests {
                 assert_ne!(result.is_error, Some(true), "{}", tool_result_text(&result));
                 let receipt: serde_json::Value =
                     serde_json::from_str(&tool_result_text(&result)).unwrap();
-                assert_eq!(receipt["request_id"], "same-request");
+                assert!(receipt.get("request_id").is_none());
             } else {
                 assert_eq!(result.is_error, Some(true));
                 assert!(tool_result_text(&result).contains("no-op"));
@@ -6192,7 +6189,48 @@ mod tests {
         assert!(!definition.annotations.read_only_hint);
         assert!(definition.annotations.destructive_hint);
         assert!(!definition.annotations.idempotent_hint,
-            "a repeated request starts a new transaction instead of replaying its receipt; the hint must not promise idempotence");
+            "an unkeyed request starts a new transaction; the overall tool must not promise idempotence");
+    }
+
+    #[tokio::test]
+    async fn keyed_mutation_refuses_offline_and_old_daemon_without_beginning() {
+        let store = InMemoryGraph::default();
+        let registry = SessionRegistry::new();
+        let args = HashMap::from([
+            ("request_id".to_string(), serde_json::json!("opaque-é")),
+            (
+                "session_id".to_string(),
+                serde_json::json!("11111111-1111-4111-8111-111111111111"),
+            ),
+            ("operations".to_string(), serde_json::json!([])),
+        ]);
+        let offline = sessions::handle_mutate(
+            &args,
+            &store,
+            &registry,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(offline.is_error, Some(true));
+        assert!(tool_result_text(&offline).contains("durable_request_daemon_required"));
+        assert!(registry.list_transactions().is_empty());
+        let calls = std::sync::Mutex::new(Vec::new());
+        let refused = sessions::mutate_through(&args, |name, arguments| {
+            calls.lock().unwrap().push((name, arguments));
+            async {
+                Ok(Some(crate::ToolCallResult::error(
+                    "Unknown tool: kin_mutate_durable_v1",
+                )))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(refused.is_error, Some(true));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, sessions::DURABLE_MUTATE_TOOL);
+        assert_eq!(calls[0].1, args);
     }
 
     /// A payload-less entity update carrying the body and nothing else.
@@ -6469,6 +6507,33 @@ mod tests {
                 other => Err(format!("unexpected forward {other}")),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn a_source_base_conflict_retains_the_one_shot_transaction() {
+        let calls: Recorded = Default::default();
+        let result = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                calls.clone(),
+                || {
+                    Ok(Some(ToolCallResult::error(
+                        crate::source_base::source_base_conflict("tx-1", "body changed"),
+                    )))
+                },
+                || Err("source-base conflict must never abort retained work".into()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(crate::source_base::is_source_base_conflict(
+            &tool_result_text(&result)
+        ));
+        assert_eq!(
+            forwarded(&calls),
+            ["kin_transaction_begin", "kin_transaction_commit"]
+        );
     }
 
     fn sessioned_mutate() -> HashMap<String, serde_json::Value> {
