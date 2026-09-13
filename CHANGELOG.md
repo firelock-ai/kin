@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.18] - 2026-09-13
+
+### Changed
+
+- Guard native agent writes and simplify release archives (#1781)
+- fix(cli): skip profile for top-level display flags (#1778)
+- docs: explain C# and Ruby test detection gap (#1780)
+- Update kin source (#1785)
+- chore: bump version to 0.7.18 (#1787)
+
+
 ## [0.7.17] - 2026-09-12
 
 ### Changed
