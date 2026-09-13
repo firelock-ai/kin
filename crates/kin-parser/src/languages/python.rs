@@ -10,8 +10,9 @@ use crate::adapter::{
 };
 use crate::error::Result;
 use crate::extract::{
-    call_extraction_incomplete_marker, CallArgShape, ExtractedEntity, ExtractedRelation,
-    ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput, RelationSite,
+    call_extraction_incomplete_marker, scoped_call_extraction_incomplete_marker, CallArgShape,
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput, RelationSite,
 };
 
 /// Every public name CPython's `builtins` module binds, sorted so
@@ -276,23 +277,11 @@ impl LanguageAdapter for PythonAdapter {
             }
         }
 
-        // A syntax-valid tree can still contain a call shape this adapter did
-        // not represent with a proven destination, for example a dynamic callee,
-        // an untyped receiver, or a call at module/class scope where no callable
-        // entity owns the edge. Keep syntax state and call-coverage completeness
-        // separate: carry one reserved negative record to the linker, which
-        // fails closed without rejecting the valid file.
-        // One walk answers both questions. `seen_calls` holds one span per call
-        // node extraction visited, so `call_nodes` is at least its size and
-        // exceeds it exactly when a call node was never visited at all. The
-        // decorator half is deliberately not in that comparison: the extractor
-        // emits an edge for each of those without ever visiting a `call` node,
-        // so counting them here would report every decorated file incomplete.
+        // Keep the full-file census and its broad completeness meaning. Scoped
+        // negative records below distinguish a known but unresolved callee from
+        // syntax that extraction could not name; neither makes the file complete.
         let mut census = PythonCallSiteCensus::default();
         census_python_call_sites(&root, source, &mut census);
-        if call_audit.incomplete || census.call_nodes > call_audit.seen_calls.len() as u64 {
-            relations.push(call_extraction_incomplete_marker());
-        }
 
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
@@ -322,6 +311,37 @@ impl LanguageAdapter for PythonAdapter {
                 fingerprint: compute_fingerprint(&root, source),
                 span: span_from_node(&root, file_id),
                 declaration_line: None,
+            });
+        }
+
+        // Calls outside the callable walk still count as gaps. Assign them only
+        // to a unique innermost declaration. Ambiguous ownership remains global.
+        for site in &census.sites {
+            if call_audit
+                .seen_calls
+                .contains(&(site.start_byte, site.end_byte))
+            {
+                continue;
+            }
+            let mut owners: Vec<_> = entities
+                .iter()
+                .filter(|entity| {
+                    entity.span.start_byte <= site.start_byte
+                        && site.end_byte <= entity.span.end_byte
+                })
+                .collect();
+            owners.sort_by_key(|entity| entity.span.end_byte - entity.span.start_byte);
+            let owner = owners.first().filter(|first| {
+                owners.get(1).is_none_or(|second| {
+                    first.span.end_byte - first.span.start_byte
+                        < second.span.end_byte - second.span.start_byte
+                })
+            });
+            relations.push(match owner {
+                Some(owner) => {
+                    scoped_call_extraction_incomplete_marker(owner.name.clone(), site.clone(), None)
+                }
+                None => call_extraction_incomplete_marker(),
             });
         }
 
@@ -1354,7 +1374,6 @@ fn extract_module_docstring(root: &tree_sitter::Node, source: &[u8]) -> Option<S
 #[derive(Default)]
 struct PythonCallExtractionAudit {
     seen_calls: std::collections::HashSet<(usize, usize)>,
-    incomplete: bool,
 }
 
 /// The call sites a Python file holds, split into the two kinds that reach the
@@ -1378,6 +1397,7 @@ struct PythonCallSiteCensus {
     /// completeness check compares against: it exceeds the number of call sites
     /// the walker visited precisely when one was missed.
     call_nodes: u64,
+    sites: Vec<RelationSite>,
     /// Decorators that produce a `Calls` relation and hold no `call` node of
     /// their own, meaning every form but `@mod.name(args)`.
     ///
@@ -1408,6 +1428,7 @@ fn census_python_call_sites(
 ) {
     if node.kind() == "call" {
         census.call_nodes += 1;
+        census.sites.push(site_from_node(node));
     }
     if node.kind() == "decorated_definition" {
         census.decorator_sites += bare_decorator_call_sites(node, source);
@@ -2013,17 +2034,42 @@ fn extract_calls_from_context(
                     call_shape: Some(extract_call_arg_shape(&child, source)),
                     kind: kin_model::RelationKind::Calls,
                     src_name: context_name.to_string(),
-                    dst_name: callee.name,
+                    dst_name: callee.name.clone(),
                     import_source: None,
                 });
                 if !callee.resolution_proven {
-                    call_audit.incomplete = true;
+                    relations.push(scoped_call_extraction_incomplete_marker(
+                        context_name.into(),
+                        site_from_node(&child),
+                        Some(callee.name),
+                    ));
                 }
             } else {
-                call_audit.incomplete = true;
+                relations.push(scoped_call_extraction_incomplete_marker(
+                    context_name.into(),
+                    site_from_node(&child),
+                    None,
+                ));
             }
         }
-        // Recurse into child nodes
+        if matches!(
+            child.kind(),
+            "function_definition"
+                | "class_definition"
+                | "lambda"
+                | "decorator"
+                | "default_parameter"
+                | "typed_default_parameter"
+        ) && contains_call_node(&child)
+        {
+            relations.push(scoped_call_extraction_incomplete_marker(
+                context_name.into(),
+                site_from_node(&child),
+                None,
+            ));
+        }
+        // Recurse into child nodes. Positive extraction is unchanged; a nested
+        // execution scope above cannot provide caller-specific negative evidence.
         extract_calls_from_context(
             &child,
             source,

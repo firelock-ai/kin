@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Exact entity source base v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "kin.entity.source_base.v1"
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workspace_generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "workspace_head_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "workspace_tree_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "repository_id",
+        "workspace_id",
+        "workspace_generation",
+        "workspace_head_hash",
+        "workspace_tree_hash"
+      ]
+    },
+    "entity_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "artifact_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "source_blob_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "start_byte": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "end_byte": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "body_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "required": [
+    "schema",
+    "context",
+    "entity_id",
+    "artifact_id",
+    "source_blob_hash",
+    "start_byte",
+    "end_byte",
+    "body_hash"
+  ]
+}

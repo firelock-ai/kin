@@ -1428,26 +1428,9 @@ async fn handle_tools_call_daemon(
         return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
     }
 
-    // `kin_mutate` is expanded here rather than forwarded, and that is a
-    // correctness requirement rather than an optimisation.
-    //
-    // Everything below this point is handed to the daemon under the name the
-    // caller used, and the daemon runs what arrives through
-    // `handlers::handle_tool_call` with `SessionAuthorityMode::OfflineFallback`,
-    // because inside the daemon its own registry IS the authority. A forwarded
-    // `kin_mutate` therefore reaches `handle_mutate` with `uses_daemon()` FALSE
-    // and takes the in-process branch, whose commit has no projection and
-    // correctly refuses a source body rather than reporting a success that
-    // discarded it. And the daemon routes exactly one name,
-    // `kin_transaction_commit`, to its exact-commit path, so a one-shot under
-    // any other name never reaches it at all.
-    //
-    // Expanding on this side sends a begin and a commit under the names the
-    // daemon matches, with the operations inline on the commit, which
-    // `kin_transaction_commit` has always accepted, and with a
-    // `transaction_id`, which is what the daemon's transaction coordination
-    // preflight keys on. A one-shot expanded on the far side would have had
-    // neither.
+    // The one-shot adapter preserves the existing unkeyed begin/commit path.
+    // Keyed requests travel intact under a versioned internal name so an old
+    // daemon refuses the durable contract before any transaction is started.
     if call_params.name == "kin_mutate" {
         let result = crate::handlers::sessions::mutate_through_daemon(&call_params.arguments)
             .await

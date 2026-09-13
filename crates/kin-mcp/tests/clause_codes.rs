@@ -20,6 +20,18 @@ use kin_mcp::verdict::{CLAUSE_CODES, UNLISTED_CLAUSE_CODE};
 /// stale allowance fails rather than quietly widening what passes.
 const NOT_CLAUSES: &[(&str, &str)] = &[
     (
+        "durable_request_daemon_required",
+        "handlers/sessions.rs: a keyed mutation transport-capability refusal, not a retrieval verdict",
+    ),
+    (
+        "durable_request_outcome_unknown",
+        "handlers/sessions.rs: a keyed mutation transport outcome error, not a retrieval verdict",
+    ),
+    (
+        "invalid_request_id",
+        "handlers/sessions.rs: a mutation request-identity validation error",
+    ),
+    (
         "kin",
         "kin-core layout.rs: the prefix of a CLI refusal message",
     ),

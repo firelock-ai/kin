@@ -244,6 +244,9 @@ fn authored_files_from_staged(
             Some(kin_mcp::McpMutationPayload::Entity(payload)) => {
                 graph.get_entity(&payload.id).ok().flatten()?
             }
+            Some(kin_mcp::McpMutationPayload::EntitySourceBase(expected)) => {
+                graph.get_entity(&expected.entity_id).ok().flatten()?
+            }
             // A relation operation writes no file, so it claims none.
             Some(_) => continue,
             None => {
@@ -372,6 +375,36 @@ pub(crate) fn commit_exact_transaction(
     arguments: &HashMap<String, serde_json::Value>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
 ) -> kin_mcp::ToolCallResult {
+    if let Some(transaction_id) = arguments
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        if let Err(error) = crate::mcp_mutate::ensure_unbound(state, transaction_id) {
+            return kin_mcp::ToolCallResult::error(error);
+        }
+    }
+    match commit_exact_transaction_inner(state, sessions, arguments, coordination) {
+        Ok(result) => result,
+        Err(error) => kin_mcp::ToolCallResult::error(error),
+    }
+}
+
+/// The daemon's one-shot owner reaches the same exact writer only after its
+/// immutable request reservation has been durably installed and checked.
+pub(crate) fn commit_bound_transaction(
+    state: &Arc<DaemonState>,
+    sessions: &kin_mcp::SessionRegistry,
+    arguments: &HashMap<String, serde_json::Value>,
+    coordination: Option<&kin_mcp::CoordinationWritePreflight>,
+    binding: &crate::mcp_mutate::RequestBinding,
+) -> kin_mcp::ToolCallResult {
+    let transaction_id = arguments
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if let Err(error) = crate::mcp_mutate::validate_bound_commit(state, binding, transaction_id) {
+        return kin_mcp::ToolCallResult::error(error);
+    }
     match commit_exact_transaction_inner(state, sessions, arguments, coordination) {
         Ok(result) => result,
         Err(error) => kin_mcp::ToolCallResult::error(error),
@@ -552,6 +585,24 @@ fn commit_exact_transaction_inner(
     })
     .map_err(|error| format!("load exact MCP commit base: {error}"))?;
     require_bound_authority_revision(state, &base, &transaction_id)?;
+    if let Err(reason) = crate::mcp_source_base::require_source_bases(
+        &authority_context,
+        &held_authority,
+        &base,
+        &transaction.staged_operations,
+    ) {
+        // Preserve even operations supplied inline by a one-shot mutation.
+        // A conflict is not permission to discard the caller's work.
+        persist_registry_checked(state, sessions).map_err(|error| {
+            format!(
+                "source base conflict; could not durably retain the attempted operations: {error}"
+            )
+        })?;
+        return Err(kin_mcp::source_base::source_base_conflict(
+            &transaction_id,
+            &reason,
+        ));
+    }
     let requested_message = requested_commit_message(arguments);
     let plan = match timed_commit_phase("plan_transaction", || {
         plan_exact_transaction(
@@ -588,6 +639,8 @@ fn commit_exact_transaction_inner(
         ));
     }
 
+    #[cfg(test)]
+    crate::mcp_mutate::fault(state, 8)?;
     let committed = match timed_commit_phase("publish_authority_and_projection", || {
         commit_native_plan_with_authored_projection(
             &state.layout,
@@ -1038,7 +1091,7 @@ fn transaction_payload_hash(transaction: &kin_mcp::McpTransaction) -> Result<Str
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn hash_canonical_json(hasher: &mut Sha256, value: &serde_json::Value) {
+pub(crate) fn hash_canonical_json(hasher: &mut Sha256, value: &serde_json::Value) {
     match value {
         serde_json::Value::Null => hasher.update([0]),
         serde_json::Value::Bool(value) => hasher.update([1, u8::from(*value)]),
@@ -1248,6 +1301,24 @@ fn plan_exact_transaction(
             .as_ref()
             .ok_or_else(|| format!("operation '{}' has no payload", operation.verb))?;
         match payload {
+            kin_mcp::McpMutationPayload::EntitySourceBase(expected) => {
+                let existing = base
+                    .graph
+                    .get_entity(&expected.entity_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("the guarded entity disappeared during planning")?;
+                record_source_edit(
+                    &mut edits,
+                    &mut edited_entities,
+                    base,
+                    existing,
+                    operation
+                        .body
+                        .as_ref()
+                        .ok_or("guarded source edit has no body")?
+                        .as_bytes(),
+                )?;
+            }
             kin_mcp::McpMutationPayload::Entity(payload_entity) => {
                 if operation.target.trim() != payload_entity.id.to_string() {
                     return Err(format!(
@@ -3164,7 +3235,9 @@ fn transaction_delta_between(
     })
 }
 
-fn changed_file_ids(change: &kin_model::SemanticChange) -> Result<Vec<FilePathId>, String> {
+pub(crate) fn changed_file_ids(
+    change: &kin_model::SemanticChange,
+) -> Result<Vec<FilePathId>, String> {
     let mut files = change
         .tree_deltas
         .iter()

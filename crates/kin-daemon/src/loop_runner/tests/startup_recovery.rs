@@ -141,7 +141,7 @@ fn startup_diagnostic_marker_positive_control_recovers_the_known_function() {
     startup_diagnostic_trace("marked_reopen_before_planning", &restarted);
     let repair = plan_unpublished_enrichment_repair(&restarted).unwrap();
     assert_eq!(repair.len(), 1);
-    assert!(matches!(&repair[0], FileEvent::Changed(path) if path.ends_with("orphan.py")));
+    assert_eq!(repair[0].as_utf8(), Some("orphan.py"));
     derive_semantics(&restarted, "orphan.py");
     startup_diagnostic_trace("marked_positive_control_after_real_reconcile", &restarted);
     assert!(restarted
@@ -828,31 +828,24 @@ async fn startup_diagnostic_deferred_drain_keeps_the_previous_authority_body_owe
 async fn startup_diagnostic_refused_publication_retains_both_bodies() {
     let repo = tempfile::tempdir().unwrap();
     let state = startup_diagnostic_committed_orphan(&repo).await;
-    std::fs::write(
-        repo.path().join("orphan.py"),
-        b"\ndef orphan():\n    return 8\n",
-    )
-    .unwrap();
+    let canonical_body = b"\ndef orphan():\n    return 8\n";
+    let proposed_body = b"\n\ndef orphan():\n    return 9\n";
+    let orphan_id = startup_diagnostic_orphan(&state).id;
+    std::fs::write(repo.path().join("orphan.py"), canonical_body).unwrap();
     exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
     let previous = authority_tree(&state);
     let generation = authority_generation(&state);
+    let authority_roots = current_authority_admission(&state).unwrap().0;
     let old = crate::semantic_debt::outstanding(&state)
         .into_iter()
         .find(|e| e.path == "orphan.py")
         .unwrap();
-    std::fs::write(
-        repo.path().join("orphan.py"),
-        b"\n\ndef orphan():\n    return 9\n",
-    )
-    .unwrap();
-    std::fs::write(
-        repo.path().join("secret.py"),
-        br#"def connect():
+    std::fs::write(repo.path().join("orphan.py"), proposed_body).unwrap();
+    let refused_secret = br#"def connect():
     password = "s3cret-notekeeper-value"
     return password
-"#,
-    )
-    .unwrap();
+"#;
+    std::fs::write(repo.path().join("secret.py"), refused_secret).unwrap();
     let deferred = sync_filesystem_with_graph_deferring_tree_publication(&state)
         .await
         .unwrap()
@@ -883,13 +876,74 @@ async fn startup_diagnostic_refused_publication_retains_both_bodies() {
         recorded.contains(&old) && recorded.contains(&proposed),
         "a refused publication retains both authority and proposed debt: {recorded:?}"
     );
-    let error = drain_semantic_debt(&state)
-        .await
-        .expect_err("the host still holds the refused proposal, so re-admission must wait");
-    assert!(matches!(error, DaemonError::SemanticReadmissionFailed(_)));
+    // Canonical repair does not re-admit the host proposal. It may settle live
+    // spans against authority while both proposed files remain refused on disk.
+    {
+        let _coordination = state.coordination_gate.lock().await;
+        drain_semantic_debt(&state).await.unwrap();
+    }
+    let repaired = startup_diagnostic_orphan(&state);
+    assert_eq!(repaired.id, orphan_id);
+    assert_eq!(repaired.metadata.extra["blob_hash"], old.body);
+    let canonical_hash = kin_blobs::Hash256::from_hex(&old.body).unwrap();
+    let proposed_hash = kin_blobs::Hash256::from_hex(&proposed.body).unwrap();
+    let canonical_bytes = state.blobs.read(&canonical_hash).unwrap();
+    assert_eq!(canonical_bytes, canonical_body);
+    assert_eq!(state.blobs.read(&proposed_hash).unwrap(), proposed_body);
+    let span = repaired.span.unwrap();
+    assert_eq!(span.start_line, 1);
+    assert_eq!(
+        std::str::from_utf8(&canonical_bytes[span.start_byte..span.end_byte])
+            .unwrap()
+            .trim_end(),
+        "def orphan():\n    return 8"
+    );
+    assert_eq!(
+        std::fs::read(repo.path().join("orphan.py")).unwrap(),
+        proposed_body
+    );
+    assert_eq!(
+        std::fs::read(repo.path().join("secret.py")).unwrap(),
+        refused_secret
+    );
+    assert_eq!(authority_generation(&state), generation);
+    assert_eq!(
+        current_authority_admission(&state).unwrap().0,
+        authority_roots
+    );
+    assert_eq!(authority_tree(&state), previous);
+    assert_eq!(state.graph.resolved_tree(), previous);
+    assert!(state
+        .graph
+        .artifact_id_at_path(&test_repo_path("secret.py"))
+        .is_none());
+    assert!(state
+        .graph
+        .query_entities(&EntityFilter {
+            file_path: Some(FilePathId::new("secret.py")),
+            ..Default::default()
+        })
+        .unwrap()
+        .is_empty());
     let remaining = crate::semantic_debt::outstanding(&state);
-    assert!(remaining.contains(&old));
-    assert!(!remaining.contains(&proposed));
+    assert!(
+        remaining.contains(&old),
+        "live repair is not semantic publication"
+    );
+    assert!(
+        !remaining.contains(&proposed),
+        "the rejected body is no longer current authority debt"
+    );
+    let refusal = publish_exact_workspace_tree(&state, &deferred).unwrap_err();
+    assert!(
+        refusal.to_string().contains("CredentialAssignment"),
+        "{refusal}"
+    );
+    assert_eq!(
+        current_authority_admission(&state).unwrap().0,
+        authority_roots
+    );
+    assert_eq!(state.graph.resolved_tree(), previous);
 }
 
 #[tokio::test]

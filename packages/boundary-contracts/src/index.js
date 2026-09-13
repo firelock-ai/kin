@@ -10,6 +10,7 @@ const schemaDir = path.join(root, 'schemas');
 let schemaCachePromise;
 
 const schemaFiles = {
+  entitySourceBase: 'entity-source-base.schema.json',
   workspaceContext: 'workspace-context.schema.json',
   scmContext: 'scm-context.schema.json',
   fileStat: 'file-stat.schema.json',
