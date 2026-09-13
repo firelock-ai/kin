@@ -13,17 +13,15 @@
 //! need not refuse: it can cut the prompt to fit, report a prompt count that no longer grows
 //! with the conversation, and let the model answer from whatever survived.
 //!
-//! The estimate is anchored on the endpoint's own count whenever the endpoint reports one:
-//! the last turn's `prompt_tokens` plus `completion_tokens` is what the next request starts
-//! from, in the endpoint's own tokenizer. Only what the loop appended since then is estimated
-//! from bytes, at [`BYTES_PER_TOKEN`], which is below what Kin's JSON costs on a local model's
-//! tokenizer, so the estimate errs toward stopping early rather than overflowing.
+//! Complete requests are admitted before dispatch, including tools and chat history. The
+//! optional llama.cpp mode counts the selected server's rendered template/tokenizer contract.
+//! Generic providers use an explicitly labeled byte heuristic; it is not a tokenizer guarantee.
+//! Reported usage anchors estimates between admissions, while tool results remain bounded.
 
 use crate::provider::Usage;
 use serde_json::{json, Value};
 
-/// Bytes per token the estimate assumes. Kin's pretty-printed JSON measures a little above
-/// three bytes a token on a local model, so this is the conservative side of it.
+/// Bytes per token used by the heuristic. This is not an upper bound for every tokenizer.
 pub const BYTES_PER_TOKEN: u64 = 3;
 /// Tokens a chat template adds around each message beyond the message's own text.
 const MESSAGE_OVERHEAD_TOKENS: u64 = 8;
@@ -186,6 +184,8 @@ pub struct ContextMeter {
     /// Bytes appended since the anchor, or since the start while there is none.
     pending_bytes: u64,
     pending_messages: u64,
+    request_tokens: Option<u64>,
+    last_request_accounting: Value,
 }
 
 impl ContextMeter {
@@ -197,7 +197,16 @@ impl ContextMeter {
             baseline_bytes,
             pending_bytes: 0,
             pending_messages: 0,
+            request_tokens: None,
+            last_request_accounting: json!({"method": "heuristic", "exact": false, "admitted": false}),
         }
+    }
+
+    /// The run validates an override against its window before constructing the meter.
+    pub(crate) fn with_reserve(window: ContextWindow, baseline_bytes: u64, reserve: u64) -> Self {
+        let mut meter = Self::new(window, baseline_bytes);
+        meter.reserve = reserve;
+        meter
     }
 
     pub fn window(&self) -> ContextWindow {
@@ -210,34 +219,42 @@ impl ContextMeter {
 
     /// The estimated size of the next request, if it were sent now.
     pub fn used(&self) -> u64 {
-        let pending =
-            estimate_tokens(self.pending_bytes) + self.pending_messages * MESSAGE_OVERHEAD_TOKENS;
-        match self.anchor {
-            Some(anchor) => anchor + pending,
-            None => estimate_tokens(self.baseline_bytes) + pending,
+        let pending = estimate_tokens(self.pending_bytes).saturating_add(
+            self.pending_messages
+                .saturating_mul(MESSAGE_OVERHEAD_TOKENS),
+        );
+        match self.request_tokens.or(self.anchor) {
+            Some(anchor) => anchor.saturating_add(pending),
+            None => estimate_tokens(self.baseline_bytes).saturating_add(pending),
         }
     }
 
     /// Whether one more message of `bytes` bytes still leaves the answer its reserve.
     pub fn fits(&self, bytes: u64) -> bool {
-        self.used() + estimate_tokens(bytes) + MESSAGE_OVERHEAD_TOKENS + self.reserve
+        self.used()
+            .saturating_add(estimate_tokens(bytes))
+            .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+            .saturating_add(self.reserve)
             <= self.window.tokens
     }
 
     /// Whether the next turn still leaves the answer its reserve.
     pub fn has_room_for_a_turn(&self) -> bool {
-        self.used() + self.reserve <= self.window.tokens
+        self.used().saturating_add(self.reserve) <= self.window.tokens
     }
 
     /// Whether a request of the current size, plus one short message, fits the window at all.
     pub fn fits_a_final_request(&self, message_bytes: u64) -> bool {
-        self.used() + estimate_tokens(message_bytes) + MESSAGE_OVERHEAD_TOKENS < self.window.tokens
+        self.used()
+            .saturating_add(estimate_tokens(message_bytes))
+            .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+            < self.window.tokens
     }
 
     /// Count one message the loop appended to the conversation.
     pub fn add(&mut self, bytes: u64) {
-        self.pending_bytes += bytes;
-        self.pending_messages += 1;
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        self.pending_messages = self.pending_messages.saturating_add(1);
     }
 
     /// Re-anchor on what the endpoint counted for the turn it just answered. `answer_bytes`
@@ -246,15 +263,29 @@ impl ContextMeter {
     pub fn anchor(&mut self, usage: &Usage, answer_bytes: u64) {
         match usage.input_tokens {
             Some(prompt) => {
+                self.request_tokens = None;
                 let answer = usage
                     .output_tokens
                     .unwrap_or_else(|| estimate_tokens(answer_bytes));
-                self.anchor = Some(prompt + answer);
+                self.anchor = Some(prompt.saturating_add(answer));
                 self.pending_bytes = 0;
                 self.pending_messages = 0;
             }
             None => self.add(answer_bytes),
         }
+    }
+
+    /// Record the next complete request separately from the last completion's usage.
+    pub(crate) fn record_request(&mut self, tokens: u64, accounting: Value) {
+        self.request_tokens = Some(tokens);
+        self.pending_bytes = 0;
+        self.pending_messages = 0;
+        self.last_request_accounting = accounting;
+    }
+
+    pub(crate) fn accounting_failed(&mut self, reason: &str) {
+        self.last_request_accounting =
+            json!({"method": "failed", "exact": false, "admitted": false, "reason": reason});
     }
 
     /// The budget as the result record carries it.
@@ -265,6 +296,7 @@ impl ContextMeter {
             "reserve_tokens": self.reserve,
             "used_tokens": self.used(),
             "anchored_on_endpoint_count": self.anchor.is_some(),
+            "last_request_accounting": self.last_request_accounting,
         })
     }
 }
@@ -291,6 +323,23 @@ mod tests {
             tokens,
             source: ContextSource::Flag,
         }
+    }
+
+    #[test]
+    fn extreme_reported_usage_cannot_wrap_into_an_admitted_estimate() {
+        let mut meter = ContextMeter::new(window(8192), 1);
+        meter.anchor(
+            &Usage {
+                input_tokens: Some(u64::MAX),
+                output_tokens: Some(1),
+            },
+            0,
+        );
+        meter.add(u64::MAX);
+        assert_eq!(meter.used(), u64::MAX);
+        assert!(!meter.fits(1));
+        assert!(!meter.has_room_for_a_turn());
+        assert!(!meter.fits_a_final_request(1));
     }
 
     #[test]

@@ -11025,6 +11025,7 @@ mod memory_pressure_tests {
     fn a_critical_machine_defers_the_background_embedding_pass() {
         let _lock = crate::test_env_lock();
         let _budget = super::budget_no_test_can_fill();
+        let _wanted = EnvVarGuard::unset(super::AUTO_EMBED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
         install_pending_embedding(&state);
