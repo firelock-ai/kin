@@ -536,6 +536,12 @@
       ]
     },
     {
+      "file": "crates/kin-daemon/src/entity_drafts.rs",
+      "reason": "Durable Save/Apply store on Unix. This module is the exclusive-lock, temp-and-rename, hard-link publication path for caller-submitted draft text under .kin/entity-drafts-v1. It never answers locate, search, context, trace, review, or xref. A lie here would lose or retain a draft record, never a graph answer. Whole-file because every filesystem primitive in this file is that store boundary.",
+      "owner": "kin-daemon",
+      "expiration": "2027-04-09"
+    },
+    {
       "file": "crates/kin-core/src/graph_section.rs",
       "reason": "Repository authority lease accessor, not a filesystem probe. The one scanned `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads the workspace set out of it to find one workspace's base target and semantic overlay. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. Nothing in this module answers from the filesystem: it reports whether an open serves a workspace base from the persisted materialized graph section or folds it out of history, and every fact it reports comes from the authority envelope and the change map header the open already holds. Pinned by exact occurrence count rather than by exempting the surrounding function body, so any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. The module's only filesystem primitives are in `#[cfg(test)]` code the scan does not read: a Git fixture that seeds a repository for the section-detection test, and the ignored FIR-3064 open-cost harness, which discovers a store named by an environment variable and shells out to `ps` for a resident-set reading.",
       "owner": "kin-core",
