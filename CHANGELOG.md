@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.19] - 2026-09-13
+
+### Changed
+
+- Complete the v0.7.18 lockstep notes and npm versions (#1788)
+
+
 ## [0.7.18] - 2026-09-13
 
 ### Changed
