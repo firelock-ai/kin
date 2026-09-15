@@ -17,9 +17,9 @@ import { readFileSync } from "node:fs";
 
 // The one title the alarm ever uses. It carries no tag and no count, because
 // the tag moves while the condition does not, and a title that moves opens a
-// second issue every time it does. The release train workflow and the release
-// sentinel prompt both repeat this string, and the release authority suite
-// asserts all three agree, so a rename cannot land in one of them alone.
+// second issue every time it does. The release train workflow repeats this
+// string, and the release authority suite asserts both agree, so a rename
+// cannot land in one of them alone.
 export const ALARM_TITLE = "Release rail is held with releasable drift";
 
 // Roughly an hour of a train that ticks at 7, 22, 37, and 52 past the hour. Low

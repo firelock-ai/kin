@@ -30,7 +30,6 @@ RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RC_BUILD = WORKFLOWS / "rc-build.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
-RELEASE_SENTINEL = WORKFLOWS / "release-sentinel.yml"
 SAST = WORKFLOWS / "sast.yml"
 ADVISORY_SWEEP = WORKFLOWS / "advisory-sweep.yml"
 ADVISORY_SWEEP_SCRIPT = ROOT / "scripts" / "advisory-sweep.mjs"
@@ -932,12 +931,6 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
     ".github/workflows/release-recovery.yml": {
         "reconcile": "Reconcile failed release",
-    },
-    ".github/workflows/release-sentinel.yml": {
-        "preflight": "Resolve sentinel credential",
-        "credential-alarm": "Alarm when the sentinel has no credential to patrol with",
-        "patrol": "Patrol the release rail",
-        "mechanical-patrol": "Patrol the RC-Build-to-Release-Cut handoff mechanically",
     },
     ".github/workflows/install-proof-canary.yml": {
         "capability-canary": "Capability Contract Canary",
@@ -9795,16 +9788,15 @@ def assert_release_proof_key_authority(
 
 def assert_release_hold_marker_contract(
     release_train: str,
-    release_sentinel: str,
     hold_alarm: str,
 ) -> None:
-    """Pin the hold marker to a producer, a consumer, and one alarm title.
+    """Pin the hold marker to a producer and its one alarm title.
 
     A marker nobody reads and an alarm keyed to a title that moves are the two
     ways this reporting path fails back into silence, and both of them look
-    exactly like a working rail from the run history. The producer, the
-    deterministic consumer, and the sentinel prompt each spell the same title
-    and the same schema, so this is what stops the three drifting apart.
+    exactly like a working rail from the run history. The producer and the
+    deterministic consumer spell the same title and the same schema, so this
+    is what stops the two drifting apart.
     """
 
     plan = "\n".join(
@@ -9876,7 +9868,6 @@ def assert_release_hold_marker_contract(
     for source, surface in (
         (hold_alarm, "the hold-alarm reader"),
         (release_train, "the release train's alarm job"),
-        (release_sentinel, "the release sentinel prompt"),
     ):
         if source.count(title) < 1:
             raise AssertionError(
@@ -11215,7 +11206,6 @@ def main() -> None:
     release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
-    release_sentinel = RELEASE_SENTINEL.read_text(encoding="utf-8")
     sast = SAST.read_text(encoding="utf-8")
     advisory_sweep = ADVISORY_SWEEP.read_text(encoding="utf-8")
     hold_alarm = HOLD_ALARM.read_text(encoding="utf-8")
@@ -12579,7 +12569,7 @@ def main() -> None:
     # makes it readable and the alarm job is what makes it heard, so the pair is
     # pinned together: a producer with no consumer and a consumer with no
     # producer both read exactly like a healthy rail.
-    assert_release_hold_marker_contract(release_train, release_sentinel, hold_alarm)
+    assert_release_hold_marker_contract(release_train, hold_alarm)
     expect_assertion(
         "a release-train stand-down publishes no hold marker",
         "must publish a hold marker",
@@ -12590,7 +12580,6 @@ def main() -> None:
                 "",
                 1,
             ),
-            release_sentinel,
             hold_alarm,
         ),
     )
@@ -12606,16 +12595,32 @@ def main() -> None:
                 'Opened the tracking issue with the observed failure or hold and its recovery path."\n',
                 1,
             ),
-            release_sentinel,
             hold_alarm,
         ),
     )
+    # The title-agreement loop lost its only falsification when the release
+    # sentinel was retired: the deleted case mutated the sentinel's copy of the
+    # title, and it was the one thing proving the loop could fire at all. An
+    # assertion nothing falsifies is an assertion that can stop working without
+    # anybody noticing, which is the defect this whole suite exists to catch.
+    # Both surviving surfaces get a case, because a loop that fires for one and
+    # silently skips the other reads identically from a green run.
     expect_assertion(
-        "the sentinel stops naming the one alarm title the reader owns",
+        "the hold-alarm reader stops naming the one alarm title it owns",
         "must spell the one reviewed alarm title",
         lambda: assert_release_hold_marker_contract(
             release_train,
-            release_sentinel.replace(
+            hold_alarm.replace(
+                "Release rail is held with releasable drift",
+                "Release rail is stuck",
+            ),
+        ),
+    )
+    expect_assertion(
+        "the release train stops naming the one alarm title the reader owns",
+        "must spell the one reviewed alarm title",
+        lambda: assert_release_hold_marker_contract(
+            release_train.replace(
                 "Release rail is held with releasable drift",
                 "Release rail is stuck",
             ),
@@ -12627,7 +12632,6 @@ def main() -> None:
         "must accept exactly the schema",
         lambda: assert_release_hold_marker_contract(
             release_train,
-            release_sentinel,
             hold_alarm.replace(
                 'MARKER_SCHEMA = "kin.release-hold.v1"',
                 'MARKER_SCHEMA = "kin.release-hold.v2"',
@@ -12639,7 +12643,6 @@ def main() -> None:
         "must pass the same consecutive-cycle threshold",
         lambda: assert_release_hold_marker_contract(
             release_train,
-            release_sentinel,
             hold_alarm.replace(
                 "DEFAULT_THRESHOLD = 4",
                 "DEFAULT_THRESHOLD = 6",
@@ -12655,7 +12658,6 @@ def main() -> None:
                 "    if: always()",
                 1,
             ),
-            release_sentinel,
             hold_alarm,
         ),
     )
@@ -12668,7 +12670,6 @@ def main() -> None:
                 "--name release-hold-marker-v2 \\",
                 1,
             ),
-            release_sentinel,
             hold_alarm,
         ),
     )

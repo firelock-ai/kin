@@ -90,9 +90,34 @@ import path from "node:path";
 // scripts/test-release-workflow-authority.py now fails the pull request that
 // moves install-proof.yml without moving this pin, so the next drift is caught
 // by that pull request rather than by a release.
+//
+// Resynced 2026-09-15 against install-proof.yml carrying the retired-VFS
+// updater fix. That change rewrites the "Run the real update path" step to
+// record `kin update`'s exit code instead of throwing on it, and appends a
+// "Grade the update, and recover only where a shipped updater cannot" step
+// after it. Both sit in the `update-proof` job, which is scoped to schedule and
+// workflow_dispatch and never runs on the release path this validator mirrors.
+//
+// Compared two ways before moving the pin, because "I read it and it looked
+// fine" is what a stale port is made of.
+//
+// First, by range. Every hunk between the two whole-file shas falls at old
+// lines 2293 to 2331. The mirrored "Validate installed capability proof" step
+// occupies old lines 1731 to 2141 of 2332. No hunk touches it.
+//
+// Second, by content. Extracting that step from its `- name:` line to the next
+// sibling `- name:` gives 411 lines, sha256
+// 66c9b40238d20d8dccb634d947af9e2aca9f3fec34ce100b239842d9fa8e67a6, byte for
+// byte identical at both whole-file shas. That figure is this extraction's own,
+// stated so it can be reproduced; it is not the f2b88473 recorded for the fifth
+// resync above, because the step itself has moved since then under pins that
+// carried their own ports.
+//
+// So nothing was ported this time either. Only the pin moved, as in the
+// kin#1069, kin#1060, kin#1652 and working-copy exit-code resyncs.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "b9d95da504c2223ff4322bc60c735f1cc0dba4dbb806ae8c65cdc250f20598d4",
+  sha256: "d47741379d11b3e04a18903b47ef0120f07f0ad5e91340ebcaeba8175bd689b7",
 };
 
 class Unreadable extends Error {}

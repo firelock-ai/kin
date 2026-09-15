@@ -54,19 +54,28 @@ Use a disposable copy of a small Git repository. Import includes its full reacha
 
 ### 1. Install
 
-On macOS or Linux, run the installer and finish its setup prompts:
+One command, and it is the same on macOS, Linux, Windows and WSL. It installs Kin, connects
+the AI coding tools it finds, and needs Node.js 20 or newer:
+
+```sh
+npx -y @kinlab/kin setup
+```
+
+On a machine without Node, run the installer instead. `get.kinlab.ai` and `get.kinlab.dev`
+serve the same script:
 
 ```sh
 curl -fsSL https://get.kinlab.dev/install | sh
 ```
 
-After it finishes, reload your shell as a separate command:
+Either way, reload your shell as a separate command, because the install puts `kin` in
+`~/.kin/bin` and adds that directory to your shell profile for new sessions:
 
 ```sh
 exec "$SHELL" -l
 ```
 
-For Windows, alternative installers, or troubleshooting, see the [full quickstart](docs/quickstart.md#1-install).
+For Windows PowerShell, other installers, or troubleshooting, see the [full quickstart](docs/quickstart.md#1-install).
 
 ### 2. Initialize the repository
 

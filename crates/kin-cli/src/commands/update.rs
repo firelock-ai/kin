@@ -6766,6 +6766,62 @@ fn validate_notifier_bundle_shape(members: &[BundleMember]) -> Result<()> {
 pub(crate) const RELEASE_ARCHIVE_DOC_FILES: &[&str] =
     &["README.md", "INSTALL.md", "checksums-sha256.txt"];
 
+/// Why the projection runtime is managed but not required on any platform.
+///
+/// `required` is not "this release ships it". It is "an archive without it is a
+/// broken archive, refuse the whole update", and that judgement is made by the
+/// updater ALREADY INSTALLED, from the list compiled into it, against an archive
+/// built much later. A name marked required here is therefore a promise every
+/// future release must keep, enforced by binaries nobody can patch.
+///
+/// v0.7.18 stopped shipping `kin-vfs` and the shim (`ROOT_FILES_BY_FAMILY` in
+/// `scripts/release-archive-shape.cjs` now names only `kin`, `kin-daemon` and
+/// the three doc files). Every install on v0.7.17 or earlier still judges that
+/// archive with the older list, so `kin update` fails on it with "release
+/// archive is incomplete: required component 'kin-vfs' is missing" and cannot
+/// move itself. That is what the Install Proof "Update proof (N-1 to Latest)"
+/// job caught, and it cannot be fixed from the release side: no archive shape
+/// satisfies both the old list and the current one at the same time. Those
+/// installs re-run the installer once, which is why `install.sh` treats
+/// projection as optional and says so.
+///
+/// Optional is what lets this happen once instead of at every retirement. An
+/// optional component that an archive does not carry is still managed: its
+/// stale copy is moved into the transaction backup and never reinstalled, and
+/// `validate_installed_bundle_at` refuses an update that leaves one behind. So
+/// the names stay listed after the runtime is retired, and an install carrying
+/// a v0.7.17 `kin-vfs` is cleaned up by its next update rather than left with a
+/// projection client that no longer matches its daemon.
+///
+/// Only `kin`, `kin-daemon` and their platform spellings stay required. They are
+/// the two executables `install.sh` itself refuses to finish without.
+///
+/// TWO MORE FROZEN CONTRACTS SIT BEHIND THIS ONE, and the field update path is
+/// not whole until they move too. The component check is simply the first to
+/// fail, which is why the Install Proof failure named only `kin-vfs`. Both were
+/// confirmed against the published `v0.7.19` `kin-linux-x86_64.provenance.json`,
+/// whose top-level keys are exactly `schema_version`, `release_tag`, `artifact`,
+/// `target`, `kin`, `archive`, `archive_contents`, `workflow`. The v0.7.17
+/// manifest additionally carried `vfs_target` and `kin_vfs`.
+///
+/// 1. `ArtifactProvenance` declares `vfs_target: String` and
+///    `kin_vfs: VfsProvenance` with no `serde` default, so `from_slice` on a
+///    retired-shape manifest fails as "is not valid provenance JSON" before any
+///    field is read. `validate_artifact_provenance_metadata` then calls
+///    `validate_hex` on `kin_vfs.commit` and `kin_vfs.cargo_lock_sha256` and
+///    rejects `kin_vfs.dirty` unconditionally.
+/// 2. `restart_pending_record` builds one obligation for each of
+///    `[Daemon, Mcp, Vfs]` and requires a staged identity for every one, so a
+///    retired archive fails as "release bundle has no staged identity for
+///    managed vfs runtime component kin-vfs". `validate_journal` and the
+///    restart-marker check then pin the manifest at `len() == 3` over exactly
+///    that kind set. `validate_journal` already exempts `WINDOWS_COMPONENTS`
+///    from the pin, which is the precedent for deriving the expected set from
+///    the runtimes a release actually staged rather than from a literal three.
+///
+/// `install.sh` is unaffected by all three: it reads the archive it downloaded.
+/// It is the documented recovery, and the "Update proof (N-1 to Latest)" job
+/// grades that recovery for every release through v0.7.19.
 const MACOS_COMPONENTS: &[ComponentSpec] = &[
     // Keep the currently running executable last in the swap order. If a
     // platform refuses to rename it, every earlier swap is rolled back.
@@ -6777,7 +6833,7 @@ const MACOS_COMPONENTS: &[ComponentSpec] = &[
     ComponentSpec {
         name: "kin-vfs",
         location: ComponentLocation::Bin,
-        required: true,
+        required: false,
     },
     // The MCP server is now `kin mcp start`; remove a stale pre-bundling
     // standalone binary instead of leaving a mixed-version command on PATH.
@@ -6789,7 +6845,7 @@ const MACOS_COMPONENTS: &[ComponentSpec] = &[
     ComponentSpec {
         name: "libkin_vfs_shim.dylib",
         location: ComponentLocation::Lib,
-        required: true,
+        required: false,
     },
     ComponentSpec {
         name: "kin",
@@ -6807,7 +6863,7 @@ const LINUX_COMPONENTS: &[ComponentSpec] = &[
     ComponentSpec {
         name: "kin-vfs",
         location: ComponentLocation::Bin,
-        required: true,
+        required: false,
     },
     ComponentSpec {
         name: "kin-mcp",
@@ -6817,7 +6873,7 @@ const LINUX_COMPONENTS: &[ComponentSpec] = &[
     ComponentSpec {
         name: "libkin_vfs_shim.so",
         location: ComponentLocation::Lib,
-        required: true,
+        required: false,
     },
     ComponentSpec {
         name: "kin",
@@ -6865,6 +6921,57 @@ fn platform_bundle_spec(os: &str) -> Result<&'static [ComponentSpec]> {
         _ => anyhow::bail!("unsupported OS for release bundle: {os}"),
     }
 }
+
+/// The single command that moves an install this updater cannot move itself.
+///
+/// `install.sh` and `install.ps1` decide what to install by reading the archive
+/// they downloaded. This updater decides by the component list compiled into it
+/// when it was built. So the installer can always reach the current release and
+/// a shipped updater cannot, once a release changes the archive's shape in a way
+/// its own list refuses.
+pub(crate) const INSTALLER_RECOVERY_COMMAND: &str = if cfg!(windows) {
+    "irm https://get.kinlab.dev/install.ps1 | iex"
+} else {
+    "curl -fsSL https://get.kinlab.dev/install | sh"
+};
+
+/// The message every "a required component is not in this archive" site shares.
+///
+/// The bare sentence was accurate and unactionable. v0.7.18 retired `kin-vfs`
+/// from the release archive while every install on v0.7.17 or earlier still
+/// required it, and those users saw only `release archive is incomplete:
+/// required component 'kin-vfs' is missing` with nothing to do about it. The
+/// updater cannot tell a retired component from a truncated archive, so the
+/// text has to be true of both, and in both the installer is the way out: it
+/// re-downloads and re-reads the archive instead of judging it against a list
+/// frozen at build time.
+///
+/// This exists for the NEXT shape change. It cannot help the installs already
+/// stranded, because their copy of this function was compiled before it.
+fn incomplete_archive_message(component: &str) -> String {
+    format!(
+        "release archive is incomplete: required component '{component}' is missing. \
+         {RETIRED_COMPONENT_RECOVERY} {INSTALLER_RECOVERY_COMMAND}"
+    )
+}
+
+/// The same recovery sentence for the manifest side of the identical failure.
+///
+/// The pinned update path reads the artifact provenance manifest before it
+/// parses the archive, so a retired component surfaces here first and has to
+/// say the same thing. Two messages rather than one because the reader needs to
+/// know which of the two inputs disagreed with this binary.
+fn provenance_missing_component_message(component: &str) -> String {
+    format!(
+        "artifact provenance is missing required component '{component}'. \
+         {RETIRED_COMPONENT_RECOVERY} {INSTALLER_RECOVERY_COMMAND}"
+    )
+}
+
+const RETIRED_COMPONENT_RECOVERY: &str =
+    "This installed updater requires a component the release does not carry. If the \
+     release retired it, no update can bridge that, and re-running the installer once \
+     moves this install to the current release:";
 
 fn component_path(root: &Path, component: ComponentSpec) -> PathBuf {
     match component.location {
@@ -7609,10 +7716,7 @@ fn validate_archive_payload_provenance_with_limits(
 
     for component in spec.iter().filter(|component| component.required) {
         if !verified.contains_key(component.name) {
-            anyhow::bail!(
-                "release archive is incomplete: required component '{}' is missing",
-                component.name
-            );
+            anyhow::bail!(incomplete_archive_message(component.name));
         }
     }
     if verified.len() != provenance_identities.len() {
@@ -8163,10 +8267,9 @@ fn validate_staged_bundle_locked(
                 "release archive is invalid: component '{}' is empty",
                 component.name
             ),
-            None if component.required => anyhow::bail!(
-                "release archive is incomplete: required component '{}' is missing",
-                component.name
-            ),
+            None if component.required => {
+                anyhow::bail!(incomplete_archive_message(component.name))
+            }
             None => {}
         }
     }
@@ -8197,10 +8300,7 @@ fn validate_staged_bundle(stage_root: &Path, spec: &[ComponentSpec]) -> Result<(
         let path = component_path(stage_root, *component);
         if !path.exists() {
             if component.required {
-                anyhow::bail!(
-                    "release archive is incomplete: required component '{}' is missing",
-                    component.name
-                );
+                anyhow::bail!(incomplete_archive_message(component.name));
             }
             continue;
         }
@@ -11045,10 +11145,7 @@ fn validate_artifact_provenance_metadata(
     }
     for component in spec.iter().filter(|component| component.required) {
         if !verified_identities.contains_key(component.name) {
-            anyhow::bail!(
-                "artifact provenance is missing required component '{}'",
-                component.name
-            );
+            anyhow::bail!(provenance_missing_component_message(component.name));
         }
     }
     validate_archive_inventory_limits(&verified_identities, RELEASE_ARCHIVE_LIMITS)?;
@@ -13460,6 +13557,44 @@ mod tests {
         ])
     }
 
+    /// A macOS archive in the shape v0.7.18 and later actually publish: the two
+    /// executables, the notification bundle, and no projection runtime.
+    #[cfg(unix)]
+    fn macos_archive_without_projection(prefix: &str) -> Vec<u8> {
+        make_tar_gz_with_modes(&[
+            (&format!("{prefix}/"), b"", 0o755),
+            (&format!("{prefix}/kin"), b"new-kin", 0o755),
+            (&format!("{prefix}/kin-daemon"), b"new-daemon", 0o755),
+            (&format!("{prefix}/KinNotifier.app/"), b"", 0o755),
+            (&format!("{prefix}/KinNotifier.app/Contents/"), b"", 0o755),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/MacOS/"),
+                b"",
+                0o755,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/Resources/"),
+                b"",
+                0o755,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/Info.plist"),
+                b"<plist>new</plist>",
+                0o644,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/MacOS/KinNotifier"),
+                b"new-notifier",
+                0o755,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/Resources/Kin.icns"),
+                b"new-icns",
+                0o644,
+            ),
+        ])
+    }
+
     /// Write a KinNotifier.app under `root/lib` whose files all carry `prefix`.
     #[cfg(unix)]
     fn write_notifier_bundle(root: &Path, marker: &[u8]) {
@@ -14156,13 +14291,52 @@ cwd = {:?}
         }
     }
 
+    /// The shape every release has carried since v0.7.18.
+    ///
+    /// This assertion used to be its exact inverse: a `kin` plus `kin-daemon`
+    /// archive was refused because `kin-vfs` was required. v0.7.18 stopped
+    /// shipping the projection runtime, and every install built against the
+    /// older list then refused the release instead of installing it, which is
+    /// what the Install Proof "Update proof (N-1 to Latest)" job caught on
+    /// 2026-09-14 moving v0.7.17 to v0.7.19. Nothing about that was detectable
+    /// from the release side, so the test that locked the old contract in is
+    /// now the test that keeps the current one.
+    #[cfg(unix)]
     #[test]
-    fn incomplete_archive_is_rejected_before_install() {
+    fn the_shipped_archive_shape_stages_without_the_retired_projection_runtime() {
+        for (spec, prefix, archive) in [
+            (
+                LINUX_COMPONENTS,
+                "kin-linux-x86_64",
+                make_tar_gz(&[
+                    ("kin-linux-x86_64/kin", b"kin"),
+                    ("kin-linux-x86_64/kin-daemon", b"daemon"),
+                ]),
+            ),
+            (
+                MACOS_COMPONENTS,
+                "kin-macos-aarch64",
+                macos_archive_without_projection("kin-macos-aarch64"),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            stage_archive(&archive, &format!("{prefix}.tar.gz"), tmp.path(), spec).unwrap_or_else(
+                |error| panic!("{prefix} must stage without a projection runtime: {error:#}"),
+            );
+            assert!(tmp.path().join("bin/kin").is_file());
+            assert!(tmp.path().join("bin/kin-daemon").is_file());
+            assert!(!tmp.path().join("bin/kin-vfs").exists());
+        }
+    }
+
+    /// An archive that really is short a component still stops the update, and
+    /// now says what to run. The updater cannot tell a retired component from a
+    /// truncated download, so the one message has to serve both, and a user who
+    /// reads it must not be left without a next command.
+    #[test]
+    fn a_missing_required_component_is_refused_and_names_the_installer() {
         let tmp = tempfile::tempdir().unwrap();
-        let archive = make_tar_gz(&[
-            ("kin-linux-x86_64/kin", b"kin"),
-            ("kin-linux-x86_64/kin-daemon", b"daemon"),
-        ]);
+        let archive = make_tar_gz(&[("kin-linux-x86_64/kin", b"kin")]);
 
         let err = stage_archive(
             &archive,
@@ -14170,9 +14344,16 @@ cwd = {:?}
             tmp.path(),
             LINUX_COMPONENTS,
         )
-        .expect_err("missing VFS files must reject the archive");
+        .expect_err("an archive without kin-daemon must reject the release");
         let message = format!("{err:#}");
-        assert!(message.contains("kin-vfs"), "message: {message}");
+        assert!(
+            message.contains("required component 'kin-daemon' is missing"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains(INSTALLER_RECOVERY_COMMAND),
+            "the refusal must name the recovery command: {message}"
+        );
     }
 
     /// The archive now carries words as well as executables, and an update must
@@ -14927,9 +15108,13 @@ cwd = {:?}
         )
         .contains("unsafe or invalid file path"));
 
+        // `kin-daemon` rather than `kin-vfs`: the projection runtime was retired
+        // from the archive in v0.7.18 and is optional here now, so asserting on
+        // it would assert that the current release shape is a broken archive.
         let missing = make_tar_gz(&[
             ("kin-linux-x86_64/kin", b"new-kin"),
-            ("kin-linux-x86_64/kin-daemon", b"new-daemon"),
+            ("kin-linux-x86_64/kin-vfs", b"new-vfs"),
+            ("kin-linux-x86_64/libkin_vfs_shim.so", b"new-shim"),
         ]);
         assert!(format!(
             "{:#}",
@@ -14941,7 +15126,7 @@ cwd = {:?}
             )
             .unwrap_err()
         )
-        .contains("required component 'kin-vfs' is missing"));
+        .contains("required component 'kin-daemon' is missing"));
     }
 
     #[test]
@@ -17016,6 +17201,62 @@ cwd = {:?}
         assert!(!kin_home.join("bin/kin-vfs.exe").exists());
         assert!(!kin_home.join("bin/kin-mcp.exe").exists());
         assert!(!kin_home.join("lib/kin_vfs_shim.dll").exists());
+    }
+
+    /// The other half of retiring a component: an install carrying the old one
+    /// must not keep it.
+    ///
+    /// Windows has had this behaviour since projection was never a requirement
+    /// there. Unix only gets it now that `kin-vfs` and the shim are optional
+    /// rather than required, and it is what stops a v0.7.17 projection client
+    /// sitting on PATH beside a daemon several releases newer. The names stay in
+    /// the component list precisely so this cleanup has something to act on.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_unix_update_removes_the_retired_projection_runtime_it_finds_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&kin_home).unwrap();
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let stage = tmp.path().join("stage");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        assert_eq!(
+            fs::read(kin_home.join("bin/kin-vfs")).unwrap(),
+            b"old-kin-vfs"
+        );
+        let archive = make_tar_gz(&[
+            ("kin-linux-x86_64/kin", b"new-kin"),
+            ("kin-linux-x86_64/kin-daemon", b"new-daemon"),
+        ]);
+
+        stage_archive(
+            &archive,
+            "kin-linux-x86_64.tar.gz",
+            &stage,
+            LINUX_COMPONENTS,
+        )
+        .unwrap();
+        install_staged_bundle(
+            &kin_home,
+            &stage,
+            LINUX_COMPONENTS,
+            "0.7.20",
+            &test_restart_pending("0.7.20"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(kin_home.join("bin/kin")).unwrap(), b"new-kin");
+        assert_eq!(
+            fs::read(kin_home.join("bin/kin-daemon")).unwrap(),
+            b"new-daemon"
+        );
+        assert!(!kin_home.join("bin/kin-vfs").exists());
+        assert!(!kin_home.join("bin/kin-mcp").exists());
+        assert!(!kin_home.join("lib/libkin_vfs_shim.so").exists());
     }
 
     #[tokio::test]

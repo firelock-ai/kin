@@ -26,7 +26,7 @@ name: Release Promotion
 # means selecting on the pending marker instead of on the prerelease flag.
 on:
   # Offset from the train (7,22,37,52), recovery and the cut (3,18,33,48) and
-  # the sentinel (11,41), so this reads a settled rail rather than one
+  # the mint (11,26,41,56), so this reads a settled rail rather than one
   # mid-reconcile.
   schedule:
     - cron: "9,24,39,54 * * * *"

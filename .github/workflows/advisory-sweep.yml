@@ -21,9 +21,9 @@ name: Advisory Sweep
 on:
   schedule:
     # Every three hours at :13, which is off the release train (:07,:22,:37,:52),
-    # recovery (:03,:18,:33,:48), sentinel (:11,:41) and mint (:11,:26,:41,:56)
-    # minutes, so the sweep never contends with a release cycle for the runner
-    # or for the branch it writes.
+    # recovery (:03,:18,:33,:48) and mint (:11,:26,:41,:56) minutes, so the
+    # sweep never contends with a release cycle for the runner or for the
+    # branch it writes.
     - cron: "13 */3 * * *"
   # `repository_dispatch` rather than `workflow_dispatch`, and not by taste. A
   # workflow_dispatch caller selects the ref, and GitHub resolves the workflow

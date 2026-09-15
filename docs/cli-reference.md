@@ -100,7 +100,7 @@ kin clone <url> [path] [options]
 
 ### `kin status`
 
-Read canonical repository/workspace status without admitting host files
+Show coherent repository-v6 workspace status
 
 ```
 kin status [options]
@@ -2896,7 +2896,35 @@ kin setup [<subcommand>] [options]
 | `--auto-daemon` |  | Auto-start kin-daemon when entering workspaces |
 | `--no-interactive` |  | Run non-interactively using defaults or provided flags |
 | `--skip-mcp-check` |  | Skip the MCP round trip that proves each configured AI client can actually call Kin (for a scripted install with no repository yet) |
+| `--install-language-servers` |  | Install the missing language servers this build enriches with, without asking. Each install is a network download into a shared prefix, so an interactive run asks first and a scripted one needs this flag |
+| `--resource-profile <profile>` |  | Record this machine's resource profile without the advanced prompt: proof, interactive, throughput, or ci |
+| `--embedding-model <when>` | `later` | When the embedding model is fetched: `later`, or `never` on a machine that does not fetch it. Setup never downloads it either way |
+| `--embedding-provider <where>` | `local` | Where vectors are computed: `local`, or `remote` for an OpenAI-compatible endpoint. `remote` collects no credential |
+| `--skip-path` |  | Do not add `~/.kin/bin` to the shell profile. Only asked about for an npm or npx install, which cannot make the edit itself |
 | `--check` |  | Skip the wizard and only run the first-run health check |
+
+The wizard opens with a hardware check. It reports the architecture, the
+physical and logical core counts, the memory and the accelerator this machine
+reports, all from the same `kin-infer` detection `kin resources inspect` reads,
+then names the resource profile that follows from them and why.
+
+`kin setup --intent advanced` can adjust that profile. A profile that budgets
+past what the machine actually has can exceed safe memory and GPU thresholds and
+crash the machine, so the detected figures are the ceiling and the prompt says
+so. An adjustment is recorded in `~/.kin/config/setup.toml`; `kin` and
+`kin-daemon` adopt it at their next start, and an exported
+`KIN_RESOURCE_PROFILE` or a repository's `[resources]` config still outranks it.
+Re-running the wizard and taking the recommendation clears the record.
+
+The last two questions are asked on every intent, because `--intent` is how a
+scripted run selects a plan and a decision reachable from only some plans is one
+some installs never make. They are when the embedding model is fetched, which
+defaults to later and never downloads during setup, and where vectors are
+computed, which recommends local and states that a remote provider sends entity
+text to the endpoint you configure.
+
+A non-interactive run prints every decision it answered for you, the value it
+took, and the command or flag that changes it later.
 
 Run `kin setup` with no subcommand for the default behavior above, or one of:
 

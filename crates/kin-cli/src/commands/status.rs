@@ -1165,21 +1165,32 @@ where
     }
 }
 
-/// Read canonical repository/workspace authority without admitting host files.
-/// A valid authority reading succeeds even when projection freshness or live
-/// coverage is unknown; authority open and validation failures remain errors.
+/// `kin status`, and the exit code it owes a caller.
+///
+/// Non-zero is [`EXIT_WORKING_COPY_UNMEASURED`] and nothing else. The report is
+/// still printed and every line in it is still true; what the code says is that
+/// no pass took the working copy, so none of it describes the files on disk.
+/// The `--json` arm returns the same code, and there it is the ONLY signal: the
+/// payload cannot carry the gap, because `StatusReportWire` denies unknown
+/// fields and a new key there makes an older CLI reject a newer daemon's report.
 pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
     let layout = crate::commands::require_repository_layout()?;
-    // Resolve only an already running daemon. Neither status nor coverage
-    // re-sampling starts one or crosses the explicit host-admission boundary.
+    // One resolution of this repository's daemon for the whole command: the
+    // supervisor's route, then the repository's own endpoint record. The
+    // admission and the reading both use it, so a daemon the supervisor does
+    // not list is read from rather than bypassed, and a slow daemon costs one
+    // probe here rather than one per step.
     let daemon = crate::daemon_client::running_daemon_reading(&layout).await;
+    // Admit, THEN read. The order is the whole point: a report read before the
+    // admission describes the graph as it was, which is exactly the wrong
+    // answer.
+    let pass = admit_with_reading(&layout, &daemon).await;
     let reading =
         settle_embedding_coverage(wait_quiesce, || read_status_once(&layout, &daemon)).await?;
     let report = reading.report;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        let pass = read_only_status_observation(&layout, &daemon, &report).await;
         // The merge Kin is holding open and where this workspace sits relative
         // to its branch both came off the SAME authority the report did, in
         // `read_status_once`. They used to be fetched here through helpers that
@@ -1259,47 +1270,7 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
             println!("{line}");
         }
     }
-    Ok(0)
-}
-
-/// Observe existing reconcile health without requesting an admission. The
-/// strict v3 report remains canonical authority; these host observations are
-/// text-only, like the projection mode and durable admission timestamp.
-async fn read_only_status_observation(
-    layout: &kin_core::KinLayout,
-    daemon: &crate::daemon_client::RunningDaemonReading,
-    report: &StatusReport,
-) -> StatusAdmission {
-    use crate::daemon_client::RunningDaemonReading;
-    let observation = async {
-        let url = match daemon {
-            RunningDaemonReading::Serving(url) => url,
-            RunningDaemonReading::Absent => anyhow::bail!("no daemon is running for this repository"),
-            RunningDaemonReading::OpeningAuthority { pid, port, warming, .. } => {
-                anyhow::bail!("the daemon (pid {pid}, port {port}) is {}; no current reconcile observation is available", if *warming { "warming" } else { "not answering readiness" });
-            }
-        };
-        let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout)?;
-        let health = tokio::time::timeout(LIVE_STATUS_READ_BUDGET, client.health())
-            .await.context("the daemon's reconcile observation did not answer in time")??;
-        // A probe from another repository cannot qualify this authority read.
-        anyhow::ensure!(
-            health.repo_root.as_deref().is_some_and(|root| std::path::Path::new(root) == report.repo_root)
-                && health.repo_id.as_deref() == Some(report.repository.repository_id.as_str()),
-            "the daemon's reconcile observation does not identify this repository"
-        );
-        Ok::<_, anyhow::Error>(health.reconcile)
-    }.await;
-    match observation {
-        Ok(reconcile) => StatusAdmission::ReadOnly {
-            reconcile: Some(Box::new(reconcile)),
-            observation_gap: None,
-        },
-        Err(error) => StatusAdmission::ReadOnly {
-            reconcile: None,
-            observation_gap: Some(error.to_string()),
-        },
-    }
+    Ok(exit_code_for_admission(&pass))
 }
 
 /// The `kin status` reading of a reconcile loop that has stood down.
@@ -1335,17 +1306,13 @@ fn admission_hold_line(pass: &StatusAdmission) -> Option<String> {
 /// copy, and the other two say so rather than rendering as a clean tree.
 fn untracked_host_content_line(pass: &StatusAdmission) -> String {
     const LEAD: &str = "Untracked host content:";
-    // Use one captured probe for both the untracked and admission-hold lines.
-    // A read-only probe describes its last observation, never a fresh scan.
+    // Read off the admission this status already took, rather than asked again.
+    // Two independent readings of one working copy is how two lines about it
+    // come to disagree, and the probes ride on the admission response for
+    // exactly this reason.
     let Some(reconcile) = pass.reconcile().cloned() else {
-        let why = match pass {
-            StatusAdmission::Skipped(why) => why.as_str(),
-            StatusAdmission::ReadOnly {
-                observation_gap, ..
-            } => observation_gap
-                .as_deref()
-                .unwrap_or("this read did not inspect or admit host contents"),
-            StatusAdmission::Took(_) => unreachable!("an admission carries its probes"),
+        let StatusAdmission::Skipped(why) = pass else {
+            unreachable!("an admission that took a pass carries its probes")
         };
         return format!("{LEAD} not measured; {why}");
     };
@@ -1559,16 +1526,32 @@ fn merge_line(merge: &MergeInProgress) -> String {
     }
 }
 
-/// Whether a caller explicitly admitted host files, or is reporting canonical
-/// authority without requesting admission. Workspace diff compatibility paths
-/// still use `Took`/`Skipped`; default status uses `ReadOnly`.
+/// Graph truth caught up with the working copy, or the reason it could not be.
+///
+/// `kin status` used to answer from the graph alone. That answer is right about
+/// the graph and is read as a statement about the files on disk, and the two
+/// come apart the moment an edit lands after the last admission: a stranger
+/// running the whole everyday loop with no Git was told `matching its base
+/// change` over a tracked file edited twenty-two seconds earlier, seven readings
+/// running. Putting the admission's age beside the verdict, which
+/// landed in kin#1254, makes the sentence honest and does not make it right,
+/// because measured on macOS the clock reads `0s ago` inside the roughly
+/// two-second window before the ambient watcher catches up, and on a bind mount
+/// that window has no end.
+///
+/// So status admits first and then answers, which is what `kin commit` has
+/// always done and the reason no commit ever missed an edit. Founder-owned
+/// thesis decision relayed 2026-08-30: the Zero File-Search Authority Rule
+/// permits exactly this, because reading the working copy to ADMIT it is
+/// ingestion at an explicit input boundary, not answering from files. The cost
+/// is a tree walk, which is what makes the answer true, and `git status` pays
+/// the same walk for the same reason.
+///
+/// The report rides along because the admission response already carries the
+/// reconcile probes. One round trip answers the verdict and the untracked line
+/// both, so the two surfaces cannot disagree about one working copy, which is
+/// the principle this file already holds for its enrichment counters.
 pub enum StatusAdmission {
-    /// Status reads canonical authority and only observes existing daemon
-    /// probes. A historical probe does not certify today's projection.
-    ReadOnly {
-        reconcile: Option<Box<crate::commands::resources::ReconcileHealth>>,
-        observation_gap: Option<String>,
-    },
     /// The pass ran and the status below was read after it.
     Took(Box<crate::commands::admit::AdmitReport>),
     /// No pass ran, carrying the clause that says why. The verdict must not
@@ -1576,9 +1559,20 @@ pub enum StatusAdmission {
     Skipped(String),
 }
 
-/// A workspace-diff compatibility caller requested admission but no pass ran.
-/// This remains separate from a command error. Default status reads canonical
-/// authority intentionally and does not use this code for projection freshness.
+/// Nothing measured the working copy, so no number below describes it.
+///
+/// Kept apart from 1, which is an error, for the reason `kin path` keeps
+/// [`crate::commands::path::NO_ROUTE_EXIT_CODE`] apart from 1: a caller has to
+/// be able to tell "the question was not answered" from "the command failed".
+/// This one says the first, and the report it rides on is still true about
+/// durable authority.
+///
+/// It is the only signal a machine consumer can get. Both commands that use it
+/// print their qualifications on the text path alone, and the JSON payload
+/// cannot carry the gap: `StatusReportWire` denies unknown fields, so a new key
+/// there makes an older CLI reject a newer daemon's report outright, which the
+/// status module already records as a deliberate wire decision rather than a
+/// field to slip in.
 pub const EXIT_WORKING_COPY_UNMEASURED: i32 = 9;
 
 /// The line a surface prints ABOVE its numbers when no admission took the
@@ -1606,8 +1600,8 @@ pub fn unmeasured_working_copy_banner(why: &str) -> String {
 
 /// The exit code a surface owes its caller for the admission it got.
 ///
-/// One predicate for explicit-admission compatibility callers and every
-/// [`StatusAdmission::Skipped`] arm, because every one of them means the same thing: no pass took the
+/// One predicate for both commands and all eight [`StatusAdmission::Skipped`]
+/// arms, because every one of them means the same thing: no pass took the
 /// working copy, so the workspace side of every comparison below is whatever
 /// the last admission left. A daemon that is absent, one still opening
 /// authority, one that refused, an author this store cannot name, and an
@@ -1615,7 +1609,7 @@ pub fn unmeasured_working_copy_banner(why: &str) -> String {
 /// reader and the same news for a script.
 pub fn exit_code_for_admission(pass: &StatusAdmission) -> i32 {
     match pass {
-        StatusAdmission::Took(_) | StatusAdmission::ReadOnly { .. } => 0,
+        StatusAdmission::Took(_) => 0,
         StatusAdmission::Skipped(_) => EXIT_WORKING_COPY_UNMEASURED,
     }
 }
@@ -1625,7 +1619,6 @@ impl StatusAdmission {
     pub fn reconcile(&self) -> Option<&crate::commands::resources::ReconcileHealth> {
         match self {
             Self::Took(report) => Some(&report.reconcile),
-            Self::ReadOnly { reconcile, .. } => reconcile.as_deref(),
             Self::Skipped(_) => None,
         }
     }
@@ -1802,9 +1795,6 @@ fn workspace_state_phrase(
     // daemon stopped, the untracked line read "no daemon is running" while this
     // line directly above it read "matching its base change as admitted 0s ago"
     // (FIR-2961).
-    if matches!(pass, StatusAdmission::ReadOnly { .. }) {
-        return format!("{verdict} in canonical authority");
-    }
     if let StatusAdmission::Skipped(why) = pass {
         return format!("{verdict} as last admitted, not measured against the working copy: {why}");
     }
@@ -1891,13 +1881,8 @@ fn render_text_with_tip(
     // arrive after the count they qualify, and a stranger read `0 artifacts` as
     // "nothing to commit" over three untracked files anyway. `merge_line` below
     // is placed here on the same argument.
-    match pass {
-        StatusAdmission::ReadOnly { .. } => {
-            lines.push("Read-only status: canonical repository/workspace authority; working-copy contents were not inspected or admitted. Use `kin admit` to admit them explicitly.".to_string());
-            lines.push(format!("Admission freshness: {}. This does not attest that the projection matches canonical authority.", admission.describe(Utc::now())));
-        }
-        StatusAdmission::Skipped(why) => lines.push(unmeasured_working_copy_banner(why)),
-        StatusAdmission::Took(_) => {}
+    if let StatusAdmission::Skipped(why) = pass {
+        lines.push(unmeasured_working_copy_banner(why));
     }
     lines.extend([
         format!("Repository: {}", report.repository.repository_id),
@@ -3528,76 +3513,6 @@ mod tests {
         assert!(
             rendered.contains("could not be read (truncated)"),
             "{rendered}"
-        );
-    }
-
-    #[test]
-    fn read_only_status_keeps_freshness_unknowns_and_merge_distinctions_explicit() {
-        let report = settle_base_report();
-        let pass = StatusAdmission::ReadOnly {
-            reconcile: None,
-            observation_gap: Some("no daemon is running for this repository".into()),
-        };
-        let recorded = LastAdmissionRead::Recorded(kin_core::last_admission::LastAdmission::new(
-            Utc::now(),
-            8,
-        ));
-        for (admission, basis) in [
-            (recorded, "covering 8 tracked artifact(s)"),
-            (
-                LastAdmissionRead::Absent,
-                "no complete admission is recorded",
-            ),
-            (
-                LastAdmissionRead::Unreadable("truncated fixture marker".into()),
-                "truncated fixture marker",
-            ),
-        ] {
-            for settled in [2, 76] {
-                let merge = merge_fixture(settled, 76);
-                let text = render_text(
-                    &report,
-                    None,
-                    None,
-                    None,
-                    &admission,
-                    &kin_core::retained_parse::RetainedParseRead::Absent,
-                    &pass,
-                    Some(&merge),
-                );
-                assert!(
-                    text.lines()
-                        .nth(1)
-                        .unwrap()
-                        .starts_with("Merge in progress:"),
-                    "{text}"
-                );
-                assert!(text.contains(basis), "{text}");
-                assert!(
-                    text.contains("working-copy contents were not inspected or admitted"),
-                    "{text}"
-                );
-                assert!(
-                    text.contains(
-                        "does not attest that the projection matches canonical authority"
-                    ),
-                    "{text}"
-                );
-                assert!(
-                    text.contains(if settled == 76 {
-                        "kin resolve --continue"
-                    } else {
-                        "kin conflicts"
-                    }),
-                    "{text}"
-                );
-                assert!(!text.contains("Exit 9"), "{text}");
-            }
-        }
-        assert_eq!(exit_code_for_admission(&pass), 0);
-        assert_eq!(
-            exit_code_for_admission(&skipped_pass()),
-            EXIT_WORKING_COPY_UNMEASURED
         );
     }
 

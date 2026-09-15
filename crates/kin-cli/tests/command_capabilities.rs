@@ -447,9 +447,7 @@ fn top_level_help_marks_open_git_replacement_surfaces() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("capabilities"));
-    assert!(
-        stdout.contains("Read canonical repository/workspace status without admitting host files")
-    );
+    assert!(stdout.contains("Show coherent repository-v6 workspace status"));
     assert!(stdout.contains("Create an exact semantic and artifact commit"));
     assert!(stdout.contains("Show exact repository-v6 artifact and semantic changes"));
     assert!(stdout.contains("Bounded graph-native rename; unsupported cases fail closed"));

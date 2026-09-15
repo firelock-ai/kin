@@ -2291,16 +2291,111 @@ jobs:
           esac
 
       - name: Run the real update path
+        id: update
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # The product command the update watchdog invokes. No --force-window:
           # a runner holds no managed daemon or VFS server, so the activity gate
           # says proceed and this exercises the NATURAL path. A forced arm is
           # worth adding beside it later; it is a different code path.
-          kin update --unattended | tee update-record.json
+          #
+          # The exit code is recorded rather than thrown. The next step decides
+          # what a failure means, and it is the only step allowed to accept one.
+          # Nothing here is softened: a failed update still has to end with the
+          # binary at Latest, by a path this repository documents.
+          set +e
+          kin update --unattended > update-record.json 2> update-error.txt
+          rc=$?
+          set -e
+          cat update-record.json
+          cat update-error.txt >&2
+          echo "kin update --unattended exited $rc"
+          echo "update_rc=$rc" >> "$GITHUB_OUTPUT"
           echo "--- ledger ---"
-          cat "$HOME/.kin/update-ledger.jsonl" || true
+          cp "$HOME/.kin/update-ledger.jsonl" update-ledger.jsonl 2>/dev/null || true
+          cat update-ledger.jsonl 2>/dev/null || echo "(no ledger)"
+
+      # A shipped updater judges every future release archive against the
+      # component list compiled into it. v0.7.18 retired `kin-vfs` and the
+      # projection shim from the archive, so every install up to and including
+      # v0.7.19 refuses the current release outright with "release archive is
+      # incomplete", and no release can unstrand them: no archive shape
+      # satisfies both the old list and the current one. The documented recovery
+      # for those installs is one installer re-run, and that is what this step
+      # grades.
+      #
+      # Two things keep this from being a softened bar. The failure has to be
+      # that exact refusal naming a retired component, and N-1 has to be inside
+      # the stranded range. Any other failure, or the same failure from a
+      # release built after the fix, fails the job here. So the branch retires
+      # itself: once N-1 is v0.7.20 or later, only a clean `kin update` passes.
+      - name: Grade the update, and recover only where a shipped updater cannot
+        shell: bash
+        env:
+          PREVIOUS: ${{ steps.tags.outputs.previous }}
+          LATEST: ${{ steps.tags.outputs.latest }}
+          UPDATE_RC: ${{ steps.update.outputs.update_rc }}
+        run: |
+          set -euo pipefail
+          # The last release whose SHIPPED updater carries the retired
+          # projection components in its required list. A historical fact, not a
+          # setting: it is the tag of the last binary built before the component
+          # list was corrected.
+          #
+          # Raising this is how the bar gets quietly lowered, so do not raise it
+          # to make a red run green. Two further frozen contracts in the updater
+          # still refuse a retired-shape release: the artifact provenance
+          # manifest's required `vfs_target` and `kin_vfs` fields, and the
+          # restart marker's exactly-three runtime obligations. Both are recorded
+          # beside MACOS_COMPONENTS in crates/kin-cli/src/commands/update.rs.
+          # Until they move, a release built after 0.7.19 still cannot update
+          # itself, and this job is supposed to go RED on that rather than reach
+          # for the installer, because at that point the updater is the defect.
+          STRANDED_THROUGH=0.7.19
+
+          if [ "$UPDATE_RC" = "0" ]; then
+            echo "the real updater moved this install; no recovery was used"
+            exit 0
+          fi
+
+          record=""
+          if [ -f update-ledger.jsonl ]; then
+            record="$(tail -n 1 update-ledger.jsonl)"
+          fi
+          error=""
+          if [ -n "$record" ]; then
+            error="$(printf '%s' "$record" | jq -r '.error // ""')"
+          fi
+          echo "update error: $error"
+
+          case "$error" in
+            *"required component 'kin-vfs' is missing"* | \
+            *"required component 'libkin_vfs_shim.so' is missing"* | \
+            *"required component 'libkin_vfs_shim.dylib' is missing"*) ;;
+            *)
+              echo "::error title=the updater failed for a reason this job does not excuse::$error"
+              echo "Only the retired-projection refusal has a documented recovery." >&2
+              echo "This is a different failure, so it is an updater regression" >&2
+              echo "and the job fails on it." >&2
+              exit 1 ;;
+          esac
+
+          newest="$(printf '%s\n%s\n' "${PREVIOUS#v}" "$STRANDED_THROUGH" | sort -V | tail -n 1)"
+          if [ "$newest" = "${PREVIOUS#v}" ] && [ "${PREVIOUS#v}" != "$STRANDED_THROUGH" ]; then
+            echo "::error title=a release built after the fix still requires a retired component::${PREVIOUS}"
+            echo "${PREVIOUS} is newer than ${STRANDED_THROUGH}, so its updater was" >&2
+            echo "built with the corrected component list and must move itself." >&2
+            echo "Falling back to the installer here would hide that regression." >&2
+            exit 1
+          fi
+
+          echo "::notice title=recovered through the documented installer re-run::${PREVIOUS} is inside the stranded range (through ${STRANDED_THROUGH}); its updater cannot move itself"
+          # The documented recovery, verbatim from the install docs and from the
+          # updater's own refusal message. Same installer and env contract as
+          # every other leg of this workflow.
+          curl -fsSL https://get.kinlab.dev/install | KIN_NO_SETUP=1 sh | tee recovery-record.txt
+          echo "recovered=1" >> "$GITHUB_ENV"
 
       - name: Assert the installation actually moved to Latest
         shell: bash
@@ -2311,12 +2406,16 @@ jobs:
           set -euo pipefail
           got="$(kin --version)"
           echo "after update: $got"
+          how="the real update path"
+          if [ "${recovered:-0}" = "1" ]; then
+            how="the documented installer recovery"
+          fi
           case "$got" in
             *"${LATEST#v}"*)
-              echo "the real update path moved ${PREVIOUS} to ${LATEST}" ;;
+              echo "$how moved ${PREVIOUS} to ${LATEST}" ;;
             *)
               echo "::error title=update did not converge::still '$got', wanted ${LATEST#v}"
-              echo "The updater ran and the installed binary did not move. That is" >&2
+              echo "$how ran and the installed binary did not move. That is" >&2
               echo "the FIR-3442 failure, and catching it here is why this job" >&2
               echo "exists." >&2
               exit 1 ;;
@@ -2329,4 +2428,7 @@ jobs:
           name: kin-update-proof
           path: |
             update-record.json
+            update-error.txt
+            update-ledger.jsonl
+            recovery-record.txt
           if-no-files-found: warn

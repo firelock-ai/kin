@@ -61,6 +61,8 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         tar_stub: str | None = None,
         home_files: dict[str, str] | None = None,
         shell: str = "/bin/sh",
+        archive_vfs: bool = True,
+        seed_stale_projection: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -74,16 +76,19 @@ class OptionalVfsInstallerTests(unittest.TestCase):
             "#!/bin/sh\nprintf 'kin 9.9.9\\n'\n",
         )
         executable(archive_root / "kin-daemon", "#!/bin/sh\nexit 0\n")
-        executable(
-            archive_root / "kin-vfs",
-            f"#!/bin/sh\nexit {vfs_exit}\n",
-        )
         shim_name = (
             "libkin_vfs_shim.dylib"
             if platform.system() == "Darwin"
             else "libkin_vfs_shim.so"
         )
-        (archive_root / shim_name).write_bytes(b"test shim")
+        # v0.7.18 and later publish no projection runtime at all, so the
+        # installer has to be exercised against both archive shapes.
+        if archive_vfs:
+            executable(
+                archive_root / "kin-vfs",
+                f"#!/bin/sh\nexit {vfs_exit}\n",
+            )
+            (archive_root / shim_name).write_bytes(b"test shim")
         if target.startswith("macos-") and archive_notifier:
             bundle_root = archive_root / "KinNotifier.app"
             notifier = bundle_root / (
@@ -133,6 +138,11 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 "#!/bin/sh\n# old-kin\nprintf 'kin 9.9.9\\n'\n",
             )
             executable(kin_home / "bin" / "kin-daemon", "#!/bin/sh\nprintf 'old-daemon\\n'\n")
+        if seed_stale_projection:
+            (kin_home / "bin").mkdir(parents=True, exist_ok=True)
+            (kin_home / "lib").mkdir(parents=True, exist_ok=True)
+            executable(kin_home / "bin" / "kin-vfs", "#!/bin/sh\nexit 0\n")
+            (kin_home / "lib" / shim_name).write_bytes(b"stale shim")
         if seed_launcher_stamp:
             (kin_home / "bin").mkdir(parents=True, exist_ok=True)
             (kin_home / "bin" / ".kinlab-kin-version").write_text(
@@ -371,6 +381,44 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         self.assertIn("Filesystem projection is unavailable", result.stdout)
         self.assertFalse((kin_home / "bin" / "kin-vfs").exists())
         self.assertFalse(any((kin_home / "lib").glob("libkin_vfs_shim.*")))
+
+    def test_an_archive_without_projection_installs_and_says_so(self) -> None:
+        """The shape every release has published since v0.7.18.
+
+        This is also the documented recovery for an install whose updater still
+        requires `kin-vfs` and therefore refuses the release outright, so the
+        installer has to finish cleanly on an archive that carries neither the
+        projection client nor its shim.
+        """
+
+        result, kin_home = self.run_installer(vfs_exit=0, archive_vfs=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not bundled in this archive", result.stdout)
+        self.assertTrue((kin_home / "bin" / "kin").exists())
+        self.assertTrue((kin_home / "bin" / "kin-daemon").exists())
+        self.assertFalse((kin_home / "bin" / "kin-vfs").exists())
+
+    def test_upgrading_past_the_retirement_clears_the_stale_projection(self) -> None:
+        """A v0.7.17 kin-vfs must not outlive the release that retired it.
+
+        Left in place it sits on PATH beside a daemon several releases newer,
+        and the installs that most need this are exactly the ones recovering
+        from an updater that cannot move itself.
+        """
+
+        result, kin_home = self.run_installer(
+            vfs_exit=0,
+            archive_vfs=False,
+            seed_current_install=True,
+            seed_stale_projection=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Removed the filesystem projection", result.stdout)
+        self.assertFalse((kin_home / "bin" / "kin-vfs").exists())
+        self.assertFalse(any((kin_home / "lib").glob("libkin_vfs_shim.*")))
+        self.assertTrue((kin_home / "bin" / "kin-daemon").exists())
 
     def test_extraction_refuses_the_archives_recorded_ownership(self) -> None:
         # tar running as root restores the uid/gid the archive records, and

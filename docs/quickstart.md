@@ -4,9 +4,11 @@ This is the recommended first-run path for Kin. One flow works on macOS, Linux, 
 Windows. On native Windows the support boundary is narrower, and WSL2 remains the
 recommended path for the full Kin experience. See step 1.
 
-1. **Install** the binaries with the one-line installer.
+1. **Install** with `npx -y @kinlab/kin setup`. One command on every platform: it
+   downloads the binaries and runs the setup wizard in the same call.
 2. **`kin setup`** asks a couple of questions, and the guided wizard configures your
-   shell, PATH, daemon, and AI clients.
+   shell, PATH, daemon, and AI clients. Step 1 already ran it; call it again by name
+   whenever you want to change an answer.
 3. **`kin init`** admits repository authority atomically and derives the semantic
    entity layer for supported sources; embeddings are a separate graph-native stage.
 4. **Verify** with `kin setup status` and read the health checklist.
@@ -22,7 +24,29 @@ in the [CLI reference](cli-reference.md).
 
 ## 1. Install
 
+### Every platform
+
+```sh
+npx -y @kinlab/kin setup
+```
+
+This is the command the install page and the README lead with, and it is the same string on
+macOS, Linux, Windows and WSL. It needs Node.js 20 or newer. The launcher downloads the
+matching `kin` and `kin-daemon` release, verifies its published SHA-256, installs both under
+`~/.kin/bin`, adds that directory to your shell profile for new sessions, and then runs the
+`kin setup` wizard. It needs no writable npm prefix and no administrator rights. For an
+agent with nobody at the keyboard, add `--intent agent --no-interactive`.
+
+Open a new terminal when it finishes, and `kin --version` then answers by bare name. The
+shell it ran in does not pick up the new PATH entry.
+
+Everything below is an alternative: a machine with no Node, native Windows PowerShell, or a
+team that already standardises on a package manager.
+
 ### macOS and Linux
+
+`get.kinlab.ai` and `get.kinlab.dev` serve the same script, and `https://kinlab.ai/install.sh`
+forwards to it.
 
 ```sh
 curl -fsSL https://get.kinlab.dev/install | sh
@@ -31,28 +55,43 @@ curl -fsSL https://get.kinlab.dev/install | sh
 The installer downloads the latest release from GitHub, **verifies its SHA-256 checksum**
 (and refuses to install an unverified or tampered download), installs the `kin` and
 `kin-daemon` binaries into `~/.kin/bin` (and `~/.kin/lib`), updates your shell profile
-(`.zshrc` / `.bashrc`), and then runs the `kin setup` wizard. Where the archive bundles
-them, the optional `kin-vfs` projection client and shim are installed alongside.
-Setup then picks a projection mode for this host, prints what each of the shim,
-NFS and FUSE would need, and records the one it chose. `kin vfs status` shows it
-again later, and `kin vfs on --mode <mode>` changes it.
+(`.zshrc` / `.bashrc`), and then runs the `kin setup` wizard. Releases from 0.7.18 on
+carry the `kin` and `kin-daemon` executables only. Upgrading past that point also clears
+the `kin-vfs` projection client and shim that an earlier release installed, so a stale
+projection cannot sit beside a newer daemon. Where an archive does bundle them, setup
+picks a projection mode for this host, prints what each of the shim, NFS and FUSE would
+need, and records the one it chose. `kin vfs status` shows it again later, and
+`kin vfs on --mode <mode>` changes it.
 `kin-daemon` is mandatory; the installer aborts cleanly rather than leaving a daemon-less
 install. Re-running the installer upgrades an existing install in place and reports the
 version change.
 
-### npm / npx
+### Updating an existing install
 
-If your workflow starts from npm, use the canonical launcher and then run the same setup:
+```sh
+kin update
+```
+
+**An install on 0.7.19 or earlier has to re-run the installer instead.** Those binaries
+check a downloaded release against a component list fixed when they were built, and that
+list still requires the `kin-vfs` projection runtime that 0.7.18 removed from the release
+archive. `kin update` refuses the release with `release archive is incomplete: required
+component 'kin-vfs' is missing` and cannot move itself past it. Run the installer line
+above. It reads the archive it downloads rather than a fixed list, so it puts the current
+release over the old one and keeps your configuration.
+
+Whenever `kin update` reports an incomplete release archive, re-running the installer is
+the answer. It is never a corrupt download to retry.
+
+### npm global install
+
+The `npx` line at the top of this section needs no global install and is the recommended
+path. A global install is the alternative when you want `kin` resolved from your npm prefix
+rather than from `~/.kin/bin`:
 
 ```sh
 npm install -g @kinlab/kin
 kin setup --intent agent
-```
-
-For zero-install provisioning:
-
-```sh
-npx -y @kinlab/kin setup --intent agent --no-interactive
 ```
 
 The launcher provisions the same managed native `kin` + `kin-daemon` release under

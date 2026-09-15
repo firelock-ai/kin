@@ -45,8 +45,8 @@ mod common;
 
 use common::Command;
 
-/// The exit code `kin diff <base> WORKSPACE` returns when its compatibility
-/// admission did not run. Read-only canonical status intentionally succeeds.
+/// The exit code `kin status` and `kin diff <base> WORKSPACE` return when no
+/// pass took the working copy.
 ///
 /// Written as a literal rather than imported from `kin_cli`, on purpose. The
 /// constant is a published contract that scripts and CI steps branch on, and a
@@ -274,7 +274,7 @@ fn workspace_diff_with_no_daemon_exits_unmeasured_with_the_gap_above_the_count()
 }
 
 #[test]
-fn status_over_untracked_work_reports_read_only_authority_above_the_tree_line() {
+fn status_over_untracked_work_with_no_daemon_exits_unmeasured_with_the_gap_above_the_tree_line() {
     let root = tempdir().expect("temp root");
     let (repo, home) = seeded_repo(root.path());
 
@@ -298,29 +298,30 @@ fn status_over_untracked_work_reports_read_only_authority_above_the_tree_line() 
 
     assert_eq!(
         code_of(&status),
-        0,
-        "canonical status did not succeed:\n{text}"
+        EXIT_WORKING_COPY_UNMEASURED,
+        "status over an unmeasured working copy exited as though it had measured it:\n{text}"
     );
     assert!(
-        line_index(&text, "Read-only status:") < line_index(&text, "Tree:"),
+        line_index(&text, BANNER) < line_index(&text, "Tree:"),
         "the gap is printed below the Tree: verdict a reader takes for the answer:\n{text}"
     );
 }
 
 #[test]
-fn canonical_status_json_succeeds_while_compatibility_diff_still_exits_unmeasured() {
+fn the_json_arm_carries_the_gap_in_its_exit_code_and_still_parses() {
     let root = tempdir().expect("temp root");
     let (repo, home) = seeded_repo(root.path());
     fs::write(repo.join("untracked.py"), b"VALUE = 1\n").expect("write untracked");
     require_no_daemon(&repo, &home);
 
-    // The unchanged v3 JSON reports canonical authority and makes no claim
-    // that status inspected the working copy.
+    // The arm with no other channel. `StatusReportWire` denies unknown fields,
+    // so the gap cannot be a key in this payload, and the text banner is not
+    // rendered here at all. If the exit code does not carry it, nothing does.
     let status = run_kin(&repo, &home, &["status", "--json"]);
     let text = stdout_of(&status);
     assert_eq!(
         code_of(&status),
-        0,
+        EXIT_WORKING_COPY_UNMEASURED,
         "the JSON arm gave a machine consumer no signal at all:\n{text}"
     );
     let report: Value =
@@ -374,11 +375,11 @@ fn dirty_the_tracked_module(repo: &Path) {
 }
 
 #[test]
-fn compatibility_diff_still_admits_while_status_reads_its_result() {
+fn a_measured_working_copy_still_gets_its_clean_exit_and_no_banner() {
     // The control that stops this fix from being "hedge every answer", and the
     // one that would catch a build that simply stopped admitting. With a daemon
-    // serving, the compatibility diff admits the tree. The following status
-    // reads that canonical result without another admission.
+    // serving, both commands admit the tree themselves, so the answer IS about
+    // the working copy and has to say so by being silent and exiting 0.
     let root = tempdir().expect("temp root");
     let (repo, home) = seeded_repo(root.path());
     dirty_the_tracked_module(&repo);
@@ -410,7 +411,7 @@ fn compatibility_diff_still_admits_while_status_reads_its_result() {
     assert_eq!(
         code_of(&status),
         0,
-        "a successful canonical status was refused:\n{status_text}"
+        "a working copy this status admitted was reported as unmeasured:\n{status_text}"
     );
     assert!(
         !status_text.contains(BANNER),

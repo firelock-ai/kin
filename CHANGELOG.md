@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `kin setup` opens with a hardware check. It names the architecture, the
+  physical and logical core counts, the memory and the accelerator this machine
+  reports, then names the resource profile that follows from them and why. The
+  figures come from the same `kin-infer` detection the embedding budgets and
+  `kin resources inspect` are derived from, so there is one answer to what this
+  machine is.
+- `kin setup --intent advanced` can adjust that profile, with a plain warning
+  that a profile budgeting past what the machine actually has can exceed safe
+  memory and GPU thresholds and crash it. An adjustment is recorded in
+  `~/.kin/config/setup.toml`, and both `kin` and `kin-daemon` adopt it at their
+  next start. An exported `KIN_RESOURCE_PROFILE` and a repository's
+  `[resources]` config both still outrank it, and `kin resources inspect`
+  reports which of the four chose the profile in effect.
+- `kin setup --resource-profile <proof|interactive|throughput|ci>` records the
+  machine profile without the prompt.
+- `kin setup` now asks when the embedding model is fetched. The answer defaults
+  to later, nothing downloads during setup, and `kin embed` starts the fetch
+  when it is wanted. Answering that this machine does not fetch it is recorded,
+  and `kin doctor`, `kin graph status` and `kin resources inspect` then report a
+  choice rather than a gap. An air-gapped host is unaffected either way.
+  `--embedding-model <later|never>` is the scripted answer.
+- `kin setup` now asks where vectors are computed, recommends local, and states
+  that a remote OpenAI-compatible provider sends entity text to the endpoint you
+  configure. Choosing remote prints the environment variables that provider
+  needs and collects no credential. `--embedding-provider <local|remote>` is the
+  scripted answer.
+- An npm or npx install is now asked before `~/.kin/bin` is added to the shell
+  profile, because that channel cannot make the edit itself and the cost of
+  skipping it is re-downloading the release archive on every `npx` run. The
+  edit is recorded in the same install ledger the curl installer's line reaches,
+  so `kin setup uninstall` removes exactly it. `--skip-path` declines.
+- An interactive run now asks before the MCP round trip that proves each
+  configured client can actually reach Kin, and recommends running it. A
+  scripted run keeps it on and, on a machine with no repository yet, reports the
+  skip with its reason as it already did.
+- A non-interactive `kin setup` now prints every decision it answered for you,
+  the value it took, and the command or flag that changes it later.
+
+### Changed
+
+- Remove a `kin-vfs` and shim pair left by an earlier release. The installer clears them
+  when the archive carries no projection runtime, and `kin update` does the same on its
+  next run, so a 0.7.17 projection client cannot sit on PATH beside a newer daemon.
+- `KIN_RESOURCE_PROFILE` gained a fourth provenance: the machine-wide profile
+  `kin setup` recorded, reported by `kin resources inspect` and marked by
+  `KIN_RESOURCE_PROFILE_HOST_CONFIG` so a spawned daemon does not read it as an
+  operator override.
+
+### Fixed
+
+- Stop requiring the retired `kin-vfs` projection runtime and its shim when judging a
+  release archive. 0.7.18 removed both from the archive, and every updater built before
+  this change still demands them, so `kin update` refuses the release with `release
+  archive is incomplete: required component 'kin-vfs' is missing`. **An install on 0.7.19
+  or earlier cannot repair itself and must re-run the installer**
+  (`curl -fsSL https://get.kinlab.dev/install | sh`, or
+  `irm https://get.kinlab.dev/install.ps1 | iex` on Windows). The installer reads the
+  archive it downloads rather than a list fixed when it was built, so it always reaches
+  the current release.
+- Name the installer in the refusal, so the next time a release changes the archive's
+  shape the error carries the one command that recovers the install.
+
 ## [0.7.19] - 2026-09-13
 
 ### Changed

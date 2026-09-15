@@ -244,6 +244,13 @@ export function pinnedCoreVersion(pinnedLock) {
 // registry happens to have would move the requirement to a third value, so it
 // holds too and reports what it saw.
 export function decide({ registryLatest, pinnedVersion, pinnedCommit }) {
+  if (!pinnedCommit) {
+    return {
+      roll: true,
+      reason:
+        `the external ${VFS_REPOSITORY} packaging is retired from release workflows; ${VFS_CORE} is uncoupled and rolls with registry releases`,
+    };
+  }
   if (registryLatest === null) {
     return {
       roll: false,
@@ -286,13 +293,16 @@ export async function main({
   log = console.log,
   writeOutput = null,
 } = {}) {
-  const sources = await readPinSources(root);
-  const pinnedCommit = readPinnedVfsCommit(sources);
-  const pinnedLock = await fetchPinnedLock(pinnedCommit, {
-    token: env.GH_TOKEN || env.GITHUB_TOKEN,
-    fetchImpl,
-  });
-  const pinnedVersion = pinnedCoreVersion(pinnedLock);
+  const sources = await readPinSources(root, { allowEmpty: true });
+  const pinnedCommit = readPinnedVfsCommit(sources, { allowAbsent: true });
+  let pinnedVersion = null;
+  if (pinnedCommit) {
+    const pinnedLock = await fetchPinnedLock(pinnedCommit, {
+      token: env.GH_TOKEN || env.GITHUB_TOKEN,
+      fetchImpl,
+    });
+    pinnedVersion = pinnedCoreVersion(pinnedLock);
+  }
   const registryLatest = await fetchRegistryLatest(VFS_CORE, {
     registryUrl: env.KIN_REGISTRY_URL || REGISTRY_URL,
     fetchImpl,
@@ -307,7 +317,7 @@ export async function main({
   await emit(
     outputLine('kin_vfs_core_roll', verdict.roll ? 'true' : 'false') +
       outputLine('kin_vfs_core_reason', verdict.reason) +
-      outputLine('kin_vfs_core_pinned', pinnedVersion) +
+      outputLine('kin_vfs_core_pinned', pinnedVersion ?? '') +
       outputLine('kin_vfs_core_registry', registryLatest ?? ''),
   );
   log(

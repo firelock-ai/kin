@@ -6,6 +6,13 @@ Kin coexists with Git and projects graph-owned truth back to a normal filesystem
 
 ## Install
 
+Start with the primary command. It is the same on macOS, Linux, Windows and WSL, it needs
+Node 20 or newer, and it installs Kin and connects the AI clients it finds in one call.
+
+- [npm launcher](https://www.npmjs.com/package/@kinlab/kin): `npx -y @kinlab/kin setup`
+
+Other ways in, for a machine without Node or a team that prefers a package manager:
+
 - [Install script for macOS and Linux](https://get.kinlab.dev/install): `curl -fsSL https://get.kinlab.dev/install | sh`
 - [Install script for Windows](https://get.kinlab.dev/install.ps1): `irm https://get.kinlab.dev/install.ps1 | iex`
 - [Homebrew](https://github.com/firelock-ai/homebrew-kin): `brew install firelock-ai/kin/kin`
