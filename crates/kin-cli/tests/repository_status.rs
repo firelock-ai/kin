@@ -82,10 +82,14 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     );
 
     let before = run_kin(&repo, &home, &["status", "--json"]);
-    // A canonical authority read succeeds independently of projection drift
-    // or daemon availability.
+    // No daemon holds this repository, which is the state this case is about
+    // and which the coverage assertions below name outright, so status answers
+    // 9: the report is complete and true about durable authority and the code
+    // says none of it describes the files on disk. This case compares two such
+    // reports for equality across checkout and Git drift, which that code does
+    // not touch. Any other non-zero is still a failure.
     assert!(
-        before.status.success(),
+        matches!(before.status.code(), Some(0) | Some(9)),
         "status answered {:?}: stdout={} stderr={}",
         before.status.code(),
         String::from_utf8_lossy(&before.stdout),
@@ -163,10 +167,14 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     .expect("add unrelated file");
 
     let after = run_kin(&repo, &home, &["status", "--json"]);
-    // A canonical authority read succeeds independently of projection drift
-    // or daemon availability.
+    // No daemon holds this repository, which is the state this case is about
+    // and which the coverage assertions below name outright, so status answers
+    // 9: the report is complete and true about durable authority and the code
+    // says none of it describes the files on disk. This case compares two such
+    // reports for equality across checkout and Git drift, which that code does
+    // not touch. Any other non-zero is still a failure.
     assert!(
-        after.status.success(),
+        matches!(after.status.code(), Some(0) | Some(9)),
         "status answered {:?}: stdout={} stderr={}",
         after.status.code(),
         String::from_utf8_lossy(&after.stdout),
@@ -213,8 +221,20 @@ fn inspect_canonical_status(repo: &Path) -> kin_cli::commands::status::StatusRep
     .unwrap()
 }
 
+/// `kin status` admits the working copy BEFORE it reads the report.
+///
+/// The order is the whole of the fix and it is the one property no wording can
+/// stand in for. A build that reads first answers from the graph as it was, and
+/// every sentence it prints is still true, which is why this asserts the request
+/// the command makes rather than the page it renders: the two `POST`s are in the
+/// transcript in order, or the fix is gone.
+///
+/// The fixture daemon refuses the admission on purpose, so the other half is
+/// graded here too. A refused pass is an answer and is not an admission, so the
+/// reading says so above its counts and exits 9, and nothing in the working
+/// copy or the durable marker moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_status_crosses_only_read_http_boundaries_and_keeps_persisted_authority() {
+async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
     use std::sync::{Arc, Mutex};
     let root = tempdir().unwrap();
     let (repo, home) = seeded_status_repository(root.path());
@@ -250,7 +270,8 @@ async fn default_status_crosses_only_read_http_boundaries_and_keeps_persisted_au
                 ("GET", "/readiness") => (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"ready": true, "warming": false}))),
                 ("GET", "/health") => (axum::http::StatusCode::OK, axum::Json(health)),
                 ("POST", "/commands/status") => (axum::http::StatusCode::OK, axum::Json(response)),
-                _ => (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "status must not request admission or any mutation"}))),
+                ("POST", "/commands/admit") => (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "this fixture daemon refuses the pass on purpose"}))),
+                _ => (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "this fixture daemon answers only readiness, health, admit and status"}))),
             }
         }
     }));
@@ -271,18 +292,11 @@ async fn default_status_crosses_only_read_http_boundaries_and_keeps_persisted_au
             command.arg("--json");
         }
         let output = command.output().unwrap();
-        assert!(
-            !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|path| path == "POST /commands/admit"),
-            "default status requested admission: {:?}",
-            requests.lock().unwrap()
-        );
-        assert!(
-            output.status.success(),
-            "{}",
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "a refused pass was reported as a measured working copy: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         if json {
@@ -291,31 +305,40 @@ async fn default_status_crosses_only_read_http_boundaries_and_keeps_persisted_au
             assert_eq!(report, before, "strict v3 JSON remains canonical authority");
         } else {
             let text = String::from_utf8(output.stdout).unwrap();
+            let banner_at = text
+                .find("Working copy: NOT MEASURED")
+                .unwrap_or_else(|| panic!("{text}"));
+            let tree_at = text.find("\nTree: ").unwrap_or_else(|| panic!("{text}"));
             assert!(
-                text.contains("Read-only status: canonical repository/workspace authority"),
-                "{text}"
+                banner_at < tree_at,
+                "the gap is printed below the Tree: verdict a reader takes for the answer:\n{text}"
             );
             assert!(
-                text.contains("working-copy contents were not inspected or admitted"),
-                "{text}"
+                text.contains("refused to admit the working copy"),
+                "the reading does not name the refused pass:\n{text}"
             );
-            assert!(text.contains("Admission freshness:"), "{text}");
-            assert!(!text.contains("Exit 9"), "{text}");
         }
     }
     server.abort();
-    assert!(requests
-        .lock()
-        .unwrap()
+    let seen = requests.lock().unwrap().clone();
+    let admitted_at = seen
         .iter()
-        .any(|path| path == "POST /commands/status"));
+        .position(|path| path == "POST /commands/admit")
+        .unwrap_or_else(|| panic!("status never admitted the working copy: {seen:?}"));
+    let read_at = seen
+        .iter()
+        .position(|path| path == "POST /commands/status")
+        .unwrap_or_else(|| panic!("status never read the report: {seen:?}"));
     assert!(
-        requests.lock().unwrap().iter().all(|path| matches!(
+        admitted_at < read_at,
+        "status read the report before it admitted the working copy: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|path| matches!(
             path.as_str(),
-            "GET /health" | "GET /readiness" | "POST /commands/status"
+            "GET /health" | "GET /readiness" | "POST /commands/admit" | "POST /commands/status"
         )),
-        "{:?}",
-        requests.lock().unwrap()
+        "{seen:?}"
     );
     assert_eq!(
         inspect_canonical_status(&repo),
@@ -334,8 +357,14 @@ async fn default_status_crosses_only_read_http_boundaries_and_keeps_persisted_au
     );
 }
 
+/// Status answers without a daemon and without an author, and starts neither.
+///
+/// It answers 9 rather than 0 in that state, because nothing admitted the
+/// working copy, and the report it prints is still complete and true about
+/// durable authority. What it must never do is start a daemon of its own or
+/// report success for a directory that is not a Kin repository.
 #[test]
-fn read_only_status_needs_no_author_or_daemon_and_real_authority_errors_still_fail() {
+fn status_needs_no_author_or_daemon_and_real_authority_errors_still_fail() {
     let root = tempdir().unwrap();
     let home = root.path().join("home");
     let repo = root.path().join("repo");
@@ -361,8 +390,9 @@ fn read_only_status_needs_no_author_or_daemon_and_real_authority_errors_still_fa
     ] {
         let output = run_kin(&repo, &home, &args);
         assert!(
-            output.status.success(),
-            "stdout={} stderr={}",
+            matches!(output.status.code(), Some(0) | Some(9)),
+            "status answered {:?}: stdout={} stderr={}",
+            output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -380,7 +410,7 @@ fn read_only_status_needs_no_author_or_daemon_and_real_authority_errors_still_fa
 }
 
 #[test]
-fn read_only_status_refuses_corrupt_canonical_source_without_repairing_from_projection() {
+fn status_refuses_corrupt_canonical_source_without_repairing_from_projection() {
     let root = tempdir().unwrap();
     let (repo, home) = seeded_status_repository(root.path());
     let before = inspect_canonical_status(&repo);

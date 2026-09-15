@@ -1670,27 +1670,57 @@ pub(crate) fn config_set(body: &str, table: &str, key: &str, value: toml::Value)
     ))
 }
 
-/// The projection mode recorded on this machine, if any.
-pub(crate) fn recorded_mode(kin_home: &Path) -> Option<ProjectionMode> {
+/// One recorded string value from this machine's `setup.toml`, trimmed, with an
+/// empty value reading the same as an absent key.
+///
+/// The generic accessor lives here because this module already owns the file:
+/// it knows where it is, how to read one key out of it and how to set one
+/// without discarding the rest. `kin setup` records the machine resource
+/// profile and the embedding-model decision in the same file, and each of those
+/// callers had grown its own copy of this read-modify-write, which put the same
+/// four filesystem primitives in three modules instead of one.
+pub(crate) fn recorded_setup_value(kin_home: &Path, table: &str, key: &str) -> Option<String> {
     let body = std::fs::read_to_string(setup_config_path(kin_home)).ok()?;
-    ProjectionMode::parse(&config_str(&body, "projection", "mode")?)
+    let value = config_str(&body, table, key)?;
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
-/// Record the projection mode this machine should use.
-pub(crate) fn record_mode(kin_home: &Path, mode: ProjectionMode) -> Result<()> {
+/// Record one string value in this machine's `setup.toml`.
+///
+/// A read-modify-write rather than a rewrite, because this file carries the
+/// projection mode, the daemon auto-start setting, the machine resource profile
+/// and the embedding-model decision at once, and a rewrite would discard
+/// whichever three the caller did not have in hand.
+///
+/// An empty `value` is how a caller clears its key: `config_set` sets one key
+/// and has no remove, and an empty value reads back through
+/// [`recorded_setup_value`] as nothing recorded, which is the same answer an
+/// absent key gives.
+pub(crate) fn record_setup_value(
+    kin_home: &Path,
+    table: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     let path = setup_config_path(kin_home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let body = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = config_set(
-        &body,
-        "projection",
-        "mode",
-        toml::Value::String(mode.as_str().to_string()),
-    )?;
+    let updated = config_set(&body, table, key, toml::Value::String(value.to_string()))?;
     std::fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// The projection mode recorded on this machine, if any.
+pub(crate) fn recorded_mode(kin_home: &Path) -> Option<ProjectionMode> {
+    ProjectionMode::parse(&recorded_setup_value(kin_home, "projection", "mode")?)
+}
+
+/// Record the projection mode this machine should use.
+pub(crate) fn record_mode(kin_home: &Path, mode: ProjectionMode) -> Result<()> {
+    record_setup_value(kin_home, "projection", "mode", mode.as_str())
 }
 
 // ---------------------------------------------------------------------------

@@ -112,6 +112,26 @@ impl EmbedModelFetch {
             .as_deref()
             .map(crate::retrieval_profile::snapshot_present)
             .unwrap_or(false);
+        // A machine whose `kin setup` run declined the fetch owes no download,
+        // and every surface that reads `no_fetch_reason` then reports a choice
+        // rather than a gap. That is the whole value of asking: a health check
+        // reads the decision the wizard recorded, and never makes one.
+        //
+        // Two conditions, and both are the point. A model already in the cache
+        // is loaded whatever the recorded answer says, so announcing "nothing is
+        // fetched" over a model that is present would be the same lie pointing
+        // the other way. And an embed pass that is actually at work has already
+        // overtaken the decision: someone ran `kin embed`, which is exactly the
+        // escape hatch the question names, so the pass is reported as a fetch in
+        // progress rather than contradicted by a stale "no".
+        //
+        // Set on the fully-probed value rather than returned early, so the
+        // cache location, the expected size and a relocated `HF_HOME` are all
+        // still reported. A reader who wants the fetch after all needs to know
+        // where it would land.
+        let declined = (!present && !embed_pass_working)
+            .then(declined_model_fetch_reason)
+            .flatten();
         // Only measured while something is owed. A resolved snapshot renders no
         // numerator anywhere, so walking a complete cache would be work no
         // surface reads.
@@ -125,7 +145,7 @@ impl EmbedModelFetch {
             present,
             fetched_bytes,
             fetching: embed_pass_working && !present,
-            no_fetch_reason: None,
+            no_fetch_reason: declined,
             relocated_hf_home: relocated_hf_home(base.as_deref()),
             model_id,
         }
@@ -347,6 +367,61 @@ fn no_fetch_reason(model_id: &str) -> Option<String> {
         return Some("a local model directory, so nothing is fetched".to_string());
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// The model-fetch decision `kin setup` records
+// ---------------------------------------------------------------------------
+
+/// The `~/.kin/config/setup.toml` table and key the decision is recorded under.
+const MODEL_FETCH_TABLE: &str = "embedding";
+const MODEL_FETCH_KEY: &str = "model_fetch";
+
+/// Recorded when the answer was "later, whenever I ask for it": the default,
+/// and the one that keeps first contact fast.
+///
+/// Recorded rather than left absent so a re-run of the wizard can pre-select
+/// the answer already given, and so `deferred` and "never asked" stay
+/// distinguishable.
+pub const MODEL_FETCH_DEFERRED: &str = "deferred";
+
+/// Recorded when the answer was "not on this machine": an air-gapped host, or
+/// one that will never spend the egress.
+pub const MODEL_FETCH_DECLINED: &str = "declined";
+
+/// Whether [`MODEL_FETCH_DECLINED`] was recorded for this machine, as the
+/// reason every status surface prints.
+///
+/// Silent on every failure: a machine that never ran setup has nothing
+/// recorded, and a `setup.toml` that will not parse is reported with its real
+/// message by `kin setup`, not by a status line.
+fn declined_model_fetch_reason() -> Option<String> {
+    let recorded = recorded_model_fetch(&crate::commands::setup::kin_dir().ok()?)?;
+    (recorded == MODEL_FETCH_DECLINED).then(|| {
+        "`kin setup` recorded that this machine does not fetch it, so nothing is downloaded; \
+         `kin embed` starts the fetch if you change your mind"
+            .to_string()
+    })
+}
+
+/// The model-fetch decision recorded for this machine, if one was.
+///
+/// Both accessors delegate to the one `setup.toml` reader and writer in
+/// `commands::projection`, which owns that file. A second copy here would put
+/// the same read-modify-write, and the same chance of rewriting the file and
+/// discarding the projection mode with it, in two modules at once.
+pub fn recorded_model_fetch(kin_home: &Path) -> Option<String> {
+    crate::commands::projection::recorded_setup_value(kin_home, MODEL_FETCH_TABLE, MODEL_FETCH_KEY)
+}
+
+/// Record the model-fetch decision a person gave the wizard.
+pub fn record_model_fetch(kin_home: &Path, decision: &str) -> anyhow::Result<()> {
+    crate::commands::projection::record_setup_value(
+        kin_home,
+        MODEL_FETCH_TABLE,
+        MODEL_FETCH_KEY,
+        decision,
+    )
 }
 
 /// The configured OpenAI-compatible provider, or `None` for local embedding.

@@ -51,6 +51,7 @@ export const PIN_SOURCE_DIRECTORIES = ['.github/workflows', 'scripts'];
 export const PIN_SOURCE_EXCLUSIONS = new Set([
   'scripts/check-kin-vfs-compat.mjs',
   'scripts/check-kin-vfs-compat.test.mjs',
+  'scripts/test-release-workflow-authority.py',
 ]);
 
 // A bare 40-hex value. `expected_vfs_commit` legitimately appears with no value
@@ -63,24 +64,26 @@ export const PIN_SOURCE_EXCLUSIONS = new Set([
 export function collectVfsPinSites(text, file) {
   const found = [];
 
-  for (const step of text.split(/^\s*-\s+name:/m).slice(1)) {
-    if (!step.includes(`repository: ${VFS_REPOSITORY}`)) {
-      continue;
+  if (/\.(ya?ml)$/i.test(file)) {
+    for (const step of text.split(/^\s*-\s+name:/m).slice(1)) {
+      if (!step.includes(`repository: ${VFS_REPOSITORY}`)) {
+        continue;
+      }
+      const ref = step.match(/^\s*ref:\s*(\S+)/m);
+      if (!ref) {
+        throw new Error(
+          `a ${VFS_REPOSITORY} checkout in ${file} records no ref, so the ` +
+          'release input floats with that repository default branch',
+        );
+      }
+      if (!COMMIT_SHA.test(ref[1])) {
+        throw new Error(
+          `${file} records a ${VFS_REPOSITORY} checkout ref "${ref[1]}", which is ` +
+          'not a 40-character commit sha; release inputs must be immutable',
+        );
+      }
+      found.push({ sha: ref[1], site: `${file} ${VFS_REPOSITORY} checkout ref` });
     }
-    const ref = step.match(/^\s*ref:\s*(\S+)/m);
-    if (!ref) {
-      throw new Error(
-        `a ${VFS_REPOSITORY} checkout in ${file} records no ref, so the ` +
-        'release input floats with that repository default branch',
-      );
-    }
-    if (!COMMIT_SHA.test(ref[1])) {
-      throw new Error(
-        `${file} records a ${VFS_REPOSITORY} checkout ref "${ref[1]}", which is ` +
-        'not a 40-character commit sha; release inputs must be immutable',
-      );
-    }
-    found.push({ sha: ref[1], site: `${file} ${VFS_REPOSITORY} checkout ref` });
   }
 
   for (const match of text.matchAll(
@@ -96,7 +99,7 @@ export function collectVfsPinSites(text, file) {
 // to agree. A half-updated pin (release.yml moved, the candidate archive left
 // behind) is exactly the shape that reaches a tag before anyone notices, and it
 // is the shape this returns an error for rather than a commit.
-export function readPinnedVfsCommit(sources) {
+export function readPinnedVfsCommit(sources, { allowAbsent = false } = {}) {
   const sites = new Map();
   for (const { path: file, text } of sources) {
     for (const { sha, site } of collectVfsPinSites(text, file)) {
@@ -105,6 +108,9 @@ export function readPinnedVfsCommit(sources) {
   }
 
   if (sites.size === 0) {
+    if (allowAbsent) {
+      return null;
+    }
     throw new Error(
       `no ${VFS_REPOSITORY} pin was found in any of ${sources.length} scanned ` +
       'file(s), so this gate has nothing to compare against and cannot be ' +
@@ -128,7 +134,7 @@ export function readPinnedVfsCommit(sources) {
 // the gate still runs in a checkout that carries one and not the other, but a
 // scan that found no file at all is, because zero files scanned and zero
 // disagreements look identical from the outside.
-export async function readPinSources(root, { fsImpl = fs } = {}) {
+export async function readPinSources(root, { fsImpl = fs, allowEmpty = false } = {}) {
   const sources = [];
   for (const dir of PIN_SOURCE_DIRECTORIES) {
     let entries;
@@ -153,6 +159,9 @@ export async function readPinSources(root, { fsImpl = fs } = {}) {
     }
   }
   if (sources.length === 0) {
+    if (allowEmpty) {
+      return [];
+    }
     throw new Error(
       'no file mentioning the kin-vfs pin was found; refusing to read an empty ' +
       'scan as agreement',

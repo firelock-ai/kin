@@ -164,6 +164,13 @@ pub struct ActualResources {
     /// override is the same lie FIR-2434 fixed in the other direction.
     #[serde(default)]
     pub resource_profile_repository_config: bool,
+    /// Whether that value came from the machine-wide choice `kin setup`
+    /// recorded in `~/.kin/config/setup.toml`. Fourth state beside the three
+    /// above, for the same reason the third exists: a profile a person adjusted
+    /// for their own hardware, reported as an operator override, is the same lie
+    /// one layer further out.
+    #[serde(default)]
+    pub resource_profile_host_config: bool,
     /// Why the value in effect is not a profile the runtime can act on, when it
     /// is not (FIR-2504).
     ///
@@ -198,6 +205,7 @@ impl ActualResources {
             resource_profile_product_selected: crate::resource_profile::product_selected(),
             resource_profile_repository_config: crate::resource_profile::repository_config_selected(
             ),
+            resource_profile_host_config: crate::resource_profile::host_config_selected(),
             rayon_num_threads_env: non_empty_env("RAYON_NUM_THREADS"),
             tokenizers_parallelism_env: non_empty_env("TOKENIZERS_PARALLELISM"),
         }
@@ -1132,6 +1140,10 @@ fn profile_selector_line(actual: &ActualResources) -> String {
         Some(value) if actual.resource_profile_repository_config => format!(
             "Profile selector: KIN_RESOURCE_PROFILE={value} (from this repository's \
              [resources] config; unset in the environment)"
+        ),
+        Some(value) if actual.resource_profile_host_config => format!(
+            "Profile selector: KIN_RESOURCE_PROFILE={value} (recorded for this machine by \
+             `kin setup`; unset in the environment)"
         ),
         Some(value) if actual.resource_profile_product_selected => {
             format!("Profile selector: KIN_RESOURCE_PROFILE={value} (selected by kin; unset in the environment)")

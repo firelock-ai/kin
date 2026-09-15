@@ -524,6 +524,12 @@ fn main() {
     // comparison `kin embed` and `kin resources inspect` run against this
     // daemon still matches. An operator's explicit KIN_RESOURCE_PROFILE wins.
     kin_cli::resource_profile::apply_product_default();
+    // …then the machine-wide profile `kin setup` recorded, still
+    // single-threaded and still ahead of every reader. The CLI applies the SAME
+    // one at the same point, so a machine whose setup run adjusted the profile
+    // does not make every command report a behavior-env divergence against this
+    // daemon.
+    kin_cli::resource_profile::apply_host_profile_at();
     // …then let this repository's recorded profile take over from that default,
     // still single-threaded and still ahead of every reader (FIR-2504). An
     // operator's own KIN_RESOURCE_PROFILE outranks the file and is untouched.

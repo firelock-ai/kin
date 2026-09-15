@@ -1094,6 +1094,28 @@ pub struct WizardOptions {
     /// Without it an interactive run asks and a scripted one prints the command
     /// and changes nothing.
     pub install_language_servers: bool,
+    /// The machine resource profile to record, skipping the hardware check's
+    /// adjustment prompt. One of `proof`, `interactive`, `throughput`, `ci`.
+    ///
+    /// The hardware check still prints what it detected and what it recommends,
+    /// because a scripted run on an unfamiliar machine is exactly the case
+    /// where that output is worth having in the log.
+    pub resource_profile: Option<String>,
+    /// When the embedding model is fetched: `later` (the recommendation) or
+    /// `never`. The wizard never downloads it either way.
+    pub embedding_model: Option<String>,
+    /// Where vectors are computed: `local` (the recommendation) or `remote`.
+    ///
+    /// `remote` collects no credentials. It prints the environment variables an
+    /// OpenAI-compatible provider needs and the egress that choosing one means,
+    /// because a credential prompt is the one question a scripted run cannot
+    /// answer.
+    pub embedding_provider: Option<String>,
+    /// Do not add `~/.kin/bin` to the shell profile.
+    ///
+    /// The curl installer makes this edit itself; an npm or npx install does
+    /// not, so the wizard asks. This is the scripted answer of no.
+    pub skip_path: bool,
 }
 
 /// First-run intent — what the user wants out of Kin. Each intent maps to a
@@ -1158,14 +1180,41 @@ impl SetupIntent {
 /// stays identical regardless of how the answers were collected.
 struct SetupPlan {
     install_shell_hook: bool,
+    /// Whether `~/.kin/bin` may be added to the shell profile.
+    ///
+    /// Always true except when a person declined, or `--skip-path` was passed.
+    /// The PATH line is what makes a bare `kin` resolve, and on an npm or npx
+    /// install nothing else writes it, so declining has a cost the wizard names
+    /// rather than a silent one.
+    add_bin_to_path: bool,
     configure_mcp: bool,
     /// Which detected AI clients to configure (indices into
     /// [`detect_ai_assistants`]). Empty unless `configure_mcp` is true.
     mcp_assistant_indices: Vec<usize>,
     inject_discovery_reminders: bool,
+    /// Whether to launch each configured client's own entry and call one real
+    /// tool through it. False when `--skip-mcp-check` was passed or a person
+    /// declined; the skip is printed with its reason either way.
+    verify_mcp_round_trip: bool,
     auto_daemon: bool,
     show_editor_hint: bool,
     show_hosted_hint: bool,
+}
+
+/// A question the fast path answered by default, and how to give it back.
+///
+/// Collected as the wizard runs rather than restated at the end, so a question
+/// added without a row here shows up as a gap in the summary instead of as a
+/// silent default. The non-interactive run prints every row; an interactive one
+/// prints only the rows a person did not actually answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkippedDecision {
+    /// What was decided.
+    decision: &'static str,
+    /// The value it took.
+    value: String,
+    /// The command or flag that changes it later.
+    give_back: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2633,7 +2682,14 @@ fn missing_shim_guidance(exe: Option<&Path>, kin_home: &Path) -> (&'static str, 
     }
 }
 
-fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
+/// Install the shell hook, and the PATH line when `allow_path` permits it.
+///
+/// `allow_path` is the answer to the wizard's PATH question. It is a parameter
+/// rather than a read of anything ambient because the two writes have different
+/// owners: the hook is Kin's own integration and setup always refreshes it,
+/// while the PATH line is an edit to how the user's shell resolves a command
+/// name, and on an npm install nobody else makes it.
+fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, String)> {
     let kin_home = kin_dir()?;
     let bin_dir = kin_home.join("bin");
     let shell_dir = kin_home.join("shell");
@@ -2675,6 +2731,17 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
     let source_line = rc_source_line(shell_name, &hook_file);
 
     for target in rc_write_plan(shell_name)? {
+        // A declined PATH line narrows the plan: a file that carried only the
+        // PATH block is dropped, and one that carried both keeps the hook. The
+        // decline was already explained where it was collected, so nothing is
+        // reported twice here.
+        let Some(blocks) = (if allow_path {
+            Some(target.blocks)
+        } else {
+            target.blocks.without_path()
+        }) else {
+            continue;
+        };
         let rc_path = target.path.as_path();
         let existed = rc_path.exists();
         let rc_content = if existed {
@@ -2693,7 +2760,7 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
             rc_path,
             &bin_dir,
             bin_dir.is_dir(),
-            target.blocks,
+            blocks,
         );
         for line in update.already_present.iter().chain(&update.skipped) {
             println!("{line}");
@@ -2807,6 +2874,20 @@ impl RcBlocks {
     fn carries_path(self) -> bool {
         matches!(self, RcBlocks::HookAndPath | RcBlocks::PathOnly)
     }
+
+    /// The same responsibility with the PATH block dropped, or `None` when
+    /// nothing is left for this file to carry.
+    ///
+    /// A declined PATH line is narrowed out of the plan here rather than faked
+    /// as an absent `~/.kin/bin`. `plan_rc_update` reports an absent bin
+    /// directory with a message naming that exact reason, and reusing it for a
+    /// person's "no" would print a reason that is not the real one.
+    fn without_path(self) -> Option<Self> {
+        match self {
+            RcBlocks::HookAndPath | RcBlocks::HookOnly => Some(RcBlocks::HookOnly),
+            RcBlocks::PathOnly => None,
+        }
+    }
 }
 
 /// The rc file Kin wants on disk, split from what it may say about it.
@@ -2898,7 +2979,11 @@ fn plan_rc_update(
 /// hook file path it wrote.
 pub(crate) fn reinstall_shell_hook() -> Result<PathBuf> {
     let shell_name = detect_shell();
-    let (hook_file, _source_line) = install_shell_hook(shell_name)?;
+    // The PATH line is allowed here because this is the repair for the
+    // `shell_path` check, which is the check that fails when `kin` cannot be
+    // resolved. A repair asked for by name is not the place to re-litigate the
+    // wizard's question.
+    let (hook_file, _source_line) = install_shell_hook(shell_name, true)?;
     Ok(hook_file)
 }
 
@@ -12409,6 +12494,610 @@ fn record_projection_choice() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// The questions the wizard asks, in the order it asks them
+// ---------------------------------------------------------------------------
+
+/// Print a numbered set of options and return the index chosen.
+///
+/// Numbered rather than y/n, because skipping has to mean something: a `no` to
+/// "fetch the model?" and a deliberate "not on this machine" are different
+/// answers, and only one of them is a decision. The recommendation is always
+/// first, so Enter accepts it.
+///
+/// A non-interactive run prints the options it did not ask about and takes the
+/// first. Printing them is what keeps a scripted log readable: the reader sees
+/// the choice that existed, not just the value it took.
+fn prompt_choice(options: &[(&str, &str)], interactive: bool) -> usize {
+    // Padded to the widest label in THIS set rather than to a fixed column. A
+    // constant column put the longest label hard against its own note, which is
+    // the one row a reader most needs to be able to separate.
+    let column = options
+        .iter()
+        .map(|(label, _)| console::measure_text_width(label))
+        .max()
+        .unwrap_or(0);
+    let items: Vec<String> = options
+        .iter()
+        .map(|(label, note)| {
+            let pad = column.saturating_sub(console::measure_text_width(label));
+            format!("{label}{:pad$}  {note}", "")
+        })
+        .collect();
+    if !interactive {
+        for (index, item) in items.iter().enumerate() {
+            println!("    [{}] {item}", index + 1);
+        }
+        return 0;
+    }
+    dialoguer::Select::new()
+        .items(&items)
+        .default(0)
+        .interact()
+        .unwrap_or(0)
+}
+
+/// The summary row's decision label for the machine resource profile.
+///
+/// A constant because two places have to agree on it: the hardware check pushes
+/// the row before the intent is known, and the advanced adjustment retracts it
+/// when a person is actually asked.
+const RESOURCE_PROFILE_DECISION: &str = "Resource profile";
+
+/// What the opening hardware check settled, for the rest of the run.
+struct HardwareCheck {
+    /// The profile the detection recommends, which the advanced adjustment
+    /// pre-selects and `record_resource_profile` compares against.
+    recommended: kin_infer::resource::Profile,
+    /// True when an explicit `--resource-profile` already answered, so the
+    /// advanced adjustment must not ask again.
+    answered_by_flag: bool,
+}
+
+/// The hardware check the wizard opens with, and the resource profile it
+/// recommends from what it found.
+///
+/// Runs before the intent question on purpose. Intent frames what "done" means,
+/// but the machine frames what is possible, and a person deciding whether to
+/// point four AI clients at Kin is owed the detected figures first.
+///
+/// It prints and records; it does not ask. The recommendation is the profile a
+/// kin binary already selects for itself, so accepting it writes no file and
+/// costs no question, which is what keeps the fast path fast. The adjustment
+/// lives in the advanced plan, where the rest of the granular toggles are.
+fn hardware_check(opts: &WizardOptions, skipped: &mut Vec<SkippedDecision>) -> HardwareCheck {
+    use super::setup_hardware;
+
+    let hardware = setup_hardware::DetectedHardware::detect();
+    let recommendation = setup_hardware::recommend_profile(&hardware);
+    let recommended = recommendation.profile;
+
+    println!("Hardware check");
+    println!("  {}", setup_hardware::detected_sentence(&hardware));
+    for line in setup_hardware::detail_lines(&hardware) {
+        println!("    {line}");
+    }
+    println!();
+    println!(
+        "  Recommended resource profile: {}",
+        style(setup_hardware::profile_name(recommended)).bold()
+    );
+    println!("    {}", recommendation.reason);
+    if let Some(upgrade) = &recommendation.upgrade {
+        println!("    {upgrade}");
+    }
+
+    // An explicit flag is an answer, so it applies on every intent without a
+    // prompt. A person who typed the profile has already made the decision the
+    // advanced menu exists to collect.
+    if let Some(requested) = opts.resource_profile.as_deref() {
+        match setup_hardware::parse_profile_name(requested) {
+            Some(profile) => {
+                record_resource_profile(profile, recommended);
+                return HardwareCheck {
+                    recommended,
+                    answered_by_flag: true,
+                };
+            }
+            None => {
+                println!(
+                    "  {} unrecognized --resource-profile '{requested}'; keeping the \
+                     recommendation",
+                    style("!").yellow()
+                );
+            }
+        }
+    } else {
+        println!(
+            "    Adjust it with `kin setup --intent advanced` or `--resource-profile <name>`."
+        );
+        skipped.push(SkippedDecision {
+            decision: RESOURCE_PROFILE_DECISION,
+            value: format!(
+                "{} (recommended)",
+                setup_hardware::profile_name(recommended)
+            ),
+            give_back: "kin setup --intent advanced, or kin setup --resource-profile <name>"
+                .to_string(),
+        });
+    }
+    println!();
+    HardwareCheck {
+        recommended,
+        answered_by_flag: false,
+    }
+}
+
+/// The advanced intent's resource-profile adjustment.
+///
+/// Carries the warning the founder asked for, because a profile that budgets
+/// past the real machine is not merely slower: it can exceed safe memory and
+/// GPU thresholds and take the machine down. The detected figures printed above
+/// are the ceiling, and the menu says so before it offers anything.
+fn adjust_resource_profile(
+    check: &HardwareCheck,
+    interactive: bool,
+    skipped: &mut Vec<SkippedDecision>,
+) {
+    use super::setup_hardware;
+
+    if check.answered_by_flag {
+        return;
+    }
+    // The hardware check recorded the recommendation as unasked, because it runs
+    // before the intent is known and most intents never open this menu. Reaching
+    // here means a person is being asked after all, so the row is retracted:
+    // telling someone a decision was made for them, on the same screen they just
+    // made it on, is worse than not summarizing it at all.
+    skipped.retain(|row| row.decision != RESOURCE_PROFILE_DECISION);
+    println!();
+    println!("Resource profile");
+    println!(
+        "  {}",
+        style(setup_hardware::ADVANCED_PROFILE_WARNING).yellow()
+    );
+    let choices = setup_hardware::profile_choices(check.recommended);
+    let options: Vec<(&str, &str)> = choices
+        .iter()
+        .map(|(profile, note)| (setup_hardware::profile_name(*profile), note.as_str()))
+        .collect();
+    let chosen = choices
+        .get(prompt_choice(&options, interactive))
+        .map(|(profile, _)| *profile)
+        .unwrap_or(check.recommended);
+    record_resource_profile(chosen, check.recommended);
+}
+
+/// Record an adjusted machine profile, or clear the record when the
+/// recommendation was chosen.
+///
+/// Clearing is the undo path, and it is why accepting the recommendation is not
+/// a no-op on a machine that was adjusted once: re-running the wizard and
+/// taking the default has to be able to put the machine back on kin's own
+/// default rather than leaving an old pin in place.
+fn record_resource_profile(
+    chosen: kin_infer::resource::Profile,
+    recommended: kin_infer::resource::Profile,
+) {
+    use super::setup_hardware;
+
+    let Ok(kin_home) = kin_dir() else {
+        return;
+    };
+    let had_record = setup_hardware::recorded_profile(&kin_home).is_some();
+    if chosen == recommended {
+        if had_record {
+            match setup_hardware::record_profile(&kin_home, None) {
+                Ok(()) => println!(
+                    "  Cleared the recorded profile; this machine is back on kin's own default ({}).",
+                    setup_hardware::profile_name(recommended)
+                ),
+                Err(error) => println!(
+                    "  {} could not clear the recorded profile: {error:#}",
+                    style("!").yellow()
+                ),
+            }
+        } else {
+            println!(
+                "  Keeping {}; nothing is recorded, so this machine follows kin's own default.",
+                setup_hardware::profile_name(recommended)
+            );
+        }
+        println!();
+        return;
+    }
+    match setup_hardware::record_profile(&kin_home, Some(chosen)) {
+        Ok(()) => {
+            println!(
+                "  Recorded {} for this machine. `kin` and `kin-daemon` adopt it at their next \
+                 start; an exported KIN_RESOURCE_PROFILE and a repository's [resources] config \
+                 both still outrank it.",
+                setup_hardware::profile_name(chosen)
+            );
+            println!("  `kin resources inspect` reports the profile in effect and who chose it.");
+        }
+        Err(error) => println!(
+            "  {} could not record the profile: {error:#}",
+            style("!").yellow()
+        ),
+    }
+    println!();
+}
+
+/// Whether this `~/.kin` was provisioned by the npm launcher rather than by the
+/// curl installer.
+///
+/// The launcher writes `bin/.kinlab-kin-version` at the end of every successful
+/// provision and the installer never touches it, which makes the stamp the one
+/// on-disk fact that separates the two channels. It matters here because the
+/// installer edits the shell profile itself and the launcher cannot: `npm
+/// install -g` needs a writable global prefix, which is the problem `npx -y`
+/// exists to avoid, so an npx user has `~/.kin/bin` populated and no PATH entry
+/// pointing at it.
+fn npm_provisioned_install(kin_home: &Path) -> bool {
+    valid_launcher_version_stamp(kin_home)
+}
+
+/// Ask whether `~/.kin/bin` goes on PATH, when this install is the one that
+/// needs asking.
+///
+/// Returns whether the PATH line may be written, and the summary row when
+/// nobody was asked. Only an npm-style install is asked: after a curl install
+/// the edit is already made and re-asking would be a question about something
+/// already true.
+fn ask_bin_path(
+    opts: &WizardOptions,
+    interactive: bool,
+    shell_name: &str,
+    skipped: &mut Vec<SkippedDecision>,
+) -> bool {
+    if opts.skip_path {
+        return false;
+    }
+    let Ok(kin_home) = kin_dir() else {
+        return true;
+    };
+    let bin_dir = kin_home.join("bin");
+    if !bin_dir.is_dir() || !npm_provisioned_install(&kin_home) {
+        return true;
+    }
+    // Already on PATH in every file this shell reads it from: there is nothing
+    // to ask about, and asking would invite a person to answer no to a change
+    // that will not happen either way.
+    let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let already = shell_path_rcs_in(&home, shell_name)
+        .unwrap_or_default()
+        .iter()
+        .all(|rc| {
+            fs::read_to_string(rc)
+                .map(|content| rc_declares_kin_bin(&content, &bin_dir))
+                .unwrap_or(false)
+        });
+    if already {
+        return true;
+    }
+
+    println!();
+    println!("Command name on PATH");
+    println!(
+        "  This install came from npm, which cannot edit your shell profile, so `kin` is not on \
+         PATH yet."
+    );
+    println!(
+        "  Without it you keep typing `npx -y {CANONICAL_NPM_MCP_PACKAGE} ...`, which re-downloads \
+         the release archive into the npx cache every run."
+    );
+    if !interactive {
+        skipped.push(SkippedDecision {
+            decision: "~/.kin/bin on PATH",
+            value: "added (recommended)".to_string(),
+            give_back: "kin setup --skip-path leaves the shell profile alone; kin setup uninstall \
+                        removes the line"
+                .to_string(),
+        });
+    }
+    let options = [
+        (
+            "Add it to my shell profile",
+            "one line, recorded so `kin setup uninstall` removes exactly it",
+        ),
+        (
+            "Leave my shell profile alone",
+            "bare `kin` will not resolve in a new shell",
+        ),
+    ];
+    let allow = prompt_choice(&options, interactive) == 0;
+    if !allow {
+        println!(
+            "  {} Left alone. Run `kin setup` again and answer yes, or add {} to PATH yourself.",
+            style("→").cyan(),
+            bin_dir.display()
+        );
+    }
+    allow
+}
+
+/// Ask when the embedding model is fetched. Always asked, on every intent.
+///
+/// The wizard never downloads it. That is deliberate: setup is the moment Kin
+/// promises a working CLI, and a several-hundred-megabyte fetch is the one real
+/// cost in the whole install. `kin init`'s first embed pass and `kin embed`
+/// both start it, and this question only records which of those a person wants
+/// to happen.
+fn ask_embedding_model(
+    opts: &WizardOptions,
+    interactive: bool,
+    skipped: &mut Vec<SkippedDecision>,
+) {
+    let kin_home = kin_dir().ok();
+    let recorded = kin_home
+        .as_deref()
+        .and_then(crate::embed_model::recorded_model_fetch);
+    // A decline this wizard recorded has to stay re-askable, or a person who
+    // changes their mind has no way back through the surface that took the
+    // answer. A reason from anywhere else (a remote provider, a model id that
+    // names a local directory) is not this question's to re-open.
+    let declined_here = recorded.as_deref() == Some(crate::embed_model::MODEL_FETCH_DECLINED);
+    let fetch = crate::embed_model::EmbedModelFetch::probe(false);
+    println!();
+    println!("Embedding model");
+    if fetch.present {
+        println!(
+            "  {} {} is already in the Hugging Face cache, so no download is owed.",
+            style("✓").green(),
+            fetch.model_id
+        );
+        return;
+    }
+    if let Some(reason) = fetch.no_fetch_reason.as_deref() {
+        println!("  {} {}: {reason}", style("→").cyan(), fetch.model_id);
+        if !declined_here {
+            return;
+        }
+    }
+
+    println!(
+        "  Semantic ranking needs {}, fetched {} from {} into the Hugging Face cache.",
+        fetch.model_id,
+        fetch.expected_download(),
+        crate::embed_model::EMBED_MODEL_HOST
+    );
+    println!(
+        "  Without it `kin locate` and `kin search` answer from lexical and graph signals only, \
+         and say so."
+    );
+    if declined_here {
+        println!(
+            "  {} You recorded that this machine does not fetch it. Taking the recommendation \
+             below clears that.",
+            style("→").cyan()
+        );
+    }
+
+    let requested = opts.embedding_model.as_deref().map(str::trim);
+    let decision = match requested.map(|value| value.to_ascii_lowercase()) {
+        Some(value) if value == "never" || value == "declined" => {
+            crate::embed_model::MODEL_FETCH_DECLINED
+        }
+        Some(value) if value == "later" || value == "deferred" => {
+            crate::embed_model::MODEL_FETCH_DEFERRED
+        }
+        Some(value) => {
+            println!(
+                "  {} unrecognized --embedding-model '{value}'; recording the recommendation",
+                style("!").yellow()
+            );
+            crate::embed_model::MODEL_FETCH_DEFERRED
+        }
+        None => {
+            if !interactive {
+                skipped.push(SkippedDecision {
+                    decision: "Embedding model",
+                    value: "fetched later, on demand (recommended)".to_string(),
+                    give_back: "kin embed starts the fetch; kin setup --embedding-model never \
+                                records that this machine does not fetch it"
+                        .to_string(),
+                });
+            }
+            let options = [
+                (
+                    "Later, whenever I ask for it",
+                    "nothing downloads now; `kin embed` starts it",
+                ),
+                (
+                    "Not on this machine",
+                    "recorded, so `kin doctor` reports a choice rather than a gap",
+                ),
+            ];
+            if prompt_choice(&options, interactive) == 0 {
+                crate::embed_model::MODEL_FETCH_DEFERRED
+            } else {
+                crate::embed_model::MODEL_FETCH_DECLINED
+            }
+        }
+    };
+
+    let Some(kin_home) = kin_home else {
+        return;
+    };
+    if let Err(error) = crate::embed_model::record_model_fetch(&kin_home, decision) {
+        println!(
+            "  {} could not record the embedding model decision: {error:#}",
+            style("!").yellow()
+        );
+        return;
+    }
+    if decision == crate::embed_model::MODEL_FETCH_DECLINED {
+        println!(
+            "  {} Recorded. Nothing fetches the model on this machine, and an air-gapped host \
+             stays fine. `kin embed` starts the fetch if you change your mind.",
+            style("→").cyan()
+        );
+    } else {
+        println!(
+            "  {} Recorded. `kin embed` starts the fetch when you want it, and `kin init`'s first \
+             embed pass starts it too. An air-gapped host stays fine.",
+            style("→").cyan()
+        );
+    }
+}
+
+/// Ask where vectors are computed. Always asked, on every intent.
+///
+/// Asked rather than inferred from whether huggingface.co answers, because the
+/// consequence is a privacy one and a person is owed it in the moment. No
+/// credential is collected: an API key is the one answer a scripted run cannot
+/// give, so choosing a remote provider prints exactly what to set instead of
+/// half-configuring it.
+fn ask_embedding_provider(
+    opts: &WizardOptions,
+    interactive: bool,
+    skipped: &mut Vec<SkippedDecision>,
+) {
+    println!();
+    println!("Where vectors are computed");
+    println!(
+        "  Local embedding runs in this process on your hardware. A remote OpenAI-compatible \
+         provider sends entity text to the endpoint you configure, because that is what remote \
+         embedding is."
+    );
+
+    let requested = opts
+        .embedding_provider
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let remote = match requested.as_deref() {
+        Some("remote") | Some("openai") | Some("lmstudio") => true,
+        Some("local") => false,
+        Some(other) => {
+            println!(
+                "  {} unrecognized --embedding-provider '{other}'; keeping local",
+                style("!").yellow()
+            );
+            false
+        }
+        None => {
+            if !interactive {
+                skipped.push(SkippedDecision {
+                    decision: "Embedding provider",
+                    value: "local (recommended)".to_string(),
+                    give_back: "set KIN_EMBED_PROVIDER and the endpoint variables to use a remote \
+                                provider"
+                        .to_string(),
+                });
+            }
+            let options = [
+                (
+                    "Local, on this machine",
+                    "nothing derived from your source leaves the machine",
+                ),
+                (
+                    "A remote OpenAI-compatible API",
+                    "entity text is sent to the endpoint you configure",
+                ),
+            ];
+            prompt_choice(&options, interactive) == 1
+        }
+    };
+
+    if !remote {
+        println!(
+            "  {} Local. Nothing selects a remote provider on its own.",
+            style("✓").green()
+        );
+        return;
+    }
+    println!(
+        "  {} Remote embedding sends entity text off this machine. Set these to use it:",
+        style("!").yellow()
+    );
+    println!("      KIN_EMBED_PROVIDER=openai   (or lmstudio, openai-compatible)");
+    println!("      KIN_EMBED_OPENAI_BASE_URL=<endpoint>");
+    println!("      KIN_EMBED_OPENAI_API_KEY=<key>");
+    println!("      KIN_EMBED_MODEL_ID=<model>  (optional; changing it re-embeds everything)");
+    println!(
+        "    Setup collects no credential, so nothing is written here. `kin resources inspect` \
+         reports the provider in effect."
+    );
+}
+
+/// Ask whether to prove each configured client's entry with one real tool call.
+///
+/// Interactive runs ask and recommend yes: it is one call, it is cheap, and the
+/// proof is the whole point of writing the config. A scripted run keeps it on,
+/// because the one case the flag was made for is a bare machine with no
+/// repository yet, and that case already reports itself as a skip with its own
+/// reason rather than needing a flag.
+fn ask_mcp_round_trip(
+    opts: &WizardOptions,
+    interactive: bool,
+    skipped: &mut Vec<SkippedDecision>,
+) -> bool {
+    if opts.skip_mcp_check {
+        println!();
+        println!(
+            "MCP round trip: skipped, because --skip-mcp-check was passed. Nothing exercised the \
+             entries this run."
+        );
+        return false;
+    }
+    if !interactive {
+        skipped.push(SkippedDecision {
+            decision: "MCP round trip",
+            value: "run (recommended)".to_string(),
+            give_back: "kin setup --skip-mcp-check turns it off".to_string(),
+        });
+        return true;
+    }
+    println!();
+    println!("MCP round trip");
+    println!(
+        "  Writing the config is not the same as the config working: a recorded launcher a `brew \
+         upgrade` moved leaves a file that reads as valid while every call the agent makes fails."
+    );
+    println!(
+        "  Skipping it leaves that surfacing later, as \"the server is connected but the tools \
+         report an empty graph\"."
+    );
+    let options = [
+        (
+            "Prove it with one real call",
+            "one bounded call per client, and it is the whole point",
+        ),
+        (
+            "Write it and do not exercise it",
+            "the same as --skip-mcp-check",
+        ),
+    ];
+    prompt_choice(&options, interactive) == 0
+}
+
+/// Print what the run answered by default, and how to give each one back.
+///
+/// The notebook's ground rule in one function: a scripted run that took five
+/// defaults has to say which five. Printed for a non-interactive run always,
+/// and for an interactive run only when something was decided without asking.
+fn print_skipped_decisions(skipped: &[SkippedDecision], interactive: bool) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!();
+    if interactive {
+        println!("Decided without asking:");
+    } else {
+        println!("This run was not interactive, so it answered these for you:");
+    }
+    for SkippedDecision {
+        decision,
+        value,
+        give_back,
+    } in skipped
+    {
+        println!("  {decision}: {value}");
+        println!("    change it later: {give_back}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `kin setup` — interactive wizard (or non-interactive with flags)
 // ---------------------------------------------------------------------------
 
@@ -12419,12 +13108,29 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!("Welcome to Kin setup. Let's get you to value in a few questions.");
     println!();
 
+    // Every question the run answered without asking, collected as it goes so a
+    // question added without a summary row shows up as a gap rather than as a
+    // silent default.
+    let mut skipped: Vec<SkippedDecision> = Vec::new();
+
+    // The hardware check comes first: it identifies the machine and names the
+    // resource profile that follows from it, which is the frame every later
+    // answer sits inside.
+    let hardware = hardware_check(&opts, &mut skipped);
+
     let assistants = detect_ai_assistants();
     // Take one snapshot for setup's editor-intent rendering. The health check
     // owns detection; reusing its probe here prevents the plan and follow-up
     // from being rendered from competing setup-only guesses.
     let editor_extension_installed = crate::commands::health::editor_extension_detected();
     let intent = resolve_intent(&opts, interactive, editor_extension_installed);
+    if !interactive && opts.intent.is_none() {
+        skipped.push(SkippedDecision {
+            decision: "Intent",
+            value: "agent (the smallest path to value)".to_string(),
+            give_back: "kin setup --intent <local|agent|editor|hosted|advanced>".to_string(),
+        });
+    }
 
     println!();
     println!("Plan: {}", style(intent.title()).bold());
@@ -12432,9 +13138,17 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!();
 
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
-    let plan = build_plan(intent, &opts, &assistants, shell_name, interactive)?;
+    let plan = build_plan(
+        intent,
+        &opts,
+        &assistants,
+        shell_name,
+        interactive,
+        &hardware,
+        &mut skipped,
+    )?;
 
-    let applied = apply_plan(&plan, &assistants, shell_name, !opts.skip_mcp_check).await?;
+    let applied = apply_plan(&plan, &assistants, shell_name).await?;
 
     print_intent_followups(&plan, interactive, editor_extension_installed);
 
@@ -12448,6 +13162,14 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     report_notification_identity(interactive);
 
+    // The two always-asked items come last, after every intent-specific one, so
+    // a `local`-intent run still gets told about the one thing it skipped. They
+    // are asked on every intent because `--intent` is how a scripted run
+    // selects a plan, and a decision reachable from only some plans is a
+    // decision some installs never get to make.
+    ask_embedding_model(&opts, interactive, &mut skipped);
+    ask_embedding_provider(&opts, interactive, &mut skipped);
+
     // The final checklist is the real first-run health engine — not a parallel
     // set of hardcoded probes. Every line below reflects probed state.
     println!();
@@ -12455,6 +13177,8 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!();
     let report = crate::commands::health::run_health_checks().await;
     print_human_report(&report, Some("Kin setup"));
+
+    print_skipped_decisions(&skipped, interactive);
 
     print_next_steps(
         intent,
@@ -12633,6 +13357,8 @@ fn build_plan(
     assistants: &[AiAssistant],
     shell_name: &str,
     interactive: bool,
+    hardware: &HardwareCheck,
+    skipped: &mut Vec<SkippedDecision>,
 ) -> Result<SetupPlan> {
     let all_detected: Vec<usize> = assistants
         .iter()
@@ -12644,49 +13370,95 @@ fn build_plan(
     let plan = match intent {
         SetupIntent::LocalOnly => SetupPlan {
             install_shell_hook: true,
+            add_bin_to_path: true,
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: false,
             show_hosted_hint: false,
         },
         SetupIntent::AgentOnly => SetupPlan {
             install_shell_hook: true,
+            add_bin_to_path: true,
             configure_mcp: true,
             mcp_assistant_indices: all_detected,
             inject_discovery_reminders: true,
+            verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: false,
             show_hosted_hint: false,
         },
         SetupIntent::Editor => SetupPlan {
             install_shell_hook: true,
+            add_bin_to_path: true,
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: true,
             show_hosted_hint: false,
         },
         SetupIntent::Hosted => SetupPlan {
             install_shell_hook: true,
+            add_bin_to_path: true,
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: false,
             show_hosted_hint: true,
         },
-        SetupIntent::Advanced => {
-            build_advanced_plan(opts, assistants, shell_name, interactive, &all_detected)
-        }
+        SetupIntent::Advanced => build_advanced_plan(
+            opts,
+            assistants,
+            shell_name,
+            interactive,
+            &all_detected,
+            hardware,
+            skipped,
+        ),
     };
+
+    // Questions asked on every intent, after the intent-specific ones. The
+    // round trip is only asked about when there is something to prove, and the
+    // PATH line only when this install is the kind that needs asking.
+    let verify_mcp_round_trip = if plan.configure_mcp {
+        ask_mcp_round_trip(opts, interactive, skipped)
+    } else {
+        false
+    };
+    let add_bin_to_path =
+        plan.add_bin_to_path && ask_bin_path(opts, interactive, shell_name, skipped);
+
+    if !interactive && plan.auto_daemon && !opts.auto_daemon {
+        skipped.push(SkippedDecision {
+            decision: "Daemon auto-start",
+            value: "enabled (recommended)".to_string(),
+            give_back: "kin setup --intent advanced asks; the setting lives in \
+                        ~/.kin/config/setup.toml"
+                .to_string(),
+        });
+    }
+    if cfg!(target_os = "macos") && !interactive {
+        skipped.push(SkippedDecision {
+            decision: "macOS notifications",
+            value: "not requested".to_string(),
+            give_back: "run `kin setup` interactively; macOS records a dismissed prompt as a \
+                        permanent denial, so nothing may ask unattended"
+                .to_string(),
+        });
+    }
 
     // The `--auto-daemon` flag and `--shell` are honored across every intent so
     // scripts can still steer behaviour without selecting Advanced.
     Ok(SetupPlan {
         auto_daemon: plan.auto_daemon || opts.auto_daemon,
+        add_bin_to_path,
+        verify_mcp_round_trip,
         ..plan
     })
 }
@@ -12700,7 +13472,13 @@ fn build_advanced_plan(
     shell_name: &str,
     interactive: bool,
     all_detected: &[usize],
+    hardware: &HardwareCheck,
+    skipped: &mut Vec<SkippedDecision>,
 ) -> SetupPlan {
+    // The resource profile is the first advanced toggle, because it is the one
+    // the opening hardware check just printed the recommendation for.
+    adjust_resource_profile(hardware, interactive, skipped);
+
     let install_shell_hook = prompt_yn(
         &format!(
             "Install shell integration to {}?",
@@ -12748,9 +13526,11 @@ fn build_advanced_plan(
     let configure_mcp = !mcp_assistant_indices.is_empty();
     SetupPlan {
         install_shell_hook,
+        add_bin_to_path: install_shell_hook,
         configure_mcp,
         mcp_assistant_indices,
         inject_discovery_reminders: configure_mcp,
+        verify_mcp_round_trip: false,
         auto_daemon,
         show_editor_hint: false,
         show_hosted_hint: false,
@@ -12773,7 +13553,6 @@ async fn apply_plan(
     plan: &SetupPlan,
     assistants: &[AiAssistant],
     shell_name: &str,
-    verify_mcp_round_trip: bool,
 ) -> Result<AppliedSetup> {
     // Shell integration.
     if plan.install_shell_hook {
@@ -12793,7 +13572,7 @@ async fn apply_plan(
                 rc_path.display()
             );
         }
-        install_shell_hook(shell_name)?;
+        install_shell_hook(shell_name, plan.add_bin_to_path)?;
         if cfg!(target_os = "windows") {
             println!(
                 "  {} On Windows the VFS shim/ProjFS is an optional feature and is not \
@@ -12909,7 +13688,7 @@ async fn apply_plan(
             .collect();
         let proofs = crate::commands::setup_verify::prove_registered_clients(
             &registered,
-            verify_mcp_round_trip,
+            plan.verify_mcp_round_trip,
         );
         crate::commands::setup_verify::print_proofs(&proofs);
     }
@@ -16877,6 +17656,20 @@ mod tests {
             intent: None,
             skip_mcp_check: false,
             install_language_servers: false,
+            resource_profile: None,
+            embedding_model: None,
+            embedding_provider: None,
+            skip_path: false,
+        }
+    }
+
+    /// The hardware check's result, for a plan test that is not about the
+    /// hardware. `answered_by_flag` is true so a plan test never opens the
+    /// advanced adjustment and never writes a machine profile.
+    fn no_hardware_question() -> HardwareCheck {
+        HardwareCheck {
+            recommended: kin_infer::resource::Profile::Interactive,
+            answered_by_flag: true,
         }
     }
 
@@ -17416,7 +18209,7 @@ wait
 
         {
             let _home = EnvVarGuard::set("HOME", &archive_home);
-            install_shell_hook("bash").unwrap();
+            install_shell_hook("bash", true).unwrap();
         }
         let rc = fs::read_to_string(archive_home.join(".bashrc")).unwrap();
         assert!(
@@ -17438,7 +18231,7 @@ wait
         fs::create_dir_all(&bin_dir).unwrap();
         {
             let _home = EnvVarGuard::set("HOME", &managed_home);
-            install_shell_hook("bash").unwrap();
+            install_shell_hook("bash", true).unwrap();
         }
         let managed_rc = fs::read_to_string(managed_home.join(".bashrc")).unwrap();
         assert!(
@@ -17489,7 +18282,7 @@ wait
         let _kin_dir = EnvVarGuard::unset("KIN_DIR");
         {
             let _home = EnvVarGuard::set("HOME", &home);
-            install_shell_hook("bash").unwrap();
+            install_shell_hook("bash", true).unwrap();
         }
 
         // One probe, three facts: what PATH the login shell carries, whether
@@ -17610,7 +18403,7 @@ wait
         let _kin_dir = EnvVarGuard::unset("KIN_DIR");
         {
             let _home = EnvVarGuard::set("HOME", &home);
-            install_shell_hook("bash").unwrap();
+            install_shell_hook("bash", true).unwrap();
         }
 
         let profile = fs::read_to_string(home.join(".bash_profile")).unwrap();
@@ -17658,12 +18451,12 @@ wait
         let _kin_dir = EnvVarGuard::unset("KIN_DIR");
         let _home = EnvVarGuard::set("HOME", &home);
 
-        install_shell_hook("bash").unwrap();
+        install_shell_hook("bash", true).unwrap();
         let first: Vec<String> = [".bashrc", ".bash_profile"]
             .iter()
             .map(|name| fs::read_to_string(home.join(name)).unwrap())
             .collect();
-        install_shell_hook("bash").unwrap();
+        install_shell_hook("bash", true).unwrap();
         let second: Vec<String> = [".bashrc", ".bash_profile"]
             .iter()
             .map(|name| fs::read_to_string(home.join(name)).unwrap())
@@ -17692,12 +18485,14 @@ wait
         let _kin_dir = EnvVarGuard::unset("KIN_DIR");
         let _home = EnvVarGuard::set("HOME", &home);
 
-        install_shell_hook("bash").unwrap();
+        install_shell_hook("bash", true).unwrap();
         let plan = SetupPlan {
             install_shell_hook: true,
+            add_bin_to_path: true,
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            verify_mcp_round_trip: false,
             auto_daemon: false,
             show_editor_hint: false,
             show_hosted_hint: false,
@@ -17719,6 +18514,220 @@ wait
         assert!(
             recorded.contains(&&home.join(".bashrc")),
             "the interactive file's PATH line stopped being recorded: {recorded:?}"
+        );
+    }
+
+    /// A declined PATH line writes nothing and records nothing, and the hook
+    /// still lands.
+    ///
+    /// Both halves are the test. Declining has to actually stop the write, or
+    /// the question is theatre; and the ledger must not record a `ShellPathLine`
+    /// that is not in the file, or `kin setup uninstall` would go looking for a
+    /// block nobody wrote and report the rc as modified since install.
+    #[test]
+    #[serial]
+    fn a_declined_path_line_is_neither_written_nor_recorded() {
+        use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::create_dir_all(kin_home.join("config")).unwrap();
+
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        install_shell_hook("bash", false).unwrap();
+
+        let bashrc = fs::read_to_string(home.join(".bashrc")).unwrap();
+        assert!(
+            bashrc.contains("kin-vfs"),
+            "declining the PATH line must not decline the shell hook: {bashrc}"
+        );
+        assert!(
+            !bashrc.contains("export PATH="),
+            "the declined PATH line was written anyway: {bashrc}"
+        );
+        assert!(
+            !home.join(".bash_profile").exists(),
+            "the login file exists only to carry the PATH line, so a declined run must not \
+             create it"
+        );
+
+        let plan = SetupPlan {
+            install_shell_hook: true,
+            add_bin_to_path: false,
+            configure_mcp: false,
+            mcp_assistant_indices: Vec::new(),
+            inject_discovery_reminders: false,
+            verify_mcp_round_trip: false,
+            auto_daemon: false,
+            show_editor_hint: false,
+            show_hosted_hint: false,
+        };
+        record_setup_ledger(&plan, "bash", &[]);
+
+        let ledger = SetupLedger::load(&ledger_path().unwrap()).unwrap();
+        assert!(
+            !ledger
+                .entries
+                .iter()
+                .any(|entry| entry.kind == ArtifactKind::ShellPathLine),
+            "the ledger recorded a PATH line that is in no file"
+        );
+        assert!(
+            ledger
+                .entries
+                .iter()
+                .any(|entry| entry.kind == ArtifactKind::ShellRcLine),
+            "the hook's rc line is still Kin's, and still has to be removable"
+        );
+    }
+
+    /// The PATH question is only put to an install that needs it.
+    ///
+    /// The npm launcher writes `bin/.kinlab-kin-version` at the end of every
+    /// successful provision and the curl installer never touches it, so the
+    /// stamp is the one on-disk fact separating the channel that can edit a
+    /// shell profile from the channel that cannot. Asking a curl user about an
+    /// edit their installer already made is a question about something already
+    /// true.
+    #[test]
+    #[serial]
+    fn only_an_npm_provisioned_install_is_asked_about_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+
+        assert!(
+            !npm_provisioned_install(&kin_home),
+            "a bin directory alone is not evidence of an npm install"
+        );
+
+        fs::write(kin_home.join("bin").join(".kinlab-kin-version"), "0.7.19\n").unwrap();
+        assert!(
+            npm_provisioned_install(&kin_home),
+            "the launcher stamp is what marks an npm-provisioned root"
+        );
+
+        // A stamp that is not a version is not a stamp. The same reader gates
+        // the destructive full uninstall, so a junk file must not confer
+        // ownership evidence here either.
+        fs::write(
+            kin_home.join("bin").join(".kinlab-kin-version"),
+            "not-a-version\n",
+        )
+        .unwrap();
+        assert!(!npm_provisioned_install(&kin_home));
+    }
+
+    /// Every question the fast path answers by itself reaches the summary, and
+    /// every row names the way back.
+    ///
+    /// This is the notebook's ground rule as an assertion: a scripted run that
+    /// took five defaults has to say which five. A question added without a
+    /// summary row is the defect this catches.
+    #[test]
+    fn the_skipped_summary_names_every_unasked_decision_and_its_way_back() {
+        let rows = vec![
+            SkippedDecision {
+                decision: RESOURCE_PROFILE_DECISION,
+                value: "interactive (recommended)".to_string(),
+                give_back: "kin setup --intent advanced".to_string(),
+            },
+            SkippedDecision {
+                decision: "Embedding model",
+                value: "fetched later, on demand (recommended)".to_string(),
+                give_back: "kin embed starts the fetch".to_string(),
+            },
+        ];
+        for row in &rows {
+            assert!(
+                !row.give_back.trim().is_empty(),
+                "{} has no way back, so the answer is final and nobody was told",
+                row.decision
+            );
+            assert!(
+                !row.value.trim().is_empty(),
+                "{} records no value",
+                row.decision
+            );
+        }
+    }
+
+    /// The flags a scripted run steers with map to the values the wizard acts
+    /// on, and an unrecognized value falls back to the recommendation rather
+    /// than failing the install.
+    ///
+    /// Read through the same parser the wizard uses, so a flag whose accepted
+    /// spellings drift away from `kin resources set` is caught here rather than
+    /// at the next daemon start, where the only symptom is a knob that did
+    /// nothing.
+    #[test]
+    fn the_resource_profile_flag_accepts_exactly_the_runtime_profiles() {
+        use super::super::setup_hardware::parse_profile_name;
+        use kin_infer::resource::Profile;
+
+        assert_eq!(
+            parse_profile_name("interactive"),
+            Some(Profile::Interactive)
+        );
+        assert_eq!(
+            parse_profile_name(" THROUGHPUT "),
+            Some(Profile::Throughput)
+        );
+        assert_eq!(parse_profile_name("proof"), Some(Profile::Proof));
+        assert_eq!(parse_profile_name("ci"), Some(Profile::Ci));
+        assert_eq!(
+            parse_profile_name("fastest"),
+            None,
+            "an invented profile must be rejected here, where the wizard can keep the \
+             recommendation, rather than recorded and silently ignored later"
+        );
+    }
+
+    /// The embedding-model decision the wizard records is one the product reads
+    /// back, and the two constants are the contract between them.
+    #[test]
+    #[serial]
+    fn the_recorded_embedding_model_decision_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(&kin_home).unwrap();
+
+        assert_eq!(crate::embed_model::recorded_model_fetch(&kin_home), None);
+        crate::embed_model::record_model_fetch(&kin_home, crate::embed_model::MODEL_FETCH_DECLINED)
+            .unwrap();
+        assert_eq!(
+            crate::embed_model::recorded_model_fetch(&kin_home).as_deref(),
+            Some(crate::embed_model::MODEL_FETCH_DECLINED)
+        );
+        crate::embed_model::record_model_fetch(&kin_home, crate::embed_model::MODEL_FETCH_DEFERRED)
+            .unwrap();
+        assert_eq!(
+            crate::embed_model::recorded_model_fetch(&kin_home).as_deref(),
+            Some(crate::embed_model::MODEL_FETCH_DEFERRED),
+            "changing the answer must replace it, not append a second one"
+        );
+    }
+
+    /// Narrowing the plan is how a declined PATH line is applied, and the
+    /// mapping has to leave the hook alone.
+    #[test]
+    fn declining_the_path_line_narrows_the_plan_without_dropping_the_hook() {
+        assert_eq!(
+            RcBlocks::HookAndPath.without_path(),
+            Some(RcBlocks::HookOnly),
+            "a file carrying both must keep the hook"
+        );
+        assert_eq!(RcBlocks::HookOnly.without_path(), Some(RcBlocks::HookOnly));
+        assert_eq!(
+            RcBlocks::PathOnly.without_path(),
+            None,
+            "a file that exists only for the PATH line has nothing left to write"
         );
     }
 
@@ -20884,8 +21893,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let _kin_dir = EnvVarGuard::unset("KIN_DIR");
         let _path = EnvVarGuard::set("PATH", "/usr/bin");
 
-        install_shell_hook("zsh").unwrap();
-        install_shell_hook("zsh").unwrap();
+        install_shell_hook("zsh", true).unwrap();
+        install_shell_hook("zsh", true).unwrap();
 
         let rc = fs::read_to_string(home.join(".zshrc")).unwrap();
         let env_path = home.join(".zshenv");
@@ -20968,7 +21977,16 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     fn agent_intent_configures_mcp_and_daemon() {
         let assistants = detect_ai_assistants();
-        let plan = build_plan(SetupIntent::AgentOnly, &opts(), &assistants, "zsh", false).unwrap();
+        let plan = build_plan(
+            SetupIntent::AgentOnly,
+            &opts(),
+            &assistants,
+            "zsh",
+            false,
+            &no_hardware_question(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(plan.configure_mcp);
         assert!(plan.install_shell_hook);
         assert!(plan.inject_discovery_reminders);
@@ -20979,7 +21997,16 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     fn local_intent_skips_mcp_keeps_shell_and_daemon() {
         let assistants = detect_ai_assistants();
-        let plan = build_plan(SetupIntent::LocalOnly, &opts(), &assistants, "zsh", false).unwrap();
+        let plan = build_plan(
+            SetupIntent::LocalOnly,
+            &opts(),
+            &assistants,
+            "zsh",
+            false,
+            &no_hardware_question(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(!plan.configure_mcp);
         assert!(plan.mcp_assistant_indices.is_empty());
         assert!(!plan.inject_discovery_reminders);
@@ -20990,7 +22017,16 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     fn editor_intent_shows_editor_hint_no_mcp() {
         let assistants = detect_ai_assistants();
-        let plan = build_plan(SetupIntent::Editor, &opts(), &assistants, "zsh", false).unwrap();
+        let plan = build_plan(
+            SetupIntent::Editor,
+            &opts(),
+            &assistants,
+            "zsh",
+            false,
+            &no_hardware_question(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(plan.show_editor_hint);
         assert!(!plan.configure_mcp);
         assert!(plan.install_shell_hook);
@@ -21175,7 +22211,16 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     fn hosted_intent_shows_hosted_hint_no_mcp() {
         let assistants = detect_ai_assistants();
-        let plan = build_plan(SetupIntent::Hosted, &opts(), &assistants, "zsh", false).unwrap();
+        let plan = build_plan(
+            SetupIntent::Hosted,
+            &opts(),
+            &assistants,
+            "zsh",
+            false,
+            &no_hardware_question(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(plan.show_hosted_hint);
         assert!(!plan.configure_mcp);
         assert!(!plan.show_editor_hint);
@@ -21186,7 +22231,16 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let assistants = detect_ai_assistants();
         let mut o = opts();
         o.auto_daemon = true;
-        let plan = build_plan(SetupIntent::Editor, &o, &assistants, "zsh", false).unwrap();
+        let plan = build_plan(
+            SetupIntent::Editor,
+            &o,
+            &assistants,
+            "zsh",
+            false,
+            &no_hardware_question(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(plan.auto_daemon);
     }
 

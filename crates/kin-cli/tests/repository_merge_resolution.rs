@@ -712,11 +712,10 @@ fn aborting_a_merge_from_a_moved_workspace_abandons_it_and_restores_nothing() {
     let parked = persisted_record(&layout).expect("the merge is parked");
 
     // Move the workspace the way a caller does: edit the conflicted file by
-    // hand, then let the daemon see it. `kin admit` is the explicit pass;
-    // `kin status` reads canonical authority and does not admit host files.
+    // hand, then let the daemon see it. `kin status` is what the stranger ran.
     let edited = b"pub fn base(count: u64) {}\npub fn mate() {}\n// hand merged\n";
     fs::write(repo.join("src/lib.rs"), edited).expect("hand edit the conflicted file");
-    ok(&run_kin(&runtime, &repo, &["admit"]), "kin admit");
+    ok(&run_kin(&runtime, &repo, &["status"]), "kin status");
     let moved = persisted_record(&layout).expect("the merge is still parked after the edit");
     assert_eq!(
         moved.restore, parked.restore,

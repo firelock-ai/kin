@@ -15,7 +15,16 @@ and compatibility boundaries.
 
 ### 1. Install Kin
 
-On macOS or Linux, run the installer on its own and finish any setup prompts:
+The primary command, the same on macOS, Linux, Windows and WSL, needing Node.js 20 or newer:
+
+```sh
+npx -y @kinlab/kin setup
+```
+
+It downloads the matching release into `~/.kin/bin`, verifies its published SHA-256, adds
+that directory to your shell profile, and runs the setup wizard in the same call.
+
+On a machine without Node, run the installer instead and finish any setup prompts:
 
 ```sh
 curl -fsSL https://get.kinlab.dev/install | sh
@@ -35,7 +44,8 @@ MCP server for detected supported clients. Use `--intent local` for CLI and
 filesystem use without MCP configuration, or `--intent editor` for the VS Code
 path.
 
-npm, Homebrew, and a manual archive resolve that same public release channel:
+A global npm install, Homebrew, and a manual archive resolve that same public release
+channel. None of them is needed when the primary command above works:
 
 ```sh
 npm install -g @kinlab/kin@latest
