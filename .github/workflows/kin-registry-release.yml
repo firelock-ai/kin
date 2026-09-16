@@ -199,8 +199,8 @@ jobs:
       # that have to agree. Its registry requirement is what the Kin binary
       # links against; the immutable kin-vfs checkout commit, a literal in
       # release.yml and rc-build.yml, is the tree the release builds the kin-vfs
-      # binary from. check-kin-vfs-compat.mjs refuses when they disagree and it
-      # carries the required `Fast gate lint and policy` context.
+      # binary from. The pin is read through scripts/kin-vfs-pins.mjs, whose
+      # own compatibility gate is retired along with external VFS packaging.
       #
       # This wave can write Cargo.toml, Cargo.lock and fuzz/Cargo.lock and
       # nothing else, and its App token has no `workflows` scope, so it can move

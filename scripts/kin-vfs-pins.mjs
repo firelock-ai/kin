@@ -1,16 +1,17 @@
-#!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-// Pull-request counterpart to release.yml's Kin/kin-vfs compatibility check.
+// Where the kin-vfs pin is recorded, and how to read it.
 //
-// release.yml compares the kin-vfs-core that Kin resolves from the registry
-// against the kin-vfs-core that the pinned kin-vfs checkout builds, and refuses
-// the release on a mismatch. That comparison ran nowhere else. ci.yml carried no
-// kin-vfs reference at all, so a pull request that moved Kin's kin-vfs-core
-// requirement satisfied every required context and failed only after the tag
-// existed, where the tag's own workflows are already resolved and no fix lands
-// without cutting another tag.
+// This was a pull-request gate that compared the kin-vfs-core Kin resolves from
+// the registry against the one the pinned kin-vfs checkout builds. External VFS
+// packaging is retired and no workflow may run that comparison any more, which
+// scripts/test-release-workflow-authority.py enforces by name, so the gate and
+// its command-line entry point are gone.
+//
+// What survives is the discovery half, because scripts/wave-kin-vfs-core-hold.mjs
+// imports it and the registry receiver runs that on every wave. Nothing here
+// executes on its own.
 //
 // The pinned commit is read out of the workflows rather than recorded again
 // here. A copy living in the gate that predicts the release would be the one
@@ -29,8 +30,6 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import process from 'node:process';
-import { pathToFileURL } from 'node:url';
 
 export const VFS_REPOSITORY = 'firelock-ai/kin-vfs';
 export const VFS_CORE = 'kin-vfs-core';
@@ -43,14 +42,14 @@ const COMMIT_SHA = /^[0-9a-f]{40}$/;
 // reading any one of them, because a half-updated pin (checkout moved, proof
 // left behind) is exactly the shape that reaches a tag before anyone notices.
 // Files that may record the pin. Every workflow, plus the release-authority
-// script whose assertion carries the expected commit as a literal. The gate's
-// own source and test are excluded on purpose: a guard that scans the file it
-// lives in matches its own patterns and passes on a tree where nothing else
-// does.
+// script whose assertion carries the expected commit as a literal. This file
+// and its test are excluded on purpose: a reader that scans the file it lives
+// in matches its own patterns and reports agreement on a tree where nothing
+// else records a pin.
 export const PIN_SOURCE_DIRECTORIES = ['.github/workflows', 'scripts'];
 export const PIN_SOURCE_EXCLUSIONS = new Set([
-  'scripts/check-kin-vfs-compat.mjs',
-  'scripts/check-kin-vfs-compat.test.mjs',
+  'scripts/kin-vfs-pins.mjs',
+  'scripts/kin-vfs-pins.test.mjs',
   'scripts/test-release-workflow-authority.py',
 ]);
 
@@ -60,7 +59,7 @@ export const PIN_SOURCE_EXCLUSIONS = new Set([
 // which were read out of the tree before this rule was written. Only a literal
 // sha is a pin site; the rest are not sites and are not errors. A checkout ref
 // is held to a stricter rule below, because a kin-vfs checkout that floats is
-// the failure this gate exists for.
+// the failure this reader was written to make visible.
 export function collectVfsPinSites(text, file) {
   const found = [];
 
@@ -256,40 +255,4 @@ export async function fetchPinnedLock(commit, { token, fetchImpl = fetch } = {})
     );
   }
   return text;
-}
-
-export async function main({
-  root = process.cwd(),
-  env = process.env,
-  fetchImpl = fetch,
-  log = console.log,
-} = {}) {
-  const sources = await readPinSources(root);
-  const commit = readPinnedVfsCommit(sources);
-  const kinLock = await fs.readFile(path.join(root, 'Cargo.lock'), 'utf8');
-  const pinnedLock = await fetchPinnedLock(commit, {
-    token: env.GH_TOKEN || env.GITHUB_TOKEN,
-    fetchImpl,
-  });
-  const version = compareVfsCore(kinLock, pinnedLock);
-  // Name how many homes agreed and which files hold them, so a scan that
-  // silently narrowed reads differently from one that checked them all. The
-  // count is of SITES that recorded a sha, not of files opened: several files
-  // mention the pin without recording one, and counting those would report
-  // coverage this gate does not have.
-  const sites = sources.flatMap(({ path: file, text }) => collectVfsPinSites(text, file));
-  const files = [...new Set(sites.map(({ site }) => site.split(' ')[0]))].sort();
-  log(
-    `Verified Kin/kin-vfs compatibility at ${VFS_CORE} ${version} ` +
-    `(pinned kin-vfs ${commit}, agreed across ${sites.length} site(s) in ` +
-    `${files.length} file(s): ${files.join(', ')})`,
-  );
-  return version;
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error) => {
-    console.error(`::error::${error.message}`);
-    process.exit(1);
-  });
 }
