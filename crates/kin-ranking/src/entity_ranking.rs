@@ -495,11 +495,34 @@ pub type TraceFanoutScore = (
     usize,
     bool,
     bool,
+    bool,
+    bool,
     usize,
     bool,
     u32,
     std::cmp::Reverse<usize>,
 );
+
+/// What the graph proved about the edge that reached one fan-out candidate.
+///
+/// Carried together because all three are properties of the EDGE rather than of
+/// the candidate, and a scorer taking them as three loose booleans is a scorer
+/// whose call sites can silently swap two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TraceEdgeEvidence {
+    /// The destination is proven rather than matched on a bare name. A
+    /// `name_only` edge is exactly the class that made `Session.request` appear
+    /// to call `RequestsCookieJar.update`, and `find_references` declines to
+    /// certify it, so a walk must not spend a scarce fan-out slot on one while
+    /// a proven call is waiting.
+    pub proven: bool,
+    /// The graph recorded a source site for the edge: a line in the caller
+    /// where the call is written. A hop with no site cannot be opened and
+    /// checked, which is what a data-flow answer is for.
+    pub has_site: bool,
+    /// Every call edge to this candidate is a `raise` target.
+    pub raise_target: bool,
+}
 
 /// Relevance of one candidate against the other candidates of the SAME step, so
 /// a per-step cap keeps the chain rather than whatever order the relation table
@@ -510,12 +533,24 @@ pub type TraceFanoutScore = (
 ///    slot from a symbol a caller can open)
 /// 2. role rank (source over test; see [`trace_role_rank`])
 /// 3. relation rank (Calls over Imports over References)
-/// 4. declared in the same FILE as the node being expanded
-/// 5. declared in the same DIRECTORY as it
-/// 6. declaration kind rank (functions and methods over constants)
-/// 7. NOT a `raise` target (see below)
-/// 8. the edge's own confidence
-/// 9. shorter name, which only ever breaks a tie the eight signals above left
+/// 4. the edge's destination is proven rather than guessed from a bare name
+/// 5. the graph recorded the site where the call is written
+/// 6. declared in the same FILE as the node being expanded
+/// 7. declared in the same DIRECTORY as it
+/// 8. declaration kind rank (functions and methods over constants)
+/// 9. NOT a `raise` target (see below)
+/// 10. the edge's own confidence
+/// 11. shorter name, which only ever breaks a tie the ten signals above left
+///
+/// Proof and site sit directly under the relation kind, above locality, because
+/// they are the two terms that say the hop is REAL. Everything below them is a
+/// guess about which real hop the caller meant. Confidence carried some of this
+/// at position 10, far too low to act: on a 714-commit slice of `cli/cli`,
+/// `apiRun`'s fan-out held five `name_only` call edges (`Parse`,
+/// `T.Errorf`, `Testing.Errorf`, `_testing.Errorf`, `RegexpWriter.Flush`) whose
+/// destinations nothing at the call site proves, and only kind and locality
+/// were keeping them out of the top slots. A same-file bare-name match would
+/// have taken one.
 ///
 /// The raise-target signal sits BELOW declaration kind, where it separates two
 /// otherwise equal candidates and can never evict one in favour of a candidate
@@ -553,7 +588,7 @@ pub fn trace_fanout_score(
     parent_file: Option<&str>,
     parent_dir: Option<&str>,
     confidence: f32,
-    raise_target: bool,
+    evidence: TraceEdgeEvidence,
 ) -> TraceFanoutScore {
     let same_file = parent_file
         .zip(entity.file_origin.as_ref())
@@ -571,10 +606,12 @@ pub fn trace_fanout_score(
         !trace_entity_is_external(entity),
         trace_role_rank(&entity.role),
         trace_relation_rank(relation_kind),
+        evidence.proven,
+        evidence.has_site,
         same_file,
         same_dir,
         declaration_kind_rank(&entity.kind),
-        !raise_target,
+        !evidence.raise_target,
         confidence,
         std::cmp::Reverse(entity.name.len()),
     )
@@ -1218,6 +1255,16 @@ mod tests {
         scored(entity, false)
     }
 
+    /// The evidence a parser-certain call carries: destination proven, site
+    /// recorded, not a throw. The tests below vary one term at a time from it.
+    fn proven_call() -> TraceEdgeEvidence {
+        TraceEdgeEvidence {
+            proven: true,
+            has_site: true,
+            raise_target: false,
+        }
+    }
+
     /// The same key with the raise-target signal set, so the tests below can
     /// compare a throw site against the hop it used to outrank.
     fn scored(entity: &Entity, raise_target: bool) -> TraceFanoutScore {
@@ -1227,8 +1274,77 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
-            raise_target,
+            TraceEdgeEvidence {
+                raise_target,
+                ..proven_call()
+            },
         )
+    }
+
+    /// The five bare-name call edges in `apiRun`'s measured fan-out, in
+    /// miniature: a guessed destination in the node's own file must not take a
+    /// slot from a proven call one directory away.
+    #[test]
+    fn a_proven_call_outranks_a_bare_name_guess_that_sits_closer() {
+        let guessed = fanout_entity("Errorf", Some("src/requests/sessions.py"));
+        let proven = fanout_entity("httpRequest", Some("src/requests/adapters.py"));
+        let guessed_score = trace_fanout_score(
+            &guessed,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            0.4,
+            TraceEdgeEvidence::default(),
+        );
+        let proven_score = trace_fanout_score(
+            &proven,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+            proven_call(),
+        );
+        assert!(
+            proven_score > guessed_score,
+            "a call the graph proved outranks one it guessed from a name, even in another file"
+        );
+    }
+
+    /// A proven edge whose site the parser never recorded is still a hop a
+    /// caller can follow, so the site term separates it from a proven hop that
+    /// CAN be opened rather than sinking it to the bare-name tier.
+    #[test]
+    fn a_recorded_site_separates_two_proven_calls_and_nothing_else() {
+        let entity = fanout_entity("httpRequest", Some("src/requests/adapters.py"));
+        let sited = trace_fanout_score(
+            &entity,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+            proven_call(),
+        );
+        let siteless = trace_fanout_score(
+            &entity,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+            TraceEdgeEvidence {
+                has_site: false,
+                ..proven_call()
+            },
+        );
+        let guessed = trace_fanout_score(
+            &entity,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+            TraceEdgeEvidence::default(),
+        );
+        assert!(sited > siteless, "a hop with a site leads one without");
+        assert!(siteless > guessed, "and both lead a bare-name guess");
     }
 
     #[test]
@@ -1323,7 +1439,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
-            false,
+            proven_call(),
         );
         let referenced = trace_fanout_score(
             &entity,
@@ -1331,7 +1447,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
-            false,
+            proven_call(),
         );
         assert!(called > referenced);
     }
@@ -1345,7 +1461,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             1.0,
-            false,
+            proven_call(),
         );
         let guessed = trace_fanout_score(
             &entity,
@@ -1353,7 +1469,7 @@ mod tests {
             Some("src/requests/sessions.py"),
             Some("src/requests"),
             0.4,
-            false,
+            proven_call(),
         );
         assert!(certain > guessed);
     }

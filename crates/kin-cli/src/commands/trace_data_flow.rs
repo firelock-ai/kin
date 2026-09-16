@@ -33,7 +33,9 @@ use crate::commands::repository_authority::{
 
 const DEFAULT_DEPTH: usize = 3;
 const MAX_DEPTH: usize = 8;
-const DEFAULT_LIMIT_PER_STEP: usize = 5;
+// The one number the schema advertises and both walkers take; see
+// `kin_mcp::remediation::TRACE_DEFAULT_LIMIT_PER_STEP` for why it is twelve.
+const DEFAULT_LIMIT_PER_STEP: usize = kin_mcp::remediation::TRACE_DEFAULT_LIMIT_PER_STEP;
 // The one number the schema declares, the hosted validator enforces and the
 // spine-clip remediation quotes. A separate literal here is how the advice
 // came to recommend a value the call refuses.
@@ -875,7 +877,8 @@ pub fn build_trace_data_flow_response_within(
     // chain the caller asked for is still the chain, and failing the call would
     // turn a typo in an optional hint into no answer at all.
     let mut target_name: Option<String> = None;
-    let mut reach_set: Option<HashSet<EntityId>> = None;
+    let mut callee_reach: Option<HashSet<EntityId>> = None;
+    let mut caller_reach: Option<HashSet<EntityId>> = None;
     if let Some(target) = request
         .target
         .as_deref()
@@ -884,8 +887,31 @@ pub fn build_trace_data_flow_response_within(
     {
         match resolve_trace_focal(graph, target)? {
             Some(entity) => {
-                let (set, complete) =
-                    reach_set_toward(graph, &entity, direction, depth, &allowed, &mut meter)?;
+                let mut complete = true;
+                if matches!(direction, TraceDirection::Calls | TraceDirection::Both) {
+                    let (set, whole) = reach_set_toward(
+                        graph,
+                        &entity,
+                        TraceDirection::Calls,
+                        depth,
+                        &allowed,
+                        &mut meter,
+                    )?;
+                    complete &= whole;
+                    callee_reach = Some(set);
+                }
+                if matches!(direction, TraceDirection::Callers | TraceDirection::Both) {
+                    let (set, whole) = reach_set_toward(
+                        graph,
+                        &entity,
+                        TraceDirection::Callers,
+                        depth,
+                        &allowed,
+                        &mut meter,
+                    )?;
+                    complete &= whole;
+                    caller_reach = Some(set);
+                }
                 if !complete {
                     record_degradation(
                         &mut degradations,
@@ -902,7 +928,6 @@ pub fn build_trace_data_flow_response_within(
                     );
                 }
                 target_name = Some(entity.name.clone());
-                reach_set = Some(set);
             }
             None => record_degradation(
                 &mut degradations,
@@ -1093,8 +1118,14 @@ pub fn build_trace_data_flow_response_within(
                         };
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
-                        let reaches_target =
-                            reach_set.as_ref().is_some_and(|set| set.contains(&next_id));
+                        // The candidate's own role decides which sense of
+                        // reachability applies to it.
+                        let reaches_target = if role == "callee" {
+                            callee_reach.as_ref()
+                        } else {
+                            caller_reach.as_ref()
+                        }
+                        .is_some_and(|set| set.contains(&next_id));
                         candidates.push(FanoutCandidate {
                             reaches_target,
                             call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
@@ -1472,8 +1503,12 @@ fn reach_set_toward(
     allowed: &HashSet<RelationKind>,
     meter: &mut TraceMeter,
 ) -> Result<(HashSet<EntityId>, bool)> {
-    let want_callees = matches!(direction, TraceDirection::Calls | TraceDirection::Both);
-    let want_callers = matches!(direction, TraceDirection::Callers | TraceDirection::Both);
+    // One sense per set, never both at once. A `both` walk asking for one set
+    // built in both senses unions "everything that reaches the target" with
+    // "everything the target reaches", which on a real store is most of the
+    // neighbourhood, and a term true of every candidate cannot order anything.
+    let want_callees = matches!(direction, TraceDirection::Calls);
+    let want_callers = matches!(direction, TraceDirection::Callers);
     let mut seen: HashSet<EntityId> = HashSet::new();
     seen.insert(target.id);
     let mut frontier = vec![target.id];
@@ -1533,6 +1568,15 @@ fn apply_fanout_cap(
     node_file: Option<&str>,
     limit: usize,
 ) -> (usize, usize) {
+    // Candidates that reach a named target sort first, so they occupy the head
+    // of the list. `fanout_cap_keeps` trades the LOWEST kept slot for a
+    // crossing-file candidate below the cap, and when the head is longer than
+    // the cap that trade spends the answer on a boundary crossing. A walk that
+    // was given a target keeps the path to it.
+    let protected = candidates
+        .iter()
+        .take_while(|candidate| candidate.reaches_target)
+        .count();
     let locality: Vec<kin_ranking::entity_ranking::FanoutLocality> = candidates
         .iter()
         .map(|candidate| match candidate.entity.file_origin.as_ref() {
@@ -1543,7 +1587,10 @@ fn apply_fanout_cap(
             Some(_) => kin_ranking::entity_ranking::FanoutLocality::OtherFile,
         })
         .collect();
-    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
+    let mut keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
+    if protected > 0 && !(0..limit.min(protected)).all(|index| keep.contains(&index)) {
+        keep = (0..limit.min(candidates.len())).collect();
+    }
     if keep.len() == candidates.len() {
         return (0, 0);
     }
@@ -1830,6 +1877,19 @@ impl FanoutCandidate {
         self.call_edges > 0 && self.raise_call_edges == self.call_edges
     }
 
+    /// What the graph proved about the edge that reached this candidate.
+    ///
+    /// Read by the shared scorer, so this arm and the MCP arm weigh proof and
+    /// site identically: two copies of a ranking can only ever disagree in a
+    /// way that reads as a passing run on both sides.
+    fn edge_evidence(&self) -> kin_ranking::entity_ranking::TraceEdgeEvidence {
+        kin_ranking::entity_ranking::TraceEdgeEvidence {
+            proven: self.resolution.is_proven(),
+            has_site: !self.reference_lines.is_empty(),
+            raise_target: self.is_raise_target(),
+        }
+    }
+
     fn normalize_reference_lines(&mut self) {
         self.reference_lines.sort_unstable();
         self.reference_lines.dedup();
@@ -1869,7 +1929,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
-            left.is_raise_target(),
+            left.edge_evidence(),
         );
         let right_score = kin_ranking::entity_ranking::trace_fanout_score(
             &right.entity,
@@ -1877,7 +1937,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
-            right.is_raise_target(),
+            right.edge_evidence(),
         );
         right_score
             .cmp(&left_score)

@@ -573,7 +573,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "max_chars": max_chars_property(),
                         "query": { "type": "string", "description": "Name pattern to search for" },
-                        "kind": { "type": "string", "description": "Entity kind filter (function, class, etc.)" },
+                        "kind": { "type": "string", "description": "Entity kind filter (function, class, etc.). `command` is a CLI command: it narrows to callable declarations and ranks the command's own run function and its constructor -- `apiRun` and `NewCmdApi` under `pkg/cmd/api/` -- above declarations that merely share a word with the command's name." },
                         "language": { "type": "string", "description": "Language filter (rust, typescript, etc.)" },
                         "limit": { "type": "integer", "description": "Max results to return", "default": 20 },
                         "compact": { "type": "boolean", "description": "If true (default), return only id/name/kind/language/file_path/start_line/end_line/signature. If false, also include doc_summary.", "default": true }
@@ -771,7 +771,7 @@ fn registered_tools() -> ToolsListResult {
                             "description": "Direction of traversal: 'calls' walks outgoing edges (focal -> callees), 'callers' walks incoming edges (callers -> focal), 'both' merges. Default 'both'.",
                             "default": "both"
                         },
-                        "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25). Kept by relevance, not by relation order; a step whose fan-out was cut says so with the count it dropped.", "default": 5, "minimum": 1, "maximum": crate::remediation::TRACE_MAX_LIMIT_PER_STEP },
+                        "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 12, capped at 25). Kept by relevance, not by relation order: a call the graph proved, with the site it is written at, is kept before one matched on a bare name, and a step on the path to a named `target` is kept before either. A step whose fan-out was cut says so with the count it dropped.", "default": crate::remediation::TRACE_DEFAULT_LIMIT_PER_STEP, "minimum": 1, "maximum": crate::remediation::TRACE_MAX_LIMIT_PER_STEP },
                         "target": { "type": "string", "description": "A symbol you are trying to reach, by exact name or UUID. Neighbors from which it is still reachable inside the requested depth survive the per-step cap ahead of neighbors that are not, so the question decides what a narrow walk keeps instead of proximity deciding it. Optional; a target that resolves to nothing is reported in degradations and the chain is still returned." },
                         "include_body": {
                             "type": "boolean",

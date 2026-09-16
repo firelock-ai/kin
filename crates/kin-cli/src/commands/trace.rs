@@ -1554,6 +1554,7 @@ mod tests {
             kin_context::FocalEdge {
                 kind: RelationKind::Calls,
                 direction: kin_context::FocalEdgeDirection::Outgoing,
+                has_site: false,
             },
         );
         focal_edges.insert(
@@ -1561,6 +1562,7 @@ mod tests {
             kin_context::FocalEdge {
                 kind: RelationKind::References,
                 direction: kin_context::FocalEdgeDirection::Outgoing,
+                has_site: false,
             },
         );
         focal_edges.insert(
@@ -1568,6 +1570,7 @@ mod tests {
             kin_context::FocalEdge {
                 kind: RelationKind::Calls,
                 direction: kin_context::FocalEdgeDirection::Incoming,
+                has_site: false,
             },
         );
 

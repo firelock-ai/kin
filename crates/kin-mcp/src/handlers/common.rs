@@ -3555,9 +3555,29 @@ pub fn build_semantic_search_request(
     Ok((query, limit, filter))
 }
 
+/// Whether a `kind` argument names a CLI command rather than a declaration kind.
+///
+/// Kept beside [`parse_kind_filter`] because the two have to agree: the filter
+/// narrows to the callable kinds a command can be, and the ranking reads this to
+/// know a command was asked for at all.
+pub fn is_command_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_lowercase().as_str(),
+        "command" | "cmd" | "subcommand"
+    )
+}
+
 pub fn parse_kind_filter(kind: &str) -> Option<Vec<EntityKind>> {
     match kind.to_lowercase().as_str() {
         "function" | "fn" => Some(vec![EntityKind::Function, EntityKind::Method]),
+        // A CLI command has no kind of its own, so this used to fall through to
+        // the wildcard arm and the request ran with NO kind filter at all: a
+        // caller asking for a command was answered with classes, modules and
+        // test functions. A command IS a callable declaration, and which
+        // callable it is comes from `crate::command_shape`, which the ranking
+        // beside this filter reads. Narrowing to the callable kinds is the half
+        // this filter can state on its own.
+        "command" | "cmd" | "subcommand" => Some(vec![EntityKind::Function, EntityKind::Method]),
         "class" => Some(vec![EntityKind::Class]),
         "interface" => Some(vec![EntityKind::Interface]),
         "trait" | "traitdef" => Some(vec![EntityKind::TraitDef]),

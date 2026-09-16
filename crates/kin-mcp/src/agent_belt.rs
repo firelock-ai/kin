@@ -756,6 +756,10 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
             "Entities per page (default 200, 1..1000). `total_in_file` is the whole-file count.",
         ),
         (
+            ("semantic_search", "kind"),
+            "Declaration kind, or `command` for a CLI command's own run function and constructor.",
+        ),
+        (
             ("trace_data_flow", "target"),
             "A symbol to reach, by exact name or UUID. Its branch survives the per-step cap first.",
         ),

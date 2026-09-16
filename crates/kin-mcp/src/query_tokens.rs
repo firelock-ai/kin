@@ -270,6 +270,13 @@ pub struct RankedEntity {
     pub coverage: usize,
     /// The weighted sum over those tokens.
     pub score: f64,
+    /// Whether this declaration is the named CLI command's own entry point, and
+    /// which half: `2` the function it runs, `1` its constructor, `0` neither.
+    /// Always `0` unless the caller asked for `kind: "command"`.
+    pub command_rank: u8,
+    /// How many of the question's words this declaration's PATH carries, which
+    /// is what separates one subcommand from its namesakes elsewhere in a tree.
+    pub command_path_match: usize,
 }
 
 /// The ranked union of every token's hits, best first.
@@ -280,7 +287,21 @@ pub struct RankedEntity {
 /// against the words they typed. Score breaks coverage ties, then the shorter
 /// name, then the name itself, then the id, so the order is total and does not
 /// depend on the union's assembly order.
-pub fn rank(plan: &TokenPlan, hits: &[TokenHits]) -> Vec<RankedEntity> {
+///
+/// `command_query` carries the whole question when the caller asked for
+/// `kind: "command"`, and when it does, the named command's own entry points
+/// lead. Coverage cannot deliver that on its own and the measured answer is
+/// why: for `gh api`, `apiRun` carries one of the two words and `ghId`,
+/// `ghRepo` and `TestGetAttestations_GhAPI_NoAttestationsFound` carry both, so
+/// coverage ranks the declarations that ARE the command below every
+/// declaration that merely spells its vendor prefix. The command signal is
+/// read from the path and the name by [`crate::command_shape`], never from a
+/// vector index, so it answers on a store with no embedding coverage.
+pub fn rank(
+    plan: &TokenPlan,
+    hits: &[TokenHits],
+    command_query: Option<&str>,
+) -> Vec<RankedEntity> {
     let weights: HashMap<&str, f64> = hits
         .iter()
         .map(|hit| (hit.token.as_str(), rarity(hit.total_matching)))
@@ -348,19 +369,39 @@ pub fn rank(plan: &TokenPlan, hits: &[TokenHits]) -> Vec<RankedEntity> {
                 score += weights.get(token.as_str()).copied().unwrap_or(1.0) * (weight + exact);
             }
 
+            let entity_path = entity.file_origin.as_ref().map(|path| path.0.as_str());
+            let command_rank = command_query.map_or(0, |query| {
+                crate::command_shape::command_rank_for_query(query, &entity.name, entity_path)
+            });
+            // Only a command entry point is separated by its path. Letting the
+            // term reach every row would reorder an ordinary answer by path
+            // overlap, which is a different ranking than the one asked for.
+            let command_path_match = match (command_query, command_rank) {
+                (Some(query), rank) if rank > 0 => {
+                    crate::command_shape::command_path_match(query, entity_path)
+                }
+                _ => 0,
+            };
+
             // An entity retrieved by one token's substring match that carries no
-            // whole token of the question is noise, not a weak answer.
-            (coverage > 0).then_some(RankedEntity {
+            // whole token of the question is noise, not a weak answer. A command
+            // entry point is the exception the other way: it answers the question
+            // the caller asked even when it spells only part of it.
+            (coverage > 0 || command_rank > 0).then_some(RankedEntity {
                 entity,
                 coverage,
                 score,
+                command_rank,
+                command_path_match,
             })
         })
         .collect();
 
     ranked.sort_by(|a, b| {
-        b.coverage
-            .cmp(&a.coverage)
+        b.command_rank
+            .cmp(&a.command_rank)
+            .then_with(|| b.command_path_match.cmp(&a.command_path_match))
+            .then_with(|| b.coverage.cmp(&a.coverage))
             .then_with(|| b.score.total_cmp(&a.score))
             .then_with(|| a.entity.name.len().cmp(&b.entity.name.len()))
             .then_with(|| a.entity.name.cmp(&b.entity.name))
@@ -374,7 +415,12 @@ pub fn rank(plan: &TokenPlan, hits: &[TokenHits]) -> Vec<RankedEntity> {
 /// Attached whenever the fan-out ran, including when it also came back empty. An
 /// empty answer to a sentence is the case a reader is most likely to misread, so
 /// it is the case that most needs the path named.
-pub fn disclosure(plan: &TokenPlan, hits: &[TokenHits], matched: usize) -> Value {
+pub fn disclosure(
+    plan: &TokenPlan,
+    hits: &[TokenHits],
+    matched: usize,
+    command_ranked: bool,
+) -> Value {
     let unmatched: Vec<&str> = hits
         .iter()
         .filter(|hit| hit.total_matching == 0)
@@ -413,8 +459,14 @@ pub fn disclosure(plan: &TokenPlan, hits: &[TokenHits], matched: usize) -> Value
         "tokens_queried_as_singular": substituted,
         "matched": matched,
         "retrieved_by": "one declaration-name query per token",
-        "ranked_by": "token coverage first, then a rarity-weighted field score: name, then \
-                      signature, then path, then doc summary",
+        "ranked_by": if command_ranked {
+            "the named command's own entry points first -- the function it runs, then its \
+             constructor, read from the declaration's path and name -- then token coverage, then \
+             a rarity-weighted field score: name, then signature, then path, then doc summary"
+        } else {
+            "token coverage first, then a rarity-weighted field score: name, then signature, \
+             then path, then doc summary"
+        },
         "vector_ranked": false,
         "caution": if matched == 0 {
             "This fallback ran and still matched nothing. The absence is a statement about word \
