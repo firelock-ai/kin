@@ -2,26 +2,26 @@
   <img src="docs/assets/kin-banner-2026.png" alt="Kin, a code repository for people and AI agents" width="100%" />
 </p>
 
-<h3 align="center">AI changed who writes code.<br />Kin changes what they build on.</h3>
-
-<p align="center">
-  <img src="docs/assets/kin-impact-human-bytes.gif" alt="kin impact human_bytes --file crates/kin-cli/src/commands/cache.rs --kind function --depth 1, showing its direct callers in Kin's own codebase next to a git grep search for the same name" width="100%" />
-</p>
+<h3 align="center">A new foundation for code.</h3>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0" /></a>
   <a href="https://github.com/firelock-ai/kin/releases/latest"><img src="https://img.shields.io/badge/release-latest-6E56CF.svg" alt="Latest release" /></a>
 </p>
 
-**Kin is an open-source code repository and version control system for people and AI agents.** It keeps track of how the code fits together, so you can investigate what a change might affect.
+**Kin is a graph-native code repository for people and AI agents.** It stores source, recorded code relationships, and versioned history as repository state. The graph is the repository model, not a search index maintained beside another repository.
 
-Functions, types, recorded relationships, and change history are repository data that you commit, branch, and merge. The graph is the repository model, not a separate index alongside Git. Exact source is preserved byte for byte, and filesystem projections let supported tools keep working with ordinary files.
-
-A star helps other people find Kin, and [Discussions](https://github.com/firelock-ai/kin/discussions) is where to bring a question about it.
+Functions, types, and the relationships between them are data you commit, branch, and merge. Exact source is preserved byte for byte, and filesystem projections let supported tools keep working with ordinary files.
 
 **Public alpha.** Start with a small repository you know well. Expect rough edges and breaking changes.
 
 [Quickstart](#quickstart) · [Documentation](docs/quickstart.md) · [Browser demo](https://kinlab.ai/demo)
+
+<p align="center">
+  <img src="docs/assets/kin-impact-human-bytes.gif" alt="kin impact human_bytes --file crates/kin-cli/src/commands/cache.rs --kind function --depth 1, showing its direct callers in Kin's own codebase next to a git grep search for the same name" width="100%" />
+</p>
+
+A star helps other people find Kin, and [Discussions](https://github.com/firelock-ai/kin/discussions) is where to bring a question about it.
 
 ## See what connects
 
