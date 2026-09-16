@@ -273,6 +273,15 @@ impl SetupLedger {
         }
     }
 
+    /// Whether an entry with this `(kind, target, path)` identity is recorded.
+    /// Pure over the loaded ledger, so a writer that keeps a recorded file in
+    /// step can ask before it re-records, and never widen the ledger.
+    pub(crate) fn has_entry(&self, kind: ArtifactKind, target: &str, path: &Path) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.kind == kind && e.target == target && e.path == path)
+    }
+
     fn find_mut(
         &mut self,
         kind: ArtifactKind,
@@ -719,6 +728,13 @@ pub fn ledger_path() -> Result<PathBuf> {
     Ok(super::setup::kin_dir()?
         .join("config")
         .join("setup-ledger.json"))
+}
+
+/// The ledger path under an explicit Kin home, for the writers that already
+/// hold one. Pure over the path: the module stays free of raw filesystem
+/// access, and the boundary that reads or writes beside it owns the IO.
+pub(crate) fn ledger_path_in(kin_home: &Path) -> PathBuf {
+    kin_home.join("config").join("setup-ledger.json")
 }
 
 // ---------------------------------------------------------------------------

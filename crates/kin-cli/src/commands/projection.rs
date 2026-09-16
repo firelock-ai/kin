@@ -1703,14 +1703,74 @@ pub(crate) fn record_setup_value(
     key: &str,
     value: &str,
 ) -> Result<()> {
+    record_setup_toml_value(kin_home, table, key, toml::Value::String(value.to_string()))
+}
+
+/// The one write path for `setup.toml`.
+///
+/// Every value Kin records in this file goes through here, because the install
+/// ledger fingerprints the whole file and a write that bypasses the refresh
+/// below is read by the next `kin doctor` as a file somebody else changed. The
+/// ledger refresh is best-effort after the bytes are on disk: the value was
+/// recorded, and a ledger that cannot be updated is reported rather than
+/// allowed to undo that.
+pub(crate) fn record_setup_toml_value(
+    kin_home: &Path,
+    table: &str,
+    key: &str,
+    value: toml::Value,
+) -> Result<()> {
     let path = setup_config_path(kin_home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let body = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = config_set(&body, table, key, toml::Value::String(value.to_string()))?;
-    std::fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))
+    let updated = config_set(&body, table, key, value)?;
+    std::fs::write(&path, &updated)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    if let Err(error) = refresh_ledger_setup_config_entry(kin_home, &path, updated.as_bytes()) {
+        println!(
+            "  {} recorded {table}.{key}, but could not refresh the install ledger: {error:#}",
+            style("!").yellow()
+        );
+    }
+    Ok(())
+}
+
+/// Bring the install ledger's `setup.toml` fingerprint back in step after Kin
+/// itself rewrote that file.
+///
+/// `kin setup` fingerprints `~/.kin/config/setup.toml` when it applies the plan,
+/// and the wizard keeps writing to the same file afterwards: the embedding
+/// model decision and the provider choice are asked last, and `kin vfs on` or
+/// `kin setup --resource-profile` write it on any later day. Each of those
+/// writes left the recorded fingerprint behind, so the very next `kin doctor`
+/// reported the install ledger STALE with "1 modified since install" on a
+/// machine nobody but Kin had touched; the 0.7.20 release preflight failed on
+/// exactly that after its second setup pass. Only an entry that already exists
+/// is refreshed: a ledger that has not recorded the file yet, or that does not
+/// exist yet, is left for `kin setup` to write, so this never widens what
+/// `kin setup uninstall` would remove. Returns whether an entry was refreshed.
+/// `bytes` are the bytes just written, so nothing is read back.
+fn refresh_ledger_setup_config_entry(kin_home: &Path, config: &Path, bytes: &[u8]) -> Result<bool> {
+    use crate::commands::setup_ledger::{ledger_path_in, ArtifactKind, LedgerEntry, SetupLedger};
+    let ledger = ledger_path_in(kin_home);
+    if !ledger.exists() {
+        return Ok(false);
+    }
+    SetupLedger::update(&ledger, |ledger| {
+        if !ledger.has_entry(ArtifactKind::DaemonConfig, "daemon", config) {
+            return Ok(false);
+        }
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::DaemonConfig,
+            "daemon",
+            config.to_path_buf(),
+            bytes,
+        ));
+        Ok(true)
+    })
 }
 
 /// The projection mode recorded on this machine, if any.
@@ -2190,6 +2250,110 @@ fn engage_fuse(driver: &DriverProbe, repo_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ledger_refresh_follows_kins_own_rewrite_of_setup_toml() {
+        use crate::commands::setup_ledger::{
+            ledger_path_in, verify_ledger, ArtifactKind, EntryState, LedgerEntry, SetupLedger,
+        };
+        let home = tempfile::tempdir().unwrap();
+        record_setup_value(home.path(), "daemon", "auto_start", "true").unwrap();
+        let cfg = setup_config_path(home.path());
+        let ledger_file = ledger_path_in(home.path());
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::DaemonConfig,
+            "daemon",
+            cfg.clone(),
+            &std::fs::read(&cfg).unwrap(),
+        ));
+        ledger.save(&ledger_file).unwrap();
+
+        // The wizard's last question rewrites the file after the plan was
+        // recorded. Without the refresh, this is the STALE row.
+        std::fs::write(
+            &cfg,
+            "[daemon]\nauto_start = true\n\n[embedding]\nmodel_fetch = \"deferred\"\n",
+        )
+        .unwrap();
+        let before = verify_ledger(&ledger_file).unwrap();
+        assert_eq!(before[0].state, EntryState::Modified);
+
+        let bytes = std::fs::read(&cfg).unwrap();
+        assert!(refresh_ledger_setup_config_entry(home.path(), &cfg, &bytes).unwrap());
+
+        let after = verify_ledger(&ledger_file).unwrap();
+        assert_eq!(after.len(), 1, "refresh upserts, never duplicates");
+        assert_eq!(after[0].state, EntryState::Verified);
+    }
+
+    #[test]
+    fn the_ledger_refresh_never_widens_the_ledger() {
+        use crate::commands::setup_ledger::{
+            ledger_path_in, ArtifactKind, LedgerEntry, SetupLedger,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let cfg = setup_config_path(home.path());
+
+        // No ledger yet: nothing to keep in step, and none is created.
+        record_setup_value(home.path(), "projection", "mode", "shim").unwrap();
+        assert!(!refresh_ledger_setup_config_entry(home.path(), &cfg, b"x").unwrap());
+        assert!(!ledger_path_in(home.path()).exists());
+
+        // A ledger that never recorded the file does not gain an entry for it.
+        let hook = home.path().join("shell").join("kin-vfs.zsh");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "HOOK").unwrap();
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::ShellHook,
+            "zsh",
+            hook,
+            b"HOOK",
+        ));
+        ledger.save(&ledger_path_in(home.path())).unwrap();
+        record_setup_value(home.path(), "embedding", "model_fetch", "deferred").unwrap();
+        let ledger = SetupLedger::load(&ledger_path_in(home.path())).unwrap();
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].kind, ArtifactKind::ShellHook);
+    }
+
+    /// The wizard records its last two decisions after the plan, and with it
+    /// the install ledger, is already written. The 0.7.20 release preflight
+    /// read the install ledger STALE on its second `kin setup` pass because of
+    /// exactly this write; the ledger has to follow every value Kin records.
+    #[test]
+    fn recording_a_setup_value_keeps_the_install_ledger_verified() {
+        use crate::commands::setup_ledger::{
+            ledger_path_in, verify_ledger, ArtifactKind, EntryState, LedgerEntry, SetupLedger,
+        };
+        let home = tempfile::tempdir().unwrap();
+        record_setup_value(home.path(), "projection", "mode", "shim").unwrap();
+        let cfg = setup_config_path(home.path());
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::DaemonConfig,
+            "daemon",
+            cfg.clone(),
+            &std::fs::read(&cfg).unwrap(),
+        ));
+        ledger.save(&ledger_path_in(home.path())).unwrap();
+
+        record_setup_value(home.path(), "embedding", "model_fetch", "deferred").unwrap();
+
+        assert_eq!(
+            config_str(
+                &std::fs::read_to_string(&cfg).unwrap(),
+                "embedding",
+                "model_fetch"
+            )
+            .as_deref(),
+            Some("deferred")
+        );
+        let verified = verify_ledger(&ledger_path_in(home.path())).unwrap();
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].state, EntryState::Verified);
+    }
 
     /// A real `kin-vfs --help` from the shipped driver: `status` and `exec` are
     /// unconditional, and neither mount feature is compiled in.

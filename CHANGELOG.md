@@ -78,6 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The install ledger now follows every value Kin itself records in
+  `~/.kin/config/setup.toml`. The wizard's embedding model and provider answers
+  are written after the ledger has fingerprinted that file, so a second
+  `kin setup` run that recorded either answer left `kin doctor` and
+  `kin setup status` reporting the ledger STALE with one artifact modified
+  since install on a machine nobody but Kin had touched. `kin vfs on` and
+  `kin setup --resource-profile` write the same file and are covered by the
+  same refresh
 - Stop the repo daemon wedging on its own entity read lock. `graph_stats` held
   the entity read guard across `embedding_status`, which reads that same lock
   again, and one queued writer parked the whole process at zero CPU with its
