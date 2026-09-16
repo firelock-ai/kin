@@ -9,6 +9,8 @@ import {
   bumpCommand,
   caretCompatible,
   chooseTarget,
+  diffLockPackages,
+  lockVersionsByName,
   parseDenyDiagnostics,
   parseDenySummary,
   parseIndexEntries,
@@ -19,6 +21,7 @@ import {
   renderMergeGroupAnnotations,
   renderPullRequestBody,
   satisfies,
+  verifyLockMove,
 } from './advisory-sweep.mjs';
 
 // Real `cargo deny --format json check advisories` output, trimmed to the
@@ -285,4 +288,112 @@ test('an advisory cargo-deny counted but the planner could not read is not a cle
   assert.equal(parseDenySummary(unreadable).errors, 1);
   assert.equal(parseDenySummary(DENY_JSON).errors, 1);
   assert.equal(parseDenySummary('nothing here').errors, 0);
+});
+
+// --- the transitive fallback's verifier -------------------------------------
+//
+// These fixtures model the shape RUSTSEC-2026-0285 had: the advisory names one
+// crate, and resolving it also moves a second entry the advisory never
+// mentioned. The old apply step asserted two moved lines per planned bump, so
+// that shape could not pass however correct it was, and the bump had to be
+// landed by hand.
+
+// The lock cargo produces for the planned h2 bump when h2 0.4.16 also requires
+// a newer `atomic-waker`. One planned move, one transitive move.
+const TRANSITIVE_LOCK = LOCK
+  .replace('name = "h2"\nversion = "0.4.15"', 'name = "h2"\nversion = "0.4.16"')
+  .replace(
+    'checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"',
+    'checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"',
+  )
+  .replace('name = "h1-neighbour"\nversion = "1.0.0"', 'name = "h1-neighbour"\nversion = "1.1.0"');
+
+test('a lock reads as name to versions, so a version move is never a new package', () => {
+  const byName = lockVersionsByName(LOCK);
+  assert.deepEqual([...byName.keys()].sort(), ['h1-neighbour', 'h2', 'h3-neighbour']);
+  assert.deepEqual(byName.get('h2'), ['0.4.15']);
+});
+
+test('a transitive move is reported as moved, not as a package entering the tree', () => {
+  const { entered, left, moved } = diffLockPackages(LOCK, TRANSITIVE_LOCK);
+  assert.deepEqual(entered, [], 'nothing entered');
+  assert.deepEqual(left, [], 'nothing left');
+  assert.deepEqual(moved, [
+    { name: 'h1-neighbour', from: ['1.0.0'], to: ['1.1.0'] },
+    { name: 'h2', from: ['0.4.15'], to: ['0.4.16'] },
+  ]);
+});
+
+test('the fix the old line count refused is accepted, and the collateral is named', () => {
+  const plan = planBumps(PLANNER);
+  const result = verifyLockMove({ baseLockText: LOCK, nextLockText: TRANSITIVE_LOCK, plan });
+  assert.ok(result.ok, `expected a pass, got: ${result.problems.join('; ')}`);
+  // The point of the change: the reviewer is told what else moved rather than
+  // the bump being refused for moving it.
+  assert.deepEqual(result.collateral, [
+    { name: 'h1-neighbour', from: ['1.0.0'], to: ['1.1.0'] },
+  ]);
+});
+
+test('the minimal edit still passes, and reports no collateral', () => {
+  const plan = planBumps(PLANNER);
+  const result = verifyLockMove({
+    baseLockText: LOCK,
+    nextLockText: applyBump(LOCK, plan.bumps[0]),
+    plan,
+  });
+  assert.ok(result.ok, `expected a pass, got: ${result.problems.join('; ')}`);
+  assert.deepEqual(result.collateral, []);
+});
+
+test('a bump that did not land is refused even though the lock moved', () => {
+  const plan = planBumps(PLANNER);
+  // h1-neighbour moved and h2 did not, which is a lock that changed without
+  // fixing anything. Counting lines would have called this a clean two-line
+  // bump; the property check names it.
+  const wrong = LOCK.replace('name = "h1-neighbour"\nversion = "1.0.0"', 'name = "h1-neighbour"\nversion = "1.1.0"');
+  const result = verifyLockMove({ baseLockText: LOCK, nextLockText: wrong, plan });
+  assert.equal(result.ok, false);
+  assert.match(result.problems.join('\n'), /plan named h2 0\.4\.15 -> 0\.4\.16, but the resulting lock carries h2 0\.4\.15/);
+});
+
+test('a landed version carrying the wrong checksum is refused', () => {
+  const plan = planBumps(PLANNER);
+  const tampered = TRANSITIVE_LOCK.replace(
+    'checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"',
+    `checksum = "${'f'.repeat(64)}"`,
+  );
+  const result = verifyLockMove({ baseLockText: LOCK, nextLockText: tampered, plan });
+  assert.equal(result.ok, false);
+  assert.match(result.problems.join('\n'), /carries checksum f{64},\s+not the a9f37a95/);
+});
+
+test('a package entering the tree is refused, because an advisory fix adds none', () => {
+  const plan = planBumps(PLANNER);
+  const widened = `${TRANSITIVE_LOCK}
+[[package]]
+name = "brand-new-transitive"
+version = "9.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "${'3'.repeat(64)}"
+`;
+  const result = verifyLockMove({ baseLockText: LOCK, nextLockText: widened, plan });
+  assert.equal(result.ok, false);
+  assert.match(result.problems.join('\n'), /brand-new-transitive 9\.9\.9 entered the tree/);
+});
+
+test('a package leaving the tree is refused too', () => {
+  const plan = planBumps(PLANNER);
+  const narrowed = TRANSITIVE_LOCK.replace(
+    `[[package]]
+name = "h3-neighbour"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "${'2'.repeat(64)}"
+`,
+    '',
+  );
+  const result = verifyLockMove({ baseLockText: LOCK, nextLockText: narrowed, plan });
+  assert.equal(result.ok, false);
+  assert.match(result.problems.join('\n'), /h3-neighbour 2\.0\.0 left the tree/);
 });

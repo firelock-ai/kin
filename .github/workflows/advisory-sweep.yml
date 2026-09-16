@@ -21,9 +21,9 @@ name: Advisory Sweep
 on:
   schedule:
     # Every three hours at :13, which is off the release train (:07,:22,:37,:52),
-    # recovery (:03,:18,:33,:48), sentinel (:11,:41) and mint (:11,:26,:41,:56)
-    # minutes, so the sweep never contends with a release cycle for the runner
-    # or for the branch it writes.
+    # recovery (:03,:18,:33,:48) and mint (:11,:26,:41,:56) minutes, so the
+    # sweep never contends with a release cycle for the runner or for the
+    # branch it writes.
     - cron: "13 */3 * * *"
   # `repository_dispatch` rather than `workflow_dispatch`, and not by taste. A
   # workflow_dispatch caller selects the ref, and GitHub resolves the workflow
@@ -180,43 +180,108 @@ jobs:
           echo "unfixable=$unfixable" >> "$GITHUB_OUTPUT"
           jq -r '.' "$RUNNER_TEMP/plan.json"
 
-      - name: Apply the bump and prove it moved only the named entries
+      - name: Apply the bump and prove it resolves
         id: apply
         if: steps.plan.outputs.bumps != '0'
         env:
           RUNNER_TEMP: ${{ runner.temp }}
-          BUMPS: ${{ steps.plan.outputs.bumps }}
         run: |
           set -euo pipefail
+          # Kept so the verifier can say what moved, rather than the reviewer
+          # having to reconstruct it from a diff after the fact.
+          cp ./Cargo.lock "$RUNNER_TEMP/Cargo.lock.base"
+
+          # FAST PATH, and still the preferred one. The direct entry rewrite
+          # moves two lines per bump and nothing else, which is what makes an
+          # unattended pull request reviewable at a glance. The header of
+          # scripts/advisory-sweep.mjs carries the 2026-08-18 measurement behind
+          # that choice: re-resolving this lock at all dragged eleven unrelated
+          # windows-sys reference lines.
           node scripts/advisory-sweep.mjs \
             --deny-json "$RUNNER_TEMP/advisories.json" \
             --lock ./Cargo.lock \
             > /dev/null
-          # Two lines per bump, the version and the checksum, and no other file.
-          changed="$(git diff --name-only)"
-          if [ -z "$changed" ]; then
-            # The plan named a bump and the tree did not move, so the plan was
-            # built against a lock that is not the one checked out here. Silence
-            # would publish an empty branch and an empty pull request.
-            echo "::error::advisory bump changed nothing; the plan does not match the checked-out lock"
-            exit 1
+          # Both checks are made against the copy taken above rather than
+          # against HEAD. They are the same tree in this job, which only ever
+          # checks out main, but tying the check to a saved base instead of to
+          # HEAD is what lets the whole step be replayed off the job, and it
+          # cannot quietly pass on a working tree that already carries a bump.
+          assert_lock_only() {
+            other="$(git diff --name-only | grep -vx 'Cargo.lock' || true)"
+            if [ -n "$other" ]; then
+              # tr rather than an unquoted expansion: flattening the newlines
+              # by word splitting also globs, so a path with a bracket in it
+              # would come out mangled in the one message telling you what went
+              # wrong.
+              echo "::error::advisory bump touched more than Cargo.lock: $(printf '%s' "$other" | tr '\n' ' ')"
+              exit 1
+            fi
+            if cmp -s "$RUNNER_TEMP/Cargo.lock.base" ./Cargo.lock; then
+              # The plan named a bump and the lock did not move, so the plan was
+              # built against a lock that is not the one checked out here.
+              # Silence would publish an empty branch and an empty pull request.
+              echo "::error::advisory bump changed nothing; the plan does not match the checked-out lock"
+              exit 1
+            fi
+          }
+          assert_lock_only
+
+          # FALLBACK. A fix whose crate pulls a transitive requirement cannot be
+          # expressed as a rewrite of the named entries alone: the result is a
+          # lock that does not resolve. RUSTSEC-2026-0285 was exactly that shape
+          # (rustls 0.23.40 -> 0.23.45 requires rustls-webpki ^0.103.14, and that
+          # one webpki entry is shared with rustls-platform-verifier through a
+          # second reqwest), it failed this step on 2026-09-15, and it had to be
+          # landed by hand. So when the minimal edit does not resolve, throw it
+          # away and let cargo resolve the same bump itself. The result is wider
+          # and it is checked harder, below, rather than trusted.
+          resolution=direct
+          if ! cargo metadata --locked --format-version 1 \
+              > /dev/null 2> "$RUNNER_TEMP/metadata.err"; then
+            echo "::notice::the direct entry rewrite does not resolve; re-running the bump through cargo"
+            sed 's/^/  /' "$RUNNER_TEMP/metadata.err"
+            # Restored from the copy taken at the top of this step, not with
+            # `git checkout -- Cargo.lock`. Same bytes when HEAD is main, which
+            # is the only tree this job checks out, but it does not depend on
+            # that being true, and it lets the whole step be replayed on a
+            # working tree whose HEAD already carries a bump.
+            cp "$RUNNER_TEMP/Cargo.lock.base" ./Cargo.lock
+            # `-p <crate>@<from>`, not `-p <crate>`: a lock that already holds
+            # two versions of the crate makes the bare spec ambiguous and cargo
+            # refuses it. This is the same spec bumpCommand() prints for a human.
+            # Crate names cannot contain whitespace, so the unquoted expansion
+            # is safe, and mapfile is avoided so this block runs under bash 3.2
+            # when somebody replays it on a Mac.
+            for crate in $(jq -r '.bumps[].crate' "$RUNNER_TEMP/plan.json"); do
+              from="$(jq -r --arg c "$crate" '.bumps[] | select(.crate == $c) | .from' "$RUNNER_TEMP/plan.json")"
+              to="$(jq -r --arg c "$crate" '.bumps[] | select(.crate == $c) | .to' "$RUNNER_TEMP/plan.json")"
+              cargo update -p "${crate}@${from}" --precise "$to"
+            done
+            resolution=cargo
+            assert_lock_only
+            # `--locked` now has to pass on cargo's own output. If it does not,
+            # the bump is not landable at all and the sweep must not publish it.
+            cargo metadata --locked --format-version 1 > /dev/null
           fi
-          if [ "$changed" != "Cargo.lock" ]; then
-            echo "::error::advisory bump touched more than Cargo.lock: $changed"
-            exit 1
-          fi
-          expected=$(( BUMPS * 2 ))
-          read -r added removed _ < <(git diff --numstat -- Cargo.lock)
-          if [ "$added" != "$expected" ] || [ "$removed" != "$expected" ]; then
-            echo "::error::advisory bump moved ${added}/${removed} lock lines, expected ${expected}/${expected}"
-            git --no-pager diff -- Cargo.lock
-            exit 1
-          fi
-          # A hand-written lock that cargo would not have produced fails here
-          # rather than in somebody's build. `--locked` refuses to rewrite.
-          cargo metadata --locked --format-version 1 > /dev/null
+
+          # The property check that replaced counting lines. Counting lines only
+          # ever held for a fix that needed nothing but the crate the advisory
+          # named, and it proved nothing about correctness either way: eight
+          # right lines and eight wrong ones count the same. This asserts that
+          # every planned bump landed at its planned version AND checksum, and
+          # that no package entered or left the tree, and it NAMES every
+          # transitive entry cargo moved so a reviewer sees them before
+          # auto-merge is armed.
+          node scripts/advisory-sweep.mjs \
+            --verify-move \
+            --plan-in "$RUNNER_TEMP/plan.json" \
+            --base-lock "$RUNNER_TEMP/Cargo.lock.base" \
+            --lock ./Cargo.lock
+
+          echo "resolution=$resolution" >> "$GITHUB_OUTPUT"
+
           # And the advisory has to actually be gone, which is the only reason
-          # the bump exists.
+          # the bump exists. Deliberately the last word of this step.
           cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories
 
       - name: Publish the bump branch

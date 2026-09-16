@@ -81,11 +81,24 @@ pub const PRODUCT_DEFAULT_PROFILE: &str = "interactive";
 /// `(set by operator)`, which is the exact confusion FIR-2434 was filed for.
 pub const RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV: &str = "KIN_RESOURCE_PROFILE_REPOSITORY_CONFIG";
 
+/// Records that the value in effect came from the profile `kin setup` recorded
+/// for this MACHINE, in `~/.kin/config/setup.toml`, rather than from a
+/// repository, an operator's shell, or kin's ship default.
+///
+/// It carries the value for the same reason the other two markers do, and it
+/// exists for the same reason: setup is where a person adjusts the profile for
+/// their hardware, and a machine-wide choice reported as `(set by operator)`
+/// would be that same lie one layer further out.
+pub const RESOURCE_PROFILE_HOST_CONFIG_ENV: &str = "KIN_RESOURCE_PROFILE_HOST_CONFIG";
+
 /// Set by [`apply_product_default`] when it actually wrote the default.
 static PRODUCT_SELECTED: AtomicBool = AtomicBool::new(false);
 
 /// Set by [`apply_repository_profile`] when it actually adopted one.
 static REPOSITORY_CONFIG_SELECTED: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`apply_host_profile`] when it actually adopted one.
+static HOST_CONFIG_SELECTED: AtomicBool = AtomicBool::new(false);
 
 /// The profile to write given the current raw value of the selector, or `None`
 /// to leave the environment exactly as it is.
@@ -151,11 +164,44 @@ pub fn product_selected() -> bool {
 /// effect, or `None` to leave the environment exactly as it is.
 ///
 /// Pure, so the precedence rule is testable without touching the process
-/// environment. A repository config outranks kin's ship default and never
-/// outranks an operator: a profile someone exported into this shell is a
-/// statement about this host and this run, and a file in the repo cannot know
-/// better than that.
+/// environment. A repository config outranks kin's ship default and the
+/// machine-wide profile `kin setup` recorded, and never outranks an operator: a
+/// profile someone exported into this shell is a statement about this host and
+/// this run, and a file in the repo cannot know better than that.
+///
+/// `current_is_unchosen` is true when the value in effect is one no person
+/// typed: kin's own ship default, or the machine profile setup recorded. Before
+/// the machine profile existed this argument was named for the ship default
+/// alone, and leaving it that way is what would have stopped a repository's
+/// `[resources]` config from applying at all on any machine whose setup run had
+/// recorded a profile.
 pub fn repository_profile_for<'a>(
+    configured: Option<&'a str>,
+    current: Option<&str>,
+    current_is_unchosen: bool,
+) -> Option<&'a str> {
+    let configured = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    match current {
+        // Nothing in effect at all: the config is the only opinion there is.
+        None => Some(configured),
+        // Nobody chose what is in effect, so the repository's recorded choice
+        // takes over from it.
+        Some(_) if current_is_unchosen => Some(configured),
+        // An operator's export is in effect. Leave it alone.
+        Some(_) => None,
+    }
+}
+
+/// The machine-wide profile to write given what is currently in effect, or
+/// `None` to leave the environment exactly as it is.
+///
+/// One rank below [`repository_profile_for`] and one above kin's ship default.
+/// A machine profile is a statement about this hardware, which a repository
+/// that may be checked out on twenty other machines cannot make, and which an
+/// operator typing an export for one command outranks.
+pub fn host_profile_for<'a>(
     configured: Option<&'a str>,
     current: Option<&str>,
     current_is_product_default: bool,
@@ -164,12 +210,8 @@ pub fn repository_profile_for<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
     match current {
-        // Nothing in effect at all: the config is the only opinion there is.
         None => Some(configured),
-        // Kin's own default is in effect, so nobody has chosen anything and the
-        // repository's recorded choice takes over.
         Some(_) if current_is_product_default => Some(configured),
-        // An operator's export is in effect. Leave it alone.
         Some(_) => None,
     }
 }
@@ -195,19 +237,109 @@ pub fn apply_repository_profile(configured: Option<&str>) -> Option<String> {
         PRODUCT_SELECTED.store(false, Ordering::Relaxed);
         return current;
     }
-    let current_is_product_default =
-        inherited_product_default(current.as_deref(), |key| std::env::var(key).ok());
-    let adopt = repository_profile_for(configured, current.as_deref(), current_is_product_default)?
-        .to_string();
+    // Kin's own ship default and the machine profile setup recorded are both
+    // values nobody typed, so a repository's recorded choice takes over from
+    // either. Reading only the first is what would have made a recorded machine
+    // profile silently disable every repository `[resources]` config on that
+    // host.
+    let current_is_unchosen =
+        inherited_product_default(current.as_deref(), |key| std::env::var(key).ok())
+            || inherited_host_profile(current.as_deref(), |key| std::env::var(key).ok());
+    let adopt =
+        repository_profile_for(configured, current.as_deref(), current_is_unchosen)?.to_string();
     std::env::set_var(RESOURCE_PROFILE_ENV, &adopt);
     std::env::set_var(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV, &adopt);
-    // The value is no longer kin's ship default, so neither marker may keep
-    // claiming it is. Leaving the old marker set is what would make the next
-    // reader report a repository choice as an unasked-for default.
+    // The value is no longer kin's ship default, nor the machine profile, so no
+    // other marker may keep claiming it is. Leaving one set is what would make
+    // the next reader report a repository choice as something else.
     std::env::remove_var(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV);
+    std::env::remove_var(RESOURCE_PROFILE_HOST_CONFIG_ENV);
     PRODUCT_SELECTED.store(false, Ordering::Relaxed);
+    HOST_CONFIG_SELECTED.store(false, Ordering::Relaxed);
     REPOSITORY_CONFIG_SELECTED.store(true, Ordering::Relaxed);
     Some(adopt)
+}
+
+/// Adopt the machine-wide profile `kin setup` recorded, when the operator has
+/// not chosen one.
+///
+/// Call immediately after [`apply_product_default`] and before
+/// [`apply_repository_profile_at`], under the same ordering requirement: the
+/// environment must be mutated while the process is still single-threaded and
+/// before the first reader caches its answer. Returns the value it adopted, or
+/// `None` when it left the environment alone.
+///
+/// Both binaries call this, for the reason [`apply_repository_profile_at`]
+/// gives. A CLI that adopted the machine profile while the daemon did not would
+/// make the two environments differ on exactly `KIN_RESOURCE_PROFILE`, which is
+/// a `BEHAVIOR_ENV_VARS` member, so every command in a repository would report
+/// a divergence a restart cannot clear.
+pub fn apply_host_profile(configured: Option<&str>) -> Option<String> {
+    let current = std::env::var(RESOURCE_PROFILE_ENV).ok();
+    // A repository profile a parent already resolved outranks this machine's,
+    // and a machine profile a parent already adopted is not an operator's
+    // export. Either way the inherited value stands and its provenance is kept.
+    if inherited_repository_profile(current.as_deref(), |key| std::env::var(key).ok()) {
+        REPOSITORY_CONFIG_SELECTED.store(true, Ordering::Relaxed);
+        PRODUCT_SELECTED.store(false, Ordering::Relaxed);
+        return current;
+    }
+    if inherited_host_profile(current.as_deref(), |key| std::env::var(key).ok()) {
+        HOST_CONFIG_SELECTED.store(true, Ordering::Relaxed);
+        PRODUCT_SELECTED.store(false, Ordering::Relaxed);
+        return current;
+    }
+    let current_is_product_default =
+        inherited_product_default(current.as_deref(), |key| std::env::var(key).ok());
+    let adopt =
+        host_profile_for(configured, current.as_deref(), current_is_product_default)?.to_string();
+    std::env::set_var(RESOURCE_PROFILE_ENV, &adopt);
+    std::env::set_var(RESOURCE_PROFILE_HOST_CONFIG_ENV, &adopt);
+    std::env::remove_var(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV);
+    PRODUCT_SELECTED.store(false, Ordering::Relaxed);
+    HOST_CONFIG_SELECTED.store(true, Ordering::Relaxed);
+    Some(adopt)
+}
+
+/// Adopt the machine-wide profile recorded in `~/.kin/config/setup.toml`, if
+/// there is one, while the process is still single-threaded.
+///
+/// Every failure is silent by design, exactly as [`apply_repository_profile_at`]
+/// is: this runs before argument parsing, a machine that never ran setup has
+/// nothing to adopt, and a file that will not parse is reported with its real
+/// message by `kin setup` itself.
+pub fn apply_host_profile_at() -> Option<String> {
+    let kin_home = crate::commands::setup::kin_dir().ok()?;
+    let recorded = crate::commands::setup_hardware::recorded_profile(&kin_home)?;
+    apply_host_profile(Some(&recorded))
+}
+
+/// Whether a value already in effect is the machine profile setup recorded,
+/// including across a spawn. Same marker-names-the-value rule as
+/// [`inherited_product_default`].
+pub fn inherited_host_profile<F>(current: Option<&str>, lookup: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match current {
+        None => false,
+        Some(current) => {
+            lookup(RESOURCE_PROFILE_HOST_CONFIG_ENV).is_some_and(|marked| marked == current)
+        }
+    }
+}
+
+/// Whether the active profile came from the machine profile `kin setup`
+/// recorded.
+pub fn host_config_selected() -> bool {
+    HOST_CONFIG_SELECTED.load(Ordering::Relaxed)
+}
+
+/// Reset the host-config mark. Test-only, for the same process-global reason as
+/// [`reset_product_selected_for_tests`].
+#[doc(hidden)]
+pub fn reset_host_config_selected_for_tests() {
+    HOST_CONFIG_SELECTED.store(false, Ordering::Relaxed);
 }
 
 /// Adopt the resource profile recorded by the repository containing `from`, if
@@ -327,6 +459,114 @@ mod tests {
         assert!(
             !repository_config_selected(),
             "a marker naming another value conferred repository provenance"
+        );
+    }
+
+    /// The machine profile fills in for kin's ship default and never for an
+    /// operator's export, one rank below a repository config.
+    #[test]
+    fn a_host_profile_replaces_the_ship_default_and_never_an_operator() {
+        assert_eq!(host_profile_for(Some("ci"), None, false), Some("ci"));
+        assert_eq!(
+            host_profile_for(Some("ci"), Some(PRODUCT_DEFAULT_PROFILE), true),
+            Some("ci")
+        );
+        // An operator exported something. A file describing this machine does
+        // not overrule a statement about this run.
+        assert_eq!(host_profile_for(Some("ci"), Some("proof"), false), None);
+        // Nothing recorded is not a choice.
+        assert_eq!(host_profile_for(None, Some("proof"), false), None);
+        assert_eq!(host_profile_for(Some("  "), None, false), None);
+        assert_eq!(host_profile_for(Some(""), None, false), None);
+    }
+
+    /// The rank that matters most, because getting it wrong breaks a feature
+    /// that already shipped: a repository's `[resources]` config must still
+    /// outrank the machine profile setup recorded. Before the `current_is_unchosen`
+    /// widening, a recorded machine profile looked exactly like an operator's
+    /// export to `repository_profile_for`, and every repository config on that
+    /// host silently stopped applying.
+    #[test]
+    fn a_repository_config_outranks_the_machine_profile() {
+        assert_eq!(
+            repository_profile_for(Some("proof"), Some("throughput"), true),
+            Some("proof"),
+            "a machine profile is not a choice a repository config may not replace"
+        );
+    }
+
+    /// The live wrapper for that rank, through the process environment: a
+    /// machine profile is in effect with its marker set, and the repository's
+    /// recorded profile takes over and reports itself as the repository's.
+    #[test]
+    fn the_repository_config_takes_over_from_a_live_machine_profile() {
+        let _guard = kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_ENV, "throughput");
+        let _host =
+            kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_HOST_CONFIG_ENV, "throughput");
+        let _repo = kin_core::test_env::EnvVarGuard::unset(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV);
+        let _product = kin_core::test_env::EnvVarGuard::unset(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV);
+        reset_product_selected_for_tests();
+        reset_repository_config_selected_for_tests();
+        reset_host_config_selected_for_tests();
+
+        assert_eq!(
+            apply_repository_profile(Some("proof")),
+            Some("proof".to_string())
+        );
+        assert!(repository_config_selected());
+        assert!(
+            !host_config_selected(),
+            "the machine profile is no longer in effect, so it must stop claiming to be"
+        );
+        assert_eq!(
+            std::env::var(RESOURCE_PROFILE_HOST_CONFIG_ENV).ok(),
+            None,
+            "a stale machine marker would make the next reader report the wrong origin"
+        );
+        reset_repository_config_selected_for_tests();
+    }
+
+    /// The spawn case for the machine profile. The CLI adopts it and then
+    /// spawns the daemon, so the daemon inherits a set variable that looks
+    /// exactly like an operator's export; it must read the marker and keep
+    /// calling the profile a machine choice.
+    #[test]
+    fn a_child_inheriting_the_machine_marker_keeps_the_machine_provenance() {
+        let _guard = kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_ENV, "proof");
+        let _marker =
+            kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_HOST_CONFIG_ENV, "proof");
+        let _repo = kin_core::test_env::EnvVarGuard::unset(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV);
+        let _product = kin_core::test_env::EnvVarGuard::unset(RESOURCE_PROFILE_PRODUCT_DEFAULT_ENV);
+        reset_product_selected_for_tests();
+        reset_host_config_selected_for_tests();
+
+        assert_eq!(apply_host_profile(Some("proof")), Some("proof".to_string()));
+        assert!(
+            host_config_selected(),
+            "an inherited machine profile was read as an operator override"
+        );
+        assert!(!product_selected());
+
+        // The direction that makes it mean something: a marker naming a
+        // different value is a stale inheritance and confers nothing.
+        let _stale = kin_core::test_env::EnvVarGuard::set(RESOURCE_PROFILE_HOST_CONFIG_ENV, "ci");
+        reset_host_config_selected_for_tests();
+        apply_host_profile(Some("proof"));
+        assert!(
+            !host_config_selected(),
+            "a marker naming another value conferred machine provenance"
+        );
+        reset_host_config_selected_for_tests();
+    }
+
+    /// The machine marker is a KIN_* name this module sets, so it has to be in
+    /// the central registry or the startup audit reports it as a probable typo
+    /// in every kin process and corrupts any JSON output.
+    #[test]
+    fn the_machine_provenance_marker_is_a_registered_environment_variable() {
+        assert!(
+            kin_core::env_registry::spec(RESOURCE_PROFILE_HOST_CONFIG_ENV).is_some(),
+            "{RESOURCE_PROFILE_HOST_CONFIG_ENV} is not registered"
         );
     }
 

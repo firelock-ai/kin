@@ -64,9 +64,10 @@ doing once.
 ## Notes worth knowing
 
 The `kin` CLI is a separate install from this plugin. The plugin's server manages its own
-cached binaries, which are not added to your PATH. To get `kin` in the terminal too, use
-`curl -fsSL https://get.kinlab.dev/install | sh` on macOS or Linux,
-`npm install -g @kinlab/kin`, or `brew install firelock-ai/kin/kin`.
+cached binaries, which are not added to your PATH. To get `kin` in the terminal too, run
+`npx -y @kinlab/kin setup`, which is the same command on every platform. On a machine
+without Node, use `curl -fsSL https://get.kinlab.dev/install | sh` on macOS or Linux,
+or `brew install firelock-ai/kin/kin`.
 
 If the user has also run `kin setup --intent agent`, they have a second Kin MCP server
 configured at user scope, pointing at their own installed binary. Both work. Two entries in

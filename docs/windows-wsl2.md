@@ -45,7 +45,14 @@ projection and the same behavior the project tests and benchmarks against.
 
 2. Inside the WSL2 Linux shell, install Kin the same way you would on Linux.
    This is the **same one-path flow** documented in the
-   [quickstart](./quickstart.md):
+   [quickstart](./quickstart.md). The primary command needs Node.js 20 or newer
+   inside WSL2:
+
+   ```sh
+   npx -y @kinlab/kin setup
+   ```
+
+   Without Node inside WSL2, run the installer instead:
 
    ```sh
    curl -fsSL https://get.kinlab.dev/install | sh

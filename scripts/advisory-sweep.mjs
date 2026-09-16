@@ -324,6 +324,107 @@ export function bumpCommand(bump) {
   return `cargo update -p ${bump.crate}@${bump.from} --precise ${bump.to}`;
 }
 
+// Read a lock into name -> sorted versions. Keyed by NAME rather than by
+// name+version on purpose: a version move keyed the other way reads as one
+// package removed and a different one added, which is exactly the shape a new
+// dependency entering the tree has, and the two must not be confusable.
+export function lockVersionsByName(lockText) {
+  const byName = new Map();
+  for (const block of lockText.split('[[package]]').slice(1)) {
+    const name = block.match(/^name = "([^"]+)"/m)?.[1];
+    const version = block.match(/^version = "([^"]+)"/m)?.[1];
+    if (!name || !version) continue;
+    byName.set(name, [...(byName.get(name) ?? []), version].sort());
+  }
+  return byName;
+}
+
+// What changed between two locks, said in terms a reviewer can act on.
+//
+// `entered` and `left` are packages whose NAME is new to or gone from the tree.
+// Those are supply-chain changes, not advisory fixes, and the verifier below
+// refuses them. `moved` is a name the tree already carried at a different set
+// of versions, which is what a transitive requirement looks like.
+export function diffLockPackages(baseLockText, nextLockText) {
+  const base = lockVersionsByName(baseLockText);
+  const next = lockVersionsByName(nextLockText);
+  const entered = [];
+  const left = [];
+  const moved = [];
+  for (const [name, versions] of next) {
+    if (!base.has(name)) {
+      entered.push({ name, versions });
+      continue;
+    }
+    const before = base.get(name).join(',');
+    const after = versions.join(',');
+    if (before !== after) moved.push({ name, from: base.get(name), to: versions });
+  }
+  for (const [name, versions] of base) {
+    if (!next.has(name)) left.push({ name, versions });
+  }
+  const order = (a, b) => a.name.localeCompare(b.name);
+  return { entered: entered.sort(order), left: left.sort(order), moved: moved.sort(order) };
+}
+
+// The replacement for counting lines.
+//
+// The old apply step asserted the lock moved exactly two lines per planned
+// bump. That assertion is only true when the advisory's fix needs nothing but
+// the crate the advisory names, and it is false for any fix that pulls a
+// transitive requirement, which is how RUSTSEC-2026-0285 (rustls 0.23.40 ->
+// 0.23.45, requiring rustls-webpki ^0.103.14) reached main unfixed. Counting
+// lines also never proved anything a reviewer cares about: eight correct lines
+// and eight wrong ones count the same.
+//
+// So this asserts the properties instead. Every planned bump landed at the
+// version and checksum the plan named, and no package entered or left the tree.
+// A name that merely moved version is allowed and is RETURNED, so the caller
+// can put it in front of a human rather than hide it. Whether the result is a
+// lock cargo would have produced, and whether the advisory is actually gone,
+// stay where they were: `cargo metadata --locked` and `cargo deny check
+// advisories` answer those, and neither is replaced here.
+export function verifyLockMove({ baseLockText, nextLockText, plan }) {
+  const problems = [];
+  const { entered, left, moved } = diffLockPackages(baseLockText, nextLockText);
+
+  for (const bump of plan.bumps) {
+    const versions = lockVersionsByName(nextLockText).get(bump.crate) ?? [];
+    if (!versions.includes(bump.to)) {
+      problems.push(
+        `plan named ${bump.crate} ${bump.from} -> ${bump.to}, but the resulting lock carries ` +
+          `${bump.crate} ${versions.length ? versions.join(', ') : 'nothing'}`,
+      );
+      continue;
+    }
+    if (!packageBlockPattern(bump.crate, bump.to).test(nextLockText)) {
+      problems.push(`${bump.crate} ${bump.to} is not a well-formed lock entry`);
+      continue;
+    }
+    const block = nextLockText.slice(
+      packageBlockPattern(bump.crate, bump.to).exec(nextLockText).index,
+    );
+    const checksum = block.match(/\nchecksum = "([0-9a-f]{64})"/)?.[1];
+    if (checksum !== bump.checksum) {
+      problems.push(
+        `${bump.crate} ${bump.to} carries checksum ${checksum ?? 'none'}, ` +
+          `not the ${bump.checksum} the advisory database named`,
+      );
+    }
+  }
+
+  for (const { name, versions } of entered) {
+    problems.push(`${name} ${versions.join(', ')} entered the tree; an advisory fix adds no package`);
+  }
+  for (const { name, versions } of left) {
+    problems.push(`${name} ${versions.join(', ')} left the tree; an advisory fix drops no package`);
+  }
+
+  const planned = new Set(plan.bumps.map((bump) => bump.crate));
+  const collateral = moved.filter(({ name }) => !planned.has(name));
+  return { ok: problems.length === 0, problems, moved, collateral };
+}
+
 export function renderMergeGroupAnnotations(plan) {
   const lines = [];
   for (const bump of plan.bumps) {
@@ -398,6 +499,8 @@ function readArgs(argv) {
     planOut: null,
     planIn: null,
     render: null,
+    verifyMove: false,
+    baseLock: null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -413,9 +516,16 @@ function readArgs(argv) {
     else if (arg === '--plan-out') options.planOut = next();
     else if (arg === '--plan-in') options.planIn = next();
     else if (arg === '--render') options.render = next();
+    else if (arg === '--base-lock') options.baseLock = next();
+    else if (arg === '--verify-move') options.verifyMove = true;
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--annotate-merge-group') options.annotateMergeGroup = true;
     else throw new Error(`unknown argument: ${arg}`);
+  }
+  if (options.verifyMove) {
+    if (!options.planIn) throw new Error('--verify-move needs --plan-in');
+    if (!options.baseLock) throw new Error('--verify-move needs --base-lock');
+    return options;
   }
   if (options.render) {
     if (!options.planIn) throw new Error('--render needs --plan-in');
@@ -477,6 +587,29 @@ export const RENDERERS = new Map([
 
 async function main(argv) {
   const options = readArgs(argv);
+  if (options.verifyMove) {
+    const plan = JSON.parse(fs.readFileSync(options.planIn, 'utf8'));
+    const result = verifyLockMove({
+      baseLockText: fs.readFileSync(options.baseLock, 'utf8'),
+      nextLockText: fs.readFileSync(options.lock, 'utf8'),
+      plan,
+    });
+    for (const problem of result.problems) console.error(`::error::${problem}`);
+    if (!result.ok) return 1;
+    const planned = plan.bumps.map((bump) => `${bump.crate} ${bump.from} -> ${bump.to}`);
+    console.log(`advisory bump landed: ${planned.join('; ') || 'nothing'}`);
+    if (result.collateral.length === 0) {
+      console.log('no other lock entry moved');
+    } else {
+      // Named rather than counted. A transitive move is legitimate and is also
+      // the thing a reviewer most needs to see before arming auto-merge.
+      console.log(`cargo also moved ${result.collateral.length} transitive entr(y/ies) to resolve it:`);
+      for (const { name, from, to } of result.collateral) {
+        console.log(`  ${name} ${from.join(', ')} -> ${to.join(', ')}`);
+      }
+    }
+    return 0;
+  }
   if (options.render) {
     const plan = JSON.parse(fs.readFileSync(options.planIn, 'utf8'));
     console.log(RENDERERS.get(options.render)(plan));

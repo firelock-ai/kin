@@ -329,14 +329,9 @@ enum Command {
         #[arg(long = "adopt-repository-id", value_name = "ID")]
         adopt_repository_id: Option<String>,
     },
-    /// Read canonical repository/workspace status without admitting host files
-    ///
-    /// Does not start a daemon, inspect working-copy contents, or require an
-    /// author. Run `kin admit` to admit files explicitly. Exit 0 means canonical
-    /// authority was read successfully, not that the projection is current.
+    /// Show coherent repository-v6 workspace status
     Status {
-        /// Output the unchanged kin.status.v3 canonical-authority JSON report;
-        /// projection freshness is not certified by this report
+        /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
         json: bool,
         /// Seconds to keep re-reading while embedding coverage is only
@@ -1586,6 +1581,33 @@ enum Command {
         /// interactive run asks first, and a scripted one needs this flag.
         #[arg(long = "install-language-servers", global = true)]
         install_language_servers: bool,
+        /// Record this machine's resource profile without the advanced prompt
+        ///
+        /// The opening hardware check prints what it detected and what it
+        /// recommends either way. A profile that budgets past what the machine
+        /// actually has can exceed safe memory and GPU thresholds.
+        #[arg(long = "resource-profile", global = true, value_parser = ["proof", "interactive", "throughput", "ci"])]
+        resource_profile: Option<String>,
+        /// When the embedding model is fetched: later (recommended) or never
+        ///
+        /// The wizard never downloads it. `later` records that `kin embed` and
+        /// `kin init`'s first embed pass may; `never` records that this machine
+        /// does not, which `kin doctor` then reports as a choice.
+        #[arg(long = "embedding-model", global = true, value_parser = ["later", "never"])]
+        embedding_model: Option<String>,
+        /// Where vectors are computed: local (recommended) or remote
+        ///
+        /// `remote` collects no credential. It prints the environment variables
+        /// an OpenAI-compatible endpoint needs and states that entity text is
+        /// sent to it.
+        #[arg(long = "embedding-provider", global = true, value_parser = ["local", "remote"])]
+        embedding_provider: Option<String>,
+        /// Do not add ~/.kin/bin to the shell profile
+        ///
+        /// Only asked about for an npm or npx install, which cannot make the
+        /// edit itself. Without the line a bare `kin` does not resolve.
+        #[arg(long = "skip-path", global = true)]
+        skip_path: bool,
         /// Skip the wizard and only run the first-run health check
         #[arg(long, default_value_t = false)]
         check: bool,
@@ -3154,6 +3176,13 @@ fn run() -> Result<()> {
     // process, and mutating the environment is only safe while the process is
     // still single-threaded. An operator's explicit KIN_RESOURCE_PROFILE wins.
     kin_cli::resource_profile::apply_product_default();
+    // ...then let the machine-wide profile `kin setup` recorded take over from
+    // that default. Setup is where a person adjusts the profile for their own
+    // hardware, and a choice nothing reads is not a choice. kin-daemon applies
+    // the SAME one at the same point, so the two environments agree on
+    // KIN_RESOURCE_PROFILE by construction and no behavior-env divergence is
+    // reported for using the feature.
+    kin_cli::resource_profile::apply_host_profile_at();
     // ...then let the repository's recorded profile take over from that default,
     // exactly as kin-daemon does, so the two agree by construction. Without this
     // the daemon runs under the repository's profile and this process does not,
@@ -3259,6 +3288,11 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 Command::Status { json, wait_quiesce } => {
+                    // A working copy nothing admitted is an answer, not an
+                    // error, and it travels in the exit code the way a parked
+                    // merge and an unrouted `kin path` already do. The report is
+                    // printed either way; the code says whether any of it
+                    // describes the files on disk.
                     let code =
                         commands::status::run(json, std::time::Duration::from_secs(wait_quiesce))
                             .await?;
@@ -4677,6 +4711,10 @@ fn run() -> Result<()> {
                     no_interactive,
                     skip_mcp_check,
                     install_language_servers,
+                    resource_profile,
+                    embedding_model,
+                    embedding_provider,
+                    skip_path,
                     check,
                 } => match action {
                     Some(SetupAction::Status { json }) => commands::setup::status(json).await,
@@ -4702,6 +4740,10 @@ fn run() -> Result<()> {
                             intent,
                             skip_mcp_check,
                             install_language_servers,
+                            resource_profile,
+                            embedding_model,
+                            embedding_provider,
+                            skip_path,
                         })
                         .await
                     }

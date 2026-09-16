@@ -91,6 +91,7 @@ pub mod semver;
 pub mod session_run;
 pub mod session_workspace;
 pub mod setup;
+pub mod setup_hardware;
 pub mod setup_ledger;
 pub mod setup_verify;
 pub mod spec;

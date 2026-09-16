@@ -375,7 +375,23 @@ if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
         info "Filesystem projection is unavailable on this platform; core CLI and daemon are fully functional without it."
     fi
 else
-    info "Filesystem projection (kin-vfs) not bundled in this archive. The core CLI and daemon are fully functional without it."
+    # An install being upgraded may still carry the projection pair from a
+    # release that bundled it. Leaving it puts a v0.7.17 kin-vfs on PATH beside
+    # a daemon several releases newer, and the installer is the documented
+    # recovery for exactly those installs, so it is the one that has to clear
+    # them. `kin update` does the same for the release after this one: the
+    # components stay in its managed list as optional, and an archive that does
+    # not carry one removes the stale copy rather than keeping it.
+    if [ -e "$KIN_BIN/kin-vfs$BIN_EXT" ] || [ -e "$KIN_LIB/libkin_vfs_shim.so" ] ||
+        [ -e "$KIN_LIB/libkin_vfs_shim.dylib" ] || [ -e "$KIN_LIB/kin_vfs_shim.dll" ]; then
+        rm -f "$KIN_BIN/kin-vfs$BIN_EXT" \
+            "$KIN_LIB/libkin_vfs_shim.so" \
+            "$KIN_LIB/libkin_vfs_shim.dylib" \
+            "$KIN_LIB/kin_vfs_shim.dll"
+        info "Removed the filesystem projection left by an earlier release; this archive does not carry one. The core CLI and daemon are fully functional without it."
+    else
+        info "Filesystem projection (kin-vfs) not bundled in this archive. The core CLI and daemon are fully functional without it."
+    fi
 fi
 
 # ── PATH setup ──────────────────────────────────────────────────────────

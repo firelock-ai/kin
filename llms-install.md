@@ -17,7 +17,22 @@ daemon if you were only proving the install works. Six sections follow, in that 
 
 ## Step 1: install the Kin CLI
 
-macOS and Linux:
+Start here. One command, identical on macOS, Linux, Windows and WSL, and it needs no domain:
+
+```sh
+npx -y @kinlab/kin setup --intent agent --no-interactive
+```
+
+It needs Node 20 or newer. It downloads the matching `kin` and `kin-daemon` release into
+`~/.kin/bin`, verifies the published SHA-256, adds that directory to the shell profile, and
+runs `kin setup` with the wizard's questions already answered, so it does not wait on a
+keyboard. Add `--install-language-servers` to have it install the language servers that
+cross-file reference edges need. This is the whole of step 4 as well when it succeeds, so
+read its client table there and skip ahead if every client you need reports configured.
+The steps below stay the order to follow on a machine with no Node.
+
+macOS and Linux. `get.kinlab.ai` and `get.kinlab.dev` serve the same script, and
+`https://kinlab.ai/install.sh` forwards to it:
 
 ```sh
 curl -fsSL https://get.kinlab.dev/install | sh
@@ -27,6 +42,15 @@ The installer downloads the latest release, verifies its published SHA-256, inst
 and `kin-daemon` under `~/.kin/bin`, updates the shell profile, and then launches the
 `kin setup` wizard. Running unattended, set `KIN_NO_SETUP=1` to skip the wizard and drive
 setup yourself in step 4.
+
+Run that same line again to update an existing install, and prefer it to `kin update` when
+you find an install already on the machine. `kin update` fails on any install at 0.7.19 or
+earlier with `release archive is incomplete: required component 'kin-vfs' is missing`,
+because those binaries check the archive against a component list fixed when they were
+built and 0.7.18 removed `kin-vfs` from the release. The installer reads the archive it
+downloads instead, so it moves that install to the current release in one step. Treat any
+incomplete-release-archive error as "re-run the installer", never as a corrupt download to
+retry.
 
 Windows, in PowerShell:
 
@@ -119,6 +143,12 @@ their coverage. The structural tools, `semantic_search`, `find_references`,
 `graph_neighborhood`, `trace_data_flow`, and `impact_analysis`, do not depend on the vector
 index and work as soon as step 2 finishes.
 
+`kin setup` defers this step by design and downloads nothing itself. It records that the
+model is fetched later, and `kin embed` is what starts the fetch. So a `kin doctor` row
+reading `Embedding model (Pending)` after setup is the recorded answer, not a failure, and
+nothing is owed until someone wants vector ranking. A host with no egress to
+`huggingface.co` stays in that state and keeps answering from lexical and graph signals.
+
 Check coverage at any time:
 
 ```sh
@@ -149,6 +179,31 @@ It writes Kin's MCP server entry into the clients it finds:
 The merge is defensive. It refuses to write to a file that is not valid JSON, only touches
 the `command`, `args`, and `env` keys under its own entry, and records every write to a
 ledger so `kin setup uninstall` can reverse it.
+
+A non-interactive run answers several questions by itself and then prints each one, the
+value it took, and the flag that changes it. Read that block rather than assuming the
+defaults, because it is the same list `kin setup status` reports. What it decides:
+
+| Decision | Non-interactive value | Flag |
+| --- | --- | --- |
+| Resource profile | the recommendation from the opening hardware check | `--resource-profile <proof\|interactive\|throughput\|ci>` |
+| Embedding model | fetched later; nothing downloads during setup | `--embedding-model <later\|never>` |
+| Embedding provider | local; nothing derived from source leaves the machine | `--embedding-provider <local\|remote>` |
+| `~/.kin/bin` on PATH | added, for an npm or npx install that needs it | `--skip-path` |
+| MCP round trip | run, unless no repository exists yet | `--skip-mcp-check` |
+| Language servers | not installed | `--install-language-servers` |
+| macOS notifications | not requested | interactive runs only |
+
+The wizard also opens with a hardware check that names this machine's architecture, core
+counts, memory and accelerator, and the resource profile that follows from them. Nothing
+about it needs answering on the scripted path. It is printed so an unattended log records
+which machine was installed to.
+
+Two of those rows deserve care from an agent. The embedding model is deliberately deferred,
+so do not read the resulting `Embedding model (Pending)` row as a failed install or pass
+`--embedding-model never` on a user's behalf; `never` is a statement about their machine
+that only they can make. And `--embedding-provider remote` sends entity text to an external
+endpoint, so never select it without an explicit instruction to.
 
 Cline is supported, and it is one of the clients `kin setup` does not detect, so wire it by
 hand with the entry below. Cline reads the same `mcpServers` shape. The CLI reads
