@@ -484,6 +484,12 @@ mod tests {
         );
         assert_eq!(window(32_768).default_result_ceiling(), 12_288);
         assert_eq!(window(2_048).default_result_ceiling(), MIN_RESULT_BYTES);
+        // 24,576 is written down in kin-mcp, as the response ceiling the agent
+        // belt asks for on `trace_data_flow` and `get_context_pack`. kin-mcp
+        // cannot import this crate, so the number lives there by hand and this
+        // is the line that keeps it honest: change `BYTES_PER_TOKEN` or the
+        // eighth and the belt's ceiling stops being the limit it claims to be.
+        assert_eq!(window(65_536).default_result_ceiling(), 24_576);
         assert_eq!(window(131_072).answer_reserve(), MAX_ANSWER_RESERVE);
         assert_eq!(window(32_768).answer_reserve(), 4_096);
         assert_eq!(window(4_096).answer_reserve(), MIN_ANSWER_RESERVE);

@@ -613,10 +613,20 @@ fn extract_calls_from_body(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
-            if let Some(callee) = extract_callee_name(&child, source) {
+            if let Some((callee, callee_node)) = extract_callee(&child, source) {
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The call as written, so a reference row can report the
+                        // line it sits on. Without it the linker has no span to
+                        // store and every consuming surface reports the edge as
+                        // having no evidence span.
+                        //
+                        // It runs from the callee to the end of the call rather
+                        // than from the start of the `call_expression` node,
+                        // because in `first + compute()` that node begins at
+                        // `first`. The span then covers `compute()`, which is
+                        // the use, not the whole operator expression around it.
+                        site: Some(swift_call_site(&callee_node, &child)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -644,23 +654,89 @@ fn extract_calls_from_body(
 /// We unwrap `suffix -> navigation_suffix -> suffix (simple_identifier)` so
 /// `a.b.c()` maps to `"c"` and `obj.method()` maps to `"method"`. This mirrors
 /// the Python attribute-call fix and keeps Calls edges keyed on simple names.
-fn extract_callee_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+/// The callee of a Swift `call_expression`, with the node the name was read
+/// from so the recorded site can start there.
+///
+/// The third arm is the one worth reading. tree-sitter-swift parses
+/// `return first + compute()` as a call whose callee is the whole
+/// `additive_expression`, so the call suffix binds to `first + compute` rather
+/// than to `compute`. Reading only the arms above it, this function returned
+/// `None` and the call reached no edge at all: `kin refs` answered that nobody
+/// called a function the source calls, and the answer looked clean. Swift reads
+/// that line as `first + (compute())`, so the callee is the operator
+/// expression's right operand, and the same rule applies through a chain of
+/// them.
+fn extract_callee<'tree>(
+    node: &tree_sitter::Node<'tree>,
+    source: &[u8],
+) -> Option<(String, tree_sitter::Node<'tree>)> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "simple_identifier" => {
                 let raw = child.utf8_text(source).unwrap_or("");
                 let stripped = raw.strip_prefix("self.").unwrap_or(raw);
-                return Some(stripped.to_string());
+                return Some((stripped.to_string(), child));
             }
             "navigation_expression" => {
-                return extract_navigation_suffix_name(&child, source);
+                let name = extract_navigation_suffix_name(&child, source)?;
+                return Some((name, child));
             }
             "call_suffix" | "value_arguments" | "lambda_literal" => continue,
-            _ => {}
+            _ => {
+                if let Some(rhs) = child.child_by_field_name("rhs") {
+                    return callee_operand(&rhs, source);
+                }
+            }
         }
     }
     None
+}
+
+/// The callee an operator expression's right operand names, following a chain
+/// of operators down to the identifier or member access at its end.
+fn callee_operand<'tree>(
+    node: &tree_sitter::Node<'tree>,
+    source: &[u8],
+) -> Option<(String, tree_sitter::Node<'tree>)> {
+    match node.kind() {
+        "simple_identifier" => {
+            let raw = node.utf8_text(source).unwrap_or("");
+            let stripped = raw.strip_prefix("self.").unwrap_or(raw);
+            Some((stripped.to_string(), *node))
+        }
+        "navigation_expression" => {
+            let name = extract_navigation_suffix_name(node, source)?;
+            Some((name, *node))
+        }
+        _ => {
+            let rhs = node.child_by_field_name("rhs")?;
+            callee_operand(&rhs, source)
+        }
+    }
+}
+
+/// The site a Swift call records: from the callee to the end of the call.
+///
+/// For an ordinary `compute()` that is the `call_expression` node itself, since
+/// the callee is its first token. For a call the grammar bound to an operator
+/// expression it is the part that is really the call, which is what a reference
+/// row should point a reader at.
+fn swift_call_site(
+    callee: &tree_sitter::Node,
+    call: &tree_sitter::Node,
+) -> crate::extract::RelationSite {
+    let start = callee.start_position();
+    let end = call.end_position();
+    crate::extract::RelationSite {
+        start_byte: callee.start_byte(),
+        end_byte: call.end_byte(),
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: end.row as u32,
+        end_col: end.column as u32,
+        syntactic_role: None,
+    }
 }
 
 /// Pull the rightmost identifier out of a tree-sitter-swift `navigation_expression`.

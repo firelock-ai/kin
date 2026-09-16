@@ -455,6 +455,27 @@ impl Belt {
         self.file_tools
     }
 
+    /// The prefix this belt's Kin tools carry, for a message that names one.
+    ///
+    /// Read off the belt rather than assumed, because a run with several repositories
+    /// attached labels each server's tools, and a message naming `mcp__kin__kin_mutate`
+    /// to a model whose belt carries `mcp__kin_cli__kin_mutate` names nothing it can call.
+    fn kin_prefix(&self) -> &str {
+        self.kin_tools
+            .first()
+            .map(|tool| {
+                if tool.exposed.starts_with(KIN_TOOL_PREFIX) {
+                    KIN_TOOL_PREFIX
+                } else {
+                    tool.exposed
+                        .rfind("__")
+                        .map(|end| &tool.exposed[..end + 2])
+                        .unwrap_or(KIN_TOOL_PREFIX)
+                }
+            })
+            .unwrap_or(KIN_TOOL_PREFIX)
+    }
+
     /// Whether a Kin tool, named as its server declares it, is on this belt.
     pub fn has_kin_tool(&self, bare: &str) -> bool {
         self.kin_tools.iter().any(|tool| tool.bare == bare)
@@ -535,16 +556,7 @@ impl Belt {
                 "There is no tool named `{name}` on this belt. This agent is locked to Kin tools only. \
                  To mutate code in the repository, call `{}kin_mutate` with an operations array \
                  naming the entity and new source body.",
-                self.kin_tools
-                    .first()
-                    .map(|t| {
-                        if t.exposed.starts_with(KIN_TOOL_PREFIX) {
-                            KIN_TOOL_PREFIX
-                        } else {
-                            ""
-                        }
-                    })
-                    .unwrap_or(KIN_TOOL_PREFIX)
+                self.kin_prefix()
             ));
         }
         // A bare Kin tool name is a near miss worth naming precisely, because the model
@@ -599,9 +611,16 @@ impl Belt {
                 "function": {
                     "name": EDIT_FILE,
                     "description": format!(
-                        "Replace one exact snippet of text in one file. The `find` text must appear \
-                         exactly once in the file unless `replace_all` is true. Use this for a small, \
-                         surgical change once Kin has told you where the code is.{suffix}"
+                        "Replace one exact snippet of text in one file. `find` is matched byte for \
+                         byte, including indentation, and must appear exactly once unless \
+                         `replace_all` is true. When the thing you are changing IS an entity Kin \
+                         has already named for you, a function, a method or a class, prefer \
+                         `{prefix}kin_mutate` with one operation {{\"verb\": \"update\", \
+                         \"target\": \"<that entity id>\", \"body\": \"<its complete new \
+                         source>\", \"description\": \"...\"}}: it names the change and needs \
+                         no old bytes at all. Use this tool for a change smaller than an entity, \
+                         or in a file the graph holds no entity for.{suffix}",
+                        prefix = self.kin_prefix(),
                     ),
                     "parameters": edit_file_schema(),
                 }
@@ -612,7 +631,10 @@ impl Belt {
                     "name": WRITE_FILE,
                     "description": format!(
                         "Write a file in full, creating it if it does not exist. Use this for a new \
-                         file; prefer edit_file for a change to an existing one.{suffix}"
+                         file; an existing one is changed through `{edit}` or, when the change is a \
+                         whole entity, through `{prefix}kin_mutate`.{suffix}",
+                        edit = EDIT_FILE,
+                        prefix = self.kin_prefix(),
                     ),
                     "parameters": write_file_schema(),
                 }
@@ -739,6 +761,13 @@ pub struct LocalOutcome {
     /// put a filesystem access on the runtime path, and between the write and the read
     /// the file could be something else.
     pub body: Option<String>,
+    /// Set on a refusal the model can clear by sending different bytes for the same
+    /// target, which is the only refusal re-reading the source answers.
+    ///
+    /// The repeat guard counts these per target and only these. An edit repository
+    /// authority declined to publish is a different problem with a different answer,
+    /// and a run redirected to go and re-read source over one is told the wrong thing.
+    pub retry_with_bytes: bool,
 }
 
 /// Resolve a model-supplied path inside the repository, refusing every escape.
@@ -875,6 +904,7 @@ pub fn run_edit(repo: &Path, arguments: &Value) -> LocalOutcome {
         is_error: false,
         changed: Some(planned.raw_path.clone()),
         body: Some(planned.updated),
+        retry_with_bytes: false,
     }
 }
 
@@ -891,6 +921,7 @@ pub fn published_edit(planned: PlannedEdit) -> LocalOutcome {
         is_error: false,
         changed: Some(planned.raw_path.clone()),
         body: Some(planned.updated),
+        retry_with_bytes: false,
     }
 }
 
@@ -906,6 +937,336 @@ pub fn unpublished_edit(planned: &PlannedEdit, reason: &str) -> LocalOutcome {
          cause and send the edit again.",
         path = planned.raw_path,
     ))
+}
+
+/// How many lines of the file a refusal quotes back.
+///
+/// Six covers a signature and the guard clause under it, which is the span a surgical
+/// change names, and stops a refusal on a long `find` from returning a page of source the
+/// run already paid to read once.
+const REFUSAL_QUOTE_LINES: usize = 6;
+
+/// How many bytes of the file a refusal quotes back.
+const REFUSAL_QUOTE_BYTES: usize = 400;
+
+/// The markers a refusal wraps quoted bytes in.
+///
+/// Not a Markdown fence. Source carries backticks, and a model that has to guess where the
+/// quoted text stops is the failure this message exists to prevent.
+const QUOTE_OPEN: &str = "<<<KIN-EXACT";
+const QUOTE_CLOSE: &str = ">>>KIN-EXACT";
+
+/// Why a `find` did not match, and the bytes in the file it points at instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchMiss {
+    /// What went wrong, in the model's terms.
+    pub reason: String,
+    /// The file's exact current bytes over the span the refusal points at.
+    pub bytes: String,
+    /// 1-based and inclusive, so a reader can join this to a source listing.
+    pub first_line: usize,
+    pub last_line: usize,
+    /// Set when `bytes` is the whole span and re-sending it verbatim must match. Clear
+    /// when the span was cut to the quote bound, or when nothing matched and the bytes
+    /// are the nearest text rather than a proven substitute.
+    pub verbatim: bool,
+}
+
+/// Decode the two-character escape sequences a model writes when it escapes its JSON twice.
+///
+/// This is the measured failure, not a hypothetical one. `get_entity_source` returns the
+/// source inside a JSON result, so a tab in the file reaches the model as the two
+/// characters `\` and `t`. A model that copies what it read into the next call's `find`
+/// sends those two characters, the file holds one tab, and the byte comparison is right to
+/// refuse. Returns `None` when there was nothing to decode, so the caller does not test the
+/// same candidate twice.
+fn decode_literal_escapes(text: &str) -> Option<String> {
+    if !text.contains('\\') {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    let mut decoded_any = false;
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('n') => {
+                out.push('\n');
+                decoded_any = true;
+            }
+            Some('t') => {
+                out.push('\t');
+                decoded_any = true;
+            }
+            Some('r') => {
+                out.push('\r');
+                decoded_any = true;
+            }
+            Some('"') => {
+                out.push('"');
+                decoded_any = true;
+            }
+            Some('\'') => {
+                out.push('\'');
+                decoded_any = true;
+            }
+            Some('\\') => {
+                out.push('\\');
+                decoded_any = true;
+            }
+            // Not an escape this decoder knows, so it is left exactly as the model wrote
+            // it and a Windows path or a regex in the source is never quietly rewritten.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    decoded_any.then_some(out)
+}
+
+/// The 1-based line a byte offset falls on.
+fn line_of(text: &str, offset: usize) -> usize {
+    text[..offset].matches('\n').count() + 1
+}
+
+/// A span cut to the quote bound, and whether it survived whole.
+fn quote_span(span: &str) -> (String, bool) {
+    let mut kept = String::new();
+    let mut whole = true;
+    for (index, line) in span.split_inclusive('\n').enumerate() {
+        if index >= REFUSAL_QUOTE_LINES || kept.len() + line.len() > REFUSAL_QUOTE_BYTES {
+            whole = false;
+            break;
+        }
+        kept.push_str(line);
+    }
+    if kept.is_empty() {
+        // One line longer than the whole bound. Cut rather than return nothing: a prefix
+        // of the real bytes still shows the model where its own text went wrong.
+        let mut end = REFUSAL_QUOTE_BYTES.min(span.len());
+        while end > 0 && !span.is_char_boundary(end) {
+            end -= 1;
+        }
+        return (span[..end].to_string(), false);
+    }
+    (kept, whole)
+}
+
+/// The miss a matching candidate produced, described against the file's own span.
+fn miss_at(original: &str, offset: usize, matched_len: usize, reason: &str) -> MatchMiss {
+    let end = (offset + matched_len).min(original.len());
+    let span = &original[offset..end];
+    let (bytes, whole) = quote_span(span);
+    let first_line = line_of(original, offset);
+    // Counted forward through the span rather than by looking up the line of its last
+    // byte. `end - 1` is inside the final character whenever that character is not
+    // ASCII, and slicing there panics. A span closing on a newline ends on the line
+    // that newline terminates, not the empty one after it.
+    let lines_spanned = span
+        .strip_suffix('\n')
+        .unwrap_or(span)
+        .matches('\n')
+        .count();
+    MatchMiss {
+        reason: reason.to_string(),
+        first_line,
+        last_line: first_line + lines_spanned,
+        bytes,
+        verbatim: whole,
+    }
+}
+
+/// The alphanumeric words of a line, for the nearest-line measure.
+fn line_words(line: &str) -> Vec<String> {
+    line.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_lowercase())
+        .collect()
+}
+
+/// The byte offset a 0-based line starts at, in a text split on `\n`.
+fn offset_of_line(lines: &[&str], line: usize) -> usize {
+    lines[..line].iter().map(|line| line.len() + 1).sum()
+}
+
+/// Why a `find` did not match this file, and the bytes that would have.
+///
+/// Candidates are tried in the order of how cheaply the model can act on the answer. One
+/// that matches gives an exact span, so the refusal hands back bytes proven to match
+/// rather than a guess. When none matches, the nearest line by shared words is the anchor,
+/// and the refusal says those bytes are the nearest text rather than a substitute.
+///
+/// Nothing here rewrites the edit. A decoder that quietly accepted the model's escaped form
+/// would apply a change to bytes the model never named, and a file that genuinely holds a
+/// literal backslash-t would be corrupted by it. The decoding only ever explains.
+pub fn diagnose_miss(original: &str, find: &str) -> Option<MatchMiss> {
+    if find.is_empty() || original.is_empty() {
+        return None;
+    }
+    let decoded = decode_literal_escapes(find);
+    let mut candidates: Vec<(String, &str)> = Vec::new();
+    if find.contains('\r') {
+        candidates.push((
+            find.replace("\r\n", "\n").replace('\r', ""),
+            "the text carried carriage returns this file does not have",
+        ));
+    }
+    if let Some(decoded) = decoded.clone() {
+        candidates.push((
+            decoded.clone(),
+            "the text arrived with its escape sequences literal, so `\\n`, `\\t` and `\\\"` reached \
+             this tool as backslash characters instead of a newline, a tab and a quote. Source read \
+             out of a JSON result is already escaped once, and has to be written back as the \
+             characters themselves",
+        ));
+        if decoded.contains('\r') {
+            candidates.push((
+                decoded.replace("\r\n", "\n").replace('\r', ""),
+                "the text arrived with its escape sequences literal and carried carriage returns \
+                 this file does not have",
+            ));
+        }
+    }
+    for (candidate, reason) in &candidates {
+        if let Some(offset) = original.find(candidate.as_str()) {
+            return Some(miss_at(original, offset, candidate.len(), reason));
+        }
+    }
+
+    // The same lines with different surrounding whitespace. Reported against the file's own
+    // lines, because those are the bytes the model has to send.
+    let probe_source = decoded.as_deref().unwrap_or(find);
+    let probe: Vec<&str> = probe_source.trim_end_matches('\n').split('\n').collect();
+    let lines: Vec<&str> = original.split('\n').collect();
+    if probe.iter().any(|line| !line.trim().is_empty()) && probe.len() <= lines.len() {
+        let window = probe.len();
+        let hit = (0..=lines.len() - window).find(|start| {
+            lines[*start..start + window]
+                .iter()
+                .zip(&probe)
+                .all(|(have, want)| have.trim() == want.trim())
+        });
+        if let Some(start) = hit {
+            let offset = offset_of_line(&lines, start);
+            let span: usize = lines[start..start + window]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
+            let reason = if decoded.is_some() {
+                "the text arrived with its escape sequences literal, and its indentation is not the \
+                 file's either"
+            } else {
+                "these lines are in the file, but their leading or trailing whitespace is not what \
+                 was sent. Indentation is part of the bytes"
+            };
+            return Some(miss_at(original, offset, span, reason));
+        }
+    }
+
+    // Nothing matched under any reading. Anchor on the nearest line so the refusal still
+    // hands back current bytes, and say plainly what they are.
+    let first_probe = probe.iter().find(|line| !line.trim().is_empty())?;
+    let wanted = line_words(first_probe);
+    if wanted.is_empty() {
+        return None;
+    }
+    let (best, score) = lines
+        .iter()
+        .enumerate()
+        .fold((0usize, 0.0f64), |best, (index, line)| {
+            let have = line_words(line);
+            if have.is_empty() {
+                return best;
+            }
+            let shared = wanted.iter().filter(|word| have.contains(word)).count() as f64;
+            let ratio = shared / wanted.len().max(have.len()) as f64;
+            if ratio > best.1 {
+                (index, ratio)
+            } else {
+                best
+            }
+        });
+    if score <= 0.0 {
+        return None;
+    }
+    let offset = offset_of_line(&lines, best);
+    let window = probe
+        .len()
+        .clamp(1, REFUSAL_QUOTE_LINES)
+        .min(lines.len() - best);
+    let span: usize = lines[best..best + window]
+        .iter()
+        .map(|line| line.len() + 1)
+        .sum();
+    let mut miss = miss_at(
+        original,
+        offset,
+        span,
+        "no text in the file matches what was sent, under any reading of it. Either the read it \
+         came from is stale, or it names a different line than the one intended",
+    );
+    miss.verbatim = false;
+    Some(miss)
+}
+
+/// The one route to the same change that needs no old bytes at all.
+///
+/// Named in every unmatched refusal, because a model that cannot make a byte match work
+/// has a second way to the same edit and the measured run shows it does not remember that
+/// on its own.
+fn entity_named_route() -> String {
+    format!(
+        "To change a whole function, method or class without matching any old text, call \
+         `{KIN_TOOL_PREFIX}kin_mutate` with operations [{{\"verb\": \"update\", \"target\": \
+         \"<the entity id {KIN_TOOL_PREFIX}semantic_locate gave you>\", \"body\": \"<the entity's \
+         complete new source>\", \"description\": \"...\"}}]."
+    )
+}
+
+/// What the model is told when its `find` matched nothing.
+///
+/// A refusal that names only the failure is the defect this replaced. Measured on
+/// 2026-09-15, `qwen/qwen3-coder-next` sent a `find` whose escape sequences were literal,
+/// was told only that the text did not appear, and spent its remaining sixteen tool calls
+/// on graph questions without attempting the change again. So this carries the three things
+/// a retry needs and nothing else: why it did not match, the file's exact current bytes at
+/// the closest span, and the one instruction that uses them.
+fn unmatched_find(raw_path: &str, original: &str, find: &str) -> String {
+    let Some(miss) = diagnose_miss(original, find) else {
+        return format!(
+            "the `find` text does not appear in `{raw_path}`, and no text in the file resembles it. \
+             Read the entity's current source with {KIN_TOOL_PREFIX}get_entity_source and send \
+             `find` as bytes that are in the file. {}",
+            entity_named_route()
+        );
+    };
+    let lines = if miss.first_line == miss.last_line {
+        format!("line {}", miss.first_line)
+    } else {
+        format!("lines {} to {}", miss.first_line, miss.last_line)
+    };
+    let quoted = miss.bytes.trim_end_matches('\n');
+    let instruction = if miss.verbatim {
+        "Re-issue this call with `find` set to exactly those bytes, and write `replace` the same \
+         way."
+    } else {
+        "Those are the file's current bytes, cut to a few lines, and not a substitute for what was \
+         sent. Take a short unique snippet out of them and re-issue this call with `find` set to \
+         it, written exactly as it appears there."
+    };
+    format!(
+        "the `find` text does not appear in `{raw_path}`. Why it did not match: {reason}. The \
+         file's exact current bytes at {lines} are between the markers below.\n\
+         {QUOTE_OPEN}\n{quoted}\n{QUOTE_CLOSE}\n\
+         {instruction} {route}",
+        reason = miss.reason,
+        route = entity_named_route(),
+    )
 }
 
 /// Resolve an `edit_file` call against the file's current text without writing anything.
@@ -929,13 +1290,12 @@ pub fn plan_edit(repo: &Path, arguments: &Value) -> Result<PlannedEdit, LocalOut
     })?;
     let occurrences = original.matches(find).count();
     if occurrences == 0 {
-        return Err(LocalOutcome::error(format!(
-            "the `find` text does not appear in `{raw_path}`. Read the exact current text with \
-             {KIN_TOOL_PREFIX}get_entity_source before editing, and match it byte for byte."
+        return Err(LocalOutcome::retry_with_bytes(unmatched_find(
+            raw_path, &original, find,
         )));
     }
     if occurrences > 1 && !replace_all {
-        return Err(LocalOutcome::error(format!(
+        return Err(LocalOutcome::retry_with_bytes(format!(
             "the `find` text appears {occurrences} times in `{raw_path}`. Give a longer, unique \
              snippet, or set replace_all to true if every occurrence should change."
         )));
@@ -983,6 +1343,7 @@ pub fn run_write(repo: &Path, arguments: &Value) -> LocalOutcome {
         is_error: false,
         changed: Some(raw_path.to_string()),
         body: Some(content.to_string()),
+        retry_with_bytes: false,
     }
 }
 
@@ -1005,6 +1366,7 @@ pub fn published_create(arguments: &Value) -> LocalOutcome {
         is_error: false,
         changed: Some(raw_path.to_string()),
         body: Some(content.to_string()),
+        retry_with_bytes: false,
     }
 }
 
@@ -1049,6 +1411,19 @@ impl LocalOutcome {
             is_error: true,
             changed: None,
             body: None,
+            retry_with_bytes: false,
+        }
+    }
+
+    /// A refusal the model clears by sending different bytes for the same target.
+    ///
+    /// Only the two byte-matching refusals use this. It is what the repeat guard counts,
+    /// so widening it to every failed change would redirect a run to re-read source over
+    /// a commit repository authority declined, which re-reading does not fix.
+    pub fn retry_with_bytes(message: String) -> Self {
+        LocalOutcome {
+            retry_with_bytes: true,
+            ..LocalOutcome::error(message)
         }
     }
 }

@@ -1158,6 +1158,17 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                     // stays well formed.
                     let guarded = match &route {
                         Route::Kin { tool, .. } => repeat_guard.before(tool, &routed_arguments),
+                        // The belt's replacement tool is the one local call a refusal
+                        // can be about the model's own bytes, and the guard counts those
+                        // per target: a run that keeps sending bytes the file does not
+                        // hold spends its whole budget one refusal at a time otherwise.
+                        Route::Local(LocalTool::Edit) => repeat_guard.before_change(
+                            &call.name,
+                            routed_arguments
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ),
                         _ => repeat::Verdict::Allow,
                     };
                     if guarded != repeat::Verdict::Allow {
@@ -1583,6 +1594,12 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                                     provenance,
                                                 )
                                             };
+                                            // Counted before the trace, so the run record
+                                            // and the guard agree about how many times this
+                                            // target was refused over its own bytes.
+                                            if outcome.retry_with_bytes {
+                                                repeat_guard.record_refusal(&call.name, raw_path);
+                                            }
                                             if let Some(path) = outcome.changed.clone() {
                                                 // With several repositories attached the
                                                 // same relative path exists in more than

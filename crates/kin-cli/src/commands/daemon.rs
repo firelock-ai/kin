@@ -25,14 +25,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::daemon_client::{
-    caller_home_id, fetch_registered_daemons, is_port_open, is_process_alive, process_identity,
-    process_identity_is_current, read_endpoint_owner_record, read_supervisor_owner_record,
-    remove_stale_daemon_files, remove_stale_supervisor_files, repo_daemon_owner_path,
-    repo_daemon_pid_path, repo_daemon_port_path, repo_daemon_recorded_endpoint,
-    retire_stopped_daemon_endpoint, supervisor_owner_path, supervisor_pid_path,
-    supervisor_port_path, supervisor_recorded_endpoint, try_acquire_supervisor_startup_lock_in_dir,
-    DaemonHomeScope, PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon,
-    SupervisorStartupLock,
+    caller_home_id, fetch_registered_daemons, is_port_open, is_process_alive, probe_daemon_port,
+    process_identity, process_identity_is_current, process_runs_a_kin_image,
+    read_endpoint_owner_record, read_supervisor_owner_record, remove_stale_daemon_files,
+    remove_stale_supervisor_files, repo_daemon_owner_path, repo_daemon_pid_path,
+    repo_daemon_port_path, repo_daemon_recorded_endpoint, retire_stopped_daemon_endpoint,
+    supervisor_owner_path, supervisor_pid_path, supervisor_port_path, supervisor_recorded_endpoint,
+    try_acquire_supervisor_startup_lock_in_dir, DaemonHomeScope, DaemonPortProbe,
+    PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon, SupervisorStartupLock,
 };
 
 /// Liveness of a recorded daemon/supervisor endpoint. Pure classification of the
@@ -40,10 +40,17 @@ use crate::daemon_client::{
 /// without a live process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonLiveness {
-    /// Recorded process is alive and its port accepts connections.
+    /// Recorded process is alive and answered on its port.
     Running,
-    /// Recorded process is alive but its port does not accept connections —
-    /// still starting up, or wedged.
+    /// Recorded process is alive and something holds its port, but the
+    /// connection was never accepted. That is what a full accept queue looks
+    /// like from outside: the socket is open and nothing is calling accept.
+    NotAccepting,
+    /// Recorded process is alive, the connection was accepted, and no HTTP
+    /// answer came back.
+    NotAnswering,
+    /// Recorded process is alive but nothing holds its port: still starting
+    /// up, or it lost the socket.
     Unresponsive,
     /// A pid was recorded but that process is not alive: the endpoint files are
     /// stale and should be cleared.
@@ -56,7 +63,13 @@ impl DaemonLiveness {
     fn label(self) -> &'static str {
         match self {
             DaemonLiveness::Running => "running",
-            DaemonLiveness::Unresponsive => "unresponsive (process alive, port closed)",
+            DaemonLiveness::NotAccepting => {
+                "wedged (process alive, socket open, connection not accepted)"
+            }
+            DaemonLiveness::NotAnswering => "wedged (process alive, socket open, no answer)",
+            DaemonLiveness::Unresponsive => {
+                "unresponsive (process alive, nothing listening on the port)"
+            }
             DaemonLiveness::Stale => "stale (recorded process is gone)",
             DaemonLiveness::NotRunning => "not running",
         }
@@ -65,17 +78,45 @@ impl DaemonLiveness {
     fn is_stale(self) -> bool {
         matches!(self, DaemonLiveness::Stale)
     }
+
+    /// Whether the process is alive and this state says the daemon cannot be
+    /// talked to. `kin daemon stop` is the remedy in every one of these, and it
+    /// is the state that decides whether to say so.
+    fn is_wedged(self) -> bool {
+        matches!(
+            self,
+            DaemonLiveness::NotAccepting | DaemonLiveness::NotAnswering
+        )
+    }
 }
 
 /// Classify liveness from the recorded pid and the observed process/port state.
-/// `process_alive` and `port_open` are only meaningful when `pid` is `Some`.
-pub fn classify_liveness(pid: Option<u32>, process_alive: bool, port_open: bool) -> DaemonLiveness {
+///
+/// `process_alive` and `port` are only meaningful when `pid` is `Some`. A
+/// recorded endpoint with no port at all probes as
+/// [`DaemonPortProbe::Closed`], which is the same verdict a refused connect
+/// earns and the same one this returned before the probe could tell them apart.
+pub fn classify_liveness(
+    pid: Option<u32>,
+    process_alive: bool,
+    port: DaemonPortProbe,
+) -> DaemonLiveness {
     match pid {
         None => DaemonLiveness::NotRunning,
         Some(_) if !process_alive => DaemonLiveness::Stale,
-        Some(_) if port_open => DaemonLiveness::Running,
-        Some(_) => DaemonLiveness::Unresponsive,
+        Some(_) => match port {
+            DaemonPortProbe::Answering => DaemonLiveness::Running,
+            DaemonPortProbe::AcceptedNotAnswering => DaemonLiveness::NotAnswering,
+            DaemonPortProbe::OpenNotAccepting => DaemonLiveness::NotAccepting,
+            DaemonPortProbe::Closed => DaemonLiveness::Unresponsive,
+        },
     }
+}
+
+/// Probe a recorded endpoint's port, or report `Closed` when none is recorded.
+fn probe_recorded_port(port: Option<u16>) -> DaemonPortProbe {
+    port.map(probe_daemon_port)
+        .unwrap_or(DaemonPortProbe::Closed)
 }
 
 /// Bounded wait for a stop to complete. The daemon's shutdown-escalation
@@ -116,8 +157,14 @@ const SUPERVISOR_STOP_RESERVE: Duration = Duration::from_secs(10);
 /// as a hang. The budget is therefore derived from the daemon's bound rather
 /// than borrowed from a per-identity constant, and still leaves headroom under
 /// the 60s callers typically allow.
+///
+/// [`ESCALATION_SIGKILL_WAIT`] is in it because a wedged worker is exactly what
+/// `--all` has to survive. The signal escalation below can now spend that on
+/// top of the daemon's own bound, and without room for it here the first wedged
+/// worker would again consume the supervisor's reserve.
 fn stop_all_budget() -> Duration {
     DAEMON_FORCE_EXIT_WORST_CASE
+        .saturating_add(ESCALATION_SIGKILL_WAIT)
         .saturating_add(SUPERVISOR_STOP_RESERVE)
         .max(stop_timeout())
 }
@@ -502,11 +549,247 @@ fn attributed_supervisor_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
     }
 }
 
+// ── escalation ──────────────────────────────────────────────────────────────
+
+/// How long the escalation waits after `SIGTERM` before reaching for
+/// `SIGKILL`.
+///
+/// [`DAEMON_FORCE_EXIT_WORST_CASE`], because that is the daemon's own bound for
+/// a shutdown it has begun. Its signal handler sets the shutdown flag, its
+/// escalation watchdog force-exits about 25s later, and that watchdog flushes
+/// the store on the way out. A shorter wait would `SIGKILL` a daemon that was
+/// about to exit cleanly and throw the flush away. Measured on the recorded
+/// wedge: a hand-sent `kill -TERM` took about twenty seconds to take effect,
+/// inside this window, and the store was correct and complete afterwards.
+const ESCALATION_SIGTERM_WAIT: Duration = DAEMON_FORCE_EXIT_WORST_CASE;
+
+/// How long the escalation waits after `SIGKILL` before reporting the pid as
+/// surviving. `SIGKILL` can be neither handled nor ignored, so this covers only
+/// the kernel tearing down an address space, which for a daemon holding a
+/// multi-gigabyte graph is not instant.
+const ESCALATION_SIGKILL_WAIT: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for a signalled process to disappear. The same
+/// 50ms the cooperative and graceful waits use.
+const ESCALATION_POLL: Duration = Duration::from_millis(50);
+
+/// Whether the recorded incarnation is gone, polled until `window` expires.
+#[cfg(unix)]
+fn wait_for_recorded_exit(identity: &ProcessIdentity, window: Duration) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        if matches!(process_identity_is_current(identity), Ok(false)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return matches!(process_identity_is_current(identity), Ok(false));
+        }
+        std::thread::sleep(ESCALATION_POLL);
+    }
+}
+
+/// Deliver one signal to a recorded daemon pid.
+///
+/// `Ok(true)` delivered, `Ok(false)` the process was already gone, `Err` the
+/// signal could not be delivered at all.
+#[cfg(unix)]
+fn signal_recorded_pid(pid: u32, signal: libc::c_int) -> std::io::Result<bool> {
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Signal the pid the store recorded, after proving twice that it is safe.
+///
+/// `kin daemon stop` names itself in the error a wedged daemon produces: "`kin
+/// daemon stop` ends a wedged one". On macOS it could not, by construction. The
+/// stop is an authenticated `POST /shutdown` to the daemon's own port
+/// ([`cooperative_shutdown_request`]), so a daemon that has stopped answering
+/// HTTP is exactly the daemon that cannot answer the request meant to end it.
+/// The recorded incident got `stop request failed: connection timed out` and
+/// left a daemon running, holding the repository's singleton, with no supported
+/// way to end it.
+///
+/// The request stays the first move, because a daemon that can answer should
+/// shut itself down and flush. A signal is the second, and two independent
+/// proofs gate it, because a signal is not recoverable:
+///
+/// * the incarnation the endpoint recorded is still the live one, which is what
+///   keeps PID reuse from redirecting this, and
+/// * that process is running a Kin image, read from the OS rather than from the
+///   record that named the pid.
+///
+/// Either proof failing ends the escalation instead of widening it. An
+/// unreadable image is "do not signal", never "not Kin".
+///
+/// `None` means the escalation did not run and the caller keeps its own
+/// outcome.
+///
+/// The two waits are arguments rather than reads of the constants so a test can
+/// drive the whole `SIGTERM` then `SIGKILL` ladder in milliseconds. Production
+/// has exactly one caller and it passes the constants.
+#[cfg(unix)]
+fn escalate_to_recorded_pid(
+    identity: &ProcessIdentity,
+    sigterm_wait: Duration,
+    sigkill_wait: Duration,
+    steps: &mut Vec<String>,
+) -> Option<StopOutcome> {
+    let pid = identity.pid();
+    match process_identity_is_current(identity) {
+        Ok(false) => {
+            steps.push(format!(
+                "pid {pid} no longer names the recorded daemon; nothing to signal"
+            ));
+            return Some(StopOutcome::NotRunning);
+        }
+        Err(error) => {
+            steps.push(format!(
+                "did not signal pid {pid}: its process incarnation could not be verified ({error})"
+            ));
+            return None;
+        }
+        Ok(true) => {}
+    }
+
+    match process_runs_a_kin_image(pid) {
+        Some(true) => {}
+        Some(false) => {
+            steps.push(format!(
+                "did not signal pid {pid}: it is not running a Kin image"
+            ));
+            return None;
+        }
+        None => {
+            steps.push(format!(
+                "did not signal pid {pid}: its executable could not be read"
+            ));
+            return None;
+        }
+    }
+
+    match signal_recorded_pid(pid, libc::SIGTERM) {
+        Ok(true) => steps.push(format!("sent SIGTERM to the recorded daemon pid {pid}")),
+        Ok(false) => {
+            steps.push(format!("pid {pid} was already gone"));
+            return Some(StopOutcome::NotRunning);
+        }
+        Err(error) => {
+            steps.push(format!("SIGTERM to pid {pid} failed: {error}"));
+            return None;
+        }
+    }
+    if wait_for_recorded_exit(identity, sigterm_wait) {
+        steps.push(format!("pid {pid} exited after SIGTERM"));
+        return Some(StopOutcome::Stopped);
+    }
+    steps.push(format!(
+        "pid {pid} was still alive {:.1}s after SIGTERM",
+        sigterm_wait.as_secs_f64()
+    ));
+
+    // Prove the incarnation again. The SIGTERM wait is long enough for the
+    // daemon to exit and the kernel to hand its number to something else, and
+    // `SIGKILL` is the one signal nothing can decline.
+    match process_identity_is_current(identity) {
+        Ok(false) => {
+            steps.push(format!("pid {pid} no longer names the recorded daemon"));
+            return Some(StopOutcome::Stopped);
+        }
+        Err(error) => {
+            steps.push(format!(
+                "did not send SIGKILL to pid {pid}: its incarnation could not be re-verified ({error})"
+            ));
+            return None;
+        }
+        Ok(true) => {}
+    }
+    match signal_recorded_pid(pid, libc::SIGKILL) {
+        Ok(true) => steps.push(format!("sent SIGKILL to the recorded daemon pid {pid}")),
+        Ok(false) => {
+            steps.push(format!("pid {pid} was already gone"));
+            return Some(StopOutcome::Stopped);
+        }
+        Err(error) => {
+            steps.push(format!("SIGKILL to pid {pid} failed: {error}"));
+            return None;
+        }
+    }
+    if wait_for_recorded_exit(identity, sigkill_wait) {
+        steps.push(format!("pid {pid} exited after SIGKILL"));
+        Some(StopOutcome::Stopped)
+    } else {
+        steps.push(format!(
+            "pid {pid} survived SIGKILL for {:.1}s",
+            sigkill_wait.as_secs_f64()
+        ));
+        Some(StopOutcome::Timeout)
+    }
+}
+
+/// Escalate a stop the daemon's own endpoint could not complete, and say what
+/// was done.
+///
+/// Windows has nothing to escalate to: its stop is already `TerminateProcess`
+/// through a pinned handle.
+fn escalate_if_unstopped(
+    identity: &ProcessIdentity,
+    outcome: StopOutcome,
+    steps: &mut Vec<String>,
+) -> StopOutcome {
+    if outcome.is_success() {
+        return outcome;
+    }
+    #[cfg(unix)]
+    {
+        match &outcome {
+            StopOutcome::SignalFailed(error) => steps.push(format!(
+                "the stop request did not reach the daemon: {error}"
+            )),
+            StopOutcome::Timeout => steps.push(format!(
+                "the daemon took the stop request and did not exit within {}s",
+                stop_timeout().as_secs()
+            )),
+            _ => {}
+        }
+        if let Some(escalated) = escalate_to_recorded_pid(
+            identity,
+            ESCALATION_SIGTERM_WAIT,
+            ESCALATION_SIGKILL_WAIT,
+            steps,
+        ) {
+            return escalated;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (identity, &steps);
+    }
+    outcome
+}
+
+/// Stop the supervisor and escalate to its recorded pid if the request fails.
+fn stop_supervisor_attributed(
+    identity: &ProcessIdentity,
+    wait: Duration,
+    steps: &mut Vec<String>,
+) -> StopOutcome {
+    let outcome = stop_supervisor_identity(identity, wait);
+    escalate_if_unstopped(identity, outcome, steps)
+}
+
 fn stop_worker_at(
     kin_root: &Path,
     pid: u32,
     wait: Duration,
     legacy_install_root: Option<&Path>,
+    steps: &mut Vec<String>,
 ) -> Result<StopOutcome> {
     let identity = match attributed_worker_identity(kin_root, pid) {
         Ok(identity) => identity,
@@ -527,7 +810,10 @@ fn stop_worker_at(
         Err(error) => return Err(error),
     };
     Ok(match identity {
-        Some(identity) => stop_worker_identity(kin_root, &identity, wait),
+        Some(identity) => {
+            let outcome = stop_worker_identity(kin_root, &identity, wait);
+            escalate_if_unstopped(&identity, outcome, steps)
+        }
         None => StopOutcome::NotRunning,
     })
 }
@@ -560,10 +846,11 @@ fn stop_supervisor_pid(
     pid: u32,
     wait: Duration,
     legacy_install_root: Option<&Path>,
+    steps: &mut Vec<String>,
 ) -> Result<StopOutcome> {
     Ok(
         match supervisor_identity_for_stop(pid, legacy_install_root)? {
-            Some(identity) => stop_supervisor_identity(&identity, wait),
+            Some(identity) => stop_supervisor_attributed(&identity, wait, steps),
             None => StopOutcome::NotRunning,
         },
     )
@@ -619,8 +906,8 @@ fn canonical(path: &Path) -> String {
 pub async fn status(json: bool) -> Result<()> {
     let (sup_pid, sup_port) = supervisor_recorded_endpoint();
     let sup_alive = sup_pid.map(is_process_alive).unwrap_or(false);
-    let sup_port_open = sup_port.map(is_port_open).unwrap_or(false);
-    let sup_state = classify_liveness(sup_pid, sup_alive, sup_port_open);
+    let sup_port_probe = probe_recorded_port(sup_port);
+    let sup_state = classify_liveness(sup_pid, sup_alive, sup_port_probe);
 
     // The per-repo worker list comes from the supervisor's `/daemons` registry —
     // the same surface `kin registry daemons` reads. Only reachable when the
@@ -652,8 +939,7 @@ pub async fn status(json: bool) -> Result<()> {
             .iter()
             .map(|d| {
                 let alive = is_process_alive(d.pid);
-                let port_open = is_port_open(d.port);
-                let state = classify_liveness(Some(d.pid), alive, port_open);
+                let state = classify_liveness(Some(d.pid), alive, probe_daemon_port(d.port));
                 serde_json::json!({
                     "repo_id": d.repo_id,
                     "display_name": d.display_name,
@@ -725,8 +1011,7 @@ pub async fn status(json: bool) -> Result<()> {
         println!("Repo daemons ({}):", daemons.len());
         for daemon in &daemons {
             let alive = is_process_alive(daemon.pid);
-            let port_open = is_port_open(daemon.port);
-            let state = classify_liveness(Some(daemon.pid), alive, port_open);
+            let state = classify_liveness(Some(daemon.pid), alive, probe_daemon_port(daemon.port));
             let label = if daemon.display_name.trim().is_empty() {
                 daemon.repo_id.clone()
             } else {
@@ -764,6 +1049,12 @@ pub async fn status(json: bool) -> Result<()> {
         if current.state.is_stale() {
             println!("  note: endpoint files are stale; `kin daemon stop` will clear them");
         }
+        if current.state.is_wedged() {
+            println!(
+                "  note: the process is alive and still holds its socket but is not serving; \
+                 `kin daemon stop` ends it and clears the endpoint"
+            );
+        }
     }
 
     Ok(())
@@ -789,8 +1080,7 @@ fn current_repo_status() -> Option<CurrentRepoStatus> {
     let working_dir = kin_root.parent().unwrap_or(kin_root);
     let (pid, port) = repo_daemon_recorded_endpoint(kin_root);
     let alive = pid.map(is_process_alive).unwrap_or(false);
-    let port_open = port.map(is_port_open).unwrap_or(false);
-    let state = classify_liveness(pid, alive, port_open);
+    let state = classify_liveness(pid, alive, probe_recorded_port(port));
     let serving_since_unix = kin_daemon_spawn::read_serving_daemon(kin_root)
         .filter(|serving| Some(serving.pid) == pid)
         .map(|serving| serving.at_unix);
@@ -822,7 +1112,8 @@ fn current_repo_line(current: &CurrentRepoStatus, supervised: bool) -> String {
     if !matches!(
         current.state,
         DaemonLiveness::Running | DaemonLiveness::Unresponsive
-    ) {
+    ) && !current.state.is_wedged()
+    {
         return line;
     }
     let mut facts = Vec::new();
@@ -1215,6 +1506,13 @@ struct StopReport {
     /// daemon as far as any later reader is concerned: `status`, autostart, and
     /// every other surface read that file to decide who owns the repo.
     preserved_endpoint: Option<PreservedDaemonEndpoint>,
+    /// What the stop did beyond delivering the request, in order.
+    ///
+    /// Empty for a healthy stop, which needs no account of itself. It fills
+    /// when the request could not end the daemon and the escalation took over,
+    /// and then it is the only record of which signal ended the process and
+    /// whether the endpoint was cleared, so it is reported rather than logged.
+    steps: Vec<String>,
 }
 
 /// Retire the endpoint of a worker whose stop attempt is over, and hand back the
@@ -1226,8 +1524,9 @@ struct StopReport {
 fn retire_worker_endpoint(
     kin_root: &Path,
     outcome: &StopOutcome,
+    steps: &mut Vec<String>,
 ) -> Option<PreservedDaemonEndpoint> {
-    match outcome {
+    let preserved = match outcome {
         StopOutcome::Stopped => retire_stopped_daemon_endpoint(kin_root)
             .preserved()
             .cloned(),
@@ -1235,8 +1534,18 @@ fn retire_worker_endpoint(
             let _ = remove_stale_daemon_files(kin_root);
             None
         }
-        StopOutcome::Timeout | StopOutcome::SignalFailed(_) => None,
+        StopOutcome::Timeout | StopOutcome::SignalFailed(_) => return None,
+    };
+    // Only an escalated stop reports this. A healthy one needs no account of
+    // itself, and a step line on every stop would bury the one case a reader
+    // has to follow.
+    if !steps.is_empty() {
+        steps.push(match &preserved {
+            None => "cleared the recorded pid and port".to_string(),
+            Some(survivor) => format!("the recorded endpoint survived: {survivor}"),
+        });
     }
+    preserved
 }
 
 /// Stop this repository's worker daemon, and only this repository's.
@@ -1294,14 +1603,16 @@ async fn stop_current_repo(json: bool, quiet: bool, kin_root: Option<&Path>) -> 
         return Ok(());
     };
 
-    let outcome = stop_worker_at(&kin_root, pid, stop_timeout(), None)?;
-    let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
+    let mut steps = Vec::new();
+    let outcome = stop_worker_at(&kin_root, pid, stop_timeout(), None, &mut steps)?;
+    let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome, &mut steps);
     let report = vec![StopReport {
         kind: "repo-daemon",
         label: label.clone(),
         pid,
         outcome,
         preserved_endpoint,
+        steps,
     }];
     if quiet {
         return Ok(());
@@ -1424,13 +1735,16 @@ async fn stop_all_inner(
     // the registry snapshot and supervisor exit.
     if uninstall_root.is_some() {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_supervisor_identity(identity, remaining_budget(deadline));
+            let mut steps = Vec::new();
+            let outcome =
+                stop_supervisor_attributed(identity, remaining_budget(deadline), &mut steps);
             reports.push(StopReport {
                 kind: "supervisor",
                 label: "supervisor".to_string(),
                 pid,
                 outcome,
                 preserved_endpoint: None,
+                steps,
             });
         }
     }
@@ -1446,19 +1760,22 @@ async fn stop_all_inner(
     for daemon in daemons {
         let label = daemon_label(&daemon);
         let kin_root = Path::new(&daemon.repo_root).join(".kin");
+        let mut steps = Vec::new();
         let outcome = stop_worker_at(
             &kin_root,
             daemon.pid,
             remaining_budget(worker_deadline),
             uninstall_root,
+            &mut steps,
         )?;
-        let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
+        let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome, &mut steps);
         reports.push(StopReport {
             kind: "repo-daemon",
             label,
             pid: daemon.pid,
             outcome,
             preserved_endpoint,
+            steps,
         });
     }
 
@@ -1479,19 +1796,23 @@ async fn stop_all_inner(
                 );
                 if may_stop && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
+                    let mut steps = Vec::new();
                     let outcome = stop_worker_at(
                         &kin_root,
                         pid,
                         remaining_budget(worker_deadline),
                         uninstall_root,
+                        &mut steps,
                     )?;
-                    let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
+                    let preserved_endpoint =
+                        retire_worker_endpoint(&kin_root, &outcome, &mut steps);
                     reports.push(StopReport {
                         kind: "repo-daemon",
                         label: repo_label(&working_dir),
                         pid,
                         outcome,
                         preserved_endpoint,
+                        steps,
                     });
                 }
             }
@@ -1508,7 +1829,9 @@ async fn stop_all_inner(
     // workers first, supervisor last. Full uninstall already stopped it above.
     if uninstall_root.is_none() && !supervisor_retained {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_supervisor_identity(identity, remaining_budget(deadline));
+            let mut steps = Vec::new();
+            let outcome =
+                stop_supervisor_attributed(identity, remaining_budget(deadline), &mut steps);
             if outcome.is_success() {
                 remove_stale_supervisor_files();
             }
@@ -1518,6 +1841,7 @@ async fn stop_all_inner(
                 pid,
                 outcome,
                 preserved_endpoint: None,
+                steps,
             });
         }
     }
@@ -1815,26 +2139,32 @@ fn stop_install_owned_daemons(
             match process.kind {
                 ManagedDaemonKind::Worker { repo_root } => {
                     let kin_root = repo_root.join(".kin");
+                    let mut steps = Vec::new();
                     let outcome = stop_worker_at(
                         &kin_root,
                         process.pid,
                         remaining_budget(deadline),
                         Some(install_root),
+                        &mut steps,
                     )?;
-                    let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
+                    let preserved_endpoint =
+                        retire_worker_endpoint(&kin_root, &outcome, &mut steps);
                     reports.push(StopReport {
                         kind: "repo-daemon",
                         label: repo_label(&repo_root),
                         pid: process.pid,
                         outcome,
                         preserved_endpoint,
+                        steps,
                     });
                 }
                 ManagedDaemonKind::Supervisor => {
+                    let mut steps = Vec::new();
                     let outcome = stop_supervisor_pid(
                         process.pid,
                         remaining_budget(deadline),
                         Some(install_root),
+                        &mut steps,
                     )?;
                     reports.push(StopReport {
                         kind: "supervisor",
@@ -1842,6 +2172,7 @@ fn stop_install_owned_daemons(
                         pid: process.pid,
                         outcome,
                         preserved_endpoint: None,
+                        steps,
                     });
                 }
                 ManagedDaemonKind::Unknown => bail!(
@@ -1899,6 +2230,9 @@ fn finish_stop_with_output(
                     "pid": r.pid,
                     "result": r.outcome.detail(),
                 });
+                if !r.steps.is_empty() {
+                    entry["steps"] = serde_json::json!(r.steps);
+                }
                 if let Some(preserved) = &r.preserved_endpoint {
                     entry["preserved_endpoint"] = serde_json::json!({
                         "pid_path": preserved.pid_path().display().to_string(),
@@ -1935,6 +2269,9 @@ fn finish_stop_with_output(
                 }
             };
             println!("  {line}");
+            for step in &r.steps {
+                println!("    step: {step}");
+            }
         }
         for r in reports {
             if let Some(preserved) = &r.preserved_endpoint {
@@ -1998,6 +2335,7 @@ mod tests {
             pid: 4242,
             outcome: StopOutcome::Stopped,
             preserved_endpoint: preserved,
+            steps: Vec::new(),
         }
     }
 
@@ -2100,33 +2438,98 @@ mod tests {
     fn classify_liveness_covers_every_state() {
         // No pid recorded → nothing is running, regardless of the probes.
         assert_eq!(
-            classify_liveness(None, false, false),
+            classify_liveness(None, false, DaemonPortProbe::Closed),
             DaemonLiveness::NotRunning
         );
         assert_eq!(
-            classify_liveness(None, true, true),
+            classify_liveness(None, true, DaemonPortProbe::Answering),
             DaemonLiveness::NotRunning
         );
         // Recorded pid, dead process → stale files.
         assert_eq!(
-            classify_liveness(Some(4219), false, false),
+            classify_liveness(Some(4219), false, DaemonPortProbe::Closed),
             DaemonLiveness::Stale
         );
         // A dead process is stale even if some unrelated process holds the port.
         assert_eq!(
-            classify_liveness(Some(4219), false, true),
+            classify_liveness(Some(4219), false, DaemonPortProbe::Answering),
             DaemonLiveness::Stale
         );
-        // Alive but port closed → unresponsive (starting up or wedged).
+        // Alive and nothing on the port → unresponsive (starting up, or it
+        // lost the socket).
         assert_eq!(
-            classify_liveness(Some(4219), true, false),
+            classify_liveness(Some(4219), true, DaemonPortProbe::Closed),
             DaemonLiveness::Unresponsive
         );
         // Alive and serving → running.
         assert_eq!(
-            classify_liveness(Some(4219), true, true),
+            classify_liveness(Some(4219), true, DaemonPortProbe::Answering),
             DaemonLiveness::Running
         );
+    }
+
+    /// The incident this split exists for: a daemon whose process is alive and
+    /// whose socket `lsof` shows in LISTEN, reported as "port closed".
+    ///
+    /// Both wedge shapes are alive with the port held, and neither may collapse
+    /// into the verdict that says nothing is there. `Unresponsive` keeps its own
+    /// meaning: the connect was refused.
+    ///
+    /// Falsify by mapping either wedge arm back onto `Unresponsive`: the label
+    /// assertions below go red because they would claim the port is not
+    /// listening.
+    #[test]
+    fn a_listening_daemon_that_never_answers_is_not_reported_as_port_closed() {
+        let not_accepting = classify_liveness(Some(99108), true, DaemonPortProbe::OpenNotAccepting);
+        let not_answering =
+            classify_liveness(Some(99108), true, DaemonPortProbe::AcceptedNotAnswering);
+
+        assert_eq!(not_accepting, DaemonLiveness::NotAccepting);
+        assert_eq!(not_answering, DaemonLiveness::NotAnswering);
+        assert_ne!(not_accepting, DaemonLiveness::Unresponsive);
+        assert_ne!(not_answering, DaemonLiveness::Unresponsive);
+
+        for state in [not_accepting, not_answering] {
+            let label = state.label();
+            assert!(
+                label.contains("socket open"),
+                "a held socket must be reported as open: {label}"
+            );
+            assert!(
+                !label.contains("port closed") && !label.contains("nothing listening"),
+                "a held socket must never be reported as closed: {label}"
+            );
+            assert!(state.is_wedged(), "{label}");
+        }
+
+        // And the one state that does mean nothing holds the port still says so.
+        let refused = classify_liveness(Some(99108), true, DaemonPortProbe::Closed);
+        assert!(
+            refused.label().contains("nothing listening on the port"),
+            "{}",
+            refused.label()
+        );
+        assert!(!refused.is_wedged(), "{}", refused.label());
+    }
+
+    /// A wedged daemon's line still names the pid and port, because those are
+    /// what the operator acts on.
+    #[test]
+    fn a_wedged_daemon_line_names_the_pid_and_port_to_act_on() {
+        let current = CurrentRepoStatus {
+            label: "cli90".to_string(),
+            repo_root: "/work/cli90".to_string(),
+            state: DaemonLiveness::NotAccepting,
+            pid: Some(99108),
+            port: Some(63357),
+            pid_file: "/work/cli90/.kin/daemon.pid".to_string(),
+            port_file: "/work/cli90/.kin/daemon.port".to_string(),
+            serving_since_unix: None,
+        };
+        let line = current_repo_line(&current, false);
+        assert!(line.contains("pid 99108"), "{line}");
+        assert!(line.contains("port 63357"), "{line}");
+        assert!(line.contains("socket open"), "{line}");
     }
 
     /// A daemon the supervisor does not list is still named, with the pair an
@@ -2184,6 +2587,8 @@ mod tests {
     fn liveness_labels_are_distinct_and_stable() {
         let states = [
             DaemonLiveness::Running,
+            DaemonLiveness::NotAccepting,
+            DaemonLiveness::NotAnswering,
             DaemonLiveness::Unresponsive,
             DaemonLiveness::Stale,
             DaemonLiveness::NotRunning,
@@ -2382,6 +2787,212 @@ mod tests {
              its parent has not reaped it"
         );
         reaped.expect("reap the stand-in daemon");
+    }
+
+    /// Env var that turns this test binary into the stand-in daemon the
+    /// escalation tests signal.
+    ///
+    /// It has to be THIS binary. The escalation refuses to signal a pid whose
+    /// executable is not a Kin image, and the test harness is
+    /// `target/debug/deps/kin_cli-<hash>`, which is one. A `sleep` child is the
+    /// control in the refusal test below, not the subject here.
+    #[cfg(unix)]
+    const ESCALATION_STANDIN: &str = "KIN_TEST_ESCALATION_STANDIN";
+
+    /// The child half of the escalation tests. Does nothing until signalled.
+    ///
+    /// `ignore-sigterm` models the case the escalation exists to end: a process
+    /// that takes the polite signal and keeps running.
+    #[cfg(unix)]
+    #[test]
+    fn escalation_standin_daemon_worker() {
+        let Some(mode) = std::env::var_os(ESCALATION_STANDIN) else {
+            return;
+        };
+        if mode == "ignore-sigterm" {
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    fn spawn_escalation_standin(mode: &str) -> std::process::Child {
+        std::process::Command::new(
+            std::env::current_exe().expect("read this test binary's own path"),
+        )
+        .arg("--exact")
+        .arg("commands::daemon::tests::escalation_standin_daemon_worker")
+        .env(ESCALATION_STANDIN, mode)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the stand-in daemon")
+    }
+
+    /// The defect KIN-4 recorded: a stop whose request cannot reach the daemon
+    /// has to end it anyway.
+    ///
+    /// On macOS the stop is an authenticated `POST /shutdown` to the daemon's
+    /// own port, so a daemon that has stopped answering HTTP is exactly the one
+    /// that cannot answer the request meant to end it. The recorded incident
+    /// got `stop request failed: connection timed out`, `kin daemon stop`
+    /// reported failure, and the daemon kept running and kept the repository's
+    /// singleton. The error message it printed named `kin daemon stop` as the
+    /// remedy for a wedged daemon.
+    ///
+    /// Falsify by deleting the `escalate_to_recorded_pid` call in
+    /// `escalate_if_unstopped`: the outcome comes back `SignalFailed`, the
+    /// stand-in is still alive, and both assertions go red.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_request_that_never_arrives_still_ends_the_recorded_daemon() {
+        let mut child = spawn_escalation_standin("plain");
+        let identity = process_identity(child.id())
+            .expect("read the stand-in daemon's birth identity")
+            .expect("a running stand-in daemon has an identity");
+
+        let mut steps = Vec::new();
+        let outcome = escalate_if_unstopped(
+            &identity,
+            StopOutcome::SignalFailed("connection timed out".to_string()),
+            &mut steps,
+        );
+        // Defensive, so a regression fails on the assertion below rather than
+        // blocking for the whole stand-in sleep. A daemon the escalation ended
+        // is already a corpse and this is a no-op on it.
+        let _ = child.kill();
+        let reaped = child.wait();
+
+        assert_eq!(
+            outcome,
+            StopOutcome::Stopped,
+            "a stop the endpoint could not deliver must still end the daemon: {steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("the stop request did not reach the daemon")),
+            "the report must say why it escalated: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|step| step.contains("sent SIGTERM")),
+            "the report must name the signal it sent: {steps:?}"
+        );
+        reaped.expect("reap the stand-in daemon");
+    }
+
+    /// A daemon that takes SIGTERM and keeps running is ended by SIGKILL, and
+    /// the ladder is reported rung by rung.
+    ///
+    /// The waits are arguments so this runs in under a second. Production
+    /// passes `ESCALATION_SIGTERM_WAIT`, which is the daemon's own force-exit
+    /// bound, so a daemon that is about to exit cleanly is never cut short.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_that_ignores_sigterm_is_ended_by_sigkill() {
+        let mut child = spawn_escalation_standin("ignore-sigterm");
+        let identity = process_identity(child.id())
+            .expect("read the stand-in daemon's birth identity")
+            .expect("a running stand-in daemon has an identity");
+        // The child installs its SIGTERM disposition after start-up, so give it
+        // a moment or the first signal lands on the default disposition and
+        // this proves nothing.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut steps = Vec::new();
+        let outcome = escalate_to_recorded_pid(
+            &identity,
+            Duration::from_millis(400),
+            Duration::from_secs(5),
+            &mut steps,
+        );
+        let _ = child.kill();
+        let reaped = child.wait();
+
+        assert_eq!(
+            outcome,
+            Some(StopOutcome::Stopped),
+            "SIGKILL must end a daemon that ignored SIGTERM: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|step| step.contains("still alive")),
+            "the report must say SIGTERM did not work: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|step| step.contains("sent SIGKILL")),
+            "the report must name the signal that did: {steps:?}"
+        );
+        reaped.expect("reap the stand-in daemon");
+    }
+
+    /// The guard on the whole escalation: a recorded pid that is not running a
+    /// Kin image is never signalled.
+    ///
+    /// A signal is not recoverable, so the proof that this pid is ours is read
+    /// from the OS rather than from the record that named it. `sleep` is a live
+    /// process with a real incarnation and the wrong executable, which is the
+    /// exact shape of a recorded pid the kernel has since handed to someone
+    /// else.
+    ///
+    /// Falsify by dropping the `process_runs_a_kin_image` check: the outcome
+    /// becomes `Stopped` and the liveness assertion goes red because the
+    /// escalation killed a process that was not a daemon.
+    #[cfg(unix)]
+    #[test]
+    fn the_escalation_never_signals_a_pid_that_is_not_a_kin_process() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .spawn()
+            .expect("spawn a non-Kin stand-in");
+        let identity = process_identity(child.id())
+            .expect("read the stand-in's birth identity")
+            .expect("a running stand-in has an identity");
+
+        let mut steps = Vec::new();
+        let outcome = escalate_if_unstopped(
+            &identity,
+            StopOutcome::SignalFailed("connection timed out".to_string()),
+            &mut steps,
+        );
+
+        // Liveness first, while the stand-in is still this test's to observe.
+        let still_alive = process_identity_is_current(&identity);
+        child.kill().expect("clean up the non-Kin stand-in");
+        child.wait().expect("reap the non-Kin stand-in");
+
+        assert!(
+            matches!(still_alive, Ok(true)),
+            "a process that is not a Kin daemon must be left alone: {steps:?}"
+        );
+        assert_eq!(
+            outcome,
+            StopOutcome::SignalFailed("connection timed out".to_string()),
+            "the caller's own outcome must survive a refused escalation: {steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("did not signal") && step.contains("Kin image")),
+            "the report must say why it refused: {steps:?}"
+        );
+    }
+
+    /// A stop that worked is never escalated, and reports no steps.
+    #[test]
+    fn a_successful_stop_is_never_escalated() {
+        let identity = process_identity(std::process::id())
+            .expect("read this process's identity")
+            .expect("this process has an identity");
+        for outcome in [StopOutcome::Stopped, StopOutcome::NotRunning] {
+            let mut steps = Vec::new();
+            let after = escalate_if_unstopped(&identity, outcome.clone(), &mut steps);
+            assert_eq!(after, outcome);
+            assert!(steps.is_empty(), "{steps:?}");
+        }
     }
 
     #[cfg(windows)]

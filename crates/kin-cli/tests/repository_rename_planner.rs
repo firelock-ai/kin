@@ -598,10 +598,12 @@ struct LanguageFixture {
     /// coverage it does not have.
     emits_module_entity_per_file: bool,
     /// Whether this language's adapter records a call site, so its `Calls`
-    /// evidence carries a `source_span` (FIR-1825). The planner does not read
-    /// spans, so its behavior below is the same either way; this keeps the
-    /// fixture honest about what the linker actually produced instead of
-    /// asserting one blanket answer for every language.
+    /// evidence carries a `source_span`. The planner does not read spans, so
+    /// its behavior below is the same either way; this keeps the fixture honest
+    /// about what the linker actually produced instead of asserting one blanket
+    /// answer for every language. Every language in this table records one now,
+    /// and the `false` branch stays because the per-language census in
+    /// `kin-index` still names adapters that do not.
     records_call_sites: bool,
 }
 
@@ -620,7 +622,9 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_source: "pub fn caller() -> u32 { target() + target() }\n",
         has_named_import: false,
         emits_module_entity_per_file: true,
-        records_call_sites: false,
+        // Rust records the call expression now, and the call run inside a
+        // macro body with it.
+        records_call_sites: true,
     },
     LanguageFixture {
         name: "TypeScript",
@@ -660,9 +664,6 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_source: "package main\n\nfunc caller() int { return target() + target() }\n",
         has_named_import: false,
         emits_module_entity_per_file: true,
-        // Go records the call expression now. Rust, Java, C and C++ below are
-        // still false, and this census is what says so: each is the same gap in
-        // its own adapter, and flipping one of them is what proves it closed.
         records_call_sites: true,
     },
     LanguageFixture {
@@ -673,7 +674,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_source: "class Caller { int caller() { return target() + target(); } }\n",
         has_named_import: false,
         emits_module_entity_per_file: true,
-        records_call_sites: false,
+        records_call_sites: true,
     },
     LanguageFixture {
         name: "C",
@@ -683,7 +684,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_source: "int caller(void) { return target() + target(); }\n",
         has_named_import: false,
         emits_module_entity_per_file: true,
-        records_call_sites: false,
+        records_call_sites: true,
     },
     LanguageFixture {
         name: "Cpp",
@@ -693,7 +694,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_source: "int caller() { return target() + target(); }\n",
         has_named_import: false,
         emits_module_entity_per_file: true,
-        records_call_sites: false,
+        records_call_sites: true,
     },
 ];
 

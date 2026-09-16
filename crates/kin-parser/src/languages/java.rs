@@ -453,7 +453,11 @@ fn extract_calls_from_body(
                 let method_name = name_node.utf8_text(source).unwrap_or("");
                 if !method_name.is_empty() {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The invocation itself, so a reference row can report
+                        // the line the call is written on. Without it the
+                        // linker has no span to store and every consuming
+                        // surface reports the edge as having no evidence span.
+                        site: Some(crate::adapter::site_from_node(&child)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,

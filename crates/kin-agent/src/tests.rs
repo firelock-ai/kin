@@ -975,6 +975,280 @@ fn edit_file_refuses_a_find_that_is_not_present() {
     );
     assert!(outcome.is_error);
     assert!(outcome.text.contains("does not appear"), "{}", outcome.text);
+    // The refusal the model can act on is the one the guard counts.
+    assert!(outcome.retry_with_bytes, "{}", outcome.text);
+}
+
+#[test]
+fn a_labelled_belt_names_its_own_mutate_prefix_in_the_hint_and_the_tool_text() {
+    // With several repositories attached each server's tools carry a label, so
+    // `mcp__kin__kin_mutate` is a name nothing on this belt answers to. A hint that used
+    // it, or dropped the prefix entirely, would send the model at a tool that does not
+    // exist, which is the same dead end as no hint at all.
+    let belt = Belt::with_file_tools(vec![kin_tool(0, "kin_mutate", Some("cli90"))]);
+    let Route::Refused(_) = belt.route("bash") else {
+        panic!("an off-belt tool is refused");
+    };
+    let pure = Belt::pure_kin(vec![kin_tool(0, "kin_mutate", Some("cli90"))]);
+    let Route::Refused(refusal) = pure.route("edit_file") else {
+        panic!("edit_file must be refused on a pure Kin belt");
+    };
+    assert!(
+        refusal.contains("`mcp__kin_cli90__kin_mutate`"),
+        "the hint must name a tool this belt actually carries: {refusal}"
+    );
+
+    let served = belt.to_specs(None);
+    let edit = served
+        .iter()
+        .find(|spec| spec["function"]["name"] == "edit_file")
+        .expect("the belt carries the local replacement tool");
+    let description = edit["function"]["description"].as_str().unwrap();
+    assert!(
+        description.contains("`mcp__kin_cli90__kin_mutate`"),
+        "the tool text must steer at a tool this belt carries: {description}"
+    );
+    assert!(
+        description.contains("\"verb\": \"update\""),
+        "the tool text must show the operation shape: {description}"
+    );
+}
+
+/// The bytes between the refusal's markers, which is what a model re-issues with.
+fn quoted_bytes(refusal: &str) -> &str {
+    let (_, after) = refusal
+        .split_once("<<<KIN-EXACT\n")
+        .unwrap_or_else(|| panic!("the refusal quotes the file's bytes: {refusal}"));
+    let (bytes, _) = after
+        .split_once("\n>>>KIN-EXACT")
+        .unwrap_or_else(|| panic!("the quote is closed: {refusal}"));
+    bytes
+}
+
+#[test]
+fn an_unmatched_find_is_answered_with_the_file_s_exact_bytes_and_the_reason() {
+    // The measured failure, byte for byte. `qwen/qwen3-coder-next` read this function
+    // through get_entity_source, which returns source inside a JSON result, and sent the
+    // escaped form straight back as `find`: 26 bytes opening with a literal backslash and
+    // a `t` where the file holds one tab.
+    let dir = tempfile::tempdir().unwrap();
+    let file = "func remoteURL(repo *api.Repository, protocol string) (string, error) {\n\
+                \tif protocol != \"ssh\" {\n\
+                \t\treturn ghrepo.FormatRemoteURL(repo, protocol), nil\n\
+                \t}\n";
+    std::fs::write(dir.path().join("clone.go"), file).unwrap();
+    let sent = "\\tif protocol != \\\"ssh\\\" {";
+    assert_eq!(sent.len(), 26, "the measured call carried 26 bytes");
+
+    let outcome = belt::run_edit(
+        dir.path(),
+        &json!({
+            "path": "clone.go",
+            "find": sent,
+            "replace": "\\tif strings.ToLower(protocol) != \\\"ssh\\\" {",
+        }),
+    );
+    assert!(outcome.is_error);
+    assert!(outcome.retry_with_bytes);
+
+    // It names the cause rather than only the failure.
+    assert!(
+        outcome.text.contains("escape sequences literal"),
+        "{}",
+        outcome.text
+    );
+    // It names where, so the model can join this to the source it already read.
+    assert!(outcome.text.contains("at line 2 "), "{}", outcome.text);
+    // It carries the file's exact current bytes, tab and plain quotes included.
+    assert_eq!(quoted_bytes(&outcome.text), "\tif protocol != \"ssh\" {");
+    // It says what to do with them, in one line.
+    assert!(
+        outcome
+            .text
+            .contains("Re-issue this call with `find` set to exactly those bytes"),
+        "{}",
+        outcome.text
+    );
+    // It names the route that needs no old bytes at all.
+    assert!(
+        outcome.text.contains("mcp__kin__kin_mutate")
+            && outcome.text.contains("\"verb\": \"update\""),
+        "{}",
+        outcome.text
+    );
+
+    // The proof that the quoted bytes are usable: re-issuing with exactly them lands.
+    let second = belt::run_edit(
+        dir.path(),
+        &json!({
+            "path": "clone.go",
+            "find": quoted_bytes(&outcome.text),
+            "replace": "\tif !strings.EqualFold(protocol, \"ssh\") {",
+        }),
+    );
+    assert!(!second.is_error, "{}", second.text);
+    let after = std::fs::read_to_string(dir.path().join("clone.go")).unwrap();
+    assert!(
+        after.contains("\tif !strings.EqualFold(protocol, \"ssh\") {"),
+        "{after}"
+    );
+    // Nothing else moved.
+    assert!(
+        after.contains("\t\treturn ghrepo.FormatRemoteURL(repo, protocol), nil"),
+        "{after}"
+    );
+}
+
+#[test]
+fn an_indentation_miss_is_answered_with_the_file_s_own_whitespace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("greet.py"),
+        "def greet(name):\n    return f\"hello {name}\"\n",
+    )
+    .unwrap();
+    // The right line, re-indented with a tab the file does not use.
+    let outcome = belt::run_edit(
+        dir.path(),
+        &json!({
+            "path": "greet.py",
+            "find": "\treturn f\"hello {name}\"",
+            "replace": "\treturn f\"hi {name}\"",
+        }),
+    );
+    assert!(outcome.is_error);
+    assert!(
+        outcome.text.contains("Indentation is part of the bytes"),
+        "{}",
+        outcome.text
+    );
+    assert_eq!(quoted_bytes(&outcome.text), "    return f\"hello {name}\"");
+}
+
+#[test]
+fn a_find_that_matches_nothing_gets_the_nearest_line_and_is_told_it_is_not_a_substitute() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("greet.py"),
+        "def greet(name):\n    return f\"hello {name}\"\n",
+    )
+    .unwrap();
+    // A stale read: the file never held this line.
+    let outcome = belt::run_edit(
+        dir.path(),
+        &json!({
+            "path": "greet.py",
+            "find": "    return \"hello \" + name.upper()",
+            "replace": "    return name",
+        }),
+    );
+    assert!(outcome.is_error);
+    assert!(
+        outcome.text.contains("the read it came from is stale"),
+        "{}",
+        outcome.text
+    );
+    // The nearest line is handed back, and the refusal does not pretend it is a swap.
+    assert_eq!(quoted_bytes(&outcome.text), "    return f\"hello {name}\"");
+    assert!(
+        outcome.text.contains("not a substitute for what was sent"),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        !outcome
+            .text
+            .contains("Re-issue this call with `find` set to exactly those bytes"),
+        "a nearest-line quote must not be presented as a proven match: {}",
+        outcome.text
+    );
+}
+
+#[test]
+fn a_span_closing_on_a_multibyte_character_is_reported_not_panicked_on() {
+    // The span's last byte is inside a character, so a line number looked up at
+    // `end - 1` slices mid-character and panics. Source carries non-ASCII in strings
+    // and comments constantly, so this is the ordinary case and not an exotic one.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("greet.py"),
+        "def greet(name):\n    return f\"héllo {name} \u{2192}\"\n",
+    )
+    .unwrap();
+    // The escaped form, cut so the span the decoder matches CLOSES on the arrow. That
+    // is the shape that breaks: the matched span carries no trailing newline, so its
+    // last byte sits inside a three-byte character.
+    let outcome = belt::run_edit(
+        dir.path(),
+        &json!({
+            "path": "greet.py",
+            "find": "f\\\"héllo {name} \u{2192}",
+            "replace": "f\"hi {name}",
+        }),
+    );
+    assert!(outcome.is_error);
+    assert!(
+        outcome.text.contains("escape sequences literal"),
+        "{}",
+        outcome.text
+    );
+    assert_eq!(
+        quoted_bytes(&outcome.text),
+        "f\"héllo {name} \u{2192}",
+        "the quoted span must close on the arrow"
+    );
+    assert!(outcome.text.contains("at line 2 "), "{}", outcome.text);
+}
+
+#[test]
+fn a_multiline_span_names_the_lines_it_covers() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("greet.py"),
+        "import sys\ndef greet(name):\n    return name\n",
+    )
+    .unwrap();
+    // Two lines, sent escaped, so the span the refusal quotes covers lines 2 and 3.
+    let outcome = belt::run_edit(
+        dir.path(),
+        &json!({
+            "path": "greet.py",
+            "find": "def greet(name):\\n    return name",
+            "replace": "x",
+        }),
+    );
+    assert!(outcome.is_error);
+    assert!(outcome.text.contains("at lines 2 to 3"), "{}", outcome.text);
+    assert_eq!(
+        quoted_bytes(&outcome.text),
+        "def greet(name):\n    return name"
+    );
+}
+
+#[test]
+fn the_refusal_quote_is_bounded_even_when_the_span_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let long: String = (0..40).map(|n| format!("    line {n}\n")).collect();
+    std::fs::write(dir.path().join("long.txt"), &long).unwrap();
+    // The whole file, re-indented, so the whitespace rule matches a 40-line span.
+    let sent: String = (0..40).map(|n| format!("\tline {n}\n")).collect();
+    let outcome = belt::run_edit(
+        dir.path(),
+        &json!({ "path": "long.txt", "find": sent, "replace": "x" }),
+    );
+    assert!(outcome.is_error);
+    let quoted = quoted_bytes(&outcome.text);
+    assert!(
+        quoted.lines().count() <= 6 && quoted.len() <= 400,
+        "the quote stays bounded, got {} lines / {} bytes",
+        quoted.lines().count(),
+        quoted.len()
+    );
+    assert!(
+        outcome.text.contains("cut to a few lines"),
+        "{}",
+        outcome.text
+    );
 }
 
 #[test]

@@ -2901,7 +2901,25 @@ mod tests {
         assert!(modified.contains(&target.id));
         assert_eq!(error_ranges.len(), 25);
         assert!(!retained.is_empty());
-        assert!(result.delta.relation_deltas.is_empty());
+        // The edge SET does not move, but the positions on it do.
+        //
+        // This asserted that a partial pass emits no relation delta at all,
+        // which held only while the C adapter recorded no call site: the pass
+        // renames an identifier three times, so every call written after the
+        // first replacement now sits at a different byte offset than the one
+        // the graph holds, and a recorded site that did not follow the text
+        // would be a wrong line rather than a missing one. What must still hold
+        // is that no edge is created or destroyed by a reparse of a file whose
+        // calls did not change.
+        assert!(
+            result
+                .delta
+                .relation_deltas
+                .iter()
+                .all(|delta| matches!(delta, RelationDelta::Modified { .. })),
+            "a partial reparse may move a site, never add or drop an edge: {:?}",
+            result.delta.relation_deltas
+        );
         assert!(result
             .delta
             .entity_deltas

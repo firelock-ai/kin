@@ -29,8 +29,24 @@ pub struct GraphStats {
     pub text_index_coverage_percent: f64,
     /// Number of entities currently present in the vector index.
     pub indexed_embedding_count: usize,
-    /// Number of entities queued for embedding but not yet indexed.
+    /// Entities in the graph that carry no vector in the index: exactly
+    /// `total_entities - indexed_embedding_count`, which is the same set
+    /// `embedding_coverage_percent` below is computed over.
     pub pending_embedding_count: usize,
+    /// Keys sitting on the embedding queues when this was sampled.
+    ///
+    /// Work, not coverage. It counts a re-embed of a key that already carries a
+    /// vector and it spans retrievable keys rather than entities, so it can
+    /// exceed `total_entities` and it is NOT part of the
+    /// `indexed + pending == total` identity above. The two used to be merged
+    /// into `pending_embedding_count` by taking the larger, which published 6
+    /// pending beside 1 indexed of 3 total.
+    ///
+    /// Defaulted on the wire so a payload minted before it existed still
+    /// deserializes; zero there means "not reported", which is also what a
+    /// build with no vector backend reports.
+    #[serde(default)]
+    pub queued_embedding_count: usize,
     /// Embedding coverage relative to total entities.
     pub embedding_coverage_percent: f64,
     /// Number of work items.

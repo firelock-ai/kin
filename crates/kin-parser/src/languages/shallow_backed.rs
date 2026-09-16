@@ -453,7 +453,11 @@ fn extract_csharp_calls(
                 };
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The invocation itself, so a reference row can report
+                        // the line the call is written on. Without it the
+                        // linker has no span to store and every consuming
+                        // surface reports the edge as having no evidence span.
+                        site: Some(crate::adapter::site_from_node(&child)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -468,7 +472,9 @@ fn extract_csharp_calls(
                 let target = normalize_scoped_name(text_of(&ty, source).trim());
                 if !target.is_empty() {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The `new T(..)` expression, for the same reason the
+                        // invocation above is recorded.
+                        site: Some(crate::adapter::site_from_node(&child)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::References,
@@ -711,6 +717,25 @@ fn extract_ruby_node(
                     }
                 }
             }
+            // Walk what is being assigned.
+            //
+            // This arm read the left side for a constant and then returned,
+            // while every other arm of this walk recurses, so `first = compute()`
+            // produced no call edge at all and `kin refs` answered that nobody
+            // called a function the source calls. The answer looked clean,
+            // which is what made it worth closing rather than noting.
+            recurse_children(node, source, |child| {
+                extract_ruby_node(
+                    child,
+                    source,
+                    file_id,
+                    container_ctx,
+                    callable_ctx,
+                    entities,
+                    relations,
+                    imports,
+                );
+            });
         }
         "call" => {
             if let Some(method_name) = child_field_text(node, "method", source) {
@@ -727,7 +752,10 @@ fn extract_ruby_node(
                     if let Some(target) = extract_ruby_first_argument(node, source) {
                         if let Some(owner) = container_ctx {
                             relations.push(ExtractedRelation {
-                                site: None,
+                                // The `include`, `extend` or `prepend` call, so
+                                // a reference row can report the line the module
+                                // was mixed in at.
+                                site: Some(crate::adapter::site_from_node(node)),
                                 receiver: None,
                                 call_shape: None,
                                 kind: kin_model::RelationKind::References,
@@ -739,7 +767,11 @@ fn extract_ruby_node(
                     }
                 } else if let Some(current_callable) = callable_ctx {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The call itself, so a reference row can report the
+                        // line the call is written on. Without it the linker has
+                        // no span to store and every consuming surface reports
+                        // the edge as having no evidence span.
+                        site: Some(crate::adapter::site_from_node(node)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,

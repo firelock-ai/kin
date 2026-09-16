@@ -55,8 +55,12 @@ async fn announce_active_scope(
 }
 
 #[cfg(feature = "vector")]
+/// The same three conditions [`crate::commands::locate`] applies, spelled the
+/// same way: `pending` is the coverage gap and `queued` is outstanding work,
+/// and completeness needs both at zero.
 fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
-    status.total == 0 || (status.indexed == status.total && status.pending == 0)
+    status.total == 0
+        || (status.indexed == status.total && status.pending == 0 && status.queued == 0)
 }
 
 #[cfg(feature = "vector")]

@@ -1194,25 +1194,49 @@ fn verification_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId)
 
 /// Progress of the background embedding pipeline.
 ///
-/// `pending` reports outstanding embedding work, defined as
-/// `max(queue_length, total - indexed)`. `total` covers retrievable graph
-/// objects that participate in semantic embedding: current entities,
-/// historical entity revisions, and current artifacts. This deliberately covers
-/// both queued-but-unembedded work and unindexed objects that have not yet been
-/// queued (the latter is the steady state after loading a graph whose embedding
-/// queues do not persist across restarts). Coverage gates that only inspect this
-/// field stay correct without also reading `indexed` and `total`. Callers that
-/// need the raw runtime queue length specifically should use
-/// [`InMemoryGraph::pending_embeddings`] and
+/// `pending` reports the coverage shortfall, exactly `total - indexed`, so
+/// `indexed + pending == total` holds on every answer. `total` covers
+/// retrievable graph objects that participate in semantic embedding: current
+/// entities, historical entity revisions, and current artifacts. An unindexed
+/// object nobody has queued yet is still counted, because it carries no vector,
+/// which is the steady state after loading a graph whose embedding queues do
+/// not persist across restarts. A coverage gate reads `pending`; a caller
+/// deciding whether to wait reads `queued`, the live backlog, which counts a
+/// re-embed of a key that already carries a vector and is therefore not part of
+/// that identity. Callers that need the raw runtime queue length broken out by
+/// kind should use [`InMemoryGraph::pending_embeddings`] and
 /// [`InMemoryGraph::pending_artifact_embeddings`] instead.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddingStatus {
-    /// Outstanding embedding work: `max(queue_length, total - indexed)`.
+    /// Retrievable graph objects in truth that carry no vector: exactly
+    /// `total - indexed`, from the same reading those two come from.
+    ///
+    /// This used to be `max(queue_length, total - indexed)`, which merged a
+    /// coverage shortfall with a work backlog and put the same key in two
+    /// counts. Every bulk enqueue here except `queue_missing_for_embedding`
+    /// queues a key whether or not it already carries a vector, so a re-embed
+    /// over a whole store made `pending` the queue depth while `indexed` still
+    /// counted every one of those keys as present. A store answered `indexed
+    /// 18123, pending 2, total 18124` on one MCP call: 18,123 plus 2 is 18,125,
+    /// and no reader can act on three numbers that do not add up.
+    ///
+    /// The work backlog did not go away, it moved to [`Self::queued`], which is
+    /// what it always was. Nothing is lost for the case the `max` was written
+    /// for either: an entity in truth that nobody has queued yet has no vector,
+    /// so `total - indexed` already counts it.
     pub pending: usize,
     /// Retrievable graph objects currently in the HNSW vector index.
     pub indexed: usize,
     /// Total retrievable graph objects that require embeddings.
     pub total: usize,
+    /// Keys sitting on the entity and artifact embedding queues right now.
+    ///
+    /// Work, not coverage. It counts a re-embed of a key that already carries a
+    /// vector, so it can exceed [`Self::pending`] and it is NOT part of the
+    /// `indexed + pending == total` identity. It is a live queue read rather
+    /// than part of the cached coverage reading, so it answers for the instant
+    /// it was taken.
+    pub queued: usize,
 }
 
 /// Outcome counts from reconciling a salvaged vector sidecar against current
@@ -4499,7 +4523,48 @@ impl InMemoryGraph {
     }
 
     /// Collect comprehensive graph statistics for observability.
+    ///
+    /// `embedding_status` is sampled BEFORE any domain guard, and that order is
+    /// load bearing rather than cosmetic.
+    ///
+    /// `entities` is a `parking_lot::RwLock`, which is task fair: a read taken
+    /// while a writer is queued waits for that writer. Its own documentation
+    /// names the consequence, that "attempts to recursively acquire a read lock
+    /// within a single thread may result in a deadlock". `embedding_status`
+    /// reaches `graph_truth_retrievable_keys`, which takes `entities.read()`
+    /// itself, so calling it under this function's own read guard was that
+    /// recursive read. One queued writer deadlocked the pair, and any entity
+    /// write will do. A sampled daemon had the reader on `POST /commands/graph`
+    /// and the writer in `backfill_missing_file_layouts` under the startup
+    /// semantics repair, parked in parking_lot's `wait_for_readers` on the very
+    /// guard the reader was holding.
+    ///
+    /// That is not a stall in one call. Both threads park holding and wanting
+    /// the same lock, so every later `entities.read()` in the process queues
+    /// behind the writer: the reconcile loop, the embed worker, and every
+    /// request handler. The process goes silent at zero CPU with its listening
+    /// socket still open and nothing accepting on it.
+    ///
+    /// The same ordering removes a second cycle. `embedding_status` takes
+    /// `embedding_queue`, and `drain_embedding_batch` holds `embedding_queue`
+    /// across its own `entities.read()`, so holding `entities` across
+    /// `embedding_status` put those two locks in both orders.
+    ///
+    /// The cost of sampling first is that the embedding figures come from a
+    /// moment fractionally before the entity counts. This function already
+    /// samples five domain locks at five different instants and exists for
+    /// observability, and the earlier sample no longer decides coverage:
+    /// `pending_embedding_count` below is `total_entities` minus
+    /// `indexed_embedding_count`, both read under the guard, so the two
+    /// entity-scoped counts and the percent beside them describe one set. What
+    /// the earlier sample carries into the result is `queued_embedding_count`,
+    /// the embedding backlog, which is a live queue depth answering for the
+    /// instant it was taken rather than a coverage claim, so reading it a
+    /// moment early cannot make a coverage number disagree with its own
+    /// denominator. Without the `vector` feature there is no index to count
+    /// against and `pending` falls back to the sampled total.
     pub fn graph_stats(&self) -> GraphStats {
+        let embedding_status = self.embedding_status();
         let ent = self.entities.read();
         let work = self.work.read();
         let reviews = self.reviews.read();
@@ -4519,7 +4584,6 @@ impl InMemoryGraph {
                     .count()
             })
             .unwrap_or(0);
-        let embedding_status = self.embedding_status();
         #[cfg(feature = "vector")]
         let indexed_embedding_count = self
             .vector_index
@@ -4534,10 +4598,20 @@ impl InMemoryGraph {
             .unwrap_or(0);
         #[cfg(not(feature = "vector"))]
         let indexed_embedding_count = 0usize;
+        // Entity-scoped, from the two entity-scoped numbers beside it, so this
+        // block's three embedding readings describe one set:
+        // `indexed_embedding_count` counts entity keys in the index,
+        // `total_entities` is the denominator `embedding_coverage_percent`
+        // divides by, and this is their difference.
+        //
+        // It used to be `max(embedding_status.pending, total_entities -
+        // indexed_embedding_count)`, and `embedding_status.pending` was itself a
+        // queue depth over retrievable keys, a wider set that also holds
+        // artifacts and revisions. Taking the larger of two counts over two
+        // different sets published 6 pending beside 1 indexed of 3 total and
+        // 33.33 percent coverage, which no reader can reconcile.
         #[cfg(feature = "vector")]
-        let pending_embedding_count = embedding_status
-            .pending
-            .max(total_entities.saturating_sub(indexed_embedding_count));
+        let pending_embedding_count = total_entities.saturating_sub(indexed_embedding_count);
         #[cfg(not(feature = "vector"))]
         let pending_embedding_count = embedding_status.pending;
 
@@ -4585,6 +4659,7 @@ impl InMemoryGraph {
             ),
             indexed_embedding_count,
             pending_embedding_count,
+            queued_embedding_count: embedding_status.queued,
             embedding_coverage_percent: coverage_percent(indexed_embedding_count, total_entities),
             work_item_count: work.work_items.len(),
             test_case_count: verification.test_cases.len(),
@@ -7092,10 +7167,17 @@ impl InMemoryGraph {
 
     /// Get the current embedding status.
     ///
-    /// The returned `pending` field is `max(queue_length, total - indexed)` so
-    /// that coverage gates remain correct when entities exist that have not
-    /// yet been queued for embedding (the steady state after loading a graph
-    /// whose embedding queue does not persist across restarts).
+    /// `indexed`, `total` and `pending` are one reading: the first two come from
+    /// [`Self::embedding_coverage_counts`], which reads both invalidation tokens
+    /// before it counts, and the third is their difference. So
+    /// `indexed + pending == total` holds on every answer this returns, and a
+    /// store whose every retrievable key carries a vector reports `pending: 0`
+    /// whatever else is in flight.
+    ///
+    /// `queued` is the separate live fact: how much embedding work is
+    /// outstanding, including re-embeds of keys that already carry a vector. A
+    /// caller deciding whether the substrate is whole reads `pending`; a caller
+    /// deciding whether to wait reads `queued`.
     pub fn embedding_status(&self) -> EmbeddingStatus {
         #[cfg(feature = "vector")]
         let (queue_len, indexed, total) = {
@@ -7107,11 +7189,11 @@ impl InMemoryGraph {
         #[cfg(not(feature = "vector"))]
         let (queue_len, indexed, total) = (0usize, 0usize, self.entity_count());
 
-        let pending = queue_len.max(total.saturating_sub(indexed));
         EmbeddingStatus {
-            pending,
+            pending: total.saturating_sub(indexed),
             indexed,
             total,
+            queued: queue_len,
         }
     }
 
@@ -19655,6 +19737,103 @@ mod tests {
         );
     }
 
+    /// The three published counters are one reading, and a queued re-embed
+    /// cannot make them disagree.
+    ///
+    /// The case this drives with came off a third-party MCP client. A store
+    /// verified at `18124/18124 indexed (0 pending)` answered a tool call with
+    /// `indexed 18123, pending 2, total 18124`. Those cannot all be true of one
+    /// store: 18,123 plus 2 is 18,125. `pending` was
+    /// `max(queue_length, total - indexed)`, and every bulk enqueue on this type
+    /// except `queue_missing_for_embedding` queues a key whether or not it
+    /// already carries a vector, so one re-queued key was counted BOTH as
+    /// indexed and as pending.
+    ///
+    /// Both arms below hold `indexed + pending == total`, which is the property
+    /// a reader needs and the one the old shape could not offer.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_requeued_key_is_outstanding_work_and_not_a_coverage_gap() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        let e3 = test_entity("baz", "src/c.rs");
+        for entity in [&e1, &e2, &e3] {
+            graph.upsert_entity(entity).unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        for entity in [&e1, &e2, &e3] {
+            index.upsert(entity.id, &[1.0, 0.0]).unwrap();
+        }
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+        graph.embedding_queue.lock().clear();
+
+        // Arm one: a complete store reads complete, and says so in every field.
+        let whole = graph.embedding_status();
+        assert_eq!(whole.total, 3);
+        assert_eq!(whole.indexed, 3);
+        assert_eq!(
+            whole.pending, 0,
+            "every retrievable key carries a vector: {whole:?}"
+        );
+        assert_eq!(whole.queued, 0, "and no work is outstanding: {whole:?}");
+        assert_eq!(
+            whole.indexed + whole.pending,
+            whole.total,
+            "the three counters are one reading: {whole:?}"
+        );
+
+        // Arm two: re-queue a key that already carries a vector, which is what
+        // every bulk enqueue does. Coverage must not move.
+        graph.queue_for_embedding(&[e2.id]);
+        let requeued = graph.embedding_status();
+        assert_eq!(
+            requeued.indexed, 3,
+            "the vector is still in the index, so it is still indexed: {requeued:?}"
+        );
+        assert_eq!(
+            requeued.pending, 0,
+            "a re-embed of an indexed key is not a coverage gap: {requeued:?}"
+        );
+        assert_eq!(
+            requeued.queued, 1,
+            "it is outstanding work, and that is where it is reported: {requeued:?}"
+        );
+        assert_eq!(
+            requeued.indexed + requeued.pending,
+            requeued.total,
+            "the identity holds with work queued: {requeued:?}"
+        );
+
+        // Arm three: a key with no vector IS a coverage gap, counted once,
+        // whether or not it is also queued. This is the control that stops the
+        // rule above being satisfied by reporting zero pending always.
+        graph
+            .remove_retrievable_vector(&RetrievalKey::Entity(e3.id))
+            .unwrap();
+        graph.queue_for_embedding(&[e3.id]);
+        let gapped = graph.embedding_status();
+        assert_eq!(gapped.total, 3, "{gapped:?}");
+        assert_eq!(gapped.indexed, 2, "{gapped:?}");
+        assert_eq!(
+            gapped.pending, 1,
+            "the missing vector is the gap, counted once: {gapped:?}"
+        );
+        assert_eq!(
+            gapped.indexed + gapped.pending,
+            gapped.total,
+            "the identity holds on a partial store too: {gapped:?}"
+        );
+        assert_eq!(
+            gapped.queued, 2,
+            "both re-queued keys are outstanding work: {gapped:?}"
+        );
+    }
+
     #[cfg(feature = "vector")]
     #[test]
     fn embedding_status_counts_unindexed_artifacts_when_queue_drained() {
@@ -19933,8 +20112,21 @@ mod tests {
         assert_eq!(stats.indexed_embedding_count, 1);
         #[cfg(not(feature = "vector"))]
         assert_eq!(stats.indexed_embedding_count, 0);
+        // 3 entities, 1 of them in the index, so 2 are an embedding gap. This
+        // read 6 until the counters were made one reading: the queue held six
+        // keys over a retrievable set wider than the three entities this block
+        // reports, and a pending count above the total is not a count.
         #[cfg(feature = "vector")]
-        assert_eq!(stats.pending_embedding_count, 6);
+        assert_eq!(
+            stats.pending_embedding_count, 2,
+            "pending is the entity gap the coverage percent beside it is computed from"
+        );
+        #[cfg(feature = "vector")]
+        assert_eq!(
+            stats.indexed_embedding_count + stats.pending_embedding_count,
+            stats.total_entities,
+            "and the three readings describe one set"
+        );
         #[cfg(not(feature = "vector"))]
         assert_eq!(
             stats.pending_embedding_count, stats.total_entities,
@@ -20269,6 +20461,84 @@ mod tests {
             graph.embedding_status().indexed,
             1,
             "the absent-index entry must not have been served to the loaded index"
+        );
+    }
+
+    /// `graph_stats` must not hold the entity read lock across the coverage
+    /// recount.
+    ///
+    /// `entities` is a `parking_lot::RwLock`, which is task fair: a read taken
+    /// while a writer is queued waits for that writer. Its own documentation
+    /// names the consequence, that "attempts to recursively acquire a read lock
+    /// within a single thread may result in a deadlock". `graph_stats` used to
+    /// take `entities.read()` and then reach `graph_truth_retrievable_keys`,
+    /// which takes `entities.read()` again, through `embedding_status` and
+    /// `embedding_coverage_counts`.
+    ///
+    /// One queued writer is all it takes, and any entity write will do. Both
+    /// threads then park holding and wanting the same lock, and every later
+    /// `entities.read()` in the process queues behind the writer: the reconcile
+    /// loop, the embed worker, and every request handler. The process goes
+    /// silent at zero CPU with its listening socket still open and nothing
+    /// accepting on it.
+    ///
+    /// Sampled on a wedged daemon: 18 of 18 tokio workers parked for a whole
+    /// ten second sample, the reader under `POST /commands/graph` in
+    /// `graph_truth_retrievable_keys` and `lock_shared_slow`, the writer in
+    /// `backfill_missing_file_layouts` and `wait_for_readers`.
+    ///
+    /// The writer is started from the observation point inside the recount,
+    /// which is exactly where the second read used to be taken.
+    ///
+    /// Falsify by moving `self.embedding_status()` back under
+    /// `let ent = self.entities.read()` in `graph_stats`: this stops returning
+    /// and fails on its deadline.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn graph_stats_does_not_take_the_entity_read_lock_twice() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (graph, _) = coverage_fixture(64, 0);
+        let graph = Arc::new(graph);
+        let observed = Arc::new(AtomicBool::new(false));
+
+        let hook_graph = Arc::clone(&graph);
+        let hook_observed = Arc::clone(&observed);
+        let stats_graph = Arc::clone(&graph);
+        let (stats_tx, stats_rx) = mpsc::channel();
+
+        let reader = std::thread::spawn(move || {
+            // The hook is a thread local, so it has to be installed on the
+            // thread that runs the recount.
+            set_embedding_coverage_before_count_hook(move |_| {
+                hook_observed.store(true, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let extra = test_entity_with_id(0x2416_7777, "queued-writer");
+                    hook_graph.batch_upsert_entities(&[extra]).unwrap();
+                });
+                // Give the writer time to park on the lock. If it has not
+                // parked yet the recursive read simply succeeds, so this can
+                // only ever pass for the wrong reason, never fail for one.
+                std::thread::sleep(Duration::from_millis(250));
+            });
+            let stats = stats_graph.graph_stats();
+            let _ = stats_tx.send(stats.total_entities);
+        });
+
+        let total = stats_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "graph_stats must return while a writer is queued on the entity lock; a timeout \
+             here is the recursive read deadlocking against it",
+        );
+        reader.join().expect("the graph_stats thread");
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "the coverage recount must have run, or this test proves nothing"
+        );
+        assert!(
+            total >= 64,
+            "the stats must describe the graph, not a partial read: {total}"
         );
     }
 
