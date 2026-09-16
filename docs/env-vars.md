@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (536 total, 360 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (537 total, 360 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -144,6 +144,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_STOP_TIMEOUT_SECS` | seconds>=0 | 30 | operational | ceiling in seconds kin daemon stop waits for a signaled daemon to exit |
 | `KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP` | bool | 0 | diagnostic | kin-daemon fault injection: refuse to admit the LSP enrichment sweep at start, so cross-file edges never publish and a reference answer is thin rather than late; off by default |
 | `KIN_DAEMON_TEST_STARTUP_HOLD_SECS` | seconds>=0 | *(unset)* | diagnostic | kin-daemon fault injection: hold the endpoint unpublished for N seconds at startup, so a client's startup binding stays PENDING past the tools/call grace and the still-starting disclosure is reachable; unset or zero disarms it |
+| `KIN_DAEMON_UNRESPONSIVE_TIMEOUT_SECS` | seconds>=0 | 20 | operational | how long a daemon that never reported itself warming may answer nothing at all before the client calls it wedged and reports, instead of waiting out KIN_DAEMON_READY_TIMEOUT_SECS. A warming daemon answers /readiness throughout its load and never reaches this. Zero waits the full readiness budget |
 | `KIN_DAEMON_URL` | url | *(unset)* | operational | explicit daemon endpoint URL (skip local discovery) |
 | `KIN_DAEMON_WATCH_PID` | usize | *(unset)* | operational | pid the daemon watches; it exits when that process dies |
 | `KIN_PUBLICATION_CONTROL_AUTH_TOKEN` | secret | *(unset)* | secret | distinct operator bearer token for hosted rollout and publication-control administration |

@@ -12,7 +12,7 @@
 //! the context budget at 59,029 tokens and answered with a guess. The hop it
 //! wanted was never in any of the nine answers.
 //!
-//! This module is the part of the loop that notices. It holds two instruments,
+//! This module is the part of the loop that notices. It holds three instruments,
 //! and they catch different things:
 //!
 //! - The repeat rule is precise. It fires when a tool is asked a near-identical
@@ -21,16 +21,22 @@
 //! - The call budget is blunt. It bounds how many times one retrieval tool may
 //!   run at all, whatever it is asked, because a model that rephrases widely
 //!   enough never trips the precise rule and still spends the window.
+//! - The refusal rule reads a refusal as a result. A change refused twice on the
+//!   same target has been told twice that the bytes it sent are not the file's,
+//!   and the third attempt is the loop. Measured on 2026-09-15,
+//!   `qwen/qwen3-coder-next` took one byte-match refusal on T4 and spent its
+//!   remaining sixteen tool calls on graph questions, producing a zero-byte diff
+//!   on the task the same model had passed in seven calls a run earlier.
 //!
-//! Either one escalates rather than refusing outright: the first two trips tell
-//! the model which tool the task needs next, and only a model that keeps going
-//! after that ends the run. A run that ends here ends with an answer, because
-//! the loop asks for one with the tools taken away, and the stop record names
-//! the tool, the question and the gap.
+//! Each of them escalates rather than refusing outright, and they share one
+//! escalation count: the first two trips tell the model what to do instead, and
+//! only a model that keeps going after that ends the run. A run that ends here
+//! ends with an answer, because the loop asks for one with the tools taken away,
+//! and the stop record names the tool, the question and the gap.
 //!
 //! Nothing here reads a file, and nothing here decides an answer is wrong. The
 //! guard's whole claim is about repetition, and a repeated question that is
-//! still producing new entities is left alone.
+//! still producing new entities is left alone, as is a change that keeps landing.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +48,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// badly, which is a reasonable thing to do once; the second is the last one
 /// that can be called a check. A third is the loop.
 pub const REPEAT_ALLOWANCE: u32 = 2;
+
+/// How many times one target may be refused before the guard stops the next
+/// attempt at it.
+///
+/// Two, for the same reason the repeat rule allows two. The first refusal is the
+/// one the model reads and corrects from, and the corrected call now carries the
+/// file's exact bytes, so a second refusal on the same target means the model is
+/// not using them. A third would be sent for the same reason the second was.
+pub const REFUSAL_ALLOWANCE: u32 = 2;
 
 /// How many escalations a run gets before the guard ends it.
 ///
@@ -294,6 +309,26 @@ fn surfaced(result: &str) -> Option<BTreeSet<String>> {
     Some(found)
 }
 
+/// What the model is told to do instead of attempting the same change again.
+///
+/// It is told to go and read, not to give up: unlike a barren question, a refused
+/// change has a route that works, and the refusal it just read carries the bytes
+/// that route needs.
+const REFUSAL_ESCALATION: &str = "Read the entity's current source with \
+     mcp__kin__get_entity_source, copy its bytes without re-escaping them, and send the change \
+     once more with `find` set to exactly those bytes. Or name the change instead of matching \
+     bytes: call mcp__kin__kin_mutate with one operation {\"verb\": \"update\", \"target\": \
+     \"<the entity id>\", \"body\": \"<its complete new source>\", \"description\": \
+     \"...\"}, which needs no old bytes at all.";
+
+/// How a redirect closes.
+///
+/// A run circling a question it cannot answer should say so. A run that cannot land
+/// a change should land it, so the refusal rule closes differently.
+const CLOSING_ANSWER: &str =
+    "Say plainly what you could not determine and which tool could not answer it.";
+const CLOSING_CHANGE: &str = "Do not send this change again until you hold those bytes.";
+
 /// What the model is told to do instead, by the tool it was about to re-run.
 fn escalation(tool: &str) -> &'static str {
     match tool {
@@ -336,6 +371,11 @@ pub struct RepeatGuard {
     calls: BTreeMap<String, u32>,
     /// Identifiers each tool has already handed this run.
     seen: BTreeMap<String, BTreeSet<String>>,
+    /// Refusals the model can clear by sending different bytes, per tool and
+    /// target. Keyed on the target rather than the bytes sent: a run that sends
+    /// three different wrong snippets at one file is the loop this bounds, and a
+    /// key that included the bytes would never match twice.
+    refusals: BTreeMap<(String, String), u32>,
     escalations: u32,
     /// Every escalation this run made, newest last, for the record.
     reasons: Vec<String>,
@@ -393,6 +433,42 @@ impl RepeatGuard {
         Verdict::Allow
     }
 
+    /// Decide whether another attempt at a change should run, before it is sent.
+    ///
+    /// `target` is what the change names, which for the belt's replacement tool is the
+    /// path. Both are compared as written: this rule is about a run repeating itself,
+    /// and two spellings of one path are two different things the model asked for.
+    pub fn before_change(&mut self, tool: &str, target: &str) -> Verdict {
+        let refused = self
+            .refusals
+            .get(&(tool.to_string(), target.to_string()))
+            .copied()
+            .unwrap_or(0);
+        if refused >= REFUSAL_ALLOWANCE {
+            return self.escalate_with(
+                format!(
+                    "{tool} has been refused {refused} times on `{target}`, and the last refusal \
+                     carried that file's exact current bytes"
+                ),
+                REFUSAL_ESCALATION,
+                CLOSING_CHANGE,
+            );
+        }
+        Verdict::Allow
+    }
+
+    /// Record a refusal the model can clear by sending different bytes.
+    ///
+    /// Only that kind. A change repository authority declined to publish is counted
+    /// nowhere here, because re-reading the source is not what fixes one and this rule's
+    /// whole redirect is an instruction to go and read.
+    pub fn record_refusal(&mut self, tool: &str, target: &str) {
+        *self
+            .refusals
+            .entry((tool.to_string(), target.to_string()))
+            .or_insert(0) += 1;
+    }
+
     /// Record what a call that ran came back with.
     pub fn record(&mut self, tool: &str, arguments: &Value, result: &str, is_error: bool) {
         if !returns_entities(tool) {
@@ -448,8 +524,17 @@ impl RepeatGuard {
         })
     }
 
-    /// Turn a tripped rule into the verdict the loop acts on.
+    /// Turn a tripped retrieval rule into the verdict the loop acts on.
     fn escalate(&mut self, tool: &str, because: String) -> Verdict {
+        self.escalate_with(because, escalation(tool), CLOSING_ANSWER)
+    }
+
+    /// Turn any tripped rule into the verdict the loop acts on.
+    ///
+    /// The escalation count is shared across all three rules on purpose: it counts how
+    /// many times this run has been told to change course, and a run that has been told
+    /// three times is circling whichever rule noticed.
+    fn escalate_with(&mut self, because: String, instead: &str, closing: &str) -> Verdict {
         self.escalations += 1;
         self.reasons.push(because.clone());
         if self.escalations > ESCALATION_ALLOWANCE {
@@ -458,9 +543,7 @@ impl RepeatGuard {
             ))
         } else {
             Verdict::Redirect(format!(
-                "[kin agent] This call was not run: {because}. {} Say plainly what you could not \
-                 determine and which tool could not answer it.",
-                escalation(tool)
+                "[kin agent] This call was not run: {because}. {instead} {closing}"
             ))
         }
     }
@@ -748,6 +831,74 @@ mod tests {
             "every escalation must leave a reason: {:?}",
             guard.reasons()
         );
+    }
+
+    #[test]
+    fn two_refusals_on_one_target_are_allowed_and_the_third_attempt_is_redirected() {
+        let mut guard = RepeatGuard::new();
+        // The first attempt is not a repeat of anything.
+        assert_eq!(
+            guard.before_change("edit_file", "pkg/cmd/repo/clone/clone.go"),
+            Verdict::Allow
+        );
+        guard.record_refusal("edit_file", "pkg/cmd/repo/clone/clone.go");
+        // The second is how a model checks whether it read the refusal right. That
+        // refusal now carries the file's exact bytes, so it is the last free one.
+        assert_eq!(
+            guard.before_change("edit_file", "pkg/cmd/repo/clone/clone.go"),
+            Verdict::Allow
+        );
+        guard.record_refusal("edit_file", "pkg/cmd/repo/clone/clone.go");
+        // The third is not run.
+        let Verdict::Redirect(message) =
+            guard.before_change("edit_file", "pkg/cmd/repo/clone/clone.go")
+        else {
+            panic!("a third attempt at a twice-refused target must not run");
+        };
+        assert!(
+            message.contains("was not run") && message.contains("pkg/cmd/repo/clone/clone.go"),
+            "the redirect must say what it stopped and on what: {message}"
+        );
+        // It sends the model to read, not to give up.
+        assert!(
+            message.contains("get_entity_source") && message.contains("exactly those bytes"),
+            "the redirect must send the model to the source: {message}"
+        );
+        assert!(
+            message.contains("kin_mutate"),
+            "the redirect must name the route that needs no old bytes: {message}"
+        );
+        assert!(
+            !message.contains("Say plainly what you could not determine"),
+            "a change that can still land must not be told to give up: {message}"
+        );
+        assert_eq!(guard.escalations(), 1);
+    }
+
+    #[test]
+    fn a_refusal_on_one_target_does_not_bound_another() {
+        let mut guard = RepeatGuard::new();
+        for _ in 0..REFUSAL_ALLOWANCE {
+            assert_eq!(guard.before_change("edit_file", "a.go"), Verdict::Allow);
+            guard.record_refusal("edit_file", "a.go");
+        }
+        assert!(matches!(
+            guard.before_change("edit_file", "a.go"),
+            Verdict::Redirect(_)
+        ));
+        // A different file is a different change, and it has been refused nothing.
+        assert_eq!(guard.before_change("edit_file", "b.go"), Verdict::Allow);
+    }
+
+    #[test]
+    fn a_change_that_lands_is_never_bounded() {
+        let mut guard = RepeatGuard::new();
+        // Nothing records a refusal, so no number of attempts trips the rule. The run's
+        // own tool-call budget is what bounds a model that keeps editing successfully.
+        for _ in 0..6 {
+            assert_eq!(guard.before_change("edit_file", "a.go"), Verdict::Allow);
+        }
+        assert_eq!(guard.escalations(), 0);
     }
 
     #[test]

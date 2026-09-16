@@ -630,7 +630,11 @@ fn extract_calls_from_context(
                 let (callee_name, receiver) = rust_callee_and_receiver(&function, source, owner);
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The call expression itself, so a reference row can
+                        // report the line the call is written on. Without it the
+                        // linker has no span to store and every consuming
+                        // surface reports the edge as having no evidence span.
+                        site: Some(crate::adapter::site_from_node(&child)),
                         receiver,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -663,6 +667,29 @@ fn extract_calls_from_context(
         }
         // Recurse into child nodes
         extract_calls_from_context(&child, source, context_name, owner, relations);
+    }
+}
+
+/// The site covering two tokens and everything between them.
+///
+/// `site_from_node` takes one node, which is all an adapter needs wherever the
+/// grammar gives the whole construct a node of its own. Inside a macro's token
+/// tree it does not: a call is a flat run of sibling tokens, so the run's
+/// extent is the first token's start and the last token's end.
+fn site_spanning(
+    first: &tree_sitter::Node,
+    last: &tree_sitter::Node,
+) -> crate::extract::RelationSite {
+    let start = first.start_position();
+    let end = last.end_position();
+    crate::extract::RelationSite {
+        start_byte: first.start_byte(),
+        end_byte: last.end_byte(),
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: end.row as u32,
+        end_col: end.column as u32,
+        syntactic_role: None,
     }
 }
 
@@ -721,7 +748,14 @@ fn extract_calls_from_token_tree(
             None
         };
         let mut callee_name = token.utf8_text(source).unwrap_or("").to_string();
-        if !is_method_call {
+        // The leftmost token of the call run, so the recorded site covers the
+        // call as written rather than only the leaf identifier. A method call
+        // starts at its receiver, which the arm above proved present before it
+        // could read the receiver's text; anything else starts at the first
+        // segment of its path.
+        let call_start = if is_method_call {
+            index - 2
+        } else {
             // Reconstruct a leading `a::b::` path so qualified callees keep
             // the same shape the call_expression arm extracts.
             let mut start = index;
@@ -736,11 +770,17 @@ fn extract_calls_from_token_tree(
                     callee_name
                 );
             }
-        }
+            start
+        };
         let (callee_name, receiver) = fold_settled_rust_receiver(callee_name, receiver, owner);
         if is_valid_callee_name(&callee_name) {
             relations.push(ExtractedRelation {
-                site: None,
+                // The token run the call is written as, from its leftmost token
+                // through the closing parenthesis of its argument group. A
+                // macro body carries no `call_expression` node to hand to
+                // `site_from_node`, and a call inside one is still a line a
+                // reference row has to be able to report.
+                site: Some(site_spanning(&tokens[call_start], next)),
                 receiver,
                 call_shape: None,
                 kind: kin_model::RelationKind::Calls,

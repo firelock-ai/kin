@@ -1691,10 +1691,17 @@ def check_12(suite):
     that ceiling, and roughly 7,700 of it was four verbatim copies of one
     limiting-factor sentence.
 
-    Two arms. At the belt's own 12,000 the answer has to fit. At a ceiling small
-    enough that the fixed part cannot fit inside it, the answer may ship over,
-    and then it has to say so rather than ship over in silence. Neither arm
-    passes on a walk the ceiling never pressed.
+    Two arms. At 12,000 the answer has to fit. At a ceiling small enough that the
+    fixed part cannot fit inside it, the answer may ship over, and then it has to
+    say so rather than ship over in silence. Neither arm passes on a walk the
+    ceiling never pressed.
+
+    Both ceilings are named in the call rather than read from the belt, which is
+    what keeps this arm grading the budgeter instead of the profile. 12,000 was
+    the belt's one number when this was written and is now what `agent-default`
+    serves a LIST tool; `trace_data_flow` itself is served 24,576, which is
+    wider, so an answer that fits here fits there. The number this walk is graded
+    at is deliberately the tighter one.
     """
     res = Result("12", "FIR-3107", "a deep trace answers inside the ceiling it advertises")
     args = {
@@ -1704,8 +1711,9 @@ def check_12(suite):
         "limit_per_step": 25,
         "include_body": False,
     }
-    # 12,000 is the number `agent-default` injects and advertises, so it is the
-    # one a client sizes on. 3,000 is below the fixed part of this response.
+    # 12,000 was the one number `agent-default` injected and advertised for every
+    # tool, and is still what it serves a list tool, so it is a ceiling a client
+    # sizes on. 3,000 is below the fixed part of this response.
     for ceiling, must_fit in ((12000, True), (3000, False)):
         try:
             payload = suite.mcp("trace_data_flow", dict(args, max_chars=ceiling))

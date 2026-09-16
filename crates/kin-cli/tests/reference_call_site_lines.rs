@@ -12,9 +12,11 @@
 //! which is why a stranger asking "who calls this, and where" got entities and
 //! files from Kin and then ran grep for the lines (FIR-1825).
 //!
-//! This asserts the whole chain on the two languages that lost those A/B tasks:
-//! adapter records the call site, linker turns it into a span under the
-//! caller's file, MCP and CLI both report it. It runs on BOTH ingest arms,
+//! This asserts the whole chain, language by language: adapter records the call
+//! site, linker turns it into a span under the caller's file, MCP and CLI both
+//! report it. A language joins the table when its adapter starts recording
+//! sites, and the per-language census in `kin-index` is what names the ones
+//! that have not. It runs on BOTH ingest arms,
 //! because they are separate code paths that have diverged before (kin#870):
 //! `resolve_cross_file` is the batch arm a `kin init` walks, and
 //! `link_cross_file_incremental_with_completeness` is the arm a live reconcile
@@ -43,10 +45,25 @@ struct Fixture {
     language: &'static str,
     defs_path: &'static str,
     defs_source: &'static str,
+    /// Entity name of the function being called. Qualified in the languages
+    /// whose adapter owns a member by its container, bare in the ones that do
+    /// not, because the row under test is the one the graph really holds.
+    target_name: &'static str,
     caller_path: &'static str,
     caller_source: &'static str,
     /// Entity name of the function doing the calling.
     caller_name: &'static str,
+    /// The array in the `find_references` body this fixture's row is in.
+    ///
+    /// `references` for every language whose call the linker can bind to one
+    /// destination. `candidates` for Ruby, whose methods are owned by a class
+    /// and whose bare call therefore reaches a same-name method the reference
+    /// site does not settle: the answer withholds that row from the counted
+    /// references on purpose, carries it beside them in the same row shape, and
+    /// says so in `degradations`. The site chain this file grades is the same
+    /// either way, and reading only `references` would leave the one language
+    /// that cannot produce one ungraded.
+    rows_field: &'static str,
     /// The call as it is written, used to derive the expected site lines from
     /// the fixture source itself rather than from a hand-counted constant.
     call_text: &'static str,
@@ -57,6 +74,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Python",
         defs_path: "defs.py",
         defs_source: "def compute():\n    return 1\n",
+        target_name: "compute",
         caller_path: "caller.py",
         // 1: import, 2: blank, 3: def run, 4: first call, 5: blank, 6: second call
         caller_source: "from defs import compute\n\
@@ -66,12 +84,14 @@ const FIXTURES: &[Fixture] = &[
                         \n\
                         \x20   return first + compute()\n",
         caller_name: "run",
+        rows_field: "references",
         call_text: "compute()",
     },
     Fixture {
         language: "JavaScript",
         defs_path: "defs.js",
         defs_source: "export function compute() { return 1; }\n",
+        target_name: "compute",
         caller_path: "caller.js",
         // 1: import, 2: blank, 3: export function run, 4: first call, 5: blank,
         // 6: second call
@@ -83,6 +103,7 @@ const FIXTURES: &[Fixture] = &[
                         \x20 return first + compute();\n\
                         }\n",
         caller_name: "run",
+        rows_field: "references",
         call_text: "compute()",
     },
     Fixture {
@@ -95,6 +116,7 @@ const FIXTURES: &[Fixture] = &[
         language: "Go",
         defs_path: "defs.go",
         defs_source: "package fixture\n\nfunc compute() int {\n\treturn 1\n}\n",
+        target_name: "compute",
         caller_path: "caller.go",
         // 1: package, 2: blank, 3: func run, 4: first call, 5: blank,
         // 6: second call, 7: close
@@ -106,6 +128,203 @@ const FIXTURES: &[Fixture] = &[
                         \x20   return first + compute()\n\
                         }\n",
         caller_name: "run",
+        rows_field: "references",
+        call_text: "compute()",
+    },
+    Fixture {
+        // Rust is here because Kin is written in it, so every demo and every
+        // agent session run against Kin's own tree read reference rows that
+        // named a caller and no line. Its adapter recorded no site for a call
+        // expression and none for a call written inside a macro body.
+        language: "Rust",
+        defs_path: "defs.rs",
+        defs_source: "pub fn compute() -> u32 {\n    1\n}\n",
+        target_name: "compute",
+        caller_path: "caller.rs",
+        // 1: pub fn run, 2: first call, 3: blank, 4: second call, 5: close
+        caller_source: "pub fn run() -> u32 {\n\
+                        \x20   let first = compute();\n\
+                        \n\
+                        \x20   first + compute()\n\
+                        }\n",
+        caller_name: "run",
+        rows_field: "references",
+        call_text: "compute()",
+    },
+    Fixture {
+        // Java, whose adapter records the invocation now. The target sits in the
+        // caller's own class for the reason the lookup below spells out.
+        language: "Java",
+        defs_path: "Other.java",
+        defs_source: "class Other {\n\
+                      \x20 int noop() { return 0; }\n\
+                      }\n",
+        target_name: "Same.compute",
+        caller_path: "Same.java",
+        // 1: class, 2: static compute, 3: int run, 4: first call, 5: blank,
+        // 6: second call, 7: close run, 8: close class
+        caller_source: "class Same {\n\
+                        \x20 static int compute() { return 1; }\n\
+                        \x20 int run() {\n\
+                        \x20   int first = compute();\n\
+                        \n\
+                        \x20   return first + compute();\n\
+                        \x20 }\n\
+                        }\n",
+        caller_name: "Same.run",
+        // The trailing semicolon keeps the definition line, which writes
+        // `compute() {`, out of the derived expectation.
+        rows_field: "references",
+        call_text: "compute();",
+    },
+    Fixture {
+        // C, whose adapter records the call expression now.
+        language: "C",
+        defs_path: "defs.c",
+        defs_source: "int compute(void) { return 1; }\n",
+        target_name: "compute",
+        caller_path: "caller.c",
+        // 1: int run, 2: first call, 3: blank, 4: second call, 5: close
+        caller_source: "int run(void) {\n\
+                        \x20   int first = compute();\n\
+                        \n\
+                        \x20   return first + compute();\n\
+                        }\n",
+        caller_name: "run",
+        rows_field: "references",
+        call_text: "compute()",
+    },
+    Fixture {
+        // C++, whose adapter records the call expression now.
+        language: "Cpp",
+        defs_path: "defs.cpp",
+        defs_source: "int compute() { return 1; }\n",
+        target_name: "compute",
+        caller_path: "caller.cpp",
+        // 1: int run, 2: first call, 3: blank, 4: second call, 5: close
+        caller_source: "int run() {\n\
+                        \x20   int first = compute();\n\
+                        \n\
+                        \x20   return first + compute();\n\
+                        }\n",
+        caller_name: "run",
+        rows_field: "references",
+        call_text: "compute()",
+    },
+    Fixture {
+        // C#, whose adapter records the invocation now. The target sits in the
+        // caller's own class for the same reason Java's does.
+        language: "CSharp",
+        defs_path: "Other.cs",
+        defs_source: "namespace N { class Other {\n\
+                      \x20 public int Noop() { return 0; }\n\
+                      } }\n",
+        target_name: "N.Same.Compute",
+        caller_path: "Same.cs",
+        // 1: namespace and class, 2: static Compute, 3: public int Run,
+        // 4: first call, 5: blank, 6: second call, 7: close Run,
+        // 8: close class and namespace
+        caller_source: "namespace N { class Same {\n\
+                        \x20 public static int Compute() { return 1; }\n\
+                        \x20 public int Run() {\n\
+                        \x20   var first = Compute();\n\
+                        \n\
+                        \x20   return first + Compute();\n\
+                        \x20 }\n\
+                        } }\n",
+        caller_name: "N.Same.Run",
+        // The trailing semicolon keeps the definition line out, as above.
+        rows_field: "references",
+        call_text: "Compute();",
+    },
+    Fixture {
+        // Ruby, whose adapter records the call now. Its row is a candidate
+        // rather than a counted reference, for the reason `rows_field` names.
+        //
+        // The first call is written on the right of an assignment, which the
+        // adapter's `assignment` arm used to walk past without extracting
+        // anything, so this fixture reported one site where its source writes
+        // two. That arm recurses now and the fixture asserts both.
+        language: "Ruby",
+        defs_path: "defs.rb",
+        defs_source: "class Defs\n\
+                      \x20 def compute\n\
+                      \x20   1\n\
+                      \x20 end\n\
+                      end\n",
+        target_name: "Defs.compute",
+        caller_path: "caller.rb",
+        // 1: class, 2: def run, 3: first call, 4: blank, 5: second call,
+        // 6: end run, 7: end class
+        caller_source: "class Caller\n\
+                        \x20 def run\n\
+                        \x20   first = compute()\n\
+                        \n\
+                        \x20   first + compute()\n\
+                        \x20 end\n\
+                        end\n",
+        caller_name: "Caller.run",
+        rows_field: "candidates",
+        call_text: "compute()",
+    },
+    Fixture {
+        // PHP, whose adapter records the call expression now.
+        language: "Php",
+        defs_path: "defs.php",
+        defs_source: "<?php\n\
+                      function compute() { return 1; }\n",
+        target_name: "compute",
+        caller_path: "caller.php",
+        // 1: open tag, 2: function run, 3: first call, 4: blank,
+        // 5: second call, 6: close
+        caller_source: "<?php\n\
+                        function run() {\n\
+                        \x20   $first = compute();\n\
+                        \n\
+                        \x20   return $first + compute();\n\
+                        }\n",
+        caller_name: "run",
+        rows_field: "references",
+        call_text: "compute()",
+    },
+    Fixture {
+        // Kotlin, whose adapter records the call expression now.
+        language: "Kotlin",
+        defs_path: "defs.kt",
+        defs_source: "fun compute(): Int { return 1 }\n",
+        target_name: "compute",
+        caller_path: "caller.kt",
+        // 1: fun run, 2: first call, 3: blank, 4: second call, 5: close
+        caller_source: "fun run(): Int {\n\
+                        \x20   val first = compute()\n\
+                        \n\
+                        \x20   return first + compute()\n\
+                        }\n",
+        caller_name: "run",
+        rows_field: "references",
+        call_text: "compute()",
+    },
+    Fixture {
+        // Swift, whose adapter records the call expression now.
+        //
+        // The second call is written inside a `return`, which tree-sitter-swift
+        // binds to the whole operator expression around it, so the adapter used
+        // to extract no call there and this fixture reported one site where its
+        // source writes two. The callee is read off the operator's right
+        // operand now and the fixture asserts both.
+        language: "Swift",
+        defs_path: "defs.swift",
+        defs_source: "func compute() -> Int { return 1 }\n",
+        target_name: "compute",
+        caller_path: "caller.swift",
+        // 1: func run, 2: first call, 3: blank, 4: second call, 5: close
+        caller_source: "func run() -> Int {\n\
+                        \x20   let first = compute()\n\
+                        \n\
+                        \x20   return first + compute()\n\
+                        }\n",
+        caller_name: "run",
+        rows_field: "references",
         call_text: "compute()",
     },
 ];
@@ -295,16 +514,34 @@ async fn reference_rows_carry_call_site_lines_on_both_ingest_arms() {
             let linked = link(&files);
             let graph = graph_with(&files, &linked);
 
-            let target = files[0]
-                .entities
+            // Across both files, not just the definition file.
+            //
+            // A language whose members are owned by a container only produces a
+            // counted reference row when the call sits inside that container:
+            // `find_references` withholds a bare cross-class call as a
+            // receiver-name candidate, because nothing at the reference site
+            // settles the receiver's type, and that is the right answer. So the
+            // Java and C# fixtures put the target beside its caller and keep a
+            // second file for the linker arms to walk, and the lookup follows
+            // the target rather than assuming which file holds it.
+            let target = files
                 .iter()
-                .find(|entity| entity.name == "compute")
-                .unwrap_or_else(|| panic!("{} {arm}: compute entity", fixture.language))
+                .flat_map(|file| file.entities.iter())
+                .find(|entity| entity.name == fixture.target_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} {arm}: no `{}` entity",
+                        fixture.language, fixture.target_name
+                    )
+                })
                 .clone();
 
             let body = find_references(&graph, &target).await;
-            let rows = body["references"].as_array().unwrap_or_else(|| {
-                panic!("{} {arm}: references array: {body:#}", fixture.language)
+            let rows = body[fixture.rows_field].as_array().unwrap_or_else(|| {
+                panic!(
+                    "{} {arm}: `{}` array: {body:#}",
+                    fixture.language, fixture.rows_field
+                )
             });
             let row = rows
                 .iter()
@@ -350,13 +587,15 @@ async fn reference_rows_carry_call_site_lines_on_both_ingest_arms() {
                 "{} {arm}: the fixture removes entity spans on purpose: {row:#}",
                 fixture.language,
             );
-            assert_eq!(
-                body["counts"]["reference_sites_complete"],
-                serde_json::json!(true),
-                "{} {arm}: every returned row has sites, so the answer must say so: \
-                 {body:#}",
-                fixture.language,
-            );
+            if fixture.rows_field == "references" {
+                assert_eq!(
+                    body["counts"]["reference_sites_complete"],
+                    serde_json::json!(true),
+                    "{} {arm}: every returned row has sites, so the answer must say so: \
+                     {body:#}",
+                    fixture.language,
+                );
+            }
 
             let layout = kin_core::KinLayout::new(tempfile::tempdir().unwrap().path().join(".kin"));
             let cli = build_refs_response(

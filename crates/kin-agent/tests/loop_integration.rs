@@ -694,6 +694,220 @@ fn mcp_log(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// The bytes a refusal quoted, which is what the next call re-issues with.
+fn quoted_bytes(refusal: &str) -> &str {
+    let (_, after) = refusal
+        .split_once("<<<KIN-EXACT\n")
+        .unwrap_or_else(|| panic!("the refusal quotes the file's bytes: {refusal}"));
+    let (bytes, _) = after
+        .split_once("\n>>>KIN-EXACT")
+        .unwrap_or_else(|| panic!("the quote is closed: {refusal}"));
+    bytes
+}
+
+#[test]
+fn a_byte_match_refusal_carries_the_bytes_the_very_next_call_lands_with() {
+    // The measured regression in one run. On 2026-09-15 `qwen/qwen3-coder-next` sent a
+    // `find` whose escape sequences were literal, because the source it had read came
+    // back inside a JSON result, and was told only that the text did not appear. It never
+    // attempted the change again and spent its remaining sixteen calls on graph
+    // questions. The refusal now carries the file's exact bytes, and this is the proof
+    // they are usable: the second call's `find` is read OUT of the first call's refusal,
+    // so the test fails if the refusal stops carrying them or carries them wrong.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // What the model reads out of a JSON tool result, copied back without being written
+    // as the characters themselves.
+    let escaped = "def greet(name):\\n    return f\\\"hello {name}\\\"";
+    // The same text as the file actually holds it.
+    let exact = "def greet(name):\n    return f\"hello {name}\"";
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Making the greeting warmer.",
+            Some(tool_call(
+                "c1",
+                "edit_file",
+                json!({
+                    "path": "src/greet.py",
+                    "find": escaped,
+                    "replace": "def greet(name):\\n    return f\\\"hi {name}\\\"",
+                }),
+            )),
+        ),
+        completion(
+            "Those were escaped. Sending the file's own bytes.",
+            Some(tool_call(
+                "c2",
+                "edit_file",
+                json!({
+                    "path": "src/greet.py",
+                    "find": exact,
+                    "replace": "def greet(name):\n    return f\"hi {name}\"",
+                }),
+            )),
+        ),
+        completion("greet now returns a shorter greeting.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.tool_results.len(), 2);
+
+    // The first call is refused, and the refusal is not only a refusal.
+    let (_, refusal, is_error) = &view.tool_results[0];
+    assert!(
+        is_error,
+        "the byte mismatch must still be refused: {refusal}"
+    );
+    assert!(
+        refusal.contains("escape sequences literal"),
+        "the refusal must name why it did not match: {refusal}"
+    );
+    assert!(
+        refusal.contains("lines 1 to 2"),
+        "the refusal must say where it looked: {refusal}"
+    );
+    assert!(
+        refusal.contains("mcp__kin__kin_mutate"),
+        "the refusal must name the route that needs no old bytes: {refusal}"
+    );
+
+    // The load-bearing assertion: the bytes the refusal handed back ARE the bytes the
+    // next call sent, so a model that copies them recovers in one turn.
+    assert_eq!(
+        quoted_bytes(refusal),
+        exact,
+        "the refusal must quote the file's exact current bytes"
+    );
+    assert_eq!(
+        view.tool_uses[1].2["find"].as_str().unwrap(),
+        quoted_bytes(refusal),
+        "the recovering call re-issues with exactly what the refusal quoted"
+    );
+
+    // And that call lands.
+    assert!(
+        !view.tool_results[1].2,
+        "the retry must succeed: {}",
+        view.tool_results[1].1
+    );
+    let edited = std::fs::read_to_string(repo.join("src/greet.py")).unwrap();
+    assert_eq!(edited, "def greet(name):\n    return f\"hi {name}\"\n");
+
+    // It landed through repository authority, not by a local write.
+    let trace = read_jsonl(&outcome.trace_path);
+    let published = trace
+        .iter()
+        .filter(|row| row["surface"] == "local" && row["tool"] == "edit_file")
+        .collect::<Vec<_>>();
+    assert_eq!(published.len(), 2);
+    assert_eq!(published[0]["is_error"], true);
+    assert_eq!(
+        published[0]["provenance"]["closed_with"], "kin_transaction_abort",
+        "a refused edit stages nothing and closes its bracket"
+    );
+    assert_eq!(published[1]["is_error"], false);
+    assert_eq!(
+        published[1]["provenance"]["closed_with"],
+        "kin_transaction_commit"
+    );
+    assert_eq!(view.result["kin_agent"]["files_changed"][0], "src/greet.py");
+}
+
+#[test]
+fn a_target_refused_twice_is_not_attempted_a_third_time() {
+    // The other half of the measured failure: a run that keeps sending bytes the file
+    // does not hold spends its budget one refusal at a time. Two are allowed, because the
+    // first is the one a model reads and corrects from. The third is not run at all, and
+    // the model is sent to read the entity's source instead.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let attempt = |id: &str, find: &str| {
+        completion(
+            "Trying the edit.",
+            Some(tool_call(
+                id,
+                "edit_file",
+                json!({ "path": "src/greet.py", "find": find, "replace": "return 1" }),
+            )),
+        )
+    };
+    let endpoint = FakeEndpoint::start(vec![
+        attempt("c1", "return \"hello \" + name"),
+        attempt("c2", "return 'hello ' + name"),
+        attempt("c3", "return  \"hello\"  +  name"),
+        completion("I could not match the line I meant to change.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.tool_results.len(), 3);
+    assert!(view.tool_results[0].2 && view.tool_results[1].2);
+
+    // The third was answered by the guard rather than run.
+    let third = &view.tool_results[2].1;
+    assert!(view.tool_results[2].2, "a stopped call is an error result");
+    assert!(
+        third.contains("This call was not run")
+            && third.contains("has been refused 2 times on `src/greet.py`"),
+        "the redirect must say what it stopped and why: {third}"
+    );
+    assert!(
+        third.contains("mcp__kin__get_entity_source"),
+        "the redirect must send the model to the source: {third}"
+    );
+    assert!(
+        third.contains("mcp__kin__kin_mutate"),
+        "the redirect must name the route that needs no old bytes: {third}"
+    );
+
+    let trace = read_jsonl(&outcome.trace_path);
+    let stopped = trace
+        .iter()
+        .find(|row| row["policy"] == "repeat_guard")
+        .expect("the guard's decision is traced");
+    assert_eq!(stopped["tool"], "edit_file");
+    assert_eq!(stopped["verdict"], "redirected");
+    assert_eq!(stopped["escalations"], 1);
+
+    // Nothing was opened for the call that did not run. Two attempts, two brackets.
+    let begins = mcp_log(&log)
+        .iter()
+        .filter(|call| call["tool"] == "kin_transaction_begin")
+        .count();
+    assert_eq!(
+        begins, 2,
+        "a call the guard stopped must not open a transaction"
+    );
+
+    // The file is untouched, and the run still ends with an answer.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/greet.py")).unwrap(),
+        "def greet(name):\n    return f\"hello {name}\"\n"
+    );
+    assert_eq!(
+        outcome.final_text,
+        "I could not match the line I meant to change."
+    );
+}
+
 #[test]
 fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
     let dir = tempfile::tempdir().unwrap();

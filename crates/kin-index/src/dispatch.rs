@@ -406,6 +406,34 @@ fn interface_method_spec<G: GraphStore>(
     Ok(None)
 }
 
+/// Whether interface dispatch is a question worth answering about `focal`.
+///
+/// True for a Go method on a CONCRETE receiver, which is the only shape
+/// [`interface_dispatch_targets`] can ever return a target for. The two empty
+/// answers that function gives are different facts, and a surface that reports
+/// one at zero needs to tell them apart: a concrete method whose receiver type
+/// satisfies no interface has a dispatch story and the answer to it is none,
+/// while an interface method spec, a free function or a method in another
+/// language has no dispatch story at all. Reporting "satisfies no interface" for
+/// `Writer.Write` would be describing the contract as if it were an
+/// implementation of itself.
+///
+/// Costs the one incoming `Contains` read [`interface_dispatch_targets`] already
+/// makes, and never the interface scan behind it, so a caller can gate on this
+/// before deciding whether to pay for the walk.
+pub fn dispatch_applies<G: GraphStore>(store: &G, focal: &Entity) -> Result<bool> {
+    if focal.kind != EntityKind::Method || focal.language != LanguageId::Go {
+        return Ok(false);
+    }
+    if split_qualified_method(&focal.name).is_none() {
+        return Ok(false);
+    }
+    let Some(owner) = owner_of_method(store, focal)? else {
+        return Ok(false);
+    };
+    Ok(owner.kind != EntityKind::Interface)
+}
+
 /// The entities that call `targets`, keyed by caller, with the interface
 /// method each one reached.
 ///

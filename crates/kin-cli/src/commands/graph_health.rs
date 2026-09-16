@@ -681,6 +681,7 @@ mod tests {
             text_index_coverage_percent: 0.0,
             indexed_embedding_count: 0,
             pending_embedding_count: 0,
+            queued_embedding_count: 0,
             embedding_coverage_percent: 0.0,
             work_item_count: 0,
             test_case_count: 0,

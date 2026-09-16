@@ -150,12 +150,20 @@ pub struct SemanticCoverage {
 /// What the embedding substrate was observed to be, as every consumer in this
 /// crate reads it.
 ///
-/// Deliberately four states where [`Completeness::classes`] carries three. The
-/// class vocabulary answers "was the substrate whole", so `Partial` and `Absent`
-/// both render there as `absent`; the finer reading is kept here and named in
-/// `limits`, because "some of it is indexed" and "none of it is" have different
-/// remediations and only one of them is what a first query on a fresh
-/// conversion sees.
+/// Four states, and [`Completeness::classes`] now carries all four for this
+/// substrate. It used to render `Partial` and `Absent` as one word, `absent`,
+/// on the reading that the class answers "was the substrate whole" and both
+/// answer no. That collapse shipped a false fact: a store verified at
+/// 18124/18124 indexed, briefly reading 18123 indexed with 2 pending while its
+/// watcher caught up, published `classes.embeddings: "absent"` beside
+/// `semantic_coverage.embedding_state: "partial"`, and a third-party agent
+/// reading the class was told no vector index existed at all. `absent` names
+/// one observation and one remediation, an attached index holding nothing,
+/// which is what `kin embed` fixes from a standing start; `partial` names a
+/// different one, an index still filling, which finishes on its own. A class
+/// word that cannot tell those apart is not a coarser reading, it is a wrong
+/// one, so the finer reading lives here AND in the class, and `limits` still
+/// carries the machine-stable label beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingState {
     /// Every eligible entity is indexed and nothing is queued.
@@ -170,10 +178,15 @@ pub enum EmbeddingState {
 
 impl EmbeddingState {
     /// The class word this state contributes to [`Completeness::classes`].
+    ///
+    /// One state to one word. Any mapping that merges two states here puts two
+    /// fields in one response that disagree about one fact, which is the defect
+    /// this function was rewritten to remove.
     fn class_state(self) -> &'static str {
         match self {
             Self::Present => STATE_PRESENT,
-            Self::Partial | Self::Absent => STATE_ABSENT,
+            Self::Partial => STATE_PARTIAL,
+            Self::Absent => STATE_ABSENT,
             Self::Unknown => STATE_UNKNOWN,
         }
     }
@@ -1159,6 +1172,13 @@ const STATE_UNKNOWN: &str = "unknown";
 /// A class the scan completed empty on while the parse side shows the linker
 /// had sites of it to resolve: a gap in the build, not the code (FIR-2672).
 const STATE_UNPRODUCED: &str = "unproduced";
+/// A class observed to hold some of what it should and not all of it. Only the
+/// embedding substrate can report it: an index still filling is an ordinary
+/// state with its own remediation, which is to wait, and calling it `absent`
+/// sent readers to `kin embed` on a store that was 99.99 percent indexed.
+/// An edge class has no such reading, because the scan either found a
+/// cross-file edge of the class or it did not.
+const STATE_PARTIAL: &str = "partial";
 
 /// The completeness signal every retrieval response carries, empty or not
 /// (FIR-2357 item 1).
@@ -1200,7 +1220,8 @@ const STATE_UNPRODUCED: &str = "unproduced";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Completeness {
     /// `complete` when every deciding class was observed present, `partial` when
-    /// one was observed absent, `unknown` when the observation could not say.
+    /// one was observed short of whole, `unknown` when the observation could not
+    /// say.
     pub status: String,
     /// `exact` when the counts in this answer are the whole set, `at_least` when
     /// they are a floor. Never omitted: a caller reading a bare number is the
@@ -1209,8 +1230,10 @@ pub struct Completeness {
     /// Which substrate this answer was drawn from: `edges`, `embeddings`, or
     /// `graph`.
     pub substrate: String,
-    /// Every coverage class the answer depended on, each `present`, `absent`, or
-    /// `unknown`.
+    /// Every coverage class the answer depended on, each `present`, `partial`,
+    /// `absent`, `unproduced` or `unknown`. An edge class never reads `partial`;
+    /// the embedding class does, and it is the difference between an index
+    /// still filling and one holding nothing.
     pub classes: Map<String, Value>,
     /// The subset of `classes` whose state decided `status`.
     pub decided_by: Vec<String>,
@@ -1305,13 +1328,16 @@ impl Completeness {
                     .unwrap_or(STATE_UNKNOWN)
             })
             .collect();
+        // A class observed short of whole decides `partial`, whichever of the
+        // three words it was observed as. `unknown` is reserved for a class
+        // nobody could read, because "we looked and it is incomplete" and "we
+        // could not look" send a reader to different places.
         let status = if deciding_states.is_empty() {
             STATE_UNKNOWN
-        } else if deciding_states
-            .iter()
-            .any(|state| *state == STATE_ABSENT || *state == STATE_UNPRODUCED)
-        {
-            "partial"
+        } else if deciding_states.iter().any(|state| {
+            *state == STATE_ABSENT || *state == STATE_UNPRODUCED || *state == STATE_PARTIAL
+        }) {
+            STATE_PARTIAL
         } else if deciding_states.iter().any(|state| *state != STATE_PRESENT) {
             STATE_UNKNOWN
         } else {
@@ -1438,6 +1464,10 @@ fn edge_class_states(
 ///
 /// Every other reason `complete` is false is still reported, in `limits`, where
 /// it is disclosure rather than a verdict about a substrate it never measured.
+///
+/// The state reaches the class unmerged, so `classes.embeddings` and
+/// `semantic_coverage.embedding_state` are one word about one fact and a reader
+/// never has to reconcile them.
 fn embedding_class_states(envelope: &Envelope) -> (Map<String, Value>, Vec<String>, Vec<String>) {
     let mut limits = Vec::new();
     let state = match &envelope.semantic_coverage {
@@ -1796,18 +1826,40 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
         .and_then(|counts| counts.get("receiver_name_candidates"))
         .and_then(Value::as_u64)
         .filter(|withheld| *withheld > 0);
+    // Same rule again, third cause. A Go concrete method reached through an
+    // interface value has no direct caller edge at all, so `reported` is a count
+    // of PROVEN referencing entities beside rows that may be referencing
+    // entities and are not proven to be. That makes the number a floor of the
+    // unit it names, and this object is where a reader learns that without
+    // reading the payload. These rows are never added to `reported`: a
+    // structural satisfaction is not an edge, and counting one here would make
+    // the envelope assert what the handler refused to.
+    let dispatch = payload
+        .get("counts")
+        .and_then(|counts| counts.get("interface_dispatch_candidates"))
+        .and_then(Value::as_u64)
+        .filter(|candidates| *candidates > 0);
     let mut counted = json!({
         "unit": unit,
         "reported": reported,
-        "exact": !truncated && withheld.is_none(),
+        "exact": !truncated && withheld.is_none() && dispatch.is_none(),
     });
     if let Some(withheld) = withheld {
         counted["withheld_candidates"] = json!(withheld);
     }
+    if let Some(dispatch) = dispatch {
+        counted["dispatch_candidates"] = json!(dispatch);
+    }
+    // Named in the order a reader acts on, most limiting first. A walk that
+    // stopped early did not even see every candidate; a bare-name candidate is
+    // a row this walk DID return and held back; a dispatch candidate is a row
+    // the walk never had an edge for.
     if truncated {
         counted["floor_reason"] = json!("walk_truncated");
     } else if withheld.is_some() {
         counted["floor_reason"] = json!("receiver_name_candidates_withheld");
+    } else if dispatch.is_some() {
+        counted["floor_reason"] = json!("interface_dispatch_candidates");
     }
     // The site numbers FIR-2398 added answer a narrower question than this
     // object does: whether every RETURNED row's sites are whole, not whether the
@@ -4305,43 +4357,63 @@ mod tests {
         (text.clone(), annotated_value(&annotated))
     }
 
-    /// The measured case, and the one the belt advertises a number for.
+    /// The measured case, graded at the TIGHTEST ceiling this belt advertises.
     ///
-    /// `trace_data_flow` on `agent-default` is injected `max_chars: 12,000` and
-    /// advertises the same number, and on 2026-09-02 the demo's run against
-    /// hiredis received 15,875 characters, 32 percent over (FIR-3107). It had
-    /// bounded everything it could reach: the chain was already at its floor of
-    /// one entry, and what was over the ceiling was the part of the response the
-    /// budget never trims.
+    /// On 2026-09-02 the demo's run against hiredis received 15,875 characters,
+    /// 32 percent over the 12,000 that was then the one number for every belt
+    /// tool. It had bounded everything it could reach: the chain was already at
+    /// its floor of one entry, and what was over the ceiling was the part of the
+    /// response the budget never trims.
     ///
-    /// Measured here on this fixture, that part was 9,210 characters against a
-    /// 12,000 ceiling, and roughly 7,700 of it was four verbatim copies of one
-    /// 1,900-character limiting-factor sentence. So the answer fits now by
-    /// writing that sentence once and pointing at it, rather than by giving up
-    /// the walk it was asked for.
+    /// Measured here on this fixture, that part was 9,210 characters against
+    /// that 12,000, and roughly 7,700 of it was four verbatim copies of one
+    /// 1,900-character limiting-factor sentence. So the answer fits by writing
+    /// that sentence once and pointing at it, rather than by giving up the walk
+    /// it was asked for.
+    ///
+    /// `trace_data_flow` itself is now served
+    /// [`AGENT_CHAIN_RESPONSE_MAX_CHARS`], which is wider. This fixture keeps
+    /// grading [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`], the number it was sized
+    /// against and the harder of the two, because the mechanism under test is
+    /// the restatement pointer rather than the trace ceiling: sized for 12,000,
+    /// it presses 12,000, and pointing it at a ceiling twice its size would take
+    /// the grading away without saying so. Whether a trace at the belt's own
+    /// ceiling is cut is graded on a walk, in
+    /// `handlers::entities::tests::a_belt_trace_at_the_default_depth_is_no_longer_cut`.
+    ///
+    /// [`AGENT_CHAIN_RESPONSE_MAX_CHARS`]: crate::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS
+    /// [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`]: crate::agent_belt::AGENT_DEFAULT_RESPONSE_MAX_CHARS
     #[test]
-    fn a_deep_trace_answers_inside_the_ceiling_the_belt_advertises() {
-        const CEILING: usize = crate::agent_belt::AGENT_DEFAULT_RESPONSE_MAX_CHARS as usize;
+    fn a_deep_trace_answers_inside_the_tightest_ceiling_the_belt_advertises() {
+        let ceiling = crate::agent_belt::AGENT_DEFAULT_RESPONSE_MAX_CHARS as usize;
         // The control. A fixture that fits on its own grades nothing, because
         // every rung below returns at its first line.
         let raw = crate::budget::measure(&deep_trace_payload());
         assert!(
-            raw > CEILING / 2,
+            raw > ceiling / 2,
             "the fixture is {raw} characters, too small to reach the ceiling with an envelope"
         );
 
         let (text, final_payload) = belt_bounded_deep_trace();
         let shipped = text.len();
-        println!("deep trace ships {shipped} characters against a {CEILING} ceiling");
+        println!("deep trace ships {shipped} characters against a {ceiling} ceiling");
         assert!(
-            shipped <= CEILING,
-            "the answer ships {shipped} characters against the {CEILING} it advertises: \
+            shipped <= ceiling,
+            "the answer ships {shipped} characters against the {ceiling} it advertises: \
              {final_payload}"
         );
         assert_eq!(
             final_payload["_kin"]["response"]["chars_after_budget"],
             json!(shipped),
             "the accounting has to name the size that ships"
+        );
+        // And inside the one this tool is actually served, which is the wider
+        // of the two. Stated rather than left to arithmetic, so a ceiling that
+        // ever went BELOW the number above would be caught here.
+        assert!(
+            shipped
+                <= crate::agent_belt::agent_default_response_max_chars("trace_data_flow") as usize,
+            "the answer ships {shipped} characters against the ceiling trace_data_flow is served"
         );
 
         // It fit by shedding restatement, not by giving up the walk.
@@ -5881,7 +5953,7 @@ mod tests {
         ));
 
         assert_eq!(completeness["substrate"], "embeddings");
-        assert_eq!(completeness["classes"]["embeddings"], "absent");
+        assert_eq!(completeness["classes"]["embeddings"], "partial");
         assert_eq!(completeness["status"], "partial", "{completeness}");
         assert_eq!(completeness["bound"], "at_least");
     }
@@ -5965,7 +6037,22 @@ mod tests {
                     "embedding_state": "partial",
                     "limited_by": ["embeddings_incomplete"],
                 }),
-                "absent",
+                "partial",
+                Some("embeddings_partial"),
+            ),
+            (
+                // The store this rule was rewritten on: verified 18124/18124
+                // with 0 pending, read a moment later at 18123 with 2 still
+                // queued. 0.011 percent of the index, and the class used to
+                // call it gone.
+                "all_but_two_indexed",
+                json!({
+                    "indexed": 18123, "total": 18124, "pending": 2,
+                    "complete": false,
+                    "embedding_state": "partial",
+                    "limited_by": ["embeddings_incomplete"],
+                }),
+                "partial",
                 Some("embeddings_partial"),
             ),
             (
@@ -6013,6 +6100,158 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// An index still filling is `partial`, and only an index holding nothing is
+    /// `absent`, in the class as well as in the counters.
+    ///
+    /// The case this drives with came off a third-party MCP client. A store
+    /// verified at `18124/18124 indexed (0 pending)` answered a moment later
+    /// with `semantic_coverage: {indexed: 18123, pending: 2, total: 18124}` and
+    /// `completeness.classes.embeddings: "absent"` in the same envelope. Two
+    /// entities out of 18,124, 0.011 percent, and the class word told a model
+    /// reading Kin's own "read `_kin.verdict` first" instruction that the store
+    /// had no vector index at all. The two words name two different
+    /// remediations: `kin embed` fills an index holding nothing, and an index
+    /// still filling finishes on its own.
+    ///
+    /// The whole envelope is asserted rather than the class alone, because the
+    /// defect was never one field being wrong on its own. It was two fields in
+    /// one response disagreeing about one fact.
+    #[test]
+    fn a_nearly_whole_index_is_partial_and_only_an_empty_one_is_absent() {
+        // (case, coverage, expected class, expected limit, the limit that must
+        // NOT appear)
+        let cases: Vec<(&str, Value, &str, &str, &str)> = vec![
+            (
+                "eighteen_thousand_one_hundred_twenty_three_of_eighteen_thousand_one_hundred_twenty_four",
+                json!({
+                    "indexed": 18123, "total": 18124, "pending": 2,
+                    "complete": false,
+                    "embedding_state": "partial",
+                    "limited_by": ["embeddings_incomplete"],
+                }),
+                "partial",
+                "embeddings_partial",
+                "embeddings_absent",
+            ),
+            (
+                "an_attached_index_holding_nothing",
+                json!({
+                    "indexed": 0, "total": 18124, "pending": 18124,
+                    "complete": false,
+                    "embedding_state": "absent",
+                    "limited_by": ["embeddings_incomplete"],
+                }),
+                "absent",
+                "embeddings_absent",
+                "embeddings_partial",
+            ),
+        ];
+
+        for (case, coverage, class, named, not_named) in cases {
+            let envelope = locate_response_with_coverage(coverage);
+            let completeness = &envelope["completeness"];
+            let counters = &envelope["semantic_coverage"];
+
+            assert_eq!(
+                completeness["classes"]["embeddings"],
+                json!(class),
+                "case {case}: the class word is the observation, not a merge of two: {envelope}"
+            );
+            // The one fact, read off both fields that state it. This is the
+            // assertion the shipped envelope failed: it carried
+            // `embedding_state_reported: "partial"` beside
+            // `classes.embeddings: "absent"`.
+            assert_eq!(
+                completeness["classes"]["embeddings"], counters["embedding_state_reported"],
+                "case {case}: the class and the counters' own state are one word about one \
+                 fact: {envelope}"
+            );
+            assert_eq!(
+                completeness["status"],
+                json!("partial"),
+                "case {case}: a substrate short of whole is partial, never unknown: {envelope}"
+            );
+            assert_eq!(
+                completeness["substrate"],
+                json!("embeddings"),
+                "case {case}: a ranked answer reads embeddings: {envelope}"
+            );
+
+            let limits = completeness["limits"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                limits.contains(&json!(named)),
+                "case {case}: the shortfall stays named in limits: {completeness}"
+            );
+            assert!(
+                !limits.contains(&json!(not_named)),
+                "case {case}: nothing is hidden and nothing is invented: {completeness}"
+            );
+        }
+    }
+
+    /// A nearly whole index is still not a whole one, and the verdict says so.
+    ///
+    /// The obvious follow-on to the fix above is to let a shortfall this small
+    /// certify, disclosing `embeddings_partial` in `limits` and nothing more.
+    /// This pins why that is refused. `bound` is `at_least` whenever the answer
+    /// cannot be shown to be whole, 2 unranked entities are exactly that, and
+    /// `crate::verdict::disagreements` records `bound: at_least` under a
+    /// certified verdict as a contradiction. Certifying here would therefore
+    /// mean carrying `bound` to `exact` over a class the same object publishes
+    /// as `partial`, which is the defect above moved one field over.
+    ///
+    /// What the reader gets instead is a sized shortfall: `classes.embeddings`
+    /// reading `partial`, `embeddings_partial` in `limits`, and the exact
+    /// counters beside them. Those agree, so an agent can act proportionately
+    /// rather than reading one word and backing off.
+    #[test]
+    fn a_two_entity_shortfall_is_sized_rather_than_certified() {
+        let envelope = locate_response_with_coverage(json!({
+            "indexed": 18123, "total": 18124, "pending": 2,
+            "complete": false,
+            "embedding_state": "partial",
+            "limited_by": ["embeddings_incomplete"],
+        }));
+        let completeness = &envelope["completeness"];
+        let verdict = &envelope["verdict"];
+
+        assert_eq!(
+            verdict["state"],
+            json!("inconclusive"),
+            "an answer whose counts are a floor is not certified: {envelope}"
+        );
+        assert_eq!(
+            completeness["bound"],
+            json!("at_least"),
+            "2 entities were not ranked, so the counts are a floor: {envelope}"
+        );
+        let factor = verdict["limiting_factor"].as_str().unwrap_or_default();
+        assert!(
+            factor.contains("substrate_partial"),
+            "the refusal names the substrate code: {envelope}"
+        );
+        // Everything a reader needs to size the shortfall is published beside
+        // the code, and nothing there says the index is gone.
+        assert_eq!(
+            completeness["classes"]["embeddings"],
+            json!("partial"),
+            "{envelope}"
+        );
+        let limits = completeness["limits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(limits.contains(&json!("embeddings_partial")), "{envelope}");
+        assert!(!limits.contains(&json!("embeddings_absent")), "{envelope}");
+        let counters = &envelope["semantic_coverage"];
+        assert_eq!(counters["indexed"], json!(18123), "{envelope}");
+        assert_eq!(counters["pending"], json!(2), "{envelope}");
+        assert_eq!(counters["total"], json!(18124), "{envelope}");
     }
 
     /// The FIR-2543 envelope, asserted as the one thing a reader cannot be asked
@@ -6111,7 +6350,7 @@ mod tests {
         }));
         assert_eq!(
             decidable["completeness"]["classes"]["embeddings"],
-            json!("absent"),
+            json!("partial"),
             "counters that decide are still read: {}",
             decidable["completeness"]
         );

@@ -414,7 +414,7 @@ enum Command {
         json: bool,
         /// Also list interface-dispatch candidates: Go call sites that reach an
         /// interface method this method's receiver type satisfies. They are
-        /// possible dependents, never proven ones, and are never added to the
+        /// possible dependents, not confirmed ones, and are never added to the
         /// impacted count.
         #[arg(long, default_value_t = false)]
         dispatch: bool,
@@ -748,7 +748,7 @@ enum Command {
         /// bulk mode). Suffix with +dispatch (or pass dispatch on its own) to
         /// list interface-dispatch candidates beside the answer: Go call sites
         /// that reach an interface method this method's receiver type
-        /// satisfies. They are possible callers, never proven ones, and are
+        /// satisfies. They are possible callers, not confirmed ones, and are
         /// never added to the count.
         #[arg(long, default_value = "all")]
         kind: String,

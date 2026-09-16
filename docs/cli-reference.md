@@ -1487,6 +1487,18 @@ writing any file, returns an error to the model and increments `unpublished_chan
 Use `agent-default` for native agent tasks that need these writing tools. Discovering a
 transaction tool later does not provision the harness's publication session.
 
+A replacement whose `find` text is not in the file is refused, and the refusal carries what
+a retry needs: why it did not match, the file's exact current bytes at the closest span,
+bounded to six lines and 400 bytes between `<<<KIN-EXACT` and `>>>KIN-EXACT` markers, and
+one instruction to re-issue with those bytes. The named causes are escape sequences that
+arrived literal, carriage returns the file does not have, and whitespace that is not the
+file's; when none of those explains it the refusal quotes the nearest line instead and says
+so rather than presenting it as a swap. Every such refusal also names the route that needs
+no old bytes at all: `kin_mutate` with one `update` operation naming the entity and its
+complete new source. A target refused twice this way is not attempted a third time. The
+run's repeat guard answers the third attempt itself, sends the model to read the entity's
+source, and records `repeat_guard` in the trace sidecar with the escalation count.
+
 The exit code is the run's outcome: `0` a final answer, `1` a harness error, `2` the
 tool-call budget was spent, `3` the deadline expired, `4` the endpoint was unreachable or
 answered with nothing usable, `5` the MCP server failed, `6` requested changes were not
@@ -1615,6 +1627,16 @@ that profile's `tools/list` attached and without it and reading the server's own
 The token figures belong to that tokenizer; the ratios between profiles do not. This page
 described `full` as "roughly 12k extra tokens of schemas per session", which understated
 it by more than three times.
+
+Those are schema costs. What a profile asks one answer to fit is a second number, and on
+`agent-default` it is per tool. `trace_data_flow` and `get_context_pack` are served a
+24,576-character ceiling, which is the per-result limit `kin agent run` cuts one tool
+result to on a 64k-token window. Every other budgeted tool is served 12,000, the size that
+lets six answers fit a 24,000-token run. They differ because the answers differ. A ranked
+list cut at its ceiling loses its tail and keeps its answer. A chain cut at its ceiling
+loses the far end, which is the end the question was about. Both numbers are advertised on
+the served schema as the `max_chars` default, so a caller reads the one it will get and can
+raise either up to 60,000. `full` serves 45,000 on everything.
 
 `kin agent run` does not put a whole profile on the model. It withholds the session and
 transaction tools it drives itself, folds `trace_data_flow` and `trace_path` into one

@@ -206,8 +206,17 @@ impl EmbeddingState {
 pub const COVERAGE_LIMIT_VECTOR_SUPPORT_DISABLED: &str = "vector_support_disabled";
 /// Machine-stable reason `complete` is false because no index was attached.
 pub const COVERAGE_LIMIT_VECTOR_INDEX_ABSENT: &str = "vector_index_absent";
-/// Machine-stable reason `complete` is false because the index is unfinished.
+/// Machine-stable reason `complete` is false because the index is unfinished:
+/// some retrievable key in graph truth carries no vector at all.
 pub const COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE: &str = "embeddings_incomplete";
+/// Machine-stable reason `complete` is false while every retrievable key DOES
+/// carry a vector: a re-embed is queued over keys that are already indexed.
+///
+/// A separate label because it has a separate remediation. `embeddings_incomplete`
+/// sends a reader to `kin embed`; this one resolves itself, and the answer beside
+/// it ranked over a whole index. Reporting the two as one word is what made a
+/// store at 18124/18124 read as an unfinished index.
+pub const COVERAGE_LIMIT_EMBEDDINGS_REQUEUED: &str = "embeddings_requeued";
 /// Machine-stable reason `complete` is false because the role filter narrowed
 /// the population the counters were taken over.
 pub const COVERAGE_LIMIT_GRAPH_ROLE_FILTER: &str = "graph_role_filter";
@@ -1908,18 +1917,24 @@ fn entity_from_retrieval_key(
 }
 
 #[cfg(feature = "vector")]
+/// Whether the embedding signal owes this store nothing at all.
+///
+/// Three conditions, not two, and the third is not new behaviour. `pending`
+/// used to be `max(queue_length, total - indexed)`, so testing it alone tested
+/// the queue as well. `pending` is now exactly `total - indexed`, which is what
+/// makes `indexed + pending == total` hold on the wire, so the queue is named
+/// here instead of riding inside another counter. The verdict this returns is
+/// bit-identical to what the merged shape produced.
 fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
-    status.total == 0 || (status.indexed == status.total && status.pending == 0)
+    status.total == 0
+        || (status.indexed == status.total && status.pending == 0 && status.queued == 0)
 }
 
 #[cfg(feature = "vector")]
 fn embedding_status_summary(status: &kin_db::EmbeddingStatus) -> String {
     format!(
-        "{}/{} indexed, {} unindexed, {} pending",
-        status.indexed,
-        status.total,
-        status.total.saturating_sub(status.indexed),
-        status.pending
+        "{}/{} indexed, {} unindexed, {} queued",
+        status.indexed, status.total, status.pending, status.queued
     )
 }
 
@@ -2098,6 +2113,11 @@ fn coverage_from_status(
             "no vector index is attached, so nothing is embedded and semantic ranking did not run ({} entities eligible). Lexical + graph results returned; run `kin embed` to build the index.",
             status.total
         ))
+        } else if status.pending == 0 {
+            Some(format!(
+            "every retrievable key carries a vector and a re-embed is queued over {} of them; ranking ran on the whole index and nothing needs running.",
+            status.queued
+        ))
         } else {
             Some(format!(
             "semantic signal partial: {} embedded. Lexical + graph results returned; run `kin embed` for full semantic ranking.",
@@ -2107,8 +2127,13 @@ fn coverage_from_status(
         let mut limited_by = Vec::new();
         if !index_attached {
             limited_by.push(COVERAGE_LIMIT_VECTOR_INDEX_ABSENT.to_string());
-        } else if !embedding_status_complete(status) {
+        } else if status.pending > 0 {
             limited_by.push(COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string());
+        } else if !embedding_status_complete(status) {
+            // Every key carries a vector and work is still queued, which is a
+            // re-embed rather than a gap. The counters beside this say so:
+            // `indexed == total` and `pending == 0`.
+            limited_by.push(COVERAGE_LIMIT_EMBEDDINGS_REQUEUED.to_string());
         }
         SemanticCoverage {
             supported: true,
@@ -23029,6 +23054,30 @@ mod tests {
     /// outcome.
     #[test]
     fn an_anchor_is_never_priced_off_a_score_the_demotion_removes() {
+        // Every knob this fixture's arithmetic assumes, pinned to the default it
+        // assumes, for the reason three of its neighbours already pin theirs.
+        //
+        // `build_entity_view` reads these from the PROCESS environment at
+        // ranking time, and `EnvVarGuard` serializes only against other guard
+        // holders. An unguarded test therefore runs beside a guarded one and
+        // reads whatever that one has set. This test read
+        // `KIN_LOCATE_FILE_ANCHORS=0` from
+        // `a_sibling_corroborates_only_if_the_retrieval_ranked_it_well`, which
+        // holds it for its whole body, and came back with no anchor at all. It
+        // passed alone and failed about once in a full-suite run, which is what
+        // that shape looks like from the outside.
+        //
+        // The share and band numbers below are the ones this fixture's own
+        // comments compute with, so pinning them also stops the arithmetic from
+        // being quietly read against another test's values.
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", "1")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1")
+            .with("KIN_LOCATE_FILE_ANCHOR_TOPK", "8")
+            .with("KIN_LOCATE_FILE_ANCHOR_BUDGET", "8")
+            .with("KIN_LOCATE_FILE_ANCHOR_MASS_WEIGHT", "0.0")
+            .with("KIN_LOCATE_FILE_ANCHOR_SHARE", "0.9")
+            .with("KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", "0.25");
+
         let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
             id: RelationId::new(),
             kind,
@@ -23156,7 +23205,9 @@ mod tests {
             .iter()
             .find(|entity| entity.provenance.origin == FILE_ANCHOR_ORIGIN)
             .map(|entity| entity.score)
-            .expect("the anchor is still admitted");
+            .unwrap_or_else(|| {
+                panic!("the anchor is still admitted, got {rows:?}");
+            });
         assert!(
             anchor_score < leader_row.score,
             "the share is strictly below the score the leader KEEPS, {anchor_score} vs {}",
@@ -23256,8 +23307,13 @@ mod tests {
 
         let question = "where HTTP redirects are resolved and followed after a response";
         let build = |band: &str| {
+            // The flag is pinned beside the band for the reason the fixture
+            // above spells out: this arm reads the anchor knobs from the
+            // process environment, and a neighbour holding
+            // `KIN_LOCATE_FILE_ANCHORS=0` would empty the anchor set under it.
             let _guard =
-                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", band);
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", band)
+                    .with("KIN_LOCATE_FILE_ANCHORS", "1");
             let mut result = LocateResult {
                 files: vec![
                     file(
@@ -23487,9 +23543,13 @@ mod tests {
         let question = "what happens between a component asking for an update \
                         and that update appearing on screen";
         let anchors_of = |topk: &str, budget: &str| -> Vec<String> {
-            let _topk = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_TOPK", topk);
-            let _budget =
-                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BUDGET", budget);
+            // One guard, with the flag pinned beside the two knobs under test.
+            // These were two guards, which is one reentry into the domain for
+            // no gain, and neither pinned `KIN_LOCATE_FILE_ANCHORS`, so a
+            // neighbour holding it at 0 would empty every list this compares.
+            let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_TOPK", topk)
+                .with("KIN_LOCATE_FILE_ANCHOR_BUDGET", budget)
+                .with("KIN_LOCATE_FILE_ANCHORS", "1");
             let mut result = LocateResult {
                 files: vec![
                     file(
@@ -23571,11 +23631,12 @@ mod tests {
         // ranks lower. At weight 0.0, the shipped order, the file arm wins and
         // every work-loop anchor sits above it.
         let ordered = |weight: &str| -> Vec<String> {
-            let _topk = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_TOPK", "8");
-            let _budget =
-                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BUDGET", "8");
-            let _weight =
-                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_MASS_WEIGHT", weight);
+            // One guard, with the flag pinned beside the knobs under test, for
+            // the same reason as the closure above.
+            let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_TOPK", "8")
+                .with("KIN_LOCATE_FILE_ANCHOR_BUDGET", "8")
+                .with("KIN_LOCATE_FILE_ANCHOR_MASS_WEIGHT", weight)
+                .with("KIN_LOCATE_FILE_ANCHORS", "1");
             let mut result = LocateResult {
                 files: vec![
                     file(
@@ -25740,6 +25801,7 @@ mod tests {
             pending: 0,
             indexed: 0,
             total: 0,
+            queued: 0,
         };
         assert!(
             coverage_from_status(&nothing_retrievable, true).complete,
@@ -25754,11 +25816,13 @@ mod tests {
             pending: 12,
             indexed: 0,
             total: 12,
+            queued: 12,
         };
         let partial = kin_db::EmbeddingStatus {
             pending: 7,
             indexed: 5,
             total: 12,
+            queued: 7,
         };
         let mut sink = Vec::new();
         record_vector_index_degradation(&coverage_from_status(&unfilled, false), false, &mut sink);
@@ -25803,6 +25867,7 @@ mod tests {
             pending: 53,
             indexed: 0,
             total: 53,
+            queued: 53,
         };
 
         // The arm under test: attached, zero indexed, a pass on its way.
@@ -25889,6 +25954,7 @@ mod tests {
             pending: 12,
             indexed: 0,
             total: 12,
+            queued: 12,
         };
 
         let mut waiting = Vec::new();
