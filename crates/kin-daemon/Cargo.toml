@@ -24,7 +24,13 @@ metal = ["embeddings", "kin-cli/metal"]
 # version so `GcsBackend::from_store` accepts a store this crate built. That is
 # what lets a custom endpoint (see `gcs_endpoint`) redirect the backend at an
 # emulator without a kin-db change.
-gcs = ["kin-db/gcs", "dep:object_store", "object_store/gcp"]
+#
+# `kin-cli/gcs` is here rather than in the Dockerfile because the image builds
+# `--bin kin-daemon --bin kin` from one `--features kin-daemon/gcs` invocation
+# that `scripts/check-docker-daemon-features.sh` pins exactly, so this is the
+# only way the hosted worker's `kin` binary can publish into a bucket. Forwarded
+# the same way `vector`, `embeddings` and `metal` are above.
+gcs = ["kin-db/gcs", "kin-cli/gcs", "dep:object_store", "object_store/gcp"]
 firestore = ["kin-spine/firestore"]
 
 [dependencies]
