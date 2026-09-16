@@ -185,14 +185,12 @@ fn a_two_hop_go_call_chain_is_named_hop_by_hop() {
             .get_all_relations_for_entity(&api_run)
             .expect("graph read"),
     );
-    assert_eq!(
-        api_edges.get(&http_request).copied(),
-        Some(FocalEdge {
-            kind: RelationKind::Calls,
-            direction: FocalEdgeDirection::Outgoing,
-        }),
-        "the fixture must hold the cross-package call; fix the fixture, not the assertion"
-    );
+    let api_to_transport = api_edges
+        .get(&http_request)
+        .copied()
+        .expect("the fixture must hold the cross-package call; fix the fixture, not the assertion");
+    assert_eq!(api_to_transport.kind, RelationKind::Calls);
+    assert_eq!(api_to_transport.direction, FocalEdgeDirection::Outgoing);
 
     let transport_edges = focal_dependency_edges(
         &http_request,
@@ -200,13 +198,14 @@ fn a_two_hop_go_call_chain_is_named_hop_by_hop() {
             .get_all_relations_for_entity(&http_request)
             .expect("graph read"),
     );
+    let transport_to_round_trip = transport_edges
+        .get(&round_trip)
+        .copied()
+        .expect("the fixture must hold the second hop; fix the fixture, not the assertion");
+    assert_eq!(transport_to_round_trip.kind, RelationKind::Calls);
     assert_eq!(
-        transport_edges.get(&round_trip).copied(),
-        Some(FocalEdge {
-            kind: RelationKind::Calls,
-            direction: FocalEdgeDirection::Outgoing,
-        }),
-        "the fixture must hold the second hop; fix the fixture, not the assertion"
+        transport_to_round_trip.direction,
+        FocalEdgeDirection::Outgoing
     );
 
     let hop_one = dependency_names(&store, &api_run, TokenBudget::Large32k);

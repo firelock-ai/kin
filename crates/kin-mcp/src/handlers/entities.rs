@@ -52,6 +52,14 @@ pub fn handle_semantic_search<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let (query, limit, filter) = build_semantic_search_request(args)?;
     let compact = get_optional_bool(args, "compact", true);
+    // `kind: "command"` used to be dropped on the floor: no `EntityKind` spells
+    // a CLI command, `parse_kind_filter` fell through to its wildcard arm, and
+    // the request ran unfiltered and unranked. It now narrows to the callable
+    // kinds AND tells the ranking below which command was asked about.
+    let command_kind = args
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .is_some_and(crate::handlers::common::is_command_kind);
 
     let entities = store.query_entities(&filter).map_err(McpError::graph)?;
 
@@ -65,12 +73,14 @@ pub fn handle_semantic_search<G: GraphStore>(
     // and gated on whitespace inside `crate::query_tokens::plan`, so a bare
     // identifier that is genuinely absent keeps reporting a clean miss rather
     // than a page of entities that merely share a word with it.
-    let (entities, fallback) = if entities.is_empty() {
+    let (mut entities, fallback) = if entities.is_empty() {
         match crate::query_tokens::plan(&query) {
             Some(planned) => {
                 let hits = retrieve_query_tokens(store, &filter, &planned)?;
-                let ranked = crate::query_tokens::rank(&planned, &hits);
-                let disclosure = crate::query_tokens::disclosure(&planned, &hits, ranked.len());
+                let ranked =
+                    crate::query_tokens::rank(&planned, &hits, command_kind.then_some(&*query));
+                let disclosure =
+                    crate::query_tokens::disclosure(&planned, &hits, ranked.len(), command_kind);
                 (
                     ranked.into_iter().map(|hit| hit.entity).collect::<Vec<_>>(),
                     Some(disclosure),
@@ -81,6 +91,43 @@ pub fn handle_semantic_search<G: GraphStore>(
     } else {
         (entities, None)
     };
+    // Ranking cannot promote a row retrieval never produced, and retrieval never
+    // produces this one: the store's name filter answers `api` with the `API`
+    // class alone and never `apiRun`, so `kind: "command"` used to be an
+    // unanswerable question however its results were ordered. The command's own
+    // spellings are asked for by name, which the store does answer, and the sort
+    // below then puts the run function ahead of its constructor.
+    let mut command_entry_points = 0usize;
+    if command_kind {
+        let found = retrieve_command_entry_points(store, &filter, &query)?;
+        command_entry_points = found.len();
+        if !found.is_empty() {
+            let mut held: std::collections::HashSet<kin_model::ids::EntityId> =
+                entities.iter().map(|entity| entity.id).collect();
+            for entity in found {
+                if held.insert(entity.id) {
+                    entities.push(entity);
+                }
+            }
+        }
+    }
+    // The whole-query filter answers a one-word command lookup without the
+    // fallback above ever running, and the store returns those rows in its own
+    // order. A caller who named a command still gets the command first.
+    if command_kind {
+        entities.sort_by_key(|entity| {
+            let path = entity.file_origin.as_ref().map(|path| path.0.as_str());
+            let rank = crate::command_shape::command_rank_for_query(&query, &entity.name, path);
+            // The path separates one command entry point from its namesakes. It
+            // says nothing about a row that is not one, so it does not reach it.
+            let path_match = match rank {
+                0 => 0,
+                _ => crate::command_shape::command_path_match(&query, path),
+            };
+            std::cmp::Reverse((rank, path_match))
+        });
+    }
+    let entities = entities;
     let total_matches = entities.len();
 
     let mut payload = if compact {
@@ -176,6 +223,15 @@ pub fn handle_semantic_search<G: GraphStore>(
     if let Some(disclosure) = fallback {
         payload[crate::query_tokens::LEXICAL_FALLBACK_KEY] = disclosure;
     }
+    // A caller asking for a command is told that the command rule ran and what
+    // it found, because a ranking that reorders an answer has to be readable:
+    // an empty `command_entry_points` beside `kind: "command"` says the graph
+    // holds no declaration shaped like that command, which is a different
+    // answer from "the rule did not run".
+    if command_kind {
+        payload["command_ranked"] = serde_json::json!(true);
+        payload["command_entry_points"] = serde_json::json!(command_entry_points);
+    }
 
     let json = serde_json::to_string_pretty(&payload).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -194,6 +250,53 @@ pub fn handle_semantic_search<G: GraphStore>(
 /// A token that matches nothing is asked once more in its singular spelling,
 /// since a question says "projections" where the declaration is named for one
 /// projection, and the index holds only the tokens the names produced.
+/// Retrieve the declarations that ARE the command a question named.
+///
+/// One store query per candidate spelling per query word, bounded by
+/// [`MAX_COMMAND_QUERY_TOKENS`] words, and every hit is re-checked against the
+/// question before it is kept, so `Test_apiRun` does not arrive on the query
+/// that finds `apiRun`.
+fn retrieve_command_entry_points<G: GraphStore>(
+    store: &G,
+    filter: &EntityFilter,
+    query: &str,
+) -> Result<Vec<kin_model::entity::Entity>> {
+    /// The most words of a question that may each fan out into name queries.
+    const MAX_COMMAND_QUERY_TOKENS: usize = 4;
+    let mut seen: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
+    let mut found: Vec<kin_model::entity::Entity> = Vec::new();
+    for token in kin_search::tokenize(query)
+        .into_iter()
+        .filter(|token| token.chars().count() >= 2)
+        .take(MAX_COMMAND_QUERY_TOKENS)
+    {
+        for spelling in crate::command_shape::command_name_spellings(&token) {
+            let hits = store
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(spelling),
+                    ..filter.clone()
+                })
+                .map_err(McpError::graph)?;
+            for entity in hits {
+                if !seen.insert(entity.id) {
+                    continue;
+                }
+                if crate::command_shape::command_entry_point_for_query(
+                    query,
+                    &entity.name,
+                    entity.file_origin.as_ref().map(|path| path.0.as_str()),
+                )
+                .is_some()
+                {
+                    found.push(entity);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn retrieve_query_tokens<G: GraphStore>(
     store: &G,
     filter: &EntityFilter,
@@ -4160,6 +4263,19 @@ impl TraceFanoutCandidate {
     /// see a `raise`, so its silence is not a claim that the call was ordinary,
     /// and counting it made this answer `false` for every candidate on any
     /// repository with a language server installed.
+    /// What the graph proved about the edge that reached this candidate.
+    ///
+    /// `has_site` reads the accumulated reference lines rather than the
+    /// displayed relation, because the site belongs to whichever edge recorded
+    /// one and the display picks the strongest kind.
+    fn edge_evidence(&self) -> kin_ranking::entity_ranking::TraceEdgeEvidence {
+        kin_ranking::entity_ranking::TraceEdgeEvidence {
+            proven: self.resolution.is_proven(),
+            has_site: !self.reference_lines.is_empty(),
+            raise_target: self.is_raise_target(),
+        }
+    }
+
     fn is_raise_target(&self) -> bool {
         self.call_edges > 0 && self.raise_call_edges == self.call_edges
     }
@@ -4190,12 +4306,20 @@ impl TraceFanoutCandidate {
 fn trace_reach_set_toward<G: GraphStore>(
     store: &G,
     target: &kin_model::entity::Entity,
-    direction: &str,
+    sense: &str,
     depth: usize,
     allowed: &std::collections::HashSet<RelationKind>,
 ) -> Result<std::collections::HashSet<kin_model::ids::EntityId>> {
-    let want_callees = direction == "calls" || direction == "both";
-    let want_callers = direction == "callers" || direction == "both";
+    // One sense per set, never both at once. A `direction: "both"` walk used to
+    // ask for one set built in both senses, and the union of "everything that
+    // reaches the target" with "everything the target reaches" is most of the
+    // neighbourhood: on a 714-commit slice of `cli/cli`, EVERY one of `apiRun`'s
+    // 45 callees was in it, so the term that exists to put the named target
+    // first told the sort nothing and `target: "httpRequest"` returned a chain
+    // that never mentions `httpRequest`. The caller now builds one set per sense
+    // and asks each candidate's own role which set applies to it.
+    let want_callees = sense == "calls";
+    let want_callers = sense == "callers";
     let mut seen: std::collections::HashSet<kin_model::ids::EntityId> =
         std::collections::HashSet::new();
     seen.insert(target.id);
@@ -4251,6 +4375,15 @@ fn apply_trace_fanout_cap(
     node_file: Option<&str>,
     limit: usize,
 ) -> (usize, usize) {
+    // Candidates that reach a named target sort first, so they occupy the head
+    // of the list. `fanout_cap_keeps` trades the LOWEST kept slot for a
+    // crossing-file candidate below the cap, and when the head is longer than
+    // the cap that trade spends the answer on a boundary crossing. A walk that
+    // was given a target keeps the path to it.
+    let protected = candidates
+        .iter()
+        .take_while(|candidate| candidate.reaches_target)
+        .count();
     let locality: Vec<kin_ranking::entity_ranking::FanoutLocality> = candidates
         .iter()
         .map(|candidate| match candidate.entity.file_origin.as_ref() {
@@ -4261,7 +4394,10 @@ fn apply_trace_fanout_cap(
             Some(_) => kin_ranking::entity_ranking::FanoutLocality::OtherFile,
         })
         .collect();
-    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
+    let mut keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
+    if protected > 0 && !(0..limit.min(protected)).all(|index| keep.contains(&index)) {
+        keep = (0..limit.min(candidates.len())).collect();
+    }
     if keep.len() == candidates.len() {
         return (0, 0);
     }
@@ -4299,7 +4435,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
-            left.is_raise_target(),
+            left.edge_evidence(),
         );
         let right_score = trace_fanout_score(
             &right.entity,
@@ -4307,7 +4443,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
-            right.is_raise_target(),
+            right.edge_evidence(),
         );
         right_score
             .cmp(&left_score)
@@ -4717,7 +4853,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     const DEFAULT_DEPTH: u64 = 3;
     const MAX_DEPTH: u64 = 8;
-    const DEFAULT_LIMIT_PER_STEP: u64 = 5;
+    // Shared with the CLI walker a live daemon routes to, so the two arms
+    // cannot answer one call under two defaults.
+    const DEFAULT_LIMIT_PER_STEP: u64 = crate::remediation::TRACE_DEFAULT_LIMIT_PER_STEP as u64;
     const MAX_LIMIT_PER_STEP: u64 = 25;
     const MAX_TOTAL_STEPS: usize = 200;
 
@@ -4817,7 +4955,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     // asked for is still the chain.
     let mut target_name: Option<String> = None;
     let mut target_unresolved: Option<String> = None;
-    let mut reach_set: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
+    let mut callee_reach: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
+    let mut caller_reach: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
     if let Some(target) = get_optional_string_param(args, "target")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -4830,9 +4969,16 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         };
         match resolved {
             Some(entity) => {
-                reach_set = Some(trace_reach_set_toward(
-                    store, &entity, direction, depth, &allowed,
-                )?);
+                if want_callees {
+                    callee_reach = Some(trace_reach_set_toward(
+                        store, &entity, "calls", depth, &allowed,
+                    )?);
+                }
+                if want_callers {
+                    caller_reach = Some(trace_reach_set_toward(
+                        store, &entity, "callers", depth, &allowed,
+                    )?);
+                }
                 target_name = Some(entity.name.clone());
             }
             None => target_unresolved = Some(target),
@@ -4937,8 +5083,15 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         };
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
-                        let reaches_target =
-                            reach_set.as_ref().is_some_and(|set| set.contains(&next_id));
+                        // The candidate's own role decides which sense of
+                        // reachability applies to it, so a `both` walk asks two
+                        // questions instead of blurring them into one.
+                        let reaches_target = if role == "callee" {
+                            callee_reach.as_ref()
+                        } else {
+                            caller_reach.as_ref()
+                        }
+                        .is_some_and(|set| set.contains(&next_id));
                         candidates.push(TraceFanoutCandidate {
                             reaches_target,
                             call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
@@ -12431,6 +12584,376 @@ mod tests {
         );
         eprintln!("FIR-2396 {tool}: {before} chars unbounded, {after} chars bounded");
         (before, after, bounded)
+    }
+
+    /// A cobra-shaped repository in miniature: the two declarations that ARE the
+    /// `gh api` command, the helper beside them that is not, the client method
+    /// the measured run rooted its whole trace on, and the `gh`-prefixed
+    /// declarations that outranked all of them.
+    ///
+    /// `ghApiId` and `ghApiString` carry BOTH of the question's words while
+    /// `apiRun` carries one, which is the measured shape: on a 714-commit slice
+    /// of `cli/cli` the top of the answer was
+    /// `TestGetAttestations_GhAPI_NoAttestationsFound`, `ghId`, `ghIds` and
+    /// `ghMain`, every one of them a declaration that spells the vendor prefix
+    /// and none of them the command. Coverage-first ranking cannot do anything
+    /// else with that, which is why the rule under test is not a tweak to the
+    /// weights.
+    fn cobra_store() -> InMemoryGraph {
+        let store = InMemoryGraph::new();
+        for (name, file) in [
+            ("apiRun", "pkg/cmd/api/api.go"),
+            ("NewCmdApi", "pkg/cmd/api/api.go"),
+            ("openUserFile", "pkg/cmd/api/api.go"),
+            ("Client.Request", "api/client.go"),
+            ("ghApiId", "pkg/cmd/pr/shared/editable_http.go"),
+            ("ghApiString", "pkg/cmd/pr/shared/editable_http.go"),
+            ("NewCmdRun", "pkg/cmd/run/run.go"),
+        ] {
+            let mut entity = make_entity_in(LanguageId::Go, name, file);
+            if name.contains('.') {
+                entity.kind = EntityKind::Method;
+            }
+            store.upsert_entity(&entity).unwrap();
+        }
+        store
+    }
+
+    fn search_result_names(response: &serde_json::Value) -> Vec<String> {
+        response["results"]
+            .as_array()
+            .expect("results is an array")
+            .iter()
+            .map(|row| row["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The measured `semantic_search {kind: "command", query: "gh api"}`: the
+    /// answer named every declaration spelling the vendor prefix and never the
+    /// command. Both halves of the fix are pinned here, because either alone
+    /// leaves the defect in place. The command is RETRIEVED by its own
+    /// spellings -- on the measured store `name_pattern: "api"` returns one
+    /// row, the `API` class in `internal/codespaces`, so no reordering can
+    /// reach a declaration retrieval never produced -- and once retrieved it
+    /// leads.
+    #[test]
+    fn a_command_query_ranks_the_command_over_the_words_it_shares() {
+        let store = cobra_store();
+        let response = parsed_response(
+            &handle_semantic_search(&search_args("gh api", Some("command")), &store).unwrap(),
+        );
+
+        assert_eq!(
+            response["command_ranked"], true,
+            "the command rule has to say it ran: {response}"
+        );
+        assert!(
+            response["command_entry_points"].as_u64().unwrap_or(0) >= 2,
+            "the command's own declarations are retrieved by their spellings: {response}"
+        );
+
+        let names = search_result_names(&response);
+        assert!(
+            names.len() >= 2,
+            "the command's own declarations must be in the answer: {names:?}"
+        );
+        assert_eq!(
+            &names[..2],
+            &["apiRun".to_string(), "NewCmdApi".to_string()],
+            "the function the command runs leads, then its constructor: {names:?}"
+        );
+        // Absence is the strongest form of "below", so a row that is not in the
+        // answer at all ranks last rather than comparing as unknown.
+        let rank = |name: &str| {
+            names
+                .iter()
+                .position(|row| row == name)
+                .unwrap_or(usize::MAX)
+        };
+        assert!(
+            rank("apiRun") < rank("Client.Request"),
+            "the client method the measured run rooted its trace on ranks below the command: \
+             {names:?}"
+        );
+        assert!(
+            rank("NewCmdApi") < rank("ghApiId"),
+            "a declaration carrying both of the question's words but running no command ranks \
+             below the command: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "NewCmdRun"),
+            "a different subcommand's constructor is not an answer to this question: {names:?}"
+        );
+    }
+
+    /// The control, and the half that makes the test above mean something: the
+    /// SAME store and the SAME question with no `kind` still answer by word
+    /// overlap, so `gh api` leads with the declarations that spell both words
+    /// and the command is buried. The rule is a property of asking for a
+    /// command, not a new global ranking.
+    #[test]
+    fn a_search_that_names_no_command_is_unchanged() {
+        let store = cobra_store();
+        let response =
+            parsed_response(&handle_semantic_search(&search_args("gh api", None), &store).unwrap());
+        assert!(
+            response.get("command_ranked").is_none(),
+            "the command rule must not run for a question that did not ask for one: {response}"
+        );
+        let names = search_result_names(&response);
+        assert!(
+            names.first().is_some_and(|name| name.starts_with("ghApi")),
+            "word overlap still decides an ordinary search: {names:?}"
+        );
+        let command_at = names.iter().position(|name| name == "apiRun");
+        assert!(
+            command_at.is_none_or(|at| at > 0),
+            "and it does not put the command first on its own: {names:?}"
+        );
+    }
+
+    /// A focal with 45 callees, one of which is the hop the question is about.
+    ///
+    /// Sized on `apiRun` in a 714-commit slice of `cli/cli`: 45 outgoing
+    /// `Calls` edges, `httpRequest` among them, and one neighbour whose
+    /// signature is long enough that a single row can put the rendered
+    /// response over a small token budget on its own. That last part is the
+    /// defect's trigger and not decoration.
+    fn wide_callee_store() -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity_in(LanguageId::Go, "apiRun", "pkg/cmd/api/api.go");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut fat = make_entity_in(LanguageId::Go, "Config", "internal/gh/gh.go");
+        fat.kind = EntityKind::Interface;
+        fat.signature = format!(
+            "Config interface {{ {} }}",
+            "GetOrDefault(host string) Entry ".repeat(90)
+        );
+        store.upsert_entity(&fat).unwrap();
+        store
+            .upsert_relation(&make_relation(focal_id, fat.id, RelationKind::Calls))
+            .unwrap();
+
+        // The one edge the graph recorded a site for, which is what orders the
+        // section inside the outgoing-call bucket. Every outgoing call carries
+        // the same relation weight, so without a site the order there falls
+        // through to the neighbours' uuids and which callees survive a tight
+        // budget is arbitrary -- the state this fixture would otherwise be in,
+        // and the state the measured store was in when `httpRequest` landed
+        // 33rd of 45.
+        let target = make_entity_in(LanguageId::Go, "httpRequest", "pkg/cmd/api/http.go");
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal_id,
+                target.id,
+                RelationKind::Calls,
+                "pkg/cmd/api/api.go",
+                434,
+            ))
+            .unwrap();
+
+        for index in 0..43 {
+            let callee = make_entity_in(
+                LanguageId::Go,
+                &format!("callee_{index:02}"),
+                &format!("pkg/cmd/api/helper_{index:02}.go"),
+            );
+            store.upsert_entity(&callee).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, callee.id, RelationKind::Calls))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    /// The measured `get_context_pack` answer on `apiRun`: `dependencies: []`
+    /// beside `dependencies_withheld: 45` and `reason: "token_budget"`, with
+    /// `tokens_used: 3501` of 8,000. The one tool built to hand a model a
+    /// focal's callees handed it none, and every row read as absent rather than
+    /// as present without its source.
+    ///
+    /// The cause is that the fold had one move for a row that did not fit:
+    /// delete it. Rows are admitted at FULL BODY until the budget is gone, so
+    /// the rendered payload is over budget by construction, and the fold shed
+    /// rows from the cheap end until the one expensive body went with the last
+    /// row. A body is an enrichment of a row; the row is the answer.
+    #[test]
+    fn a_wide_focal_keeps_its_callees_as_signatures_instead_of_losing_them() {
+        let (store, focal_id) = wide_callee_store();
+        let sessions = SessionRegistry::empty_for_test();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(focal_id.to_string()),
+            ),
+            ("token_budget".to_string(), serde_json::json!(8000)),
+        ]);
+        let response =
+            parsed_response(&handle_get_context_pack(&args, &store, &sessions, None).unwrap());
+
+        let rows = response["dependencies"]
+            .as_array()
+            .expect("dependencies is an array");
+        assert!(
+            !rows.is_empty(),
+            "a focal with 45 callees must not report none of them: {}",
+            serde_json::to_string(&response["elisions"]).unwrap_or_default()
+        );
+
+        let used = response["tokens_used"].as_u64().unwrap_or(0);
+        let budget = response["token_budget"].as_u64().unwrap_or(0);
+        assert!(
+            !(rows.is_empty() && used * 2 <= budget),
+            "a section is not emptied for a budget it is not spending: {used} of {budget}"
+        );
+
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|row| row["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("httpRequest"),
+            "the call the graph recorded a site for leads the section: {names:?}"
+        );
+        for row in rows {
+            assert_ne!(
+                row["projection"], "FullBody",
+                "the budget sheds bodies before it sheds rows: {row}"
+            );
+        }
+    }
+
+    /// A focal whose fan-out is wider than the default per-step cap, with the
+    /// hop the question is about ranked below it, plus the bare-name call edges
+    /// that a proven call must outrank.
+    fn apirun_fanout_store() -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity_in(LanguageId::Go, "apiRun", "pkg/cmd/api/api.go");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        // Same-file callees, which the locality terms rank above anything in
+        // another file. Seven of them is what pushes the cross-file hop past a
+        // five-wide cap.
+        for index in 0..7 {
+            let near = make_entity_in(
+                LanguageId::Go,
+                &format!("aa_same_file_{index:02}"),
+                "pkg/cmd/api/api.go",
+            );
+            store.upsert_entity(&near).unwrap();
+            store
+                .upsert_relation(&proven_call(focal_id, near.id))
+                .unwrap();
+        }
+        // The hop the question is about: one directory over, proven, with a site.
+        let target = make_entity_in(LanguageId::Go, "httpRequest", "pkg/cmd/api/http.go");
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&proven_call(focal_id, target.id))
+            .unwrap();
+        // The bare-name call edges: same file as the focal, so every locality
+        // term favours them, and nothing at the call site proves the destination.
+        for index in 0..5 {
+            let guess = make_entity_in(
+                LanguageId::Go,
+                &format!("a_guess_{index:02}"),
+                "pkg/cmd/api/api.go",
+            );
+            store.upsert_entity(&guess).unwrap();
+            let mut edge = make_relation(focal_id, guess.id, RelationKind::Calls);
+            edge.confidence = 0.4;
+            store.upsert_relation(&edge).unwrap();
+        }
+        (store, focal_id)
+    }
+
+    /// A call edge the graph proved, carrying the site it is written at.
+    fn proven_call(src: EntityId, dst: EntityId) -> Relation {
+        make_relation_with_site(src, dst, RelationKind::Calls, "pkg/cmd/api/api.go", 433)
+    }
+
+    /// The measured `trace_data_flow` answer on `apiRun`: 45 callees,
+    /// `httpRequest` eighth of them, `limit_per_step` defaulting to 5, and
+    /// `dropped_callees: 40` disclosing that the hop the question was about was
+    /// one of the forty. The default has to reach the answer.
+    #[test]
+    fn the_default_walk_reaches_a_cross_file_hop_and_sinks_the_bare_name_guesses() {
+        let (store, focal_id) = apirun_fanout_store();
+        let args = HashMap::from([
+            ("focal".to_string(), serde_json::json!(focal_id.to_string())),
+            ("direction".to_string(), serde_json::json!("calls")),
+            ("depth".to_string(), serde_json::json!(1)),
+            ("max_response_chars".to_string(), serde_json::json!(60000)),
+        ]);
+        let response = parsed_response(&handle_trace_data_flow(&args, &store).unwrap());
+
+        assert_eq!(
+            response["limit_per_step"], 12,
+            "the default per-step cap is what a 24 KB result ceiling allows: {response}"
+        );
+        let names: Vec<&str> = response["chain"]
+            .as_array()
+            .expect("chain is an array")
+            .iter()
+            .map(|step| step["entity_name"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            names.contains(&"httpRequest"),
+            "the default walk names the hop the question is about: {names:?}"
+        );
+        let target_at = names
+            .iter()
+            .position(|name| *name == "httpRequest")
+            .expect("checked above");
+        let first_guess = names
+            .iter()
+            .position(|name| name.starts_with("a_guess_"))
+            .unwrap_or(usize::MAX);
+        assert!(
+            target_at < first_guess,
+            "a proven call one directory over outranks a bare-name guess in the focal's own \
+             file: {names:?}"
+        );
+    }
+
+    /// The same walk with the hop NAMED. A target the caller asked for is on
+    /// the path this tool returns, whatever the proximity terms would have
+    /// preferred.
+    ///
+    /// The measured failure was `direction: "both"`, which built ONE reach set
+    /// in both senses: the union of what reaches the target and what the target
+    /// reaches is most of the neighbourhood, so the term was true of every
+    /// candidate and ordered nothing.
+    #[test]
+    fn a_named_target_is_the_first_hop_a_both_ways_walk_keeps() {
+        let (store, focal_id) = apirun_fanout_store();
+        let args = HashMap::from([
+            ("focal".to_string(), serde_json::json!(focal_id.to_string())),
+            ("target".to_string(), serde_json::json!("httpRequest")),
+            ("direction".to_string(), serde_json::json!("both")),
+            ("depth".to_string(), serde_json::json!(1)),
+            ("limit_per_step".to_string(), serde_json::json!(3)),
+            ("max_response_chars".to_string(), serde_json::json!(60000)),
+        ]);
+        let response = parsed_response(&handle_trace_data_flow(&args, &store).unwrap());
+
+        assert_eq!(response["target_name"], "httpRequest", "{response}");
+        let names: Vec<&str> = response["chain"]
+            .as_array()
+            .expect("chain is an array")
+            .iter()
+            .map(|step| step["entity_name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("httpRequest"),
+            "a named target leads the walk that was given it: {names:?}"
+        );
     }
 
     fn wide_store(callers: usize) -> (InMemoryGraph, EntityId) {

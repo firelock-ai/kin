@@ -36,6 +36,25 @@ use crate::budget::RESPONSE_MAX_MAX_CHARS;
 /// [`spine_clipped`] first recommended a value past it.
 pub const TRACE_MAX_LIMIT_PER_STEP: usize = 25;
 
+/// The `limit_per_step` a trace surface walks with when the caller names none.
+///
+/// One constant for the same reason as the ceiling above: `trace_data_flow` has
+/// two walkers, the generic-`GraphStore` arm in `crate::handlers::entities` and
+/// the CLI arm that a live daemon routes to, and a default fixed in one of them
+/// reads as fixed on both while only one is. The MCP schema advertises this
+/// number, and both arms take it.
+///
+/// Five was below what the answer costs. Measured on a 714-commit slice of
+/// `cli/cli`: `apiRun` has 45 callees, `httpRequest` -- the hop "how does
+/// `gh api` send the request" is about -- ranks eighth of them, and a five-wide
+/// default reported `dropped_callees: 40` and never named it. Twelve is what
+/// the 24,576-byte per-result ceiling an agent reads a tool answer under
+/// allows at this tool's default depth: on that store at `depth: 3` with the
+/// belt's own `include_body: false`, the rendered response is 16,327
+/// characters at twelve and 22,988 at sixteen, so twelve leaves the envelope
+/// its room and sixteen does not.
+pub const TRACE_DEFAULT_LIMIT_PER_STEP: usize = 12;
+
 /// The largest `max_depth` a `trace_path` call accepts.
 ///
 /// Read by the MCP schema (`crate::tools`), by the handler's clamp
