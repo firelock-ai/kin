@@ -576,6 +576,8 @@ fn config(repo: &Path, out: &Path, base_url: &str, mcp_command: Vec<String>) -> 
         },
         max_result_bytes: None,
         tool_profile: None,
+        // These runs grade the file-tool path the operator can still switch on.
+        belt_file_tools: Some(true),
     }
 }
 

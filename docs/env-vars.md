@@ -54,7 +54,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_AGENT_CONTEXT_ACCOUNTING` | enum | heuristic | correctness | agent request accounting: heuristic estimates the prepared request; llama_cpp uses the selected server's rendered prompt and tokenizer |
 | `KIN_AGENT_OUTPUT_RESERVE_TOKENS` | usize | *(unset)* | correctness | override the agent's output token reserve; must be positive and below the context window, and unset uses the configured context's answer reserve |
 | `KIN_AGENT_OUTPUT_TOKEN_PARAMETER` | enum | *(unset)* | correctness | override the completion request's output-limit field; unset selects max_completion_tokens for api.openai.com and max_tokens for compatible endpoints |
-| `KIN_AGENT_PURE_KIN` | bool | false | operational | lock `kin agent run` to Kin tools only: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes |
+| `KIN_AGENT_PURE_KIN` | bool | true | operational | keep `kin agent run` on Kin tools only, the default: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes; false adds the two file tools back |
 | `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN` | bool | false | operational | allow the CLI to bootstrap an admin-scoped daemon |
 | `KIN_ALLOW_MASS_DELETION` | bool | false | correctness | permit reconcile to apply mass deletions (data-destructive) |
 | `KIN_ALLOW_OFFLINE_RESTORE` | bool | false | operational | allow restoring a backup without remote verification |

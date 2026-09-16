@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.20] - 2026-09-16
+
 ### Added
 
 - `kin setup` opens with a hardware check. It names the architecture, the
@@ -49,6 +51,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- MCP `find_references` answers Go interface dispatch candidates, with truthful
+  counts that keep a candidate out of the proven total (#78)
+- The agent belt's response ceiling is per tool: `trace_data_flow` and
+  `get_context_pack` are served the agent's own 24,576 byte per-result limit and
+  every other budgeted tool keeps 12,000 (#78)
+- The seven session and transaction tools describe themselves as write plumbing,
+  and the MCP server instructions name the query tools one line each, so a client
+  that ranks tools by description can find the tools that answer a code question
+  (#77, in #83)
+- Regenerate the KinLab Kin reference data from a current binary and gate it
+  against going stale again (#83)
+
+- `kin agent run` puts the Kin-only belt on the model by default: no `edit_file`,
+  no `write_file`, and the one write tool is `kin_mutate`, which names the
+  entity it changes. `KIN_AGENT_PURE_KIN=false` adds the two file tools back.
+
+
 - Remove a `kin-vfs` and shim pair left by an earlier release. The installer clears them
   when the archive carries no projection runtime, and `kin update` does the same on its
   next run, so a 0.7.17 projection client cannot sit on PATH beside a newer daemon.
@@ -56,22 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kin setup` recorded, reported by `kin resources inspect` and marked by
   `KIN_RESOURCE_PROFILE_HOST_CONFIG` so a spawned daemon does not read it as an
   operator override.
-
-### Fixed
-
-- Stop requiring the retired `kin-vfs` projection runtime and its shim when judging a
-  release archive. 0.7.18 removed both from the archive, and every updater built before
-  this change still demands them, so `kin update` refuses the release with `release
-  archive is incomplete: required component 'kin-vfs' is missing`. **An install on 0.7.19
-  or earlier cannot repair itself and must re-run the installer**
-  (`curl -fsSL https://get.kinlab.dev/install | sh`, or
-  `irm https://get.kinlab.dev/install.ps1 | iex` on Windows). The installer reads the
-  archive it downloads rather than a list fixed when it was built, so it always reaches
-  the current release.
-- Name the installer in the refusal, so the next time a release changes the archive's
-  shape the error carries the one command that recovers the install.
-
-## [0.7.20] - 2026-09-16
 
 ### Fixed
 
@@ -103,19 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pin the anchor flag in the `kin locate` tests that read anchors, so a
   neighbouring test's environment cannot empty their anchor set (#87)
 
-### Changed
-
-- MCP `find_references` answers Go interface dispatch candidates, with truthful
-  counts that keep a candidate out of the proven total (#78)
-- The agent belt's response ceiling is per tool: `trace_data_flow` and
-  `get_context_pack` are served the agent's own 24,576 byte per-result limit and
-  every other budgeted tool keeps 12,000 (#78)
-- The seven session and transaction tools describe themselves as write plumbing,
-  and the MCP server instructions name the query tools one line each, so a client
-  that ranks tools by description can find the tools that answer a code question
-  (#77, in #83)
-- Regenerate the KinLab Kin reference data from a current binary and gate it
-  against going stale again (#83)
+- Stop requiring the retired `kin-vfs` projection runtime and its shim when judging a
+  release archive. 0.7.18 removed both from the archive, and every updater built before
+  this change still demands them, so `kin update` refuses the release with `release
+  archive is incomplete: required component 'kin-vfs' is missing`. **An install on 0.7.19
+  or earlier cannot repair itself and must re-run the installer**
+  (`curl -fsSL https://get.kinlab.dev/install | sh`, or
+  `irm https://get.kinlab.dev/install.ps1 | iex` on Windows). The installer reads the
+  archive it downloads rather than a list fixed when it was built, so it always reaches
+  the current release.
+- Name the installer in the refusal, so the next time a release changes the archive's
+  shape the error carries the one command that recovers the install.
 
 ## [0.7.19] - 2026-09-13
 
