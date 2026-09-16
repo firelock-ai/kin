@@ -24,13 +24,15 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use crate::daemon_client::process_runs_a_kin_image;
 use crate::daemon_client::{
     caller_home_id, fetch_registered_daemons, is_port_open, is_process_alive, probe_daemon_port,
-    process_identity, process_identity_is_current, process_runs_a_kin_image,
-    read_endpoint_owner_record, read_supervisor_owner_record, remove_stale_daemon_files,
-    remove_stale_supervisor_files, repo_daemon_owner_path, repo_daemon_pid_path,
-    repo_daemon_port_path, repo_daemon_recorded_endpoint, retire_stopped_daemon_endpoint,
-    supervisor_owner_path, supervisor_pid_path, supervisor_port_path, supervisor_recorded_endpoint,
+    process_identity, process_identity_is_current, read_endpoint_owner_record,
+    read_supervisor_owner_record, remove_stale_daemon_files, remove_stale_supervisor_files,
+    repo_daemon_owner_path, repo_daemon_pid_path, repo_daemon_port_path,
+    repo_daemon_recorded_endpoint, retire_stopped_daemon_endpoint, supervisor_owner_path,
+    supervisor_pid_path, supervisor_port_path, supervisor_recorded_endpoint,
     try_acquire_supervisor_startup_lock_in_dir, DaemonHomeScope, DaemonPortProbe,
     PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon, SupervisorStartupLock,
 };
@@ -561,6 +563,7 @@ fn attributed_supervisor_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
 /// about to exit cleanly and throw the flush away. Measured on the recorded
 /// wedge: a hand-sent `kill -TERM` took about twenty seconds to take effect,
 /// inside this window, and the store was correct and complete afterwards.
+#[cfg(unix)]
 const ESCALATION_SIGTERM_WAIT: Duration = DAEMON_FORCE_EXIT_WORST_CASE;
 
 /// How long the escalation waits after `SIGKILL` before reporting the pid as
@@ -571,6 +574,7 @@ const ESCALATION_SIGKILL_WAIT: Duration = Duration::from_secs(5);
 
 /// Poll interval while waiting for a signalled process to disappear. The same
 /// 50ms the cooperative and graceful waits use.
+#[cfg(unix)]
 const ESCALATION_POLL: Duration = Duration::from_millis(50);
 
 /// Whether the recorded incarnation is gone, polled until `window` expires.
