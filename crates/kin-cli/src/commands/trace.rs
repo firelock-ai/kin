@@ -436,6 +436,14 @@ fn build_trace_lines_with_graph(
     };
     let pack = kin_context::build_context_pack(graph, &target.id, &opts)?;
 
+    // The focal's own edges, so every row below can say which relation the graph
+    // holds for it and which way that relation points. One read of the focal's
+    // relations, and the same query the pack's own admission order is built on.
+    let focal_edges = kin_context::focal_dependency_edges(
+        &target.id,
+        &graph.get_all_relations_for_entity(&target.id)?,
+    );
+
     let file_display = target
         .file_origin
         .as_ref()
@@ -530,14 +538,21 @@ fn build_trace_lines_with_graph(
             .collect();
         if !all_dep_ids.is_empty() {
             lines.push("\n--- Deps ---".to_string());
-            let mut printed = 0usize;
+            // Every call the focal makes is printed. The eight-row cap and the
+            // same-file skip below bound the rows that answer a different
+            // question; neither may cut a row that answers this one, which is
+            // what left `apiRun`'s call to `httpRequest` out of every rendering.
+            let mut other_printed = 0usize;
+            let mut other_withheld = 0usize;
             for eid in &all_dep_ids {
-                if printed >= 8 {
-                    break;
+                let call = is_outgoing_call(&focal_edges, eid);
+                if !call && other_printed >= 8 {
+                    other_withheld += 1;
+                    continue;
                 }
                 if let Some(dep) = graph.get_entity(eid)? {
-                    if dep.file_origin == target.file_origin {
-                        continue; // skip same-file deps — agent already has the file
+                    if !call && dep.file_origin == target.file_origin {
+                        continue; // skip same-file non-call deps; the agent has the file
                     }
                     let file_loc = dep
                         .file_origin
@@ -546,37 +561,83 @@ fn build_trace_lines_with_graph(
                         .unwrap_or_else(|| "unknown".to_string());
                     let line = kin_mcp::handlers::common::entity_presentation_start_line(&dep)
                         .unwrap_or(0);
-                    lines.push(format!("  {} @ {}:{}", dep.name, file_loc, line));
-                    printed += 1;
+                    lines.push(format!(
+                        "  {} {} @ {}:{}",
+                        relation_label(&focal_edges, eid),
+                        dep.name,
+                        file_loc,
+                        line
+                    ));
+                    if !call {
+                        other_printed += 1;
+                    }
                 }
+            }
+            if other_withheld > 0 {
+                lines.push(format!(
+                    "  ({} further non-call rows not shown)",
+                    other_withheld
+                ));
             }
         }
     } else {
         if !pack.dependency_signatures.is_empty() {
             lines.push("\n--- Nearby ---".to_string());
             let mut expanded_same_file = 0usize;
-            for entry in pack.dependency_signatures.iter().take(nearby_limit) {
-                if let Some(dep) = graph.get_entity(&entry.entity_id)? {
+            // `--nearby` bounds the rows that answer a question other than "what
+            // does this call". A call the focal makes is always printed: the
+            // section is ordered so those rows come first, and a limit that can
+            // still cut one turns a graph the walk reached into an absence the
+            // reader cannot see.
+            let mut other_printed = 0usize;
+            let mut other_withheld = 0usize;
+            for entry in pack.dependency_signatures.iter() {
+                let call = is_outgoing_call(&focal_edges, &entry.entity_id);
+                if !call {
+                    if other_printed >= nearby_limit {
+                        other_withheld += 1;
+                        continue;
+                    }
+                    other_printed += 1;
+                }
+                let label = relation_label(&focal_edges, &entry.entity_id);
+                let dep = graph.get_entity(&entry.entity_id)?;
+                if let Some(ref dep) = dep {
                     let same_file = dep.file_origin == target.file_origin;
                     if same_file && expanded_same_file < 4 {
                         if let Some(content) = render_neighbor_source(
                             binding,
                             graph,
-                            &dep,
+                            dep,
                             focal_max_lines,
                             snippet_max_chars,
                         )? {
-                            lines.push(content);
+                            lines.push(labelled_row(&label, &content));
                             expanded_same_file += 1;
                             continue;
                         }
                     }
                 }
 
-                lines.push(clip_rendered_text_with_cap(
-                    &entry.content,
-                    focal_max_lines,
-                    snippet_max_chars,
+                let rendered =
+                    clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars);
+                // An entity the graph holds no signature for projects to nothing,
+                // and a labelled blank says an edge exists and names no end of it.
+                // The name and kind are what the graph does hold.
+                let rendered = if rendered.trim().is_empty() {
+                    match dep {
+                        Some(dep) => format!("{} ({:?})", dep.name, dep.kind),
+                        None => rendered,
+                    }
+                } else {
+                    rendered
+                };
+                lines.push(labelled_row(&label, &rendered));
+            }
+            if other_withheld > 0 {
+                lines.push(format!(
+                    "({} further non-call rows not shown; raise --nearby to see them)",
+                    other_withheld
                 ));
             }
         }
@@ -584,10 +645,13 @@ fn build_trace_lines_with_graph(
         if !pack.transitive_deps.is_empty() {
             lines.push("\n--- Transitive ---".to_string());
             for entry in pack.transitive_deps.iter().take(transitive_limit) {
-                lines.push(clip_rendered_text_with_cap(
-                    &entry.content,
-                    focal_max_lines,
-                    snippet_max_chars,
+                lines.push(labelled_row(
+                    &relation_label(&focal_edges, &entry.entity_id),
+                    &clip_rendered_text_with_cap(
+                        &entry.content,
+                        focal_max_lines,
+                        snippet_max_chars,
+                    ),
                 ));
             }
         }
@@ -830,6 +894,49 @@ fn render_entity_source(
 
 fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
     rel_path.to_string()
+}
+
+/// The edge the graph holds between the focal and one rendered row.
+///
+/// Every row used to arrive unlabelled under a heading a reader takes for
+/// callees, so a `References` edge to an unrelated package's same-named
+/// function read exactly like a call: on `cli/cli` v2.101.0 `apiRun`'s section
+/// listed `requestBody` from `pkg/cmd/run/rerun`, which `apiRun` references by
+/// name and never calls, with nothing on the row to say so.
+///
+/// `2-hop` is the honest answer for a transitive row: the focal holds no edge
+/// to it at all, and naming a kind there would invent one.
+fn relation_label(
+    focal_edges: &std::collections::HashMap<kin_model::EntityId, kin_context::FocalEdge>,
+    entity_id: &kin_model::EntityId,
+) -> String {
+    match focal_edges.get(entity_id) {
+        Some(edge) => match edge.direction {
+            kin_context::FocalEdgeDirection::Outgoing => format!("[{:?} ->]", edge.kind),
+            kin_context::FocalEdgeDirection::Incoming => format!("[<- {:?}]", edge.kind),
+        },
+        None => "[2-hop]".to_string(),
+    }
+}
+
+/// Put a row's label in front of its rendering, on its own line when the
+/// rendering is a source body rather than a signature.
+fn labelled_row(label: &str, content: &str) -> String {
+    if content.contains('\n') {
+        format!("{}\n{}", label, content)
+    } else {
+        format!("{} {}", label, content)
+    }
+}
+
+/// Whether one rendered row rides a call the focal makes.
+fn is_outgoing_call(
+    focal_edges: &std::collections::HashMap<kin_model::EntityId, kin_context::FocalEdge>,
+    entity_id: &kin_model::EntityId,
+) -> bool {
+    focal_edges
+        .get(entity_id)
+        .is_some_and(kin_context::FocalEdge::is_outgoing_call)
 }
 
 fn render_neighbor_source(
@@ -1109,8 +1216,8 @@ mod tests {
     }
 
     use super::{
-        entity_mentions_qualifier, fallback_leaf_trace_matches, query_trace_matches,
-        select_best_match, trace_not_found_guidance,
+        entity_mentions_qualifier, fallback_leaf_trace_matches, is_outgoing_call, labelled_row,
+        query_trace_matches, relation_label, select_best_match, trace_not_found_guidance,
     };
     use kin_core::normalize_trace_name;
     use kin_db::{InMemoryGraph, LocalFileBackend};
@@ -1432,6 +1539,73 @@ mod tests {
     fn normalize_trace_name_strips_generic_arguments() {
         assert_eq!(normalize_trace_name("Router<S>::route"), "Router::route");
         assert_eq!(normalize_trace_name("Map<K, V>::insert"), "Map::insert");
+    }
+
+    #[test]
+    fn every_row_says_which_relation_the_graph_holds_and_which_way() {
+        use kin_model::relation::RelationKind;
+        let callee = make_entity("httpRequest");
+        let referenced = make_entity("requestBody");
+        let caller = make_entity("NewCmdApi");
+        let two_hop = make_entity("addQueryParam");
+        let mut focal_edges = std::collections::HashMap::new();
+        focal_edges.insert(
+            callee.id,
+            kin_context::FocalEdge {
+                kind: RelationKind::Calls,
+                direction: kin_context::FocalEdgeDirection::Outgoing,
+            },
+        );
+        focal_edges.insert(
+            referenced.id,
+            kin_context::FocalEdge {
+                kind: RelationKind::References,
+                direction: kin_context::FocalEdgeDirection::Outgoing,
+            },
+        );
+        focal_edges.insert(
+            caller.id,
+            kin_context::FocalEdge {
+                kind: RelationKind::Calls,
+                direction: kin_context::FocalEdgeDirection::Incoming,
+            },
+        );
+
+        assert_eq!(relation_label(&focal_edges, &callee.id), "[Calls ->]");
+        assert_eq!(
+            relation_label(&focal_edges, &referenced.id),
+            "[References ->]",
+            "a reference the focal makes must not be rendered as a call"
+        );
+        assert_eq!(relation_label(&focal_edges, &caller.id), "[<- Calls]");
+        assert_eq!(
+            relation_label(&focal_edges, &two_hop.id),
+            "[2-hop]",
+            "the focal holds no edge to it, so no kind may be claimed"
+        );
+
+        assert!(is_outgoing_call(&focal_edges, &callee.id));
+        assert!(
+            !is_outgoing_call(&focal_edges, &referenced.id),
+            "only a call counts as a call, so only a call is exempt from the limit"
+        );
+        assert!(!is_outgoing_call(&focal_edges, &caller.id));
+        assert!(!is_outgoing_call(&focal_edges, &two_hop.id));
+    }
+
+    #[test]
+    fn a_label_leads_a_signature_and_heads_a_body() {
+        assert_eq!(
+            labelled_row("[Calls ->]", "func httpRequest()"),
+            "[Calls ->] func httpRequest()"
+        );
+        assert_eq!(
+            labelled_row(
+                "[Calls ->]",
+                "// fillPlaceholders\nfunc fillPlaceholders() {}"
+            ),
+            "[Calls ->]\n// fillPlaceholders\nfunc fillPlaceholders() {}"
+        );
     }
 
     #[test]

@@ -3930,6 +3930,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "the host had no room for the embed pass".to_string(),
             at_unix: 4_800,
+            from_budget: false,
         };
         let refused = embedding_model_notice(&absent, &absent, Some(&refusal));
         assert!(
@@ -4086,12 +4087,14 @@ mod tests {
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "the embed batch was held back",
+            false,
         );
         PressureRefusal::record(
             dir.path(),
             HeavyWork::LspSweep,
             PressureLevel::Critical,
             "the sweep was held back",
+            false,
         );
 
         // This is only the case that matters if the newest really is the other

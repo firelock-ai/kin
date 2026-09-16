@@ -1817,7 +1817,11 @@ pub fn build_graph_source_response(
         &crate::entity_identity::IdentityQualifiers::default(),
     )?;
     let refusal = if resolution.pin_excluded_all() {
-        Some(crate::entity_identity::pin_miss_lines(graph, &resolution))
+        Some(crate::entity_identity::pin_miss_lines(
+            graph,
+            &resolution,
+            crate::entity_identity::PinSpelling::FileKind,
+        ))
     } else if resolution.needs_a_pin() {
         Some(crate::entity_identity::pin_request_lines(
             graph,
@@ -2168,6 +2172,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "background work was refused".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         let complete = kin_core::memory_pressure::EmbeddingCoverage {
             pending: 0,

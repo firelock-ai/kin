@@ -6269,6 +6269,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "host memory pressure is critical".to_string(),
             at_unix: 4_800,
+            from_budget: false,
         };
         let held = Envelope::daemon().with_memory_pressure(Some(&refusal));
         assert_eq!(held.degraded.memory_pressure, Some(true));
@@ -6294,6 +6295,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "host memory pressure is critical".to_string(),
             at_unix: 4_800,
+            from_budget: false,
         };
         let held = Envelope::daemon().with_memory_pressure(Some(&refusal));
         assert_eq!(

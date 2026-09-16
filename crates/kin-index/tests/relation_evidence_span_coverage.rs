@@ -181,7 +181,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Go",
         min_relations: 2,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Go records the call expression now. The floor is set the way the
+        // other site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.go",
@@ -705,7 +709,11 @@ fn print_table(rows: &[(String, Counts)], title: &str) {
 /// offset. This constant proves something different and narrower: that the
 /// linker carries a site the parser recorded all the way onto persisted
 /// evidence.
-const MEASURED_RELATIONS_WITH_SPAN: usize = 12;
+///
+/// 12 to 15 when the Go adapter started recording the position of a call, a
+/// value read, a send and a spawn. All three of this fixture's Go relations are
+/// calls and all three now carry a site, which is the whole of the move.
+const MEASURED_RELATIONS_WITH_SPAN: usize = 15;
 
 /// Span-backed evidence RECORDS, which exceed span-backed relations whenever one
 /// caller reaches one callee at more than one site. Each fixture calls `compute`
@@ -717,7 +725,12 @@ const MEASURED_RELATIONS_WITH_SPAN: usize = 12;
 /// edge carries exactly one evidence record because a specifier binds once.
 /// The surplus of records over relations is unchanged, since it comes from
 /// repeat CALL sites and this edge adds none.
-const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 15;
+///
+/// 15 to 19 with Go, which is now a fourth site-recording language and
+/// contributes four records across three edges for the same reason the others
+/// do: `run` calls `compute` twice and those two sites travel as two records on
+/// the one edge.
+const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 19;
 
 #[test]
 fn relation_evidence_span_population_per_language() {

@@ -907,6 +907,11 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     }
 }
 
+/// The value reads one context has already emitted a `References` edge for,
+/// keyed on (name, start byte) so repeated reads of one name each keep their
+/// own position while a subtree the walk reaches twice still yields one edge.
+type ValueReadsSeen = std::collections::HashSet<(String, usize)>;
+
 /// Recursively walk a function/method body to find `call_expression` nodes.
 ///
 /// Callee names are extracted as *simple* identifiers: for a selector
@@ -924,7 +929,7 @@ fn extract_calls_from_body(
     context_name: &str,
     relations: &mut Vec<ExtractedRelation>,
     call_prefixes: &mut Vec<(usize, String)>,
-    ref_seen: &mut std::collections::HashSet<String>,
+    ref_seen: &mut ValueReadsSeen,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -976,7 +981,11 @@ fn extract_calls_from_body(
                 if is_valid_callee_name(&callee) {
                     let idx = relations.len();
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The call expression itself, so a reference row can
+                        // report the line the call is written on. Without it the
+                        // linker has no span to store and every consuming
+                        // surface reports the edge as having no evidence span.
+                        site: Some(crate::adapter::site_from_node(&child)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
@@ -995,7 +1004,9 @@ fn extract_calls_from_body(
                 let channel_name = channel.utf8_text(source).unwrap_or("").to_string();
                 if !channel_name.is_empty() {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The send statement, for the same reason the call
+                        // expression above is recorded.
+                        site: Some(crate::adapter::site_from_node(&child)),
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::SendsMessage,
@@ -1014,7 +1025,8 @@ fn extract_calls_from_body(
                         let spawned = function.utf8_text(source).unwrap_or("").to_string();
                         if !spawned.is_empty() {
                             relations.push(ExtractedRelation {
-                                site: None,
+                                // The `go` statement's call expression.
+                                site: Some(crate::adapter::site_from_node(&go_child)),
                                 receiver: None,
                                 call_shape: None,
                                 kind: kin_model::RelationKind::Spawns,
@@ -1039,23 +1051,34 @@ fn extract_calls_from_body(
 }
 
 /// Emit `References` edges for the value-position identifiers read within
-/// `node`, sourced from `context_name`. Deduped by destination name against
-/// `ref_seen` so a name referenced several times in one body yields one edge.
-/// The linker resolves References by name and drops unresolvables, so locals
-/// and parameters that match no package-level entity are harmless.
+/// `node`, sourced from `context_name`, each carrying the position it was read
+/// at. The linker resolves References by name and drops unresolvables, so
+/// locals and parameters that match no package-level entity are harmless.
+///
+/// `ref_seen` is keyed on (name, start byte) rather than on the name alone.
+/// Keying it on the name dropped every read after the first, so a body that
+/// reads a name five times produced one edge carrying one position at best, and
+/// the four other reads could not be recovered downstream: a relation's
+/// evidence is the only record of where the syntax sat. The walk reaches some
+/// subtrees from more than one match arm, and a position key still collapses
+/// those to one edge per read, so the emitted set stays free of duplicates.
 fn emit_value_references(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
     relations: &mut Vec<ExtractedRelation>,
-    ref_seen: &mut std::collections::HashSet<String>,
+    ref_seen: &mut ValueReadsSeen,
 ) {
-    let mut names = Vec::new();
-    collect_value_refs(node, source, &mut names);
-    for name in names {
-        if name != context_name && ref_seen.insert(name.clone()) {
+    let mut reads = Vec::new();
+    collect_value_refs(node, source, &mut reads);
+    for (name, site) in reads {
+        if name != context_name && ref_seen.insert((name.clone(), site.start_byte)) {
             relations.push(ExtractedRelation {
-                site: None,
+                // The identifier that read the name. The linker merges the
+                // evidence of every edge that resolves to the same
+                // (source, destination, kind), so the sites of repeated reads
+                // accumulate onto one relation.
+                site: Some(site),
                 receiver: None,
                 call_shape: None,
                 kind: kin_model::RelationKind::References,
@@ -1067,7 +1090,8 @@ fn emit_value_references(
     }
 }
 
-/// Collect bare identifier names read as VALUES within an expression subtree.
+/// Collect bare identifier names read as VALUES within an expression subtree,
+/// each paired with the position the identifier sits at.
 ///
 /// Walks value expressions while pruning positions that are not value reads:
 /// a call's callee (already captured as a `Calls` edge), a selector's `.field`
@@ -1075,12 +1099,16 @@ fn emit_value_references(
 /// identifiers and the blank identifier `_` are never collected. The receiver
 /// of a method call (`obj` in `obj.M()`) and every call argument ARE collected,
 /// since they are genuine value reads.
-fn collect_value_refs(node: &tree_sitter::Node, source: &[u8], out: &mut Vec<String>) {
+fn collect_value_refs(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut Vec<(String, crate::extract::RelationSite)>,
+) {
     match node.kind() {
         "identifier" => {
             let name = node.utf8_text(source).unwrap_or("");
             if !name.is_empty() && name != "_" {
-                out.push(name.to_string());
+                out.push((name.to_string(), crate::adapter::site_from_node(node)));
             }
         }
         // `x.Field` reads the operand value `x`; the `.Field` selector itself

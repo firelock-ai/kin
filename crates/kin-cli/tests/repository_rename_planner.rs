@@ -660,7 +660,10 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_source: "package main\n\nfunc caller() int { return target() + target() }\n",
         has_named_import: false,
         emits_module_entity_per_file: true,
-        records_call_sites: false,
+        // Go records the call expression now. Rust, Java, C and C++ below are
+        // still false, and this census is what says so: each is the same gap in
+        // its own adapter, and flipping one of them is what proves it closed.
+        records_call_sites: true,
     },
     LanguageFixture {
         name: "Java",
