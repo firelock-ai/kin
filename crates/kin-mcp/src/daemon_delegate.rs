@@ -2834,6 +2834,7 @@ mod tests {
             level: "constrained".to_string(),
             reason: format!("{work} was refused"),
             at_unix: 1,
+            from_budget: false,
         }
     }
 

@@ -46948,10 +46948,10 @@ mod tests {
              (indexed={indexed}, pending={pending}, total={total})"
         );
         assert_eq!(indexed, total, "every retrievable key was seeded");
-        // Not `pending == 0`. `pending` is `max(queue_length, total - indexed)`,
-        // and upserting the entity above put it on the graph's embedding queue,
-        // so a fully covered graph still reports the queued work. Coverage and
-        // outstanding work are different facts; only the first is asserted here.
+        // Coverage and outstanding work are different facts, and only the
+        // first is asserted here. `pending` is the coverage shortfall,
+        // `total - indexed`, and the queued re-embed that upserting the entity
+        // above enqueued is reported separately as `queued`.
         assert!(
             pending >= total - indexed,
             "pending ({pending}) must account for the uncovered keys"

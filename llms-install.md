@@ -338,6 +338,26 @@ daemons belonging to other managed homes rather than stopping them, and leaves t
 supervisor up while any of them remain. Leave a daemon running if the user is about to work
 in the repository. It is the normal serving state, not a leak.
 
+## If you run Kin's own agent
+
+`kin agent run` drives any OpenAI-compatible endpoint against this same MCP surface, and
+writes `transcript.jsonl`, `kin-trace.jsonl` and `result.json` per run under `--out`.
+
+Read a run's spend off `kin_agent.cost` in `result.json` rather than counting it yourself.
+It carries `total_input_tokens`, `total_output_tokens`, `requests`, `stop_reason`,
+`tool_calls`, `error_calls`, and a `by_tool` row per tool name holding that tool's `calls`,
+`error_calls`, `bytes_returned`, `bytes_shown` and `wall_ms`.
+
+Two fields decide whether a number from that object means anything. `error_calls` is how
+many calls came back to the model as an error, and a run whose calls were refused is not a
+run that did the work cheaply, so read it in the same breath as the token totals.
+`accounting_mode` names which counting produced those totals, one of `endpoint_usage`,
+`endpoint_usage_partial`, `llama_cpp_tokenizer`, `heuristic` or `none`. A byte heuristic and
+a model's own tokenizer are different rulers, so never compare a number from one run against
+a number from another without checking that both say the same mode. When nothing counted the
+answers, `total_output_tokens` is `null` rather than 0. The full field list is in
+[the CLI reference](docs/cli-reference.md#kin-agent).
+
 ## When something is wrong
 
 **`kin init` exits 1 saying the repository is shallow.** Run `git fetch --unshallow`, then

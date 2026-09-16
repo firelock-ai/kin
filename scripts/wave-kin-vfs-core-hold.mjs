@@ -9,7 +9,7 @@
 // a Kin release ships both halves. The registry requirement in `Cargo.toml` is
 // what the Kin binary links against. The immutable kin-vfs checkout commit,
 // recorded as a literal in `release.yml` and `rc-build.yml`, is the tree the
-// release builds the kin-vfs binary from. `scripts/check-kin-vfs-compat.mjs`
+// release builds the kin-vfs binary from. `scripts/kin-vfs-pins.mjs`
 // refuses when they disagree, and it is a required context on every pull
 // request.
 //
@@ -31,7 +31,7 @@
 // and the reviewed pull request that advances the pin is what releases the next
 // kin-vfs-core roll.
 //
-// The pin is read through `check-kin-vfs-compat.mjs`'s own discovery rather
+// The pin is read through `kin-vfs-pins.mjs`'s own discovery rather
 // than a second reader, so this and the gate it exists to satisfy cannot
 // disagree about where the pin lives or what it says.
 
@@ -46,7 +46,7 @@ import {
   lockPackages,
   readPinSources,
   readPinnedVfsCommit,
-} from './check-kin-vfs-compat.mjs';
+} from './kin-vfs-pins.mjs';
 
 export { VFS_CORE, VFS_REPOSITORY };
 
@@ -327,7 +327,7 @@ export async function main({
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  // Resolved from the working directory, exactly as check-kin-vfs-compat.mjs
+  // Resolved from the working directory, exactly as kin-vfs-pins.mjs
   // resolves it, so both read the same tree when the workflow runs them from
   // GITHUB_WORKSPACE.
   main().catch((error) => {

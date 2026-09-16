@@ -115,6 +115,27 @@ not act on an absence in the answer.
 `_kin.completeness` beside it carries `status`, `bound` (`exact` or `at_least`),
 `substrate`, `classes`, `decided_by`, `limits`, `counted` and `reference_resolution`.
 
+The embedding class carries a state the edge classes do not, `partial`, and the
+difference is load bearing. `absent` means an attached vector index holds no embedding
+for any eligible entity, which `kin embed` fixes from a standing start. `partial` means
+the index holds some and is still filling, which finishes on its own. The two used to
+share the word `absent`, and a store verified at `18124/18124 indexed (0 pending)`,
+read a moment later at 18123 indexed with 2 pending, published
+`classes.embeddings: "absent"` beside `semantic_coverage.embedding_state: "partial"` in
+one response. Read the class and `semantic_coverage`'s counters together: they are one
+fact stated twice and they now agree.
+
+A nearly whole index still does not certify, and that is deliberate rather than an
+oversight. `bound` is `at_least` whenever the answer cannot be shown to be whole, which
+is exactly what entities still queued for embedding mean, and `bound: at_least` under a
+certified verdict is itself a contradiction the tests scan for. So a threshold that let
+0.011 percent pending certify would have to carry `status` to `complete` and `bound` to
+`exact` over a class the same object publishes as `partial`, putting two fields in one
+response back into disagreement one field over from where they were fixed. Kin sizes the
+shortfall instead of waving it through: act on `classes`, `limits` and the counters
+together, and treat `inconclusive` over a 99.99 percent index as "the counts are a floor
+by that much" rather than as "the index is missing".
+
 A tool that changes state, which is every session and transaction tool, carries only
 `envelope_version`, `runtime` and `degraded`, plus `behind` or `watcher_loss` when
 either holds. The store readings ride `kin_graph_status` and every read.
@@ -188,7 +209,7 @@ in `negative.trust_reason`. The list is closed: a code not in it is never sent, 
 | `semantic_authoritative` | Certifying: daemon-owned truth with complete embedding coverage. Appears only when trust is authoritative. |
 | `spine_root_stale` | The cross-repo spine's recorded root for this repository is stale. |
 | `structural_authoritative` | Certifying: the daemon's graph is initialized and loaded. Appears only when trust is authoritative. |
-| `substrate_partial` | A coverage class the answer depended on was observed absent; `_kin.completeness.classes` names it. |
+| `substrate_partial` | A coverage class the answer depended on was observed short of whole; `_kin.completeness.classes` names it and says whether it was `partial`, `absent` or `unproduced`. |
 | `substrate_unknown` | The coverage classes the answer depended on were not all observed present; `_kin.completeness.classes` names them. |
 | `trace_spine_clipped` | The per-step cap cut the walk's fan-out, so the chain is one route among those the cap kept and a missing hop was not looked for. |
 | `trace_walk_degraded` | The walk reported degradations, so it did not complete under its own work bounds. |
@@ -391,6 +412,37 @@ envelope, this is the tool that says so, and it costs about 610 bytes.
 An agent that never searches gets a narrower answer, never a wrong one. No served description
 points at a withheld tool in silence: on this profile the note names `kin_tool_search` as the way
 to reach it, rather than telling an agent mid-session to restart the server on `full`.
+
+#### A client that hides the tool schemas
+
+Some clients never send the tool schemas to the model at all. Grok is one: it delivers this
+server's `instructions` string verbatim as a synthetic reminder on turn one, and the model has
+to call Grok's own `search_tool` with a query to learn any Kin tool's name or schema. Measured
+on 2026-09-15 with Kin attached beside Grok's own file and shell tools, three local models made
+zero Kin calls across ten runs. Every one of the ten answered from Grok's own file and shell
+tools instead, and only three ever called `search_tool` at all.
+
+Two things follow, and both are now Kin's side of the contract rather than the client's.
+
+The `instructions` string is a discovery surface. It names `semantic_locate`,
+`semantic_search`, `get_context_pack`, `find_references`, `trace_data_flow`, `trace_path`,
+`impact_analysis` and `list_file_entities` with one line each, because a name a model has read
+is a name it can search for, and it tells a model whose client lists tools by search to search
+for `kin` before its first file read. It stays under 1,200 bytes, since a client spends it once
+per session on the model's context. `kin agent run` builds its own prompt and never reads it.
+
+The session and transaction descriptions carry no code vocabulary. A client that ranks tools by
+retrieval scores them against the question, and on one real locate question Grok's ranked top
+eight came back holding `kin_transaction_commit` and `kin_session_end` while `get_context_pack`,
+`find_references`, `trace_path` and `trace_data_flow` did not make the cut. Two of eight slots
+went to tools that answer nothing. Each of the seven now opens by saying it is plumbing for
+writing and carries no word a code question is phrased in, so the same ranking pass offers the
+tools that answer. The tools themselves are unchanged and the write path, begin then stage then
+commit, is reachable exactly as before.
+
+If your client only ever reads, `agent-query` removes the seven from the list entirely and is
+the better answer than making them rank badly. Use the description rule for the clients that
+cannot choose a profile.
 
 `agent-default` serves the declaration filter under its registered name, `semantic_search`,
 like every other profile. It also accepts **`find_declarations`** on a `tools/call`, which is

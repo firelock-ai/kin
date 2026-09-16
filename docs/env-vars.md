@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (535 total, 360 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (537 total, 360 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -50,6 +50,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_ACTOR` | string | *(unset)* | operational | actor identity recorded in provenance |
+| `KIN_AGENT_BELT` | string | default | operational | how much of the server's tool surface `kin agent run` puts on the model: default (the tools an agent needs to answer, edit and publish) or wide (everything the profile serves that the harness does not own) |
 | `KIN_AGENT_CONTEXT_ACCOUNTING` | enum | heuristic | correctness | agent request accounting: heuristic estimates the prepared request; llama_cpp uses the selected server's rendered prompt and tokenizer |
 | `KIN_AGENT_OUTPUT_RESERVE_TOKENS` | usize | *(unset)* | correctness | override the agent's output token reserve; must be positive and below the context window, and unset uses the configured context's answer reserve |
 | `KIN_AGENT_OUTPUT_TOKEN_PARAMETER` | enum | *(unset)* | correctness | override the completion request's output-limit field; unset selects max_completion_tokens for api.openai.com and max_tokens for compatible endpoints |
@@ -132,7 +133,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_IDLE_FLUSH_SECS` | seconds>=0 | 2 | operational | idle debounce before a full-graph persistence flush |
 | `KIN_DAEMON_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | auto-shutdown after this idle period; 0 disables idle shutdown |
 | `KIN_DAEMON_LOCATE_ONLY` | bool | false | correctness | daemon serves locate-only from a snapshot, changing what it answers |
-| `KIN_DAEMON_MEMORY_BUDGET_BYTES` | usize | *(unset)* | operational | the most one repository daemon and the processes it starts may hold before heavy work backs off, in bytes. Unset derives it as half the memory available here, held between 1 GiB and 8 GiB, because a repository daemon holding more than eight gigabytes is pathological whatever the machine has spare. An operator value wins outright and is not clamped; zero or an unparseable value is ignored, since a budget of zero would refuse every background pass forever |
+| `KIN_DAEMON_MEMORY_BUDGET_BYTES` | usize | *(unset)* | operational | the most one repository daemon and the processes it starts may hold before heavy work backs off, in bytes. Unset derives it as half this machine's total memory, held between 1 GiB and a cap that follows the machine: 8 GiB below 32 GiB of RAM, then 16, 24 and 32 GiB at the 32, 64 and 96 GiB tiers the inference resource plan grades a host on, because a repository daemon holding more than that is pathological for the size of machine it is running on. An operator value wins outright and is not clamped; zero or an unparseable value is ignored, since a budget of zero would refuse every background pass forever |
 | `KIN_DAEMON_PERIODIC_FLUSH_SECS` | seconds>=0 | 30 | operational | maximum interval before dirty graph state is flushed |
 | `KIN_DAEMON_READY_TIMEOUT_SECS` | seconds>=0 | 300 | operational | how long to wait for a starting daemon to become ready |
 | `KIN_DAEMON_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for all daemon requests; set falsy to opt out |
@@ -143,6 +144,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_STOP_TIMEOUT_SECS` | seconds>=0 | 30 | operational | ceiling in seconds kin daemon stop waits for a signaled daemon to exit |
 | `KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP` | bool | 0 | diagnostic | kin-daemon fault injection: refuse to admit the LSP enrichment sweep at start, so cross-file edges never publish and a reference answer is thin rather than late; off by default |
 | `KIN_DAEMON_TEST_STARTUP_HOLD_SECS` | seconds>=0 | *(unset)* | diagnostic | kin-daemon fault injection: hold the endpoint unpublished for N seconds at startup, so a client's startup binding stays PENDING past the tools/call grace and the still-starting disclosure is reachable; unset or zero disarms it |
+| `KIN_DAEMON_UNRESPONSIVE_TIMEOUT_SECS` | seconds>=0 | 20 | operational | how long a daemon that never reported itself warming may answer nothing at all before the client calls it wedged and reports, instead of waiting out KIN_DAEMON_READY_TIMEOUT_SECS. A warming daemon answers /readiness throughout its load and never reaches this. Zero waits the full readiness budget |
 | `KIN_DAEMON_URL` | url | *(unset)* | operational | explicit daemon endpoint URL (skip local discovery) |
 | `KIN_DAEMON_WATCH_PID` | usize | *(unset)* | operational | pid the daemon watches; it exits when that process dies |
 | `KIN_PUBLICATION_CONTROL_AUTH_TOKEN` | secret | *(unset)* | secret | distinct operator bearer token for hosted rollout and publication-control administration |

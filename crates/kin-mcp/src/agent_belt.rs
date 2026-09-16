@@ -59,20 +59,23 @@ use crate::types::ToolsListResult;
 
 /// The most characters one `agent-default` description may carry.
 ///
-/// 265 is roughly two sentences of technical prose. It is a budget rather than a
-/// target: several tools here are shorter, and none should need more, because a
-/// description longer than this is documentation, and documentation belongs in
-/// the `full` profile where a reader has the room for it.
+/// 180 is one sentence of technical prose, down from the 265 that bought two.
+/// It is a budget rather than a target: several tools here are shorter, and none
+/// should need more, because a description longer than this is documentation,
+/// and documentation belongs in the `full` profile where a reader has the room
+/// for it. Two sentences were affordable when the belt was measured in tens of
+/// thousands of tokens; against a 64k local window they are not, and the second
+/// sentence was where the prose crept back.
 /// `no_agent_default_description_exceeds_its_budget` below fails on any tool
 /// that exceeds it.
-pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 265;
+pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 180;
 
 /// The whole profile's description budget.
 ///
-/// 10,000 characters against the 47,739 the long forms cost. Held as a total as
+/// 4,500 characters against the 47,739 the long forms cost. Held as a total as
 /// well as a per-tool cap because twenty tools each sitting just under the
 /// per-tool budget would be a profile that had learned nothing.
-pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 10_000;
+pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 4_500;
 
 /// The honest name for the declaration filter, accepted on a call and never
 /// served.
@@ -161,12 +164,14 @@ pub fn canonicalize_tool_name(name: &mut String) {
 /// The rest is the response size. The registered ceiling of 45,000 characters is
 /// right for a client with room and wrong for this belt: it is roughly 10,500
 /// tokens, so two default answers exhaust a 24,000-token run. Each budget tool
-/// therefore gets [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`], the walker gets the
-/// shape rather than the bodies, and the context pack gets a token budget that
-/// fits inside the same answer. Every one of these is advertised on the served
-/// schema by [`apply_belt_schema_defaults`], so a caller reading `tools/list`
-/// sees the number the belt actually sends and can raise it with the same
-/// `max_chars` it always could.
+/// therefore gets [`agent_default_response_max_chars`] for its own name, which
+/// is [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`] for a tool that answers with a list
+/// and [`AGENT_CHAIN_RESPONSE_MAX_CHARS`] for the two that answer with a chain.
+/// The walker gets the shape rather than the bodies, and the context pack gets a
+/// token budget that fits inside the answer the list rule sizes. Every one of
+/// these is advertised on the served schema by [`apply_belt_schema_defaults`],
+/// so a caller reading `tools/list` sees the number the belt actually sends and
+/// can raise it with the same `max_chars` it always could.
 pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_json::Value>) {
     if name == "semantic_locate" {
         arguments
@@ -211,7 +216,7 @@ pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_jso
     {
         arguments.insert(
             "max_chars".to_string(),
-            serde_json::json!(AGENT_DEFAULT_RESPONSE_MAX_CHARS),
+            serde_json::json!(agent_default_response_max_chars(name)),
         );
     }
 }
@@ -225,35 +230,35 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "find_references",
-            "Find who depends on one entity: direct callers, importers and references, one row each with id, name, kind, file and the lines it references from. Call it for one hop. For a whole chain, use trace_data_flow.",
+            "Find who depends on one entity: callers, importers and references, one row each with id, name, kind and file. One hop only; use trace_data_flow for a chain.",
         ),
         (
             "get_context_pack",
-            "Assemble a token-bounded bundle from one entity, several entities, or a plain-language question: focal bodies plus dependency signatures and connecting routes. Call it instead of several get_entity_source and traversal reads.",
+            "Assemble a token-bounded context bundle from one entity, several entities or a question: focal bodies plus signatures and routes, instead of several get_entity_source reads.",
         ),
         (
             "get_entity_source",
-            "Return one entity's exact graph-owned body by id. Call it when you hold an id and need the real source text, not a snippet.",
+            "Return one entity's exact graph-owned body by id, when a snippet is not enough.",
         ),
         (
             "graph_neighborhood",
-            "Get what one entity depends on and what depends on it, to a depth you choose, as summaries with ids. Call it to orient in unfamiliar code. Use find_references for callers only, trace_data_flow for an ordered path.",
+            "Get what one entity depends on and what depends on it, to a depth you choose. Callers only? Use find_references. An ordered path? Use trace_data_flow.",
         ),
         (
             "impact_analysis",
-            "Walk the graph from a change to every entity it could affect. Target it one way at a time: entity_ids, file paths, base and head change ids, or change_ids. Call it before editing, across the whole repository.",
+            "Walk the graph from a change to every entity it could affect, targeted one way at a time by entity_ids, files, base and head, or change_ids.",
         ),
         (
             "kin_artifact_list",
-            "List the repository's tracked files at one semantic change, code and non-code alike: Dockerfiles, lockfiles, configuration, assets, symlinks. Call it for what the repository contains, not what the parsers turned into entities.",
+            "List the repository's tracked files at one semantic change, code and non-code alike, whether or not the parsers made entities for them.",
         ),
         (
             "kin_artifact_read",
-            "Read one tracked file's exact content by artifact_id or repo-relative path: text when valid UTF-8, else base64. Call it for a file the parsers made no entities for, which a locate hit's artifact_path means.",
+            "Read one tracked file's exact content by artifact_id or repo-relative path: text when valid UTF-8, else base64.",
         ),
         (
             "kin_graph_status",
-            "The graph this call is answered from: entity and relation counts, and how many are embedded, pending or unindexed. Call it when a search returns less than you expect. `sampling=last_settled_selected_graph` means the last settled reading, aged in `stale`.",
+            "Counts for the graph this call is answered from, and how many entities are embedded, pending or unindexed. `sampling=last_settled_selected_graph` is the last settled reading.",
         ),
         // The one fact an agent cannot discover for itself: that the list it was
         // handed is partial on purpose, and how to reach the rest. Every other
@@ -268,59 +273,59 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
         ),
         (
             "kin_provenance_query",
-            "Answer who changed an entity and whether it was approved: change count, latest change, approvals on it, a page of changes newest first, and recent audit events. Call it before relying on code whose history matters.",
+            "Answer who changed an entity and whether it was approved: change count, latest change, approvals, a page of changes and recent audit events.",
         ),
         (
             "kin_session_end",
-            "Close this session and release what it holds. Call it when your work is done.",
+            "Session plumbing for writes. Close an open session and release what it holds, once your writing is done.",
         ),
         (
             "kin_session_heartbeat",
-            "Keep this session alive. Call it periodically during long work so the session does not lapse at its idle TTL.",
+            "Session plumbing for writes. Renew an open session during long work so it does not lapse at its idle TTL.",
         ),
         (
             "kin_mutate",
-            "Atomically validate and commit a batch of graph mutations in a single call. Automatically manages transaction begin, validation, and commit. Provide an operations array with mutation verb and payload.",
+            "Validate and commit a batch of graph mutations in one atomic call, naming the entity or file each operation changes and the new body it gets.",
         ),
         (
             "kin_session_start",
-            "Register this agent with Kin and get a session_id: who you are, your transport, working directory and capabilities. Call it once at the start of your work, before any transaction, so activity is attributed.",
+            "Session plumbing for writes. Open a session and get a session_id, before your first transaction, so the work is attributed.",
         ),
         (
             "kin_transaction_abort",
-            "Abandon an open transaction and discard everything staged on it. Call it when you decide against a change, or to start clean after a refusal. Refused once kin_transaction_commit has fenced it.",
+            "Transaction plumbing for writes. Discard everything staged on an open transaction and close it. Refused once kin_transaction_commit has fenced it.",
         ),
         (
             "kin_transaction_begin",
-            "Open a transaction to stage mutations onto. Returns a transaction_id; nothing lands until kin_transaction_commit.",
+            "Transaction plumbing for writes. Open a transaction and get a transaction_id. Nothing staged on it lands until kin_transaction_commit.",
         ),
         (
             "kin_transaction_commit",
-            "Publish every staged mutation atomically: the daemon reparses the final bytes and journals the semantic change, the workspace tree and the ref together. All of it lands or none does. Re-sending a fenced commit is safe.",
+            "Transaction plumbing for writes. Publish everything staged on one transaction atomically, all of it or none. Re-sending a fenced commit is safe.",
         ),
         (
             "kin_transaction_stage",
-            "Stage mutations onto an open transaction. Four verbs: 'create' admits a file the graph has never seen, 'update' changes an entity, 'delete' retires one, 'rename' moves one. An 'update' replaces the whole body; read it first with get_entity_source.",
+            "Transaction plumbing for writes. Stage a create, update, delete or rename onto an open transaction. An update replaces the whole body, so send the complete new text.",
         ),
         (
             "list_file_entities",
-            "List every entity the graph holds for one file, by repo-relative path. The only retrieval tool that says what it left out: it returns the whole set and reports whether it is complete. Call it before concluding a file holds nothing.",
+            "List every entity the graph holds for one file by repo-relative path, and say whether that list is complete, before concluding a file holds nothing.",
         ),
         (
             "semantic_locate",
-            "Find code by a plain-language question, ranked from the graph. Call it when you know what the code does but not its name. Returns id, name, kind, file, line, signature, score. Read `ranked_by`. Know the exact name? Use semantic_search.",
+            "Find code by a plain-language question, ranked from the graph: id, name, kind, file, line, signature, score. Know the exact name? Use semantic_search.",
         ),
         (
             DECLARATION_FILTER_CANONICAL,
-            "Filter declarations by name, kind or language: functions, methods, classes, structs, traits, enums, types, constants. Call it when you know what the thing is called. It matches names, not meaning. For a description, use semantic_locate.",
+            "Filter declarations by exact name, kind or language; it matches names, not meaning. Asking what code does rather than what it is called? Use semantic_locate.",
         ),
         (
             "trace_data_flow",
-            "Walk the call chain out from ONE entity and get the whole path back, as ordered steps. Give a focal, a direction and a depth. It walks call and import edges, not values through variables. Naming TWO things? Use trace_path.",
+            "Walk the call chain out from ONE entity and get the whole ordered path back; it walks call and import edges. Naming TWO things? Use trace_path.",
         ),
         (
             "trace_path",
-            "Find how one entity reaches another, as ordered hops. Call it when your question names TWO things. `from` and `to` take a name, an id, or name@file. Read `found` and `gap` before concluding A never reaches B. One endpoint? Use trace_data_flow.",
+            "Find how one entity reaches another as ordered hops; read `found` and `gap` before concluding A never reaches B. One endpoint only? Use trace_data_flow.",
         ),
     ])
 }
@@ -442,7 +447,8 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
     ])
 }
 
-/// The response ceiling `agent-default` asks for on its agents' behalf.
+/// The response ceiling `agent-default` asks for on its agents' behalf, for
+/// every budgeted tool whose answer is a LIST.
 ///
 /// Derived from one rule rather than taste: an agent must be able to make at
 /// least six tool calls at default answer size inside a 24,000-token run and
@@ -462,7 +468,63 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
 /// treats the served schema as the contract an agent reads, so a belt that
 /// injected 12,000 while advertising 45,000 would be lying in the one place a
 /// caller looks. Both halves move together, and `full` keeps 45,000.
+///
+/// A list cut at this number loses its tail and keeps its answer: the rows a
+/// reader most wants lead it, and the count beside them says how many were
+/// dropped. [`AGENT_CHAIN_RESPONSE_MAX_CHARS`] is the number for the two tools
+/// where that is not true.
 pub const AGENT_DEFAULT_RESPONSE_MAX_CHARS: u64 = 12_000;
+
+/// The response ceiling `agent-default` asks for on the two tools whose answer
+/// is a CHAIN rather than a list.
+///
+/// The number is the agent's own per-result limit. `kin agent run` cuts one tool
+/// result to `ContextWindow::default_result_ceiling()`, an eighth of the window
+/// at `kin_agent::context::BYTES_PER_TOKEN`, and on the 65,536-token window the
+/// 2026-09-15 trace measurement ran under that is 24,576 bytes. It is the
+/// largest ceiling a server can ask for and still know the whole answer reaches
+/// the model, because past it the harness cuts and Kin discloses nothing about a
+/// cut it did not make. kin-agent is not a dependency of this crate and cannot
+/// be, so the number is written here rather than imported, with its derivation
+/// beside it.
+///
+/// Why these two tools and not the whole belt. The rule above sizes an answer so
+/// six of them fit a 24,000-token run, and for a ranked list that trade is
+/// right: the top of the list IS the answer. A chain is not a list. Cutting it
+/// removes the far end, which is the end the question was about, and a walk that
+/// never reaches the callee a caller asked about has spent its tokens and
+/// answered nothing. #76 measured that on `cli/cli`: at the trace tool's wider
+/// per-step default the rendered answer is 16,327 characters, the 12,000 ceiling
+/// cut the chain, and an untargeted `trace_data_flow` still did not reach
+/// `httpRequest`. `get_context_pack` assembles the same shape, a focal plus the
+/// routes and dependencies around it, and sheds from the same far end.
+///
+/// The cost is stated rather than hidden: two chain answers now fill a
+/// 24,000-token run where four fit before. That is the trade the decision makes,
+/// and it is made for the tools where a cut answer is not a shorter answer but a
+/// wrong one. Every other budgeted tool keeps 12,000.
+pub const AGENT_CHAIN_RESPONSE_MAX_CHARS: u64 = 24_576;
+
+/// The belt tools that get [`AGENT_CHAIN_RESPONSE_MAX_CHARS`].
+///
+/// A list rather than a predicate on the tool's shape, because "is this answer a
+/// chain" is not a property the registry carries and inferring it would make the
+/// ceiling move when an unrelated field moved.
+const CHAIN_RESPONSE_TOOLS: [&str; 2] = ["trace_data_flow", "get_context_pack"];
+
+/// The response ceiling this belt asks for on behalf of `tool`.
+///
+/// One function so the injected number and the advertised number cannot come
+/// apart: `apply_belt_defaults` and `belt_schema_defaults` both read it, and
+/// `no_agent_default_response_budget_is_advertised_above_the_cap` grades them
+/// against each other through it.
+pub fn agent_default_response_max_chars(tool: &str) -> u64 {
+    if CHAIN_RESPONSE_TOOLS.contains(&tool) {
+        AGENT_CHAIN_RESPONSE_MAX_CHARS
+    } else {
+        AGENT_DEFAULT_RESPONSE_MAX_CHARS
+    }
+}
 
 /// The ranked entities `semantic_locate` returns per page on `agent-default`.
 ///
@@ -513,6 +575,14 @@ pub const AGENT_DEFAULT_LOCATE_PAGE: u64 = 12;
 /// registered default of 16,000 is larger than the whole answer this belt now
 /// asks for. 2,500 sits under the roughly 2,800 tokens
 /// [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`] buys, leaving the envelope its room.
+///
+/// This did not move when the pack's response ceiling did. The two are separate
+/// levers and the change to the ceiling was a decision about one of them: this
+/// number bounds what the BUILDER assembles, and the ceiling bounds what the
+/// response may ship. Raising the ceiling stops a built pack from being cut on
+/// the way out; raising this would build a larger one, which is a different
+/// question with its own measurement and is not what
+/// [`AGENT_CHAIN_RESPONSE_MAX_CHARS`] decided.
 pub const AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET: u64 = 2_500;
 
 /// The belt tools whose registered schema advertises a response budget.
@@ -532,6 +602,77 @@ const BUDGET_TOOLS: [&str; 8] = [
     "get_context_pack",
 ];
 
+/// Whole input schemas this belt serves in place of the registered ones.
+///
+/// A keep-list hides a property. This replaces a schema, which is what a tool
+/// needs when the bytes are not in its property LIST but in one property's
+/// nested contract, and when the registered top-level keys include combinators a
+/// trimmed profile should not advertise.
+///
+/// `kin_mutate` is the only entry and the reason the mechanism exists. Its
+/// registered `operations` item is a seven-branch `oneOf` that spells out every
+/// verb synonym and every path rule, 8,406 bytes of input schema on a tool whose
+/// whole served definition is 8,699. The form below carries the same five fields
+/// under one object and the canonical verb for each operation.
+///
+/// It advertises less than the server accepts, which is the same bargain every
+/// trim in this module makes: no tool here sets `additionalProperties: false` at
+/// the top level, the handler reads arguments by name, and the `full` profile
+/// still serves every branch. A caller that sends `modify` instead of `update`,
+/// a `payload` object, or a `request_id` still reaches the same handler and is
+/// validated against the registered schema there.
+///
+/// `every_schema_override_names_only_registered_properties` holds the one
+/// invariant that matters: an override may hide a property but may never invent
+/// one, and may never require a property the registered schema does not.
+fn belt_schema_overrides() -> BTreeMap<&'static str, serde_json::Value> {
+    BTreeMap::from([(
+        "kin_mutate",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "description": "Changes applied together or not at all.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "verb": {
+                                "type": "string",
+                                "enum": ["update", "create", "replace", "rename", "delete"],
+                                "description": "update an entity body; create, replace, rename or delete a tracked file."
+                            },
+                            "target": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Entity UUID or exact entity name for update; repository-relative path for the file verbs."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Complete new UTF-8 text, never a fragment or a diff. Required by update, create and replace."
+                            },
+                            "destination": {
+                                "type": "string",
+                                "description": "Repository-relative path the file moves to. Required by rename."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "One sentence saying what this operation changes."
+                            }
+                        },
+                        "required": ["verb", "target", "description"]
+                    }
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One sentence a human reads in history. Omitted, the change records only its id."
+                }
+            },
+            "required": ["operations"]
+        }),
+    )])
+}
+
 /// The properties whose advertised `default` this belt rewrites, by tool.
 ///
 /// A number the profile injects has to be the number the profile advertises, or
@@ -541,14 +682,17 @@ fn belt_schema_defaults() -> BTreeMap<(&'static str, &'static str), serde_json::
     for tool in BUDGET_TOOLS {
         defaults.insert(
             (tool, "max_chars"),
-            serde_json::json!(AGENT_DEFAULT_RESPONSE_MAX_CHARS),
+            serde_json::json!(agent_default_response_max_chars(tool)),
         );
     }
     // `trace_data_flow` registers the same budget under both spellings, and a
-    // caller reading either one has to see the same ceiling.
+    // caller reading either one has to see the same ceiling. This one is not
+    // decoration: the handler reads `max_response_chars` and ignores
+    // `max_chars`, so the spelling the belt injects bounds the response at the
+    // envelope while THIS one is what the walk bounds itself by.
     defaults.insert(
         ("trace_data_flow", "max_response_chars"),
-        serde_json::json!(AGENT_DEFAULT_RESPONSE_MAX_CHARS),
+        serde_json::json!(agent_default_response_max_chars("trace_data_flow")),
     );
     // Shape first. The tool's own belt description tells a model to pass false
     // when it wants the shape of a chain, and then the registered default handed
@@ -615,17 +759,20 @@ pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 90;
 
 /// The tools whose schemas this module does not rewrite at all.
 ///
-/// 1353 left the nested transaction contracts whole, and they stay whole: a
-/// staged mutation's shape is the thing a caller gets wrong, and it is the one
-/// place on this belt where the schema IS the documentation. They cost 11,245
-/// bytes and 2,423 tokens between them, which is 31 percent of every token in
-/// the served list, and that number belongs in a product decision about which
-/// tools a read-only agent is served rather than in a prose trim.
-const PROSE_EXEMPT_TOOLS: [&str; 3] = [
-    "kin_transaction_stage",
-    "kin_transaction_commit",
-    "kin_mutate",
-];
+/// The nested transaction contracts stay whole: a staged mutation's shape is the
+/// thing a caller gets wrong, and it is the one place on this belt where the
+/// schema IS the documentation. Both of these are harness-owned
+/// (`kin-agent/src/belt.rs`), so `kin agent run` never puts either on a model's
+/// belt and their bytes are paid only by a client wired straight to the MCP
+/// server.
+///
+/// `kin_mutate` used to sit here with them and no longer does. It is the one
+/// mutation tool a model IS handed, so its bytes are on the belt of every agent
+/// run: 8,699 of the belt's 22,014 bytes, 40 percent of the schema an agent
+/// reads before it has asked anything, almost all of it the seven-branch `oneOf`
+/// under `operations`. [`belt_schema_overrides`] serves it a single-object form
+/// of the same contract instead.
+const PROSE_EXEMPT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction_commit"];
 
 /// Short property descriptions that read the same on every tool carrying them.
 ///
@@ -637,11 +784,11 @@ fn shared_property_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "max_chars",
-            "Serialized characters this response may occupy; what was cut is named in `elisions`.",
+            "Character ceiling; what was cut is named in `elisions`.",
         ),
         (
             "max_response_chars",
-            "Serialized characters this response may occupy; the same parameter as `max_chars`.",
+            "Character ceiling; the same parameter as `max_chars`.",
         ),
         (
             "cursor",
@@ -677,6 +824,10 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
         (
             ("list_file_entities", "page_size"),
             "Entities per page (default 200, 1..1000). `total_in_file` is the whole-file count.",
+        ),
+        (
+            ("semantic_search", "kind"),
+            "Declaration kind, or `command` for a CLI command's own run function and constructor.",
         ),
         (
             ("trace_data_flow", "target"),
@@ -717,6 +868,10 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
         (
             ("trace_path", "from_file"),
             "Pin `from` to the entity of that name in this file. Same as the name@file spelling.",
+        ),
+        (
+            ("kin_mutate", "summary"),
+            "One sentence a human reads in history. Omitted, the change records only its id.",
         ),
         (
             ("find_references", "relation_kinds"),
@@ -793,14 +948,25 @@ fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
 pub fn compact_for_agent_default(list: &mut ToolsListResult) {
     let descriptions = short_descriptions();
     let keeps = schema_keep_lists();
+    let overrides = belt_schema_overrides();
     for tool in &mut list.tools {
         if let Some(short) = descriptions.get(tool.name.as_str()) {
             tool.description = (*short).to_string();
         }
-        if let Some(keep) = keeps.get(tool.name.as_str()) {
-            trim_schema(&mut tool.input_schema, keep);
+        // An override replaces the schema outright, so the keep-list and the
+        // property-prose pass below have nothing left to do on that tool: both
+        // exist to cut a registered schema down, and the override already is the
+        // cut form. The default injection still runs, because a budget this
+        // profile advertises has to be the budget it injects whatever produced
+        // the schema.
+        if let Some(schema) = overrides.get(tool.name.as_str()) {
+            tool.input_schema = schema.clone();
+        } else {
+            if let Some(keep) = keeps.get(tool.name.as_str()) {
+                trim_schema(&mut tool.input_schema, keep);
+            }
+            shorten_property_descriptions(&tool.name, &mut tool.input_schema);
         }
-        shorten_property_descriptions(&tool.name, &mut tool.input_schema);
         apply_belt_schema_defaults(&tool.name, &mut tool.input_schema);
     }
     // No name is rewritten here, so the name order `tools::tool_definitions`
@@ -827,6 +993,7 @@ fn trim_schema(schema: &mut serde_json::Value, keep: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// Every tool the profile serves needs a short form, or the profile carries
     /// a 6,823-character description it was supposed to have replaced.
@@ -1155,13 +1322,20 @@ mod tests {
         );
     }
 
-    /// Every advertised response budget on `agent-default` stays at or under the
-    /// cap, and the number advertised is the number injected.
+    /// Every advertised response budget on `agent-default` is the one its own
+    /// tool is capped at, and the number advertised is the number injected.
     ///
     /// The registered ceiling is 45,000 characters, about 10,500 gemma-4-e4b
     /// tokens, so two default answers exhaust the 24,000-token run this belt
-    /// exists to fit. The cap is derived from one rule: six calls at default
-    /// size inside that run with room left to answer.
+    /// exists to fit. The list cap is derived from one rule: six calls at
+    /// default size inside that run with room left to answer. The two chain
+    /// tools are capped at the agent's own per-result limit instead, for the
+    /// reason on [`AGENT_CHAIN_RESPONSE_MAX_CHARS`].
+    ///
+    /// Read per tool rather than against one number, because a single ceiling is
+    /// exactly what this stopped being. Asserted as EQUALITY rather than "at or
+    /// under", which is stronger than the check it replaced: a tool advertising
+    /// less than its cap used to pass, and would now be a silent second policy.
     ///
     /// Both halves are asserted together on purpose. A belt that injected the
     /// cap while advertising 45,000 would pass any check that reads only one
@@ -1174,6 +1348,7 @@ mod tests {
     fn no_agent_default_response_budget_is_advertised_above_the_cap() {
         let served = served_agent_default();
         let mut problems: Vec<String> = Vec::new();
+        let mut checked = 0usize;
         for tool in &served.tools {
             let properties = tool
                 .input_schema
@@ -1182,29 +1357,29 @@ mod tests {
             let Some(properties) = properties else {
                 continue;
             };
+            let cap = agent_default_response_max_chars(&tool.name);
             for key in ["max_chars", "max_response_chars"] {
                 let Some(property) = properties.get(key) else {
                     continue;
                 };
+                checked += 1;
                 let advertised = property.get("default").and_then(|value| value.as_u64());
                 match advertised {
                     None => problems.push(format!("{}.{key} advertises no default", tool.name)),
-                    Some(value) if value > AGENT_DEFAULT_RESPONSE_MAX_CHARS => {
-                        problems.push(format!(
-                            "{}.{key} advertises {value}, over the \
-                             {AGENT_DEFAULT_RESPONSE_MAX_CHARS}-character cap",
-                            tool.name
-                        ))
-                    }
+                    Some(value) if value != cap => problems.push(format!(
+                        "{}.{key} advertises {value}, and this tool's cap is {cap}",
+                        tool.name
+                    )),
                     Some(_) => {}
                 }
                 // The number advertised has to be the number the belt sends.
                 let mut arguments = HashMap::new();
                 apply_belt_defaults(&tool.name, &mut arguments);
                 let injected = arguments.get("max_chars").and_then(|value| value.as_u64());
-                if injected != Some(AGENT_DEFAULT_RESPONSE_MAX_CHARS) {
+                if injected != Some(cap) {
                     problems.push(format!(
-                        "{} advertises a budget and the belt injects {injected:?}",
+                        "{} advertises a budget and the belt injects {injected:?} against a cap \
+                         of {cap}",
                         tool.name
                     ));
                 }
@@ -1212,7 +1387,32 @@ mod tests {
         }
         assert!(
             problems.is_empty(),
-            "agent-default response budgets disagree with the cap: {problems:#?}"
+            "agent-default response budgets disagree with their caps: {problems:#?}"
+        );
+        // The sweep has to be reaching the schemas, or an empty problem list is
+        // a fixture that found nothing rather than a belt that is right.
+        assert!(
+            checked >= 9,
+            "the sweep found only {checked} budget properties on agent-default, so it is not \
+             reaching the served schemas"
+        );
+        // The split is the point, and a table that collapsed back to one number
+        // would satisfy every assertion above.
+        assert_eq!(
+            agent_default_response_max_chars("trace_data_flow"),
+            AGENT_CHAIN_RESPONSE_MAX_CHARS
+        );
+        assert_eq!(
+            agent_default_response_max_chars("get_context_pack"),
+            AGENT_CHAIN_RESPONSE_MAX_CHARS
+        );
+        assert_eq!(
+            agent_default_response_max_chars("find_references"),
+            AGENT_DEFAULT_RESPONSE_MAX_CHARS
+        );
+        assert_ne!(
+            AGENT_CHAIN_RESPONSE_MAX_CHARS,
+            AGENT_DEFAULT_RESPONSE_MAX_CHARS
         );
     }
 
@@ -1785,6 +1985,344 @@ mod tests {
         );
     }
 
+    /// The session and transaction tools, which are plumbing for writing and
+    /// can answer no question about code.
+    ///
+    /// Written out rather than derived from the difference between the two
+    /// belts, for the reason
+    /// `agent_query_serves_the_query_half_of_the_agent_belt` gives: a name that
+    /// joins the write half should cost somebody a decision here.
+    /// `the_lifecycle_set_is_the_write_half_of_the_belt` holds the two in step.
+    const LIFECYCLE_TOOLS: [&str; 7] = [
+        "kin_session_end",
+        "kin_session_heartbeat",
+        "kin_session_start",
+        "kin_transaction_abort",
+        "kin_transaction_begin",
+        "kin_transaction_commit",
+        "kin_transaction_stage",
+    ];
+
+    /// `kin_mutate` is the eighth write tool and is deliberately not lifecycle.
+    /// It is the write ACTION rather than the plumbing around one, an agent
+    /// asking how to change something should find it, and it names entity
+    /// changes on purpose.
+    #[test]
+    fn the_lifecycle_set_is_the_write_half_of_the_belt() {
+        let query: BTreeSet<&str> = crate::tools::agent_query_tool_names()
+            .iter()
+            .copied()
+            .collect();
+        let write_half: BTreeSet<&str> = crate::tools::agent_default_tool_names()
+            .iter()
+            .copied()
+            .filter(|name| !query.contains(name) && *name != "kin_mutate")
+            .collect();
+        assert_eq!(
+            write_half,
+            LIFECYCLE_TOOLS.into_iter().collect::<BTreeSet<&str>>(),
+            "the belt's write half moved; the vocabulary guards below are keyed on it"
+        );
+    }
+
+    /// Words a locate, reference, context or trace question arrives in.
+    ///
+    /// A lifecycle description that carries one of these competes with the tool
+    /// that answers the question, in a client where the model never sees the
+    /// schemas and learns the surface by searching it.
+    const QUERY_VOCABULARY: [&str; 24] = [
+        "behavior",
+        "behaviour",
+        "caller",
+        "callers",
+        "code",
+        "context",
+        "declaration",
+        "depends",
+        "entities",
+        "entity",
+        "find",
+        "graph",
+        "impact",
+        "locate",
+        "neighborhood",
+        "query",
+        "read",
+        "reads",
+        "reference",
+        "references",
+        "search",
+        "semantic",
+        "symbol",
+        "trace",
+    ];
+
+    /// No lifecycle description may carry the vocabulary of a code question.
+    ///
+    /// Measured on a third-party client rather than reasoned about. Grok never
+    /// sends MCP tool schemas to the model: the model learns a tool by calling
+    /// Grok's own `search_tool` with a query, which ranks over tool names and
+    /// descriptions. On a pure locate question the ranked top eight came back
+    /// holding `kin__kin_transaction_commit` and `kin__kin_session_end`, while
+    /// `get_context_pack`, `find_references`, `trace_path` and
+    /// `trace_data_flow` did not make the cut. Two of eight slots went to tools
+    /// that cannot answer any question, and four that can were never offered.
+    ///
+    /// The tools stay. A third-party agent's write path is begin, stage, commit,
+    /// and deleting the plumbing would take the write path with it. What changes
+    /// is that each of them now opens by saying it is plumbing for writing, and
+    /// carries no word a code question is phrased in.
+    #[test]
+    fn no_lifecycle_description_carries_the_vocabulary_of_a_code_question() {
+        let descriptions = short_descriptions();
+        for tool in LIFECYCLE_TOOLS {
+            let description = descriptions
+                .get(tool)
+                .unwrap_or_else(|| panic!("{tool} has no short description"));
+            let words: BTreeSet<String> = tokens(description);
+            let carried: Vec<&str> = QUERY_VOCABULARY
+                .into_iter()
+                .filter(|word| words.contains(*word))
+                .collect();
+            assert!(
+                carried.is_empty(),
+                "{tool}'s short description carries query vocabulary {carried:?}, so a ranker \
+                 that scores it against a code question will offer it: {description:?}"
+            );
+            // And the other half of the rule: it has to SAY what it is, or a
+            // ranker has nothing to score a write question against.
+            assert!(
+                words.contains("plumbing") && words.contains("writes"),
+                "{tool}'s short description must name itself as plumbing for writes: \
+                 {description:?}"
+            );
+        }
+    }
+
+    /// Lowercase alphanumeric words, which is what a lexical ranker sees.
+    fn tokens(text: &str) -> BTreeSet<String> {
+        text.split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
+    /// Words that carry no information about WHICH tool answers a question.
+    ///
+    /// `kin` is here with the grammar. Every tool on this server is a Kin tool,
+    /// so the term separates none of them from each other, and half the
+    /// registered names happen to carry it as a prefix while the retrieval tools
+    /// do not. Leaving it in would score `kin_session_end` above
+    /// `semantic_locate` on the word "kin" alone, which is a fact about the
+    /// naming convention rather than about either tool.
+    const RANKING_STOPWORDS: [&str; 48] = [
+        "a", "about", "after", "all", "an", "and", "are", "as", "at", "be", "before", "by", "can",
+        "do", "does", "every", "for", "from", "has", "have", "i", "if", "in", "into", "is", "it",
+        "its", "kin", "me", "my", "not", "of", "on", "one", "onto", "or", "out", "so", "that",
+        "the", "this", "to", "up", "was", "what", "which", "will", "with",
+    ];
+
+    /// How many distinct terms of `question` a tool's name and description
+    /// carry, which is the signal a lexical ranker orders candidates by.
+    ///
+    /// A four-character shared prefix counts as a match, so "references" scores
+    /// against "reference" and "entities" against "entity". A real ranker stems
+    /// or embeds; this is the crudest form of the same idea, and it is enough to
+    /// hold the property that matters.
+    fn overlap(question: &str, name: &str, description: &str) -> usize {
+        let stop: BTreeSet<&str> = RANKING_STOPWORDS.into_iter().collect();
+        let surface = tokens(&format!("{name} {description}"));
+        tokens(question)
+            .iter()
+            .filter(|term| !stop.contains(term.as_str()))
+            .filter(|term| {
+                surface.iter().any(|token| {
+                    token == *term
+                        || (term.len() >= 4
+                            && token.len() >= 4
+                            && (token.starts_with(term.as_str())
+                                || term.starts_with(token.as_str())))
+                })
+            })
+            .count()
+    }
+
+    /// A code question must never rank a lifecycle tool over the tool that
+    /// answers it, and a write question must still reach the lifecycle tools.
+    ///
+    /// This is the regression guard for the ranked-discovery defect. It models a
+    /// lexical ranker over the served name and description, which is what a
+    /// client that hides schemas gives a model to choose from. The control at
+    /// the end is what stops the guard being satisfied by emptying the seven
+    /// descriptions out.
+    #[test]
+    fn a_code_question_never_ranks_a_lifecycle_tool_over_the_tool_that_answers_it() {
+        let descriptions = short_descriptions();
+        let score = |question: &str, tool: &str| -> usize {
+            overlap(
+                question,
+                tool,
+                descriptions
+                    .get(tool)
+                    .unwrap_or_else(|| panic!("{tool} has no short description")),
+            )
+        };
+
+        // The first probe is the query the Grok run actually sent.
+        let code_questions: [(&str, &[&str]); 6] = [
+            (
+                "kin semantic locate function behavior exit code",
+                &["semantic_locate"],
+            ),
+            (
+                "find every caller and reference of this function",
+                &["find_references"],
+            ),
+            (
+                "give me the context around this entity before I change it",
+                &["get_context_pack"],
+            ),
+            (
+                "trace the data flow from this function through the call chain",
+                &["trace_data_flow"],
+            ),
+            (
+                "what breaks if I change this entity and what does it affect",
+                &["impact_analysis"],
+            ),
+            (
+                "how does one function reach another through the code",
+                &["trace_path"],
+            ),
+        ];
+
+        for (question, answering) in code_questions {
+            let noise = LIFECYCLE_TOOLS
+                .into_iter()
+                .map(|tool| (tool, score(question, tool)))
+                .max_by_key(|(_, points)| *points)
+                .expect("the lifecycle set is not empty");
+            assert_eq!(
+                noise.1, 0,
+                "{:?} scores {} on the code question {question:?}, so a ranker can offer it \
+                 in place of a tool that answers: {:?}",
+                noise.0, noise.1, descriptions[noise.0]
+            );
+            for tool in answering {
+                let points = score(question, tool);
+                assert!(
+                    points > noise.1,
+                    "{tool} scores {points} on {question:?} against {} for {:?}, so the tool \
+                     that answers the question is not the one a ranker offers",
+                    noise.1,
+                    noise.0
+                );
+            }
+        }
+
+        // The control. A write question has to reach the plumbing, or the guard
+        // above would pass on seven blank strings.
+        let write_questions: [(&str, &str); 3] = [
+            ("commit the staged transaction", "kin_transaction_commit"),
+            ("open a session before writing", "kin_session_start"),
+            (
+                "stage an update onto the open transaction",
+                "kin_transaction_stage",
+            ),
+        ];
+        let query_tools: Vec<&str> = crate::tools::agent_query_tool_names().to_vec();
+        for (question, answering) in write_questions {
+            let points = score(question, answering);
+            let best_query = query_tools
+                .iter()
+                .map(|tool| (*tool, score(question, tool)))
+                .max_by_key(|(_, points)| *points)
+                .expect("the query profile is not empty");
+            assert!(
+                points > best_query.1,
+                "{answering} scores {points} on the write question {question:?} against {} for \
+                 {:?}, so the write path is not what a ranker offers",
+                best_query.1,
+                best_query.0
+            );
+        }
+    }
+
+    /// The one string a client is guaranteed to hand the model names tools the
+    /// model can actually reach, and stays inside its budget.
+    ///
+    /// The server `instructions` are separate from the profile, and a client may
+    /// deliver one without the other. Grok delivers exactly this string and
+    /// never the schemas: the model sees it as a synthetic reminder on turn one
+    /// and has to search by name for anything else. So a name in here that the
+    /// served profile does not carry sends a model looking for a tool that is
+    /// not there, which is the same wasted round trip the ranked-discovery
+    /// defect above cost, arriving through a different door.
+    #[test]
+    fn the_server_instructions_name_only_tools_the_profile_serves() {
+        // The byte budget is a compile-time assertion beside the string
+        // itself, so it is not restated here. This test is about what the
+        // bytes SAY.
+        let instructions = crate::server::SERVER_INSTRUCTIONS;
+
+        // The tools it must name. A model that never reads a schema learns the
+        // surface from these names, so the query half has to be in here.
+        let named = [
+            "semantic_locate",
+            "semantic_search",
+            "get_context_pack",
+            "find_references",
+            "trace_data_flow",
+            "trace_path",
+            "impact_analysis",
+            "list_file_entities",
+        ];
+        let default: BTreeSet<&str> = crate::tools::agent_default_tool_names()
+            .iter()
+            .copied()
+            .collect();
+        let query: BTreeSet<&str> = crate::tools::agent_query_tool_names()
+            .iter()
+            .copied()
+            .collect();
+        for tool in named {
+            assert!(
+                instructions.contains(tool),
+                "the instructions no longer name {tool}, so a client that hides schemas gives \
+                 the model no way to find it"
+            );
+            assert!(
+                default.contains(tool) && query.contains(tool),
+                "the instructions name {tool}, which agent-default or agent-query does not \
+                 serve"
+            );
+        }
+
+        // No lifecycle tool is named. The write path is reachable through the
+        // served list and through tool search; spending this budget on plumbing
+        // is what the ranked-discovery defect cost in the first place.
+        for tool in LIFECYCLE_TOOLS {
+            assert!(
+                !instructions.contains(tool),
+                "the instructions name {tool}, which answers no question and costs the budget \
+                 a query tool's line needs"
+            );
+        }
+
+        // The one instruction that only matters in a client that hides the
+        // schemas, and the one every measured run needed and did not get.
+        assert!(
+            instructions.contains("search for \"kin\" first, before your first file read"),
+            "the instructions must tell a model whose client lists tools by search to search \
+             for this server before it reads a file: {instructions:?}"
+        );
+        // And the envelope sentence a reader has to act on survives the cut.
+        assert!(
+            instructions.contains("_kin.verdict") && instructions.contains("inconclusive"),
+            "the verdict contract keeps its one sentence: {instructions:?}"
+        );
+    }
+
     /// The belt asks for compact on behalf of its agents, and only when the
     /// caller said nothing. This is the half of the compact surface that
     /// actually reaches an agent, since the wire default is the shared schema.
@@ -1875,6 +2413,81 @@ mod tests {
 
     /// Same for the keep-lists: a keep-list naming a property the tool does not
     /// have would silently trim the schema to nothing.
+    /// An override may hide a property. It may never invent one, and it may
+    /// never require one the registered schema does not.
+    ///
+    /// The whole bargain of this module is that trimming hides rather than
+    /// removes: the handler still reads every registered argument by name and
+    /// `full` still advertises them. A replacement schema is the one place that
+    /// bargain could be broken quietly, by advertising a knob the server does not
+    /// take, so a caller sends it and it is ignored, or by requiring a field the
+    /// handler never asks for, so a valid call is refused before it is sent.
+    #[test]
+    fn every_schema_override_names_only_registered_properties() {
+        let registered = crate::tools::tool_definitions();
+        for (name, schema) in belt_schema_overrides() {
+            let tool = registered
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "belt_schema_overrides() in crates/kin-mcp/src/agent_belt.rs names \
+                         '{name}', which tool_definitions() does not register"
+                    )
+                });
+            let declared = tool.input_schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} has no properties object"));
+            let served = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("the {name} override has no properties object"));
+            for property in served.keys() {
+                assert!(
+                    declared.contains_key(property),
+                    "the {name} override advertises '{property}', which the registered schema \
+                     does not declare, so a caller would send a knob the handler never reads"
+                );
+            }
+            let required = |value: &serde_json::Value| -> Vec<String> {
+                value
+                    .get("required")
+                    .and_then(|value| value.as_array())
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|name| name.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let declared_required = required(&tool.input_schema);
+            for property in required(&schema) {
+                assert!(
+                    declared_required.contains(&property),
+                    "the {name} override requires '{property}', which the registered schema does \
+                     not, so a call the server would accept is refused before it is sent"
+                );
+                assert!(
+                    served.contains_key(&property),
+                    "the {name} override requires '{property}' but does not describe it"
+                );
+            }
+            // The control: the override must be much smaller than the schema it
+            // replaces, or it is a rewrite that saved nothing and this whole
+            // mechanism is cost with no benefit.
+            let before = serde_json::to_string(&tool.input_schema)
+                .expect("json")
+                .len();
+            let after = serde_json::to_string(&schema).expect("json").len();
+            assert!(
+                after * 3 < before,
+                "the {name} override is {after} bytes against the registered {before}; an \
+                 override that does not cut the schema by much is not worth the divergence"
+            );
+        }
+    }
+
     #[test]
     fn every_keep_list_names_real_properties() {
         let registered = crate::tools::tool_definitions();

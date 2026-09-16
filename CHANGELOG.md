@@ -71,6 +71,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Name the installer in the refusal, so the next time a release changes the archive's
   shape the error carries the one command that recovers the install.
 
+## [0.7.20] - 2026-09-16
+
+### Fixed
+
+- Stop the repo daemon wedging on its own entity read lock. `graph_stats` held
+  the entity read guard across `embedding_status`, which reads that same lock
+  again, and one queued writer parked the whole process at zero CPU with its
+  listening socket still open (#79)
+- `kin daemon stop` can now end a daemon that cannot answer HTTP, escalating to
+  SIGTERM and then SIGKILL only after proving the recorded incarnation is still
+  live and is running a Kin image (#79)
+- `kin daemon status` reports a held-but-not-accepting socket as wedged rather
+  than as a closed port, and a daemon that never said it was warming and answers
+  nothing is reported in twenty seconds rather than after the full readiness
+  budget (#79)
+- Count an embedding coverage gap and an embedding backlog apart, so
+  `indexed + pending == total` holds on every answer and a re-embed of an
+  already indexed key is reported as queued work (#80)
+- The envelope's embedding class distinguishes a partly built vector index from
+  an absent one, so a 99.99 percent complete index is no longer published as
+  having no vector index at all (#77, in #83)
+- Record the syntax position on the call edges of the nine language adapters
+  that carried none, so every `Calls` edge in the fleet can report its call site
+  (#75 in #81, #81)
+- Extract the calls the Ruby and Swift adapters dropped entirely, and record the
+  macro-use and C++ type alias sites beside them (#84)
+- A byte-match refusal on an entity source edit now explains why the text did
+  not match, quotes the file's exact bytes, and names the entity-level route, and
+  a target refused twice is not attempted a third time (#86)
+- Pin the anchor flag in the `kin locate` tests that read anchors, so a
+  neighbouring test's environment cannot empty their anchor set (#87)
+
+### Changed
+
+- MCP `find_references` answers Go interface dispatch candidates, with truthful
+  counts that keep a candidate out of the proven total (#78)
+- The agent belt's response ceiling is per tool: `trace_data_flow` and
+  `get_context_pack` are served the agent's own 24,576 byte per-result limit and
+  every other budgeted tool keeps 12,000 (#78)
+- The seven session and transaction tools describe themselves as write plumbing,
+  and the MCP server instructions name the query tools one line each, so a client
+  that ranks tools by description can find the tools that answer a code question
+  (#77, in #83)
+- Regenerate the KinLab Kin reference data from a current binary and gate it
+  against going stale again (#83)
+
 ## [0.7.19] - 2026-09-13
 
 ### Changed

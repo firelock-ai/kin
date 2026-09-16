@@ -999,6 +999,7 @@ mod tests {
                 level: "critical".to_string(),
                 reason: "host memory pressure is critical".to_string(),
                 at_unix: 0,
+                from_budget: false,
             }));
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();

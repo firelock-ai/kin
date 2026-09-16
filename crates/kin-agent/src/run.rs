@@ -4,15 +4,17 @@
 //! The agent loop.
 
 use crate::belt::{self, Belt, LocalTool, Route};
-use crate::context::{self, ContextMeter};
+use crate::context::{self, ContextMeter, CountSource};
 use crate::mcp::{McpClient, McpError, McpTool, ToolOutcome};
 use crate::parse::{self, Turn};
 use crate::provider::{
     ChatRequest, Completion, PromptCount, Provider, ProviderError, RequestAccounting, Usage,
 };
+use crate::repeat;
 use crate::transcript::{now_iso, TranscriptWriter};
 use crate::{AgentConfig, ExitStatus, RunOutcome};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -172,6 +174,54 @@ fn repo_path_note(repos: &[std::path::PathBuf]) -> String {
     )
 }
 
+/// What one tool cost a run, summed over every call to it.
+#[derive(Debug, Clone, Default)]
+struct ToolCost {
+    calls: u32,
+    error_calls: u32,
+    /// Bytes the tool itself returned, before any cut.
+    bytes_returned: u64,
+    /// Bytes that reached the model, which is less when a result was cut or withheld.
+    bytes_shown: u64,
+    wall_ms: u128,
+}
+
+/// Which counting produced a run's token numbers.
+///
+/// Named in the record and never omitted. A byte heuristic at
+/// [`crate::context::BYTES_PER_TOKEN`] and a model's own tokenizer disagree, often by
+/// a lot, so two runs counted different ways are not comparable and a reader has to be
+/// told which ruler each number came off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountingMode {
+    /// Every completion carried the endpoint's own prompt and answer counts.
+    EndpointUsage,
+    /// Some completions carried a count and some did not, so the totals cover only
+    /// part of the run. `requests_with_input_usage` and `requests_with_output_usage`
+    /// say how much.
+    EndpointUsagePartial,
+    /// The endpoint counted nothing, and every dispatched request's prompt was counted
+    /// by the server's own template and tokenizer. The answers were counted by nothing.
+    LlamaCppTokenizer,
+    /// The endpoint counted nothing, and at least one prompt count is the labeled byte
+    /// heuristic rather than a tokenizer's. Not an upper bound for every tokenizer.
+    Heuristic,
+    /// Nothing counted anything: the run stopped before it dispatched a request.
+    None,
+}
+
+impl AccountingMode {
+    fn label(self) -> &'static str {
+        match self {
+            AccountingMode::EndpointUsage => "endpoint_usage",
+            AccountingMode::EndpointUsagePartial => "endpoint_usage_partial",
+            AccountingMode::LlamaCppTokenizer => "llama_cpp_tokenizer",
+            AccountingMode::Heuristic => "heuristic",
+            AccountingMode::None => "none",
+        }
+    }
+}
+
 struct Counters {
     tool_calls: u32,
     kin_calls: u32,
@@ -196,6 +246,23 @@ struct Counters {
     input_tokens: u64,
     output_tokens: u64,
     saw_usage: bool,
+    /// Completions the endpoint returned, including one whose choice was rejected after
+    /// the model had already generated it. Generation cost what it cost, so it is counted.
+    completions: u32,
+    /// How many of those carried the endpoint's own prompt count, and its own answer
+    /// count, kept apart because an endpoint that reports one and not the other is
+    /// ordinary and summing the missing half as zero reads as a measured zero.
+    input_reports: u32,
+    output_reports: u32,
+    /// The admitted prompt count of every request this run dispatched, and how many of
+    /// those counts came from the server's own tokenizer rather than the byte heuristic.
+    /// Used only when the endpoint counted nothing, and never added to an endpoint count.
+    admitted_prompt_tokens: u64,
+    admitted_requests: u32,
+    exact_admissions: u32,
+    /// What each tool cost, keyed by the name the model called, so a refusal appears
+    /// under the name the model invented rather than under nothing.
+    by_tool: BTreeMap<String, ToolCost>,
     api_ms: u128,
     edits: Vec<String>,
     /// Entities the model named to `kin_mutate`, in the order it named them.
@@ -232,6 +299,13 @@ impl Counters {
             input_tokens: 0,
             output_tokens: 0,
             saw_usage: false,
+            completions: 0,
+            input_reports: 0,
+            output_reports: 0,
+            admitted_prompt_tokens: 0,
+            admitted_requests: 0,
+            exact_admissions: 0,
+            by_tool: BTreeMap::new(),
             api_ms: 0,
             edits: Vec::new(),
             entity_edits: Vec::new(),
@@ -239,14 +313,124 @@ impl Counters {
     }
 
     fn absorb(&mut self, usage: &Usage) {
+        self.completions += 1;
         if let Some(value) = usage.input_tokens {
             self.input_tokens += value;
+            self.input_reports += 1;
             self.saw_usage = true;
         }
         if let Some(value) = usage.output_tokens {
             self.output_tokens += value;
+            self.output_reports += 1;
             self.saw_usage = true;
         }
+    }
+
+    /// Count one request the loop admitted and dispatched, with the prompt count that
+    /// admitted it and whether that count came from a tokenizer or the byte heuristic.
+    fn record_admission(&mut self, tokens: u64, exact: bool) {
+        self.admitted_prompt_tokens = self.admitted_prompt_tokens.saturating_add(tokens);
+        self.admitted_requests += 1;
+        if exact {
+            self.exact_admissions += 1;
+        }
+    }
+
+    /// Count one tool call the run actually attempted.
+    ///
+    /// `produced` is what the tool itself returned and `shown` is what reached the
+    /// model, and they differ exactly when a result was cut to the per-result ceiling
+    /// or withheld for the context budget. A call that was never run because a budget
+    /// was spent part way through a batch is not counted here; it is `skipped_calls`.
+    fn record_call(
+        &mut self,
+        name: &str,
+        wall_ms: u128,
+        produced: usize,
+        shown: usize,
+        is_error: bool,
+    ) {
+        let cost = self.by_tool.entry(name.to_string()).or_default();
+        cost.calls += 1;
+        if is_error {
+            cost.error_calls += 1;
+        }
+        cost.bytes_returned = cost.bytes_returned.saturating_add(produced as u64);
+        cost.bytes_shown = cost.bytes_shown.saturating_add(shown as u64);
+        cost.wall_ms = cost.wall_ms.saturating_add(wall_ms);
+    }
+
+    /// Which counting produced this run's token numbers.
+    fn accounting_mode(&self) -> AccountingMode {
+        if self.completions > 0
+            && self.input_reports == self.completions
+            && self.output_reports == self.completions
+        {
+            return AccountingMode::EndpointUsage;
+        }
+        if self.input_reports > 0 || self.output_reports > 0 {
+            return AccountingMode::EndpointUsagePartial;
+        }
+        if self.admitted_requests == 0 {
+            return AccountingMode::None;
+        }
+        if self.exact_admissions == self.admitted_requests {
+            AccountingMode::LlamaCppTokenizer
+        } else {
+            AccountingMode::Heuristic
+        }
+    }
+
+    /// What the run spent, summarized from the rows the transcript and the trace
+    /// already carry, so a reader does not have to join two files to state a cost.
+    ///
+    /// `accounting_mode` is mandatory and never omitted, because a byte heuristic and a
+    /// tokenizer count are two different rulers and a reader comparing a number from one
+    /// against a number from the other, with nothing saying which is which, is comparing
+    /// nothing. Endpoint counts are preferred whenever the endpoint reported any, and a
+    /// heuristic count is never summed into a counted one.
+    fn cost_json(&self, stop: &Stop) -> Value {
+        let mode = self.accounting_mode();
+        let (input, output) = match mode {
+            AccountingMode::EndpointUsage | AccountingMode::EndpointUsagePartial => (
+                (self.input_reports > 0).then_some(self.input_tokens),
+                (self.output_reports > 0).then_some(self.output_tokens),
+            ),
+            // Nothing counted the answers, so the answer count stays absent rather than
+            // becoming a zero that reads like a measurement.
+            AccountingMode::LlamaCppTokenizer | AccountingMode::Heuristic => {
+                (Some(self.admitted_prompt_tokens), None)
+            }
+            AccountingMode::None => (None, None),
+        };
+        let by_tool: Map<String, Value> = self
+            .by_tool
+            .iter()
+            .map(|(name, cost)| {
+                (
+                    name.clone(),
+                    json!({
+                        "calls": cost.calls,
+                        "error_calls": cost.error_calls,
+                        "bytes_returned": cost.bytes_returned,
+                        "bytes_shown": cost.bytes_shown,
+                        "wall_ms": cost.wall_ms as u64,
+                    }),
+                )
+            })
+            .collect();
+        json!({
+            "accounting_mode": mode.label(),
+            "total_input_tokens": input,
+            "total_output_tokens": output,
+            "requests": self.completions,
+            "requests_with_input_usage": self.input_reports,
+            "requests_with_output_usage": self.output_reports,
+            "stop_reason": stop.reason,
+            "tool_calls": self.tool_calls,
+            "error_calls": self.by_tool.values().map(|cost| cost.error_calls).sum::<u32>(),
+            "by_tool": Value::Object(by_tool),
+        })
     }
 
     fn usage_json(&self) -> Option<Value> {
@@ -350,6 +534,12 @@ impl Stop {
 enum Spent {
     ToolCalls,
     Context,
+    /// The run kept asking a question that had stopped answering. Not a budget
+    /// in the sense the other two are, and ended the same way on purpose: the
+    /// model is asked for its answer with the tools taken away, so a run that
+    /// was going in circles finishes by saying what it could not determine
+    /// instead of by running out of window.
+    Repeat,
 }
 
 /// Why a turn got no completion.
@@ -365,12 +555,20 @@ enum EndpointStop {
 pub struct RunOptions {
     pub accounting: RequestAccounting,
     pub output_reserve_tokens: Option<u64>,
+    /// Which belt this run puts on the model. `None` reads `KIN_AGENT_BELT`.
+    ///
+    /// Named here as well as in the environment because a caller that wants the
+    /// wide belt for one run should not have to set a process-wide variable to
+    /// get it, and a test that did would be setting it for every other test
+    /// sharing the process.
+    pub belt: Option<belt::BeltProfile>,
 }
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
             accounting: RequestAccounting::Heuristic,
             output_reserve_tokens: None,
+            belt: None,
         }
     }
 }
@@ -404,6 +602,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
         RunOptions {
             accounting,
             output_reserve_tokens,
+            belt: None,
         },
     )
 }
@@ -447,6 +646,10 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
     let deadline_at = started + config.deadline;
     let result_ceiling = config.result_ceiling();
 
+    // Resolved once, before the run record is written, so the provenance line,
+    // the filter below and the specs sent to the endpoint cannot disagree about
+    // which belt this run had.
+    let belt_profile = options.belt.unwrap_or_else(belt::BeltProfile::from_env);
     let agent_meta = json!({
         "base_url": config.provider.base_url,
         "max_tool_calls": config.max_tool_calls,
@@ -464,6 +667,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
         // there is no edit_file and no write_file at all, so a change in that
         // run went through Kin or it did not happen.
         "belt": if belt::Belt::pure_kin_default() { "pure-kin" } else { "kin-plus-file-tools" },
+        "belt_profile": belt_profile.as_str(),
         "policy": "no-shell-no-file-search",
         "mcp_command": config.mcp_command.join(" "),
     });
@@ -558,7 +762,11 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
             if belt::is_harness_owned(&tool.name) {
                 continue;
             }
+            if belt_profile == belt::BeltProfile::Default && belt::is_opt_in(&tool.name) {
+                continue;
+            }
             kin_tools.push(belt::KinTool {
+                folded: false,
                 server: index,
                 bare: tool.name.clone(),
                 exposed: format!("{prefix}{}", tool.name),
@@ -567,6 +775,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
             });
         }
     }
+    belt::fold_traversal(&mut kin_tools);
     // `KIN_AGENT_PURE_KIN` is the whole switch, read once here so the trace
     // above and the belt below cannot disagree about which one this run had.
     //
@@ -639,6 +848,9 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
 
     let mut next_tool_id = 0u64;
     let mut consecutive_unusable = 0u32;
+    let mut repeat_guard = repeat::RepeatGuard::new();
+    // Set when the guard decided the run should answer rather than ask again.
+    let mut repeat_stop: Option<String> = None;
     let mut surfaced_degraded = false;
     // Set when a result was withheld because the conversation could not hold it.
     let mut context_note: Option<String> = None;
@@ -655,6 +867,8 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
             Some(Spent::ToolCalls)
         } else if context_note.is_some() {
             Some(Spent::Context)
+        } else if repeat_stop.is_some() {
+            Some(Spent::Repeat)
         } else {
             match prepare_turn(
                 &provider,
@@ -686,6 +900,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                 &config,
                 &meter,
                 context_note.as_deref(),
+                repeat_stop.as_deref(),
                 counters.turns,
             );
             stop = spent_stop;
@@ -726,7 +941,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                 &mut writer,
             )? {
                 Ok(completion) => {
-                    counters.absorb(&completion.usage);
+                    record_completion(&mut counters, &mut writer, &completion)?;
                     let turn = parse::parse_choice(&completion.choice, belt.names());
                     let text = match turn {
                         Turn::Final { text } => text,
@@ -792,7 +1007,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                 break;
             }
         };
-        counters.absorb(&completion.usage);
+        record_completion(&mut counters, &mut writer, &completion)?;
         counters.turns += 1;
         meter.anchor(&completion.usage, message_bytes(&completion.choice));
         let turn = parse::parse_choice(&completion.choice, belt.names());
@@ -890,6 +1105,11 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                         ))
                     } else if context_note.is_some() {
                         Some("the conversation has reached the model's context window".to_string())
+                    } else if repeat_stop.is_some() {
+                        Some(
+                            "this run stopped re-asking a question the graph had already answered"
+                                .to_string(),
+                        )
                     } else {
                         None
                     };
@@ -918,7 +1138,89 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                         continue;
                     }
                     counters.tool_calls += 1;
-                    let route = belt.route(&call.name);
+                    // One clock over every call, whatever it routes to, so a refusal and a
+                    // graph call are timed the same way and the per-tool wall time can be
+                    // added up without knowing which surface answered.
+                    let call_started = Instant::now();
+                    // Set only where the tool's own answer is bigger than what the model is
+                    // sent, which is the Kin result that was cut to the per-result ceiling.
+                    let mut produced_bytes: Option<usize> = None;
+                    // Routed with the arguments, not just the name: a folded
+                    // belt tool picks its server tool from what the model sent,
+                    // and the arguments that go out are the ones the route
+                    // resolved with.
+                    let routed = belt.route_call(&call.name, &call.arguments);
+                    let routed_arguments = routed.arguments;
+                    let route = routed.route;
+                    // The guard sees a Kin call before it is sent. A call it
+                    // stops still cost the model a turn, so it stays counted
+                    // above, and it still gets an answer so the conversation
+                    // stays well formed.
+                    let guarded = match &route {
+                        Route::Kin { tool, .. } => repeat_guard.before(tool, &routed_arguments),
+                        // The belt's replacement tool is the one local call a refusal
+                        // can be about the model's own bytes, and the guard counts those
+                        // per target: a run that keeps sending bytes the file does not
+                        // hold spends its whole budget one refusal at a time otherwise.
+                        Route::Local(LocalTool::Edit) => repeat_guard.before_change(
+                            &call.name,
+                            routed_arguments
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ),
+                        _ => repeat::Verdict::Allow,
+                    };
+                    if guarded != repeat::Verdict::Allow {
+                        let (text, ends_run) = match guarded {
+                            repeat::Verdict::Redirect(message) => (message, None),
+                            repeat::Verdict::Exhausted(detail) => (
+                                format!(
+                                    "[kin agent] This call was not run: {detail}. Answer now with \
+                                     what you have learned, and name what you could not determine \
+                                     and which tool could not answer it."
+                                ),
+                                Some(detail),
+                            ),
+                            repeat::Verdict::Allow => unreachable!("checked above"),
+                        };
+                        writer.trace(json!({
+                            "tool_use_id": call.id,
+                            "surface": "policy",
+                            "tool": call.name,
+                            "args": redact_content(&call.arguments),
+                            "policy": "repeat_guard",
+                            "verdict": if ends_run.is_some() { "exhausted" } else { "redirected" },
+                            "reason": repeat_guard.reasons().last(),
+                            "escalations": repeat_guard.escalations(),
+                            "is_error": true,
+                        }))?;
+                        // The guard's refusal is this call's result: it went back to the model
+                        // marked as an error, so it takes a per-tool row like every other answered
+                        // call. `tool_calls` was incremented above on purpose, and the cost summary
+                        // asserts the per-tool rows add up to it, so a guarded call that skipped
+                        // `record_call` would leave the headline counting a call no row accounts
+                        // for. Nothing was cut, so what the tool produced and what the model was
+                        // shown are the same bytes.
+                        counters.record_call(
+                            &call.name,
+                            call_started.elapsed().as_millis(),
+                            text.len(),
+                            text.len(),
+                            true,
+                        );
+                        writer.tool_result(&call.id, &text, true)?;
+                        meter.add(text.len() as u64);
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": text,
+                        }));
+                        if let Some(detail) = ends_run {
+                            repeat_stop = Some(detail);
+                        }
+                        continue;
+                    }
                     // A local tool's answer says whether a change landed, which the model must
                     // hear, and it is small; only a Kin answer is ever withheld for size.
                     let from_kin = matches!(route, Route::Kin { .. });
@@ -967,7 +1269,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                 Ok(()) => {
                                     let session = servers[server_index].session.clone();
                                     let arguments = with_harness_session(
-                                        &call.arguments,
+                                        &routed_arguments,
                                         &name,
                                         session.as_deref(),
                                     );
@@ -988,6 +1290,17 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                                 "transport_error": err.to_string(),
                                             }))?;
                                             writer.tool_result(&call.id, &err.to_string(), true)?;
+                                            // Recorded on the way out, because this exit
+                                            // skips the loop's own accounting below and a
+                                            // call the run made must not be missing from
+                                            // the summary it reports.
+                                            counters.record_call(
+                                                &call.name,
+                                                call_started.elapsed().as_millis(),
+                                                err.to_string().len(),
+                                                err.to_string().len(),
+                                                true,
+                                            );
                                             final_text = err.to_string();
                                             return finish(
                                                 writer,
@@ -1011,6 +1324,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                             // Cut before the notes are appended, so what Kin
                                             // said about its own answer is never the part cut.
                                             let result_bytes = outcome.text.len();
+                                            produced_bytes = Some(result_bytes);
                                             let mut shown_bytes = result_bytes;
                                             if result_bytes > result_ceiling {
                                                 counters.clipped_results += 1;
@@ -1025,6 +1339,16 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                                 shown_bytes = shown.shown_bytes;
                                                 outcome.text = shown.text;
                                             }
+                                            // Read before the envelope notes go
+                                            // on, so the guard grades what Kin
+                                            // returned rather than what the
+                                            // harness added about it.
+                                            repeat_guard.record(
+                                                &name,
+                                                &arguments,
+                                                &outcome.text,
+                                                outcome.is_error,
+                                            );
                                             let annotated = annotate(
                                                 &outcome,
                                                 &mut counters,
@@ -1270,6 +1594,12 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                                     provenance,
                                                 )
                                             };
+                                            // Counted before the trace, so the run record
+                                            // and the guard agree about how many times this
+                                            // target was refused over its own bytes.
+                                            if outcome.retry_with_bytes {
+                                                repeat_guard.record_refusal(&call.name, raw_path);
+                                            }
                                             if let Some(path) = outcome.changed.clone() {
                                                 // With several repositories attached the
                                                 // same relative path exists in more than
@@ -1335,6 +1665,13 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                         } else {
                             (result_text, is_error)
                         };
+                    counters.record_call(
+                        &call.name,
+                        call_started.elapsed().as_millis(),
+                        produced_bytes.unwrap_or(result_text.len()),
+                        result_text.len(),
+                        is_error,
+                    );
                     writer.tool_result(&call.id, &result_text, is_error)?;
                     meter.add(result_text.len() as u64);
                     messages.push(json!({
@@ -1375,11 +1712,31 @@ fn budget_stop(
     config: &AgentConfig,
     meter: &ContextMeter,
     withheld: Option<&str>,
+    repeated: Option<&str>,
     turns: u32,
 ) -> (Stop, String) {
     const ASK: &str = "Do not call any more tools. Answer now in plain text with what you have \
                        learned, and say plainly what you were not able to determine.";
     match spent {
+        // Named apart from the tool-call cap it shares an exit code with. Both
+        // are a run that ran out of room to ask, and only this one says the room
+        // went on the same question twice, which is the difference a reader
+        // grading a run needs and an exit code cannot carry.
+        Spent::Repeat => (
+            Stop::new(
+                ExitStatus::CapReached,
+                "repeat_loop",
+                Some(
+                    repeated
+                        .unwrap_or("the run kept asking a question that had stopped answering")
+                        .to_string(),
+                ),
+            ),
+            format!(
+                "You were asking the same question repeatedly and it had stopped producing \
+                 anything new. {ASK}"
+            ),
+        ),
         Spent::ToolCalls => (
             Stop::new(
                 ExitStatus::CapReached,
@@ -1396,19 +1753,24 @@ fn budget_stop(
         ),
         Spent::Context => {
             let window = meter.window();
+            // The stop names what counted as well as how much. A stop read
+            // against a number whose source is unstated cannot be checked, and
+            // the byte heuristic and the endpoint's own count disagree by
+            // enough to end a run that had room left.
+            let counted = meter.count_source().label();
             let detail = match withheld {
                 Some(withheld) => withheld.to_string(),
                 None if turns == 0 => format!(
-                    "the first request needs about {} tokens, which leaves less than the {} kept \
-                     for the answer in the model's {}-token window ({})",
+                    "the first request needs about {} tokens, {counted}, which leaves less than \
+                     the {} kept for the answer in the model's {}-token window ({})",
                     meter.used(),
                     meter.reserve(),
                     window.tokens,
                     window.source.label()
                 ),
                 None => format!(
-                    "the conversation holds about {} of the model's {} tokens ({}), which \
-                     leaves less than the {} kept for the answer",
+                    "the conversation holds about {} of the model's {} tokens ({} window, \
+                     {counted}), which leaves less than the {} kept for the answer",
                     meter.used(),
                     window.tokens,
                     window.source.label(),
@@ -1525,6 +1887,28 @@ fn check_arguments(belt: &Belt, name: &str, arguments: &Value) -> Result<(), Str
     }
 }
 
+/// Take one completion's cost, and write the endpoint's own count for that one request
+/// to the trace beside it.
+///
+/// The per-request row is what makes the summary checkable: a reader can add the rows up
+/// and get the totals back, and a request the endpoint counted nothing for says so with
+/// nulls rather than dropping out of the file.
+fn record_completion(
+    counters: &mut Counters,
+    writer: &mut TranscriptWriter,
+    completion: &Completion,
+) -> std::io::Result<()> {
+    counters.absorb(&completion.usage);
+    writer.trace(json!({
+        "event": "request_usage",
+        "request": counters.completions,
+        "input_tokens": completion.usage.input_tokens,
+        "output_tokens": completion.usage.output_tokens,
+        "reported_by_endpoint": !completion.usage.is_empty(),
+        "api_ms": completion.api_ms as u64,
+    }))
+}
+
 fn record_accounting_failure(
     meter: &mut ContextMeter,
     counters: &mut Counters,
@@ -1618,26 +2002,42 @@ fn prepare_turn(
                 }));
             }
         };
-        let (tokens, exact, reason) = match measured {
-            PromptCount::Counted(tokens) => (tokens, true, None),
+        let (tokens, source, reason) = match measured {
+            PromptCount::Counted(tokens) => (tokens, CountSource::Tokenizer, None),
+            // Once the endpoint has counted this conversation itself, the byte
+            // heuristic does not get to overrule it. `heuristic_floor` is the
+            // endpoint's own count of the last request plus an estimate of only
+            // what the loop appended since, so the history is counted and just
+            // the delta is estimated. Taking the larger of that and a heuristic
+            // over the whole body is what ended runs early: on qwen3-coder-next
+            // the whole-body heuristic read 59,029 tokens for a request the
+            // server counted at 46,523, and the run stopped for its context
+            // budget with about 19,000 tokens free and the model mid-task.
+            PromptCount::Unsupported(reason) if meter.anchored_on_endpoint() => {
+                (heuristic_floor, CountSource::EndpointUsage, Some(reason))
+            }
             PromptCount::Unsupported(reason) => (
                 request.heuristic_tokens().max(heuristic_floor),
-                false,
+                CountSource::Heuristic,
                 Some(reason),
             ),
         };
+        let exact = source.exact();
         let room = meter.window().tokens.saturating_sub(tokens);
         let admitted = request.max_tokens() > 0 && request.max_tokens() <= room;
         let detail = json!({
-            "event":"context_admission", "method":if exact {"llama_cpp_template_tokenize"} else {"heuristic"},
+            "event":"context_admission", "method":source.method(),
             "exact":exact, "contract":if exact {Some("rendered_text_add_special_false_parse_special_true")} else {None},
             "fallback_reason":reason, "prompt_tokens":tokens, "max_tokens":request.max_tokens(),
             "output_token_parameter":request.output_token_parameter(),
             "window_tokens":meter.window().tokens, "tool_free":tools.is_empty(), "round":round, "admitted":admitted,
         });
-        meter.record_request(tokens, detail.clone());
+        meter.record_request(tokens, source, detail.clone());
         writer.trace(detail)?;
         if admitted {
+            // Only the admitted round is dispatched, so only its count is the run's
+            // cost. An earlier round's count was a request that never went out.
+            counters.record_admission(tokens, exact);
             if exact {
                 request.expect_prompt_tokens(tokens);
             }
@@ -2482,6 +2882,9 @@ fn finish(
     };
     let mut agent = counters.to_json(status.code(), &stop);
     agent["max_result_bytes"] = json!(config.result_ceiling());
+    // What the run spent, in one object, so a cost claim about a run is read off the
+    // record rather than assembled by hand from two files, or estimated.
+    agent["cost"] = counters.cost_json(&stop);
     // The budget as it stood when the run stopped, so a context stop can be read against
     // the numbers that decided it.
     agent["context"] = meter.map_or(Value::Null, ContextMeter::to_json);

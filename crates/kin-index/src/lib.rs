@@ -22,6 +22,7 @@ fn kin_process_group_guardian_worker() {
 pub mod admission;
 pub mod artifacts;
 pub mod classifier;
+pub mod dispatch;
 pub mod error;
 pub mod fingerprint;
 pub mod history;
@@ -41,6 +42,10 @@ pub use admission::{
 };
 pub use artifacts::extract_artifact;
 pub use classifier::{FileClassification, FileClassifier};
+pub use dispatch::{
+    dispatch_candidate_callers, go_method_arity, interface_dispatch_targets, method_set_satisfies,
+    split_qualified_method, DispatchTarget, GoArity, DISPATCH_FIELD, DISPATCH_INTERFACE_CANDIDATE,
+};
 pub use error::{IndexError, Result};
 pub use fingerprint::{
     behavior_equivalence_hash, compute_entity_fingerprint, language_supports_equivalence,

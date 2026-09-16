@@ -163,6 +163,17 @@ fn completion_with_usage(
     response
 }
 
+/// A completion the endpoint reports no counts at all for, the way an OpenAI-compatible
+/// server that omits `usage` answers. The run then has only its own admission count.
+fn completion_without_usage(content: &str, tool_calls: Option<Value>) -> Value {
+    let mut response = completion(content, tool_calls);
+    response
+        .as_object_mut()
+        .expect("a completion is an object")
+        .remove("usage");
+    response
+}
+
 /// Answer one GET by path from a fixed table, 404 for anything else, and record the path,
 /// the way a server that keeps its own API beside the compatible one answers.
 fn serve_route(
@@ -681,6 +692,220 @@ fn mcp_log(path: &Path) -> Vec<Value> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+/// The bytes a refusal quoted, which is what the next call re-issues with.
+fn quoted_bytes(refusal: &str) -> &str {
+    let (_, after) = refusal
+        .split_once("<<<KIN-EXACT\n")
+        .unwrap_or_else(|| panic!("the refusal quotes the file's bytes: {refusal}"));
+    let (bytes, _) = after
+        .split_once("\n>>>KIN-EXACT")
+        .unwrap_or_else(|| panic!("the quote is closed: {refusal}"));
+    bytes
+}
+
+#[test]
+fn a_byte_match_refusal_carries_the_bytes_the_very_next_call_lands_with() {
+    // The measured regression in one run. On 2026-09-15 `qwen/qwen3-coder-next` sent a
+    // `find` whose escape sequences were literal, because the source it had read came
+    // back inside a JSON result, and was told only that the text did not appear. It never
+    // attempted the change again and spent its remaining sixteen calls on graph
+    // questions. The refusal now carries the file's exact bytes, and this is the proof
+    // they are usable: the second call's `find` is read OUT of the first call's refusal,
+    // so the test fails if the refusal stops carrying them or carries them wrong.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // What the model reads out of a JSON tool result, copied back without being written
+    // as the characters themselves.
+    let escaped = "def greet(name):\\n    return f\\\"hello {name}\\\"";
+    // The same text as the file actually holds it.
+    let exact = "def greet(name):\n    return f\"hello {name}\"";
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Making the greeting warmer.",
+            Some(tool_call(
+                "c1",
+                "edit_file",
+                json!({
+                    "path": "src/greet.py",
+                    "find": escaped,
+                    "replace": "def greet(name):\\n    return f\\\"hi {name}\\\"",
+                }),
+            )),
+        ),
+        completion(
+            "Those were escaped. Sending the file's own bytes.",
+            Some(tool_call(
+                "c2",
+                "edit_file",
+                json!({
+                    "path": "src/greet.py",
+                    "find": exact,
+                    "replace": "def greet(name):\n    return f\"hi {name}\"",
+                }),
+            )),
+        ),
+        completion("greet now returns a shorter greeting.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.tool_results.len(), 2);
+
+    // The first call is refused, and the refusal is not only a refusal.
+    let (_, refusal, is_error) = &view.tool_results[0];
+    assert!(
+        is_error,
+        "the byte mismatch must still be refused: {refusal}"
+    );
+    assert!(
+        refusal.contains("escape sequences literal"),
+        "the refusal must name why it did not match: {refusal}"
+    );
+    assert!(
+        refusal.contains("lines 1 to 2"),
+        "the refusal must say where it looked: {refusal}"
+    );
+    assert!(
+        refusal.contains("mcp__kin__kin_mutate"),
+        "the refusal must name the route that needs no old bytes: {refusal}"
+    );
+
+    // The load-bearing assertion: the bytes the refusal handed back ARE the bytes the
+    // next call sent, so a model that copies them recovers in one turn.
+    assert_eq!(
+        quoted_bytes(refusal),
+        exact,
+        "the refusal must quote the file's exact current bytes"
+    );
+    assert_eq!(
+        view.tool_uses[1].2["find"].as_str().unwrap(),
+        quoted_bytes(refusal),
+        "the recovering call re-issues with exactly what the refusal quoted"
+    );
+
+    // And that call lands.
+    assert!(
+        !view.tool_results[1].2,
+        "the retry must succeed: {}",
+        view.tool_results[1].1
+    );
+    let edited = std::fs::read_to_string(repo.join("src/greet.py")).unwrap();
+    assert_eq!(edited, "def greet(name):\n    return f\"hi {name}\"\n");
+
+    // It landed through repository authority, not by a local write.
+    let trace = read_jsonl(&outcome.trace_path);
+    let published = trace
+        .iter()
+        .filter(|row| row["surface"] == "local" && row["tool"] == "edit_file")
+        .collect::<Vec<_>>();
+    assert_eq!(published.len(), 2);
+    assert_eq!(published[0]["is_error"], true);
+    assert_eq!(
+        published[0]["provenance"]["closed_with"], "kin_transaction_abort",
+        "a refused edit stages nothing and closes its bracket"
+    );
+    assert_eq!(published[1]["is_error"], false);
+    assert_eq!(
+        published[1]["provenance"]["closed_with"],
+        "kin_transaction_commit"
+    );
+    assert_eq!(view.result["kin_agent"]["files_changed"][0], "src/greet.py");
+}
+
+#[test]
+fn a_target_refused_twice_is_not_attempted_a_third_time() {
+    // The other half of the measured failure: a run that keeps sending bytes the file
+    // does not hold spends its budget one refusal at a time. Two are allowed, because the
+    // first is the one a model reads and corrects from. The third is not run at all, and
+    // the model is sent to read the entity's source instead.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let attempt = |id: &str, find: &str| {
+        completion(
+            "Trying the edit.",
+            Some(tool_call(
+                id,
+                "edit_file",
+                json!({ "path": "src/greet.py", "find": find, "replace": "return 1" }),
+            )),
+        )
+    };
+    let endpoint = FakeEndpoint::start(vec![
+        attempt("c1", "return \"hello \" + name"),
+        attempt("c2", "return 'hello ' + name"),
+        attempt("c3", "return  \"hello\"  +  name"),
+        completion("I could not match the line I meant to change.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success);
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    assert_eq!(view.tool_results.len(), 3);
+    assert!(view.tool_results[0].2 && view.tool_results[1].2);
+
+    // The third was answered by the guard rather than run.
+    let third = &view.tool_results[2].1;
+    assert!(view.tool_results[2].2, "a stopped call is an error result");
+    assert!(
+        third.contains("This call was not run")
+            && third.contains("has been refused 2 times on `src/greet.py`"),
+        "the redirect must say what it stopped and why: {third}"
+    );
+    assert!(
+        third.contains("mcp__kin__get_entity_source"),
+        "the redirect must send the model to the source: {third}"
+    );
+    assert!(
+        third.contains("mcp__kin__kin_mutate"),
+        "the redirect must name the route that needs no old bytes: {third}"
+    );
+
+    let trace = read_jsonl(&outcome.trace_path);
+    let stopped = trace
+        .iter()
+        .find(|row| row["policy"] == "repeat_guard")
+        .expect("the guard's decision is traced");
+    assert_eq!(stopped["tool"], "edit_file");
+    assert_eq!(stopped["verdict"], "redirected");
+    assert_eq!(stopped["escalations"], 1);
+
+    // Nothing was opened for the call that did not run. Two attempts, two brackets.
+    let begins = mcp_log(&log)
+        .iter()
+        .filter(|call| call["tool"] == "kin_transaction_begin")
+        .count();
+    assert_eq!(
+        begins, 2,
+        "a call the guard stopped must not open a transaction"
+    );
+
+    // The file is untouched, and the run still ends with an answer.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/greet.py")).unwrap(),
+        "def greet(name):\n    return f\"hello {name}\"\n"
+    );
+    assert_eq!(
+        outcome.final_text,
+        "I could not match the line I meant to change."
+    );
 }
 
 #[test]
@@ -1934,6 +2159,373 @@ fn an_off_belt_tool_is_refused_and_never_runs() {
     );
 }
 
+/// The run summarizes what it spent, in one object, in `result.json`.
+///
+/// Three files per run and nothing that added them up is what let a saving be asserted
+/// off a run nobody had counted. The summary puts `error_calls` beside
+/// `total_output_tokens` in the same object, so a run whose calls were refused cannot be
+/// read as cheap work the model did: the refusals are in the same sentence as the tokens.
+#[test]
+fn result_json_carries_a_cost_summary_with_tokens_and_error_calls_by_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion_with_usage(
+            "Looking.",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({ "query": "greet" }),
+            )),
+            120,
+            18,
+        ),
+        // An off-belt name, which the router refuses by name. It is a call the model
+        // made and a turn the run paid for, so it has to appear in the cost.
+        completion_with_usage(
+            "Trying a shell.",
+            Some(tool_call("c2", "bash", json!({ "command": "ls" }))),
+            240,
+            12,
+        ),
+        completion_with_usage("greet is defined in src/greet.py.", None, 300, 28),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    // The object is in the file a reader opens, not only in the value the caller got.
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("result.json")).unwrap())
+            .expect("result.json is JSON");
+    assert_eq!(record, outcome.result);
+    let cost = &record["kin_agent"]["cost"];
+
+    // Every completion carried the endpoint's own counts, so the totals are the
+    // endpoint's and the mode names that ruler instead of leaving a reader to guess it.
+    assert_eq!(cost["accounting_mode"], "endpoint_usage");
+    assert_eq!(cost["total_input_tokens"], 120 + 240 + 300);
+    assert_eq!(cost["total_output_tokens"], 18 + 12 + 28);
+    assert_eq!(cost["requests"], 3);
+    assert_eq!(cost["requests_with_input_usage"], 3);
+    assert_eq!(cost["requests_with_output_usage"], 3);
+    assert_eq!(cost["stop_reason"], "final_answer");
+
+    assert_eq!(cost["tool_calls"], 2);
+    assert_eq!(cost["error_calls"], 1);
+    let by_tool = cost["by_tool"].as_object().expect("by_tool is an object");
+    assert_eq!(by_tool.len(), 2, "one row per tool name: {by_tool:?}");
+    let located = &by_tool["mcp__kin__semantic_locate"];
+    assert_eq!(located["calls"], 1);
+    assert_eq!(located["error_calls"], 0);
+    assert!(
+        located["bytes_returned"].as_u64().unwrap() > 0,
+        "the graph answered something: {located}"
+    );
+    // Nothing was cut, so what the tool returned and what the model saw are the same.
+    assert_eq!(located["bytes_returned"], located["bytes_shown"]);
+    // The refusal is filed under the name the model invented, because that is the only
+    // name it has, and a refusal filed under nothing is a call that vanishes.
+    let refused = &by_tool["bash"];
+    assert_eq!(refused["calls"], 1);
+    assert_eq!(refused["error_calls"], 1);
+    assert!(refused["bytes_returned"].as_u64().unwrap() > 0);
+
+    // The per-tool rows add up to the headline, so they are one count and not two that
+    // can disagree. A call that was never run is `skipped_calls` and is in neither.
+    let calls: u64 = by_tool
+        .values()
+        .map(|row| row["calls"].as_u64().unwrap())
+        .sum();
+    let errors: u64 = by_tool
+        .values()
+        .map(|row| row["error_calls"].as_u64().unwrap())
+        .sum();
+    assert_eq!(calls, cost["tool_calls"].as_u64().unwrap());
+    assert_eq!(errors, cost["error_calls"].as_u64().unwrap());
+
+    // The totals are the sum of the per-request rows in the trace, so a reader can check
+    // the summary against the file instead of taking it on faith.
+    let usage_rows: Vec<Value> = read_jsonl(&outcome.trace_path)
+        .into_iter()
+        .filter(|row| row["event"] == "request_usage")
+        .collect();
+    assert_eq!(usage_rows.len(), 3);
+    let counted: u64 = usage_rows
+        .iter()
+        .map(|row| row["input_tokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(counted, cost["total_input_tokens"].as_u64().unwrap());
+    assert!(usage_rows
+        .iter()
+        .all(|row| row["reported_by_endpoint"] == true));
+}
+
+/// The conversation the two counts disagree about: two large graph listings and
+/// then an answer. `counts` is the prompt and answer count the endpoint reports
+/// per turn, or `None` for an endpoint that reports none.
+fn two_large_listings(counts: Option<[(u64, u64); 3]>) -> Vec<Value> {
+    let listing = |id: &str, offset: u64| {
+        Some(tool_call(
+            id,
+            "mcp__kin__kin_artifact_list",
+            json!({ "limit": 600, "offset": offset }),
+        ))
+    };
+    let turns = [
+        ("Listing the artifacts.", listing("a1", 0)),
+        ("Listing the next page.", listing("a2", 600)),
+        ("This repository holds 5000 artifacts.", None),
+    ];
+    turns
+        .into_iter()
+        .enumerate()
+        .map(|(index, (text, calls))| match counts {
+            Some(counts) => completion_with_usage(text, calls, counts[index].0, counts[index].1),
+            None => completion_without_usage(text, calls),
+        })
+        .collect()
+}
+
+/// A 64k window with the answer reserve the loop derives for it, and a per-result
+/// ceiling high enough that the listings arrive whole. The run has to be able to
+/// put more bytes in the conversation than the byte heuristic would allow.
+fn wide_window_config(
+    repo: &Path,
+    out: &Path,
+    base_url: &str,
+    mcp_command: Vec<String>,
+) -> AgentConfig {
+    AgentConfig {
+        context: kin_agent::ContextWindow {
+            tokens: 65_536,
+            source: kin_agent::ContextSource::Flag,
+        },
+        max_result_bytes: Some(200_000),
+        max_tool_calls: 4,
+        ..config(repo, out, base_url, mcp_command)
+    }
+}
+
+/// Every `context_admission` row in a run's trace, in order.
+fn admissions(trace_path: &Path) -> Vec<Value> {
+    read_jsonl(trace_path)
+        .into_iter()
+        .filter(|row| row["event"] == "context_admission")
+        .collect()
+}
+
+/// An endpoint that counts its own prompts governs the budget, and the run keeps
+/// going where the byte heuristic would have ended it.
+///
+/// Measured against qwen3-coder-next, the byte heuristic read 59,029 tokens for a
+/// request the server itself counted at 46,523. The run stopped for its context
+/// budget with about 19,000 tokens of the window free and the model still
+/// working, and the same gap ended a second model's run on the same task. Short
+/// runs agreed within a few hundred tokens, so the overcount only bites where it
+/// costs the most.
+#[test]
+fn an_endpoint_that_counts_its_own_prompt_governs_the_budget_over_the_byte_heuristic() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // The endpoint counts the same history far lower than three bytes to a
+    // token, which is the direction every measured model went.
+    let endpoint = FakeEndpoint::start(two_large_listings(Some([
+        (500, 20),
+        (20_000, 20),
+        (55_000, 30),
+    ])));
+    let base_url = endpoint.base_url.clone();
+
+    // The wide belt, for the same reason the clipping and withholding tests take
+    // it: the artifact listing is the tool whose answer is large enough to fill a
+    // window, and the belt this run would otherwise get does not carry it. Asked
+    // for here rather than through `KIN_AGENT_BELT` so the rest of this process
+    // keeps the belt it expects.
+    let outcome = kin_agent::run_with_options(
+        wide_window_config(&repo, &out, &base_url, mcp_command(&server, &log)),
+        wide_belt(),
+    )
+    .expect("the run completes");
+
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    let result_bytes: u64 = view
+        .tool_results
+        .iter()
+        .map(|(_, text, _)| text.len() as u64)
+        .sum();
+
+    // The control the rest of this test rests on. The conversation has to carry
+    // more bytes than the byte heuristic would let through, or an admission that
+    // succeeded would prove nothing about which count governed it.
+    let spendable = 65_536 - 8_192;
+    assert!(
+        result_bytes / kin_agent::context::BYTES_PER_TOKEN > spendable,
+        "the fixture must exceed the heuristic's room: {result_bytes} bytes"
+    );
+
+    assert_eq!(
+        outcome.status,
+        ExitStatus::Success,
+        "the run must reach its answer: {}",
+        outcome.result["kin_agent"]["stop_detail"]
+    );
+    assert_eq!(outcome.result["kin_agent"]["stop_reason"], "final_answer");
+
+    // Once the endpoint has counted the conversation, every later admission is
+    // decided on that count plus what the loop appended after it.
+    let admissions = admissions(&outcome.trace_path);
+    assert!(admissions.len() >= 3, "{admissions:?}");
+    assert_eq!(
+        admissions[0]["method"], "heuristic",
+        "nothing had counted anything yet on the first request"
+    );
+    let last = admissions.last().unwrap();
+    assert_eq!(last["method"], "endpoint_usage_anchor");
+    assert_eq!(last["admitted"], true);
+    assert!(
+        last["prompt_tokens"].as_u64().unwrap() < spendable,
+        "the admitted count is the endpoint's, not the bytes: {last}"
+    );
+    assert_eq!(
+        outcome.result["kin_agent"]["context"]["count_source"],
+        "endpoint_usage_anchor"
+    );
+    assert_eq!(
+        outcome.result["kin_agent"]["cost"]["accounting_mode"],
+        "endpoint_usage"
+    );
+}
+
+/// The reverse, on the same script and the same window: an endpoint that counts
+/// nothing leaves the byte heuristic in charge, and the run stops on its context
+/// budget and says which count ended it.
+///
+/// Without this the change above would read as "the budget got looser", when
+/// what it does is prefer a real count over an estimate wherever one exists.
+#[test]
+fn an_endpoint_that_counts_nothing_leaves_the_byte_heuristic_in_charge() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(two_large_listings(None));
+    let base_url = endpoint.base_url.clone();
+
+    // The wide belt, for the same reason the clipping and withholding tests take
+    // it: the artifact listing is the tool whose answer is large enough to fill a
+    // window, and the belt this run would otherwise get does not carry it. Asked
+    // for here rather than through `KIN_AGENT_BELT` so the rest of this process
+    // keeps the belt it expects.
+    let outcome = kin_agent::run_with_options(
+        wide_window_config(&repo, &out, &base_url, mcp_command(&server, &log)),
+        wide_belt(),
+    )
+    .expect("the run completes");
+
+    assert_eq!(
+        outcome.status,
+        ExitStatus::ContextBudget,
+        "the same conversation stops when nothing but the heuristic counted it: {}",
+        outcome.result["kin_agent"]["stop_detail"]
+    );
+    assert_eq!(outcome.result["kin_agent"]["stop_reason"], "context_budget");
+
+    for row in admissions(&outcome.trace_path) {
+        assert_eq!(
+            row["method"], "heuristic",
+            "no endpoint count exists to anchor on: {row}"
+        );
+    }
+    assert_eq!(
+        outcome.result["kin_agent"]["context"]["count_source"],
+        "heuristic"
+    );
+    assert_eq!(
+        outcome.result["kin_agent"]["cost"]["accounting_mode"],
+        "heuristic"
+    );
+
+    // A stop is a decision to end a run, so the record says what counted.
+    let detail = outcome.result["kin_agent"]["stop_detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        detail.contains("byte heuristic") || detail.contains("was withheld"),
+        "the stop must name what counted: {detail}"
+    );
+}
+
+/// A run whose endpoint counts nothing still reports a prompt count, says it is the byte
+/// heuristic, and leaves the answer count absent.
+///
+/// The control for the test above. Without it `accounting_mode` would be proven only in
+/// the state where it reads `endpoint_usage`, and a field that says one thing in every
+/// run is not a field that separates two rulers. The absent answer count matters for the
+/// same reason: a zero there would read as a model that generated nothing.
+#[test]
+fn a_run_the_endpoint_counts_nothing_for_reports_a_heuristic_prompt_count_and_no_answer_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion_without_usage(
+            "Looking.",
+            Some(tool_call(
+                "c1",
+                "mcp__kin__semantic_locate",
+                json!({ "query": "greet" }),
+            )),
+        ),
+        completion_without_usage("greet is defined in src/greet.py.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    let cost = &outcome.result["kin_agent"]["cost"];
+    assert_eq!(cost["accounting_mode"], "heuristic");
+    assert_eq!(cost["requests"], 2);
+    assert_eq!(cost["requests_with_input_usage"], 0);
+    assert_eq!(cost["requests_with_output_usage"], 0);
+    // The loop counted the prompts itself to admit them, so there is a number.
+    assert!(
+        cost["total_input_tokens"].as_u64().unwrap() > 0,
+        "admission counted the prompt: {cost}"
+    );
+    // Nothing counted the answers, so the answer count stays absent rather than becoming
+    // a zero that reads like a measurement.
+    assert_eq!(cost["total_output_tokens"], Value::Null);
+    // The trace says per request that the endpoint reported nothing, so the null above
+    // is a fact about the endpoint rather than a gap in the loop's own recording.
+    let usage_rows: Vec<Value> = read_jsonl(&outcome.trace_path)
+        .into_iter()
+        .filter(|row| row["event"] == "request_usage")
+        .collect();
+    assert_eq!(usage_rows.len(), 2);
+    assert!(usage_rows
+        .iter()
+        .all(|row| row["reported_by_endpoint"] == false
+            && row["input_tokens"] == Value::Null
+            && row["output_tokens"] == Value::Null));
+}
+
 #[test]
 fn malformed_arguments_get_one_repair_turn_and_the_call_does_not_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -2097,6 +2689,19 @@ fn a_batch_that_crosses_the_tool_call_budget_runs_only_what_the_budget_allows() 
     );
 }
 
+/// Run options asking for the belt that carries every tool the server serves.
+///
+/// Two tests here drive `kin_artifact_list` because it is the tool whose answer
+/// is big enough to clip and to withhold. The default belt withholds it, so they
+/// say which belt they want rather than setting `KIN_AGENT_BELT` for the whole
+/// test process.
+fn wide_belt() -> kin_agent::RunOptions {
+    kin_agent::RunOptions {
+        belt: Some(kin_agent::belt::BeltProfile::Wide),
+        ..kin_agent::RunOptions::default()
+    }
+}
+
 /// A result larger than the per-result ceiling reaches the model cut, with a note that names
 /// its size, the ceiling and the arguments that page it, and the transcript records what the
 /// model saw.
@@ -2123,7 +2728,12 @@ fn an_oversized_result_is_cut_to_the_ceiling_with_a_note_naming_size_ceiling_and
 
     let mut cfg = config(&repo, &out, &base_url, mcp_command(&server, &log));
     cfg.max_result_bytes = Some(8_192);
-    let outcome = kin_agent::run(cfg).expect("the run completes");
+    // The wide belt, because what this grades is clipping and the artifact
+    // listing is only the vehicle: it is the tool that returns a result large
+    // enough to cut. The default belt leaves it to `KIN_AGENT_BELT=wide`, and
+    // asking for that here rather than through the environment keeps every other
+    // test in this process on the belt it expects.
+    let outcome = kin_agent::run_with_options(cfg, wide_belt()).expect("the run completes");
     assert_eq!(outcome.status, ExitStatus::Success);
 
     let trace = read_jsonl(&outcome.trace_path);
@@ -2207,7 +2817,10 @@ fn a_result_the_window_cannot_hold_is_withheld_and_the_run_ends_on_its_context_b
         tokens: 4_096,
         source: kin_agent::ContextSource::Flag,
     };
-    let outcome = kin_agent::run(cfg).expect("the run completes");
+    // The wide belt, for the same reason as the clipping test above: this grades
+    // withholding, and the artifact listing is the tool whose answer is too
+    // large for the window to hold.
+    let outcome = kin_agent::run_with_options(cfg, wide_belt()).expect("the run completes");
 
     assert_eq!(outcome.status, ExitStatus::ContextBudget);
     assert_eq!(outcome.status.code(), 7);
@@ -3349,6 +3962,7 @@ fn configured_output_reserve_reaches_admission_transcript_and_generation() {
         kin_agent::RunOptions {
             accounting: kin_agent::RequestAccounting::LlamaCpp,
             output_reserve_tokens: Some(32768),
+            ..kin_agent::RunOptions::default()
         },
     )
     .unwrap();
@@ -3381,6 +3995,7 @@ fn invalid_output_reserve_fails_before_any_run_io() {
             kin_agent::RunOptions {
                 accounting: kin_agent::RequestAccounting::LlamaCpp,
                 output_reserve_tokens: Some(reserve),
+                ..kin_agent::RunOptions::default()
             },
         );
         assert!(result

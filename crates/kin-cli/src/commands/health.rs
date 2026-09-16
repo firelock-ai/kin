@@ -4537,7 +4537,9 @@ fn memory_floor_check_for(
     let budget = kin_core::memory_pressure::FootprintBudget::resolve(Some(evidence.limit_bytes))
         .unwrap_or(kin_core::memory_pressure::FootprintBudget {
             bytes: kin_core::memory_pressure::FootprintBudget::derived_from(evidence.limit_bytes),
-            source: kin_core::memory_pressure::BudgetSource::Derived,
+            source: kin_core::memory_pressure::BudgetSource::Derived {
+                host_ceiling_bytes: Some(evidence.limit_bytes),
+            },
         });
     let daemon_clause = format!(
         "one repository daemon is allowed {} of that, {}, and its background embedding is the \
@@ -4650,27 +4652,32 @@ fn memory_floor_check_for(
 /// Where a daemon's budget came from, in the four shapes it can take.
 ///
 /// "Half the ceiling" is true of a 12 GiB container and false of a 128 GiB
-/// workstation, where half is 64 and the derived budget is capped at 8. The row
-/// printed the half sentence over both, which is a claim eight times the size of
-/// the fact on the second machine, and a reader who trusted it would size their
-/// host for a daemon Kin will never let grow that large.
+/// workstation, where half is 64 and the derived budget is capped. The row
+/// printed the half sentence over both, which is a claim several times the size
+/// of the fact on the second machine, and a reader who trusted it would size
+/// their host for a daemon Kin will never let grow that large.
+///
+/// The cap it names is the cap for THIS host, not the base constant. Reading
+/// the base here graded a 128 GiB workstation against a 16 GiB laptop's bar and
+/// reported a cap the machine does not run under.
 fn describe_daemon_budget(
     budget: &kin_core::memory_pressure::FootprintBudget,
     ceiling_bytes: u64,
 ) -> String {
-    if budget.source == kin_core::memory_pressure::BudgetSource::Operator {
+    if !budget.source.is_derived() {
         return format!(
             "the figure {} names rather than anything derived from this ceiling",
             kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV
         );
     }
     let half = ceiling_bytes / 2;
-    if budget.bytes >= kin_core::memory_pressure::DERIVED_BUDGET_CEILING_BYTES
+    if budget.bytes >= kin_core::memory_pressure::derived_budget_ceiling_bytes(ceiling_bytes)
         && half > budget.bytes
     {
         return format!(
-            "the most a derived budget ever allows one daemon rather than half of {}, because a \
-             repository daemon holding more than that is pathological whatever the host has spare",
+            "the most a derived budget ever allows one daemon on a host of {} rather than half of \
+             it, because a repository daemon holding more than that is pathological for the size \
+             of machine it is running on",
             format_health_bytes(ceiling_bytes)
         );
     }
@@ -5861,9 +5868,15 @@ mod tests {
     ///
     /// The first draft of this row said it over both. On the 128 GiB machine it
     /// was written on, half is 64 GiB and the budget a daemon actually gets is
-    /// 8, so the sentence was eight times the size of the fact and pointed a
-    /// reader at a host they would never need. Caught by printing the row rather
-    /// than by reading it, which is why this arm exists.
+    /// the cap, so the sentence was several times the size of the fact and
+    /// pointed a reader at a host they would never need. Caught by printing the
+    /// row rather than by reading it, which is why this arm exists.
+    ///
+    /// The workstation figure moved when the cap started following the host:
+    /// a 128 GiB machine is on the top tier of the ladder, so its cap is
+    /// 32 GiB rather than the base constant. The row's claim is unchanged,
+    /// which is the point: half of 128 is still 64 and a daemon still does not
+    /// get it.
     ///
     /// Falsify by restoring the unconditional "half the ceiling": the clamped
     /// arm goes red and the container arm stays green, which is exactly how the
@@ -5889,16 +5902,23 @@ mod tests {
         );
         assert!(
             !workstation.detail.contains("half the ceiling"),
-            "half of 128 GiB is 64 and the cap holds a daemon to 8, so this machine is not \
+            "half of 128 GiB is 64 and the cap holds a daemon to 32, so this machine is not \
              getting half of anything: {}",
             workstation.detail
         );
         assert!(
-            workstation.detail.contains("8.0 GiB of that")
+            workstation.detail.contains("32.0 GiB of that")
                 && workstation
                     .detail
                     .contains("the most a derived budget ever allows"),
             "and the row names the cap that decided it: {}",
+            workstation.detail
+        );
+        // The cap it names is this host's, not the base constant. Reading the
+        // base here graded a 128 GiB workstation against a 16 GiB laptop's bar.
+        assert!(
+            workstation.detail.contains("on a host of 128.0 GiB"),
+            "the row has to say which host's cap decided it: {}",
             workstation.detail
         );
     }
@@ -12264,6 +12284,7 @@ mod tests {
             },
             budget_bytes: 4 * gib,
             budget_is_derived: true,
+            budget_host_ceiling_bytes: Some(8 * gib),
             level: "critical".to_string(),
             pid: 4103,
             at_unix: 76_440, // 21:14Z
@@ -12277,6 +12298,7 @@ mod tests {
                      of the 4.0 GiB it is allowed"
                 .to_string(),
             at_unix: 76_440, // 21:14Z
+            from_budget: false,
         };
 
         let row = host_memory_pressure_check_for(std::slice::from_ref(&refusal), Some(&over), None);
@@ -12308,6 +12330,7 @@ mod tests {
                      complete record from it"
                 .to_string(),
             at_unix: 76_440, // 21:14Z
+            from_budget: false,
         };
         let unreadable_row =
             host_memory_pressure_check_for(std::slice::from_ref(&unreadable), None, None);
@@ -12415,6 +12438,7 @@ mod tests {
             },
             budget_bytes: 8 * 1024 * 1024 * 1024,
             budget_is_derived: true,
+            budget_host_ceiling_bytes: Some(16 * 1024 * 1024 * 1024),
             level: "nominal".to_string(),
             pid: 4103,
             at_unix: std::time::SystemTime::now()
@@ -12448,6 +12472,7 @@ mod tests {
             level: "critical".to_string(),
             reason: format!("host memory pressure held back {work}"),
             at_unix: 4_800,
+            from_budget: false,
         };
         let coverage = |pending, indexed, total| kin_core::memory_pressure::EmbeddingCoverage {
             pending,

@@ -339,7 +339,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "substrate_partial",
-        meaning: "A coverage class the answer depended on was observed absent; `_kin.completeness.classes` names it.",
+        meaning: "A coverage class the answer depended on was observed short of whole; `_kin.completeness.classes` names it and says whether it was `partial`, `absent` or `unproduced`.",
     },
     ClauseCode {
         code: "substrate_unknown",
@@ -773,14 +773,18 @@ impl Verdict {
         // what changes is that the one-word summary can no longer say "whole"
         // while the response's verdict says otherwise.
         //
-        // `partial` when something was actually observed absent, `unknown`
-        // otherwise, because a verdict refused for a reason no class captures is
-        // not evidence that a class was missing.
-        completeness.status = if completeness
-            .classes
-            .values()
-            .any(|state| matches!(state.as_str(), Some("absent") | Some("unproduced")))
-        {
+        // `partial` when something was actually observed short of whole,
+        // `unknown` otherwise, because a verdict refused for a reason no class
+        // captures is not evidence that a class was missing. `partial` is on
+        // this list because the embedding class publishes it: an index reading
+        // 18123 of 18124 was observed, and reporting that observation as
+        // `unknown` would say nobody looked.
+        completeness.status = if completeness.classes.values().any(|state| {
+            matches!(
+                state.as_str(),
+                Some("absent") | Some("unproduced") | Some("partial")
+            )
+        }) {
             "partial".to_string()
         } else {
             "unknown".to_string()
@@ -1277,6 +1281,41 @@ fn graph_empty_reading(envelope: &Envelope) -> Reading {
     }
 }
 
+/// The completeness signal's own reading.
+///
+/// ## Why a nearly whole substrate still refuses
+///
+/// A store verified at 18124/18124 indexed, read a moment later at 18123 with 2
+/// pending, refuses here. 2 in 18,124 is 0.011 percent, and the obvious reply is
+/// that a shortfall that small should be disclosed rather than decisive, with
+/// the verdict certifying and `limits` still carrying `embeddings_partial`. A
+/// ratio threshold cannot deliver that, and the reason is structural rather than
+/// a matter of taste.
+///
+/// `state` follows `limiting_factor`, and this reading refuses on `bound` as
+/// well as on `status`. `bound` is `at_least` whenever the answer cannot be
+/// shown to be whole, which is exactly what 2 unranked entities mean, and
+/// [`disagreements`] records `bound: at_least` under a certified verdict as a
+/// contradiction in its own right. So a threshold that only skipped the `status`
+/// branch would change nothing, and one that reached `state` would have to carry
+/// `status` to `complete` and `bound` to `exact`, asserting that the printed
+/// counts are the whole set over a class the same object publishes as `partial`.
+/// That is two fields in one response disagreeing about one fact, which is the
+/// defect the embedding class was just fixed to remove, reintroduced one field
+/// over.
+///
+/// So the threshold is refused and the wording is fixed instead. The reader now
+/// gets `classes.embeddings: "partial"`, `limits: ["embeddings_partial"]`, the
+/// exact counters beside them, and a `substrate_partial` whose published meaning
+/// says "short of whole" rather than "observed absent". Those agree, and they
+/// let a reader size the shortfall and act proportionately, which is what a
+/// verdict word alone could never do. The one claim still withheld is that the
+/// counts are whole, and over 2 unembedded entities that claim would be false.
+///
+/// The absence gate keeps its own separate refusal
+/// ([`Envelope::negative_trust`], `coverage_partial`) at every ratio, because
+/// the unembedded entities are precisely the set that could hold the thing a
+/// reader is about to conclude does not exist.
 fn completeness_reading(envelope: &Envelope) -> Reading {
     let Some(completeness) = &envelope.completeness else {
         return Reading::Silent;

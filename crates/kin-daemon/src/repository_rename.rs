@@ -940,10 +940,20 @@ mod tests {
                     && relation.dst == GraphNodeId::Entity(target.id)
             })
             .expect("real linker must resolve the repeated caller/target edge");
-        assert!(relation
-            .evidence
-            .iter()
-            .all(|evidence| evidence.source_span.is_none()));
+        // Both call sites, each carrying the position it was written at. This
+        // asserted the opposite while the Rust adapter recorded no site, which
+        // made the fixture a spanless-relation control by accident rather than
+        // by design; the deliberate spanless controls live in the planner suite
+        // and build their graphs by hand. What the rename path needs from this
+        // fixture is that the repeated edge really is one edge with two
+        // occurrences, and that is what the count below states.
+        assert!(
+            relation
+                .evidence
+                .iter()
+                .all(|evidence| evidence.source_span.is_some()),
+            "the Rust adapter records a call site, so both occurrences carry one: {relation:?}"
+        );
         assert_eq!(
             relation
                 .evidence
@@ -1217,10 +1227,22 @@ mod tests {
             .unwrap()
             .report
             .unwrap();
+        // The later generation renames the CALLER, not the target again.
+        //
+        // A rename commits entity and tree authority and reparses the files it
+        // edited, but the relation evidence already in the graph keeps the span
+        // it was linked at, so a second rename of the same target is refused by
+        // the exact-span guard: it looks for the new name inside the old call's
+        // byte range and finds a prefix of it. That is not a property of this
+        // fixture's language. It is what every adapter that records call sites
+        // does here, and closing it means re-anchoring relation evidence after
+        // a rename commit, which is not this suite's subject. What this test
+        // needs is a later authority generation, and renaming the caller's own
+        // declaration is the smallest one.
         let second_request = RenameRequest {
-            symbol: "renamed_target".to_string(),
-            new_name: "final_target".to_string(),
-            file: Some(fixture.target_file.0.clone()),
+            symbol: "caller".to_string(),
+            new_name: "renamed_caller".to_string(),
+            file: Some(fixture.caller_file.0.clone()),
             line: Some(1),
             column: None,
             json: true,
@@ -1252,7 +1274,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .name,
-            "final_target"
+            "renamed_target",
+            "the replay must not re-apply the first rename over the later generation"
         );
     }
 

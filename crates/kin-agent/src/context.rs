@@ -38,6 +38,54 @@ pub fn estimate_tokens(bytes: u64) -> u64 {
     bytes.div_ceil(BYTES_PER_TOKEN)
 }
 
+/// Where the number a budget decision was made on came from.
+///
+/// A budget stop is a decision to end a run, so the record has to say what
+/// counted. Measured against qwen3-coder-next, the byte heuristic read 59,029
+/// tokens for a request the server itself counted at 46,523, and the run stopped
+/// with about 19,000 tokens of the window still free and the model mid-task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountSource {
+    /// The model's own tokenizer, through the server's template and tokenize
+    /// endpoints. Exact for that server's contract.
+    Tokenizer,
+    /// The endpoint's own count of the last request it answered, plus a
+    /// heuristic estimate of only what the loop appended since. The history is
+    /// counted rather than estimated, which is the whole of the difference.
+    EndpointUsage,
+    /// The labeled byte heuristic over the whole request. Not a tokenizer
+    /// guarantee, and on a code and JSON conversation it reads high.
+    Heuristic,
+}
+
+impl CountSource {
+    /// The stable token a trace row and any analyzer match on.
+    pub fn method(self) -> &'static str {
+        match self {
+            CountSource::Tokenizer => "llama_cpp_template_tokenize",
+            CountSource::EndpointUsage => "endpoint_usage_anchor",
+            CountSource::Heuristic => "heuristic",
+        }
+    }
+
+    /// The same thing in the sentence a stop reason prints.
+    pub fn label(self) -> &'static str {
+        match self {
+            CountSource::Tokenizer => "counted by the model's own tokenizer",
+            CountSource::EndpointUsage => {
+                "counted by the endpoint on its last request, plus an estimate of what was \
+                 added since"
+            }
+            CountSource::Heuristic => "estimated by a byte heuristic",
+        }
+    }
+
+    /// Whether this number is the model's own count of the exact request.
+    pub fn exact(self) -> bool {
+        matches!(self, CountSource::Tokenizer)
+    }
+}
+
 /// Where a run's context window came from, recorded so a budget stop can be read against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextSource {
@@ -186,6 +234,8 @@ pub struct ContextMeter {
     pending_messages: u64,
     request_tokens: Option<u64>,
     last_request_accounting: Value,
+    /// What produced the number the last admission decided on.
+    last_count_source: CountSource,
 }
 
 impl ContextMeter {
@@ -199,6 +249,7 @@ impl ContextMeter {
             pending_messages: 0,
             request_tokens: None,
             last_request_accounting: json!({"method": "heuristic", "exact": false, "admitted": false}),
+            last_count_source: CountSource::Heuristic,
         }
     }
 
@@ -276,11 +327,26 @@ impl ContextMeter {
     }
 
     /// Record the next complete request separately from the last completion's usage.
-    pub(crate) fn record_request(&mut self, tokens: u64, accounting: Value) {
+    pub(crate) fn record_request(&mut self, tokens: u64, source: CountSource, accounting: Value) {
         self.request_tokens = Some(tokens);
         self.pending_bytes = 0;
         self.pending_messages = 0;
         self.last_request_accounting = accounting;
+        self.last_count_source = source;
+    }
+
+    /// Whether the endpoint has counted this conversation itself.
+    ///
+    /// True once a completion reported its own prompt count. From then on the
+    /// history is a counted number rather than an estimate, and only what the
+    /// loop appended after it is estimated.
+    pub fn anchored_on_endpoint(&self) -> bool {
+        self.anchor.is_some()
+    }
+
+    /// What produced the number the last admission decided on.
+    pub fn count_source(&self) -> CountSource {
+        self.last_count_source
     }
 
     pub(crate) fn accounting_failed(&mut self, reason: &str) {
@@ -296,6 +362,7 @@ impl ContextMeter {
             "reserve_tokens": self.reserve,
             "used_tokens": self.used(),
             "anchored_on_endpoint_count": self.anchor.is_some(),
+            "count_source": self.last_count_source.method(),
             "last_request_accounting": self.last_request_accounting,
         })
     }
@@ -417,6 +484,12 @@ mod tests {
         );
         assert_eq!(window(32_768).default_result_ceiling(), 12_288);
         assert_eq!(window(2_048).default_result_ceiling(), MIN_RESULT_BYTES);
+        // 24,576 is written down in kin-mcp, as the response ceiling the agent
+        // belt asks for on `trace_data_flow` and `get_context_pack`. kin-mcp
+        // cannot import this crate, so the number lives there by hand and this
+        // is the line that keeps it honest: change `BYTES_PER_TOKEN` or the
+        // eighth and the belt's ceiling stops being the limit it claims to be.
+        assert_eq!(window(65_536).default_result_ceiling(), 24_576);
         assert_eq!(window(131_072).answer_reserve(), MAX_ANSWER_RESERVE);
         assert_eq!(window(32_768).answer_reserve(), 4_096);
         assert_eq!(window(4_096).answer_reserve(), MIN_ANSWER_RESERVE);

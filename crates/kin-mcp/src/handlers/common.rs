@@ -1175,12 +1175,13 @@ impl ReferenceLinesAbsent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceLinesPartial {
     /// An edge behind this row came from language-server enrichment, which
-    /// records at most one site per edge.
+    /// records the sites one query answered with and caps how many it keeps.
     ///
-    /// kin-lsp takes `CallHierarchyOutgoingCall.from_ranges.first()` for a call
-    /// edge, keeps the first location per target for a `UsesType` edge, and
-    /// carries no span at all on its `References` edges. Each is one site
-    /// standing in for however many the file holds.
+    /// kin-lsp records every range a call-hierarchy answer reported and every
+    /// position a reference answer reported, up to its own per-edge ceiling, and
+    /// keeps the first location per target for a `UsesType` edge. So the sites
+    /// are what one server query saw rather than a statement about the file, and
+    /// a floor is the strongest thing this can say about them.
     LanguageServerEdge,
     /// An edge behind this row came from a producer with no every-site
     /// contract: `Manual`, or an origin added after this was written.
@@ -1367,6 +1368,189 @@ pub fn collect_graph_reference_members<G: GraphStore>(
         ReferenceBodies::Omit,
         EntitySourceScope::WorkspaceHead,
     )
+}
+
+/// One caller a dynamic dispatch MAY have routed to the focal, and the
+/// interface methods it wrote the call against.
+///
+/// The row is an ordinary [`ReferenceRow`], collected by the same function that
+/// builds a proven one, so it carries the same caller identity, the same role
+/// and the same evidence-span site lines. What it is a row ABOUT is different,
+/// and `via` is the field that says so: the call it records provably reaches
+/// `Writer.Write`, and nothing in the graph says the interface value held the
+/// focal's receiver type when it ran.
+#[derive(Debug, Clone)]
+pub struct DispatchCandidateRow {
+    pub row: ReferenceRow,
+    /// The interface methods, `Interface.Method`, this caller reached the focal
+    /// through. Ascending and deduplicated, because one caller can write calls
+    /// against two contracts the focal's receiver type both satisfies.
+    pub via: Vec<String>,
+}
+
+/// What a focal's interface-dispatch question was answered with.
+///
+/// Four outcomes rather than an empty list, because they are four different
+/// facts and only one of them is "nothing reaches this". A reader deciding
+/// whether a method with no callers is dead needs to know which.
+#[derive(Debug, Clone)]
+pub enum DispatchCandidates {
+    /// The focal's receiver type satisfies no interface this graph holds, so no
+    /// call through an interface value can reach it.
+    SatisfiesNoInterface,
+    /// It satisfies contracts and nothing in the graph calls them.
+    NoCallers { contracts: Vec<String> },
+    /// Callers written against a contract the focal's receiver type satisfies.
+    Candidates {
+        contracts: Vec<String>,
+        rows: Vec<DispatchCandidateRow>,
+    },
+    /// The walk failed. Reported rather than swallowed: a walk that errored is
+    /// not a candidate-free answer, and the reference list beside it stands on
+    /// its own edges either way.
+    Unavailable { reason: String },
+}
+
+/// The callers a Go interface value may have routed to `focal`.
+///
+/// `None` when the dispatch question does not apply to this focal at all, which
+/// [`kin_index::dispatch::dispatch_applies`] decides: anything that is not a Go
+/// method on a concrete receiver has no dispatch story, and a surface that
+/// reported one for a Rust function would be inventing a section.
+///
+/// This is on the default path, which is a change from the CLI, where both
+/// surfaces are opt-in. An agent has no flag to learn about and no reference
+/// page to read one from, so the only way it sees this class is for the answer
+/// to carry it. The cost is paid only by a Go method: `dispatch_applies` costs
+/// one incoming-edge read, and the walk behind it costs one entity query for the
+/// repository's Go interfaces plus a `Contains` read per interface, which is in
+/// family with the language scans `edge_coverage` and `caller_arrival` already
+/// run on every answer.
+///
+/// The rows come from [`collect_graph_reference_rows_at`] against each interface
+/// method spec rather than from a second row builder. That is deliberate: the
+/// call site a candidate row points at is a real `Calls` edge with a real
+/// evidence span, so the site lines, the floor reasons and the workspace-head
+/// membership rules are the ones every other reference row already gets. Which
+/// callers COUNT as candidates is still decided by `kin_index::dispatch`, the
+/// same authority `kin refs --kind dispatch` and `kin impact --dispatch` read,
+/// so the two surfaces cannot drift about who is on the list.
+pub fn collect_interface_dispatch_candidates<G: GraphStore>(
+    store: &G,
+    focal: &Entity,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<Option<DispatchCandidates>> {
+    if !kin_index::dispatch::dispatch_applies(store, focal).map_err(McpError::graph)? {
+        return Ok(None);
+    }
+    let targets = match kin_index::dispatch::interface_dispatch_targets(store, focal) {
+        Ok(targets) => targets,
+        Err(error) => {
+            return Ok(Some(DispatchCandidates::Unavailable {
+                reason: error.to_string(),
+            }))
+        }
+    };
+    if targets.is_empty() {
+        return Ok(Some(DispatchCandidates::SatisfiesNoInterface));
+    }
+    let contracts: Vec<String> = targets
+        .iter()
+        .map(|target| target.interface_method_name.clone())
+        .collect();
+    let callers = match kin_index::dispatch::dispatch_candidate_callers(store, focal, &targets) {
+        Ok(callers) => callers,
+        Err(error) => {
+            return Ok(Some(DispatchCandidates::Unavailable {
+                reason: error.to_string(),
+            }))
+        }
+    };
+    if callers.is_empty() {
+        return Ok(Some(DispatchCandidates::NoCallers { contracts }));
+    }
+    let via_by_caller: HashMap<EntityId, Vec<String>> = callers.into_iter().collect();
+
+    // One pass per contract, merged on the caller's entity id. A caller that
+    // writes calls against two contracts the focal satisfies is one row, the
+    // same rule the proven list follows, and its `via` names both.
+    let mut merged: HashMap<EntityId, ReferenceRow> = HashMap::new();
+    for target in &targets {
+        let rows = collect_reference_rows(
+            store,
+            &target.interface_method_id,
+            &[RelationKind::Calls],
+            repository_authority,
+            ReferenceBodies::Project,
+            source_scope,
+        )?;
+        for row in rows {
+            let Some(caller) = row
+                .entity_id
+                .as_deref()
+                .and_then(|id| parse_entity_id(id).ok())
+            else {
+                // A federated spine xref carries no local entity id, so the
+                // dispatch walk never nominated it and it cannot be matched to
+                // one of its rows. Dropped rather than guessed at.
+                continue;
+            };
+            if !via_by_caller.contains_key(&caller) {
+                continue;
+            }
+            match merged.entry(caller) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    merge_dispatch_row(held.get_mut(), row);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(row);
+                }
+            }
+        }
+    }
+
+    let mut rows: Vec<DispatchCandidateRow> = merged
+        .into_iter()
+        .map(|(caller, row)| DispatchCandidateRow {
+            via: via_by_caller.get(&caller).cloned().unwrap_or_default(),
+            row,
+        })
+        .collect();
+    // The same order the proven list is sorted in, entity id included, because
+    // these rows came off a hash map too.
+    rows.sort_by(|left, right| {
+        left.row
+            .file_path
+            .cmp(&right.row.file_path)
+            .then_with(|| left.row.name.cmp(&right.row.name))
+            .then_with(|| left.row.entity_id.cmp(&right.row.entity_id))
+    });
+    Ok(Some(DispatchCandidates::Candidates { contracts, rows }))
+}
+
+/// Fold a second contract's row for one caller into the row already held.
+///
+/// Site lines union and stay ascending, and the weaker statement about them
+/// wins on both axes: a row is only as located as its least located edge.
+fn merge_dispatch_row(held: &mut ReferenceRow, incoming: ReferenceRow) {
+    held.reference_lines.extend(incoming.reference_lines);
+    held.reference_lines.sort_unstable();
+    held.reference_lines.dedup();
+    merge_site_contract_gap(
+        &mut held.reference_lines_partial,
+        incoming.reference_lines_partial,
+    );
+    if held.reference_lines.is_empty() {
+        held.reference_lines_absent = held
+            .reference_lines_absent
+            .or(incoming.reference_lines_absent);
+    } else {
+        held.reference_lines_absent = None;
+    }
+    for kind in incoming.relation_kinds {
+        push_reference_kind(&mut held.relation_kinds, kind);
+    }
 }
 
 /// Whether a reference row projects its caller's body.
@@ -3554,9 +3738,29 @@ pub fn build_semantic_search_request(
     Ok((query, limit, filter))
 }
 
+/// Whether a `kind` argument names a CLI command rather than a declaration kind.
+///
+/// Kept beside [`parse_kind_filter`] because the two have to agree: the filter
+/// narrows to the callable kinds a command can be, and the ranking reads this to
+/// know a command was asked for at all.
+pub fn is_command_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_lowercase().as_str(),
+        "command" | "cmd" | "subcommand"
+    )
+}
+
 pub fn parse_kind_filter(kind: &str) -> Option<Vec<EntityKind>> {
     match kind.to_lowercase().as_str() {
         "function" | "fn" => Some(vec![EntityKind::Function, EntityKind::Method]),
+        // A CLI command has no kind of its own, so this used to fall through to
+        // the wildcard arm and the request ran with NO kind filter at all: a
+        // caller asking for a command was answered with classes, modules and
+        // test functions. A command IS a callable declaration, and which
+        // callable it is comes from `crate::command_shape`, which the ranking
+        // beside this filter reads. Narrowing to the callable kinds is the half
+        // this filter can state on its own.
+        "command" | "cmd" | "subcommand" => Some(vec![EntityKind::Function, EntityKind::Method]),
         "class" => Some(vec![EntityKind::Class]),
         "interface" => Some(vec![EntityKind::Interface]),
         "trait" | "traitdef" => Some(vec![EntityKind::TraitDef]),

@@ -4,6 +4,7 @@
 pub mod agent_belt;
 pub mod budget;
 pub mod caller_arrival;
+pub mod command_shape;
 pub mod daemon_delegate;
 pub mod edge_coverage;
 pub mod entity_drafts;

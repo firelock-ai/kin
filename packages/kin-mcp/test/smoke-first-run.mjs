@@ -312,6 +312,43 @@ function framedRequest(id, method, params) {
   return `${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`;
 }
 
+/**
+ * The tool names one profile serves, from a short-lived server on the cached
+ * binary.
+ *
+ * Used to size the default surface against the whole registry rather than
+ * against a number written down here. This assertion used to read
+ * `toolNames.length > 20`, and `agent-default` passed twenty tools without
+ * anything noticing, so the one claim this proof made about the surface had
+ * been false for several releases while the script read green on demand.
+ * A bound derived from `full` cannot go stale that way.
+ */
+async function toolNamesForProfile(kinBinary, cwd, env, profile, timeoutMs) {
+  const child = cp.spawn(kinBinary, ['mcp', 'start'], {
+    cwd,
+    env: { ...env, KIN_MCP_TOOL_PROFILE: profile },
+    stdio: ['pipe', 'pipe', 'ignore']
+  });
+  const reader = new JsonRpcReader();
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => reader.feed(chunk));
+  try {
+    child.stdin.write(
+      framedRequest(1, 'initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'kin-mcp-smoke-profile', version: '0.0.0' }
+      })
+    );
+    await reader.await(1, timeoutMs);
+    child.stdin.write(framedRequest(2, 'tools/list', {}));
+    const listed = await reader.await(2, timeoutMs);
+    return (listed.result?.tools ?? []).map(tool => tool.name).sort();
+  } finally {
+    child.kill();
+  }
+}
+
 class JsonRpcReader {
   constructor() {
     this.buffer = '';
@@ -473,11 +510,31 @@ async function main() {
     if (!toolNames.includes('kin_graph_status')) {
       throw new Error(`kin_graph_status missing from tools/list: ${toolNames.join(', ')}`);
     }
-    if (toolNames.length > 20) {
+    const registry = await toolNamesForProfile(
+      cachedKin,
+      repoDir,
+      fixtureContext.env,
+      'full',
+      timeoutMs
+    );
+    if (registry.length === 0) {
+      throw new Error('the full profile listed no tools, so there is nothing to size against');
+    }
+    if (toolNames.length >= registry.length) {
       throw new Error(
-        `expected the small agent-default surface, got ${toolNames.length} tools`
+        `expected the curated agent-default surface, got ${toolNames.length} tools against ` +
+          `${registry.length} in the full registry`
       );
     }
+    const unregistered = toolNames.filter(name => !registry.includes(name));
+    if (unregistered.length > 0) {
+      throw new Error(
+        `the default profile served names the full registry does not: ${unregistered.join(', ')}`
+      );
+    }
+    log(
+      `agent-default served ${toolNames.length} of the registry's ${registry.length} tools`
+    );
 
     child.stdin.write(
       framedRequest(3, 'tools/call', { name: 'kin_graph_status', arguments: {} })

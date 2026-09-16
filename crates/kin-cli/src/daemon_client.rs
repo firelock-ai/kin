@@ -3002,6 +3002,21 @@ fn process_image_path(pid: u32) -> Option<String> {
 /// by policy for the legacy supervisor endpoint. Widening that is a separate
 /// decision about a different piece of state; this reader is scoped to the lock
 /// whose holder Kin itself recorded.
+/// Whether `pid` is running a Kin image right now, or `None` when the image
+/// could not be read.
+///
+/// The second of the two proofs `kin daemon stop` takes before it signals a
+/// recorded daemon pid. The first, [`process_identity_is_current`], proves the
+/// pid still names the incarnation the endpoint recorded; this one reads the
+/// executable from the OS and proves that process is one of ours, so the
+/// decision does not rest on the record alone.
+///
+/// `None` is "do not signal", never "not Kin". A caller that cannot read an
+/// image knows nothing about the process and must not act on that.
+pub fn process_runs_a_kin_image(pid: u32) -> Option<bool> {
+    process_image_path(pid).map(|image| image_path_could_be_kin(&image))
+}
+
 fn startup_lock_holder_is_foreign(pid: u32) -> bool {
     match process_image_path(pid) {
         Some(image) => !image_path_could_be_kin(&image),
@@ -3050,7 +3065,98 @@ fn legacy_supervisor_pid_authorizes_cleanup(pid: u32) -> bool {
 /// port is not (yet) bound.
 pub fn is_port_open(port: u16) -> bool {
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    std::net::TcpStream::connect_timeout(&addr, PORT_PROBE_CONNECT_TIMEOUT).is_ok()
+}
+
+/// How long a port probe waits for the TCP handshake.
+const PORT_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How long a port probe waits for the first byte of an HTTP answer on a
+/// connection the daemon did accept.
+const PORT_PROBE_ANSWER_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// What a probe established about a recorded daemon port.
+///
+/// [`is_port_open`] collapses all of this into one boolean, and the collapse is
+/// what let `kin daemon status` report "port closed" for a port `lsof` showed
+/// in LISTEN. A wedged daemon still holds its listening socket: the kernel
+/// keeps the listener, the accept queue fills because nothing is calling
+/// accept, and a connect against it times out rather than being refused. Being
+/// refused and timing out are different facts about the daemon and lead an
+/// operator to different remedies, so they are different answers here.
+///
+/// Stated as what the probe can prove rather than as what the kernel table
+/// says. A socket bound without `listen` also swallows the connect on macOS
+/// (the reason `ReservedClosedPort` in this file's tests exists), and
+/// `OpenNotAccepting` is true of it as well: something holds the port and the
+/// handshake did not complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonPortProbe {
+    /// The connect was refused or failed outright: nothing holds the port.
+    Closed,
+    /// The connect neither completed nor was refused inside the window.
+    /// Something holds the port and is not accepting, which is what a full
+    /// accept queue looks like from outside the process.
+    OpenNotAccepting,
+    /// The connection was established and no HTTP answer arrived on it inside
+    /// the window.
+    AcceptedNotAnswering,
+    /// The daemon answered an HTTP request.
+    Answering,
+}
+
+impl DaemonPortProbe {
+    /// Whether something holds the port at all, whatever it did with the
+    /// connection afterwards.
+    pub fn holds_the_port(self) -> bool {
+        !matches!(self, DaemonPortProbe::Closed)
+    }
+}
+
+/// Probe a recorded daemon port for the three states an operator can act on.
+///
+/// Deliberately a bare socket rather than the async health client: `status` and
+/// `stop` must be able to describe a daemon that is not answering HTTP at all,
+/// and a client whose only failure is "request failed" cannot tell the caller
+/// whether the listener is there.
+///
+/// Any HTTP answer counts as answering, including an error status. The question
+/// is whether the daemon's server loop is running, not whether this particular
+/// request succeeded.
+pub fn probe_daemon_port(port: u16) -> DaemonPortProbe {
+    use std::io::{Read as _, Write as _};
+
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut stream = match std::net::TcpStream::connect_timeout(&addr, PORT_PROBE_CONNECT_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return DaemonPortProbe::OpenNotAccepting
+        }
+        Err(_) => return DaemonPortProbe::Closed,
+    };
+
+    if stream
+        .set_write_timeout(Some(PORT_PROBE_ANSWER_TIMEOUT))
+        .is_err()
+        || stream
+            .set_read_timeout(Some(PORT_PROBE_ANSWER_TIMEOUT))
+            .is_err()
+    {
+        return DaemonPortProbe::AcceptedNotAnswering;
+    }
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() || stream.flush().is_err() {
+        return DaemonPortProbe::AcceptedNotAnswering;
+    }
+    let mut first = [0u8; 16];
+    match stream.read(&mut first) {
+        // A read that returns nothing is an answerless close, which is the same
+        // fact as a read that times out: the connection was taken and never
+        // served.
+        Ok(0) | Err(_) => DaemonPortProbe::AcceptedNotAnswering,
+        Ok(_) => DaemonPortProbe::Answering,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3335,7 +3441,43 @@ impl DaemonEndpointCleanup {
 /// window preserves a dead daemon's endpoint for good.
 const ENDPOINT_TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 
+/// How many teardown budgets a caller waits for a DEAD owner's `daemon.lock`
+/// handle to be released.
+///
+/// The two waits answer different questions and the second can afford to be
+/// much longer, which is the correction here. Waiting for the process asks
+/// whether the owner is gone, and five seconds bounds that because a process
+/// that has not gone in five seconds is not going. Waiting for the lock asks
+/// only when the kernel will finish releasing a handle whose owner is ALREADY
+/// confirmed dead, and that is not a question a short budget answers better.
+///
+/// Measured: on a loaded CI runner a graceful stop printed `stopped` for both
+/// the replica and the supervisor, correctly judged the owner dead, then spent
+/// its whole five seconds contending on the singleton and failed the command
+/// with "Kin daemons stopped but their endpoints were not retired". The same
+/// tree had passed on the previous run, so the budget was the whole of it.
+///
+/// A multiple rather than a constant, so a caller that passes no budget still
+/// gets none. `remove_stale_daemon_files` probes once by design, and a hygiene
+/// path that began waiting half a minute on a lock somebody else holds would
+/// be a worse command than the one this fixes.
+///
+/// Six, because the failure was observed at one and the wait costs nothing
+/// when it is not needed: a healthy stop retires on its first attempt and
+/// never reaches the second poll. The worst case is the same order as the
+/// `KIN_DAEMON_STOP_TIMEOUT_SECS` this command already spends per daemon, and
+/// it is only ever spent where the alternative today is failing outright.
+const ENDPOINT_LOCK_RELEASE_MULTIPLE: u32 = 6;
+
 const ENDPOINT_TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// What [`ENDPOINT_LOCK_RELEASE_MULTIPLE`] comes to for this caller's budget.
+///
+/// Zero in, zero out: multiplying preserves the single-probe contract the
+/// hygiene paths rely on without a branch that could drift from it.
+fn lock_release_budget(teardown_budget: Duration) -> Duration {
+    teardown_budget * ENDPOINT_LOCK_RELEASE_MULTIPLE
+}
 
 /// Remove a repo worker daemon's pid/port endpoint files. The daemon deletes
 /// these itself on graceful shutdown; hygiene paths call this to clear a record
@@ -3413,6 +3555,13 @@ fn wait_until_retirable(
 /// it is the correct answer rather than a delay. `CoordinationUnavailable` must
 /// not either, since it reports a real IO failure rather than contention.
 ///
+/// The budget is [`lock_release_budget`] rather than the caller's teardown
+/// budget, because by the time this runs the owner is already confirmed dead
+/// and the only thing left to wait for is the kernel. Bounded rather than
+/// unbounded all the same: `SingletonHeld` can also be a successor that has
+/// taken the lock and not yet published its endpoint, and a stop that waited
+/// for ever on that would hang instead of reporting.
+///
 /// Returns `None` when the endpoint is gone, or the reason it survived.
 fn retire_within_budget(kin_root: &Path, budget: Duration) -> Option<String> {
     let deadline = Instant::now() + budget;
@@ -3463,7 +3612,9 @@ fn retire_daemon_endpoint_with_probe(
 
     let recorded = daemon_endpoint_snapshot(kin_root);
     let preserved_reason = match recorded.pid {
-        Some(pid) if retirable(kin_root, pid) => retire_within_budget(kin_root, teardown_budget),
+        Some(pid) if retirable(kin_root, pid) => {
+            retire_within_budget(kin_root, lock_release_budget(teardown_budget))
+        }
         Some(pid) => {
             warn!(
                 pid,
@@ -3477,7 +3628,9 @@ fn retire_daemon_endpoint_with_probe(
                 "recorded owner pid {pid} never became affirmatively dead"
             ))
         }
-        None if !recorded.pid_exists => retire_within_budget(kin_root, teardown_budget),
+        None if !recorded.pid_exists => {
+            retire_within_budget(kin_root, lock_release_budget(teardown_budget))
+        }
         None => {
             warn!(
                 pid_path = %repo_daemon_pid_path(kin_root).display(),
@@ -4908,6 +5061,35 @@ async fn carry_idle_timeout_to_existing_daemon(
              may exit mid-session."
         ),
     }
+}
+
+/// How long a daemon that is not warming may answer nothing at all before the
+/// client calls it wedged instead of slow.
+///
+/// Twenty seconds. The health client gives each probe a 2s request timeout and
+/// a 500ms connect timeout and the loop sleeps 200ms between them, so this is
+/// at least nine consecutive probes that got no answer whatsoever, which is
+/// well past a transient stall on a loaded host. It is also short enough to sit
+/// inside a third-party agent's per-tool timeout rather than blow through it,
+/// which is the case it exists for: a Kin tool call against a wedged daemon
+/// used to stall the model's turn for the full 300s readiness budget with
+/// nothing printed and nothing to act on.
+///
+/// It can only apply to a daemon that has NOT reported itself warming. A
+/// warming daemon answers `/readiness` throughout the repository-sized load
+/// that `daemon_ready_timeout_secs` is generous for, so it never reaches this
+/// and keeps the whole budget.
+///
+/// Zero restores the old behaviour and waits out the full budget.
+const DEFAULT_DAEMON_UNRESPONSIVE_TIMEOUT_SECS: u64 = 20;
+
+/// The silence bound, or `None` when the operator turned it off.
+fn daemon_unresponsive_timeout() -> Option<Duration> {
+    let secs = std::env::var("KIN_DAEMON_UNRESPONSIVE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DAEMON_UNRESPONSIVE_TIMEOUT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 fn existing_daemon_ready_timeout_secs() -> u64 {
@@ -6573,6 +6755,17 @@ enum EndpointVerdict {
         port: u16,
         detail: String,
         warming: bool,
+        /// How long the daemon went without answering any probe, when that
+        /// silence is what ended the wait rather than the caller's budget.
+        ///
+        /// `Some` says the daemon is wedged rather than slow: it never
+        /// reported itself warming and it answered nothing at all for
+        /// [`daemon_unresponsive_timeout`]. The caller reports that and stops,
+        /// instead of spending the rest of a budget sized for a repository
+        /// load that is not happening.
+        ///
+        /// `None` is the ordinary outcome: the caller's own deadline elapsed.
+        silent_for: Option<Duration>,
     },
 }
 
@@ -6588,7 +6781,14 @@ async fn probe_daemon_endpoint(
     timeout: Duration,
 ) -> EndpointVerdict {
     let warming = std::sync::Arc::new(AtomicBool::new(false));
-    probe_daemon_endpoint_with_warming_signal(kin_root, endpoint, timeout, warming).await
+    probe_daemon_endpoint_with_warming_signal(
+        kin_root,
+        endpoint,
+        timeout,
+        warming,
+        daemon_unresponsive_timeout(),
+    )
+    .await
 }
 
 async fn probe_daemon_endpoint_with_warming_signal(
@@ -6596,14 +6796,24 @@ async fn probe_daemon_endpoint_with_warming_signal(
     endpoint: LiveDaemonEndpoint,
     timeout: Duration,
     warming_signal: std::sync::Arc<AtomicBool>,
+    silence_bound: Option<Duration>,
 ) -> EndpointVerdict {
     let Some(working_dir) = kin_root.parent() else {
         return EndpointVerdict::Invalid("invalid .kin layout: no parent".to_string());
     };
     let base_url = format!("http://127.0.0.1:{}", endpoint.port);
     let client = daemon_health_client();
-    let deadline = Instant::now() + timeout;
-    let mut warming = false;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    // Seeded from the signal rather than from `false`, because this call may be
+    // the long probe that follows a short one which already learned the daemon
+    // is warming. Starting it at `false` would forget that and read a warming
+    // daemon's silence as a wedge.
+    let mut warming = warming_signal.load(Ordering::Relaxed);
+    // The last moment the daemon answered anything at all. An HTTP error status
+    // is an answer: the question is whether its server loop is running, not
+    // whether this request succeeded. A transport failure is not.
+    let mut last_answer: Option<Instant> = None;
 
     loop {
         // Judged against the recorded incarnation, not the bare PID. `Invalid`
@@ -6634,6 +6844,7 @@ async fn probe_daemon_endpoint_with_warming_signal(
                     warming = readiness.warming;
                     warming_signal.store(warming, Ordering::Relaxed);
                 }
+                last_answer = Some(Instant::now());
                 match probe_health_for_repo(&client, &base_url, kin_root, working_dir).await {
                     HealthProbe::Matches => return EndpointVerdict::Serving(base_url),
                     // The daemon answered and identified itself as something
@@ -6646,6 +6857,7 @@ async fn probe_daemon_endpoint_with_warming_signal(
                 }
             }
             Ok(resp) => {
+                last_answer = Some(Instant::now());
                 let status = resp.status();
                 // A 503 body carries the daemon's own readiness detail. It
                 // answered, so it is unambiguously alive; keep the last known
@@ -6665,12 +6877,30 @@ async fn probe_daemon_endpoint_with_warming_signal(
             Err(err) => err.to_string(),
         };
 
+        // A daemon that finished starting and then stopped answering is wedged,
+        // not slow, and the readiness budget is sized for a repository load it
+        // is not doing. Spending the rest of that budget buys nothing and costs
+        // the caller minutes of silence.
+        let silent_for = last_answer.unwrap_or(started).elapsed();
+        if let Some(bound) = silence_bound {
+            if !warming && silent_for >= bound {
+                return EndpointVerdict::LiveNotReady {
+                    pid: endpoint.pid,
+                    port: endpoint.port,
+                    detail: probe_error,
+                    warming,
+                    silent_for: Some(silent_for),
+                };
+            }
+        }
+
         if Instant::now() >= deadline {
             return EndpointVerdict::LiveNotReady {
                 pid: endpoint.pid,
                 port: endpoint.port,
                 detail: probe_error,
                 warming,
+                silent_for: None,
             };
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -6931,6 +7161,7 @@ async fn wait_for_existing_daemon(kin_root: &Path) -> ExistingDaemon {
         kin_root,
         Duration::from_secs(existing_daemon_ready_timeout_secs()),
         Duration::from_secs(daemon_ready_timeout_secs()),
+        daemon_unresponsive_timeout(),
     )
     .await
 }
@@ -6939,10 +7170,12 @@ async fn wait_for_existing_daemon_within(
     kin_root: &Path,
     short: Duration,
     patience: Duration,
+    silence_bound: Option<Duration>,
 ) -> ExistingDaemon {
     let deadline = Instant::now() + patience;
     loop {
-        match inspect_existing_daemon_once(kin_root, short, deadline, patience).await {
+        match inspect_existing_daemon_once(kin_root, short, deadline, patience, silence_bound).await
+        {
             ExistingDaemon::Starting(_detail) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -6963,6 +7196,7 @@ async fn inspect_existing_daemon_once(
     short: Duration,
     deadline: Instant,
     patience: Duration,
+    silence_bound: Option<Duration>,
 ) -> ExistingDaemon {
     let recorded = daemon_endpoint_snapshot(kin_root);
     let Some(pid) = recorded.pid else {
@@ -6984,7 +7218,14 @@ async fn inspect_existing_daemon_once(
                     ))
                 }
                 preserved => {
-                    follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+                    follow_preserved_daemon_endpoint(
+                        kin_root,
+                        deadline,
+                        patience,
+                        silence_bound,
+                        preserved,
+                    )
+                    .await
                 }
             };
         }
@@ -6996,7 +7237,14 @@ async fn inspect_existing_daemon_once(
                 preserved.preserved_reason()
             )),
             preserved => {
-                follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+                follow_preserved_daemon_endpoint(
+                    kin_root,
+                    deadline,
+                    patience,
+                    silence_bound,
+                    preserved,
+                )
+                .await
             }
         };
     };
@@ -7010,7 +7258,14 @@ async fn inspect_existing_daemon_once(
                 preserved.preserved_reason()
             )),
             preserved => {
-                follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+                follow_preserved_daemon_endpoint(
+                    kin_root,
+                    deadline,
+                    patience,
+                    silence_bound,
+                    preserved,
+                )
+                .await
             }
         };
     }
@@ -7023,7 +7278,11 @@ async fn inspect_existing_daemon_once(
     let existing = LiveDaemonEndpoint { pid, port };
 
     let short_deadline = (Instant::now() + short).min(deadline);
-    let mut verdict = probe_daemon_endpoint_until(kin_root, existing, short_deadline, false).await;
+    // No silence bound on the short probe. It is the fast path for a healthy
+    // daemon and is shorter than the bound anyway, so applying it there would
+    // only risk calling a daemon wedged on its first missed answer.
+    let mut verdict =
+        probe_daemon_endpoint_until(kin_root, existing, short_deadline, false, None).await;
 
     if let EndpointVerdict::LiveNotReady {
         pid, port, warming, ..
@@ -7038,7 +7297,9 @@ async fn inspect_existing_daemon_once(
             "daemon for this repo is alive but not ready yet; waiting rather than \
              replacing a running daemon"
         );
-        verdict = probe_daemon_endpoint_until(kin_root, existing, deadline, last_warming).await;
+        verdict =
+            probe_daemon_endpoint_until(kin_root, existing, deadline, last_warming, silence_bound)
+                .await;
     }
 
     match verdict {
@@ -7071,7 +7332,14 @@ async fn inspect_existing_daemon_once(
                     ))
                 }
                 preserved => {
-                    follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+                    follow_preserved_daemon_endpoint(
+                        kin_root,
+                        deadline,
+                        patience,
+                        silence_bound,
+                        preserved,
+                    )
+                    .await
                 }
             }
         }
@@ -7080,13 +7348,11 @@ async fn inspect_existing_daemon_once(
             port,
             detail,
             warming,
-        } => ExistingDaemon::LiveNotReady(live_daemon_not_ready_message(
-            pid,
-            port,
-            &detail,
-            warming,
-            patience.as_secs(),
-        )),
+            silent_for,
+        } => ExistingDaemon::LiveNotReady(match silent_for {
+            Some(silent_for) => live_daemon_wedged_message(pid, port, &detail, silent_for),
+            None => live_daemon_not_ready_message(pid, port, &detail, warming, patience.as_secs()),
+        }),
     }
 }
 
@@ -7095,6 +7361,7 @@ async fn probe_daemon_endpoint_until(
     endpoint: LiveDaemonEndpoint,
     deadline: Instant,
     last_warming: bool,
+    silence_bound: Option<Duration>,
 ) -> EndpointVerdict {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -7103,6 +7370,7 @@ async fn probe_daemon_endpoint_until(
             port: endpoint.port,
             detail: "the caller's daemon readiness deadline elapsed".to_string(),
             warming: last_warming,
+            silent_for: None,
         };
     }
     let warming_signal = std::sync::Arc::new(AtomicBool::new(last_warming));
@@ -7113,6 +7381,7 @@ async fn probe_daemon_endpoint_until(
             endpoint,
             remaining,
             std::sync::Arc::clone(&warming_signal),
+            silence_bound,
         ),
     )
     .await
@@ -7123,6 +7392,7 @@ async fn probe_daemon_endpoint_until(
             port: endpoint.port,
             detail: "the caller's daemon readiness deadline elapsed".to_string(),
             warming: warming_signal.load(Ordering::Relaxed),
+            silent_for: None,
         },
     }
 }
@@ -7131,6 +7401,7 @@ async fn follow_preserved_daemon_endpoint(
     kin_root: &Path,
     deadline: Instant,
     patience: Duration,
+    silence_bound: Option<Duration>,
     retirement: DaemonEndpointRetirement,
 ) -> ExistingDaemon {
     debug_assert!(!matches!(retirement, DaemonEndpointRetirement::Retired));
@@ -7143,16 +7414,21 @@ async fn follow_preserved_daemon_endpoint(
         ));
     };
     let endpoint = LiveDaemonEndpoint { pid, port };
-    match probe_daemon_endpoint_until(kin_root, endpoint, deadline, false).await {
+    match probe_daemon_endpoint_until(kin_root, endpoint, deadline, false, silence_bound).await {
         EndpointVerdict::Serving(base_url) => ExistingDaemon::Connected(base_url),
         EndpointVerdict::LiveNotReady {
             pid,
             port,
             detail,
             warming,
+            silent_for,
         } => ExistingDaemon::LiveNotReady(format!(
             "{} Retirement was refused because {reason}.",
-            live_daemon_not_ready_message(pid, port, &detail, warming, patience.as_secs(),)
+            match silent_for {
+                Some(silent_for) => live_daemon_wedged_message(pid, port, &detail, silent_for),
+                None =>
+                    live_daemon_not_ready_message(pid, port, &detail, warming, patience.as_secs()),
+            }
         )),
         EndpointVerdict::Invalid(detail) => ExistingDaemon::LiveNotReady(format!(
             "daemon endpoint retirement was refused because {reason}; the preserved endpoint \
@@ -7177,6 +7453,30 @@ async fn follow_preserved_daemon_endpoint(
 /// because the cost tracks repository size rather than the budget. The daemon
 /// records each phase's real cost for this repository once it is up, which is
 /// a truthful per-repository number where a hardcoded typical would not be.
+/// Message for a daemon that finished starting and then stopped answering.
+///
+/// The sibling below is about a daemon that is still loading, and it tells the
+/// reader to wait. This one must not, because the wait it would ask for cannot
+/// end: a daemon that is not warming and answers nothing is not working on
+/// anything this caller can outlast. The recorded case spent the full 300s
+/// readiness budget in silence and then failed anyway, which inside a
+/// third-party agent is 300s of a model's turn bought for nothing.
+///
+/// So it names the state, says why the wait was cut short, and gives the one
+/// remedy that ends it.
+fn live_daemon_wedged_message(pid: u32, port: u16, detail: &str, silent_for: Duration) -> String {
+    format!(
+        "kin daemon (pid {pid}, port {port}) owns this repo, never reported itself warming, and \
+         answered nothing for {:.0}s: {detail}. A daemon that has finished starting and stops \
+         answering is wedged rather than slow, so kin is reporting now instead of waiting out a \
+         readiness budget sized for a repository load it is not doing. Run `kin daemon stop` to \
+         end it and clear the endpoint, then retry; `.kin/daemon.log` records what it was doing \
+         last. Raise KIN_DAEMON_UNRESPONSIVE_TIMEOUT_SECS, or set it to 0 to wait the full \
+         budget, if this host needs longer.",
+        silent_for.as_secs_f64()
+    )
+}
+
 fn live_daemon_not_ready_message(
     pid: u32,
     port: u16,
@@ -8291,6 +8591,11 @@ pub async fn running_daemon_reading(layout: &KinLayout) -> RunningDaemonReading 
             port,
             detail,
             warming,
+            // This reading is a diagnostic snapshot taken under the SHORT
+            // budget, which is below the silence bound, so it never carries
+            // one. Its caller reports what it found rather than deciding a
+            // wait, which is the decision the bound exists for.
+            silent_for: _,
         } => RunningDaemonReading::OpeningAuthority {
             pid,
             port,
@@ -9543,6 +9848,83 @@ mod tests {
         );
     }
 
+    /// The probe has to separate three things `is_port_open` collapses into
+    /// one boolean: nothing on the port, something on the port that never
+    /// answers, and a daemon that answers.
+    ///
+    /// The middle one is the wedge KIN-4 recorded, where `lsof` showed the
+    /// socket in LISTEN and `kin daemon status` reported "port closed".
+    /// `is_port_open` answers `true` for the silent listener and the serving
+    /// one alike, which is why status cannot read it.
+    ///
+    /// Falsify by returning `Answering` as soon as the connect completes: the
+    /// silent case then reads as a serving daemon.
+    #[test]
+    fn a_port_probe_separates_no_listener_from_a_silent_one_from_an_answering_one() {
+        // Nothing on the port: bind, read the number, release it.
+        let free_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
+            listener.local_addr().expect("read the scratch port").port()
+        };
+        assert_eq!(probe_daemon_port(free_port), DaemonPortProbe::Closed);
+
+        // Something on the port that takes the connection and never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the silent listener");
+        let silent_port = silent.local_addr().expect("read the silent port").port();
+        let silent_listener = std::thread::spawn(move || {
+            if let Ok((stream, _)) = silent.accept() {
+                // Held open and unanswered past the probe's own window.
+                // Dropping it at once would send FIN and give the probe an
+                // end of stream, which is a different fact from silence.
+                std::thread::sleep(PORT_PROBE_ANSWER_TIMEOUT * 2);
+                drop(stream);
+            }
+        });
+        assert_eq!(
+            probe_daemon_port(silent_port),
+            DaemonPortProbe::AcceptedNotAnswering
+        );
+
+        // A daemon that answers, whatever the status line says.
+        let serving =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the serving listener");
+        let serving_port = serving.local_addr().expect("read the serving port").port();
+        let serving_listener = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = serving.accept() {
+                use std::io::Write as _;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n");
+                let _ = stream.flush();
+            }
+        });
+        assert_eq!(probe_daemon_port(serving_port), DaemonPortProbe::Answering);
+
+        silent_listener.join().expect("the silent listener thread");
+        serving_listener
+            .join()
+            .expect("the serving listener thread");
+    }
+
+    /// A socket held without accepting reads as held, never as closed.
+    ///
+    /// `ReservedClosedPort` is bound and never listened, which its own comment
+    /// records as a refused connect on Linux and Windows and an unanswered SYN
+    /// on macOS. Both are "something is on this port and it will not talk to
+    /// you", and the assertion is deliberately the platform-honest one: the
+    /// probe must never claim that socket answered.
+    #[test]
+    fn a_port_held_without_accepting_never_reads_as_answering() {
+        let reserved = reserved_closed_loopback_port();
+        let probe = probe_daemon_port(reserved.port);
+        assert!(
+            matches!(
+                probe,
+                DaemonPortProbe::Closed | DaemonPortProbe::OpenNotAccepting
+            ),
+            "a bound, unlistened socket must read as refused or unaccepting: {probe:?}"
+        );
+    }
+
     fn write_endpoint_files(kin_root: &Path, pid: u32, port: u16) {
         std::fs::write(kin_root.join("daemon.pid"), pid.to_string()).unwrap();
         std::fs::write(kin_root.join("daemon.port"), port.to_string()).unwrap();
@@ -9574,6 +9956,7 @@ mod tests {
             root,
             Duration::from_millis(50),
             Duration::from_millis(150),
+            None,
         )
         .await;
 
@@ -9591,6 +9974,160 @@ mod tests {
         );
     }
 
+    /// The 300-second stall KIN-4 recorded, bounded.
+    ///
+    /// A daemon that finished starting and then stopped answering used to cost
+    /// every later command the full readiness budget in silence, and then fail
+    /// anyway. Inside a third-party agent that is 300s of a model's turn bought
+    /// for nothing. The budget is sized for a repository-sized load, and a
+    /// daemon that never reported itself warming is not doing one.
+    ///
+    /// The patience here is twenty times the silence bound, so returning inside
+    /// the bound is the whole assertion: the wait ended on the daemon's silence
+    /// rather than on the caller running out of budget.
+    ///
+    /// Falsify by passing `None` for the bound: the call takes the full
+    /// patience, the elapsed assertion goes red, and the message is the
+    /// wait-for-it one rather than the wedge one.
+    #[tokio::test]
+    async fn a_daemon_that_is_not_warming_and_answers_nothing_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pid = std::process::id();
+        // The recorded owner is this process, so it is provably alive, and
+        // nothing answers on the port. That is the wedge from outside: a live
+        // owner and no answer.
+        let closed = reserved_closed_loopback_port();
+        write_endpoint_files(root, pid, closed.port);
+
+        let bound = Duration::from_millis(300);
+        let patience = bound * 20;
+        let started = Instant::now();
+        let verdict =
+            wait_for_existing_daemon_within(root, Duration::from_millis(50), patience, Some(bound))
+                .await;
+        let elapsed = started.elapsed();
+
+        let ExistingDaemon::LiveNotReady(message) = verdict else {
+            panic!("a live owner that answers nothing must be reported, not replaced");
+        };
+        assert!(
+            elapsed < patience / 2,
+            "the wait must end on the daemon's silence, not on the budget: {elapsed:?} of \
+             {patience:?}"
+        );
+        assert!(
+            message.contains("wedged"),
+            "the diagnosis must name the state: {message}"
+        );
+        assert!(
+            message.contains("kin daemon stop"),
+            "the diagnosis must carry the remedy: {message}"
+        );
+        assert!(
+            message.contains(&pid.to_string()),
+            "the diagnosis must name the process to act on: {message}"
+        );
+        // The endpoint belongs to a live process and is never cleared on the
+        // strength of a silence.
+        assert!(root.join("daemon.pid").exists());
+        assert!(root.join("daemon.port").exists());
+    }
+
+    /// A daemon that keeps answering keeps the whole budget.
+    ///
+    /// The silence bound is about a daemon that answers NOTHING. This one
+    /// answers `/readiness` throughout and never completes `/health`, which is
+    /// a live daemon too busy to finish a second request, and it must be given
+    /// the budget it always had. Cutting that short would turn a slow first
+    /// open on a large store into a failure.
+    ///
+    /// The bound here is a twentieth of the patience, so a fast-fail would be
+    /// unmissable in the elapsed time. The sibling above isolates the warming
+    /// flag itself, which this cannot: an answering daemon never reaches the
+    /// silence check at all.
+    #[tokio::test]
+    async fn a_warming_daemon_keeps_the_whole_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (port, server) = daemon_answering_readiness_but_not_health(true).await;
+        write_endpoint_files(root, std::process::id(), port);
+
+        let patience = Duration::from_millis(600);
+        let started = Instant::now();
+        let verdict = wait_for_existing_daemon_within(
+            root,
+            Duration::from_millis(50),
+            patience,
+            Some(patience / 20),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server.abort();
+
+        let ExistingDaemon::LiveNotReady(message) = verdict else {
+            panic!("a warming daemon that never completes readiness must be reported");
+        };
+        assert!(
+            elapsed >= patience,
+            "a warming daemon must be given its whole budget: {elapsed:?} of {patience:?}"
+        );
+        assert!(
+            !message.contains("wedged"),
+            "a warming daemon must never be called wedged: {message}"
+        );
+        assert!(
+            message.contains("warming"),
+            "the message must say what it is waiting for: {message}"
+        );
+    }
+
+    /// The warming flag survives the handover from the short probe to the long
+    /// one, so a daemon that reported itself warming and then went quiet is
+    /// still given the whole budget.
+    ///
+    /// This is the case the silence bound must not claim. It is tested at the
+    /// probe rather than through the wait because the point is the carried
+    /// flag, not the endpoint files: the port answers nothing at all here, so
+    /// silence alone would trip the bound immediately.
+    #[tokio::test]
+    async fn a_carried_warming_flag_holds_off_the_silence_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir_all(&root).unwrap();
+        let closed = reserved_closed_loopback_port();
+        let endpoint = LiveDaemonEndpoint {
+            pid: std::process::id(),
+            port: closed.port,
+        };
+
+        // The budget has to outlast several probe iterations. A probe against
+        // a port that answers nothing costs the health client's 500ms connect
+        // timeout plus the loop's 200ms sleep, so a budget near one iteration
+        // would end the call on the caller's own deadline before the silence
+        // check was ever reached, and the test would pass whatever the gate
+        // did.
+        let budget = Duration::from_secs(2);
+        let bound = Some(Duration::from_millis(100));
+        let started = Instant::now();
+        let verdict =
+            probe_daemon_endpoint_until(&root, endpoint, Instant::now() + budget, true, bound)
+                .await;
+        let elapsed = started.elapsed();
+
+        match verdict {
+            EndpointVerdict::LiveNotReady { silent_for, .. } => assert!(
+                silent_for.is_none(),
+                "a daemon that reported itself warming must not be called wedged for going quiet"
+            ),
+            other => panic!("a live owner that answers nothing must stay LiveNotReady: {other:?}"),
+        }
+        assert!(
+            elapsed >= budget,
+            "the warming daemon must be given its whole budget: {elapsed:?} of {budget:?}"
+        );
+    }
+
     #[tokio::test]
     async fn unready_endpoint_names_the_holder_and_refuses_to_replace_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -9603,6 +10140,7 @@ mod tests {
             root,
             Duration::from_millis(50),
             Duration::from_millis(150),
+            None,
         )
         .await
         else {
@@ -9719,6 +10257,7 @@ mod tests {
             root,
             Duration::from_millis(50),
             Duration::from_millis(400),
+            None,
         )
         .await;
 
@@ -9744,6 +10283,7 @@ mod tests {
             root,
             Duration::from_millis(50),
             Duration::from_millis(400),
+            None,
         )
         .await
         else {
@@ -9799,9 +10339,13 @@ mod tests {
             let _ = predecessor.wait();
         });
 
-        let verdict =
-            wait_for_existing_daemon_within(&root, Duration::from_secs(2), Duration::from_secs(3))
-                .await;
+        let verdict = wait_for_existing_daemon_within(
+            &root,
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            None,
+        )
+        .await;
         handover.await.expect("handover task");
 
         assert!(
@@ -9906,9 +10450,14 @@ mod tests {
                 "retirement must attempt the second component even after a first-component error"
             );
 
-            let verdict =
-                follow_preserved_daemon_endpoint(root, Instant::now(), Duration::ZERO, decision)
-                    .await;
+            let verdict = follow_preserved_daemon_endpoint(
+                root,
+                Instant::now(),
+                Duration::ZERO,
+                None,
+                decision,
+            )
+            .await;
             assert!(
                 matches!(verdict, ExistingDaemon::LiveNotReady(_)),
                 "a partial retirement must preserve startup authority, never authorize a \
@@ -11097,6 +11646,89 @@ mod tests {
         assert!(!root.join("daemon.pid").exists());
     }
 
+    /// A stop returns only once the pid record AND the singleton are both gone.
+    ///
+    /// The sibling above proves the retry waits out a lock; this proves the
+    /// wait is long enough to be worth having, and that "retired" is not
+    /// reported while either half of the endpoint is still standing.
+    ///
+    /// The hold here is three times the caller's teardown budget, which is the
+    /// exact shape of the CI failure: the owner was confirmed dead, the lock
+    /// outlived the budget the teardown wait was sized for, and the command
+    /// failed with "Kin daemons stopped but their endpoints were not retired".
+    /// Before [`lock_release_budget`] the retry ran under that same budget and
+    /// gave up here.
+    ///
+    /// Falsify by making `lock_release_budget` the identity: the hold then
+    /// outlives the retry, the call returns `Preserved`, and both the ordering
+    /// assertion and the elapsed one go red.
+    #[test]
+    fn a_stop_returns_only_once_the_pid_record_and_the_singleton_are_both_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_endpoint_files(&root, 4242, 51000);
+
+        let teardown = Duration::from_millis(200);
+        let hold = teardown * 3;
+
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lock"))
+            .unwrap();
+        singleton.try_lock_exclusive().expect("take the singleton");
+
+        // Watched from the holder rather than asserted after the fact: the
+        // claim is about ordering, and a check that only runs at the end
+        // cannot tell a wait from a race that happened to finish late.
+        let watched = root.clone();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            let pid_present_while_held = watched.join("daemon.pid").exists();
+            let _ = fs2::FileExt::unlock(&singleton);
+            pid_present_while_held
+        });
+
+        let started = Instant::now();
+        let cleanup = retire_daemon_endpoint_with_probe(&root, teardown, |_, _| true);
+        let elapsed = started.elapsed();
+        let pid_present_while_held = holder.join().unwrap();
+
+        assert_eq!(
+            cleanup,
+            DaemonEndpointCleanup::Retired,
+            "a lock held past the teardown budget must still be waited out"
+        );
+        assert!(
+            pid_present_while_held,
+            "the endpoint must still stand while the singleton is held; retiring it first \
+             would publish a half-retired endpoint to every later reader"
+        );
+        assert!(
+            elapsed >= hold,
+            "the call returned in {elapsed:?}, before the {hold:?} hold ended, so it did not \
+             wait for the lock at all"
+        );
+        assert!(
+            !root.join("daemon.pid").exists(),
+            "the pid record is gone once the call returns"
+        );
+        // And the singleton is free, which is what made the retirement legal.
+        let after = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lock"))
+            .unwrap();
+        after
+            .try_lock_exclusive()
+            .expect("the singleton is released once the call returns");
+        let _ = fs2::FileExt::unlock(&after);
+    }
+
     /// The falsification of the test above: the SAME contention with no budget
     /// to wait in still reports the survivor. Without this, "retired" would say
     /// nothing about whether the retry did any work.
@@ -11273,6 +11905,7 @@ mod tests {
             root,
             Duration::from_millis(20),
             Duration::from_millis(50),
+            None,
         )
         .await;
 
@@ -11300,6 +11933,7 @@ mod tests {
             dir.path(),
             Duration::from_millis(20),
             Duration::from_millis(50),
+            None,
         )
         .await;
 
@@ -11346,6 +11980,7 @@ mod tests {
                 &waiter_root,
                 Duration::from_millis(20),
                 FOLLOW_PATIENCE,
+                None,
             )
             .await
         });
@@ -11618,6 +12253,7 @@ mod tests {
             root,
             Duration::from_millis(50),
             Duration::from_millis(150),
+            None,
         )
         .await;
 

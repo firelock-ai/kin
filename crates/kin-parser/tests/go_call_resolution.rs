@@ -198,3 +198,116 @@ fn fixture_calls_produces_simple_names_only() {
         "fmt.Println should carry import_source 'fmt'"
     );
 }
+
+/// The 0-based rows of the lines that satisfy `matches`, read off the fixture
+/// source so editing the fixture cannot leave the expectation behind.
+fn rows_where(source: &str, matches: impl Fn(&str) -> bool) -> Vec<u32> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| matches(line))
+        .map(|(row, _)| row as u32)
+        .collect()
+}
+
+/// The 0-based rows a relation's site names, sorted.
+fn site_rows(rels: &[ExtractedRelation], kind: RelationKind, dst: &str, src: &str) -> Vec<u32> {
+    let mut rows: Vec<u32> = rels
+        .iter()
+        .filter(|r| r.kind == kind && r.dst_name == dst && r.src_name == src)
+        .map(|r| {
+            r.site
+                .as_ref()
+                .unwrap_or_else(|| panic!("{kind:?} edge {src} -> {dst} carries no site: {r:?}"))
+                .start_line
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// Every Go call and value read names the position its syntax sits at, and two
+/// reads of one name keep two positions.
+///
+/// The adapter emitted all of them with `site: None`, so the linker had no
+/// position to put on the relation's evidence and every surface that reports
+/// reference lines reported the edge as having no evidence span instead. The
+/// per-context dedup then kept only the first read of a name, so even a site
+/// recorded later could not have described the others.
+#[test]
+fn calls_and_value_reads_carry_the_position_they_were_read_at() {
+    // 1 package, 2 blank, 3 var, 4 blank, 5 func caller, 6 call, 7 call,
+    // 8 read, 9 read, 10 close, 11 blank, 12 func work.
+    let source = "package main\n\
+                  \n\
+                  var limit = 1\n\
+                  \n\
+                  func caller() int {\n\
+                  \x20   work()\n\
+                  \x20   work()\n\
+                  \x20   first := limit\n\
+                  \x20   return first + limit\n\
+                  }\n\
+                  \n\
+                  func work() {}\n";
+    let rels = parse_and_extract(source);
+
+    // The two calls, which are written on two lines so a site list reporting
+    // one of them is distinguishable from one reporting both. `func work() {}`
+    // is excluded by the exact match on the trimmed line, so the declaration
+    // cannot stand in for a call site.
+    let call_rows = rows_where(source, |line| line.trim() == "work()");
+    assert_eq!(call_rows.len(), 2, "the fixture writes two calls");
+    assert_eq!(
+        site_rows(&rels, RelationKind::Calls, "work", "caller"),
+        call_rows,
+        "each Calls edge must name the call expression it came from: {rels:?}"
+    );
+
+    // The two reads of the package-level variable. Its declaration is excluded,
+    // so a site copied from the declaration would not match either.
+    let read_rows = rows_where(source, |line| {
+        line.contains("limit") && !line.trim_start().starts_with("var ")
+    });
+    assert_eq!(read_rows.len(), 2, "the fixture writes two reads");
+    assert_eq!(
+        site_rows(&rels, RelationKind::References, "limit", "caller"),
+        read_rows,
+        "a name read twice in one body must contribute both positions: {rels:?}"
+    );
+
+    // No edge of a kind that describes a position may arrive without one.
+    for rel in &rels {
+        if matches!(
+            rel.kind,
+            RelationKind::Calls
+                | RelationKind::References
+                | RelationKind::SendsMessage
+                | RelationKind::Spawns
+        ) {
+            assert!(
+                rel.site.is_some(),
+                "{:?} edge must carry a site: {rel:?}",
+                rel.kind
+            );
+        }
+    }
+}
+
+/// The same claim over the checked-in Go fixture, so a shape this file does not
+/// spell out cannot reintroduce a siteless edge.
+#[test]
+fn fixture_calls_all_carry_a_site() {
+    let source = load_fixture();
+    let rels = parse_and_extract(&source);
+    let calls: Vec<&ExtractedRelation> = rels
+        .iter()
+        .filter(|r| r.kind == RelationKind::Calls)
+        .collect();
+    assert!(!calls.is_empty(), "the fixture must produce Calls edges");
+    let siteless: Vec<&&ExtractedRelation> = calls.iter().filter(|c| c.site.is_none()).collect();
+    assert!(
+        siteless.is_empty(),
+        "every Calls edge must name its call expression, these do not: {siteless:?}"
+    );
+}

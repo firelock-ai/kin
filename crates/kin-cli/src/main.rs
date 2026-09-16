@@ -412,6 +412,12 @@ enum Command {
         /// Emit the ranked graph-evidence report as JSON; ambiguous identities fail closed
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Also list interface-dispatch candidates: Go call sites that reach an
+        /// interface method this method's receiver type satisfies. They are
+        /// possible dependents, not confirmed ones, and are never added to the
+        /// impacted count.
+        #[arg(long, default_value_t = false)]
+        dispatch: bool,
     },
     /// Build a context pack for one entity, several, or a question
     Context {
@@ -738,7 +744,12 @@ enum Command {
         /// `Name#kind`
         #[arg(required_unless_present = "bulk_json")]
         entity: Option<String>,
-        /// Filter relation kinds: all, calls, imports, or references (or Any for bulk mode)
+        /// Filter relation kinds: all, calls, imports, or references (or Any for
+        /// bulk mode). Suffix with +dispatch (or pass dispatch on its own) to
+        /// list interface-dispatch candidates beside the answer: Go call sites
+        /// that reach an interface method this method's receiver type
+        /// satisfies. They are possible callers, not confirmed ones, and are
+        /// never added to the count.
         #[arg(long, default_value = "all")]
         kind: String,
         /// Exact repo-relative file of the entity, when its name has twins
@@ -3366,7 +3377,11 @@ fn run() -> Result<()> {
                     kind,
                     signature,
                     json,
-                } => commands::impact::run(entity, depth, file, kind, signature, json).await,
+                    dispatch,
+                } => {
+                    commands::impact::run(entity, depth, file, kind, signature, json, dispatch)
+                        .await
+                }
                 Command::Context {
                     entities,
                     question,

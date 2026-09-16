@@ -296,9 +296,14 @@ fn extract_cpp_node(
                 let src_name = class_ctx
                     .map(str::to_string)
                     .unwrap_or_else(|| alias_name.clone());
-                for referenced_type in referenced_types {
+                for (referenced_type, site) in referenced_types {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The position the type name was read at, where the
+                        // node walk found it. A name only the text pass
+                        // produced stays spanless, because it has no node and
+                        // pointing at the whole alias would be a wrong line
+                        // rather than a missing one.
+                        site,
                         receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::References,
@@ -389,7 +394,7 @@ fn extract_cpp_node(
                         let body = value_node.utf8_text(source).unwrap_or("");
                         let params = macro_parameter_names(node, source);
                         let mut seen = std::collections::HashSet::new();
-                        for token in lex_identifiers(body) {
+                        for (token, offset) in lex_identifiers(body) {
                             if token != name
                                 && !token.starts_with("__")
                                 && !params.contains(token)
@@ -397,7 +402,13 @@ fn extract_cpp_node(
                                 && seen.insert(token.to_string())
                             {
                                 relations.push(ExtractedRelation {
-                                    site: None,
+                                    // The identifier inside the replacement
+                                    // list. It has no node of its own, so the
+                                    // extent is computed from the value node's
+                                    // start and the text before it, and the
+                                    // span covers the identifier as written
+                                    // rather than the whole replacement list.
+                                    site: Some(site_in_node_text(&value_node, body, offset, token)),
                                     receiver: None,
                                     call_shape: None,
                                     kind: kin_model::RelationKind::UsesMacro,
@@ -688,10 +699,20 @@ fn typedef_alias_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     names
 }
 
+/// The alias name and every type it references, each with the position the
+/// reference was read at when one is recoverable.
+///
+/// The names come from two places and only one of them has nodes. The node walk
+/// reads a `type_identifier` or a `qualified_identifier` and can name the bytes
+/// it read, so those references carry a site and a reference row can report the
+/// line. The text pass lexes the alias's own source for names the walk does not
+/// reach and normalizes what it finds, so a name it alone produced has no
+/// extent to point at and stays spanless rather than pointing at a guess. A
+/// name both find keeps the walk's site.
 fn extract_alias_declaration(
     node: &tree_sitter::Node,
     source: &[u8],
-) -> Option<(String, Vec<String>)> {
+) -> Option<(String, Vec<(String, Option<crate::extract::RelationSite>)>)> {
     let alias_name = node
         .child_by_field_name("name")
         .and_then(|child| child.utf8_text(source).ok())
@@ -710,12 +731,23 @@ fn extract_alias_declaration(
         &mut skipped_alias,
         &mut references,
     );
-    references.sort();
-    references.dedup();
-    Some((alias_name, references))
+    // Sorted and unique by name, the order this produced before it carried
+    // sites, with a site kept wherever any occurrence of the name had one.
+    let mut by_name: std::collections::BTreeMap<String, Option<crate::extract::RelationSite>> =
+        std::collections::BTreeMap::new();
+    for (name, site) in references {
+        let slot = by_name.entry(name).or_default();
+        if slot.is_none() {
+            *slot = site;
+        }
+    }
+    Some((alias_name, by_name.into_iter().collect()))
 }
 
-fn alias_rhs_type_references(alias_text: &str, alias_name: &str) -> Vec<String> {
+fn alias_rhs_type_references(
+    alias_text: &str,
+    alias_name: &str,
+) -> Vec<(String, Option<crate::extract::RelationSite>)> {
     let Some((_, rhs)) = alias_text.split_once('=') else {
         return Vec::new();
     };
@@ -735,10 +767,16 @@ fn alias_rhs_type_references(alias_text: &str, alias_name: &str) -> Vec<String> 
     references
 }
 
-fn push_normalized_alias_reference(raw: &str, _alias_name: &str, references: &mut Vec<String>) {
+fn push_normalized_alias_reference(
+    raw: &str,
+    _alias_name: &str,
+    references: &mut Vec<(String, Option<crate::extract::RelationSite>)>,
+) {
     if let Some(name) = normalize_cpp_type_reference(raw) {
         if !is_unhelpful_cpp_type_reference(&name) {
-            references.push(name);
+            // Lexed out of the alias's text, so there is no node to name and
+            // no extent this pass can honestly claim.
+            references.push((name, None));
         }
     }
 }
@@ -761,13 +799,17 @@ fn collect_alias_referenced_types(
     source: &[u8],
     alias_name: &str,
     skipped_alias: &mut bool,
-    references: &mut Vec<String>,
+    references: &mut Vec<(String, Option<crate::extract::RelationSite>)>,
 ) {
     match node.kind() {
         "qualified_identifier" => {
             if let Some(name) = normalize_cpp_type_reference(node.utf8_text(source).unwrap_or("")) {
                 if name != alias_name && !is_unhelpful_cpp_type_reference(&name) {
-                    references.push(name);
+                    // The node the name was read from. A qualified name keeps
+                    // its own bytes; a template's arguments are siblings, so
+                    // the span covers the type name as written and not the
+                    // argument list beside it.
+                    references.push((name, Some(crate::adapter::site_from_node(node))));
                 }
             }
             return;
@@ -779,7 +821,7 @@ fn collect_alias_referenced_types(
                     return;
                 }
                 if name != alias_name && !is_unhelpful_cpp_type_reference(&name) {
-                    references.push(name);
+                    references.push((name, Some(crate::adapter::site_from_node(node))));
                 }
             }
         }
@@ -974,7 +1016,11 @@ fn collect_scoped_calls(
                 };
                 if is_valid_callee(&dst_name) {
                     relations.push(ExtractedRelation {
-                        site: None,
+                        // The call expression itself, so a reference row can
+                        // report the line the call is written on. Without it
+                        // the linker has no span to store and every consuming
+                        // surface reports the edge as having no evidence span.
+                        site: Some(crate::adapter::site_from_node(&child)),
                         receiver: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
@@ -1250,7 +1296,12 @@ fn extract_includes_and_macros_recursive(
                 if let Some(src_name) = find_enclosing_entity(node, source) {
                     if src_name != name && !src_name.ends_with(&format!("::{}", name)) {
                         relations.push(ExtractedRelation {
-                            site: None,
+                            // The identifier that used the macro, so a
+                            // reference row can report the line the use is
+                            // written on. Without it the linker has no span to
+                            // store and every consuming surface reports the
+                            // edge as having no evidence span.
+                            site: Some(crate::adapter::site_from_node(node)),
                             receiver: None,
                             call_shape: None,
                             kind: kin_model::RelationKind::UsesMacro,
@@ -1307,10 +1358,12 @@ fn macro_parameter_names(
     names
 }
 
-/// Lex identifier tokens from raw text, skipping the contents of string and
-/// char literals so quoted words are never treated as identifiers. Used to
-/// scan opaque macro-body text that tree-sitter does not tokenize.
-fn lex_identifiers(text: &str) -> Vec<&str> {
+/// Lex identifier tokens from raw text, each with its byte offset in that text,
+/// skipping the contents of string and char literals so quoted words are never
+/// treated as identifiers. Used to scan opaque macro-body text that tree-sitter
+/// does not tokenize. The offset is what lets a use inside such text name a
+/// position, since it has no node of its own.
+fn lex_identifiers(text: &str) -> Vec<(&str, usize)> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -1338,7 +1391,7 @@ fn lex_identifiers(text: &str) -> Vec<&str> {
                     i += 1;
                 }
                 if let Ok(tok) = std::str::from_utf8(&bytes[start..i]) {
-                    tokens.push(tok);
+                    tokens.push((tok, start));
                 }
             }
             _ => {
@@ -1347,6 +1400,39 @@ fn lex_identifiers(text: &str) -> Vec<&str> {
         }
     }
     tokens
+}
+
+/// The site of a token inside a node whose text tree-sitter does not tokenize.
+///
+/// tree-sitter leaves a macro's replacement list as one opaque node, so a name
+/// used inside it has no node of its own and `site_from_node` has nothing to
+/// take. The extent is derived from the node's own start and the text before
+/// the token, so the span covers the identifier as written rather than the
+/// whole replacement list. An identifier holds no newline, so its end is on the
+/// row its start is.
+fn site_in_node_text(
+    node: &tree_sitter::Node,
+    text: &str,
+    offset: usize,
+    token: &str,
+) -> crate::extract::RelationSite {
+    let start = node.start_position();
+    let before = &text[..offset];
+    let newlines = before.matches('\n').count();
+    let start_line = start.row + newlines;
+    let start_col = match before.rfind('\n') {
+        Some(last) => offset - (last + 1),
+        None => start.column + offset,
+    };
+    crate::extract::RelationSite {
+        start_byte: node.start_byte() + offset,
+        end_byte: node.start_byte() + offset + token.len(),
+        start_line: start_line as u32,
+        start_col: start_col as u32,
+        end_line: start_line as u32,
+        end_col: (start_col + token.len()) as u32,
+        syntactic_role: None,
+    }
 }
 
 /// Extract a `#include` directive into a `FileImport`.

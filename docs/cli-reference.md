@@ -334,15 +334,54 @@ kin refs [entity] [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `[entity]` | no | Entity name or ID. Required unless --bulk-json + --entities is provided. |
+| `[entity]` | no | Entity name or ID. Required unless --bulk-json + --entities is provided. A name with twins can carry its pin: `Name@file`, `Name@file:line`, `Name#kind` |
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--kind <kind>` | `all` | Filter relation kinds: all, calls, imports, or references (or Any for bulk mode) |
+| `--file <file>` |  | Exact repo-relative file of the entity, when its name has twins |
+| `--entity-kind <kind>` |  | Exact entity kind (for example: function or method), when its name has twins. `--kind` filters relation kinds here, so the entity's own kind takes this flag |
 | `--bulk-json` |  | Bulk mode: classify many entities by reachability in one daemon call. Outputs JSON to stdout. Requires --entities. |
 | `--entities <entities>` |  | Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set. |
 | `--compact` |  | If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count}). Set --no-compact for verbose rows with name/kind/file_path/matched_kinds. |
 | `--no-compact` |  | Force verbose bulk-mode rows (overrides --compact). Required for clap to accept `--no-compact`. |
+
+A bare name that several entities share resolves through the ranking every read
+command shares, and the answer lists the others and says it chose. `--file` and
+`--entity-kind` pin which one you meant, and they are the same pin `kin impact`
+takes as `--file` and `--kind`, spelled apart here because `kin refs --kind`
+already filters relation kinds. The entity kind is spelled the way the answer's
+own candidate rows spell it, lowercase, so a pair copied out of a note is a pair
+the filter compares.
+
+```
+kin refs render --file src/panel.rs --entity-kind function
+```
+
+A pinned answer says so on the line under the header, naming the pin, the
+definition it selected and how many entities the name reaches, because the
+candidate note goes quiet exactly when a pin worked. A pin that excludes every
+entity the name reaches reports the pin miss and lists what the name alone does
+reach, rather than reporting the entity absent.
+
+The count the answer leads with holds the references the graph can stand behind.
+A row whose only edge is a bare name match, with nothing at the site settling
+which entity the name means, is held out of that count and listed under its own
+heading with its own number, beside the receiver-name candidates held out for the
+same reason. A local variable or a parameter sharing a function's name produces
+exactly that row, and counting those is how one Go function with one caller came
+back as seventeen referencing entities. A call is never held out on its
+resolution alone: a call site is evidence of use even when the destination was
+picked by name, and holding those out would understate a function that is
+genuinely called.
+
+Every row ends with its resolution tier, and the answer states once what the
+tiers mean whenever a row carries one weaker than proven. `type_resolved` means
+the destination entity itself is proven, `import_scoped` means an import singled
+out the scope the name was selected in, and `name_only` means the name matched
+and nothing at the site settles the destination. A reader working through an
+agent has no grep to check a row against, so the tier is the whole of what it
+has.
 
 ### `kin context`
 
@@ -1357,6 +1396,59 @@ unchanged. `kin-trace.jsonl` is one row per tool call carrying the `_kin` envelo
 `negative` verdict and the policy decision, joinable to the transcript on `tool_use_id`.
 `result.json` is the terminal record on its own.
 
+`result.json` also carries the run's own account of what it spent, under `kin_agent.cost`,
+so a cost claim about a run is read off one object rather than assembled by hand from three
+files or estimated.
+
+| Field | Meaning |
+| --- | --- |
+| `accounting_mode` | Which counting produced the token numbers. Always present. |
+| `total_input_tokens` | Prompt tokens over every request, or `null` when nothing counted them |
+| `total_output_tokens` | Answer tokens over every request, or `null` when nothing counted them |
+| `requests` | Completions the endpoint returned, including one whose choice was rejected after the model had already generated it |
+| `requests_with_input_usage` | How many of those carried the endpoint's own prompt count |
+| `requests_with_output_usage` | How many carried its own answer count |
+| `stop_reason` | The same token as `kin_agent.stop_reason` |
+| `tool_calls` | Calls the run attempted |
+| `error_calls` | How many of those came back to the model as an error |
+| `by_tool` | One row per tool name, as the model called it |
+
+Each `by_tool` row carries `calls`, `error_calls`, `bytes_returned` (what the tool itself
+returned), `bytes_shown` (what reached the model, which is less when a result was cut to
+`--max-result-bytes` or withheld for the context budget) and `wall_ms`. The rows add up to
+`tool_calls` and `error_calls` exactly. A call that was never run because a budget was spent
+part way through a batch is counted in `skipped_calls` and is in neither.
+
+`error_calls` counts every call whose result went back marked as an error: a tool name the
+router refused, arguments the schema rejected, an `isError` result from Kin, and a result
+the conversation could not hold. It sits beside the token totals on purpose. Seven error
+calls beside fifty-eight answer tokens is a run that spent its turns being refused, and
+reading the tokens without the refusals beside them is how a saving gets claimed for work
+that never happened.
+
+`accounting_mode` is never omitted, because a byte heuristic and a model's own tokenizer are
+two different rulers and a number off one is not comparable with a number off the other. It
+is one of:
+
+- `endpoint_usage`. Every completion carried the endpoint's own `prompt_tokens` and
+  `completion_tokens`, and the totals are those. An endpoint's own count is preferred
+  whenever it reports one.
+- `endpoint_usage_partial`. Some completions carried a count and some did not, so the totals
+  cover only part of the run. The two `requests_with_` fields say how much.
+- `llama_cpp_tokenizer`. The endpoint reported nothing, and every dispatched request's prompt
+  was counted by the server's own `/apply-template` and `/tokenize` under
+  `KIN_AGENT_CONTEXT_ACCOUNTING=llama_cpp`. Nothing counted the answers, so
+  `total_output_tokens` is `null`.
+- `heuristic`. The endpoint reported nothing and at least one prompt count is the labeled
+  byte heuristic of three bytes to a token. That is a labeled estimate and not an upper bound
+  for every tokenizer, and `total_output_tokens` is `null`.
+- `none`. The run stopped before it dispatched a request, so nothing counted anything.
+
+`kin-trace.jsonl` carries the per-request rows the totals are summed from, one
+`"event": "request_usage"` per completion with `input_tokens`, `output_tokens`,
+`reported_by_endpoint` and `api_ms`, so the summary can be checked against the file rather
+than taken on faith.
+
 Three bounds hold on every run. The deadline covers every wait, the endpoint's included: a
 request still unanswered when it passes is abandoned and the run stops with `deadline` as
 its reason. One tool result is sent to the model up to `--max-result-bytes`, and a longer
@@ -1364,10 +1456,23 @@ one is cut with a note naming its size, the ceiling and how to page. The convers
 kept inside the model's context window: the window comes from `--context-tokens`, else from
 what the endpoint reports for the loaded model (LM Studio's own API, vLLM's
 `max_model_len`, OpenRouter's `context_length`), else `32768`, and the first line on
-stderr says which. The estimate starts from the endpoint's own prompt count each turn, a
-result the conversation cannot hold is withheld with a note, and the agent is asked for its
-final answer before the next request would overflow. The result record carries the reason
-in `stop_reason` and `stop_detail`, and the budget under `context`.
+stderr says which. A result the conversation cannot hold is withheld with a note, and the
+agent is asked for its final answer before the next request would overflow. The result
+record carries the reason in `stop_reason` and `stop_detail`, and the budget under
+`context`.
+
+What counts the conversation decides when a run ends, so the rule is explicit. Once the
+endpoint has reported a prompt count of its own, every later budget decision is made on
+that count plus an estimate of only what the loop appended since, and the byte heuristic
+does not overrule it. The heuristic governs only until the first count arrives and for
+endpoints that report none. Measured against qwen3-coder-next, the heuristic read 59,029
+tokens for a request the server counted at 46,523, and the run stopped for its context
+budget with about 19,000 tokens of the window free and the model still working; short runs
+agreed within a few hundred tokens, so the overcount bit hardest where it cost the most.
+`context.count_source` in the result record and `method` on each `context_admission` row in
+`kin-trace.jsonl` name which count governed, as one of `endpoint_usage_anchor`,
+`llama_cpp_template_tokenize` or `heuristic`, and the `stop_detail` sentence says it in
+words.
 
 The run's Kin session stays open through a long model turn. Every Kin call refreshes it, and
 while a request to the endpoint is in flight the runner sends `kin_session_heartbeat` at a
@@ -1381,6 +1486,18 @@ abort. A query-only or search-only profile that omits those tools refuses the ch
 writing any file, returns an error to the model and increments `unpublished_changes`.
 Use `agent-default` for native agent tasks that need these writing tools. Discovering a
 transaction tool later does not provision the harness's publication session.
+
+A replacement whose `find` text is not in the file is refused, and the refusal carries what
+a retry needs: why it did not match, the file's exact current bytes at the closest span,
+bounded to six lines and 400 bytes between `<<<KIN-EXACT` and `>>>KIN-EXACT` markers, and
+one instruction to re-issue with those bytes. The named causes are escape sequences that
+arrived literal, carriage returns the file does not have, and whitespace that is not the
+file's; when none of those explains it the refusal quotes the nearest line instead and says
+so rather than presenting it as a swap. Every such refusal also names the route that needs
+no old bytes at all: `kin_mutate` with one `update` operation naming the entity and its
+complete new source. A target refused twice this way is not attempted a third time. The
+run's repeat guard answers the third attempt itself, sends the model to read the entity's
+source, and records `repeat_guard` in the trace sidecar with the escalation count.
 
 The exit code is the run's outcome: `0` a final answer, `1` a harness error, `2` the
 tool-call budget was spent, `3` the deadline expired, `4` the endpoint was unreachable or
@@ -1492,8 +1609,40 @@ kin mcp start [options]
 | --- | --- | --- |
 | `--global` |  | Run in global mode, serving every repo in this home's registry (KIN_REGISTRY_PATH, else <KIN_HOME>/registry.toml, else ~/.kin/registry.toml) |
 | `--repo <path>` |  | Bind this server to a specific Kin repository instead of relying on the launching process's working directory. Overrides KIN_MCP_REPO. Use this for a global agent-CLI MCP entry that may launch outside any Kin repository (e.g. an umbrella workspace root). |
-| `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `agent-query` (that belt without the session and transaction tools, for a client that only queries), `agent-search` (the measured always-on set, with every other tool reached through `kin_tool_search`), `full` (every tool, roughly 12k extra tokens of schemas per session), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
+| `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `agent-query` (that belt without the session and transaction tools, for a client that only queries), `agent-search` (the measured always-on set, with every other tool reached through `kin_tool_search`), `full` (every tool), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
 | `--no-spawn` |  | Never start or revive a daemon from this server: bind only a daemon that is already running, and answer graph tool calls with an honest "no daemon is running" error otherwise. This is the probe mode for watchdogs and boot-time checks (equivalent to KIN_NO_DAEMON=1): the MCP handshake and tool list are served in full, and nothing heavy is ever spawned by the check itself. |
+
+What each profile costs before the model has asked anything, measured on 2026-09-15
+against `qwen/qwen3.8-27b` (MLX 4-bit) by sending it one identical two-message chat with
+that profile's `tools/list` attached and without it and reading the server's own
+`prompt_tokens` both times:
+
+| `--tool-profile` | tools served | schema JSON bytes | schema tokens |
+| --- | ---: | ---: | ---: |
+| `agent-search` | 5 | 5,622 | 1,700 |
+| `agent-query` | 14 | 11,873 | 3,596 |
+| `agent-default` | 22 | 31,430 | 8,728 |
+| `full` | 74 | 160,276 | 37,752 |
+
+The token figures belong to that tokenizer; the ratios between profiles do not. This page
+described `full` as "roughly 12k extra tokens of schemas per session", which understated
+it by more than three times.
+
+Those are schema costs. What a profile asks one answer to fit is a second number, and on
+`agent-default` it is per tool. `trace_data_flow` and `get_context_pack` are served a
+24,576-character ceiling, which is the per-result limit `kin agent run` cuts one tool
+result to on a 64k-token window. Every other budgeted tool is served 12,000, the size that
+lets six answers fit a 24,000-token run. They differ because the answers differ. A ranked
+list cut at its ceiling loses its tail and keeps its answer. A chain cut at its ceiling
+loses the far end, which is the end the question was about. Both numbers are advertised on
+the served schema as the `max_chars` default, so a caller reads the one it will get and can
+raise either up to 60,000. `full` serves 45,000 on everything.
+
+`kin agent run` does not put a whole profile on the model. It withholds the session and
+transaction tools it drives itself, folds `trace_data_flow` and `trace_path` into one
+`trace` tool, and withholds the tools `KIN_AGENT_BELT=wide` exists to restore, so the belt
+a model receives is smaller than any row above: 2,917 tokens on the same model, for ten Kin
+tools plus `edit_file` and `write_file`.
 
 `get_entity_source` and its `get_entity_body` alias ask the selected repository daemon on
 every call, including retries after a source gap. A committed generation does not describe

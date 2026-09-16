@@ -495,37 +495,116 @@ impl TreeFootprint {
 /// Where a budget's number came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetSource {
-    /// Derived from the ceiling this process runs under.
-    Derived,
+    /// Derived from the ceiling this process runs under, which is carried here
+    /// so the disclosure can name it.
+    ///
+    /// A reader who is told an allowance and not what it was derived from
+    /// cannot tell a number that followed their machine from a constant, and
+    /// those are the two cases this whole derivation is about. `None` is a
+    /// standing published by a daemon older than this field, where the basis
+    /// was never recorded and saying which machine it came from would be
+    /// inventing one.
+    Derived { host_ceiling_bytes: Option<u64> },
     /// An operator named it outright.
     Operator,
 }
 
 impl BudgetSource {
     /// How a disclosure describes the number's provenance.
-    pub fn as_str(self) -> &'static str {
+    ///
+    /// The derived case names the ceiling rather than describing it, because
+    /// the arithmetic is then checkable in the sentence: an allowance beside
+    /// the machine it came from either follows from
+    /// [`FootprintBudget::derived_from`] or does not.
+    pub fn describe(self) -> String {
         match self {
-            BudgetSource::Derived => "derived from the memory available here",
-            BudgetSource::Operator => "set by an operator",
+            BudgetSource::Derived {
+                host_ceiling_bytes: Some(ceiling),
+            } => format!("derived from this machine's {}", human_bytes(ceiling)),
+            BudgetSource::Derived {
+                host_ceiling_bytes: None,
+            } => "derived from this machine's size".to_string(),
+            BudgetSource::Operator => "set by an operator".to_string(),
         }
+    }
+
+    /// Whether this number was derived rather than named by an operator.
+    pub fn is_derived(self) -> bool {
+        matches!(self, BudgetSource::Derived { .. })
     }
 }
 
 /// Where an operator names the budget outright, in bytes.
 pub const FOOTPRINT_BUDGET_ENV: &str = "KIN_DAEMON_MEMORY_BUDGET_BYTES";
 
-/// The most a derived budget will ever allow one repository daemon to hold.
+/// The most a derived budget allows one repository daemon on a host of ordinary
+/// size, and the base every larger host's cap is a multiple of.
 ///
 /// This constant is the lever that would have caught the measured failure, and
 /// it is a judgement rather than a measurement, so it is written where a reader
 /// can find and argue with it. The sweep that killed the daemon peaked at 18.2
 /// GB on a store of about one gigabyte, on a host with 128 GiB. Any budget
 /// derived only as a fraction of the ceiling would have allowed it: half of 128
-/// GiB is 64. A repository daemon holding more than eight gigabytes is
-/// pathological for any store a person is working in, whatever the host has
-/// spare, so the derived budget is capped here regardless of how large the
-/// machine is.
+/// GiB is 64, so the cap is what stops the fraction alone deciding.
+///
+/// It was a flat constant until a second measurement said a flat one is wrong
+/// at the top of the range. A workstation ingesting an 813-file Rust tree
+/// starts one language server per language beside the daemon, and the tree's
+/// proportional footprint settles well past eight gigabytes with more than a
+/// hundred free on the host. The flat cap graded that Critical, so background
+/// embedding never started and the store never converged. That is the same
+/// ending the resident-set overcount above produced, reached through the budget
+/// arm instead: vectors refused on a box that had room. See
+/// [`derived_budget_ceiling_bytes`] for what replaced it.
 pub const DERIVED_BUDGET_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// How many times [`DERIVED_BUDGET_CEILING_BYTES`] a host this large is worth.
+///
+/// The same ladder the inference resource plan grades a host on
+/// (`unified_throughput_scale` in `kin-infer/src/resource.rs`), and it is the
+/// same ladder on purpose. That plan already decides how much work this machine
+/// is sized for; an allowance that graded the machine differently would refuse
+/// the very batches the plan just sized for it. The two are separate crates and
+/// `kin-infer` depends on no Kin crate, so the ladder is written twice and the
+/// duplicate is named here and pinned by
+/// [`tests::the_cap_ladder_matches_the_inference_resource_plan`] rather than
+/// left to drift silently.
+///
+/// Below the smallest tier this returns one, so every host under 32 GiB and
+/// every container keeps exactly the cap it had before this function existed.
+pub fn host_memory_scale(host_ceiling_bytes: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    match host_ceiling_bytes {
+        bytes if bytes >= 96 * GIB => 4,
+        bytes if bytes >= 64 * GIB => 3,
+        bytes if bytes >= 32 * GIB => 2,
+        _ => 1,
+    }
+}
+
+/// The most a derived budget will ever allow one repository daemon to hold, on
+/// a host this large.
+///
+/// A cap that follows the machine rather than a constant. The judgement the
+/// constant encoded is kept: a daemon does not get the whole host merely
+/// because the host is big, and the fraction alone never decides. What changes
+/// is that "pathological" is now read against the machine, so a tree that is
+/// ordinary on a 128 GiB workstation is not graded by the bar a 16 GiB laptop
+/// sets.
+pub fn derived_budget_ceiling_bytes(host_ceiling_bytes: u64) -> u64 {
+    DERIVED_BUDGET_CEILING_BYTES.saturating_mul(host_memory_scale(host_ceiling_bytes))
+}
+
+/// The largest cap any host size can reach.
+///
+/// The answer to "would a bigger machine fix this", which is a different
+/// question from "what does this machine allow" and has to be asked of the
+/// ladder rather than of the host in front of it. A surface that answered it
+/// with [`DERIVED_BUDGET_CEILING_BYTES`] would tell a reader no machine helps
+/// while three larger tiers still do.
+pub fn largest_derived_budget_ceiling_bytes() -> u64 {
+    derived_budget_ceiling_bytes(u64::MAX)
+}
 
 /// The least a derived budget will ever allow.
 ///
@@ -562,11 +641,14 @@ impl FootprintBudget {
         }
         ceiling_bytes.map(|ceiling| Self {
             bytes: derive_budget(ceiling),
-            source: BudgetSource::Derived,
+            source: BudgetSource::Derived {
+                host_ceiling_bytes: Some(ceiling),
+            },
         })
     }
 
-    /// Half the ceiling, held between the floor and the ceiling constant.
+    /// Half the ceiling, held between the floor and the cap for a host this
+    /// large.
     ///
     /// Half because a daemon is not the only thing on the machine, and the
     /// other half is the user's editor, their language servers outside Kin,
@@ -577,7 +659,10 @@ impl FootprintBudget {
 }
 
 fn derive_budget(ceiling_bytes: u64) -> u64 {
-    (ceiling_bytes / 2).clamp(DERIVED_BUDGET_FLOOR_BYTES, DERIVED_BUDGET_CEILING_BYTES)
+    (ceiling_bytes / 2).clamp(
+        DERIVED_BUDGET_FLOOR_BYTES,
+        derived_budget_ceiling_bytes(ceiling_bytes),
+    )
 }
 
 /// How a daemon's tree stands against its budget.
@@ -638,7 +723,7 @@ impl BudgetStanding {
             self.footprint.child_count,
             human_bytes(self.footprint.total_bytes()),
             human_bytes(self.budget.bytes),
-            self.budget.source.as_str(),
+            self.budget.source.describe(),
             human_bytes(self.footprint.children_bytes),
             if self.footprint.kernel_capped {
                 ", held at what the kernel charges this container"
@@ -718,7 +803,7 @@ impl Verdict {
         // is what keeps an unreadable host from overriding a budget that was
         // measured, and an unmeasurable tree from overriding a host that was.
         let level = budget_level.map_or(host_level, |budget| host_level.max(budget));
-        let by_budget = budget_level == Some(level) && level > host_level;
+        let by_budget = level_came_from_budget(level, host_level, budget_level);
         let did = match level {
             PressureLevel::Elevated => "runs in smaller batches",
             _ => "did not start",
@@ -1003,6 +1088,27 @@ fn describe_budget(work: HeavyWork, standing: &BudgetStanding, did: &'static str
         did,
         work.consequence()
     )
+}
+
+/// Whether this daemon's own budget, rather than the machine, produced the
+/// level that refused the work.
+///
+/// One definition, because two surfaces turn on it and they must not disagree.
+/// [`Verdict::decide`] uses it to pick which sentence describes the refusal,
+/// and the durable record uses it to pick which remedy to offer. A record that
+/// named the budget in its cause and the machine in its remedy would send the
+/// reader to buy memory in the same breath as telling them the machine has it.
+///
+/// The budget arm wins only when it graded strictly worse than the host. Equal
+/// rungs belong to the host: the machine is short either way, and a remedy
+/// about Kin's own ceiling would be wrong advice for a host that is genuinely
+/// full. `None` is an unmeasurable tree and can never win.
+pub fn level_came_from_budget(
+    level: PressureLevel,
+    host_level: PressureLevel,
+    budget_level: Option<PressureLevel>,
+) -> bool {
+    budget_level == Some(level) && level > host_level
 }
 
 /// What the reader can do about a budget the daemon has reached.
@@ -1435,6 +1541,19 @@ pub struct PressureRefusal {
     pub reason: String,
     /// When it was declined, in unix seconds.
     pub at_unix: u64,
+    /// Whether this daemon's own budget produced the level, rather than the
+    /// machine being short.
+    ///
+    /// It selects the remedy, and the two remedies are opposite instructions:
+    /// one says give the machine room, the other says this is Kin's limit on
+    /// itself and names the lever that moves it. Defaulted on read, so a record
+    /// an older daemon published keeps exactly the remedy it had, which is the
+    /// machine one. That default is the safe direction: telling someone their
+    /// machine is short when Kin's own ceiling bit is merely unhelpful, while
+    /// the reverse tells someone with a genuinely full machine to raise a
+    /// limit and push on.
+    #[serde(default)]
+    pub from_budget: bool,
 }
 
 /// Exact embedding state that can prove an old embed refusal is complete.
@@ -1477,6 +1596,12 @@ struct LegacyPressureRefusalProjection {
     level: String,
     reason: String,
     at_unix: u64,
+    /// Carried so a record that round-trips through the stable single-record
+    /// path keeps its remedy. Old readers ignore the key; dropping it here
+    /// would turn every budget refusal back into a machine one the moment it
+    /// was projected.
+    #[serde(default)]
+    from_budget: bool,
     #[serde(default)]
     pressure_records_nonce: Option<String>,
 }
@@ -1488,6 +1613,7 @@ impl LegacyPressureRefusalProjection {
             level: witness.record.level.clone(),
             reason: witness.record.reason.clone(),
             at_unix: witness.record.at_unix,
+            from_budget: witness.record.from_budget,
             pressure_records_nonce: witness.nonce.clone(),
         }
     }
@@ -1499,6 +1625,7 @@ impl LegacyPressureRefusalProjection {
                 level: self.level,
                 reason: self.reason,
                 at_unix: self.at_unix,
+                from_budget: self.from_budget,
             },
             nonce: self.pressure_records_nonce,
         }
@@ -1597,6 +1724,9 @@ impl LegacyPressureRefusalRecords {
                 level: self.level.clone(),
                 reason: self.reason.clone(),
                 at_unix: self.at_unix,
+                // The transitional flat format has no place to record it, so
+                // this reads as the machine remedy, which is the safe default.
+                from_budget: false,
             },
             nonce: None,
         }
@@ -1616,6 +1746,7 @@ impl LegacyPressureRefusalRecords {
                 level,
                 reason,
                 at_unix,
+                from_budget: false,
             }]
         } else {
             refusals
@@ -1684,12 +1815,19 @@ impl PressureRefusal {
     /// including ids this build does not recognise. A write that fails is
     /// dropped, because a daemon that cannot write its own disclosure must not
     /// fail the work it was disclosing about.
-    pub fn record(kin_root: &Path, work: HeavyWork, level: PressureLevel, reason: &str) {
+    pub fn record(
+        kin_root: &Path,
+        work: HeavyWork,
+        level: PressureLevel,
+        reason: &str,
+        from_budget: bool,
+    ) {
         let record = Self {
             work: work.id().to_string(),
             level: level.as_str().to_string(),
             reason: reason.to_string(),
             at_unix: unix_now(),
+            from_budget,
         };
         let _ = Self::mutate_with(kin_root, |refusals| {
             refusals.retain(|existing| existing.work != record.work);
@@ -1766,6 +1904,9 @@ impl PressureRefusal {
             reason: "Kin found an existing memory-pressure publication but could not read one complete record from it; an older daemon may still be replacing it"
                 .to_string(),
             at_unix: unix_now(),
+            // Not a refusal any budget produced, and `remediation` reaches its
+            // own unreadable-ledger remedy before the flag is consulted.
+            from_budget: false,
         }
     }
 
@@ -2052,9 +2193,19 @@ impl PressureRefusal {
     }
 
     /// What the reader can do about it.
+    ///
+    /// Three answers, in the order they are decided. A record nobody could
+    /// parse yet has its own remedy and neither of the others applies. A
+    /// refusal Kin's own budget produced gets [`BUDGET_REMEDY`], which names
+    /// the limit and the lever; it was written for exactly this and then never
+    /// reached, so every budget refusal told the reader to give the machine
+    /// more memory it already had. Everything else is the machine being short,
+    /// which is the reader's to fix and [`PRESSURE_REMEDY`]'s to describe.
     pub fn remediation(&self) -> String {
         if self.is_unreadable_record() {
             PRESSURE_RECORD_UNREADABLE_REMEDY.to_string()
+        } else if self.from_budget {
+            BUDGET_REMEDY.to_string()
         } else {
             PRESSURE_REMEDY.to_string()
         }
@@ -2094,6 +2245,15 @@ pub struct DaemonFootprint {
     pub budget_bytes: u64,
     /// Whether that number was derived or named by an operator.
     pub budget_is_derived: bool,
+    /// The host ceiling a derived number was derived from, so the line that
+    /// prints the allowance can print the machine it came from.
+    ///
+    /// Defaulted on read, like [`TreeFootprint::kernel_capped`], so a record an
+    /// older daemon published still parses. `None` there says the basis was
+    /// never recorded, which the disclosure reports as exactly that rather than
+    /// naming a size nobody measured.
+    #[serde(default)]
+    pub budget_host_ceiling_bytes: Option<u64>,
     /// The rung it sat at.
     pub level: String,
     /// The pid that published it, so a reader can tell one daemon's record from
@@ -2109,7 +2269,11 @@ impl DaemonFootprint {
         let record = Self {
             footprint: standing.footprint,
             budget_bytes: standing.budget.bytes,
-            budget_is_derived: standing.budget.source == BudgetSource::Derived,
+            budget_is_derived: standing.budget.source.is_derived(),
+            budget_host_ceiling_bytes: match standing.budget.source {
+                BudgetSource::Derived { host_ceiling_bytes } => host_ceiling_bytes,
+                BudgetSource::Operator => None,
+            },
             level: level.as_str().to_string(),
             pid,
             at_unix: unix_now(),
@@ -2150,7 +2314,9 @@ impl DaemonFootprint {
             budget: FootprintBudget {
                 bytes: self.budget_bytes,
                 source: if self.budget_is_derived {
-                    BudgetSource::Derived
+                    BudgetSource::Derived {
+                        host_ceiling_bytes: self.budget_host_ceiling_bytes,
+                    }
                 } else {
                     BudgetSource::Operator
                 },
@@ -2608,7 +2774,9 @@ mod tests {
             },
             budget: FootprintBudget {
                 bytes: budget,
-                source: BudgetSource::Derived,
+                source: BudgetSource::Derived {
+                    host_ceiling_bytes: Some(budget.saturating_mul(2)),
+                },
             },
         }
     }
@@ -2691,20 +2859,337 @@ mod tests {
         }
     }
 
+    /// A refusal Kin's own budget produced names Kin's own limit, not the
+    /// machine.
+    ///
+    /// The defect this closes: `BUDGET_REMEDY` was written for exactly this
+    /// case, its own doc comment says sending someone out for memory they
+    /// already have is the thing not to do, and nothing ever reached it.
+    /// `remediation` returned the machine remedy over every refusal, so a
+    /// daemon past its own ceiling on a host with a hundred gigabytes free
+    /// told the reader to give the machine more memory.
+    #[test]
+    fn a_refusal_the_budget_produced_names_the_budget_and_not_the_machine() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "this repository's daemon and the 4 process(es) it started hold 11.0 GiB of the \
+             8.0 GiB it is allowed",
+            true,
+        );
+        let recorded = PressureRefusal::read(dir.path()).expect("a refusal was recorded");
+        assert!(recorded.from_budget);
+        assert_eq!(recorded.remediation(), BUDGET_REMEDY);
+        assert!(
+            recorded
+                .remediation()
+                .contains("KIN_DAEMON_MEMORY_BUDGET_BYTES"),
+            "the remedy has to name the lever that moves the limit: {}",
+            recorded.remediation()
+        );
+        assert!(
+            !recorded.remediation().contains("Give the machine"),
+            "and must not send the reader out for memory they already have: {}",
+            recorded.remediation()
+        );
+
+        // The control. A refusal the machine produced keeps the machine remedy,
+        // or this test would pass with the selection removed entirely.
+        let host = tempfile::tempdir().expect("a temp dir");
+        PressureRefusal::record(
+            host.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "host memory pressure is critical",
+            false,
+        );
+        let machine = PressureRefusal::read(host.path()).expect("a refusal was recorded");
+        assert!(!machine.from_budget);
+        assert_eq!(machine.remediation(), PRESSURE_REMEDY);
+    }
+
+    /// A refusal published before the flag existed keeps the remedy it had.
+    ///
+    /// `kin doctor`, `kin graph status` and the MCP envelope read this record
+    /// out of the store, so a store an older daemon last wrote must not stop
+    /// parsing, and must not silently acquire a remedy nobody recorded.
+    #[test]
+    fn a_refusal_published_before_the_flag_existed_keeps_the_machine_remedy() {
+        let older = r#"{"work":"embed-batch","level":"critical",
+            "reason":"host memory pressure is critical","at_unix":76440}"#;
+        let parsed: PressureRefusal = serde_json::from_str(older).expect("an older record parses");
+        assert!(
+            !parsed.from_budget,
+            "an absent flag is not evidence that the budget refused"
+        );
+        assert_eq!(parsed.remediation(), PRESSURE_REMEDY);
+    }
+
+    /// The one rule that decides which arm refused, asserted on its own.
+    ///
+    /// Both the verdict's sentence and the record's remedy turn on it, and the
+    /// equal-rung case is the one worth pinning: a host that is short at the
+    /// same rung the budget reaches belongs to the host, because a remedy about
+    /// Kin's own ceiling is wrong advice for a machine that is genuinely full.
+    #[test]
+    fn only_a_budget_rung_strictly_worse_than_the_host_counts_as_the_budget_arm() {
+        use PressureLevel::{Critical, Elevated, Nominal, Unknown};
+        assert!(level_came_from_budget(Critical, Nominal, Some(Critical)));
+        assert!(!level_came_from_budget(Critical, Critical, Some(Critical)));
+        assert!(!level_came_from_budget(Critical, Critical, Some(Elevated)));
+        assert!(
+            !level_came_from_budget(Critical, Critical, None),
+            "an unmeasurable tree can never be the arm that refused"
+        );
+        assert!(!level_came_from_budget(Unknown, Unknown, None));
+    }
+
+    /// The remedy a budget refusal carries survives the legacy projection.
+    ///
+    /// The stable single-record path is what an older binary reads, and the
+    /// current writer projects into it on every write. A projection that
+    /// dropped the flag would turn every budget refusal back into a machine one
+    /// the moment it was written.
+    #[test]
+    fn the_legacy_projection_carries_the_remedy_the_refusal_was_recorded_with() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "the tree is past its allowance",
+            true,
+        );
+        let projected = std::fs::read_to_string(pressure_record_path(dir.path()))
+            .expect("the stable single-record path is written");
+        let parsed: PressureRefusal =
+            serde_json::from_str(&projected).expect("an older reader parses it");
+        assert!(
+            parsed.from_budget,
+            "the projection dropped the flag, so the remedy downgraded: {projected}"
+        );
+        assert_eq!(parsed.remediation(), BUDGET_REMEDY);
+    }
+
     #[test]
     fn a_derived_budget_is_half_the_ceiling_between_its_floor_and_its_cap() {
         assert_eq!(FootprintBudget::derived_from(12 * GIB), 6 * GIB);
         // The case the cap exists for: half of a 128 GiB host is 64 GiB, which
-        // would have allowed the 18.2 GB sweep without a murmur.
+        // would have allowed the 18.2 GB sweep without a murmur. The cap still
+        // decides there; it is the cap for a host that size rather than the
+        // base constant.
         assert_eq!(
             FootprintBudget::derived_from(128 * GIB),
-            DERIVED_BUDGET_CEILING_BYTES
+            derived_budget_ceiling_bytes(128 * GIB)
         );
+        assert!(FootprintBudget::derived_from(128 * GIB) < 64 * GIB);
         // And the case the floor exists for: a daemon on a 1 GiB container
         // must still be allowed to do something.
         assert_eq!(
             FootprintBudget::derived_from(512 * MIB),
             DERIVED_BUDGET_FLOOR_BYTES
+        );
+    }
+
+    #[test]
+    fn the_cap_ladder_matches_the_inference_resource_plan() {
+        // `unified_throughput_scale` in `kin-infer/src/resource.rs` grades a
+        // host on exactly these four bands. kin-infer depends on no Kin crate,
+        // so the ladder cannot be shared and this is what stops the copy
+        // drifting: a change to either side has to come here and say so.
+        assert_eq!(host_memory_scale(16 * GIB), 1);
+        assert_eq!(host_memory_scale(32 * GIB - 1), 1);
+        assert_eq!(host_memory_scale(32 * GIB), 2);
+        assert_eq!(host_memory_scale(64 * GIB - 1), 2);
+        assert_eq!(host_memory_scale(64 * GIB), 3);
+        assert_eq!(host_memory_scale(96 * GIB - 1), 3);
+        assert_eq!(host_memory_scale(96 * GIB), 4);
+        assert_eq!(host_memory_scale(1024 * GIB), 4);
+        // The top of the ladder is what answers "would a bigger machine help",
+        // and it is a fact about the ladder rather than about any host.
+        assert_eq!(
+            largest_derived_budget_ceiling_bytes(),
+            DERIVED_BUDGET_CEILING_BYTES * 4
+        );
+    }
+
+    #[test]
+    fn every_host_below_the_first_tier_keeps_the_cap_it_had() {
+        // The whole small end of the range must not move. A container and a
+        // laptop derived their allowance from the flat constant, and a change
+        // that shifted them would be changing the back-off on the machines the
+        // back-off was written for.
+        for ceiling in [
+            512 * MIB,
+            GIB,
+            4 * GIB,
+            8 * GIB,
+            12 * GIB,
+            16 * GIB,
+            24 * GIB,
+            32 * GIB - 1,
+        ] {
+            let flat =
+                (ceiling / 2).clamp(DERIVED_BUDGET_FLOOR_BYTES, DERIVED_BUDGET_CEILING_BYTES);
+            assert_eq!(
+                FootprintBudget::derived_from(ceiling),
+                flat,
+                "a {} host must derive what it derived before the ladder existed",
+                human_bytes(ceiling)
+            );
+        }
+    }
+
+    #[test]
+    fn a_workstation_tree_is_graded_against_its_own_machine_rather_than_a_laptops_cap() {
+        // The measured reproduction, in the numbers it actually had. A 128 GiB
+        // workstation ingesting an 813-file Rust tree published own 3.80 GiB
+        // and one language-server child at 3.85 GiB, a tree of 7.65 GiB. Under
+        // the flat cap that is 0.96 of an 8.0 GiB allowance, which grades
+        // Critical, and `Verdict::decide` refuses the embed batch: background
+        // embedding stops on a host with more than a hundred gigabytes free,
+        // which is the resident-set overcount's ending reached through the
+        // budget arm.
+        let host = 128 * GIB;
+        let measured_own = 4_082_929_864;
+        let measured_children = 4_129_264_056;
+        let bars = Thresholds::default();
+
+        let flat = BudgetStanding {
+            footprint: TreeFootprint {
+                own_bytes: measured_own,
+                children_bytes: measured_children,
+                child_count: 1,
+                kernel_capped: false,
+            },
+            budget: FootprintBudget {
+                bytes: DERIVED_BUDGET_CEILING_BYTES,
+                source: BudgetSource::Derived {
+                    host_ceiling_bytes: Some(host),
+                },
+            },
+        };
+        assert_eq!(
+            flat.level_under(&bars),
+            PressureLevel::Critical,
+            "the flat cap is what this test exists to show refusing"
+        );
+
+        let scaled = BudgetStanding {
+            budget: FootprintBudget {
+                bytes: FootprintBudget::derived_from(host),
+                ..flat.budget
+            },
+            ..flat
+        };
+        assert_eq!(
+            scaled.level_under(&bars),
+            PressureLevel::Nominal,
+            "the same tree on the same machine, graded against that machine"
+        );
+        let nominal = MemoryPressure::Known(reading(host, host / 4));
+        assert_eq!(
+            Verdict::decide(HeavyWork::EmbedBatch, &nominal, Some(&scaled), &bars),
+            Verdict::Proceed,
+            "so background embedding starts instead of being refused"
+        );
+    }
+
+    #[test]
+    fn a_tree_past_its_scaled_allowance_still_refuses() {
+        // The guard this change must not weaken. Raising the cap moves where
+        // the bar sits; it does not move what happens at the bar. A tree past
+        // its allowance on a 128 GiB host is still Critical and still refused.
+        let host = 128 * GIB;
+        let budget = FootprintBudget::derived_from(host);
+        let runaway = BudgetStanding {
+            footprint: TreeFootprint {
+                own_bytes: budget,
+                children_bytes: budget / 2,
+                child_count: 3,
+                kernel_capped: false,
+            },
+            budget: FootprintBudget {
+                bytes: budget,
+                source: BudgetSource::Derived {
+                    host_ceiling_bytes: Some(host),
+                },
+            },
+        };
+        let bars = Thresholds::default();
+        assert!(runaway.is_over_allowance());
+        assert_eq!(runaway.level_under(&bars), PressureLevel::Critical);
+        let roomy = MemoryPressure::Known(reading(host, host / 4));
+        assert!(
+            Verdict::decide(HeavyWork::EmbedBatch, &roomy, Some(&runaway), &bars).refused(),
+            "a roomy machine does not excuse a tree past its own allowance"
+        );
+    }
+
+    #[test]
+    fn a_standing_names_the_machine_its_allowance_was_derived_from() {
+        // The line a reader checks the arithmetic in. "derived from the memory
+        // available here" named neither the basis nor the right quantity: the
+        // derivation reads total memory, and a reader given a bare allowance
+        // cannot tell a number that followed their machine from a constant.
+        let host = 128 * GIB;
+        let named = BudgetStanding {
+            footprint: TreeFootprint {
+                own_bytes: 4 * GIB,
+                children_bytes: 3 * GIB,
+                child_count: 1,
+                kernel_capped: false,
+            },
+            budget: FootprintBudget {
+                bytes: FootprintBudget::derived_from(host),
+                source: BudgetSource::Derived {
+                    host_ceiling_bytes: Some(host),
+                },
+            },
+        };
+        let sentence = named.sentence();
+        assert!(
+            sentence.contains("derived from this machine's 128.0 GiB"),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("of the 32.0 GiB it is allowed"),
+            "{sentence}"
+        );
+        assert!(
+            !sentence.contains("memory available here"),
+            "the old wording named a quantity the derivation never reads: {sentence}"
+        );
+
+        // A record from before the basis was carried says so rather than
+        // naming a size nobody measured.
+        let unknown = BudgetSource::Derived {
+            host_ceiling_bytes: None,
+        };
+        assert_eq!(unknown.describe(), "derived from this machine's size");
+        assert!(unknown.is_derived());
+    }
+
+    #[test]
+    fn a_standing_published_before_the_basis_existed_still_parses() {
+        // The compatibility this field has to keep: a daemon that predates it
+        // wrote a record with no basis, and `kin status` reads that record
+        // rather than asking the daemon, so an unparsable one deletes the line
+        // on every store an older daemon last served.
+        let older = r#"{"footprint":{"own_bytes":1073741824,"children_bytes":0,
+            "child_count":0},"budget_bytes":8589934592,"budget_is_derived":true,
+            "level":"nominal","pid":4103,"at_unix":76440}"#;
+        let parsed: DaemonFootprint = serde_json::from_str(older).expect("an older record parses");
+        assert_eq!(parsed.budget_host_ceiling_bytes, None);
+        assert!(parsed.standing().budget.source.is_derived());
+        assert!(
+            parsed
+                .line(76_440)
+                .contains("derived from this machine's size"),
+            "{}",
+            parsed.line(76_440)
         );
     }
 
@@ -2808,7 +3293,12 @@ mod tests {
             let _guard = crate::test_env::EnvVarGuard::set(FOOTPRINT_BUDGET_ENV, raw);
             let resolved = FootprintBudget::resolve(Some(12 * GIB)).expect("a budget");
             assert_eq!(resolved.bytes, 6 * GIB, "raw {raw:?} should be ignored");
-            assert_eq!(resolved.source, BudgetSource::Derived);
+            assert_eq!(
+                resolved.source,
+                BudgetSource::Derived {
+                    host_ceiling_bytes: Some(12 * GIB)
+                }
+            );
         }
     }
 
@@ -2843,6 +3333,7 @@ mod tests {
             footprint: over.footprint,
             budget_bytes: over.budget.bytes,
             budget_is_derived: true,
+            budget_host_ceiling_bytes: Some(16 * GIB),
             level: "nominal".to_string(),
             pid: 1,
             at_unix: 5_000,
@@ -2863,6 +3354,7 @@ mod tests {
             HeavyWork::LspSweep,
             PressureLevel::Critical,
             "host memory pressure is critical",
+            false,
         );
         let record = PressureRefusal::read(dir.path()).expect("a recorded refusal");
         assert_eq!(record.work, "lsp-sweep");
@@ -2887,12 +3379,14 @@ mod tests {
             HeavyWork::LspSweep,
             PressureLevel::Critical,
             "old refusal",
+            false,
         );
         PressureRefusal::record(
             dir.path(),
             HeavyWork::LspSweep,
             PressureLevel::Elevated,
             "replacement refusal",
+            false,
         );
 
         let record = PressureRefusal::read(dir.path()).expect("the replacement record");
@@ -2931,7 +3425,13 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().expect("a temp dir");
             for work in order {
-                PressureRefusal::record(dir.path(), work, PressureLevel::Critical, work.id());
+                PressureRefusal::record(
+                    dir.path(),
+                    work,
+                    PressureLevel::Critical,
+                    work.id(),
+                    false,
+                );
             }
 
             assert!(PressureRefusal::read_for_work(dir.path(), HeavyWork::LspSweep).is_some());
@@ -2974,6 +3474,7 @@ mod tests {
                         level: PressureLevel::Critical.as_str().to_string(),
                         reason: "lsp refused".to_string(),
                         at_unix: 1,
+                        from_budget: false,
                     });
                     true
                 },
@@ -2997,6 +3498,7 @@ mod tests {
                         level: PressureLevel::Critical.as_str().to_string(),
                         reason: "embed refused".to_string(),
                         at_unix: 2,
+                        from_budget: false,
                     });
                     true
                 },
@@ -3045,6 +3547,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "future work was refused".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         let body = serde_json::to_vec(&future).expect("serialize future record");
         write_pressure_record_atomically(&pressure_record_path(dir.path()), &body)
@@ -3055,6 +3558,7 @@ mod tests {
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "embed refused",
+            false,
         );
         assert!(PressureRefusal::clear_for_work(
             dir.path(),
@@ -3071,6 +3575,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "legacy sweep refusal".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         std::fs::write(
             pressure_record_path(dir.path()),
@@ -3084,6 +3589,7 @@ mod tests {
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "new embed refusal",
+            false,
         );
         assert_eq!(
             PressureRefusal::read_all(dir.path())
@@ -3117,12 +3623,14 @@ mod tests {
             level: "critical".to_string(),
             reason: "lsp refused".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         let future = PressureRefusal {
             work: "future-heavy-work".to_string(),
             level: "critical".to_string(),
             reason: "future refused".to_string(),
             at_unix: 2,
+            from_budget: false,
         };
         let transitional = LegacyPressureRefusalRecords::new(vec![lsp.clone(), future.clone()])
             .expect("two refusal collection");
@@ -3137,6 +3645,7 @@ mod tests {
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "embed refused",
+            false,
         );
 
         let all = PressureRefusal::read_all(dir.path());
@@ -3160,6 +3669,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "old daemon refusal".to_string(),
             at_unix: 7,
+            from_budget: false,
         };
         let complete = serde_json::to_vec(&refusal).expect("serialize complete legacy record");
         let mut reads = vec![b"{\"work\":".to_vec(), complete].into_iter();
@@ -3198,12 +3708,14 @@ mod tests {
             level: "critical".to_string(),
             reason: "same-second refusal".to_string(),
             at_unix: 7,
+            from_budget: false,
         };
         let independent = PressureRefusal {
             work: HeavyWork::LspSweep.id().to_string(),
             level: "critical".to_string(),
             reason: "independent newer work".to_string(),
             at_unix: 8,
+            from_budget: false,
         };
         let witness = LegacyProjectionWitness {
             record: record.clone(),
@@ -3251,12 +3763,14 @@ mod tests {
             HeavyWork::LspSweep,
             PressureLevel::Critical,
             "lsp refused",
+            false,
         );
         PressureRefusal::record(
             dir.path(),
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "embed refused",
+            false,
         );
 
         let legacy_only = PressureRefusal {
@@ -3264,6 +3778,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "an older daemon rewrote the stable path".to_string(),
             at_unix: u64::MAX,
+            from_budget: false,
         };
         std::fs::write(
             pressure_record_path(dir.path()),
@@ -3302,12 +3817,14 @@ mod tests {
             HeavyWork::LspSweep,
             PressureLevel::Critical,
             "current sidecar refusal",
+            false,
         );
         let current = PressureRefusal::read_for_work(dir.path(), HeavyWork::LspSweep)
             .expect("current refusal");
         let old_update = PressureRefusal {
             reason: "old daemon replacement".to_string(),
             at_unix: u64::MAX,
+            from_budget: false,
             ..current.clone()
         };
         std::fs::write(
@@ -3339,6 +3856,7 @@ mod tests {
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "publication must remain best effort",
+            false,
         );
 
         let mut entries = std::fs::read_dir(dir.path())
@@ -3379,6 +3897,7 @@ mod tests {
             level: PressureLevel::Critical.as_str().to_string(),
             reason: "legacy refusal remains readable".to_string(),
             at_unix: 7,
+            from_budget: false,
         };
         std::fs::write(
             pressure_record_path(dir.path()),
@@ -3431,6 +3950,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "host memory pressure is critical".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         let complete = EmbeddingCoverage {
             pending: 0,
@@ -3499,6 +4019,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "legacy projection survives".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         std::fs::write(
             pressure_record_path(dir.path()),
@@ -3567,6 +4088,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "legacy embed refusal".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         std::fs::write(
             pressure_record_path(dir.path()),
@@ -3603,6 +4125,7 @@ mod tests {
             level: "critical".to_string(),
             reason: "legacy LSP refusal".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         std::fs::write(
             pressure_record_path(dir.path()),
@@ -3620,6 +4143,7 @@ mod tests {
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "embed refused",
+            false,
         );
         assert!(PressureRefusal::clear_for_work(
             dir.path(),
@@ -3644,6 +4168,7 @@ mod tests {
             HeavyWork::EmbedBatch,
             PressureLevel::Critical,
             "embed refused",
+            false,
         );
         std::fs::remove_file(pressure_record_path(dir.path()))
             .expect("remove the atomic projection fixture");

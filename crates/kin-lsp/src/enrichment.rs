@@ -159,7 +159,54 @@ pub(crate) fn query_position_evidence(
     file: &str,
     range: &protocol::Range,
 ) -> Vec<RelationEvidence> {
-    vec![RelationEvidence {
+    vec![position_evidence(rule, file, range)]
+}
+
+/// The most positions one enrichment edge records.
+///
+/// A language server can answer with more sites than any reader will act on,
+/// and each one is persisted evidence. The consuming surfaces already declare an
+/// enrichment edge's site list a floor rather than a total, so stopping here
+/// reports fewer sites than exist and never reports a total it cannot support.
+pub const MAX_SITES_PER_EDGE: usize = 64;
+
+/// Every position the server reported for one edge, in source order, capped at
+/// [`MAX_SITES_PER_EDGE`].
+///
+/// A server answers `find_references` and `outgoingCalls` with a list, and
+/// keeping only its head threw away every site after the first. The edge is
+/// keyed on (kind, source, destination), so the sites of one edge have to travel
+/// as several evidence records on that one edge rather than as several edges.
+///
+/// Ordered by position rather than by arrival, so the stored record is a
+/// function of the positions alone. That is also what makes the cap
+/// deterministic: it keeps the earliest sites in the file rather than whichever
+/// ones the server happened to name first.
+pub(crate) fn query_positions_evidence(
+    rule: &'static str,
+    file: &str,
+    ranges: impl IntoIterator<Item = protocol::Range>,
+) -> Vec<RelationEvidence> {
+    fn key(range: &protocol::Range) -> (u32, u32, u32, u32) {
+        (
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+        )
+    }
+    let mut ordered: Vec<protocol::Range> = ranges.into_iter().collect();
+    ordered.sort_by_key(key);
+    ordered.dedup_by_key(|range| key(range));
+    ordered.truncate(MAX_SITES_PER_EDGE);
+    ordered
+        .iter()
+        .map(|range| position_evidence(rule, file, range))
+        .collect()
+}
+
+fn position_evidence(rule: &'static str, file: &str, range: &protocol::Range) -> RelationEvidence {
+    RelationEvidence {
         source_span: Some(SourceSpan {
             file: FilePathId::new(file),
             start_byte: 0,
@@ -175,7 +222,7 @@ pub(crate) fn query_position_evidence(
         resolved_path: None,
         occurrence_count: 1,
         call_shape: None,
-    }]
+    }
 }
 
 pub(crate) fn deterministic_relation_id(
@@ -276,15 +323,16 @@ pub async fn enrich_entity_calls(
                     origin: RelationOrigin::Lsp,
                     created_in: None,
                     import_source: None,
-                    // The call SITE inside the caller, which is what a reader
-                    // needs and what `reference_lines` publishes.
-                    evidence: call
-                        .from_ranges
-                        .first()
-                        .map(|range| {
-                            query_position_evidence("lsp_call_hierarchy", &caller.file_path, range)
-                        })
-                        .unwrap_or_default(),
+                    // Every call SITE inside the caller, which is what a reader
+                    // needs and what `reference_lines` publishes. The server
+                    // answers with one range per call it saw, and taking only
+                    // the head reported a caller that calls the target five
+                    // times as calling it once.
+                    evidence: query_positions_evidence(
+                        "lsp_call_hierarchy",
+                        &caller.file_path,
+                        call.from_ranges.iter().cloned(),
+                    ),
                 });
             }
             None => {
@@ -1012,8 +1060,14 @@ pub async fn enrich_entity_references(
 
     let locations: Vec<protocol::Location> = decode_optional_array(result?)?;
 
-    let mut relations = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    // One relation per referencing entity, carrying every position the server
+    // named inside it. The reference locations arrive as a flat list and several
+    // of them can land in the same entity, so they are grouped here: an edge is
+    // keyed on (kind, source, destination) and a second relation for the same
+    // pair would overwrite the first rather than add to it.
+    let mut relations: Vec<Relation> = Vec::new();
+    let mut row_for: std::collections::HashMap<EntityId, usize> = std::collections::HashMap::new();
+    let mut sites_for: Vec<(String, Vec<protocol::Range>)> = Vec::new();
     for location in &locations {
         // Find the entity that contains this reference location.
         let ref_line = location.range.start.line;
@@ -1022,22 +1076,37 @@ pub async fn enrich_entity_references(
             if referencing.id == entity.id {
                 continue;
             }
-            // Deduplicate.
-            if !seen.insert(referencing.id) {
-                continue;
+            match row_for.get(&referencing.id) {
+                Some(&row) => sites_for[row].1.push(location.range.clone()),
+                None => {
+                    row_for.insert(referencing.id, relations.len());
+                    sites_for.push((referencing.file_path.clone(), vec![location.range.clone()]));
+                    relations.push(Relation {
+                        id: deterministic_relation_id(
+                            RelationKind::References,
+                            referencing.id,
+                            entity.id,
+                        ),
+                        kind: RelationKind::References,
+                        src: GraphNodeId::Entity(referencing.id),
+                        dst: GraphNodeId::Entity(entity.id),
+                        confidence: 0.95,
+                        origin: RelationOrigin::Lsp,
+                        created_in: None,
+                        import_source: None,
+                        // Filled below, once every location for this entity has
+                        // been collected. The reference SITE is inside the
+                        // REFERENCING entity's file, which is why the span is
+                        // built against that file and not against the file the
+                        // declaration was queried in.
+                        evidence: Vec::new(),
+                    });
+                }
             }
-            relations.push(Relation {
-                id: deterministic_relation_id(RelationKind::References, referencing.id, entity.id),
-                kind: RelationKind::References,
-                src: GraphNodeId::Entity(referencing.id),
-                dst: GraphNodeId::Entity(entity.id),
-                confidence: 0.95,
-                origin: RelationOrigin::Lsp,
-                created_in: None,
-                import_source: None,
-                evidence: Vec::new(),
-            });
         }
+    }
+    for (relation, (file, ranges)) in relations.iter_mut().zip(sites_for.iter_mut()) {
+        relation.evidence = query_positions_evidence("lsp_references", file, ranges.drain(..));
     }
 
     Ok(relations)
@@ -1046,6 +1115,97 @@ pub async fn enrich_entity_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn range(start_line: u32, start_col: u32) -> protocol::Range {
+        protocol::Range {
+            start: protocol::Position {
+                line: start_line,
+                character: start_col,
+            },
+            end: protocol::Position {
+                line: start_line,
+                character: start_col + 1,
+            },
+        }
+    }
+
+    /// Every distinct position a server answered with becomes one evidence
+    /// record under the caller's own file.
+    ///
+    /// The reference arm built its edges with no evidence at all while holding
+    /// these ranges, so an edge a language server proved arrived with no
+    /// reference site and every consuming surface reported it as having no
+    /// evidence span.
+    #[test]
+    fn every_reported_position_becomes_one_site() {
+        let evidence = query_positions_evidence(
+            "lsp_references",
+            "pkg/caller.go",
+            [range(4, 8), range(9, 2)],
+        );
+        let spans: Vec<(String, u32, u32)> = evidence
+            .iter()
+            .map(|record| {
+                let span = record.source_span.as_ref().expect("a site carries a span");
+                (span.file.0.clone(), span.start_line, span.start_col)
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                ("pkg/caller.go".to_string(), 4, 8),
+                ("pkg/caller.go".to_string(), 9, 2),
+            ]
+        );
+    }
+
+    /// One position answered twice is one site, so a server that repeats itself
+    /// cannot inflate an edge's site count.
+    #[test]
+    fn a_repeated_position_is_one_site() {
+        let evidence = query_positions_evidence(
+            "lsp_references",
+            "pkg/caller.go",
+            [range(4, 8), range(4, 8)],
+        );
+        assert_eq!(evidence.len(), 1);
+    }
+
+    /// The per-edge ceiling holds, which is what lets the surfaces keep calling
+    /// an enrichment edge's site list a floor rather than a total, and it keeps
+    /// the earliest sites in the file whatever order the server named them in.
+    #[test]
+    fn the_site_list_stops_at_the_per_edge_ceiling() {
+        let ranges: Vec<protocol::Range> = (0..(MAX_SITES_PER_EDGE as u32 + 10))
+            .rev()
+            .map(|line| range(line, 0))
+            .collect();
+        let evidence = query_positions_evidence("lsp_references", "pkg/caller.go", ranges);
+        assert_eq!(evidence.len(), MAX_SITES_PER_EDGE);
+        let lines: Vec<u32> = evidence
+            .iter()
+            .map(|record| record.source_span.as_ref().expect("a site").start_line)
+            .collect();
+        assert_eq!(lines, (0..MAX_SITES_PER_EDGE as u32).collect::<Vec<_>>());
+    }
+
+    /// The record is a function of the positions, not of the order they arrived
+    /// in, so two servers that answer the same sites in different orders store
+    /// the same edge.
+    #[test]
+    fn the_site_list_does_not_depend_on_arrival_order() {
+        let forward = query_positions_evidence(
+            "lsp_references",
+            "pkg/caller.go",
+            [range(4, 8), range(9, 2)],
+        );
+        let backward = query_positions_evidence(
+            "lsp_references",
+            "pkg/caller.go",
+            [range(9, 2), range(4, 8)],
+        );
+        assert_eq!(forward, backward);
+    }
 
     #[test]
     fn entity_index_finds_by_position() {

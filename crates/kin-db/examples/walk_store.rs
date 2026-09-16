@@ -23,6 +23,9 @@
 //! and folding the store, so a walk cheaper than that fold moves it not at all.
 //! Live resident size is what the walk itself holds while it runs, which is the
 //! number the clone actually changes.
+//!
+//! Both resident readings come from the platform's own accounting and exist on
+//! Unix hosts only. On Windows they read 0 and the walk timings still hold.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
@@ -110,6 +113,7 @@ static ALLOCATOR: Counting = Counting;
 ///
 /// `ru_maxrss` is bytes on macOS and kilobytes on Linux; the scale is part of
 /// the platform's ABI, not something to normalize away silently.
+#[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: `usage` is a zeroed `rusage` this call only writes to.
@@ -147,8 +151,14 @@ fn live_rss_bytes() -> u64 {
     }
 }
 
+/// Peak resident set size is not read on this platform.
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> u64 {
+    0
+}
+
 /// Resident set size right now, in bytes, or 0 when it cannot be read.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn live_rss_bytes() -> u64 {
     let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
         return 0;
@@ -165,6 +175,12 @@ fn live_rss_bytes() -> u64 {
         return 0;
     }
     resident_pages.saturating_mul(page as u64)
+}
+
+/// Resident set size is not read on this platform.
+#[cfg(not(unix))]
+fn live_rss_bytes() -> u64 {
+    0
 }
 
 fn mib(bytes: u64) -> f64 {

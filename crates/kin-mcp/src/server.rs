@@ -1170,19 +1170,61 @@ pub async fn process_daemon_message(
 /// The MCP protocol version this server supports.
 const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// The most bytes [`SERVER_INSTRUCTIONS`] may carry.
+///
+/// It is injected once per session and a client may spend it on the model's
+/// context rather than on its own, so it is a budget rather than a page.
+/// Grok delivers it as a 1,194-byte synthetic user message on turn one.
+///
+/// Held by the compile-time assertion below the string rather than by a test.
+/// There is no state in which this crate should build with an instructions
+/// string a client cannot afford to inject, and a test that fails after the
+/// bytes are written is a slower way to learn the same thing.
+pub(crate) const SERVER_INSTRUCTIONS_BUDGET: usize = 1_200;
+
 /// Usage instructions returned at initialize time so a connecting agent knows
-/// what this server is before its first tool call. Kept factual: what the
-/// tools answer from, when to prefer them over text search, and how to read
-/// the envelope and negative contract on retrieval results.
-const SERVER_INSTRUCTIONS: &str = "Kin answers repository questions from a semantic graph rather than raw file search. \
-Prefer semantic_locate to find symbols and behavior by meaning, get_context_pack for a structured context bundle \
-around an entity or file, and trace_data_flow for cross-file data lineage; reach for grep only when no graph-backed \
-tool answers the question. Every tool response carries a `_kin` envelope reporting graph freshness and coverage. \
-Read `_kin.verdict` first: it is the ONE verdict for the response, computed from every block that qualifies the \
-answer, with the most pessimistic input winning. When its `state` is `inconclusive`, treat the counts as a lower \
-bound and do not act on an absence in the answer, whatever any single count or block says on its own; \
-`limiting_factor` names what stopped it. `negative` and `_kin.completeness` beside it are the evidence that verdict \
-was computed from, never independent answers.";
+/// what this server is before its first tool call.
+///
+/// Written for the client shape where this string is ALL the model gets. A
+/// client is free to hide the tool schemas: Grok never sends them, delivering
+/// this string verbatim as a synthetic reminder on turn one and making the
+/// model call its own `search_tool` with a query to learn any tool's name or
+/// schema. Measured on 2026-09-15 with Kin attached beside Grok's own file and
+/// shell tools, three local models made zero Kin calls across ten runs. The
+/// string they read said "prefer semantic_locate" and "reach for grep only when
+/// no graph-backed tool answers the question". Every one of the ten answered
+/// from Grok's own file and shell tools instead, eight of them with grep, and
+/// only three ever called `search_tool` at all.
+///
+/// So this is a discovery surface, not a doctrine page. It names the query
+/// tools by their exact registered names with one line each, because a name a
+/// model has read is a name it can search for, and it tells a model whose
+/// client lists tools by search to search for this server before its first file
+/// read. The envelope contract keeps one sentence, the one a reader has to act
+/// on; `docs/mcp-tools.md` carries the rest. `kin agent run` builds its own
+/// prompt and never reads this string.
+pub(crate) const SERVER_INSTRUCTIONS: &str = "Kin answers questions about this repository from a \
+semantic graph instead of file search. Reach for these tools before grep, and before opening a \
+file, on any question about what the code does or what depends on what.
+If your client does not show you these tools up front and you have to search for a tool, search \
+for \"kin\" first, before your first file read; that is also how you reach a tool this connection \
+did not list.
+semantic_locate: find code by describing what it does, when you do not know the name.
+semantic_search: find declarations by exact name, kind or language.
+get_context_pack: one token-bounded bundle of the code around an entity or a question.
+find_references: who calls, imports or references one entity.
+trace_data_flow: the ordered call chain out from one entity.
+trace_path: how one entity reaches another.
+impact_analysis: what a change to one entity could affect.
+list_file_entities: everything the graph holds for one file.
+Every answer carries a `_kin` envelope. Read `_kin.verdict` first: when its `state` is \
+`inconclusive`, treat the counts as a lower bound and do not act on an absence in the answer.";
+
+const _: () = assert!(
+    SERVER_INSTRUCTIONS.len() <= SERVER_INSTRUCTIONS_BUDGET,
+    "SERVER_INSTRUCTIONS is over SERVER_INSTRUCTIONS_BUDGET: a client injects it once per \
+     session, and on a client that hides tool schemas it is the whole surface the model reads"
+);
 
 fn handle_initialize(
     id: Option<serde_json::Value>,
@@ -2089,6 +2131,7 @@ mod tests {
             level: "constrained".to_string(),
             reason: format!("{work} was refused"),
             at_unix: 1,
+            from_budget: false,
         }
     }
 
@@ -2405,12 +2448,17 @@ mod tests {
         // P2-2.3: kinVersion must be present in serverInfo
         assert!(result["serverInfo"]["kinVersion"].is_string());
         // The spec's instructions field must reach the wire with usable content.
+        // What that content has to hold is asserted once, in
+        // `agent_belt::tests::the_server_instructions_name_only_tools_the_profile_serves`,
+        // against the served profiles. This asserts only that the string
+        // survives the round trip, since a client that hides tool schemas has
+        // nothing else to give the model.
         let instructions = result["instructions"].as_str().unwrap();
+        assert_eq!(instructions, SERVER_INSTRUCTIONS);
         assert!(instructions.contains("semantic_locate"));
         // The one verdict has to be named on the wire, or an agent learns the
         // contract from whichever block it happens to read first.
         assert!(instructions.contains("_kin.verdict"));
-        assert!(instructions.contains("most pessimistic input"));
     }
 
     #[tokio::test]

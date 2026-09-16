@@ -79,7 +79,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Rust",
         min_relations: 3,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Rust records the call expression now. The floor is set the way the
+        // other site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.rs",
@@ -181,7 +185,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Go",
         min_relations: 2,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Go records the call expression now. The floor is set the way the
+        // other site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.go",
@@ -209,7 +217,11 @@ const FIXTURES: &[Fixture] = &[
         // Two: the cross-file `compute()` every language resolves, and the
         // same-file `render()` -> `compute()` sibling FIR-1826 added.
         min_calls: 2,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "Defs.java",
@@ -235,7 +247,11 @@ const FIXTURES: &[Fixture] = &[
         min_relations: 5,
         // Two, for the same reason as Java above.
         min_calls: 2,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "Defs.cs",
@@ -260,7 +276,11 @@ const FIXTURES: &[Fixture] = &[
         language: "C",
         min_relations: 2,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.c",
@@ -282,7 +302,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Cpp",
         min_relations: 3,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.cpp",
@@ -307,7 +331,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Ruby",
         min_relations: 3,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.rb",
@@ -335,7 +363,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Php",
         min_relations: 3,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.php",
@@ -360,7 +392,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Kotlin",
         min_relations: 3,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.kt",
@@ -384,7 +420,11 @@ const FIXTURES: &[Fixture] = &[
         language: "Swift",
         min_relations: 3,
         min_calls: 1,
-        min_calls_with_span: 0,
+        // Records the call site now. The floor is set the way the other
+        // site-recording languages set theirs, low enough that ordinary
+        // extraction changes do not trip it and high enough that the adapter
+        // going silent does; the exact totals below do the precise work.
+        min_calls_with_span: 1,
         files: &[
             (
                 "defs.swift",
@@ -705,7 +745,40 @@ fn print_table(rows: &[(String, Counts)], title: &str) {
 /// offset. This constant proves something different and narrower: that the
 /// linker carries a site the parser recorded all the way onto persisted
 /// evidence.
-const MEASURED_RELATIONS_WITH_SPAN: usize = 12;
+///
+/// 12 to 15 when the Go adapter started recording the position of a call, a
+/// value read, a send and a spawn. All three of this fixture's Go relations are
+/// calls and all three now carry a site, which is the whole of the move.
+///
+/// 15 to 18 with Rust, whose adapter now records the call expression and the
+/// token run a call inside a macro body is written as. Every Rust call edge in
+/// this fixture carries a site.
+///
+/// 18 to 20 with Java, whose two call edges in this fixture both carry a
+/// site now.
+///
+/// 20 to 23 with C, whose three call edges in this fixture all carry a site
+/// now.
+///
+/// 23 to 26 with C++, whose three call edges in this fixture all carry a
+/// site now.
+///
+/// 26 to 28 with C#, whose two call edges in this fixture both carry a site
+/// now.
+///
+/// 28 to 29 with Ruby, whose one call edge in this fixture carries a site
+/// now.
+///
+/// 29 to 32 with PHP, whose three call edges in this fixture all carry a
+/// site now.
+///
+/// 32 to 35 with Kotlin, whose three call edges in this fixture all carry
+/// a site now.
+///
+/// 35 to 38 with Swift, whose three call edges in this fixture all carry a
+/// site now. Every `Calls` edge the fleet's fixtures produce carries one
+/// from here, which the by-kind table below reads as 35 of 35.
+const MEASURED_RELATIONS_WITH_SPAN: usize = 38;
 
 /// Span-backed evidence RECORDS, which exceed span-backed relations whenever one
 /// caller reaches one callee at more than one site. Each fixture calls `compute`
@@ -717,7 +790,36 @@ const MEASURED_RELATIONS_WITH_SPAN: usize = 12;
 /// edge carries exactly one evidence record because a specifier binds once.
 /// The surplus of records over relations is unchanged, since it comes from
 /// repeat CALL sites and this edge adds none.
-const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 15;
+///
+/// 15 to 19 with Go, which is now a fourth site-recording language and
+/// contributes four records across three edges for the same reason the others
+/// do: `run` calls `compute` twice and those two sites travel as two records on
+/// the one edge.
+///
+/// 19 to 23 with Rust, four records over its three edges, because `run` calls
+/// `compute` on two lines and those two sites travel as two records on the one
+/// edge the linker merges them onto.
+///
+/// 23 to 26 with Java, three records over its two edges, because `run`
+/// calls `compute` on two lines.
+///
+/// 26 to 30 with C, four records over its three edges, because `run` calls
+/// `compute` on two lines.
+///
+/// 30 to 34 with C++, four records over its three edges, for the same
+/// reason.
+///
+/// 34 to 37 with C#, three records over its two edges, for the same reason.
+///
+/// 37 to 39 with Ruby, two records over its one edge, because `run` calls
+/// `compute` on two lines.
+///
+/// 39 to 43 with PHP, four records over its three edges.
+///
+/// 43 to 47 with Kotlin, four records over its three edges.
+///
+/// 47 to 51 with Swift, four records over its three edges.
+const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 51;
 
 #[test]
 fn relation_evidence_span_population_per_language() {

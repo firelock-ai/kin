@@ -118,6 +118,169 @@ pub(crate) fn is_dependency_edge(kind: &RelationKind) -> bool {
     }
 }
 
+/// Which way the focal's own dependency edge to one neighbour points.
+///
+/// The endpoint alone cannot say. Every kind [`is_dependency_edge`] accepts runs
+/// src-depends-on-dst, so the same neighbour is a callee on an edge leaving the
+/// focal and a caller on one arriving at it, and "what does this call" is
+/// answered only by the leaving edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocalEdgeDirection {
+    /// `focal --dep--> neighbour`. The focal needs the neighbour.
+    Outgoing,
+    /// `neighbour --dep--> focal`. The neighbour needs the focal.
+    Incoming,
+}
+
+/// The strongest dependency edge the focal itself holds to one neighbour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocalEdge {
+    pub kind: RelationKind,
+    pub direction: FocalEdgeDirection,
+    /// The graph recorded the site where this edge is written: a line in the
+    /// focal a reader can open and check.
+    pub has_site: bool,
+}
+
+impl FocalEdge {
+    /// Whether this edge is a call the focal makes.
+    pub fn is_outgoing_call(&self) -> bool {
+        self.direction == FocalEdgeDirection::Outgoing && self.kind == RelationKind::Calls
+    }
+
+    /// Admission bucket for the dependency section, lowest admitted first.
+    ///
+    /// A call the focal makes is the answer to the question the section exists
+    /// for, so it is admitted before any other edge class and before anything
+    /// the walk reached at more than one hop.
+    pub fn admission_rank(&self) -> u8 {
+        match (self.direction, self.kind) {
+            (FocalEdgeDirection::Outgoing, RelationKind::Calls) => 0,
+            (FocalEdgeDirection::Outgoing, _) => 1,
+            (FocalEdgeDirection::Incoming, _) => 2,
+        }
+    }
+
+    /// Order within one admission bucket, lowest admitted first.
+    ///
+    /// A focal with forty-five outgoing calls puts every one of them in bucket
+    /// zero at the same relation weight, so before this the order inside the
+    /// bucket fell through to the neighbour's uuid and which callees survived a
+    /// tight budget was arbitrary. Measured on a 714-commit slice of `cli/cli`:
+    /// `apiRun` holds a real `Calls` edge to `httpRequest` and the row landed
+    /// 33rd of 45. A recorded call site is the one thing the graph knows about
+    /// these edges that distinguishes them, and it is the property that makes a
+    /// row checkable.
+    pub fn site_rank(&self) -> u8 {
+        u8::from(!self.has_site)
+    }
+}
+
+/// Admission bucket for a subgraph entity the focal holds no dependency edge to.
+///
+/// Above every direct edge, because a row reached at two hops answers the
+/// question less directly than any row reached at one.
+pub const NO_FOCAL_EDGE_RANK: u8 = 3;
+
+/// The admission bucket for one neighbour, given the focal's own edges.
+pub fn focal_edge_rank(edges: &HashMap<EntityId, FocalEdge>, entity_id: &EntityId) -> u8 {
+    edges
+        .get(entity_id)
+        .map_or(NO_FOCAL_EDGE_RANK, |edge| edge.admission_rank())
+}
+
+/// Order within the admission bucket for one neighbour. Highest for a neighbour
+/// the focal holds no edge to, which is already last by its bucket.
+pub fn focal_edge_site_rank(edges: &HashMap<EntityId, FocalEdge>, entity_id: &EntityId) -> u8 {
+    edges
+        .get(entity_id)
+        .map_or(u8::MAX, |edge| edge.site_rank())
+}
+
+/// Every dependency edge the FOCAL itself holds, keyed by the neighbour, with
+/// the direction kept and the strongest edge per neighbour retained.
+///
+/// This is the query the dependency section is an answer to, and it was never
+/// asked. [`build_weight_map`] scores a neighbour by the heaviest relation
+/// anywhere in the subgraph that touches it, including relations that touch the
+/// focal nowhere: its transitive arm weights BOTH endpoints of a two-hop edge.
+/// `Calls` is the heaviest kind at 5.0, so a callee of the focal carries the
+/// same score as any entity two hops out that sits on any call edge at all, and
+/// the tie breaks on [`EntityId`], which is a uuid. That order is the order the
+/// token budget admits in and the order both trace surfaces render, so the one
+/// outgoing call a caller asked about arrives wherever its uuid put it.
+///
+/// Measured on `cli/cli` v2.101.0: `apiRun` holds a real
+/// `Calls` edge to `httpRequest` at `pkg/cmd/api/api.go:434`, `kin path` walks
+/// it forward in one hop, and it landed 33rd in the dependency section, behind
+/// a `References` edge to an unrelated package's `requestBody` and three
+/// same-named `Errorf` methods. `kin trace --nearby 12` prints the first twelve
+/// rows, so the edge the question was about was never named.
+///
+/// Reading the focal's own relations answers direction and kind exactly, for
+/// every edge the graph holds, with no ranking in the way.
+pub fn focal_dependency_edges(
+    focal_id: &EntityId,
+    relations: &[kin_model::Relation],
+) -> HashMap<EntityId, FocalEdge> {
+    let focal_node = GraphNodeId::Entity(*focal_id);
+    let mut edges: HashMap<EntityId, FocalEdge> = HashMap::new();
+    for rel in relations {
+        if !is_dependency_edge(&rel.kind) {
+            continue;
+        }
+        let (neighbor, direction) = if rel.src == focal_node {
+            match rel.dst.as_entity() {
+                Some(id) if id != *focal_id => (id, FocalEdgeDirection::Outgoing),
+                _ => continue,
+            }
+        } else if rel.dst == focal_node {
+            match rel.src.as_entity() {
+                Some(id) if id != *focal_id => (id, FocalEdgeDirection::Incoming),
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        let candidate = FocalEdge {
+            kind: rel.kind,
+            direction,
+            has_site: rel
+                .evidence
+                .iter()
+                .any(|evidence| evidence.source_span.is_some()),
+        };
+        match edges.get(&neighbor) {
+            Some(held) if !focal_edge_is_stronger(&candidate, held) => {}
+            _ => {
+                edges.insert(neighbor, candidate);
+            }
+        }
+    }
+    edges
+}
+
+/// Which of two edges to the same neighbour describes it.
+///
+/// The direction that answers "what does the focal need" first, then the
+/// heavier kind, then the kind's own spelling, so a store holding both a
+/// `Calls` and a `References` edge for one pair always reports the same one and
+/// the section does not reorder itself between runs.
+fn focal_edge_is_stronger(candidate: &FocalEdge, held: &FocalEdge) -> bool {
+    use std::cmp::Ordering;
+    match candidate.admission_rank().cmp(&held.admission_rank()) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => {
+            match relation_weight(&candidate.kind).total_cmp(&relation_weight(&held.kind)) {
+                Ordering::Greater => true,
+                Ordering::Less => false,
+                Ordering::Equal => format!("{:?}", candidate.kind) < format!("{:?}", held.kind),
+            }
+        }
+    }
+}
+
 /// Build a map from entity ID to its maximum relation weight relative to the focal entity.
 ///
 /// For each relation in the subgraph, the weight is assigned to the non-focal endpoint.
@@ -409,6 +572,20 @@ impl DependencySelection {
         self.budget_elided.entry(group).or_default().push(entity_id);
     }
 
+    /// Undo one refusal, for a row the fold put back.
+    ///
+    /// A row that reached the answer is not a row the answer lost, and the
+    /// refill below returns rows the removal pass had already filed. Leaving
+    /// the filing in place would report a loss the response did not take,
+    /// which is the same defect as silence with its sign flipped.
+    fn readmit(&mut self, group: &'static str, entity_id: EntityId) {
+        if let Some(ids) = self.budget_elided.get_mut(group) {
+            if let Some(at) = ids.iter().rposition(|id| *id == entity_id) {
+                ids.remove(at);
+            }
+        }
+    }
+
     /// Rows one group lost to the token budget, discounting any the caller
     /// recovered by another route.
     ///
@@ -646,6 +823,9 @@ pub fn build_context_pack_with_provider<G: GraphStore>(
         .get_entity(focal_id)
         .map_err(|e| ContextError::Graph(e.to_string()))?
         .ok_or_else(|| ContextError::EntityNotFound(focal_id.to_string()))?;
+    // Rows the loop below shed, in the order it shed them, so a section it
+    // emptied without needing to can be refilled rather than reported as lost.
+    let mut withheld_rows: Vec<(&'static str, ContextEntry)> = Vec::new();
     loop {
         let mut settled = None;
         for _ in 0..16 {
@@ -660,6 +840,29 @@ pub fn build_context_pack_with_provider<G: GraphStore>(
             ContextError::Other("context response accounting did not converge".into())
         })?;
         if measured <= opts.budget.max_tokens() {
+            // A section is not emptied to satisfy a budget it is not spending.
+            // The removal pass above works one row at a time and stops the
+            // moment the payload fits, so a single oversized row could take
+            // every row after it down with it and leave the answer reporting
+            // an empty section under half its own budget. When that is what
+            // happened, the rows it shed go back in their original order for
+            // as long as they fit.
+            if !withheld_rows.is_empty()
+                && pack.dependency_signatures.is_empty()
+                && measured.saturating_mul(2) <= opts.budget.max_tokens()
+            {
+                let refilled = refill_dependency_rows(
+                    &mut pack,
+                    &mut selection,
+                    &projections,
+                    &mut withheld_rows,
+                    opts.budget.max_tokens(),
+                    &mut measure,
+                )?;
+                if refilled > 0 {
+                    continue;
+                }
+            }
             pack.actual_tokens = measured;
             return Ok((pack, selection, projections));
         }
@@ -670,6 +873,45 @@ pub fn build_context_pack_with_provider<G: GraphStore>(
         }
         if pack.work_items.pop().is_some() {
             selection.refuse(group::WORK_ITEMS, *focal_id);
+            continue;
+        }
+        // A dependency's BODY is an enrichment of its row; the row is the
+        // answer. Taking the whole row to reclaim the body's tokens is what
+        // made `get_context_pack` hand back `dependencies: []` beside
+        // `dependencies_withheld: 45` on a focal with 45 callees, having spent
+        // 3,501 of its 8,000 tokens: the inner fold above admits rows at FULL
+        // BODY until the budget is gone, so the rendered payload is over
+        // budget by construction whenever one of those bodies is large, and
+        // the only move this loop had was to delete rows until the last body
+        // went with the last row. Every row then read as absent rather than as
+        // present without its source, which is the opposite claim.
+        //
+        // So bodies are shed first, largest first, and a row is withheld only
+        // once every row in the section is already down to its signature.
+        if let Some(at) = pack
+            .dependency_signatures
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.projection_level == ProjectionLevel::FullBody)
+            .max_by_key(|(_, entry)| entry.content.len())
+            .map(|(at, _)| at)
+        {
+            let entity_id = pack.dependency_signatures[at].entity_id;
+            let entity = graph
+                .get_entity(&entity_id)
+                .map_err(|e| ContextError::Graph(e.to_string()))?;
+            let entry = &mut pack.dependency_signatures[at];
+            entry.content = match entity.as_ref() {
+                Some(entity) => project_signature_only(entity),
+                None => String::new(),
+            };
+            entry.projection_level = ProjectionLevel::SignatureOnly;
+            projections.full_bodies.remove(&entity_id);
+            projections.budget_withheld.insert(entity_id);
+            projections.downgrades.insert(
+                entity_id,
+                "whole source body exceeds its token allowance".to_string(),
+            );
             continue;
         }
         let removed = if let Some(entry) = pack.tests.pop() {
@@ -693,6 +935,7 @@ pub fn build_context_pack_with_provider<G: GraphStore>(
         if let Some((group, entry)) = removed {
             selection.refuse(group, entry.entity_id);
             projections.full_bodies.remove(&entry.entity_id);
+            withheld_rows.push((group, entry));
             continue;
         }
         let entry = &mut pack.focal_entities[0];
@@ -718,6 +961,58 @@ pub fn build_context_pack_with_provider<G: GraphStore>(
             "projection reduced to fit the complete rendered response".into(),
         );
     }
+}
+
+/// Put dependency-section rows back after a removal pass that emptied it.
+///
+/// Called only when the settled payload is at or under half its token budget,
+/// which is the state that says the removal went further than the budget
+/// needed. Rows go back in the order the builder ranked them, each one measured
+/// before the next is offered, so the refill can never push the response past
+/// the budget it is repairing. Returns how many rows it put back.
+fn refill_dependency_rows(
+    pack: &mut ContextPack,
+    selection: &mut DependencySelection,
+    projections: &ProjectionReport,
+    withheld: &mut Vec<(&'static str, ContextEntry)>,
+    budget: usize,
+    measure: &mut dyn FnMut(&ContextPack, &DependencySelection, &ProjectionReport) -> Result<usize>,
+) -> Result<usize> {
+    // The removal pass pops from the end of the section, so its stash holds the
+    // section in reverse. Reversing it back is what makes the refill restore the
+    // builder's own order rather than an arbitrary one.
+    let mut rows: Vec<(&'static str, ContextEntry)> = Vec::new();
+    withheld.retain(|(group, entry)| {
+        if *group == group::DEPENDENCIES || *group == group::DEPENDENTS {
+            rows.push((*group, entry.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    rows.reverse();
+
+    let mut refilled = 0usize;
+    for (group, entry) in rows {
+        let entity_id = entry.entity_id;
+        pack.dependency_signatures.push(entry);
+        let mut measured = pack.actual_tokens;
+        for _ in 0..16 {
+            let next = measure(pack, selection, projections)?;
+            if measured == next {
+                break;
+            }
+            measured = next;
+        }
+        if measured > budget {
+            pack.dependency_signatures.pop();
+            break;
+        }
+        pack.actual_tokens = measured;
+        selection.readmit(group, entity_id);
+        refilled += 1;
+    }
+    Ok(refilled)
 }
 
 /// Build a context pack and report how its dependency section was selected.
@@ -864,6 +1159,11 @@ fn build_context_pack_inner<G: GraphStore>(
         .chain(dependent_ids.iter().copied())
         .collect();
     selection.dependents = dependent_ids;
+    // The focal's own edges, read once, before anything is ranked or admitted.
+    // The weight map below cannot stand in for this: it scores a neighbour by
+    // the heaviest relation anywhere in the subgraph, so it cannot tell a call
+    // the focal makes from a call made two hops away.
+    let focal_edges = focal_dependency_edges(focal_id, &direct_relations);
 
     // BFS only follows outgoing edges, so entities with only incoming edges to
     // the focal (e.g. test entities with a Tests relation pointing at the focal)
@@ -944,10 +1244,30 @@ fn build_context_pack_inner<G: GraphStore>(
         .iter()
         .filter(|(eid, _)| **eid != focal.id)
         .collect();
+    // The focal's own edge decides first. Relation weight ranks an entity by
+    // the heaviest edge anywhere in the subgraph that touches it, which is a
+    // relevance signal for the neighbourhood and not an answer about the focal:
+    // it hands a two-hop entity sitting on any call edge the same 5.0 a callee
+    // of the focal carries, and the id tiebreak then interleaves them. The
+    // budget fold below admits greedily in this order and both trace surfaces
+    // cut the section by a caller's limit, so an arbitrary interleave is enough
+    // to lose the one call the caller asked about.
     sorted_entities.sort_by(|(a_id, _), (b_id, _)| {
+        let ra = focal_edge_rank(&focal_edges, a_id);
+        let rb = focal_edge_rank(&focal_edges, b_id);
         let wa = weight_map.get(a_id).copied().unwrap_or(0.0);
         let wb = weight_map.get(b_id).copied().unwrap_or(0.0);
-        wb.total_cmp(&wa).then_with(|| a_id.cmp(b_id))
+        ra.cmp(&rb)
+            // Within one bucket, a call the graph recorded a site for leads one
+            // it did not. Relation weight cannot separate them -- every outgoing
+            // call carries the same 5.0 -- so without this the order inside the
+            // bucket is the neighbours' uuids.
+            .then_with(|| {
+                focal_edge_site_rank(&focal_edges, a_id)
+                    .cmp(&focal_edge_site_rank(&focal_edges, b_id))
+            })
+            .then_with(|| wb.total_cmp(&wa))
+            .then_with(|| a_id.cmp(b_id))
     });
 
     let mut dep_entries = Vec::new();
@@ -1127,7 +1447,18 @@ fn build_context_pack_inner<G: GraphStore>(
     // last. `sort_by_key` is stable, so weight order survives inside each
     // bucket and this only lifts the rows that answer "what does this need"
     // above the rows that answer "what needs this".
-    dep_entries.sort_by_key(|entry| selection.relation_for(&entry.entity_id).sort_rank());
+    //
+    // The focal's own edge leads the key. Direction alone puts every outgoing
+    // edge in one bucket, so a `References` edge to an unrelated package's
+    // same-named function sorted level with a real call and could be rendered
+    // above it. The same key orders the admission above, so what the budget
+    // kept and what a surface prints agree.
+    dep_entries.sort_by_key(|entry| {
+        (
+            focal_edge_rank(&focal_edges, &entry.entity_id),
+            selection.relation_for(&entry.entity_id).sort_rank(),
+        )
+    });
 
     // 4. Gather active work items scoped to focal and direct dependencies.
     let mut work_entries = Vec::new();
@@ -3734,6 +4065,169 @@ mod tests {
             selection.budget_elisions().count(),
             0,
             "a whole pack must carry no elision at all, so a disclosure means a cut"
+        );
+    }
+
+    /// An entity whose id is derived from its identity rather than drawn fresh,
+    /// so the tie-break the old ordering fell through to is fixed input to the
+    /// test instead of a different uuid on every run.
+    fn fixed_entity(name: &str, kind: EntityKind, file_path: &str) -> Entity {
+        let mut entity = make_file_entity(name, kind, file_path);
+        entity.id = EntityId::from_content(file_path, name, &format!("{kind:?}"), 1);
+        entity
+    }
+
+    fn relate(
+        store: &kin_db::InMemoryGraph,
+        kind: kin_model::relation::RelationKind,
+        src: EntityId,
+        dst: EntityId,
+    ) {
+        store
+            .upsert_relation(&kin_model::relation::Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind,
+                src: GraphNodeId::Entity(src),
+                dst: GraphNodeId::Entity(dst),
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn focal_dependency_edges_keep_direction_and_the_strongest_kind() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let focal = fixed_entity("focal", EntityKind::Function, "pkg/a/a.go");
+        let callee = fixed_entity("httpish", EntityKind::Function, "pkg/b/b.go");
+        let caller = fixed_entity("caller", EntityKind::Function, "pkg/e/e.go");
+        let unrelated = fixed_entity("distant", EntityKind::Function, "pkg/d/d.go");
+        let edge = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let relations = vec![
+            // A weaker edge first, so the stronger one has to displace it.
+            edge(RelationKind::References, focal.id, callee.id),
+            edge(RelationKind::Calls, focal.id, callee.id),
+            edge(RelationKind::Calls, caller.id, focal.id),
+            // Touches the focal nowhere.
+            edge(RelationKind::Calls, caller.id, unrelated.id),
+            // Not a dependency edge in either direction.
+            edge(RelationKind::CoChanges, focal.id, unrelated.id),
+        ];
+
+        let edges = focal_dependency_edges(&focal.id, &relations);
+
+        assert_eq!(
+            edges.get(&callee.id).copied(),
+            Some(FocalEdge {
+                kind: RelationKind::Calls,
+                direction: FocalEdgeDirection::Outgoing,
+                has_site: false,
+            }),
+            "an outgoing call outranks a weaker outgoing edge to the same neighbour"
+        );
+        assert_eq!(
+            edges.get(&caller.id).copied(),
+            Some(FocalEdge {
+                kind: RelationKind::Calls,
+                direction: FocalEdgeDirection::Incoming,
+                has_site: false,
+            }),
+            "an arriving edge is kept, and kept as arriving"
+        );
+        assert_eq!(
+            edges.get(&unrelated.id),
+            None,
+            "a co-change edge is not a dependency, and an edge between two other \
+             entities is not the focal's"
+        );
+        assert_eq!(focal_edge_rank(&edges, &callee.id), 0);
+        assert_eq!(focal_edge_rank(&edges, &caller.id), 2);
+        assert_eq!(focal_edge_rank(&edges, &unrelated.id), NO_FOCAL_EDGE_RANK);
+    }
+
+    /// The BUG-8 shape, reduced: a focal that calls one entity and imports
+    /// another, where the imported one bridges to a two-hop entity over a
+    /// `Calls` edge.
+    ///
+    /// [`build_weight_map`] hands the bridge and the two-hop entity the same 5.0
+    /// it hands the callee, because its transitive arm weights both endpoints of
+    /// an edge that touches the focal nowhere. Every one of the three then ties,
+    /// the tie falls through to the entity id, and these ids are fixed so the
+    /// fall-through is deterministic: the bridge sorts first and the call the
+    /// focal actually makes sorts last.
+    ///
+    /// On `cli/cli` v2.101.0 that put `apiRun -Calls-> httpRequest` 33rd in the
+    /// section, past every limit either trace surface renders.
+    #[test]
+    fn the_call_the_focal_makes_leads_the_dependency_section() {
+        use kin_model::relation::RelationKind;
+        let store = kin_db::InMemoryGraph::new();
+
+        let focal = fixed_entity("focal", EntityKind::Function, "pkg/a/a.go");
+        let callee = fixed_entity("httpish", EntityKind::Function, "pkg/b/b.go");
+        let bridge = fixed_entity("bridge", EntityKind::Function, "pkg/c/c.go");
+        let distant = fixed_entity("distant", EntityKind::Function, "pkg/d/d.go");
+        assert!(
+            bridge.id < callee.id && distant.id < callee.id,
+            "this fixture only grades the ordering while the id tie-break would \
+             have put the call last; regenerate the names if the id scheme changes"
+        );
+
+        for entity in [&focal, &callee, &bridge, &distant] {
+            store.upsert_entity(entity).unwrap();
+        }
+        relate(&store, RelationKind::Calls, focal.id, callee.id);
+        relate(&store, RelationKind::Imports, focal.id, bridge.id);
+        relate(&store, RelationKind::Calls, bridge.id, distant.id);
+
+        let (pack, selection) = build_context_pack_with_provenance(
+            &store,
+            &focal.id,
+            &ContextOptions {
+                budget: TokenBudget::Large32k,
+                ..ContextOptions::default()
+            },
+        )
+        .unwrap();
+
+        let rows: Vec<EntityId> = pack
+            .dependency_signatures
+            .iter()
+            .map(|entry| entry.entity_id)
+            .collect();
+        assert!(
+            rows.contains(&callee.id),
+            "the focal's own call must be in the section at all"
+        );
+        assert_eq!(
+            rows.first().copied(),
+            Some(callee.id),
+            "the call the focal makes leads the section; it came {:?} of {}",
+            rows.iter().position(|id| *id == callee.id),
+            rows.len()
+        );
+        assert_eq!(
+            selection.relation_for(&callee.id),
+            DependencyRelation::DependencyEdge
+        );
+        assert!(
+            pack.transitive_deps
+                .iter()
+                .any(|entry| entry.entity_id == distant.id),
+            "the two-hop entity stays in the pack, in the section that says it is two hops out"
         );
     }
 }
