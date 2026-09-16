@@ -102,6 +102,8 @@ pub fn run(args: RunArgs) -> Result<i32> {
         deadline: Duration::from_secs(args.deadline.unwrap_or(DEFAULT_DEADLINE_S)),
         context,
         max_result_bytes: args.max_result_bytes,
+        // The belt follows `KIN_AGENT_PURE_KIN`; the CLI adds no flag of its own.
+        belt_file_tools: None,
         tool_profile: args.tool_profile,
     };
 

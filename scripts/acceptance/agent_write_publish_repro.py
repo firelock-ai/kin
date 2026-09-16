@@ -645,11 +645,18 @@ def entity_id(listed, name):
     return None
 
 
+# The belt is Kin tools only by default. The checks that grade edit_file and
+# write_file ask for the two file tools explicitly, so they keep grading the
+# path an operator can still switch on.
+FILE_TOOLS_BELT = {"KIN_AGENT_PURE_KIN": "0"}
+
+
 def check_edit_lands(suite):
     rc, _ = suite.agent([completion("Documenting value.", "edit_file",
                                     {"path": "src/lib.rs", "find": EDIT_FIND,
                                      "replace": EDIT_REPLACE}),
-                         completion("value is documented.")])
+                         completion("value is documented.")],
+        env_extra=FILE_TOOLS_BELT)
     session = suite.mcp()
     try:
         listed = session.call("list_file_entities", {"path": "src/lib.rs", "limit": 50})
@@ -667,7 +674,8 @@ def check_refused_edit_is_clean(suite):
     rc, tool_result = suite.agent([completion("Commenting out kept.", "edit_file",
                                               {"path": "src/other.rs", "find": REFUSED_FIND,
                                                "replace": REFUSED_REPLACE}),
-                                   completion("kept is commented out.")])
+                                   completion("kept is commented out.")],
+        env_extra=FILE_TOOLS_BELT)
     verdict, detail = grade_refused_edit_is_clean(rc, before, suite.read("src/other.rs"),
                                                   tool_result)
     return Result("refused_edit_is_clean", verdict, "%s %s" % (TICKET, detail))
@@ -676,7 +684,8 @@ def check_refused_edit_is_clean(suite):
 def check_create_lands(suite):
     rc, _ = suite.agent([completion("Adding a module.", "write_file",
                                     {"path": CREATED_PATH, "content": CREATED_BODY}),
-                         completion("src/added.rs holds added.")])
+                         completion("src/added.rs holds added.")],
+        env_extra=FILE_TOOLS_BELT)
     session = suite.mcp()
     try:
         listed = session.call("list_file_entities", {"path": CREATED_PATH, "limit": 50})
@@ -690,7 +699,8 @@ def check_refused_create_is_clean(suite):
     before = suite.read("README.md")
     rc, tool_result = suite.agent([completion("Rewriting the readme.", "write_file",
                                               {"path": "README.md", "content": OVERWRITE_BODY}),
-                                   completion("README.md rewritten.")])
+                                   completion("README.md rewritten.")],
+        env_extra=FILE_TOOLS_BELT)
     verdict, detail = grade_refused_create_is_clean(rc, before, suite.read("README.md"),
                                                     tool_result)
     return Result("refused_create_is_clean", verdict, "%s %s" % (TICKET, detail))
@@ -733,7 +743,8 @@ def check_edit_survives_a_daemon_restart(suite):
                                     {"path": "src/other.rs", "find": RESTART_FIND,
                                      "replace": RESTART_REPLACE}),
                          completion("other is documented.")],
-                        before_first=lambda: stop.append(suite.stop_daemon()))
+                        before_first=lambda: stop.append(suite.stop_daemon()),
+        env_extra=FILE_TOOLS_BELT)
     session = suite.mcp()
     try:
         listed = session.call("list_file_entities", {"path": "src/other.rs", "limit": 50})

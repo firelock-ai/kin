@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `kin agent run` puts the Kin-only belt on the model by default: no `edit_file`,
+  no `write_file`, and the one write tool is `kin_mutate`, which names the
+  entity it changes. `KIN_AGENT_PURE_KIN=false` adds the two file tools back.
+
 ### Added
 
 - `kin setup` opens with a hardware check. It names the architecture, the

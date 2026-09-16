@@ -377,7 +377,8 @@ fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
     );
 }
 
-/// `KIN_AGENT_PURE_KIN` means what kin-core's env registry says a boolean means.
+/// `KIN_AGENT_PURE_KIN` means what kin-core's env registry says a boolean means,
+/// and the belt is Kin tools only unless it says false.
 ///
 /// Read through the pure function rather than the process environment, because
 /// tests share one process and a test that sets an environment variable races
@@ -390,18 +391,21 @@ fn the_pure_kin_switch_reads_booleans_the_way_the_env_registry_does() {
             "{on:?} should lock the belt"
         );
     }
-    // The case this replaced: the old reading treated everything except `0`
-    // and `false` as on, so an operator who wrote `off` got the locked belt.
-    for off in ["0", "false", "no", "off", "OFF", "", "maybe"] {
+    for off in ["0", "false", "no", "off", "OFF", " Off "] {
         assert!(
             !belt::pure_kin_requested(Some(off)),
-            "{off:?} should leave the full belt"
+            "{off:?} should add the two file tools"
         );
     }
-    assert!(
-        !belt::pure_kin_requested(None),
-        "unset leaves the full belt"
-    );
+    // Unset is the locked belt, and so is a value the registry cannot read:
+    // startup validation reports the typo, the default is not guessed away.
+    assert!(belt::pure_kin_requested(None), "unset is the Kin-only belt");
+    for unread in ["", "maybe"] {
+        assert!(
+            belt::pure_kin_requested(Some(unread)),
+            "{unread:?} leaves the Kin-only belt"
+        );
+    }
 }
 
 /// The built-in prompt describes only the write tools the belt actually carries.
