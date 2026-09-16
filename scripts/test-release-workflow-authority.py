@@ -5892,8 +5892,8 @@ def assert_retired_vfs_runtime_is_absent_from_new_archives(
             )
 
     for forbidden in (
-        "scripts/check-kin-vfs-compat.mjs",
-        "scripts/check-kin-vfs-compat.test.mjs",
+        "scripts/kin-vfs-pins.mjs",
+        "scripts/kin-vfs-pins.test.mjs",
         "expected_vfs_commit: """,
     ):
         if forbidden in ci:

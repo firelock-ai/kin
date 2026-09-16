@@ -16,7 +16,7 @@ import {
   lockPackages,
   readPinSources,
   readPinnedVfsCommit,
-} from './check-kin-vfs-compat.mjs';
+} from './kin-vfs-pins.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PIN_A = 'a'.repeat(40);
@@ -203,8 +203,8 @@ test('the real tree records zero pins when VFS is retired, or one pin across eve
     assert.equal(new Set(sites.map(({ sha }) => sha)).size, 1, 'every home agrees');
   }
   assert.ok(
-    !sources.some(({ path: file }) => file.includes('check-kin-vfs-compat')),
-    'the gate must not scan its own source, which carries its own patterns',
+    !sources.some(({ path: file }) => file.includes('kin-vfs-pins')),
+    'the reader must not scan its own source, which carries its own patterns',
   );
 });
 
