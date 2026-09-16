@@ -638,6 +638,13 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
     let started = Instant::now();
     // Validate the provider dialect before transcript or MCP I/O. Construction sends no request.
     let provider = Provider::new(config.provider.clone())?;
+    // Which belt this run has, resolved once so the trace header and the belt
+    // below cannot disagree: the config's explicit choice, else the
+    // `KIN_AGENT_PURE_KIN` default, which is Kin tools only.
+    let pure_kin = match config.belt_file_tools {
+        Some(file_tools) => !file_tools,
+        None => belt::Belt::pure_kin_default(),
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut writer = TranscriptWriter::create(&config.out_dir, &session_id)?;
     let mut counters = Counters::new();
@@ -666,7 +673,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
         // provenance has no other way to tell them apart. On a pure-Kin belt
         // there is no edit_file and no write_file at all, so a change in that
         // run went through Kin or it did not happen.
-        "belt": if belt::Belt::pure_kin_default() { "pure-kin" } else { "kin-plus-file-tools" },
+        "belt": if pure_kin { "pure-kin" } else { "kin-plus-file-tools" },
         "belt_profile": belt_profile.as_str(),
         "policy": "no-shell-no-file-search",
         "mcp_command": config.mcp_command.join(" "),
@@ -786,7 +793,6 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
     // to the curated default, so overloading it would ask for a belt and
     // quietly reconfigure the server as well: two settings moved by one word,
     // one of them not the one the operator meant.
-    let pure_kin = belt::Belt::pure_kin_default();
     let belt = if pure_kin {
         Belt::pure_kin(kin_tools)
     } else {

@@ -118,6 +118,10 @@ pub struct AgentConfig {
     /// the context window.
     pub max_result_bytes: Option<usize>,
     pub tool_profile: Option<String>,
+    /// Whether the belt carries the two local file tools, `edit_file` and `write_file`.
+    /// `None` reads `KIN_AGENT_PURE_KIN`, whose default keeps the belt Kin-only, so the
+    /// one write tool is `kin_mutate` and a change names the entity it touches.
+    pub belt_file_tools: Option<bool>,
 }
 
 impl AgentConfig {
