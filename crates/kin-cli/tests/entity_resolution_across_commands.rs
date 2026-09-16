@@ -193,6 +193,7 @@ async fn impact_result(
             kind: None,
             signature: None,
             require_unique: false,
+            dispatch_candidates: false,
         },
         &healthy_envelope(),
     )
@@ -405,6 +406,111 @@ async fn a_pin_given_twice_with_two_values_is_refused() {
     assert!(
         format!("{error:#}").contains("given twice"),
         "the refusal must say what was wrong: {error:#}"
+    );
+}
+
+/// `kin refs --file` and `--entity-kind` decide which twin the answer is about,
+/// and the answer says which one the pin selected.
+///
+/// The two flags travel to the resolver as the one-token pin every command
+/// reads, so this composes them exactly as `kin refs` does rather than handing
+/// the composed string in directly. Both files are named in turn, because a pin
+/// that agrees with the ranking proves nothing: the second one is the twin the
+/// bare name does not choose.
+#[tokio::test]
+async fn refs_file_and_entity_kind_pin_which_twin_the_answer_is_about() {
+    let graph = twins_graph(&FILES);
+    let unpinned = header_file(&refs_response(&graph, "human_bytes").lines[0]);
+
+    let mut pinned_elsewhere = 0;
+    for (file, source) in [
+        ("src/init_attempt.rs", INIT_ATTEMPT_RS),
+        ("src/spawn.rs", SPAWN_RS),
+    ] {
+        let expected = format!("{file}:{}", line_of(source, "fn human_bytes("));
+        // What `kin refs <name> --file <file> --entity-kind function` sends.
+        let pinned =
+            kin_cli::entity_ref::compose_entity_ref("human_bytes", Some(file), Some("function"));
+        let refs = refs_response(&graph, &pinned);
+        assert!(refs.error.is_none(), "{:?}", refs.lines);
+        let header = &refs.lines[0];
+        assert!(header.contains(&expected), "pinned to {file}: {header}");
+
+        // The header says a pin chose, names it in the flags this command takes,
+        // and names the definition it landed on. Without it the answer is silent
+        // about the narrowing, because the candidate note goes quiet exactly
+        // when a pin worked.
+        let note = refs
+            .lines
+            .iter()
+            .find(|line| line.starts_with("note: pinned by "))
+            .unwrap_or_else(|| panic!("no pin note in {:?}", refs.lines));
+        assert!(
+            note.contains(&format!("--file {file}")) && note.contains("--entity-kind function"),
+            "the note must name the pin as this command takes it: {note}"
+        );
+        assert!(
+            note.contains(&expected) && note.contains("5 entities the name reaches"),
+            "the note must name the definition and what the name alone reaches: {note}"
+        );
+        assert!(
+            !refs.lines.join("\n").contains("names 5 entities"),
+            "a pinned query chose nothing, so it carries no candidate note: {:?}",
+            refs.lines
+        );
+
+        // The same pin reaches the same entity through `kin impact`, which is
+        // the command `kin refs` had to be counted from while it took no pin.
+        let impact = impact_result(&graph, "human_bytes", Some(file))
+            .await
+            .expect("impact");
+        assert!(impact.lines[0].contains(&expected), "{}", impact.lines[0]);
+
+        if header_file(header) != unpinned {
+            pinned_elsewhere += 1;
+        }
+    }
+    assert!(
+        pinned_elsewhere > 0,
+        "at least one pin must select a twin the bare name does not, or the pin \
+         proves nothing"
+    );
+}
+
+/// A pin that excludes every entity the name reaches is a filter miss, and the
+/// refusal names the flags THIS command takes.
+///
+/// `kin refs --kind` filters relation kinds, so a refusal telling the caller to
+/// narrow with `--kind` sends them to a flag that answers a different question.
+#[test]
+fn a_refs_pin_that_excludes_everything_names_the_entity_kind_flag_refs_takes() {
+    let graph = twins_graph(&FILES);
+    let pinned =
+        kin_cli::entity_ref::compose_entity_ref("human_bytes", Some("src/nothing.rs"), None);
+    let error = refs_response(&graph, &pinned)
+        .error
+        .expect("a pin that matches nothing must be refused");
+    assert!(
+        error.contains("No entity named 'human_bytes' matches --file src/nothing.rs"),
+        "{error}"
+    );
+    // The entity is in the graph five times over, so calling it absent is false.
+    for twin in human_bytes_twins(&graph) {
+        assert!(error.contains(&twin.id.to_string()), "{error}");
+    }
+
+    let by_kind =
+        kin_cli::entity_ref::compose_entity_ref("human_bytes", None, Some("no_such_kind"));
+    let error = refs_response(&graph, &by_kind)
+        .error
+        .expect("a kind that matches nothing must be refused");
+    assert!(
+        error.contains("--entity-kind no_such_kind"),
+        "the refusal must spell the flag this command takes: {error}"
+    );
+    assert!(
+        !error.contains("--kind no_such_kind"),
+        "and must not spell it as the relation-kind filter: {error}"
     );
 }
 

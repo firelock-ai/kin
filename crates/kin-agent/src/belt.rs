@@ -33,6 +33,19 @@ pub enum Route {
     Refused(String),
 }
 
+/// Where a call goes, and what goes out with it.
+///
+/// The arguments travel with the route because a folded belt tool rewrites them,
+/// and a dispatcher that read the route from one call and the arguments from
+/// another could send a two-ended question to the one-ended handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedCall {
+    pub route: Route,
+    /// What to send. Identical to what the model wrote unless the belt folded
+    /// the tool it named.
+    pub arguments: Value,
+}
+
 /// One Kin tool on the belt, bound to the server that declared it.
 ///
 /// A run can attach several graph servers, one per repository, and every one of them
@@ -48,6 +61,15 @@ pub struct KinTool {
     pub exposed: String,
     pub description: String,
     pub schema: Value,
+    /// Set when this belt tool stands for more than one server tool, so the
+    /// arguments decide which one a call reaches.
+    ///
+    /// Marked rather than inferred from the name. `bare` holds the tool a call
+    /// takes by default, which is a real server tool either way, so nothing
+    /// downstream could tell a folded tool from an ordinary one by looking at
+    /// it, and a router that guessed from a name would be one rename away from
+    /// sending a fold's arguments to the wrong handler.
+    pub folded: bool,
 }
 
 /// The prefix one server's tools carry on the model's belt.
@@ -105,6 +127,259 @@ pub fn server_label(repo: &Path, taken: &BTreeSet<String>) -> String {
 pub enum LocalTool {
     Edit,
     Write,
+}
+
+/// How much of the server's surface this run puts on the model's belt.
+///
+/// The server's `agent-default` profile is curated for a client with room. A
+/// local model's window is the binding constraint, and measured on
+/// `qwen/qwen3.8-27b` the fifteen Kin tools plus the two local ones cost 6,367
+/// prompt tokens before the model had read one line of code. Four of those tools
+/// answer questions an agent asking, editing and publishing does not ask, so the
+/// default belt withholds them and an operator who wants them says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BeltProfile {
+    /// The tools an agent needs to answer, edit and publish, and nothing else.
+    #[default]
+    Default,
+    /// Everything the server serves, minus what the harness owns.
+    Wide,
+}
+
+impl BeltProfile {
+    /// Read the profile a `KIN_AGENT_BELT` value asks for.
+    ///
+    /// Unset, empty and every value outside the two names read as the default
+    /// belt. A typo is reported by the env registry's own startup validation,
+    /// which is where a value neither name matches belongs, rather than guessed
+    /// at here.
+    pub fn from_value(value: Option<&str>) -> Self {
+        match value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("wide") => BeltProfile::Wide,
+            _ => BeltProfile::Default,
+        }
+    }
+
+    /// The profile this process asked for, through `KIN_AGENT_BELT`.
+    pub fn from_env() -> Self {
+        Self::from_value(std::env::var("KIN_AGENT_BELT").ok().as_deref())
+    }
+
+    /// The token an operator reads back in the run record.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BeltProfile::Default => "default",
+            BeltProfile::Wide => "wide",
+        }
+    }
+}
+
+/// Whether the default belt withholds this tool, leaving it to `KIN_AGENT_BELT=wide`.
+///
+/// Withholding is not removal. Every name here is still served by the MCP
+/// profile, still reachable from any other client, and still on this belt when
+/// the operator asks for the wide one. What it buys is window: these four cost
+/// 3,239 of the belt's 21,998 schema bytes, and none of them answers a question
+/// that stands between an agent and an answer, an edit or a commit.
+///
+/// Why each one:
+///
+/// - `kin_artifact_list` and `kin_artifact_read` read tracked files rather than
+///   entities. They are the escape hatch for a file the parsers made no entities
+///   for, which is a real capability and a rare one; on the two-hop trace run
+///   that spent its whole window, the one `kin_artifact_list` call returned
+///   18,435 bytes and the answer was in none of them.
+/// - `graph_neighborhood` is `find_references` in one direction and
+///   `trace` in the other, and the belt carries both.
+/// - `kin_provenance_query` answers who changed an entity and whether it was
+///   approved. That is a question about history, and an agent reaches it after
+///   it has an answer, not on the way to one.
+///
+/// `impact_analysis` is deliberately NOT here. "What breaks if I change this" is
+/// the question Kin is described as answering, and a belt that cannot ask it is
+/// not the product.
+pub fn is_opt_in(name: &str) -> bool {
+    matches!(
+        name,
+        "kin_artifact_list" | "kin_artifact_read" | "graph_neighborhood" | "kin_provenance_query"
+    )
+}
+
+/// The name the folded traversal tool carries on the belt.
+pub const TRACE_TOOL: &str = "trace";
+
+/// The server tool a `trace` call with no `to` goes to.
+pub const TRACE_ONE_ENDPOINT: &str = "trace_data_flow";
+
+/// The server tool a `trace` call naming both ends goes to.
+pub const TRACE_TWO_ENDPOINT: &str = "trace_path";
+
+/// Fold the two traversal tools on each server into one belt tool.
+///
+/// `trace_data_flow` walks out from one entity and `trace_path` finds the route
+/// between two. They are the same question with a different number of ends, and
+/// the server's own descriptions say so: one closes "Naming TWO things? Use
+/// trace_path" and the other "One endpoint only? Use trace_data_flow". A model
+/// that has to choose between them before it knows which shape its question has
+/// pays for both schemas and then picks wrong, and the two cost 3,066 of the
+/// belt's schema bytes between them.
+///
+/// The folded tool takes `from` and an optional `to`. Giving `to` asks for the
+/// route between two ends; leaving it out walks the chain out from `from`.
+///
+/// The schema is assembled from the property definitions the server declared,
+/// not written out here, so a bound, a default or a clause the server changes
+/// arrives on the belt with it. `direction` is the one exception and the reason
+/// it is: the two tools spell the same three directions differently, `calls`,
+/// `callers` and `both` against `forward`, `reverse` and `either`, so the belt
+/// names one set and [`resolve_trace_call`] translates.
+///
+/// A server that declares only one of the two is left exactly as it is. The fold
+/// is a saving, not a contract, and half of it is a belt missing a capability.
+pub fn fold_traversal(tools: &mut Vec<KinTool>) {
+    let servers: BTreeSet<usize> = tools.iter().map(|tool| tool.server).collect();
+    for server in servers {
+        let one = tools
+            .iter()
+            .position(|tool| tool.server == server && tool.bare == TRACE_ONE_ENDPOINT);
+        let two = tools
+            .iter()
+            .position(|tool| tool.server == server && tool.bare == TRACE_TWO_ENDPOINT);
+        let (Some(one), Some(two)) = (one, two) else {
+            continue;
+        };
+        let folded = folded_trace_tool(&tools[one], &tools[two]);
+        let (first, second) = (one.min(two), one.max(two));
+        tools[first] = folded;
+        tools.remove(second);
+    }
+}
+
+/// Build the folded tool from the two the server declared.
+fn folded_trace_tool(one_endpoint: &KinTool, two_endpoint: &KinTool) -> KinTool {
+    let property = |tool: &KinTool, name: &str| -> Option<Value> {
+        tool.schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(name))
+            .cloned()
+    };
+    let mut properties = Map::new();
+    properties.insert(
+        "from".to_string(),
+        property(two_endpoint, "from").unwrap_or_else(|| json!({ "type": "string" })),
+    );
+    properties.insert(
+        "to".to_string(),
+        property(two_endpoint, "to").unwrap_or_else(|| json!({ "type": "string" })),
+    );
+    properties.insert(
+        "direction".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["forward", "reverse", "both"],
+            "default": "forward",
+            "description": "`forward` walks out of `from`, `reverse` walks what reaches it, `both` merges."
+        }),
+    );
+    for name in ["depth", "include_body", "limit_per_step", "max_chars"] {
+        if let Some(declared) = property(one_endpoint, name) {
+            properties.insert(name.to_string(), declared);
+        }
+    }
+    let exposed = one_endpoint
+        .exposed
+        .strip_suffix(TRACE_ONE_ENDPOINT)
+        .map(|prefix| format!("{prefix}{TRACE_TOOL}"))
+        .unwrap_or_else(|| format!("{KIN_TOOL_PREFIX}{TRACE_TOOL}"));
+    KinTool {
+        folded: true,
+        server: one_endpoint.server,
+        bare: TRACE_ONE_ENDPOINT.to_string(),
+        exposed,
+        description: "Walk the call and import graph from one entity. Name `to` as well and it \
+                      returns the ordered hops from one to the other; leave it out and it walks \
+                      the whole chain out from `from`."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": Value::Object(properties),
+            "required": ["from"],
+        }),
+    }
+}
+
+/// Resolve a call on the folded tool to the server tool and arguments it takes.
+///
+/// Naming a non-empty `to` is the whole selector, because it is the one thing a
+/// two-ended question has that a one-ended question does not. An empty string is
+/// read as absent: a model asked for an optional argument it does not want often
+/// sends `""` rather than omitting the key, and routing that to the two-ended
+/// tool would refuse a question the one-ended tool answers.
+pub fn resolve_trace_call(arguments: &Value) -> (&'static str, Value) {
+    let named = |key: &str| arguments.get(key).cloned().filter(|value| !value.is_null());
+    let to = arguments
+        .get("to")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|to| !to.is_empty());
+    let direction = arguments.get("direction").and_then(Value::as_str);
+    let mut out = Map::new();
+    if let Some(from) = named("from") {
+        out.insert(
+            if to.is_some() { "from" } else { "focal" }.to_string(),
+            from,
+        );
+    }
+    match to {
+        Some(to) => {
+            out.insert("to".to_string(), Value::String(to.to_string()));
+            if let Some(direction) = direction {
+                out.insert(
+                    "direction".to_string(),
+                    Value::String(
+                        match direction {
+                            "reverse" => "reverse",
+                            "both" => "either",
+                            _ => "forward",
+                        }
+                        .to_string(),
+                    ),
+                );
+            }
+            if let Some(depth) = named("depth") {
+                out.insert("max_depth".to_string(), depth);
+            }
+            if let Some(max_chars) = named("max_chars") {
+                out.insert("max_chars".to_string(), max_chars);
+            }
+            (TRACE_TWO_ENDPOINT, Value::Object(out))
+        }
+        None => {
+            if let Some(direction) = direction {
+                out.insert(
+                    "direction".to_string(),
+                    Value::String(
+                        match direction {
+                            "reverse" => "callers",
+                            "both" => "both",
+                            _ => "calls",
+                        }
+                        .to_string(),
+                    ),
+                );
+            }
+            for name in ["depth", "include_body", "limit_per_step", "max_chars"] {
+                if let Some(value) = named(name) {
+                    out.insert(name.to_string(), value);
+                }
+            }
+            (TRACE_ONE_ENDPOINT, Value::Object(out))
+        }
+    }
 }
 
 /// The belt: every name the model may call this run.
@@ -205,14 +480,50 @@ impl Belt {
         None
     }
 
-    /// Route a name the model produced.
+    /// Route a name the model produced, ignoring arguments.
+    ///
+    /// A folded tool takes its default half here, because a name on its own
+    /// cannot say which half a call meant. The dispatcher calls
+    /// [`Belt::route_call`] instead, which has the arguments.
     pub fn route(&self, name: &str) -> Route {
+        self.route_call(name, &Value::Null).route
+    }
+
+    /// Route a name the model produced, with the arguments it sent, and say what
+    /// goes out on the wire.
+    ///
+    /// The arguments change the destination for exactly one belt tool, the
+    /// folded traversal tool, and they are rewritten for that one alone. Every
+    /// other call goes out with the arguments the model wrote, byte for byte, so
+    /// a trace row and a refusal keep naming what the model actually sent.
+    pub fn route_call(&self, name: &str, arguments: &Value) -> RoutedCall {
         if let Some(tool) = self.kin_tools.iter().find(|tool| tool.exposed == name) {
-            return Route::Kin {
-                server: tool.server,
-                tool: tool.bare.clone(),
+            if tool.folded {
+                let (bare, arguments) = resolve_trace_call(arguments);
+                return RoutedCall {
+                    route: Route::Kin {
+                        server: tool.server,
+                        tool: bare.to_string(),
+                    },
+                    arguments,
+                };
+            }
+            return RoutedCall {
+                route: Route::Kin {
+                    server: tool.server,
+                    tool: tool.bare.clone(),
+                },
+                arguments: arguments.clone(),
             };
         }
+        RoutedCall {
+            route: self.route_by_name(name),
+            arguments: arguments.clone(),
+        }
+    }
+
+    /// Everything routing does once a Kin tool has been ruled out.
+    fn route_by_name(&self, name: &str) -> Route {
         if self.file_tools {
             match name {
                 EDIT_FILE => return Route::Local(LocalTool::Edit),

@@ -85,6 +85,29 @@ const FIXTURES: &[Fixture] = &[
         caller_name: "run",
         call_text: "compute()",
     },
+    Fixture {
+        // Go is here because it was the language this whole chain was broken
+        // on: its adapter recorded no site for a call, so the linker had no
+        // span to store and every row came back with no evidence span. Against
+        // the Go compiler on the gh CLI repository that cost a third of the
+        // reference rows a language-server tier returned, and all of the rows a
+        // parser-only tier returned.
+        language: "Go",
+        defs_path: "defs.go",
+        defs_source: "package fixture\n\nfunc compute() int {\n\treturn 1\n}\n",
+        caller_path: "caller.go",
+        // 1: package, 2: blank, 3: func run, 4: first call, 5: blank,
+        // 6: second call, 7: close
+        caller_source: "package fixture\n\
+                        \n\
+                        func run() int {\n\
+                        \x20   first := compute()\n\
+                        \n\
+                        \x20   return first + compute()\n\
+                        }\n",
+        caller_name: "run",
+        call_text: "compute()",
+    },
 ];
 
 impl Fixture {
@@ -255,11 +278,11 @@ async fn find_references(graph: &InMemoryGraph, target: &Entity) -> serde_json::
     serde_json::from_str(text).expect("find_references body is json")
 }
 
-/// Every resolved Python and JavaScript reference row carries the caller-file
-/// lines of the reference sites, on both ingest arms, and the CLI prints the
-/// same lines the MCP row carries.
+/// Every resolved reference row carries the caller-file lines of the reference
+/// sites, on both ingest arms, and the CLI prints the same lines the MCP row
+/// carries.
 #[tokio::test]
-async fn python_and_javascript_reference_rows_carry_call_site_lines_on_both_ingest_arms() {
+async fn reference_rows_carry_call_site_lines_on_both_ingest_arms() {
     for fixture in FIXTURES {
         for (arm, link) in [
             (

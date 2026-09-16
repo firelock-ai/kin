@@ -393,7 +393,12 @@ impl BudgetVerdict {
         ceiling_bytes: u64,
         allowance_bytes: u64,
     ) -> String {
-        let remedy = if daemon_load_bytes <= memory_pressure::DERIVED_BUDGET_CEILING_BYTES {
+        // The largest cap any host reaches, not this host's cap. The question
+        // this branch asks is whether a bigger machine would help at all, and
+        // the cap climbs with the machine, so asking it of one host's cap
+        // answers "no machine helps" while larger tiers still do.
+        let largest_allowance = memory_pressure::largest_derived_budget_ceiling_bytes();
+        let remedy = if daemon_load_bytes <= largest_allowance {
             format!(
                 "give this {} more than {}",
                 ceiling_noun(),
@@ -403,7 +408,7 @@ impl BudgetVerdict {
             format!(
                 "no machine size fixes this, because one repository daemon is never allowed more \
                  than {}, so this store needs less history",
-                human_bytes(memory_pressure::DERIVED_BUDGET_CEILING_BYTES)
+                human_bytes(largest_allowance)
             )
         };
         format!(
@@ -1924,18 +1929,23 @@ mod tests {
     /// A load no machine size can give the daemon room for is told that,
     /// rather than told to find a bigger machine.
     ///
-    /// The derived allowance is capped at [`memory_pressure::DERIVED_BUDGET_CEILING_BYTES`]
-    /// regardless of the host, so above that cap "give it more memory" is
-    /// advice that cannot work, which is the failure mode this product already
-    /// carries a ticket for on its OOM recovery text.
+    /// The derived allowance is capped, and the cap climbs with the host only
+    /// as far as [`memory_pressure::largest_derived_budget_ceiling_bytes`], so
+    /// above that "give it more memory" is advice that cannot work, which is
+    /// the failure mode this product already carries a ticket for on its OOM
+    /// recovery text. Asking this of one host's cap rather than the ladder's
+    /// top would tell a reader on a small machine that nothing helps while
+    /// three larger tiers still do.
     #[test]
     fn a_load_past_the_allowance_cap_does_not_send_a_reader_to_buy_memory() {
         // Large enough that the load is past the cap, with a ceiling large
-        // enough that the conversion itself has room.
-        let survey = survey(20_000, 100);
+        // enough that the conversion itself has room. The commit count climbed
+        // with the ladder: 20,000 commits is 22.4 GiB of daemon load, which
+        // clears a flat 8 GiB cap and not the 32 GiB the largest tier reaches.
+        let survey = survey(40_000, 100);
         assert!(
-            survey.daemon_load_bytes() > memory_pressure::DERIVED_BUDGET_CEILING_BYTES,
-            "this test needs a load past the allowance cap"
+            survey.daemon_load_bytes() > memory_pressure::largest_derived_budget_ceiling_bytes(),
+            "this test needs a load past the largest allowance any host reaches"
         );
         let ceiling = survey.forecast_peak_bytes() * 4;
         let verdict = verdict_for(survey, ceiling);
@@ -1949,6 +1959,52 @@ mod tests {
         assert!(
             !line.contains("give this"),
             "a capped allowance was still told to find more memory: {line}"
+        );
+    }
+
+    /// A load a larger machine can hold is told which machine, not that no
+    /// machine helps.
+    ///
+    /// The measured case. github.com/cli/cli at 12,180 commits forecasts
+    /// 13.6 GiB of daemon load. Under the flat cap every host on earth
+    /// derived the same 8.0 GiB allowance, so the advisory said "no machine
+    /// size fixes this ... so this store needs less history", which is not
+    /// something a reader can do to a repository they did not author. The cap
+    /// now climbs with the host, so the honest answer is a machine size.
+    #[test]
+    fn a_load_a_larger_machine_can_hold_names_that_machine_rather_than_a_dead_end() {
+        let survey = survey(12_180, 1_406);
+        let load = survey.daemon_load_bytes();
+        assert!(
+            load > memory_pressure::DERIVED_BUDGET_CEILING_BYTES,
+            "this test needs a load past the base cap a small host derives"
+        );
+        assert!(
+            load < memory_pressure::largest_derived_budget_ceiling_bytes(),
+            "and inside what the largest tier reaches, or no machine would help"
+        );
+
+        // A 16 GiB laptop is below the first tier, so its cap is the base
+        // constant and this load is still past its allowance. The advisory
+        // stays, which is the guard this change must not weaken.
+        let small = verdict_for(survey, 16 * 1024 * 1024 * 1024);
+        let line = small
+            .advisory_line()
+            .expect("a load past a small machine's allowance still speaks");
+        assert!(
+            line.contains("give this machine more than"),
+            "line was: {line}"
+        );
+        assert!(
+            !line.contains("no machine size fixes this"),
+            "a reachable machine size must not be reported as unreachable: {line}"
+        );
+
+        // And a host whose own half clears the load is silent.
+        let roomy = verdict_for(survey, 128 * 1024 * 1024 * 1024);
+        assert!(
+            matches!(roomy, BudgetVerdict::Fits { .. }),
+            "a 128 GiB host derives 32 GiB, which holds 13.6 GiB without a word"
         );
     }
 

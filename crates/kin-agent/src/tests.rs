@@ -208,6 +208,7 @@ fn test_belt() -> Belt {
 /// that server's prefix.
 fn kin_tool(server: usize, bare: &str, label: Option<&str>) -> belt::KinTool {
     belt::KinTool {
+        folded: false,
         server,
         bare: bare.to_string(),
         exposed: format!("{}{bare}", belt::tool_prefix(label)),
@@ -298,6 +299,7 @@ fn harness_owned_tools_never_reach_the_model() {
 #[test]
 fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
     let tool = crate::belt::KinTool {
+        folded: false,
         server: 0,
         bare: "kin_mutate".into(),
         exposed: "mcp__kin__kin_mutate".into(),
@@ -349,6 +351,7 @@ fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
     // file tools by accident, or against a `to_specs` that stopped emitting
     // anything at all.
     let tool = crate::belt::KinTool {
+        folded: false,
         server: 0,
         bare: "kin_mutate".into(),
         exposed: "mcp__kin__kin_mutate".into(),
@@ -491,6 +494,231 @@ fn a_second_repository_of_the_same_name_gets_its_own_label() {
     // A name a tool prefix cannot carry is reduced, not passed through.
     let odd = belt::server_label(std::path::Path::new("/tmp/my repo.v2"), &BTreeSet::new());
     assert_eq!(odd, "my_repo_v2");
+}
+
+/// One belt entry carrying a schema close enough to the real one to fold.
+fn traversal_tool(server: usize, bare: &str, label: Option<&str>) -> belt::KinTool {
+    let schema = match bare {
+        belt::TRACE_ONE_ENDPOINT => json!({
+            "type": "object",
+            "properties": {
+                "focal": { "type": "string", "description": "The entity to walk from." },
+                "target": { "type": "string" },
+                "direction": { "type": "string", "enum": ["calls", "callers", "both"] },
+                "depth": { "type": "integer", "default": 3 },
+                "include_body": { "type": "boolean", "default": false },
+                "limit_per_step": { "type": "integer", "default": 25 },
+                "max_chars": { "type": "integer", "default": 12000 }
+            },
+            "required": ["focal"]
+        }),
+        _ => json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "One end, by name, id or name@file." },
+                "to": { "type": "string", "description": "The other end." },
+                "direction": { "type": "string", "enum": ["forward", "reverse", "either"] },
+                "max_depth": { "type": "integer", "default": 6 },
+                "limit": { "type": "integer", "default": 3 },
+                "max_chars": { "type": "integer", "default": 12000 }
+            },
+            "required": ["from", "to"]
+        }),
+    };
+    belt::KinTool {
+        folded: false,
+        server,
+        bare: bare.to_string(),
+        exposed: format!("{}{bare}", belt::tool_prefix(label)),
+        description: format!("test tool {bare}"),
+        schema,
+    }
+}
+
+#[test]
+fn the_two_traversal_tools_arrive_on_the_belt_as_one() {
+    let mut tools = vec![
+        kin_tool(0, "semantic_locate", None),
+        traversal_tool(0, belt::TRACE_ONE_ENDPOINT, None),
+        traversal_tool(0, belt::TRACE_TWO_ENDPOINT, None),
+    ];
+    belt::fold_traversal(&mut tools);
+    let names: Vec<&str> = tools.iter().map(|tool| tool.exposed.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["mcp__kin__semantic_locate", "mcp__kin__trace"],
+        "the belt should carry one traversal tool, not two"
+    );
+    let folded = &tools[1];
+    assert!(folded.folded, "the fold must be marked, not inferred");
+    let properties = folded.schema["properties"].as_object().expect("properties");
+    for name in [
+        "from",
+        "to",
+        "direction",
+        "depth",
+        "include_body",
+        "limit_per_step",
+    ] {
+        assert!(
+            properties.contains_key(name),
+            "the folded tool lost {name}: {:?}",
+            properties.keys().collect::<Vec<_>>()
+        );
+    }
+    // The bounds and defaults the server declared travel with the property, so
+    // the belt cannot drift from the schema it is folding.
+    assert_eq!(properties["limit_per_step"]["default"], json!(25));
+    assert_eq!(
+        properties["from"]["description"],
+        json!("One end, by name, id or name@file.")
+    );
+}
+
+#[test]
+fn a_server_declaring_only_one_traversal_tool_is_left_alone() {
+    let mut tools = vec![traversal_tool(0, belt::TRACE_ONE_ENDPOINT, None)];
+    belt::fold_traversal(&mut tools);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].exposed, "mcp__kin__trace_data_flow");
+    assert!(!tools[0].folded);
+}
+
+#[test]
+fn naming_both_ends_routes_the_folded_call_to_the_two_ended_tool() {
+    let mut tools = vec![
+        traversal_tool(0, belt::TRACE_ONE_ENDPOINT, None),
+        traversal_tool(0, belt::TRACE_TWO_ENDPOINT, None),
+    ];
+    belt::fold_traversal(&mut tools);
+    let belt = Belt::with_file_tools(tools);
+
+    let two_ended = belt.route_call(
+        "mcp__kin__trace",
+        &json!({ "from": "apiRun", "to": "httpRequest", "direction": "both", "depth": 4 }),
+    );
+    assert_eq!(
+        two_ended.route,
+        Route::Kin {
+            server: 0,
+            tool: belt::TRACE_TWO_ENDPOINT.into()
+        }
+    );
+    assert_eq!(
+        two_ended.arguments,
+        json!({ "from": "apiRun", "to": "httpRequest", "direction": "either", "max_depth": 4 }),
+        "the two-ended tool takes max_depth and its own direction words"
+    );
+
+    let one_ended = belt.route_call(
+        "mcp__kin__trace",
+        &json!({ "from": "apiRun", "direction": "reverse", "depth": 2 }),
+    );
+    assert_eq!(
+        one_ended.route,
+        Route::Kin {
+            server: 0,
+            tool: belt::TRACE_ONE_ENDPOINT.into()
+        }
+    );
+    assert_eq!(
+        one_ended.arguments,
+        json!({ "focal": "apiRun", "direction": "callers", "depth": 2 }),
+        "the one-ended tool takes focal and its own direction words"
+    );
+}
+
+#[test]
+fn an_empty_to_is_read_as_one_ended_rather_than_refused() {
+    let mut tools = vec![
+        traversal_tool(0, belt::TRACE_ONE_ENDPOINT, None),
+        traversal_tool(0, belt::TRACE_TWO_ENDPOINT, None),
+    ];
+    belt::fold_traversal(&mut tools);
+    let belt = Belt::with_file_tools(tools);
+    let routed = belt.route_call("mcp__kin__trace", &json!({ "from": "apiRun", "to": "  " }));
+    assert_eq!(
+        routed.route,
+        Route::Kin {
+            server: 0,
+            tool: belt::TRACE_ONE_ENDPOINT.into()
+        }
+    );
+    assert_eq!(routed.arguments, json!({ "focal": "apiRun" }));
+}
+
+#[test]
+fn the_fold_keeps_two_servers_apart() {
+    let mut tools = vec![
+        traversal_tool(0, belt::TRACE_ONE_ENDPOINT, Some("alpha")),
+        traversal_tool(0, belt::TRACE_TWO_ENDPOINT, Some("alpha")),
+        traversal_tool(1, belt::TRACE_ONE_ENDPOINT, Some("beta")),
+        traversal_tool(1, belt::TRACE_TWO_ENDPOINT, Some("beta")),
+    ];
+    belt::fold_traversal(&mut tools);
+    let names: Vec<&str> = tools.iter().map(|tool| tool.exposed.as_str()).collect();
+    assert_eq!(names, vec!["mcp__kin_alpha__trace", "mcp__kin_beta__trace"]);
+    assert_eq!(tools[0].server, 0);
+    assert_eq!(tools[1].server, 1);
+}
+
+#[test]
+fn the_default_belt_withholds_the_opt_in_tools_and_the_wide_one_does_not() {
+    assert_eq!(
+        belt::BeltProfile::from_value(None),
+        belt::BeltProfile::Default
+    );
+    assert_eq!(
+        belt::BeltProfile::from_value(Some(" WIDE ")),
+        belt::BeltProfile::Wide
+    );
+    assert_eq!(
+        belt::BeltProfile::from_value(Some("nonsense")),
+        belt::BeltProfile::Default,
+        "an unreadable value must not quietly widen the belt"
+    );
+    for withheld in [
+        "kin_artifact_list",
+        "kin_artifact_read",
+        "graph_neighborhood",
+        "kin_provenance_query",
+    ] {
+        assert!(belt::is_opt_in(withheld), "{withheld} should be opt-in");
+    }
+    // The capabilities an agent needs to answer, edit and publish stay on the
+    // default belt. impact_analysis is here deliberately: "what breaks if I
+    // change this" is the question Kin is described as answering.
+    for kept in [
+        "semantic_locate",
+        "semantic_search",
+        "get_context_pack",
+        "get_entity_source",
+        "find_references",
+        "list_file_entities",
+        "impact_analysis",
+        "kin_mutate",
+        "trace_data_flow",
+        "trace_path",
+        "kin_graph_status",
+    ] {
+        assert!(
+            !belt::is_opt_in(kept),
+            "{kept} must stay on the default belt"
+        );
+    }
+    // And nothing the harness owns is listed here, or it would be withheld twice
+    // and the reason a reader finds would be the wrong one.
+    for withheld in [
+        "kin_artifact_list",
+        "kin_artifact_read",
+        "graph_neighborhood",
+        "kin_provenance_query",
+    ] {
+        assert!(
+            !belt::is_harness_owned(withheld),
+            "{withheld} is already withheld as harness-owned"
+        );
+    }
 }
 
 #[test]

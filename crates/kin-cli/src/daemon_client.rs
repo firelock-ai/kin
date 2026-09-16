@@ -3335,7 +3335,43 @@ impl DaemonEndpointCleanup {
 /// window preserves a dead daemon's endpoint for good.
 const ENDPOINT_TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 
+/// How many teardown budgets a caller waits for a DEAD owner's `daemon.lock`
+/// handle to be released.
+///
+/// The two waits answer different questions and the second can afford to be
+/// much longer, which is the correction here. Waiting for the process asks
+/// whether the owner is gone, and five seconds bounds that because a process
+/// that has not gone in five seconds is not going. Waiting for the lock asks
+/// only when the kernel will finish releasing a handle whose owner is ALREADY
+/// confirmed dead, and that is not a question a short budget answers better.
+///
+/// Measured: on a loaded CI runner a graceful stop printed `stopped` for both
+/// the replica and the supervisor, correctly judged the owner dead, then spent
+/// its whole five seconds contending on the singleton and failed the command
+/// with "Kin daemons stopped but their endpoints were not retired". The same
+/// tree had passed on the previous run, so the budget was the whole of it.
+///
+/// A multiple rather than a constant, so a caller that passes no budget still
+/// gets none. `remove_stale_daemon_files` probes once by design, and a hygiene
+/// path that began waiting half a minute on a lock somebody else holds would
+/// be a worse command than the one this fixes.
+///
+/// Six, because the failure was observed at one and the wait costs nothing
+/// when it is not needed: a healthy stop retires on its first attempt and
+/// never reaches the second poll. The worst case is the same order as the
+/// `KIN_DAEMON_STOP_TIMEOUT_SECS` this command already spends per daemon, and
+/// it is only ever spent where the alternative today is failing outright.
+const ENDPOINT_LOCK_RELEASE_MULTIPLE: u32 = 6;
+
 const ENDPOINT_TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// What [`ENDPOINT_LOCK_RELEASE_MULTIPLE`] comes to for this caller's budget.
+///
+/// Zero in, zero out: multiplying preserves the single-probe contract the
+/// hygiene paths rely on without a branch that could drift from it.
+fn lock_release_budget(teardown_budget: Duration) -> Duration {
+    teardown_budget * ENDPOINT_LOCK_RELEASE_MULTIPLE
+}
 
 /// Remove a repo worker daemon's pid/port endpoint files. The daemon deletes
 /// these itself on graceful shutdown; hygiene paths call this to clear a record
@@ -3413,6 +3449,13 @@ fn wait_until_retirable(
 /// it is the correct answer rather than a delay. `CoordinationUnavailable` must
 /// not either, since it reports a real IO failure rather than contention.
 ///
+/// The budget is [`lock_release_budget`] rather than the caller's teardown
+/// budget, because by the time this runs the owner is already confirmed dead
+/// and the only thing left to wait for is the kernel. Bounded rather than
+/// unbounded all the same: `SingletonHeld` can also be a successor that has
+/// taken the lock and not yet published its endpoint, and a stop that waited
+/// for ever on that would hang instead of reporting.
+///
 /// Returns `None` when the endpoint is gone, or the reason it survived.
 fn retire_within_budget(kin_root: &Path, budget: Duration) -> Option<String> {
     let deadline = Instant::now() + budget;
@@ -3463,7 +3506,9 @@ fn retire_daemon_endpoint_with_probe(
 
     let recorded = daemon_endpoint_snapshot(kin_root);
     let preserved_reason = match recorded.pid {
-        Some(pid) if retirable(kin_root, pid) => retire_within_budget(kin_root, teardown_budget),
+        Some(pid) if retirable(kin_root, pid) => {
+            retire_within_budget(kin_root, lock_release_budget(teardown_budget))
+        }
         Some(pid) => {
             warn!(
                 pid,
@@ -3477,7 +3522,9 @@ fn retire_daemon_endpoint_with_probe(
                 "recorded owner pid {pid} never became affirmatively dead"
             ))
         }
-        None if !recorded.pid_exists => retire_within_budget(kin_root, teardown_budget),
+        None if !recorded.pid_exists => {
+            retire_within_budget(kin_root, lock_release_budget(teardown_budget))
+        }
         None => {
             warn!(
                 pid_path = %repo_daemon_pid_path(kin_root).display(),
@@ -11095,6 +11142,89 @@ mod tests {
             "a lock the dead owner had not yet released must be waited out, not reported"
         );
         assert!(!root.join("daemon.pid").exists());
+    }
+
+    /// A stop returns only once the pid record AND the singleton are both gone.
+    ///
+    /// The sibling above proves the retry waits out a lock; this proves the
+    /// wait is long enough to be worth having, and that "retired" is not
+    /// reported while either half of the endpoint is still standing.
+    ///
+    /// The hold here is three times the caller's teardown budget, which is the
+    /// exact shape of the CI failure: the owner was confirmed dead, the lock
+    /// outlived the budget the teardown wait was sized for, and the command
+    /// failed with "Kin daemons stopped but their endpoints were not retired".
+    /// Before [`lock_release_budget`] the retry ran under that same budget and
+    /// gave up here.
+    ///
+    /// Falsify by making `lock_release_budget` the identity: the hold then
+    /// outlives the retry, the call returns `Preserved`, and both the ordering
+    /// assertion and the elapsed one go red.
+    #[test]
+    fn a_stop_returns_only_once_the_pid_record_and_the_singleton_are_both_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_endpoint_files(&root, 4242, 51000);
+
+        let teardown = Duration::from_millis(200);
+        let hold = teardown * 3;
+
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lock"))
+            .unwrap();
+        singleton.try_lock_exclusive().expect("take the singleton");
+
+        // Watched from the holder rather than asserted after the fact: the
+        // claim is about ordering, and a check that only runs at the end
+        // cannot tell a wait from a race that happened to finish late.
+        let watched = root.clone();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            let pid_present_while_held = watched.join("daemon.pid").exists();
+            let _ = fs2::FileExt::unlock(&singleton);
+            pid_present_while_held
+        });
+
+        let started = Instant::now();
+        let cleanup = retire_daemon_endpoint_with_probe(&root, teardown, |_, _| true);
+        let elapsed = started.elapsed();
+        let pid_present_while_held = holder.join().unwrap();
+
+        assert_eq!(
+            cleanup,
+            DaemonEndpointCleanup::Retired,
+            "a lock held past the teardown budget must still be waited out"
+        );
+        assert!(
+            pid_present_while_held,
+            "the endpoint must still stand while the singleton is held; retiring it first \
+             would publish a half-retired endpoint to every later reader"
+        );
+        assert!(
+            elapsed >= hold,
+            "the call returned in {elapsed:?}, before the {hold:?} hold ended, so it did not \
+             wait for the lock at all"
+        );
+        assert!(
+            !root.join("daemon.pid").exists(),
+            "the pid record is gone once the call returns"
+        );
+        // And the singleton is free, which is what made the retirement legal.
+        let after = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lock"))
+            .unwrap();
+        after
+            .try_lock_exclusive()
+            .expect("the singleton is released once the call returns");
+        let _ = fs2::FileExt::unlock(&after);
     }
 
     /// The falsification of the test above: the SAME contention with no budget

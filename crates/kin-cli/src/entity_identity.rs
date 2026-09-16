@@ -48,10 +48,22 @@ impl IdentityQualifiers {
 
     /// The qualifiers as the caller typed them, for a message that has to name
     /// what excluded everything.
+    ///
+    /// Spelled for a command whose entity-kind pin is `--kind`. A command that
+    /// spells it otherwise calls [`IdentityQualifiers::labels_for`], because a
+    /// message naming a flag that means something else on the command a reader
+    /// just ran sends them to the wrong flag.
     pub fn labels(&self) -> Vec<String> {
+        self.labels_for(PinSpelling::FileKind)
+    }
+
+    /// The qualifiers as the caller would type them at `spelling`'s command.
+    pub fn labels_for(&self, spelling: PinSpelling) -> Vec<String> {
         [
             self.file.as_deref().map(|v| format!("--file {v}")),
-            self.kind.as_deref().map(|v| format!("--kind {v}")),
+            self.kind
+                .as_deref()
+                .map(|v| format!("{} {v}", spelling.entity_kind_flag())),
             self.signature
                 .as_deref()
                 .map(|v| format!("--signature {v}")),
@@ -535,11 +547,16 @@ pub enum PinSpelling {
 }
 
 impl PinSpelling {
-    fn flags(self, file: &str, kind: &str) -> String {
+    /// The flag this command takes the entity's own kind on.
+    pub fn entity_kind_flag(self) -> &'static str {
         match self {
-            Self::FileKind => format!("--file {file} --kind {kind}"),
-            Self::FileEntityKind => format!("--file {file} --entity-kind {kind}"),
+            Self::FileKind => "--kind",
+            Self::FileEntityKind => "--entity-kind",
         }
+    }
+
+    fn flags(self, file: &str, kind: &str) -> String {
+        format!("--file {file} {} {kind}", self.entity_kind_flag())
     }
 }
 
@@ -645,17 +662,24 @@ pub fn pin_request_lines_by(
 
 /// The answer when the name resolves and the pins exclude every entity it
 /// reaches. The entity is in the graph, so saying it is absent would be false.
-pub fn pin_miss_lines<G: GraphStore>(graph: &G, resolution: &EntityResolution) -> Vec<String> {
-    pin_miss_lines_by(resolution, |candidate| entity_location(graph, candidate))
+pub fn pin_miss_lines<G: GraphStore>(
+    graph: &G,
+    resolution: &EntityResolution,
+    spelling: PinSpelling,
+) -> Vec<String> {
+    pin_miss_lines_by(resolution, spelling, |candidate| {
+        entity_location(graph, candidate)
+    })
 }
 
 /// [`pin_miss_lines`] with the location supplied by the caller.
 pub fn pin_miss_lines_by(
     resolution: &EntityResolution,
+    spelling: PinSpelling,
     locate: impl Fn(&Entity) -> String,
 ) -> Vec<String> {
     let name = &resolution.reference.name;
-    let mut pins = resolution.reference.qualifiers.labels();
+    let mut pins = resolution.reference.qualifiers.labels_for(spelling);
     if let Some(line) = resolution.reference.line {
         pins.push(format!("line {line}"));
     }

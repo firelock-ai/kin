@@ -17,7 +17,9 @@ Set `KIN_AGENT_CONTEXT_ACCOUNTING=heuristic`, or leave it unset, for the generic
 path. Invalid values fail explicitly. Rust callers can select
 `run_with_accounting(config, RequestAccounting::LlamaCpp)` without changing the
 process environment. `run_with_options(config, RunOptions { accounting,
-output_reserve_tokens: Some(32768) })` also selects a positive output reserve.
+output_reserve_tokens: Some(32768), ..RunOptions::default() })` also selects a
+positive output reserve, and its `belt` field picks the belt this run puts on the
+model without setting `KIN_AGENT_BELT` for the whole process.
 Existing `ProviderConfig`, `run`, and direct completion
 method signatures remain available; admission and output limits apply to the run
 loop, while direct provider completion methods retain their previous behavior.

@@ -40,3 +40,6 @@ mod round_trip_fuzz;
 
 #[cfg(test)]
 mod concurrency_enforcement;
+
+#[cfg(test)]
+mod go_two_hop_call_chain;

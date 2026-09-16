@@ -19,6 +19,7 @@ pub mod context;
 pub mod mcp;
 pub mod parse;
 pub mod provider;
+pub mod repeat;
 pub mod run;
 pub mod transcript;
 

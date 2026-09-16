@@ -253,6 +253,7 @@ async fn impact(
             kind: None,
             signature: None,
             require_unique: true,
+            dispatch_candidates: false,
         },
         &envelope(),
     )

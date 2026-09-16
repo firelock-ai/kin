@@ -59,20 +59,23 @@ use crate::types::ToolsListResult;
 
 /// The most characters one `agent-default` description may carry.
 ///
-/// 265 is roughly two sentences of technical prose. It is a budget rather than a
-/// target: several tools here are shorter, and none should need more, because a
-/// description longer than this is documentation, and documentation belongs in
-/// the `full` profile where a reader has the room for it.
+/// 180 is one sentence of technical prose, down from the 265 that bought two.
+/// It is a budget rather than a target: several tools here are shorter, and none
+/// should need more, because a description longer than this is documentation,
+/// and documentation belongs in the `full` profile where a reader has the room
+/// for it. Two sentences were affordable when the belt was measured in tens of
+/// thousands of tokens; against a 64k local window they are not, and the second
+/// sentence was where the prose crept back.
 /// `no_agent_default_description_exceeds_its_budget` below fails on any tool
 /// that exceeds it.
-pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 265;
+pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 180;
 
 /// The whole profile's description budget.
 ///
-/// 10,000 characters against the 47,739 the long forms cost. Held as a total as
+/// 4,500 characters against the 47,739 the long forms cost. Held as a total as
 /// well as a per-tool cap because twenty tools each sitting just under the
 /// per-tool budget would be a profile that had learned nothing.
-pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 10_000;
+pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 4_500;
 
 /// The honest name for the declaration filter, accepted on a call and never
 /// served.
@@ -225,35 +228,35 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "find_references",
-            "Find who depends on one entity: direct callers, importers and references, one row each with id, name, kind, file and the lines it references from. Call it for one hop. For a whole chain, use trace_data_flow.",
+            "Find who depends on one entity: callers, importers and references, one row each with id, name, kind and file. One hop only; use trace_data_flow for a chain.",
         ),
         (
             "get_context_pack",
-            "Assemble a token-bounded bundle from one entity, several entities, or a plain-language question: focal bodies plus dependency signatures and connecting routes. Call it instead of several get_entity_source and traversal reads.",
+            "Assemble a token-bounded bundle from one entity, several entities or a question: focal bodies plus signatures and routes, instead of several get_entity_source reads.",
         ),
         (
             "get_entity_source",
-            "Return one entity's exact graph-owned body by id. Call it when you hold an id and need the real source text, not a snippet.",
+            "Return one entity's exact graph-owned body by id, when a snippet is not enough.",
         ),
         (
             "graph_neighborhood",
-            "Get what one entity depends on and what depends on it, to a depth you choose, as summaries with ids. Call it to orient in unfamiliar code. Use find_references for callers only, trace_data_flow for an ordered path.",
+            "Get what one entity depends on and what depends on it, to a depth you choose. Callers only? Use find_references. An ordered path? Use trace_data_flow.",
         ),
         (
             "impact_analysis",
-            "Walk the graph from a change to every entity it could affect. Target it one way at a time: entity_ids, file paths, base and head change ids, or change_ids. Call it before editing, across the whole repository.",
+            "Walk the graph from a change to every entity it could affect, targeted one way at a time by entity_ids, files, base and head, or change_ids.",
         ),
         (
             "kin_artifact_list",
-            "List the repository's tracked files at one semantic change, code and non-code alike: Dockerfiles, lockfiles, configuration, assets, symlinks. Call it for what the repository contains, not what the parsers turned into entities.",
+            "List the repository's tracked files at one semantic change, code and non-code alike, whether or not the parsers made entities for them.",
         ),
         (
             "kin_artifact_read",
-            "Read one tracked file's exact content by artifact_id or repo-relative path: text when valid UTF-8, else base64. Call it for a file the parsers made no entities for, which a locate hit's artifact_path means.",
+            "Read one tracked file's exact content by artifact_id or repo-relative path: text when valid UTF-8, else base64.",
         ),
         (
             "kin_graph_status",
-            "The graph this call is answered from: entity and relation counts, and how many are embedded, pending or unindexed. Call it when a search returns less than you expect. `sampling=last_settled_selected_graph` means the last settled reading, aged in `stale`.",
+            "Counts for the graph this call is answered from, and how many entities are embedded, pending or unindexed. `sampling=last_settled_selected_graph` is the last settled reading.",
         ),
         // The one fact an agent cannot discover for itself: that the list it was
         // handed is partial on purpose, and how to reach the rest. Every other
@@ -268,59 +271,59 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
         ),
         (
             "kin_provenance_query",
-            "Answer who changed an entity and whether it was approved: change count, latest change, approvals on it, a page of changes newest first, and recent audit events. Call it before relying on code whose history matters.",
+            "Answer who changed an entity and whether it was approved: change count, latest change, approvals, a page of changes and recent audit events.",
         ),
         (
             "kin_session_end",
-            "Close this session and release what it holds. Call it when your work is done.",
+            "Close this session and release what it holds, once your work is done.",
         ),
         (
             "kin_session_heartbeat",
-            "Keep this session alive. Call it periodically during long work so the session does not lapse at its idle TTL.",
+            "Keep this session alive through long work so it does not lapse at its idle TTL.",
         ),
         (
             "kin_mutate",
-            "Atomically validate and commit a batch of graph mutations in a single call. Automatically manages transaction begin, validation, and commit. Provide an operations array with mutation verb and payload.",
+            "Validate and commit a batch of graph mutations in one atomic call, naming the entity or file each operation changes and the new body it gets.",
         ),
         (
             "kin_session_start",
-            "Register this agent with Kin and get a session_id: who you are, your transport, working directory and capabilities. Call it once at the start of your work, before any transaction, so activity is attributed.",
+            "Register this agent with Kin and get a session_id, once at the start and before any transaction, so activity is attributed.",
         ),
         (
             "kin_transaction_abort",
-            "Abandon an open transaction and discard everything staged on it. Call it when you decide against a change, or to start clean after a refusal. Refused once kin_transaction_commit has fenced it.",
+            "Abandon an open transaction and discard everything staged on it, refused once kin_transaction_commit has fenced it.",
         ),
         (
             "kin_transaction_begin",
-            "Open a transaction to stage mutations onto. Returns a transaction_id; nothing lands until kin_transaction_commit.",
+            "Open a transaction to stage mutations onto; it returns a transaction_id and nothing lands until kin_transaction_commit.",
         ),
         (
             "kin_transaction_commit",
-            "Publish every staged mutation atomically: the daemon reparses the final bytes and journals the semantic change, the workspace tree and the ref together. All of it lands or none does. Re-sending a fenced commit is safe.",
+            "Publish every staged mutation atomically: the daemon reparses the final bytes and journals the change, all of it or none. Re-sending a fenced commit is safe.",
         ),
         (
             "kin_transaction_stage",
-            "Stage mutations onto an open transaction. Four verbs: 'create' admits a file the graph has never seen, 'update' changes an entity, 'delete' retires one, 'rename' moves one. An 'update' replaces the whole body; read it first with get_entity_source.",
+            "Stage mutations onto an open transaction with verb create, update, delete or rename; an update replaces the whole body, so read it first with get_entity_source.",
         ),
         (
             "list_file_entities",
-            "List every entity the graph holds for one file, by repo-relative path. The only retrieval tool that says what it left out: it returns the whole set and reports whether it is complete. Call it before concluding a file holds nothing.",
+            "List every entity the graph holds for one file by repo-relative path, and say whether that list is complete, before concluding a file holds nothing.",
         ),
         (
             "semantic_locate",
-            "Find code by a plain-language question, ranked from the graph. Call it when you know what the code does but not its name. Returns id, name, kind, file, line, signature, score. Read `ranked_by`. Know the exact name? Use semantic_search.",
+            "Find code by a plain-language question, ranked from the graph: id, name, kind, file, line, signature, score. Know the exact name? Use semantic_search.",
         ),
         (
             DECLARATION_FILTER_CANONICAL,
-            "Filter declarations by name, kind or language: functions, methods, classes, structs, traits, enums, types, constants. Call it when you know what the thing is called. It matches names, not meaning. For a description, use semantic_locate.",
+            "Filter declarations by exact name, kind or language; it matches names, not meaning. Asking what code does rather than what it is called? Use semantic_locate.",
         ),
         (
             "trace_data_flow",
-            "Walk the call chain out from ONE entity and get the whole path back, as ordered steps. Give a focal, a direction and a depth. It walks call and import edges, not values through variables. Naming TWO things? Use trace_path.",
+            "Walk the call chain out from ONE entity and get the whole ordered path back; it walks call and import edges. Naming TWO things? Use trace_path.",
         ),
         (
             "trace_path",
-            "Find how one entity reaches another, as ordered hops. Call it when your question names TWO things. `from` and `to` take a name, an id, or name@file. Read `found` and `gap` before concluding A never reaches B. One endpoint? Use trace_data_flow.",
+            "Find how one entity reaches another as ordered hops; read `found` and `gap` before concluding A never reaches B. One endpoint only? Use trace_data_flow.",
         ),
     ])
 }
@@ -532,6 +535,77 @@ const BUDGET_TOOLS: [&str; 8] = [
     "get_context_pack",
 ];
 
+/// Whole input schemas this belt serves in place of the registered ones.
+///
+/// A keep-list hides a property. This replaces a schema, which is what a tool
+/// needs when the bytes are not in its property LIST but in one property's
+/// nested contract, and when the registered top-level keys include combinators a
+/// trimmed profile should not advertise.
+///
+/// `kin_mutate` is the only entry and the reason the mechanism exists. Its
+/// registered `operations` item is a seven-branch `oneOf` that spells out every
+/// verb synonym and every path rule, 8,406 bytes of input schema on a tool whose
+/// whole served definition is 8,699. The form below carries the same five fields
+/// under one object and the canonical verb for each operation.
+///
+/// It advertises less than the server accepts, which is the same bargain every
+/// trim in this module makes: no tool here sets `additionalProperties: false` at
+/// the top level, the handler reads arguments by name, and the `full` profile
+/// still serves every branch. A caller that sends `modify` instead of `update`,
+/// a `payload` object, or a `request_id` still reaches the same handler and is
+/// validated against the registered schema there.
+///
+/// `every_schema_override_names_only_registered_properties` holds the one
+/// invariant that matters: an override may hide a property but may never invent
+/// one, and may never require a property the registered schema does not.
+fn belt_schema_overrides() -> BTreeMap<&'static str, serde_json::Value> {
+    BTreeMap::from([(
+        "kin_mutate",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "description": "Changes applied together or not at all.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "verb": {
+                                "type": "string",
+                                "enum": ["update", "create", "replace", "rename", "delete"],
+                                "description": "update an entity body; create, replace, rename or delete a tracked file."
+                            },
+                            "target": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Entity UUID or exact entity name for update; repository-relative path for the file verbs."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Complete new UTF-8 text, never a fragment or a diff. Required by update, create and replace."
+                            },
+                            "destination": {
+                                "type": "string",
+                                "description": "Repository-relative path the file moves to. Required by rename."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "One sentence saying what this operation changes."
+                            }
+                        },
+                        "required": ["verb", "target", "description"]
+                    }
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One sentence a human reads in history. Omitted, the change records only its id."
+                }
+            },
+            "required": ["operations"]
+        }),
+    )])
+}
+
 /// The properties whose advertised `default` this belt rewrites, by tool.
 ///
 /// A number the profile injects has to be the number the profile advertises, or
@@ -615,17 +689,20 @@ pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 90;
 
 /// The tools whose schemas this module does not rewrite at all.
 ///
-/// 1353 left the nested transaction contracts whole, and they stay whole: a
-/// staged mutation's shape is the thing a caller gets wrong, and it is the one
-/// place on this belt where the schema IS the documentation. They cost 11,245
-/// bytes and 2,423 tokens between them, which is 31 percent of every token in
-/// the served list, and that number belongs in a product decision about which
-/// tools a read-only agent is served rather than in a prose trim.
-const PROSE_EXEMPT_TOOLS: [&str; 3] = [
-    "kin_transaction_stage",
-    "kin_transaction_commit",
-    "kin_mutate",
-];
+/// The nested transaction contracts stay whole: a staged mutation's shape is the
+/// thing a caller gets wrong, and it is the one place on this belt where the
+/// schema IS the documentation. Both of these are harness-owned
+/// (`kin-agent/src/belt.rs`), so `kin agent run` never puts either on a model's
+/// belt and their bytes are paid only by a client wired straight to the MCP
+/// server.
+///
+/// `kin_mutate` used to sit here with them and no longer does. It is the one
+/// mutation tool a model IS handed, so its bytes are on the belt of every agent
+/// run: 8,699 of the belt's 22,014 bytes, 40 percent of the schema an agent
+/// reads before it has asked anything, almost all of it the seven-branch `oneOf`
+/// under `operations`. [`belt_schema_overrides`] serves it a single-object form
+/// of the same contract instead.
+const PROSE_EXEMPT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction_commit"];
 
 /// Short property descriptions that read the same on every tool carrying them.
 ///
@@ -637,11 +714,11 @@ fn shared_property_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "max_chars",
-            "Serialized characters this response may occupy; what was cut is named in `elisions`.",
+            "Character ceiling; what was cut is named in `elisions`.",
         ),
         (
             "max_response_chars",
-            "Serialized characters this response may occupy; the same parameter as `max_chars`.",
+            "Character ceiling; the same parameter as `max_chars`.",
         ),
         (
             "cursor",
@@ -719,6 +796,10 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
             "Pin `from` to the entity of that name in this file. Same as the name@file spelling.",
         ),
         (
+            ("kin_mutate", "summary"),
+            "One sentence a human reads in history. Omitted, the change records only its id.",
+        ),
+        (
             ("find_references", "relation_kinds"),
             "Filter to calls, imports or references. Defaults to all three.",
         ),
@@ -793,14 +874,25 @@ fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
 pub fn compact_for_agent_default(list: &mut ToolsListResult) {
     let descriptions = short_descriptions();
     let keeps = schema_keep_lists();
+    let overrides = belt_schema_overrides();
     for tool in &mut list.tools {
         if let Some(short) = descriptions.get(tool.name.as_str()) {
             tool.description = (*short).to_string();
         }
-        if let Some(keep) = keeps.get(tool.name.as_str()) {
-            trim_schema(&mut tool.input_schema, keep);
+        // An override replaces the schema outright, so the keep-list and the
+        // property-prose pass below have nothing left to do on that tool: both
+        // exist to cut a registered schema down, and the override already is the
+        // cut form. The default injection still runs, because a budget this
+        // profile advertises has to be the budget it injects whatever produced
+        // the schema.
+        if let Some(schema) = overrides.get(tool.name.as_str()) {
+            tool.input_schema = schema.clone();
+        } else {
+            if let Some(keep) = keeps.get(tool.name.as_str()) {
+                trim_schema(&mut tool.input_schema, keep);
+            }
+            shorten_property_descriptions(&tool.name, &mut tool.input_schema);
         }
-        shorten_property_descriptions(&tool.name, &mut tool.input_schema);
         apply_belt_schema_defaults(&tool.name, &mut tool.input_schema);
     }
     // No name is rewritten here, so the name order `tools::tool_definitions`
@@ -1875,6 +1967,81 @@ mod tests {
 
     /// Same for the keep-lists: a keep-list naming a property the tool does not
     /// have would silently trim the schema to nothing.
+    /// An override may hide a property. It may never invent one, and it may
+    /// never require one the registered schema does not.
+    ///
+    /// The whole bargain of this module is that trimming hides rather than
+    /// removes: the handler still reads every registered argument by name and
+    /// `full` still advertises them. A replacement schema is the one place that
+    /// bargain could be broken quietly, by advertising a knob the server does not
+    /// take, so a caller sends it and it is ignored, or by requiring a field the
+    /// handler never asks for, so a valid call is refused before it is sent.
+    #[test]
+    fn every_schema_override_names_only_registered_properties() {
+        let registered = crate::tools::tool_definitions();
+        for (name, schema) in belt_schema_overrides() {
+            let tool = registered
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "belt_schema_overrides() in crates/kin-mcp/src/agent_belt.rs names \
+                         '{name}', which tool_definitions() does not register"
+                    )
+                });
+            let declared = tool.input_schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} has no properties object"));
+            let served = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("the {name} override has no properties object"));
+            for property in served.keys() {
+                assert!(
+                    declared.contains_key(property),
+                    "the {name} override advertises '{property}', which the registered schema \
+                     does not declare, so a caller would send a knob the handler never reads"
+                );
+            }
+            let required = |value: &serde_json::Value| -> Vec<String> {
+                value
+                    .get("required")
+                    .and_then(|value| value.as_array())
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|name| name.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let declared_required = required(&tool.input_schema);
+            for property in required(&schema) {
+                assert!(
+                    declared_required.contains(&property),
+                    "the {name} override requires '{property}', which the registered schema does \
+                     not, so a call the server would accept is refused before it is sent"
+                );
+                assert!(
+                    served.contains_key(&property),
+                    "the {name} override requires '{property}' but does not describe it"
+                );
+            }
+            // The control: the override must be much smaller than the schema it
+            // replaces, or it is a rewrite that saved nothing and this whole
+            // mechanism is cost with no benefit.
+            let before = serde_json::to_string(&tool.input_schema)
+                .expect("json")
+                .len();
+            let after = serde_json::to_string(&schema).expect("json").len();
+            assert!(
+                after * 3 < before,
+                "the {name} override is {after} bytes against the registered {before}; an \
+                 override that does not cut the schema by much is not worth the divergence"
+            );
+        }
+    }
+
     #[test]
     fn every_keep_list_names_real_properties() {
         let registered = crate::tools::tool_definitions();

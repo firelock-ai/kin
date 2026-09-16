@@ -150,6 +150,7 @@ async fn impact_lines(graph: &InMemoryGraph, entity: &str, file: Option<&str>) -
             kind: None,
             signature: None,
             require_unique: false,
+            dispatch_candidates: false,
         },
         // Substrate sound, so the FIR-2524 absence qualifier answers on coverage
         // rather than on the envelope. These cases assert impact CONTENT.

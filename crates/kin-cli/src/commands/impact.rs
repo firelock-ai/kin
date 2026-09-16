@@ -27,6 +27,15 @@ pub struct ImpactRequest {
     /// the legacy human surface retains its deterministic first-match display.
     #[serde(default)]
     pub require_unique: bool,
+    /// List the Go interface-dispatch candidates for the focal beside the
+    /// impact walk.
+    ///
+    /// Defaulted on the wire so an older client keeps its exact answer, and
+    /// off by default for the same reason `kin refs` asks for them explicitly:
+    /// a dispatch candidate is a possible caller, and a surface whose job is
+    /// to say what breaks must not widen that set without being asked.
+    #[serde(default)]
+    pub dispatch_candidates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +107,7 @@ pub async fn run(
     kind: Option<String>,
     signature: Option<String>,
     json: bool,
+    dispatch: bool,
 ) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_impact(
@@ -109,6 +119,7 @@ pub async fn run(
             kind,
             signature,
             require_unique: json,
+            dispatch_candidates: dispatch,
         },
     )
     .await?;
@@ -329,6 +340,16 @@ pub async fn build_impact_response(
         }
     }
 
+    // Additive, and after the absence verdict above rather than instead of it.
+    // A Go concrete method reached only through an interface has no downstream
+    // impact at all, so the empty branch is the branch this whole class lands
+    // on, and a candidate is not evidence that the verdict was wrong: the
+    // verdict answers whether the graph could have held a direct dependent, and
+    // these rows are not direct dependents.
+    if request.dispatch_candidates {
+        lines.extend(dispatch_candidate_lines(graph, target));
+    }
+
     if let Some(note) = crate::entity_identity::stale_span_note(&lines) {
         lines.push(note);
     }
@@ -346,6 +367,92 @@ pub async fn build_impact_response(
         ranked,
         negative,
     })
+}
+
+/// The Go interface-dispatch candidates for `target`, rendered in impact's own
+/// indentation.
+///
+/// The same computation and the same sentences `kin refs --kind dispatch`
+/// prints, because two surfaces describing one class of row two ways is how a
+/// reader learns to trust the wrong one. What differs is only the shape of the
+/// list, which follows the impact walk above it.
+///
+/// These rows are deliberately NOT part of the hop walk. A dispatch candidate
+/// is a caller relationship the graph holds no edge for, so folding it into
+/// `downstream_impact_by_hop` would mean inventing an edge and then counting
+/// transitively through it. They are listed flat, at one hop, and the count
+/// stays out of the impacted total: a surface whose whole job is to answer
+/// "what breaks if I change this" must not pad that answer with maybes.
+fn dispatch_candidate_lines(
+    graph: &kin_db::InMemoryGraph,
+    target: &kin_model::Entity,
+) -> Vec<String> {
+    if target.kind != kin_model::EntityKind::Method || target.language != kin_model::LanguageId::Go
+    {
+        return vec![format!(
+            "  No interface-dispatch candidates: they are computed for Go methods, and '{}' is \
+             a {:?} in {}.",
+            target.name, target.kind, target.language
+        )];
+    }
+    let targets = match kin_index::dispatch::interface_dispatch_targets(graph, target) {
+        Ok(targets) if !targets.is_empty() => targets,
+        Ok(_) => {
+            return vec![
+                "  0 interface-dispatch candidates: this method's receiver type satisfies no \
+                 interface this graph holds, so no call through an interface can reach it."
+                    .to_string(),
+            ]
+        }
+        Err(error) => {
+            return vec![format!(
+                "  Interface-dispatch candidates unavailable: {error}"
+            )]
+        }
+    };
+    let callers = match kin_index::dispatch::dispatch_candidate_callers(graph, target, &targets) {
+        Ok(callers) => callers,
+        Err(error) => {
+            return vec![format!(
+                "  Interface-dispatch candidates unavailable: {error}"
+            )]
+        }
+    };
+    let contracts: Vec<&str> = targets
+        .iter()
+        .map(|entry| entry.interface_method_name.as_str())
+        .collect();
+    if callers.is_empty() {
+        return vec![format!(
+            "  0 interface-dispatch candidates. This method satisfies {}, and nothing calls {} \
+             either.",
+            contracts.join(", "),
+            if contracts.len() == 1 { "it" } else { "them" }
+        )];
+    }
+    let mut lines = vec![format!(
+        "  {} interface-dispatch candidate{} not counted above; each calls {}, which this \
+         method's receiver type satisfies, so dispatch here is possible and unproven:",
+        callers.len(),
+        if callers.len() == 1 { "" } else { "s" },
+        contracts.join(", "),
+    )];
+    for (caller_id, via) in &callers {
+        let Ok(Some(caller)) = graph.get_entity(caller_id) else {
+            continue;
+        };
+        let at = entity_location(graph, &caller)
+            .map(|loc| format!(" @ {loc}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "    - {} ({:?}){} (dispatch_candidate) via {}",
+            caller.name,
+            caller.kind,
+            at,
+            via.join(", ")
+        ));
+    }
+    lines
 }
 
 /// The relation kinds a member's dependent count is read over.
@@ -774,6 +881,7 @@ mod tests {
                 level: "critical".to_string(),
                 reason: "host memory pressure is critical".to_string(),
                 at_unix: 0,
+                from_budget: false,
             }));
 
         let response = build_impact_response(
@@ -786,6 +894,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &degraded,
         )
@@ -848,6 +957,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &vectors_only,
         )
@@ -966,6 +1076,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -994,6 +1105,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1040,6 +1152,7 @@ mod tests {
                 kind: Some("function".to_string()),
                 signature: Some("fn changed()".to_string()),
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1074,6 +1187,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1106,6 +1220,7 @@ mod tests {
                 kind: Some("function".to_string()),
                 signature: Some("fn   handle(value: String)".to_string()),
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1164,6 +1279,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1214,6 +1330,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &degraded,
         )
@@ -1308,6 +1425,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1355,6 +1473,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1395,6 +1514,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1433,6 +1553,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1485,6 +1606,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1509,6 +1631,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1555,6 +1678,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1848,6 +1972,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: false,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1908,6 +2033,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -1968,6 +2094,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2032,6 +2159,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2131,6 +2259,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2202,6 +2331,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2268,6 +2398,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2331,6 +2462,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2382,6 +2514,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2403,6 +2536,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )
@@ -2445,6 +2579,7 @@ mod tests {
             kind: None,
             signature: None,
             require_unique: true,
+            dispatch_candidates: false,
         };
 
         let healthy = build_impact_response(&layout, &graph, &request, &healthy_test_envelope())
@@ -2479,6 +2614,7 @@ mod tests {
                 level: "critical".to_string(),
                 reason: "host memory pressure is critical".to_string(),
                 at_unix: 0,
+                from_budget: false,
             }));
         let refused = build_impact_response(&layout, &graph, &request, &degraded)
             .await
@@ -2571,6 +2707,7 @@ mod tests {
                 kind: None,
                 signature: None,
                 require_unique: true,
+                dispatch_candidates: false,
             },
             &healthy_test_envelope(),
         )

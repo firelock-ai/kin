@@ -441,7 +441,11 @@ fn chosen_or_refused(
         }
     } else if resolution.pin_excluded_all() {
         EntityQueryRefusal {
-            lines: crate::entity_identity::pin_miss_lines_by(resolution, locate),
+            lines: crate::entity_identity::pin_miss_lines_by(
+                resolution,
+                PinSpelling::FileKind,
+                locate,
+            ),
             absent: false,
         }
     } else if resolution.needs_a_pin() {

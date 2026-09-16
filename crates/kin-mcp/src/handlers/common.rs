@@ -1175,12 +1175,13 @@ impl ReferenceLinesAbsent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceLinesPartial {
     /// An edge behind this row came from language-server enrichment, which
-    /// records at most one site per edge.
+    /// records the sites one query answered with and caps how many it keeps.
     ///
-    /// kin-lsp takes `CallHierarchyOutgoingCall.from_ranges.first()` for a call
-    /// edge, keeps the first location per target for a `UsesType` edge, and
-    /// carries no span at all on its `References` edges. Each is one site
-    /// standing in for however many the file holds.
+    /// kin-lsp records every range a call-hierarchy answer reported and every
+    /// position a reference answer reported, up to its own per-edge ceiling, and
+    /// keeps the first location per target for a `UsesType` edge. So the sites
+    /// are what one server query saw rather than a statement about the file, and
+    /// a floor is the strongest thing this can say about them.
     LanguageServerEdge,
     /// An edge behind this row came from a producer with no every-site
     /// contract: `Manual`, or an origin added after this was written.

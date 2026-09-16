@@ -3221,11 +3221,25 @@ pub(crate) fn disclose_pressure_refusal(
     call: &PressureCall,
     reason: &str,
 ) {
+    // Which arm refused decides the remedy, and the log line takes the same
+    // one the durable record will. The log said "give the machine more memory"
+    // over a refusal Kin's own ceiling produced, which is the advice
+    // `BUDGET_REMEDY` exists to replace.
+    let from_budget = kin_core::memory_pressure::level_came_from_budget(
+        call.level,
+        call.host_level,
+        call.budget_level,
+    );
+    let remedy = if from_budget {
+        kin_core::memory_pressure::BUDGET_REMEDY
+    } else {
+        kin_core::memory_pressure::PRESSURE_REMEDY
+    };
     warn!(
         work = work.id(),
         pressure = call.level.as_str(),
-        "{reason} {}",
-        kin_core::memory_pressure::PRESSURE_REMEDY
+        by_budget = from_budget,
+        "{reason} {remedy}"
     );
     let _record_guard = PRESSURE_REFUSAL_RECORD_LOCK
         .lock()
@@ -3235,6 +3249,7 @@ pub(crate) fn disclose_pressure_refusal(
         work,
         call.level,
         reason,
+        from_budget,
     );
 }
 
@@ -4460,6 +4475,10 @@ impl PendingEnrichment {
 /// evidence, import source or origin changed is still written. An unreadable
 /// neighbourhood abandons the comparison and offers everything, which costs a
 /// rewrite and can never drop a relation wrongly.
+///
+/// What it offers for an edge the graph already holds is the union of both
+/// records' sites, by [`with_union_of_sites`], so one pass's positions cannot
+/// erase another's.
 fn unheld_lsp_relations(
     state: &DaemonState,
     relations: &[kin_model::Relation],
@@ -4485,12 +4504,67 @@ fn unheld_lsp_relations(
     }
     relations
         .iter()
-        .filter(|candidate| {
-            held.get(&candidate.id)
-                .is_none_or(|held| held != *candidate)
+        .filter_map(|candidate| match held.get(&candidate.id) {
+            None => Some(candidate.clone()),
+            Some(held) => {
+                let merged = with_union_of_sites(held, candidate);
+                (&merged != held).then_some(merged)
+            }
         })
-        .cloned()
         .collect()
+}
+
+/// The most evidence records one enrichment edge keeps, matching the producer's
+/// own per-edge ceiling so a union cannot grow past what a single pass may
+/// offer.
+const MAX_ENRICHMENT_EVIDENCE: usize = kin_lsp::enrichment::MAX_SITES_PER_EDGE;
+
+/// The offered edge carrying the sites of the held record as well as its own.
+///
+/// Two enrichment passes prove the same edge and each names the positions it
+/// saw: a file's definition pass names the identifier it resolved, and the
+/// reference pass on the destination names every position the server reported
+/// inside the caller. Both derive the same id from (kind, source, destination),
+/// and `upsert_relation` replaces a record wholesale, so writing one over the
+/// other discarded the other's sites and which sites survived depended on the
+/// order the sweep happened to reach the two files in.
+///
+/// The result is canonical rather than merely merged: records are deduplicated
+/// on their span and rule and then ordered by them, so the same set of sites
+/// produces the same record whichever pass arrives first. That is also what
+/// keeps a converged re-sweep writing nothing, because an offer whose sites the
+/// held record already carries merges back to the held record exactly.
+fn with_union_of_sites(
+    held: &kin_model::Relation,
+    offered: &kin_model::Relation,
+) -> kin_model::Relation {
+    fn key(evidence: &kin_model::RelationEvidence) -> (String, u32, u32, u32, u32, String) {
+        let span = evidence.source_span.as_ref();
+        (
+            span.map(|span| span.file.0.clone()).unwrap_or_default(),
+            span.map_or(0, |span| span.start_line),
+            span.map_or(0, |span| span.start_col),
+            span.map_or(0, |span| span.end_line),
+            span.map_or(0, |span| span.end_col),
+            evidence.parser_rule.clone().unwrap_or_default(),
+        )
+    }
+
+    let mut merged = offered.clone();
+    let mut seen: std::collections::HashSet<_> = std::collections::HashSet::new();
+    let mut evidence: Vec<kin_model::RelationEvidence> = held
+        .evidence
+        .iter()
+        .chain(offered.evidence.iter())
+        .filter(|record| seen.insert(key(record)))
+        .cloned()
+        .collect();
+    // An evidence record with no span is a marker rather than a site, and one
+    // sorts ahead of every site because its key's file is empty.
+    evidence.sort_by(|left, right| key(left).cmp(&key(right)));
+    evidence.truncate(MAX_ENRICHMENT_EVIDENCE);
+    merged.evidence = evidence;
+    merged
 }
 
 /// The ids, among `relations`, that the graph actually holds right now.
@@ -10163,6 +10237,7 @@ mod memory_pressure_tests {
             level: "critical".to_string(),
             reason: format!("{work} was refused"),
             at_unix: 1,
+            from_budget: false,
         };
         let mut refusals = PressureRefusal::read_all(root);
         refusals.retain(|existing| existing.work != refusal.work);
@@ -10356,7 +10431,9 @@ mod memory_pressure_tests {
         // test can switch off is a check that cannot fail.
         let budget = kin_core::memory_pressure::FootprintBudget {
             bytes: kin_core::memory_pressure::FootprintBudget::derived_from(12 * GIB),
-            source: kin_core::memory_pressure::BudgetSource::Derived,
+            source: kin_core::memory_pressure::BudgetSource::Derived {
+                host_ceiling_bytes: Some(12 * GIB),
+            },
         };
         assert_eq!(budget.bytes, 6 * GIB, "half of a 12 GiB container");
         let stand = |footprint| kin_core::memory_pressure::BudgetStanding { footprint, budget };
@@ -10523,7 +10600,9 @@ mod memory_pressure_tests {
         // and a check another test can switch off is a check that cannot fail.
         let budget = kin_core::memory_pressure::FootprintBudget {
             bytes: kin_core::memory_pressure::FootprintBudget::derived_from(12 * GIB),
-            source: kin_core::memory_pressure::BudgetSource::Derived,
+            source: kin_core::memory_pressure::BudgetSource::Derived {
+                host_ceiling_bytes: Some(12 * GIB),
+            },
         };
         assert_eq!(budget.bytes, 6 * GIB, "half of a 12 GiB container");
         let stand = |footprint| kin_core::memory_pressure::BudgetStanding { footprint, budget };
@@ -11153,6 +11232,7 @@ mod memory_pressure_tests {
             level: "critical".to_string(),
             reason: "embed refused".to_string(),
             at_unix: 1,
+            from_budget: false,
         };
         let lsp = PressureRefusal {
             work: "lsp-sweep".to_string(),
@@ -12836,5 +12916,109 @@ mod shutdown_vector_checkpoint_tests {
             elapsed < std::time::Duration::from_secs(30),
             "a shutdown with nothing refused must not pay for an authority reopen; took {elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod enrichment_site_union_tests {
+    use super::{with_union_of_sites, MAX_ENRICHMENT_EVIDENCE};
+    use kin_model::{
+        EntityId, FilePathId, GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind,
+        RelationOrigin, SourceSpan,
+    };
+
+    fn site(file: &str, line: u32) -> RelationEvidence {
+        RelationEvidence {
+            source_span: Some(SourceSpan {
+                file: FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 0,
+                start_line: line,
+                start_col: 0,
+                end_line: line,
+                end_col: 1,
+            }),
+            parser_rule: Some("lsp_references".to_string()),
+            ..RelationEvidence::default()
+        }
+    }
+
+    fn edge(evidence: Vec<RelationEvidence>) -> Relation {
+        let src = EntityId::from_content("caller.go", "Caller", "Function", 1);
+        let dst = EntityId::from_content("defs.go", "Target", "Function", 1);
+        Relation {
+            id: RelationId::from_content("caller", "target", "References"),
+            kind: RelationKind::References,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 0.95,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence,
+        }
+    }
+
+    fn lines(relation: &Relation) -> Vec<u32> {
+        relation
+            .evidence
+            .iter()
+            .filter_map(|record| record.source_span.as_ref())
+            .map(|span| span.start_line)
+            .collect()
+    }
+
+    /// Two passes prove the same edge and each names what it saw. Neither may
+    /// erase the other.
+    ///
+    /// The file definition pass and the reference pass derive the same id from
+    /// (kind, source, destination), and `upsert_relation` replaces a record
+    /// wholesale, so the pass that ran second used to decide which positions the
+    /// graph kept.
+    #[test]
+    fn a_later_pass_adds_its_sites_instead_of_replacing_them() {
+        let merged = with_union_of_sites(
+            &edge(vec![site("caller.go", 12)]),
+            &edge(vec![site("caller.go", 40)]),
+        );
+        assert_eq!(lines(&merged), vec![12, 40]);
+    }
+
+    /// The union is the same whichever pass arrives first, so the graph's
+    /// content does not depend on the order the sweep walked the files in.
+    #[test]
+    fn the_union_does_not_depend_on_arrival_order() {
+        let one = edge(vec![site("caller.go", 40), site("caller.go", 12)]);
+        let other = edge(vec![site("caller.go", 12), site("caller.go", 7)]);
+        assert_eq!(
+            lines(&with_union_of_sites(&one, &other)),
+            lines(&with_union_of_sites(&other, &one))
+        );
+        assert_eq!(lines(&with_union_of_sites(&one, &other)), vec![7, 12, 40]);
+    }
+
+    /// A re-offer of sites the graph already holds merges back to the held
+    /// record exactly, which is what keeps a converged re-sweep from rewriting
+    /// an edge and discarding both endpoints' embeddings.
+    #[test]
+    fn an_offer_the_graph_already_holds_merges_to_the_held_record() {
+        let held = with_union_of_sites(
+            &edge(vec![site("caller.go", 12)]),
+            &edge(vec![site("caller.go", 40)]),
+        );
+        let merged = with_union_of_sites(&held, &edge(vec![site("caller.go", 12)]));
+        assert_eq!(merged, held, "nothing new means nothing to write");
+    }
+
+    /// The union stops at the same per-edge ceiling a single pass does.
+    #[test]
+    fn the_union_stops_at_the_per_edge_ceiling() {
+        let held = edge(
+            (0..MAX_ENRICHMENT_EVIDENCE as u32)
+                .map(|line| site("caller.go", line))
+                .collect(),
+        );
+        let merged = with_union_of_sites(&held, &edge(vec![site("caller.go", 9_000)]));
+        assert_eq!(merged.evidence.len(), MAX_ENRICHMENT_EVIDENCE);
     }
 }

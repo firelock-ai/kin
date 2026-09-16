@@ -192,6 +192,7 @@ pub fn build_refs_response(
     envelope: &kin_mcp::Envelope,
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
+    let want_dispatch = strip_dispatch_modifier(&request.kind).1;
     // The one resolver every read command shares (FIR-3505). The ranker this
     // replaced tied every twin on name, kind and callers, so it answered about
     // whichever one the store listed first, and nothing said a choice was made.
@@ -206,7 +207,14 @@ pub fn build_refs_response(
         // verdict here would qualify a lookup failure as if it were a finding.
         Some(refs_not_found_guidance(&resolution.reference.name))
     } else if resolution.pin_excluded_all() {
-        Some(crate::entity_identity::pin_miss_lines(graph, &resolution))
+        // Spelled the way this command takes its pins. `kin refs --kind` filters
+        // relation kinds, so a miss telling the caller to narrow with `--kind`
+        // would send them to a flag that answers a different question.
+        Some(crate::entity_identity::pin_miss_lines(
+            graph,
+            &resolution,
+            crate::entity_identity::PinSpelling::FileEntityKind,
+        ))
     } else if resolution.needs_a_pin() {
         Some(crate::entity_identity::pin_request_lines(
             graph,
@@ -247,6 +255,7 @@ pub fn build_refs_response(
         "References to '{}' -> {} ({:?}) @ {}",
         resolution.reference.name, target.name, target.kind, target_path
     ));
+    lines.extend(pinned_note(&resolution, target, &target_path));
     let choice = crate::entity_identity::choice_note(
         graph,
         &resolution,
@@ -276,6 +285,15 @@ pub fn build_refs_response(
         // The candidate note above already named every same-name identity, so
         // the sibling listing would only repeat it.
         lines.extend(empty_result_context(target, &neighbors, !listed_candidates));
+        // Additive, and deliberately AFTER the absence verdict rather than
+        // instead of it. A Go concrete method reached only through an interface
+        // has no direct callers at all, so this is the path the whole class
+        // lands on, and a candidate is not evidence that the verdict above was
+        // wrong: the verdict answers whether the graph could have held a direct
+        // caller, and these rows are not direct callers.
+        if want_dispatch {
+            lines.extend(dispatch_candidate_lines(layout, graph, target));
+        }
         if let Some(note) = crate::entity_identity::stale_span_note(&lines) {
             lines.push(note);
         }
@@ -292,9 +310,29 @@ pub fn build_refs_response(
     // `find_references(HTTPAdapter.send)` answer 33 for a method two lines call.
     // The headline counts callers; the candidates get their own heading and
     // their own count.
-    let (resolved, candidates): (Vec<ReferenceEntry>, Vec<ReferenceEntry>) = refs
-        .into_iter()
-        .partition(|entry| !entry.receiver_name_guess);
+    //
+    // A row that is only a name match is held out for the same reason and gets
+    // its own heading too. On cli/cli v2.101.0 the repository holds exactly one
+    // `func requestBody`, and `kin refs requestBody` counted seventeen
+    // referencing entities: sixteen were local variables of that name in
+    // packages that never import the one the function lives in, every one of
+    // them a `References` edge at `name_only`, and one was the real caller.
+    // A caller with no file-reading tool cannot check sixteen fabricated
+    // cross-package references against anything, so they must not be inside the
+    // number the answer leads with.
+    let mut resolved: Vec<ReferenceEntry> = Vec::new();
+    let mut receiver_candidates: Vec<ReferenceEntry> = Vec::new();
+    let mut name_matches: Vec<ReferenceEntry> = Vec::new();
+    for entry in refs {
+        if entry.receiver_name_guess {
+            receiver_candidates.push(entry);
+        } else if entry.is_name_match_only() {
+            name_matches.push(entry);
+        } else {
+            resolved.push(entry);
+        }
+    }
+    let unconfirmed_count = receiver_candidates.len() + name_matches.len();
 
     let render = |lines: &mut Vec<String>, entry: &ReferenceEntry| {
         let file_path = entry
@@ -323,13 +361,13 @@ pub fn build_refs_response(
     // response is contradicting, which is the shape that made an MCP
     // `total_upstream: 0` deletable while the one real caller sat in the payload
     // beside it.
-    let unconfirmed = if candidates.is_empty() {
+    let unconfirmed = if unconfirmed_count == 0 {
         String::new()
     } else {
         format!(
             ", plus {} unconfirmed candidate{} not in that count",
-            candidates.len(),
-            if candidates.len() == 1 { "" } else { "s" }
+            unconfirmed_count,
+            if unconfirmed_count == 1 { "" } else { "s" }
         )
     };
     if resolved.is_empty() {
@@ -347,16 +385,56 @@ pub fn build_refs_response(
         }
     }
 
-    if !candidates.is_empty() {
+    if !receiver_candidates.is_empty() {
         lines.push(format!(
             "{} receiver-name candidate{} not counted above; each is a call through a \
              receiver whose type nothing at the reference site settles:",
-            candidates.len(),
-            if candidates.len() == 1 { "" } else { "s" }
+            receiver_candidates.len(),
+            if receiver_candidates.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
-        for entry in &candidates {
+        for entry in &receiver_candidates {
             render(&mut lines, entry);
         }
+    }
+
+    if !name_matches.is_empty() {
+        lines.push(format!(
+            "{} name-only match{} not counted above; each is an identifier that carries this \
+             name with nothing at the site proving it is this entity, which is what a local \
+             variable or a parameter of the same name looks like:",
+            name_matches.len(),
+            if name_matches.len() == 1 { "" } else { "es" }
+        ));
+        for entry in &name_matches {
+            render(&mut lines, entry);
+        }
+    }
+
+    // What the tag after each row means, said once, whenever a row carries a
+    // tier weaker than proven. The tags were already printed and nothing said
+    // what they meant, and the reader this answer is written for has no grep to
+    // check a row against, so the tier is the whole of what it has.
+    if resolved
+        .iter()
+        .chain(&receiver_candidates)
+        .chain(&name_matches)
+        .any(|entry| !entry.resolution.is_proven())
+    {
+        lines.push(
+            "note: the tag after each row is its resolution tier. type_resolved means the \
+             destination entity itself is proven, import_scoped means an import singled out the \
+             scope the name was selected in, and name_only means the name matched and nothing \
+             at the site settles the destination."
+                .to_string(),
+        );
+    }
+
+    if want_dispatch {
+        lines.extend(dispatch_candidate_lines(layout, graph, target));
     }
 
     // No verdict on this path, and that is decided rather than skipped. The walk
@@ -375,6 +453,43 @@ pub fn build_refs_response(
         negative: None,
         error: None,
     })
+}
+
+/// What the header adds when the caller pinned which definition it meant.
+///
+/// Empty when nothing was pinned, so an ordinary answer is unchanged. It exists
+/// because the candidate note goes quiet exactly when a pin worked. One
+/// candidate survives, so nothing else in the answer records that several
+/// same-named entities were narrowed to one, and a reader cannot tell a pinned
+/// answer from a name that only ever named one thing.
+///
+/// The kind is spelled the way `--entity-kind` takes it rather than the
+/// header's debug spelling, so the note can be pasted back into the command
+/// that produced it.
+fn pinned_note(
+    resolution: &crate::entity_identity::EntityResolution,
+    target: &Entity,
+    target_path: &str,
+) -> Vec<String> {
+    let mut pins = resolution
+        .reference
+        .qualifiers
+        .labels_for(crate::entity_identity::PinSpelling::FileEntityKind);
+    if let Some(line) = resolution.reference.line {
+        pins.push(format!("line {line}"));
+    }
+    if pins.is_empty() {
+        return Vec::new();
+    }
+    let reached = resolution.name_matches.len();
+    vec![format!(
+        "note: pinned by {} to the {} at {}, of {} entit{} the name reaches.",
+        pins.join(" "),
+        kin_review::StableEntityIdentity::from_entity(target).kind,
+        target_path,
+        reached,
+        if reached == 1 { "y" } else { "ies" },
+    )]
 }
 
 /// The reference sites of one entry, or the named reason it has none.
@@ -876,6 +991,28 @@ pub(crate) struct ReferenceEntry {
     pub(crate) receiver_name_guess: bool,
 }
 
+impl ReferenceEntry {
+    /// Whether this row is a bare name match and nothing more.
+    ///
+    /// True when no edge behind it resolved past `name_only` and none of them is
+    /// a call. That pair is what a local variable or a parameter sharing a
+    /// function's name produces: the linker matched an identifier by name, the
+    /// site says nothing that settles which entity the name means, and the edge
+    /// is a `References` rather than a call. Counting those beside real callers
+    /// is how one Go function with one caller came back with seventeen
+    /// referencing entities, sixteen of them local variables in packages that
+    /// never import it.
+    ///
+    /// A call at `name_only` is deliberately not held out. The site is a call,
+    /// which is evidence of use even when the destination was chosen by name,
+    /// and the same store answers real cross-file calls that way: holding those
+    /// out would understate a function that is genuinely called, which is the
+    /// same defect facing the other direction.
+    fn is_name_match_only(&self) -> bool {
+        !self.resolution.is_proven() && !self.relation_kinds.contains(&RelationKind::Calls)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceCollection {
     pub(crate) references: Vec<ReferenceEntry>,
@@ -1037,7 +1174,11 @@ fn push_relation_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
 }
 
 fn parse_relation_kinds(kind: &str) -> Result<Vec<RelationKind>> {
-    match kind.to_ascii_lowercase().as_str() {
+    match strip_dispatch_modifier(kind)
+        .0
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "all" => Ok(vec![
             RelationKind::Calls,
             RelationKind::Imports,
@@ -1047,10 +1188,126 @@ fn parse_relation_kinds(kind: &str) -> Result<Vec<RelationKind>> {
         "imports" | "import" => Ok(vec![RelationKind::Imports]),
         "references" | "refs" | "reference" => Ok(vec![RelationKind::References]),
         other => anyhow::bail!(
-            "invalid --kind '{}': use one of all, calls, imports, references",
+            "invalid --kind '{}': use one of all, calls, imports, references, \
+             each optionally suffixed with +dispatch",
             other
         ),
     }
+}
+
+/// Split a `--kind` value into the relation kinds it names and whether it asked
+/// for interface-dispatch candidates beside them.
+///
+/// Carried on the existing argument rather than as a new request field because
+/// `RefsRequest` crosses the daemon boundary and is constructed at a dozen call
+/// sites; a suffix costs no wire change and no churn, and `calls+dispatch` reads
+/// as what it is. `dispatch` alone means `calls+dispatch`, because a dispatch
+/// candidate is only ever a call.
+fn strip_dispatch_modifier(kind: &str) -> (&str, bool) {
+    let trimmed = kind.trim();
+    if trimmed.eq_ignore_ascii_case("dispatch") {
+        return ("calls", true);
+    }
+    match trimmed.rsplit_once('+') {
+        Some((head, tail)) if tail.eq_ignore_ascii_case("dispatch") => (head.trim(), true),
+        _ => (trimmed, false),
+    }
+}
+
+/// The interface-dispatch candidates for `target`, rendered.
+///
+/// Empty unless `target` is a Go method whose receiver type satisfies an
+/// interface the graph holds. Every row is labelled a candidate and none is
+/// added to the reference count above it, because a Go interface is satisfied
+/// structurally: the graph can say a call through `Writer.Write` MAY have
+/// reached `Buffer.Write`, and holds nothing that says it did. The heading
+/// names the interface method each row came through so a reader can check the
+/// claim rather than take it.
+fn dispatch_candidate_lines(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+) -> Vec<String> {
+    // Asked for and answered, at zero as well as above it. A section that
+    // appears only when it has rows is one a reader never learns to look for,
+    // and the reader who most needs this one is the reader who got an empty
+    // reference list and is deciding whether the method is dead.
+    if target.kind != kin_model::EntityKind::Method || target.language != kin_model::LanguageId::Go
+    {
+        return vec![format!(
+            "No interface-dispatch candidates: they are computed for Go methods, and '{}' is \
+             a {:?} in {}.",
+            target.name, target.kind, target.language
+        )];
+    }
+    let targets = match kin_index::dispatch::interface_dispatch_targets(graph, target) {
+        Ok(targets) if !targets.is_empty() => targets,
+        Ok(_) => {
+            return vec![
+                "0 interface-dispatch candidates: this method's receiver type satisfies no \
+                 interface this graph holds, so no call through an interface can reach it."
+                    .to_string(),
+            ]
+        }
+        // A walk that failed is not a candidate-free answer, and saying so is
+        // not this command's verdict to change: the reference answer beside it
+        // stands on its own edges. Reported rather than swallowed.
+        Err(error) => {
+            return vec![format!(
+                "Interface-dispatch candidates unavailable: {error}"
+            )]
+        }
+    };
+    let callers = match kin_index::dispatch::dispatch_candidate_callers(graph, target, &targets) {
+        Ok(callers) => callers,
+        Err(error) => {
+            return vec![format!(
+                "Interface-dispatch candidates unavailable: {error}"
+            )]
+        }
+    };
+    let contracts: Vec<&str> = targets
+        .iter()
+        .map(|entry| entry.interface_method_name.as_str())
+        .collect();
+    if callers.is_empty() {
+        return vec![format!(
+            "0 interface-dispatch candidates. This method satisfies {}, and nothing calls {} \
+             either.",
+            contracts.join(", "),
+            if contracts.len() == 1 { "it" } else { "them" }
+        )];
+    }
+    let mut lines = vec![format!(
+        "{} interface-dispatch candidate{} not counted above; each calls {}, which this \
+         method's receiver type satisfies, so dispatch here is possible and unproven:",
+        callers.len(),
+        if callers.len() == 1 { "" } else { "s" },
+        contracts.join(", "),
+    )];
+    for (caller_id, via) in &callers {
+        let Ok(Some(caller)) = graph.get_entity(caller_id) else {
+            continue;
+        };
+        let file_path = caller
+            .file_origin
+            .as_ref()
+            .map(|origin| display_read_path(layout, &origin.0))
+            .unwrap_or_else(|| "unknown".to_string());
+        let pointer = crate::entity_identity::entity_pointer(graph, &caller);
+        let location = match (pointer.line, pointer.stale) {
+            (_, true) => format!("{file_path} {}", crate::entity_identity::STALE_SPAN_MARK),
+            (Some(line), false) => format!("{file_path}:{line}"),
+            (None, false) => file_path,
+        };
+        lines.push(format!(
+            "  {} @ {} [Calls] (dispatch_candidate) via {}",
+            caller.name,
+            location,
+            via.join(", ")
+        ));
+    }
+    lines
 }
 
 fn relation_kinds_label(kinds: &[RelationKind]) -> String {
@@ -1078,8 +1335,8 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 mod tests {
     use super::{
         build_bulk_refs_response, build_refs_response, collect_graph_references,
-        parse_relation_kinds, refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse,
-        ReferenceLinesAbsent, RefsRequest, RelationResolution,
+        parse_relation_kinds, refs_not_found_guidance, strip_dispatch_modifier, BulkRefsRequest,
+        BulkRefsResponse, ReferenceLinesAbsent, RefsRequest, RelationResolution,
     };
 
     /// MEASUREMENT, not an assertion. Prints which of a C prototype and its
@@ -1630,6 +1887,7 @@ mod tests {
                 level: "critical".to_string(),
                 reason: "host memory pressure is critical".to_string(),
                 at_unix: 0,
+                from_budget: false,
             }));
         let answer = |envelope: &kin_mcp::Envelope| {
             build_refs_response(
@@ -2310,6 +2568,53 @@ mod tests {
     fn parse_relation_kinds_accepts_import_alias() {
         let kinds = parse_relation_kinds("import").unwrap();
         assert_eq!(kinds, vec![RelationKind::Imports]);
+    }
+
+    #[test]
+    fn a_dispatch_suffix_keeps_the_relation_kinds_it_was_added_to() {
+        assert_eq!(strip_dispatch_modifier("calls+dispatch"), ("calls", true));
+        assert_eq!(strip_dispatch_modifier("all+dispatch"), ("all", true));
+        assert_eq!(
+            parse_relation_kinds("calls+dispatch").unwrap(),
+            vec![RelationKind::Calls]
+        );
+        assert_eq!(
+            parse_relation_kinds("all+dispatch").unwrap(),
+            vec![
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References
+            ]
+        );
+    }
+
+    /// A dispatch candidate is always a call, so the bare word needs no second
+    /// argument to mean something.
+    #[test]
+    fn bare_dispatch_means_calls_plus_dispatch() {
+        assert_eq!(strip_dispatch_modifier("dispatch"), ("calls", true));
+        assert_eq!(
+            parse_relation_kinds("dispatch").unwrap(),
+            vec![RelationKind::Calls]
+        );
+    }
+
+    /// Every existing spelling must keep meaning exactly what it meant, because
+    /// this suffix rides on an argument that crosses the daemon boundary.
+    #[test]
+    fn a_kind_without_the_suffix_asks_for_no_candidates() {
+        for kind in ["all", "calls", "call", "imports", "import", "references"] {
+            assert!(
+                !strip_dispatch_modifier(kind).1,
+                "{kind} must not turn on dispatch candidates"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_still_refused_with_the_suffix() {
+        assert!(parse_relation_kinds("nonsense+dispatch").is_err());
+        assert!(parse_relation_kinds("nonsense").is_err());
     }
 
     /// Distinct entity ids are distinct callers even when their display
