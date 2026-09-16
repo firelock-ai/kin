@@ -2978,6 +2978,13 @@ jobs:
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
+    # The coverage step below already treats a tarpaulin failure as a warning.
+    # What it cannot absorb is the runner dying under the instrumented test
+    # binaries, which ends the job with no step verdict and no log; on
+    # 2026-09-16 that alone read as a failed CI run and refused the 0.7.20 cut
+    # twice. Coverage is a diagnostic, not a release gate, so its job never
+    # decides the run.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 
