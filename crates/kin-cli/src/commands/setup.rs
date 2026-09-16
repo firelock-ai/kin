@@ -12378,20 +12378,12 @@ fn mcp_repair_targets_ledger_verified_with_locks(
 /// projection mode, and a rewrite would have discarded that mode the next time
 /// anyone ran setup, silently returning the machine to the fallback order.
 fn write_auto_daemon_config(enabled: bool) -> Result<()> {
-    let kin_home = kin_dir()?;
-    let config_dir = kin_home.join("config");
-    fs::create_dir_all(&config_dir).context("failed to create ~/.kin/config/")?;
-    let config_path = config_dir.join("setup.toml");
-    let body = fs::read_to_string(&config_path).unwrap_or_default();
-    let content = crate::commands::projection::config_set(
-        &body,
+    crate::commands::projection::record_setup_toml_value(
+        &kin_dir()?,
         "daemon",
         "auto_start",
         toml::Value::Boolean(enabled),
-    )?;
-    fs::write(&config_path, content)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(())
+    )
 }
 
 /// Choose the projection this host should use, prove the choice, and record it.
