@@ -49,9 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a list is trimmed again before the answer is made to pay for the record of
   that cut. On the study's largest reply, all three reference rows now return
   where two were elided before.
-- `name_only` reference rows are held out of the `find_references` headline
-  count and travel as candidates, and `min_resolution` sets the floor. On the Go
-  study, F1 0.4857 to 0.8500 with recall unchanged.
 - A daemon whose filesystem reconcile is switched off no longer reports a
   working copy as compared when nothing compared it. `host_bytes` reads
   `unchecked`, the verdict names `file_bytes_unchecked` as the limiting factor,
