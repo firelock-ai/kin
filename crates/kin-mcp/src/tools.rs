@@ -839,6 +839,12 @@ fn registered_tools() -> ToolsListResult {
                             "type": "boolean",
                             "description": "If true, each row also carries the referencing entity's signature and a bounded body excerpt. Off by default, because one row is one caller and bodies would then scale with the number of callers. Every row still carries entity_id, which drills to the full body via get_entity_source.",
                             "default": false
+                        },
+                        "min_resolution": {
+                            "type": "string",
+                            "description": "Weakest resolution a row may carry and still be counted in `references` and `total_upstream`. Defaults to import_scoped, so the headline is the proven subset. A row under the floor is not dropped: it moves to `candidates` whole, keeping its resolution and site lines. Pass name_only to count every row in the headline instead, or type_resolved to keep only rows whose destination the graph proved outright.",
+                            "enum": ["name_only", "import_scoped", "type_resolved"],
+                            "default": "import_scoped"
                         }
                     }
                 }),

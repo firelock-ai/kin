@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `find_references` held `name_only` rows, a bare same-name match with nothing
+  at the reference site proving it, out of `total_upstream` by description but
+  not by code: the headline partitioned on a single receiver-guess tier, so
+  the other guess tiers still counted as fact. Measured on the frozen gh CLI
+  corpus against compiler-produced gold: on the small callers gold, F1 score
+  rose from 49 percent to 85 percent, precision from 35 percent to 89 percent,
+  with recall unchanged at 81 percent. Across the full resolvable set, F1
+  score rose from 83 percent to 95 percent and precision from 76 percent to
+  99 percent, with recall unchanged at 92 percent. No true site was lost. The
+  tool now takes `min_resolution`, defaulting to `import_scoped`. Setting
+  `min_resolution: "name_only"` returns the old headline. `counts` reports
+  `receiver_name_candidates` and `unresolved_name_candidates` apart.
+
 ## [0.7.21] - 2026-09-18
 
 ### Added
