@@ -2016,6 +2016,12 @@ zero no more than the one: `counts.upstream_including_unconfirmed` is the matchi
 ceiling, and the caller set lies between them. Read `references` alone and you get the \
 proven subset, which is the right answer to \"who provably calls this\" and the wrong \
 one to \"who calls this\". \
+`min_resolution` sets where that line falls, defaulting to `import_scoped`, so the \
+default headline is the proven subset. Nothing is dropped at any setting: a row under \
+the floor moves to `candidates` whole, keeping its `resolution` and its site lines, and \
+`min_resolution: \"name_only\"` counts every one of them in the headline again. \
+`counts.receiver_name_candidates` and `counts.unresolved_name_candidates` say which \
+ground held each withheld row. \
 For a Go INTERFACE method the response also carries `interface_implementations`: the \
 concrete methods whose receiver types satisfy that contract, each with the file AND LINE \
 of its declaration, plus `files`, the files those declarations live in and no others. A \
@@ -2264,9 +2270,19 @@ fn answer_witnessed_classes<G: GraphStore>(
 /// the same rule an unlocatable row already followed.
 fn reference_counts(
     rows: &[ReferenceRow],
-    receiver_name_candidates: usize,
+    candidate_rows: &[ReferenceRow],
     interface_dispatch_candidates: Option<usize>,
 ) -> serde_json::Value {
+    // The two grounds are reported apart because they are different facts. A
+    // receiver fan-out row is a method that shares a leaf name with the focal
+    // and nothing more. A below-floor row was matched by name across the repo,
+    // which is weak but not the same weakness, and a reader deciding how hard to
+    // confirm the rows wants to know which kind is sitting in `candidates`.
+    let receiver_name_candidates = candidate_rows
+        .iter()
+        .filter(|row| row.receiver_name_guess)
+        .count();
+    let unresolved_name_candidates = candidate_rows.len() - receiver_name_candidates;
     let known_reference_sites: usize = rows.iter().map(|row| row.reference_lines.len()).sum();
     let reference_sites_complete = rows
         .iter()
@@ -2287,6 +2303,9 @@ fn reference_counts(
         // here so a reader who looks only at `counts` still learns the answer
         // withheld something (FIR-1552).
         "receiver_name_candidates": receiver_name_candidates,
+        // Rows held back because their strongest edge sits below
+        // `min_resolution`, beside the fan-out count rather than folded into it.
+        "unresolved_name_candidates": unresolved_name_candidates,
         // The union, because every other number here is a PROVEN count and a
         // reader who wants "how many callers might there be" was left to add two
         // of them together. A stranger read `total_upstream: 1` beside a
@@ -2296,7 +2315,7 @@ fn reference_counts(
         // floor of; it is not evidence that the extra rows are callers, which is
         // what `receiver_name_candidates` above and `candidates` themselves say.
         "upstream_including_unconfirmed": rows.len()
-            + receiver_name_candidates
+            + candidate_rows.len()
             + interface_dispatch_candidates.unwrap_or(0),
     });
     // Present only when the dispatch question applies to this focal, which is a
@@ -2313,6 +2332,61 @@ fn reference_counts(
         counts["interface_dispatch_candidates"] = serde_json::json!(candidates);
     }
     counts
+}
+
+/// Weakest resolution a row may carry and still be counted in the headline.
+///
+/// `import_scoped` is the default because it is the weakest tier at which
+/// something at the reference site named the destination: an import bound the
+/// receiver, the parser pinned the callee to a module, or the caller's own
+/// include closure singled the file out. Below it nothing at the site chose the
+/// target, so the row is a candidate and belongs in `candidates`.
+const DEFAULT_MIN_RESOLUTION: RelationResolution = RelationResolution::ImportScoped;
+
+/// Read the caller's resolution floor.
+///
+/// An unparseable value is refused rather than silently widened: a caller that
+/// misspells the floor it wants is asking for a narrower answer than it would
+/// get, and answering the wide question under a name that says otherwise is the
+/// failure this whole field exists to stop.
+fn min_resolution_from_args(
+    args: &HashMap<String, serde_json::Value>,
+) -> Result<RelationResolution> {
+    let Some(raw) = get_optional_string_param(args, "min_resolution") else {
+        return Ok(DEFAULT_MIN_RESOLUTION);
+    };
+    match raw.trim() {
+        "name_only" => Ok(RelationResolution::NameOnly),
+        "import_scoped" => Ok(RelationResolution::ImportScoped),
+        "type_resolved" => Ok(RelationResolution::TypeResolved),
+        other => Err(McpError::InvalidParams(format!(
+            "min_resolution must be one of name_only, import_scoped, type_resolved; got '{other}'"
+        ))),
+    }
+}
+
+/// Whether this row is held out of the headline and carried in `candidates`.
+///
+/// Two independent grounds, and either one is enough. The receiver fan-out is
+/// held at every floor, because a method matched on its bare leaf name is a
+/// candidate whatever a caller asked for. Everything else is held when its
+/// strongest contributing edge sits below the floor.
+///
+/// Two classes are never held. A federated row carries no resolution at all,
+/// because the edge behind it lives in another repository's graph, and reading
+/// its `None` as "weak" would demote every cross-repo reference on a question
+/// that was never asked about them. A row composed over a proven override
+/// publishes `via_override_of=<base>` rather than a tier: the caller provably
+/// calls the base and the focal provably overrides it, which is a resolved
+/// chain and not a name match.
+fn is_withheld_candidate(row: &ReferenceRow, floor: RelationResolution) -> bool {
+    if row.receiver_name_guess {
+        return true;
+    }
+    if row.via_override_of.is_some() {
+        return false;
+    }
+    row.resolution.is_some_and(|resolution| resolution < floor)
 }
 
 /// Component and reason a withheld-candidate disclosure is filed under, matched
@@ -2639,7 +2713,8 @@ fn disclose_withheld_candidates(result: &mut serde_json::Value) {
         ),
         "remediation":
             "read `candidates` for the rows withheld, and confirm each at its reference site \
-             before treating it as a caller",
+             before treating it as a caller; pass min_resolution=\"name_only\" to count them \
+             in the headline instead",
     });
     match result
         .get_mut("degradations")
@@ -2911,6 +2986,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     source_scope: EntitySourceScope,
 ) -> Result<ToolCallResult> {
     let include_snippets = get_optional_bool(args, "include_snippets", false);
+    let min_resolution = min_resolution_from_args(args)?;
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
     {
         if raw_kinds.is_empty() {
@@ -3048,8 +3124,22 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // could not separate the two true rows from the 31 invented ones. The
     // headline counts what resolved; candidates travel in their own array under
     // their own count and are never added to it.
-    let (rows, candidate_rows): (Vec<ReferenceRow>, Vec<ReferenceRow>) =
-        rows.into_iter().partition(|row| !row.receiver_name_guess);
+    //
+    // The class held back is every row under `min_resolution`, which defaults to
+    // `import_scoped`. It was the receiver fan-out alone, on the reasoning that
+    // an exact-name match with one candidate is an ordinary cross-file call and
+    // demoting it would empty the headline. Measured on the frozen gh CLI
+    // corpus that reasoning does not hold: over the six declarations of the
+    // callers gold, `references` carried 39 rows, the 23 at `name_only` were
+    // wrong to the last one, and holding them back cost no true site at all:
+    // recall 0.8095 either way, precision 0.3469 to 0.8947. `Title` answered 31
+    // lines for a six-line gold and answers exactly the six now. The rows are
+    // held, never dropped: they travel in `candidates` at full fidelity, they
+    // carry their own `resolution`, and `min_resolution: "name_only"` puts every
+    // one of them back in the headline for a caller that wants the wide read.
+    let (rows, candidate_rows): (Vec<ReferenceRow>, Vec<ReferenceRow>) = rows
+        .into_iter()
+        .partition(|row| !is_withheld_candidate(row, min_resolution));
 
     // Who a Go interface value may have routed here. A call written `w.Write(p)`
     // where `w` holds an interface resolves to the INTERFACE method object, so a
@@ -3088,7 +3178,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
     let counts = reference_counts(
         &rows,
-        candidate_rows.len(),
+        &candidate_rows,
         dispatch.as_ref().map(dispatch_candidate_count),
     );
 
@@ -10380,10 +10470,20 @@ mod tests {
     /// own count, and adding the two numbers together is the only way to get the
     /// old one back.
     ///
-    /// `resolution` is not the discriminator here and cannot be: an ordinary
-    /// cross-file call whose callee name matches exactly one entity is
-    /// `name_only` too, and demoting those would empty the headline on every
-    /// repository. The candidate class is the receiver fan-out alone.
+    /// The candidate class was the receiver fan-out alone, on the reasoning that
+    /// an ordinary cross-file call whose callee name matches exactly one entity
+    /// is `name_only` too and demoting those would empty the headline on every
+    /// repository. Measured, that reasoning does not hold. Over the six
+    /// declarations of the frozen gh CLI callers gold, `references` carried 39
+    /// rows, the 23 at `name_only` were wrong to the last one, and holding them
+    /// back cost no true site: recall 0.8095 either way, precision 0.3469 to
+    /// 0.8947. The headline does not empty, it stops being mostly wrong.
+    ///
+    /// So the floor is `min_resolution`, defaulting to `import_scoped`, and the
+    /// exact-name row below is where that bites: it is a real caller AND it is
+    /// `name_only`, so the default holds it back. It is held, not dropped, and
+    /// the second half of this test is the control that proves it comes back
+    /// whole when a caller asks for the wide read.
     ///
     /// The fixture is deliberately lopsided, three guesses against two proven
     /// callers, so no assertion here can pass on a fixture where every number
@@ -10396,8 +10496,8 @@ mod tests {
 
         let proven = ["Session.send", "handle_401"];
         // 0.7 is the exact-name tier: `name_only` by the ladder, and an ordinary
-        // caller all the same. It has to land in the headline, or this fix takes
-        // real callers out of every count with the invented ones.
+        // caller all the same. Under the default floor it is a candidate, and
+        // `min_resolution: "name_only"` is what puts it back in the headline.
         let exact_name_caller = "Session.request";
         let guessed = ["test_lowlevel", "text_response_server", "test_pickling"];
         for name in proven
@@ -10431,16 +10531,24 @@ mod tests {
         let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
 
         assert_eq!(
-            body["total_upstream"], 3,
-            "the headline counts callers, the exact-name one included: {body:#}"
+            body["total_upstream"], 2,
+            "the headline counts what resolved past the default floor: {body:#}"
         );
         assert_eq!(
-            body["counts"]["referencing_entities"], 3,
+            body["counts"]["referencing_entities"], 2,
             "the counts object must agree with the headline: {body:#}"
         );
         assert_eq!(
             body["counts"]["receiver_name_candidates"], 3,
-            "and must state how many rows it held back: {body:#}"
+            "and must state how many rows the fan-out ground held back: {body:#}"
+        );
+        assert_eq!(
+            body["counts"]["unresolved_name_candidates"], 1,
+            "and how many the floor held back, as its own fact: {body:#}"
+        );
+        assert_eq!(
+            body["counts"]["upstream_including_unconfirmed"], 6,
+            "the ceiling counts every row the graph held: {body:#}"
         );
 
         let named = |rows: &serde_json::Value| -> Vec<String> {
@@ -10452,25 +10560,15 @@ mod tests {
         };
         let references = named(&body["references"]);
         let candidates = named(&body["candidates"]);
-        assert_eq!(references.len(), 3, "{body:#}");
-        assert_eq!(candidates.len(), 3, "{body:#}");
+        assert_eq!(references.len(), 2, "{body:#}");
+        assert_eq!(candidates.len(), 4, "{body:#}");
         for name in proven {
             assert!(references.contains(&name.to_string()), "{body:#}");
         }
-        // The positive control. This row's `resolution` reads `name_only`, and
-        // it is still a caller.
         assert!(
-            references.contains(&exact_name_caller.to_string()),
-            "an exact-name caller must survive the split: {body:#}"
-        );
-        assert!(
-            body["references"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["name"] == exact_name_caller && row["resolution"] == "name_only"),
-            "and it must survive it while still reading name_only, which is what \
-             makes this control able to fail: {body:#}"
+            candidates.contains(&exact_name_caller.to_string()),
+            "an exact-name row is under the default floor and belongs in \
+             `candidates`: {body:#}"
         );
         for name in guessed {
             assert!(
@@ -10485,6 +10583,190 @@ mod tests {
         // Nothing was dropped: every caller the graph holds is in one array or
         // the other, so this is a split rather than a filter.
         assert_eq!(references.len() + candidates.len(), 6, "{body:#}");
+
+        // The positive control, and the half that can fail if the floor turns
+        // into a filter. Asked for the wide read, the exact-name caller is back
+        // in the headline, still reading `name_only`, and every count moves with
+        // it. A floor that dropped rows could not produce this response.
+        let wide = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("min_resolution".to_string(), serde_json::json!("name_only")),
+        ]);
+        let body = parsed_response(&handle_find_references(&wide, &store, None).await.unwrap());
+        assert_eq!(
+            body["total_upstream"], 3,
+            "min_resolution=name_only counts the exact-name caller: {body:#}"
+        );
+        assert_eq!(body["counts"]["unresolved_name_candidates"], 0, "{body:#}");
+        assert_eq!(
+            body["counts"]["receiver_name_candidates"], 3,
+            "the fan-out is held at every floor: {body:#}"
+        );
+        assert!(
+            body["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["name"] == exact_name_caller && row["resolution"] == "name_only"),
+            "and it comes back reading name_only, which is what makes this \
+             control able to fail: {body:#}"
+        );
+        assert_eq!(named(&body["candidates"]).len(), 3, "{body:#}");
+    }
+
+    /// A `name_only` CALL is held out of the headline, and its sites come back
+    /// whole when asked for.
+    ///
+    /// This is the shape the gh CLI measurement found, and the one neither
+    /// existing rule caught. The receiver fan-out partition reads the exact
+    /// `0.3` tier, so a `name_only` call at `0.7` was never a candidate; the CLI
+    /// listing's own rule requires the row to carry no `Calls` edge, so it was
+    /// never one there either. Every false row in that measurement was a
+    /// `name_only` call: 23 of them across six declarations, wrong to the last
+    /// one, sitting inside `total_upstream` beside 16 true rows.
+    ///
+    /// `Title` is the case in miniature. Its gold is six sites, `references`
+    /// answered 31 lines, and the 25 wrong ones were `name_only` calls. The
+    /// fixture below is that shape at small scale: one proven caller, three
+    /// `name_only` callers, no fan-out anywhere, so a rule that only reads the
+    /// fan-out tier cannot pass this test.
+    #[tokio::test]
+    async fn a_name_only_call_is_withheld_by_default_and_returned_on_request() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("Title", "src/text.rs");
+        store.upsert_entity(&target).unwrap();
+
+        // 1.0 is parser-certain, 0.7 the exact-name tier. Both are calls, and
+        // that is the point: `relation_kinds` cannot separate them and neither
+        // can the fan-out predicate.
+        let rows = [
+            ("truth", 1.0_f32, 11_u32),
+            ("guess_one", 0.7, 21),
+            ("guess_two", 0.7, 22),
+            ("guess_three", 0.7, 23),
+        ];
+        for (name, confidence, line) in rows {
+            let caller = make_entity(name, "src/callers.rs");
+            store.upsert_entity(&caller).unwrap();
+            let mut relation = make_relation_with_site(
+                caller.id,
+                target.id,
+                RelationKind::Calls,
+                "src/callers.rs",
+                line,
+            );
+            relation.confidence = confidence;
+            store.upsert_relation(&relation).unwrap();
+        }
+
+        let by_id = |extra: Option<(&str, serde_json::Value)>| {
+            let mut args = HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            )]);
+            if let Some((key, value)) = extra {
+                args.insert(key.to_string(), value);
+            }
+            args
+        };
+        let names = |rows: &serde_json::Value| -> Vec<String> {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let body = parsed_response(
+            &handle_find_references(&by_id(None), &store, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            names(&body["references"]),
+            vec!["truth".to_string()],
+            "the headline is the proven caller alone: {body:#}"
+        );
+        assert_eq!(
+            body["total_upstream"], 1,
+            "and the count is that one row: {body:#}"
+        );
+        let withheld = names(&body["candidates"]);
+        assert_eq!(withheld.len(), 3, "{body:#}");
+        for guess in ["guess_one", "guess_two", "guess_three"] {
+            assert!(withheld.contains(&guess.to_string()), "{body:#}");
+        }
+        assert_eq!(
+            body["counts"]["unresolved_name_candidates"], 3,
+            "the floor is the ground that held them: {body:#}"
+        );
+        assert_eq!(
+            body["counts"]["receiver_name_candidates"], 0,
+            "and the fan-out predicate caught none of them, which is the defect \
+             this test exists for: {body:#}"
+        );
+        assert_eq!(
+            body["counts"]["upstream_including_unconfirmed"], 4,
+            "the ceiling still names every row: {body:#}"
+        );
+        assert_eq!(
+            body["unconfirmed_candidates"], 3,
+            "the headline says how many it held: {body:#}"
+        );
+
+        // Held, not dropped. Every withheld row keeps its label and its site
+        // line, so a caller can confirm one without asking again.
+        for row in body["candidates"].as_array().unwrap() {
+            assert_eq!(row["resolution"], "name_only", "{body:#}");
+            assert_eq!(row["reference_line_count"], 1, "{body:#}");
+            assert_eq!(row["file_path"], "src/callers.rs", "{body:#}");
+        }
+
+        // The wide read puts all four back, and nothing about the rows changed.
+        let body = parsed_response(
+            &handle_find_references(
+                &by_id(Some(("min_resolution", serde_json::json!("name_only")))),
+                &store,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["total_upstream"], 4, "{body:#}");
+        assert_eq!(names(&body["references"]).len(), 4, "{body:#}");
+        assert_eq!(names(&body["candidates"]).len(), 0, "{body:#}");
+
+        // And the strictest floor keeps only what the graph proved outright.
+        let body = parsed_response(
+            &handle_find_references(
+                &by_id(Some(("min_resolution", serde_json::json!("type_resolved")))),
+                &store,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            names(&body["references"]),
+            vec!["truth".to_string()],
+            "{body:#}"
+        );
+
+        // A floor nobody defined is refused rather than widened: answering the
+        // wide question under a narrow name is the failure this field prevents.
+        let refused = handle_find_references(
+            &by_id(Some(("min_resolution", serde_json::json!("proven")))),
+            &store,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(McpError::InvalidParams(_))),
+            "an unknown floor must be refused, not silently widened"
+        );
     }
 
     /// Holding candidates back is what makes the count honest, and saying

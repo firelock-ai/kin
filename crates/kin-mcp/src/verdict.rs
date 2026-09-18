@@ -1565,15 +1565,28 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
         )),
         Some(_) => {}
     }
-    if let Some(counted) = response
-        .get("counts")
-        .and_then(|counts| counts.get("receiver_name_candidates"))
-        .and_then(Value::as_u64)
-    {
-        if counted != withheld {
+    // Two grounds hold a row back, and `counts` reports them apart: the
+    // receiver fan-out, and an edge under the request's `min_resolution` floor.
+    // The accounting is the SUM, because that is what `candidates` holds. Read
+    // against the fan-out alone this said `reads 0 against 18` on every answer
+    // that withheld a below-floor row, which is the check calling a correct
+    // response broken.
+    let counts = response.get("counts");
+    let counted = |key: &str| {
+        counts
+            .and_then(|counts| counts.get(key))
+            .and_then(Value::as_u64)
+    };
+    let receiver = counted("receiver_name_candidates");
+    let unresolved = counted("unresolved_name_candidates");
+    if let Some(total) = match (receiver, unresolved) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    } {
+        if total != withheld {
             found.push(format!(
-                "counts.receiver_name_candidates reads {counted} against {withheld} candidate \
-                 row(s)"
+                "counts.receiver_name_candidates plus counts.unresolved_name_candidates reads \
+                 {total} against {withheld} candidate row(s)"
             ));
         }
     }
@@ -2656,12 +2669,14 @@ mod tests {
         // Present but wrong is caught too, at each of the three placements the
         // one withheld number surfaces at.
         response["unconfirmed_candidates"] = json!(0);
-        response["counts"] = json!({"receiver_name_candidates": 0});
+        response["counts"] =
+            json!({"receiver_name_candidates": 0, "unresolved_name_candidates": 0});
         response["_kin"]["completeness"]["counted"]["withheld_candidates"] = json!(4);
         let skewed = disagreements(&response);
         for expected in [
             "unconfirmed_candidates reads 0 against 1 candidate row(s)",
-            "counts.receiver_name_candidates reads 0 against 1 candidate row(s)",
+            "counts.receiver_name_candidates plus counts.unresolved_name_candidates reads 0 \
+             against 1 candidate row(s)",
             "_kin.completeness.counted.withheld_candidates reads 4 against 1 candidate row(s)",
         ] {
             assert!(
@@ -2672,8 +2687,21 @@ mod tests {
 
         // And the agreeing form clears, so the check is not simply always-on.
         response["unconfirmed_candidates"] = json!(1);
-        response["counts"] = json!({"receiver_name_candidates": 1});
+        response["counts"] =
+            json!({"receiver_name_candidates": 1, "unresolved_name_candidates": 0});
         response["_kin"]["completeness"]["counted"]["withheld_candidates"] = json!(1);
+        assert!(
+            headline_count_disagreements(&response).is_empty(),
+            "{:?}",
+            headline_count_disagreements(&response)
+        );
+
+        // The accounting is the SUM of the two grounds, so a row held by the
+        // resolution floor alone agrees just as well as one held by the fan-out.
+        // Read against the fan-out count alone this response was reported broken
+        // on every answer that withheld a below-floor row.
+        response["counts"] =
+            json!({"receiver_name_candidates": 0, "unresolved_name_candidates": 1});
         assert!(
             headline_count_disagreements(&response).is_empty(),
             "{:?}",
