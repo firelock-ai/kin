@@ -226,10 +226,6 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "This repository has a working copy the graph is supposed to be level with and nothing is comparing them, so whether the answer describes the file as it is now is not known.",
     },
     ClauseCode {
-        code: "file_bytes_unchecked",
-        meaning: "This repository has a working copy the graph is supposed to be level with and nothing is comparing them, so whether the answer describes the file as it is now is not known.",
-    },
-    ClauseCode {
         code: "file_coverage_unreported",
         meaning: "The answer did not report whether a language adapter parsed the file.",
     },
