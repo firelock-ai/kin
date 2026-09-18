@@ -180,6 +180,7 @@ in `negative.trust_reason`. The list is closed: a code not in it is never sent, 
 | `entity_index_unresolved` | Nothing resolves the program behind the parsed declarations, so an empty name or kind filter cannot separate a missing declaration from one the extractor did not admit. |
 | `enumeration_shifted` | The file gained or lost entities between pages, so the pages do not assemble into one state; walk again from the start. |
 | `file_bytes_unadmitted` | The working copy holds content at this path that graph truth does not carry, so the spans describe earlier bytes; `kin reconcile` takes the edit. |
+| `file_bytes_unchecked` | This repository has a working copy the graph is supposed to be level with and nothing is comparing them, so whether the answer describes the file as it is now is not known. |
 | `file_coverage_unreported` | The answer did not report whether a language adapter parsed the file. |
 | `file_not_parsed` | No language adapter produced a layout for the file, so an empty enumeration is a fact about extraction coverage, not the file. |
 | `file_parse_failed` | The adapter could not parse the file, so the entities the graph still carries for it describe an earlier state. |

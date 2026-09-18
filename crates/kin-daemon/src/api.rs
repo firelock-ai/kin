@@ -4145,16 +4145,31 @@ fn mcp_repository_authority_source(
 /// it is read one host entry, at a path the caller already named, and weaken its
 /// own verdict ([`kin_mcp::working_copy`]). No row of any response comes from it.
 ///
-/// `None` on a daemon whose filesystem-to-graph ingestion is off, for the same
-/// reason its untracked measurement records itself as not applicable there:
-/// nothing on that projected checkout is content an admission failed to take, so
-/// comparing it to graph truth would manufacture a divergence out of the
-/// projection.
-fn mcp_working_copy_probe(state: &DaemonState) -> Option<kin_mcp::WorkingCopyProbe> {
-    if state.filesystem_reconcile_disabled() {
-        return None;
+/// Three standings, because a daemon with its filesystem-to-graph ingestion off
+/// is in one of two quite different situations and this used to answer `None`
+/// for both.
+///
+/// A graph-authority storage backend serves a checkout that is a PROJECTION of
+/// graph truth. Nothing on it is content an admission failed to take, so
+/// comparing it would manufacture a divergence out of the projection, and there
+/// is no freshness question for an answer to leave unanswered. That is
+/// `NotApplicable`, and it is the case the `None` here was written for.
+///
+/// `KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE` over an ordinary checkout is the
+/// other one, and it is not that case at all. The working copy is real, it moves
+/// when the user pulls, and switching the ingestion off switches off the only
+/// thing that would have noticed. Answering `None` there published a host
+/// reading indistinguishable from a comparison that ran and agreed, so every
+/// answer read as clean while the signal was gone. That is `Unchecked`, and a
+/// handler refuses to certify over it.
+fn mcp_working_copy_source(state: &DaemonState) -> kin_mcp::WorkingCopySource {
+    if state.graph_authority_storage_backend() {
+        return kin_mcp::WorkingCopySource::NotApplicable;
     }
-    Some(kin_mcp::WorkingCopyProbe::new(
+    if state.filesystem_reconcile_disabled() {
+        return kin_mcp::WorkingCopySource::Unchecked;
+    }
+    kin_mcp::WorkingCopySource::Probe(kin_mcp::WorkingCopyProbe::new(
         state.layout.working_dir().to_path_buf(),
     ))
 }
@@ -15848,7 +15863,7 @@ async fn mcp_tools_call_dispatch(
         let repository_authority = mcp_repository_authority_source(&state);
         // Resolved once for the whole dispatch, so the two `handle_tool_call`
         // arms below cannot offer different working copies for one request.
-        let host = mcp_working_copy_probe(&state);
+        let host = mcp_working_copy_source(&state);
         let handled = if request.name == "get_context_pack"
             && (request
                 .arguments
@@ -15877,7 +15892,7 @@ async fn mcp_tools_call_dispatch(
                         &sessions,
                         kin_mcp::SessionAuthorityMode::OfflineFallback,
                         repository_authority.as_ref(),
-                        host.as_ref(),
+                        host.surface(),
                     )
                     .await
                 }
@@ -15951,7 +15966,7 @@ async fn mcp_tools_call_dispatch(
                         &sessions,
                         kin_mcp::SessionAuthorityMode::OfflineFallback,
                         repository_authority.as_ref(),
-                        host.as_ref(),
+                        host.surface(),
                     )
                     .await
                 }

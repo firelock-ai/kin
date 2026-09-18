@@ -72,20 +72,49 @@ const MAX_PROBE_BYTES: u64 = 64 * 1024 * 1024;
 /// What the host holds at one repository path, relative to what graph truth
 /// carries for it.
 ///
-/// Three states, and the middle one is the point: `Unobserved` and `Admitted`
-/// both permit certification and mean different things, so a reader can tell a
-/// probe that ran and agreed from one that never ran.
+/// Five states, because there were always more than the two an equality test
+/// against `diverged` can see. "The host matches" and "the host differs" are the
+/// two a reader expects; the other three all mean no comparison happened, and
+/// they are not interchangeable. A path a probe declined to read is one thing, a
+/// repository whose checkout is a projection of graph truth is another, and a
+/// real working copy nothing is comparing is the third. Only the last of those
+/// is a freshness signal that has gone missing, and it is the one that used to
+/// read as clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostEntryReading {
-    /// Nothing compared the host with the graph.
+    /// No working copy this graph is supposed to be level with, so there is
+    /// nothing to compare and no signal to be missing.
     ///
-    /// The honest state for every case where the working copy is not evidence
-    /// about graph truth: no probe was supplied, the path is a gitlink with no
-    /// content identity to compare, the host entry could not be read, or it is
-    /// larger than this probe will hash. Certification is unaffected, exactly as
+    /// A caller that offered no working copy at all, or a repository whose graph
+    /// is its own write authority and whose checkout is one projection of it.
+    /// Certification is unaffected: there is no disk here that graph truth could
+    /// be behind.
+    NotApplicable,
+    /// This repository HAS a working copy the graph is supposed to be level
+    /// with, and nothing compared them.
+    ///
+    /// The state this enum exists to make sayable. A daemon whose
+    /// filesystem-to-graph ingestion is switched off still serves answers about
+    /// a checkout that can move underneath it, and the reading it used to
+    /// publish was indistinguishable from a probe that ran and agreed. So every
+    /// answer read as clean while the one thing that could have shown it stale
+    /// was not running.
+    ///
+    /// This refuses certification, for the same reason
+    /// [`crate::verdict`]'s watcher-loss input refuses: it is a positive
+    /// observation that an input is missing, not an inference from an absence of
+    /// evidence, and a caller who switched the comparison off is told so on
+    /// every answer rather than reassured by silence.
+    Unchecked,
+    /// A probe ran over this repository and this path is not evidence about
+    /// graph truth.
+    ///
+    /// The honest per-path absence: the path is a gitlink with no content
+    /// identity to compare, the host entry could not be read, or it is larger
+    /// than this probe will hash. Certification is unaffected, exactly as
     /// [`crate::handlers::file_entities::SpanProvenance::Unverified`] leaves it
-    /// unaffected, because refusing on an absence of evidence would floor every
-    /// answer on every store this cannot see.
+    /// unaffected, because refusing on one unreadable path would floor every
+    /// answer over a store that holds one.
     Unobserved,
     /// The host entry hashes to the content identity graph truth holds for this
     /// path, so the spans this answer serves were derived from the bytes that
@@ -104,16 +133,73 @@ impl HostEntryReading {
     /// The wire word, published beside `span_provenance` in `file_coverage`.
     pub fn wire(self) -> &'static str {
         match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Unchecked => "unchecked",
             Self::Unobserved => "unobserved",
             Self::Admitted => "admitted",
             Self::Diverged => "diverged",
         }
     }
 
-    /// Whether this reading permits certifying an answer about the path. Only a
-    /// provable divergence refuses.
+    /// Whether this reading permits certifying an answer about the path.
+    ///
+    /// Two states refuse and they refuse for opposite reasons. [`Self::Diverged`]
+    /// is a provable mismatch. [`Self::Unchecked`] is a provable absence of the
+    /// comparison itself over a working copy that has one to make, which cannot
+    /// license an answer either: a caller acting on `certified` is acting on an
+    /// agreement nothing established.
     pub fn permits_certification(self) -> bool {
-        !matches!(self, Self::Diverged)
+        !matches!(self, Self::Diverged | Self::Unchecked)
+    }
+}
+
+/// What a request may read the host with, decided by whichever layer knows what
+/// this repository's checkout is.
+///
+/// The handler used to be handed `Option<&WorkingCopyProbe>`, and a `None` there
+/// carried two facts at once: that no comparison would happen, and nothing about
+/// whether one should have. A daemon serving a projected checkout and a daemon
+/// with its filesystem ingestion switched off both passed `None`, and the
+/// answer came out identical. This names which, so the envelope can too.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkingCopySurface<'a> {
+    /// No working copy this graph is supposed to be level with.
+    NotApplicable,
+    /// A working copy exists and nothing in this process is comparing it with
+    /// graph truth.
+    Unchecked,
+    /// Compare, one path at a time.
+    Probe(&'a WorkingCopyProbe),
+}
+
+impl WorkingCopySurface<'_> {
+    /// This surface's reading of one path, which is the probe's reading when
+    /// there is a probe and the surface's own standing when there is not.
+    pub fn observe(self, path: &RepoPath, admitted: Option<&TreeEntry>) -> HostEntryReading {
+        match self {
+            Self::NotApplicable => HostEntryReading::NotApplicable,
+            Self::Unchecked => HostEntryReading::Unchecked,
+            Self::Probe(probe) => probe.observe(path, admitted),
+        }
+    }
+}
+
+/// The owned twin of [`WorkingCopySurface`], for a caller that builds the probe
+/// per request and lends it to the handler.
+#[derive(Debug, Clone)]
+pub enum WorkingCopySource {
+    NotApplicable,
+    Unchecked,
+    Probe(WorkingCopyProbe),
+}
+
+impl WorkingCopySource {
+    pub fn surface(&self) -> WorkingCopySurface<'_> {
+        match self {
+            Self::NotApplicable => WorkingCopySurface::NotApplicable,
+            Self::Unchecked => WorkingCopySurface::Unchecked,
+            Self::Probe(probe) => WorkingCopySurface::Probe(probe),
+        }
     }
 }
 
@@ -330,13 +416,20 @@ mod tests {
         );
     }
 
-    /// Only a divergence refuses certification, and the two permitting states
-    /// are asserted separately so a change that collapsed them would be caught.
+    /// A divergence and an unmade comparison both refuse, and the three
+    /// permitting states are asserted separately so a change that collapsed any
+    /// of them would be caught.
+    ///
+    /// The second refusal is the one this enum grew for. A working copy nothing
+    /// compared cannot license `certified`, because the agreement a caller would
+    /// be acting on is one nothing established.
     #[test]
-    fn only_a_divergence_refuses_certification() {
+    fn a_divergence_and_an_unmade_comparison_both_refuse_certification() {
         assert!(!HostEntryReading::Diverged.permits_certification());
+        assert!(!HostEntryReading::Unchecked.permits_certification());
         assert!(HostEntryReading::Admitted.permits_certification());
         assert!(HostEntryReading::Unobserved.permits_certification());
+        assert!(HostEntryReading::NotApplicable.permits_certification());
     }
 
     /// The wire words are distinct, because two states rendering the same word
@@ -345,6 +438,8 @@ mod tests {
     #[test]
     fn every_reading_has_its_own_wire_word() {
         let words = [
+            HostEntryReading::NotApplicable.wire(),
+            HostEntryReading::Unchecked.wire(),
             HostEntryReading::Unobserved.wire(),
             HostEntryReading::Admitted.wire(),
             HostEntryReading::Diverged.wire(),
@@ -353,6 +448,59 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), words.len(), "wire words collided: {words:?}");
+    }
+
+    /// A surface with no probe still answers, and it answers with its own
+    /// standing rather than with the per-path absence a probe would have
+    /// produced. Without this the two conditions collapse back into one word.
+    #[test]
+    fn a_surface_with_no_probe_reports_its_own_standing() {
+        assert_eq!(
+            WorkingCopySurface::NotApplicable.observe(&repo_path("lib.rs"), None),
+            HostEntryReading::NotApplicable
+        );
+        assert_eq!(
+            WorkingCopySurface::Unchecked.observe(&repo_path("lib.rs"), None),
+            HostEntryReading::Unchecked
+        );
+    }
+
+    /// An unchecked surface says so on a path the graph admits bytes for, which
+    /// is the case the study measured: a real working copy, a real tree entry,
+    /// and nothing comparing them.
+    #[test]
+    fn an_unchecked_surface_says_so_even_where_a_probe_could_have_compared() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let body = b"fn one() {}\n";
+        std::fs::write(root.path().join("lib.rs"), body).expect("write host entry");
+        let admitted = blob_of(body);
+        assert_eq!(
+            WorkingCopySurface::Probe(&probe_over(root.path()))
+                .observe(&repo_path("lib.rs"), Some(&admitted)),
+            HostEntryReading::Admitted
+        );
+        assert_eq!(
+            WorkingCopySurface::Unchecked.observe(&repo_path("lib.rs"), Some(&admitted)),
+            HostEntryReading::Unchecked
+        );
+    }
+
+    /// The owned twin lends exactly the surface it names.
+    #[test]
+    fn the_owned_source_lends_the_surface_it_names() {
+        let root = tempfile::tempdir().expect("temp dir");
+        assert!(matches!(
+            WorkingCopySource::NotApplicable.surface(),
+            WorkingCopySurface::NotApplicable
+        ));
+        assert!(matches!(
+            WorkingCopySource::Unchecked.surface(),
+            WorkingCopySurface::Unchecked
+        ));
+        assert!(matches!(
+            WorkingCopySource::Probe(probe_over(root.path())).surface(),
+            WorkingCopySurface::Probe(_)
+        ));
     }
 
     /// A symlink is compared against the bytes of its target path, which is what

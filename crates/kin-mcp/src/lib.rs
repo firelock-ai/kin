@@ -62,4 +62,4 @@ pub use types::{
     ContentBlock, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult, ToolDefinition,
 };
 pub use verdict::{disagreements as verdict_disagreements, Verdict, VERDICT_KEY};
-pub use working_copy::{HostEntryReading, WorkingCopyProbe};
+pub use working_copy::{HostEntryReading, WorkingCopyProbe, WorkingCopySource, WorkingCopySurface};

@@ -1657,24 +1657,49 @@ fn merge_file_coverage_classes(
         .and_then(|coverage| coverage.get("span_provenance"))
         .and_then(Value::as_str)
         == Some("stale");
-    let bytes_unadmitted = coverage
+    // Read once into the word itself rather than tested for equality against one
+    // value. `host_bytes` has never been a two-state field, and an `== Some(
+    // "diverged")` over it answered one question -- "did a comparison prove a
+    // divergence" -- while the class it fed answered another: "is this file's
+    // parse a present class". A path nothing compared reported neither a
+    // divergence nor a reason, so it fell through as healthy, and a daemon with
+    // its filesystem ingestion switched off served every answer that way. That
+    // is the same collapse `ParsedState` above refuses between `Absent` and
+    // `Failed`, and `SpanProvenance` refuses with its own `Unverified`.
+    let host_bytes = coverage
         .and_then(|coverage| coverage.get("host_bytes"))
-        .and_then(Value::as_str)
-        == Some("diverged");
-    let parsed = if spans_stale || bytes_unadmitted {
+        .and_then(Value::as_str);
+    let bytes_unadmitted = host_bytes == Some("diverged");
+    // A working copy this graph is supposed to be level with that nothing is
+    // comparing. Not the same as `unobserved`, which is one path a probe
+    // declined, and not the same as `not_applicable`, which is a checkout that is
+    // a projection of graph truth and has no divergence to have.
+    let bytes_unchecked = host_bytes == Some("unchecked");
+    let raw_parsed = parsed;
+    let parsed = if spans_stale || bytes_unadmitted || bytes_unchecked {
         STATE_ABSENT
     } else {
         parsed
     };
     classes.insert("file_parsed".to_string(), json!(parsed));
     decided_by.push("file_parsed".to_string());
+    // Named unconditionally rather than as one branch of the chain below,
+    // because it is the only limit here that is a fact about the whole store
+    // rather than about this file, and it holds whatever else is also true. A
+    // caller who switched the comparison off is told so on every answer, which
+    // is the point: the old reading told them on none.
+    if bytes_unchecked {
+        limits.push("file_bytes_unchecked".to_string());
+    }
     // Named in the order the handler's own gate names them, so the limit and the
-    // limiting factor a reader acts on cannot point at different causes.
+    // limiting factor a reader acts on cannot point at different causes. Read
+    // from `raw_parsed`, the file's own parse state, so a host reading folded
+    // into the class above cannot be re-reported here as a parse that never ran.
     if bytes_unadmitted {
         limits.push("file_bytes_unadmitted".to_string());
     } else if spans_stale {
         limits.push("file_spans_stale".to_string());
-    } else if parsed != STATE_PRESENT {
+    } else if raw_parsed != STATE_PRESENT {
         // Name the cause when the answer carries one. `file_parsed_absent` is
         // true and says nothing: a file no adapter claims and a file whose
         // adapter fell over earn the same word, and only the second is evidence
@@ -1687,7 +1712,7 @@ fn merge_file_coverage_classes(
                 .and_then(Value::as_str)
             {
                 Some(reason) => format!("file_content_opaque_{reason}"),
-                None => format!("file_parsed_{parsed}"),
+                None => format!("file_parsed_{raw_parsed}"),
             },
         );
     }
@@ -1741,10 +1766,11 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
         .and_then(|coverage| coverage.get("span_provenance"))
         .and_then(Value::as_str)
         == Some("stale");
-    let bytes_unadmitted = coverage
+    let host_bytes = coverage
         .and_then(|coverage| coverage.get("host_bytes"))
-        .and_then(Value::as_str)
-        == Some("diverged");
+        .and_then(Value::as_str);
+    let bytes_unadmitted = host_bytes == Some("diverged");
+    let bytes_unchecked = host_bytes == Some("unchecked");
 
     let mut counted = json!({
         "unit": "entities_in_file",
@@ -1763,6 +1789,12 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
         counted["floor_reason"] = json!(format!("file_parsed_{parsed}"));
     } else if bytes_unadmitted {
         counted["floor_reason"] = json!("file_bytes_unadmitted");
+    } else if bytes_unchecked {
+        // Ahead of the span reading and behind the parse state, matching the
+        // order the gate one file over names them. A count nothing checked the
+        // bytes behind is a floor for the same reason a count over bytes the
+        // graph has not taken is one, and the caller can act on both.
+        counted["floor_reason"] = json!("file_bytes_unchecked");
     } else if spans_stale {
         counted["floor_reason"] = json!("file_spans_stale");
     } else if shifted {
@@ -3833,6 +3865,153 @@ mod tests {
             "a working copy nobody measured cannot report its work recorded: {durability:?}"
         );
         assert_eq!(durability.live_only_entities, None);
+    }
+
+    /// One enumeration, five host readings, and the three that are not a
+    /// comparison must not all read as a comparison that agreed.
+    ///
+    /// This is the narrowest possible grading of the defect. The payload is
+    /// identical in every arm except the one word in `file_coverage.host_bytes`,
+    /// the graph is healthy, the parse is full and the spans are digest
+    /// verified, so anything that separates the arms is this field alone.
+    ///
+    /// Before the split, `unchecked` did not exist and a daemon with its
+    /// filesystem-to-graph ingestion switched off published `unobserved`, which
+    /// this test shows is indistinguishable from `admitted` and rightly so:
+    /// `unobserved` means a probe ran and this one path is not evidence. So the
+    /// condition that removed the freshness signal entirely reached the caller
+    /// as a certified answer with a null limiting factor, every time.
+    #[test]
+    fn a_host_comparison_that_did_not_happen_does_not_read_as_one_that_agreed() {
+        let health = serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "graph_relation_count": 51,
+            "durable_relation_count": 51,
+            "reconciliation_status": "idle",
+            "graph_loaded": true,
+            "initialized": true,
+        });
+        let reading_of = |host_bytes: &str| -> Value {
+            let payload = serde_json::json!({
+                "path": "lib/express.js",
+                "entities": [],
+                "returned": 0,
+                "total_in_file": 0,
+                "page_size": 200,
+                "offset": 0,
+                "next_cursor": Value::Null,
+                "truncated": false,
+                "enumeration_shifted": false,
+                crate::handlers::file_entities::FILE_COVERAGE_KEY: {
+                    "path": "lib/express.js",
+                    "tracked_in_graph": true,
+                    "tier": "entity_source",
+                    "content_opaque": false,
+                    "opaque_reason": Value::Null,
+                    "parsed": "full",
+                    "parse_detail": Value::Null,
+                    "layout_entity_regions": 0,
+                    "enriched": "present",
+                    "embedded": "not_measured_per_file",
+                    "span_provenance": "digest_verified",
+                    "stale_spans": 0,
+                    "host_bytes": host_bytes,
+                    "whole_file_in_response": true,
+                    // What the handler computes for this arm: only a proven
+                    // divergence and an unmade comparison refuse.
+                    "certifies_enumeration": !matches!(host_bytes, "diverged" | "unchecked"),
+                },
+            });
+            envelope_of(&finalize(
+                ToolCallResult::text(payload.to_string()),
+                Envelope::daemon().with_health(&health),
+                crate::handlers::file_entities::TOOL_NAME,
+            ))
+        };
+        let state_of = |reading: &Value| {
+            reading["verdict"]["state"]
+                .as_str()
+                .expect("a verdict state")
+                .to_string()
+        };
+        let factor_of = |reading: &Value| reading["verdict"]["limiting_factor"].clone();
+        let parsed_class_of = |reading: &Value| {
+            reading["completeness"]["classes"]["file_parsed"]
+                .as_str()
+                .expect("a file_parsed class")
+                .to_string()
+        };
+
+        // The two arms where a comparison happened. Nothing here changes.
+        let admitted = reading_of("admitted");
+        assert_eq!(state_of(&admitted), "certified");
+        assert_eq!(factor_of(&admitted), Value::Null);
+        assert_eq!(parsed_class_of(&admitted), STATE_PRESENT);
+
+        let diverged = reading_of("diverged");
+        assert_eq!(state_of(&diverged), "inconclusive");
+        assert!(
+            factor_of(&diverged)
+                .as_str()
+                .expect("a factor")
+                .contains("file_bytes_unadmitted"),
+            "a proven divergence still leads with its own code: {:?}",
+            factor_of(&diverged)
+        );
+
+        // The per-path absence. A probe ran over this repository and declined
+        // this one entry, which is honest and must not floor the answer, or a
+        // single gitlink would floor every answer over the store that holds it.
+        let unobserved = reading_of("unobserved");
+        assert_eq!(state_of(&unobserved), "certified");
+        assert_eq!(factor_of(&unobserved), Value::Null);
+        assert_eq!(parsed_class_of(&unobserved), STATE_PRESENT);
+
+        // A checkout that is a projection of graph truth. There is no disk here
+        // the graph could be behind, so this certifies too, and it is spelled
+        // differently from the per-path case so the wire can tell them apart.
+        let not_applicable = reading_of("not_applicable");
+        assert_eq!(state_of(&not_applicable), "certified");
+        assert_eq!(factor_of(&not_applicable), Value::Null);
+
+        // The defect. A real working copy, nothing comparing it, and this is the
+        // only one of the three non-comparisons that is a missing signal rather
+        // than an absent question.
+        let unchecked = reading_of("unchecked");
+        assert_eq!(
+            state_of(&unchecked),
+            "inconclusive",
+            "a working copy nothing is comparing cannot certify: {unchecked:#?}"
+        );
+        let factor = factor_of(&unchecked);
+        let factor = factor.as_str().expect("an unchecked answer names its gap");
+        assert!(
+            factor.contains("file_bytes_unchecked"),
+            "the caller has to be told the comparison did not run: {factor:?}"
+        );
+        assert_eq!(parsed_class_of(&unchecked), STATE_ABSENT);
+        assert!(
+            unchecked["completeness"]["limits"]
+                .as_array()
+                .expect("limits")
+                .iter()
+                .any(|limit| limit == "file_bytes_unchecked"),
+            "the limit is named beside the class it decided: {:#?}",
+            unchecked["completeness"]
+        );
+        assert_eq!(
+            unchecked["completeness"]["counted"]["floor_reason"],
+            serde_json::json!("file_bytes_unchecked"),
+            "a count nothing checked the bytes behind is a floor, and says why"
+        );
+
+        // Falsification in the direction that matters: the two refusing arms do
+        // not share a word with the three permitting ones, so no arm here passes
+        // by accident of a shared default.
+        assert_ne!(state_of(&admitted), state_of(&unchecked));
+        assert_ne!(state_of(&unobserved), state_of(&unchecked));
+        assert_ne!(state_of(&not_applicable), state_of(&unchecked));
     }
 
     /// A tool that changes state carries the minimal envelope, and a read keeps

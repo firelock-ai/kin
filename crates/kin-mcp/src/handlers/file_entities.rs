@@ -46,7 +46,7 @@ use crate::handlers::common::{
     entity_presentation_end_line, entity_presentation_start_line, recorded_span_source_digest,
 };
 use crate::types::ToolCallResult;
-use crate::working_copy::{HostEntryReading, WorkingCopyProbe};
+use crate::working_copy::WorkingCopySurface;
 
 /// The tool's registered name, spelled once so the registry, the dispatcher,
 /// the budget table and the negative registry cannot drift from each other.
@@ -518,12 +518,12 @@ fn sort_key(entity: &Entity) -> (usize, String, String) {
 /// Enumerate the entities the graph holds for one file.
 ///
 /// `host` is the working copy this repository's graph is supposed to be level
-/// with, when the caller has one to offer. It qualifies the answer and never
+/// with, as the calling layer understands it. It qualifies the answer and never
 /// produces any part of it: see [`crate::working_copy`].
 pub fn handle_list_file_entities<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    host: Option<&WorkingCopyProbe>,
+    host: WorkingCopySurface<'_>,
 ) -> Result<ToolCallResult> {
     let cursor = match args.get("cursor").and_then(serde_json::Value::as_str) {
         Some(token) if !token.trim().is_empty() => {
@@ -670,9 +670,7 @@ pub fn handle_list_file_entities<G: GraphStore>(
     //
     // Taken after the graph-gap refusal above, so a path this graph has never
     // seen costs no host read at all.
-    let host_entry = host
-        .map(|probe| probe.observe(&repo_path, tree_entry.as_ref()))
-        .unwrap_or(HostEntryReading::Unobserved);
+    let host_entry = host.observe(&repo_path, tree_entry.as_ref());
 
     let enriched = language_server_edges(store, &entities)?;
 
@@ -785,6 +783,8 @@ pub fn handle_list_file_entities<G: GraphStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::working_copy::WorkingCopyProbe;
 
     use kin_db::InMemoryGraph;
     use kin_model::graph::EntityStore;
@@ -901,7 +901,7 @@ mod tests {
         store: &InMemoryGraph,
         args: &[(&str, serde_json::Value)],
     ) -> Result<serde_json::Value> {
-        call_over_host(store, args, None)
+        call_over_surface(store, args, WorkingCopySurface::NotApplicable)
     }
 
     /// The same call with a working copy offered, for the arms that grade what
@@ -910,6 +910,23 @@ mod tests {
         store: &InMemoryGraph,
         args: &[(&str, serde_json::Value)],
         host: Option<&WorkingCopyProbe>,
+    ) -> Result<serde_json::Value> {
+        call_over_surface(
+            store,
+            args,
+            match host {
+                Some(probe) => WorkingCopySurface::Probe(probe),
+                None => WorkingCopySurface::NotApplicable,
+            },
+        )
+    }
+
+    /// The same call over a named working-copy standing, for the arms that grade
+    /// what a surface with no probe publishes.
+    fn call_over_surface(
+        store: &InMemoryGraph,
+        args: &[(&str, serde_json::Value)],
+        host: WorkingCopySurface<'_>,
     ) -> Result<serde_json::Value> {
         let args: HashMap<String, serde_json::Value> = args
             .iter()
@@ -1094,7 +1111,8 @@ mod tests {
     fn finalized_limits(store: &InMemoryGraph, path: &str) -> String {
         let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
         let finalized = crate::finalize_with_envelope(
-            handle_list_file_entities(&args, store, None).expect("the tool answers"),
+            handle_list_file_entities(&args, store, WorkingCopySurface::NotApplicable)
+                .expect("the tool answers"),
             structural_authoritative_envelope(),
             TOOL_NAME,
         );
@@ -1958,27 +1976,104 @@ mod tests {
         );
     }
 
-    /// A caller with no working copy to offer is unchanged, which is what keeps
-    /// every offline and hosted answer off a floor it has no evidence for.
+    /// A caller with no working copy for this graph to be level with is
+    /// unchanged, which is what keeps every offline and hosted answer off a
+    /// floor it has no evidence for.
+    ///
+    /// The word is `not_applicable` rather than `unobserved`. `unobserved` is
+    /// one path a probe declined over a repository that has a working copy;
+    /// this is a repository that does not, and the two used to be spelled the
+    /// same.
     #[test]
-    fn an_answer_with_no_working_copy_offered_reports_unobserved_and_certifies() {
+    fn an_answer_with_no_working_copy_to_be_level_with_certifies() {
         let body = b"exports.setCharset = function () {};\n";
-        // The host holds other bytes, and nobody offered the probe that would
-        // see them. The reading must be the absence of evidence rather than the
-        // divergence a probe would have found.
+        // The host holds other bytes, and this route has no working copy the
+        // graph is supposed to be level with. The reading must be the absence
+        // of the question rather than the divergence a probe would have found.
         let (store, _root, _probe) = store_over_working_copy(body, b"// edited\n");
 
         let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
         let coverage = &payload[FILE_COVERAGE_KEY];
         assert_eq!(
             coverage["host_bytes"],
-            serde_json::json!("unobserved"),
+            serde_json::json!("not_applicable"),
             "{payload}"
         );
         assert_eq!(
             coverage["certifies_enumeration"],
             serde_json::json!(true),
             "{payload}"
+        );
+    }
+
+    /// The defect this split exists for, at the handler.
+    ///
+    /// A daemon with its filesystem-to-graph ingestion switched off serves a
+    /// real working copy that nothing is comparing with graph truth. It used to
+    /// publish the same word as a probe that ran and declined one path, so the
+    /// answer certified and the caller was told nothing at all. The store here
+    /// is byte-identical to the certifying control above; only the standing the
+    /// calling layer declares is different.
+    #[test]
+    fn an_unchecked_working_copy_says_so_and_cannot_certify() {
+        let body = b"exports.setCharset = function () {};\n";
+        let (store, _root, _probe) = store_over_working_copy(body, body);
+
+        let level = call_over_surface(
+            &store,
+            &[("path", serde_json::json!(FILE))],
+            WorkingCopySurface::NotApplicable,
+        )
+        .unwrap();
+        assert_eq!(
+            level[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(true),
+            "the control has to certify or this arm proves nothing: {level}"
+        );
+
+        let payload = call_over_surface(
+            &store,
+            &[("path", serde_json::json!(FILE))],
+            WorkingCopySurface::Unchecked,
+        )
+        .unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["host_bytes"],
+            serde_json::json!("unchecked"),
+            "{payload}"
+        );
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(false),
+            "an answer over a working copy nothing compared cannot be certified: {payload}"
+        );
+
+        let annotated = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::to_string(&payload).unwrap()),
+            structural_authoritative_envelope(),
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_ne!(
+            value["_kin"]["verdict"]["state"],
+            serde_json::json!("certified"),
+            "the one verdict a reader acts on must not certify: {value}"
+        );
+        let limiting = value["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            limiting.contains("file_bytes_unchecked"),
+            "the verdict must name the comparison that did not run: {limiting:?}"
+        );
+        assert!(
+            crate::verdict::CLAUSE_CODES
+                .iter()
+                .any(|entry| entry.code == "file_bytes_unchecked"),
+            "and the code must carry one written meaning a reader can look up"
         );
     }
 

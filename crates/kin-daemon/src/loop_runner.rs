@@ -5395,7 +5395,7 @@ mod tests {
         let result = kin_mcp::handlers::file_entities::handle_list_file_entities(
             &args,
             state.graph.as_ref(),
-            None,
+            kin_mcp::WorkingCopySurface::NotApplicable,
         )
         .expect("the enumeration answers");
         let kin_mcp::types::ContentBlock::Text { text } = &result.content[0];

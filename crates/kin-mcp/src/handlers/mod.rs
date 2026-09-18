@@ -33,16 +33,17 @@ use crate::error::{McpError, Result};
 use crate::server::SessionAuthorityMode;
 use crate::session::SessionRegistry;
 use crate::types::ToolCallResult;
-use crate::working_copy::WorkingCopyProbe;
+use crate::working_copy::WorkingCopySurface;
 
 /// Dispatch a tool call to the appropriate handler.
 ///
 /// `host` is the working copy graph truth is supposed to be level with, offered
-/// by whichever layer knows this repository has one. It is a disclosure input
-/// only: a handler may read one host entry through it to refuse certifying an
-/// answer, and no row of any answer is ever produced from it
-/// ([`crate::working_copy`]). `None` is the honest state for a caller with no
-/// working copy, or one whose graph is its own write authority.
+/// by whichever layer knows what this repository's checkout is. It is a
+/// disclosure input only: a handler may read one host entry through it to refuse
+/// certifying an answer, and no row of any answer is ever produced from it
+/// ([`crate::working_copy`]). It names which of three standings holds rather
+/// than passing an `Option`, because a bare `None` said both "nothing will
+/// compare" and nothing at all about whether something should have.
 pub async fn handle_tool_call<G: GraphStore>(
     tool_name: &str,
     arguments: &HashMap<String, serde_json::Value>,
@@ -50,7 +51,7 @@ pub async fn handle_tool_call<G: GraphStore>(
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
     repository_authority: Option<&RequestRepositoryAuthority>,
-    host: Option<&WorkingCopyProbe>,
+    host: WorkingCopySurface<'_>,
 ) -> Result<ToolCallResult> {
     let mut result = dispatch_tool_call(
         tool_name,
@@ -122,7 +123,7 @@ async fn dispatch_tool_call<G: GraphStore>(
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
     repository_authority: Option<&RequestRepositoryAuthority>,
-    host: Option<&WorkingCopyProbe>,
+    host: WorkingCopySurface<'_>,
 ) -> Result<ToolCallResult> {
     match tool_name {
         "kin_draft_apply"
@@ -1800,7 +1801,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
-            None,
+            WorkingCopySurface::NotApplicable,
         )
         .await;
         assert!(result.is_err());
@@ -1826,7 +1827,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
-            None,
+            WorkingCopySurface::NotApplicable,
         )
         .await
         .unwrap();
@@ -1849,7 +1850,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
-            None,
+            WorkingCopySurface::NotApplicable,
         )
         .await
         .unwrap();
@@ -1865,7 +1866,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
-            None,
+            WorkingCopySurface::NotApplicable,
         )
         .await
         .unwrap();
@@ -9503,7 +9504,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
-            None,
+            WorkingCopySurface::NotApplicable,
         )
         .await
         .unwrap();
@@ -9535,7 +9536,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
-            None,
+            WorkingCopySurface::NotApplicable,
         )
         .await
         .unwrap();
