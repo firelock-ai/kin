@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The reconcile pass now reports `waiting_deferred` instead of `idle` once the
+  startup catch-up after a large pull has admitted everything it safely can
+  and a directory this graph has never met is still left unadmitted on
+  purpose. A directory arriving whole cannot be told from a clone or a move
+  by its modification time, so the daemon still declines to sweep it in
+  silently, but the pass no longer describes that state the way it describes
+  a fully caught-up store, and the daemon log names the count and a sample of
+  the paths. Admitting the content, by an explicit command or by an ordinary
+  later edit, clears the pass back to idle on its own. `reconciliation_status`
+  itself is unchanged. Measured on a corpus checkout nine hundred forty-two
+  commits ahead of its store, roughly twenty-six percent of its files were in
+  this previously unreported state.
+- `kin agent run`'s result record now carries every row a `find_references`
+  call returned, under `kin_agent.reference_rows`, independent of what the
+  model's own final answer text kept. A study task found Kin's
+  `find_references` returning six rows for `toSSG`, all resolved with
+  equal confidence, and the model's own prose answer keeping four while
+  dropping two, with no code anywhere between the tool result and the
+  model's turn filtering on the referencing entity's kind or on anything
+  else: the drop was the model's own composition, not the belt's. A belt
+  cannot make a model's free text complete, so this record does not try to;
+  instead it holds the full, deduplicated row set the run actually saw, so a
+  consumer reading the structured result depends on zero percent prose and
+  gets one hundred percent of the resolved rows.
+- `find_references` held `name_only` rows, a bare same-name match with nothing
+  at the reference site proving it, out of `total_upstream` by description but
+  not by code: the headline partitioned on a single receiver-guess tier, so
+  the other guess tiers still counted as fact. Measured on the frozen gh CLI
+  corpus against compiler-produced gold: on the small callers gold, F1 score
+  rose from 49 percent to 85 percent, precision from 35 percent to 89 percent,
+  with recall unchanged at 81 percent. Across the full resolvable set, F1
+  score rose from 83 percent to 95 percent and precision from 76 percent to
+  99 percent, with recall unchanged at 92 percent. No true site was lost. The
+  tool now takes `min_resolution`, defaulting to `import_scoped`. Setting
+  `min_resolution: "name_only"` returns the old headline. `counts` reports
+  `receiver_name_candidates` and `unresolved_name_candidates` apart.
+- `find_references`'s resolution floor no longer withholds every row for a
+  focal when nothing found for it ever resolved above `name_only`. A Go store
+  the batch ingest arm builds with no gopls links no import across files at
+  all, so a caller's only row resolved at `name_only` and the default floor
+  moved it out of `references` into `candidates`. The graph had found the
+  call, and the floor emptied the headline over it anyway: it removed one
+  hundred percent of the answer and gained no precision, because no stronger
+  row was there to prefer it over. The floor now withholds a `name_only` row
+  only where an `import_scoped` or `type_resolved` row exists for the same
+  focal to prefer, and `degradations` says when the floor could not trade.
+
 ## [0.7.21] - 2026-09-18
 
 ### Added

@@ -202,28 +202,87 @@ set -e
 printf '%s\n' "$publish_output"
 
 if [ "$publish_status" -ne 0 ]; then
-  # A transport failure can occur after npm accepts the immutable version.
-  # Recover only when anonymous public authority proves the exact version,
-  # bytes, provenance, and final channel from this same release.
+  # npm stages a provenance publish and finalizes public availability,
+  # attestation, and the channel tag asynchronously. A "previously staged
+  # version" E409 for the exact version we just tried to publish means npm
+  # already accepted this immutable version and is finishing that
+  # finalization out of band, so it gets a long poll for that finalization
+  # below instead of the short window a generic transport failure gets.
+  in_flight=0
+  if printf '%s\n' "$publish_output" | grep -q 'E409' \
+    && printf '%s\n' "$publish_output" \
+      | grep -qF "previously staged version \"${version}\""; then
+    in_flight=1
+  fi
+
   accepted=""
-  for attempt in 1 2 3 4 5 6; do
-    set +e
-    accepted="$(npm_view_version "${package}@${version}")"
-    accepted_status=$?
-    set -e
-    if [ "$accepted_status" -eq 0 ] && [ "$accepted" = "$version" ]; then
-      break
-    fi
-    accepted=""
-    if [ "$attempt" -lt 6 ]; then
-      sleep 5
-    fi
-  done
+  if [ "$in_flight" -eq 1 ]; then
+    echo "::warning::npm reported ${package}@${version} as a previously staged version (E409); waiting for the registry to finish an asynchronous provenance publish instead of failing immediately."
+    # The registry has taken well over a minute to finalize a staged
+    # provenance publish, so this polls for at least 10 minutes (overridable
+    # for tests) before giving up, logging every attempt.
+    wait_budget="${NPM_RELEASE_INFLIGHT_WAIT_SECONDS:-600}"
+    poll_interval="${NPM_RELEASE_INFLIGHT_POLL_SECONDS:-12}"
+    wait_started="$SECONDS"
+    poll=0
+    while :; do
+      poll=$((poll + 1))
+      set +e
+      accepted="$(npm_view_version "${package}@${version}")"
+      accepted_status=$?
+      set -e
+      elapsed=$((SECONDS - wait_started))
+      if [ "$accepted_status" -eq 0 ] && [ "$accepted" = "$version" ]; then
+        echo "poll ${poll} (${elapsed}s elapsed): ${package}@${version} is publicly verifiable."
+        break
+      fi
+      accepted=""
+      echo "poll ${poll} (${elapsed}s elapsed): ${package}@${version} not yet publicly verifiable (npm view exit ${accepted_status})."
+      if [ "$elapsed" -ge "$wait_budget" ]; then
+        break
+      fi
+      sleep "$poll_interval"
+    done
+  else
+    # A transport failure can occur after npm accepts the immutable version.
+    # Recover only when anonymous public authority proves the exact version,
+    # bytes, provenance, and final channel from this same release.
+    for attempt in 1 2 3 4 5 6; do
+      set +e
+      accepted="$(npm_view_version "${package}@${version}")"
+      accepted_status=$?
+      set -e
+      if [ "$accepted_status" -eq 0 ] && [ "$accepted" = "$version" ]; then
+        break
+      fi
+      accepted=""
+      if [ "$attempt" -lt 6 ]; then
+        sleep 5
+      fi
+    done
+  fi
+
   if [ "$accepted" != "$version" ]; then
     echo "::error::npm could not publish ${package}@${version} to ${channel}, and the exact version did not become publicly verifiable. GitHub Latest remains blocked; rerun this same release after correcting the Trusted Publisher or registry failure." >&2
     exit "$publish_status"
   fi
   echo "::warning::npm returned failure after accepting ${package}@${version}; recovering from anonymous public authority."
+
+  # The registry can finalize bytes before it finalizes the channel tag, and
+  # this automatic path carries only short-lived OIDC scoped to `npm
+  # publish` (see docs/security/signing-and-update-trust.md); it has no
+  # credential to mutate a tag directly, so this step only confirms and logs
+  # the tag state. The unchanged require_exact_channel check right after
+  # this block is still the one that passes or fails the job on it.
+  set +e
+  staged_current="$(read_channel 2>&1)"
+  staged_status=$?
+  set -e
+  if [ "$staged_status" -eq 0 ] && [ "$staged_current" = "$version" ]; then
+    echo "npm ${package}@${channel} already resolves to ${version}; the registry finalized the tag on its own."
+  elif [ "$staged_status" -eq 0 ]; then
+    echo "npm ${package}@${channel} still resolves to ${staged_current:-<none>} right after the finalizing publish; the channel check below will re-read it."
+  fi
 fi
 
 env -u NODE_AUTH_TOKEN -u NPM_TOKEN bash "$verify_script" \
