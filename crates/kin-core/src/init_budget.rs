@@ -270,6 +270,7 @@ pub enum BudgetVerdict {
         survey: HistorySurvey,
         forecast_bytes: u64,
         ceiling_bytes: u64,
+        source: memory_pressure::PressureSource,
     },
     /// The conversion fits the ceiling, but the store it writes is forecast
     /// past the daemon's share of it.
@@ -292,12 +293,14 @@ pub enum BudgetVerdict {
         daemon_load_bytes: u64,
         ceiling_bytes: u64,
         allowance_bytes: u64,
+        source: memory_pressure::PressureSource,
     },
     /// The forecast is over the ceiling. The conversion refuses here.
     Exceeds {
         survey: HistorySurvey,
         forecast_bytes: u64,
         ceiling_bytes: u64,
+        source: memory_pressure::PressureSource,
     },
 }
 
@@ -321,6 +324,7 @@ impl BudgetVerdict {
             daemon_load_bytes,
             ceiling_bytes,
             allowance_bytes,
+            source,
         } = self
         {
             return Some(Self::daemon_allowance_line(
@@ -329,12 +333,14 @@ impl BudgetVerdict {
                 *daemon_load_bytes,
                 *ceiling_bytes,
                 *allowance_bytes,
+                *source,
             ));
         }
         let Self::Tight {
             survey,
             forecast_bytes,
             ceiling_bytes,
+            source,
         } = self
         else {
             return None;
@@ -356,7 +362,7 @@ impl BudgetVerdict {
              repository with less history",
             human_bytes(*forecast_bytes),
             human_bytes(*ceiling_bytes),
-            ceiling_noun(),
+            source.as_str(),
             survey.commits,
             survey.tracked_artifacts,
             human_bytes(*forecast_bytes),
@@ -392,6 +398,7 @@ impl BudgetVerdict {
         daemon_load_bytes: u64,
         ceiling_bytes: u64,
         allowance_bytes: u64,
+        source: memory_pressure::PressureSource,
     ) -> String {
         // The largest cap any host reaches, not this host's cap. The question
         // this branch asks is whether a bigger machine would help at all, and
@@ -401,7 +408,7 @@ impl BudgetVerdict {
         let remedy = if daemon_load_bytes <= largest_allowance {
             format!(
                 "give this {} more than {}",
-                ceiling_noun(),
+                source.as_str(),
                 human_bytes(daemon_load_bytes.saturating_mul(2))
             )
         } else {
@@ -422,7 +429,7 @@ impl BudgetVerdict {
              room, {}, or convert a repository with less history",
             human_bytes(forecast_bytes),
             human_bytes(ceiling_bytes),
-            ceiling_noun(),
+            source.as_str(),
             human_bytes(allowance_bytes),
             survey.commits,
             survey.tracked_artifacts,
@@ -456,6 +463,7 @@ impl BudgetVerdict {
             survey,
             forecast_bytes,
             ceiling_bytes,
+            source,
         } = self
         else {
             return Vec::new();
@@ -482,7 +490,7 @@ impl BudgetVerdict {
         vec![
             format!(
                 "this conversion needs more memory than this {} has: at least {}{}",
-                ceiling_noun(),
+                source.as_str(),
                 human_bytes(*forecast_bytes),
                 against,
             ),
@@ -505,7 +513,7 @@ impl BudgetVerdict {
             format!(
                 "  give it more than {}, on a larger machine or by raising this {}'s memory limit",
                 human_bytes(*forecast_bytes),
-                ceiling_noun(),
+                source.as_str(),
             ),
             "  or convert a repository with less history. Note that a shallow clone is not that \
              repository: `git clone --depth` leaves a boundary Kin refuses, because a history \
@@ -514,7 +522,7 @@ impl BudgetVerdict {
             format!(
                 "  if this {} really has more memory than Kin could read, set {} to the true \
                  ceiling in bytes and run again",
-                ceiling_noun(),
+                source.as_str(),
                 INIT_MEMORY_CEILING_ENV,
             ),
             "  nothing was written: this refusal happens before any capture, so there is no \
@@ -524,17 +532,26 @@ impl BudgetVerdict {
     }
 }
 
-/// Whether the ceiling this process reads belongs to a container or a machine.
+/// Whether the ceiling this process runs under belongs to a container or a
+/// machine.
 ///
 /// The same word the post-mortem uses for the same ceiling, taken from the same
 /// method, so a refusal and the post-mortem that would have followed it cannot
-/// disagree about what kind of limit stopped the run. Read fresh rather than
-/// carried on the verdict, because a verdict pinned in a test should not have to
-/// fabricate a pressure source in order to render.
-fn ceiling_noun() -> &'static str {
+/// disagree about what kind of limit stopped the run.
+///
+/// Read here, at the entry points that touch the machine, and then carried on
+/// the verdict. It used to be read at render time instead, which made a verdict
+/// pinned in a test render differently depending on the host the test ran on: a
+/// capped container said "container" where a bare host said "machine", so the
+/// suite passed on a hosted virtual machine and failed in a container. A
+/// rendering that consults the environment is not a pure function of the
+/// verdict, whatever the verdict was built from.
+fn measured_source() -> memory_pressure::PressureSource {
     memory_pressure::read()
         .reading()
-        .map_or("machine", |reading| reading.source.as_str())
+        .map_or(memory_pressure::PressureSource::Host, |reading| {
+            reading.source
+        })
 }
 
 /// Where the ceiling came from, or why there is none to judge against.
@@ -720,7 +737,7 @@ pub fn assess(source: &Path) -> BudgetVerdict {
     let allowance_bytes = memory_pressure::FootprintBudget::resolve(Some(ceiling_bytes))
         .map(|budget| budget.bytes)
         .unwrap_or_else(|| memory_pressure::FootprintBudget::derived_from(ceiling_bytes));
-    verdict_for_with_allowance(survey, ceiling_bytes, allowance_bytes)
+    verdict_for_with_allowance_under(survey, ceiling_bytes, allowance_bytes, measured_source())
 }
 
 /// The decision itself, over numbers rather than over a repository.
@@ -746,12 +763,34 @@ pub fn verdict_for_with_allowance(
     ceiling_bytes: u64,
     allowance_bytes: u64,
 ) -> BudgetVerdict {
+    verdict_for_with_allowance_under(
+        survey,
+        ceiling_bytes,
+        allowance_bytes,
+        memory_pressure::PressureSource::Host,
+    )
+}
+
+/// The same decision, with the kind of ceiling named rather than measured.
+///
+/// A caller that names a ceiling in bytes is describing a machine of that size,
+/// so the two-number entry points above say so outright instead of asking the
+/// host they happen to run on. Only [`assess`] passes what it measured, because
+/// only [`assess`] is running on the machine the daemon will start on. That
+/// split is what keeps the rendered advisory a function of its inputs.
+pub fn verdict_for_with_allowance_under(
+    survey: HistorySurvey,
+    ceiling_bytes: u64,
+    allowance_bytes: u64,
+    source: memory_pressure::PressureSource,
+) -> BudgetVerdict {
     let forecast_bytes = survey.forecast_peak_bytes();
     if forecast_bytes as f64 > ceiling_bytes as f64 * REFUSE_MULTIPLE {
         return BudgetVerdict::Exceeds {
             survey,
             forecast_bytes,
             ceiling_bytes,
+            source,
         };
     }
     if forecast_bytes as f64 > ceiling_bytes as f64 * TIGHT_FRACTION {
@@ -759,6 +798,7 @@ pub fn verdict_for_with_allowance(
             survey,
             forecast_bytes,
             ceiling_bytes,
+            source,
         };
     }
     // The conversion is not the whole command. Below TIGHT_FRACTION the
@@ -776,6 +816,7 @@ pub fn verdict_for_with_allowance(
             daemon_load_bytes,
             ceiling_bytes,
             allowance_bytes,
+            source,
         };
     }
     BudgetVerdict::Fits {
@@ -844,6 +885,7 @@ pub enum ImportProjection {
         survey: ImportSurvey,
         projected_bytes: u64,
         available_bytes: u64,
+        source: memory_pressure::PressureSource,
     },
 }
 
@@ -865,6 +907,7 @@ impl ImportProjection {
         let Self::Short {
             survey,
             projected_bytes,
+            source,
             available_bytes,
         } = self
         else {
@@ -882,7 +925,7 @@ impl ImportProjection {
              the tree is the size, not the history. It will probably not finish; to be sure, give \
              it more than {} or convert a smaller subtree",
             human_bytes(*projected_bytes),
-            ceiling_noun(),
+            source.as_str(),
             human_bytes(*available_bytes),
             survey.head_artifacts,
             human_bytes(survey.object_bytes),
@@ -897,7 +940,7 @@ impl ImportProjection {
 /// [`projection_for`] and this is the only part a test cannot run without one.
 pub fn project_import(survey: ImportSurvey) -> ImportProjection {
     match headroom_bytes() {
-        Ok(available_bytes) => projection_for(survey, available_bytes),
+        Ok(available_bytes) => projection_for_under(survey, available_bytes, measured_source()),
         Err(reason) => ImportProjection::Unmeasured { reason },
     }
 }
@@ -948,12 +991,30 @@ fn headroom_for(ceiling: Ceiling, charged_bytes: u64) -> Result<u64, String> {
 /// The same decision over numbers, so the threshold is testable without a
 /// machine of any particular size.
 pub fn projection_for(survey: ImportSurvey, available_bytes: u64) -> ImportProjection {
+    projection_for_under(
+        survey,
+        available_bytes,
+        memory_pressure::PressureSource::Host,
+    )
+}
+
+/// The same projection, with the kind of ceiling named rather than measured.
+///
+/// Same split as [`verdict_for_with_allowance_under`], and for the same reason:
+/// a caller naming a byte count is describing a machine, and only
+/// [`project_import`] is running on one.
+pub fn projection_for_under(
+    survey: ImportSurvey,
+    available_bytes: u64,
+    source: memory_pressure::PressureSource,
+) -> ImportProjection {
     let projected_bytes = survey.projected_peak_bytes();
     if projected_bytes > available_bytes {
         ImportProjection::Short {
             survey,
             projected_bytes,
             available_bytes,
+            source,
         }
     } else {
         ImportProjection::Fits {
