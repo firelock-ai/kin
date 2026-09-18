@@ -829,7 +829,7 @@ fn registered_tools() -> ToolsListResult {
                         "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query is provided." },
-                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided." },
+                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided. Alone it is ranked, not exact. When several declarations share the name, the ranking prefers the most referenced one, and `focal_resolution` reports the rest. An owner-qualified name (`Receiver.method` in Go, `Owner.member` in TypeScript, and the same shape in other languages where the graph names members that way) is exact. An `entity_id` from semantic_locate or list_file_entities is exact too." },
                         "relation_kinds": {
                             "type": "array",
                             "description": "Filter relation kinds. Supported values: calls, imports, references. Defaults to all three.",

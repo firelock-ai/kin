@@ -874,6 +874,10 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
             "One sentence a human reads in history. Omitted, the change records only its id.",
         ),
         (
+            ("find_references", "query"),
+            "Symbol name. `Owner.member` is exact; a bare name shared by declarations is ranked.",
+        ),
+        (
             ("find_references", "relation_kinds"),
             "Filter to calls, imports or references. Defaults to all three.",
         ),

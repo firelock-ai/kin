@@ -1974,7 +1974,10 @@ Find who depends on an entity: its direct upstream callers, importers, and refer
 Give it an entity_id or an exact symbol name (it resolves the best-matching canonical \
 definition) and it returns ONE ROW PER REFERENCING ENTITY, with that caller's entity id, \
 name, kind, file path, its own definition line (start_line), and every line inside it \
-that references the focal (reference_lines). Two callers in one file are two rows, and \
+that references the focal (reference_lines). An owner-qualified name (`Receiver.method` \
+in Go, `Owner.member` in TypeScript, and the same shape in other languages where the \
+graph names members that way) is exact too. \
+Two callers in one file are two rows, and \
 `total_upstream` is the number of referencing entities, the same unit `kin refs` prints. \
 The `counts` object states the unit outright and adds `files` and `reference_sites`, so \
 a count is never read against the wrong unit. `reference_sites` is null when some row's \
