@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.21] - 2026-09-18
+
+### Added
+
+- `find_references` accepts `answer_only`. The reply is the reference rows with
+  the focal, the relation kinds searched, the headline count and the number of
+  unconfirmed candidates held out of it, the degradations, the budget's own
+  disclosure, and a `_kin` reduced to the verdict's state, whether absence is
+  safe to conclude, and the limiting factor. Nothing else is removed from the
+  tool; a caller who omits the parameter gets the whole reply. Measured over the
+  same 75 frozen queries, an `answer_only` reply is 2,273 bytes mean on the wire
+  against 10,013 for the whole reply.
+
+### Changed
+
+- A `query` to `find_references` that names the owner is exact:
+  `Receiver.method` in Go, `Owner.member` in TypeScript. A bare name shared by
+  several declarations is ranked, prefers the most referenced one, and says so
+  in `focal_resolution`. The tool description now says this; the resolver has
+  not changed.
+
+### Fixed
+
+- A TypeScript interface or class member now has its own entity, named
+  `Owner.member`, so references to it resolve instead of falling to a bare-name
+  guess. Two upstream grammar defects that left a fifth of the lines in eight
+  files unreadable are fixed in a vendored TypeScript grammar. Measured against
+  the compiler on `honojs/hono`: pooled F1 0.6441 to 0.9365, and the sixteen
+  reference lines that never spell the declaration's name are found fourteen
+  times over, as before.
+- `find_references` on a Go interface method now answers where the method is
+  implemented. An `interface_implementations` block names each concrete method
+  whose receiver type satisfies the interface, with the file and line of its
+  declaration and the files those declarations live in. Measured against the
+  compiler on `cli/cli`: implementation sites 0.0000 to 0.9469, implementation
+  files 0.0754 to 0.9390.
+- The reply budget cuts the answer last. The unproven candidate lists that
+  qualify a `find_references` answer, including the interface-dispatch
+  candidates nested inside their own block, are cut before the reference rows,
+  and a list is trimmed again before the answer is made to pay for the record of
+  that cut. On the study's largest reply, all three reference rows now return
+  where two were elided before.
+- `name_only` reference rows are held out of the `find_references` headline
+  count and travel as candidates, and `min_resolution` sets the floor. On the Go
+  study, F1 0.4857 to 0.8500 with recall unchanged.
+- A daemon whose filesystem reconcile is switched off no longer reports a
+  working copy as compared when nothing compared it. `host_bytes` reads
+  `unchecked`, the verdict names `file_bytes_unchecked` as the limiting factor,
+  and the answer is not certified.
+- `reconciliation_status` says when an idle reconcile loop stopped with work
+  still outstanding, and the reply names `kin admit` as the command that takes
+  the working tree. Two messages that told a caller to run `kin reconcile` for
+  that are corrected.
+- A file with no parse record reads `parsed: unrecorded` instead of `absent`,
+  which is the word for a file something parsed and found empty.
+
 ## [0.7.20] - 2026-09-16
 
 ### Added
