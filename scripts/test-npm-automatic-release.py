@@ -68,6 +68,18 @@ elif args[:1] == ["view"]:
         save()
         print("npm error code E503\nnpm error registry unavailable", file=sys.stderr)
         raise SystemExit(1)
+    if (state.get("scenario") in (
+                "previously_staged_version",
+                "previously_staged_version_never_finalizes",
+            ) and selector == state.get("target_version")
+            and selector not in state.get("public", {}).get(package, [])):
+        state["inflight_polls"] = state.get("inflight_polls", 0) + 1
+        threshold = state.get("finalize_after_polls")
+        if (state["scenario"] == "previously_staged_version"
+                and threshold is not None
+                and state["inflight_polls"] >= threshold):
+            state["public"].setdefault(package, []).append(selector)
+            state.setdefault("tags", {}).setdefault(package, {})["latest"] = selector
     value = None
     if selector in state.get("public", {}).get(package, []):
         value = selector
@@ -91,6 +103,18 @@ elif args[:1] == ["publish"]:
     if state.get("scenario") == "reject_publish":
         save()
         print("simulated trusted publisher rejection", file=sys.stderr)
+        raise SystemExit(1)
+    if state.get("scenario") in (
+        "previously_staged_version",
+        "previously_staged_version_never_finalizes",
+    ):
+        save()
+        print(
+            "npm error code E409\n"
+            f'npm error 409 Conflict - PUT https://registry.npmjs.org/{package} '
+            f'- Cannot publish over previously staged version "{version}"',
+            file=sys.stderr,
+        )
         raise SystemExit(1)
     public.append(version)
     state["tags"][package][tag] = version
@@ -233,7 +257,11 @@ def harness() -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, str]]:
 
 
 def run_publish(
-    state: dict[str, object], *, preflight: bool = False, verify_fail: bool = False
+    state: dict[str, object],
+    *,
+    preflight: bool = False,
+    verify_fail: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, bytes]]:
     owner, package_dir, env = harness()
     tmp = Path(owner.name)
@@ -243,6 +271,8 @@ def run_publish(
     ).strip()
     if verify_fail:
         env["FAKE_VERIFY_FAIL"] = "1"
+    if extra_env:
+        env.update(extra_env)
     command = ["bash", str(PUBLISHER)]
     if preflight:
         command.append("--preflight")
@@ -487,6 +517,71 @@ def test_failure_after_acceptance_recovers_from_public_authority() -> None:
     print("PASS: post-acceptance transport failure recovers only from public proof")
 
 
+def test_previously_staged_version_recovers_after_polling() -> None:
+    state = base_state(
+        scenario="previously_staged_version",
+        target_version=VERSION,
+        # The script's own pre-publish idempotency check (npm view before it
+        # ever attempts npm publish) is itself one poll of the exact version,
+        # so this must clear that call plus the three the assertions below
+        # expect from the recovery loop that follows the E409.
+        finalize_after_polls=4,
+    )
+    result, snapshot = run_publish(
+        state,
+        extra_env={
+            "NPM_RELEASE_INFLIGHT_WAIT_SECONDS": "5",
+            "NPM_RELEASE_INFLIGHT_POLL_SECONDS": "0.05",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    combined = result.stdout + result.stderr
+    assert "previously staged version (E409)" in combined
+    poll_lines = [
+        line for line in result.stdout.splitlines() if line.startswith("poll ")
+    ]
+    assert len(poll_lines) >= 3, result.stdout
+    assert "is publicly verifiable" in poll_lines[-1]
+    assert "already resolves to" in result.stdout
+    state_after = json.loads(snapshot["state.json"])
+    assert VERSION in state_after["public"][PACKAGE]
+    assert state_after["tags"][PACKAGE]["latest"] == VERSION
+    assert not any(
+        command[:2] == ["stage", "publish"] or command[:1] == ["dist-tag"]
+        for command in state_after["commands"]
+    )
+    assert b"published=true" in snapshot["github-output"]
+    print("PASS: previously staged version E409 recovers by polling for public verifiability")
+
+
+def test_previously_staged_version_times_out_without_recovery() -> None:
+    state = base_state(
+        scenario="previously_staged_version_never_finalizes",
+        target_version=VERSION,
+    )
+    result, snapshot = run_publish(
+        state,
+        extra_env={
+            "NPM_RELEASE_INFLIGHT_WAIT_SECONDS": "1",
+            "NPM_RELEASE_INFLIGHT_POLL_SECONDS": "0.1",
+        },
+    )
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "previously staged version (E409)" in combined
+    poll_lines = [
+        line for line in result.stdout.splitlines() if line.startswith("poll ")
+    ]
+    assert len(poll_lines) >= 2, result.stdout
+    assert all("not yet publicly verifiable" in line for line in poll_lines)
+    assert "did not become publicly verifiable" in result.stderr
+    assert "GitHub Latest remains blocked" in result.stderr
+    assert "verify.json" not in snapshot
+    state_after = json.loads(snapshot["state.json"])
+    assert VERSION not in state_after.get("public", {}).get(PACKAGE, [])
+    print("PASS: previously staged version E409 gives up after exhausting the poll budget")
+
+
 def test_newer_channel_before_publish_fails_without_mutation() -> None:
     state = base_state(scenario="advance_before_publish", newer=NEWER_VERSION)
     result, snapshot = run_publish(state)
@@ -533,6 +628,8 @@ def main() -> None:
     test_public_rerun_verifies_before_skip()
     test_rejected_publish_fails_without_public_version()
     test_failure_after_acceptance_recovers_from_public_authority()
+    test_previously_staged_version_recovers_after_polling()
+    test_previously_staged_version_times_out_without_recovery()
     test_newer_channel_before_publish_fails_without_mutation()
     test_newer_channel_during_publish_blocks_finalization()
     test_post_publish_channel_read_failure_blocks_finalization()
