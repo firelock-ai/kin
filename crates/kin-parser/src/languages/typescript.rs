@@ -819,6 +819,20 @@ fn is_ts_function_like_node(node: &tree_sitter::Node) -> bool {
 /// Object/array literals that contain function-like nodes (arrow functions,
 /// function expressions) are kept — they represent meaningful code such as
 /// React components (`styled('div')(...)`) or configuration with callbacks.
+///
+/// An object/array literal with no elements is kept too, whether or not it
+/// carries function-like content: `hono`'s `export const globalContexts:
+/// Context<unknown>[] = []` (`src/jsx/context.ts:13`) declares a top-level
+/// singleton the rest of the file pushes into and reads from, but an empty
+/// array has no function-like child, so this filter answered trivial the
+/// same way it does for `CONFIG = { port: 3000 }`. `globalContexts` then had
+/// no entity at all: `list_file_entities` never listed it and
+/// `find_references` answered an authoritative "entity not found" instead of
+/// its real references. The data-literal case this filter exists for
+/// (`filter_data_only_object_literal_const`'s MUI theme tokens) is never
+/// empty — a literal that opens with no elements carries no config values to
+/// explode on — so exempting emptiness closes this gap without reopening
+/// that one.
 fn is_trivial_reexport(node: &tree_sitter::Node, source: &[u8]) -> bool {
     match node.kind() {
         // `const X = Y` — bare identifier re-export
@@ -835,7 +849,8 @@ fn is_trivial_reexport(node: &tree_sitter::Node, source: &[u8]) -> bool {
         // Template literals without embedded function calls are data
         "template_string" => !subtree_contains_function_like(node),
         // Object/array literals are data unless they contain callbacks/components
-        "object" | "array" => !subtree_contains_function_like(node),
+        // or open with no elements at all (see the doc comment above).
+        "object" | "array" => node.named_child_count() > 0 && !subtree_contains_function_like(node),
         // Type assertions: `X as Type` or `X satisfies Type`
         "as_expression" | "satisfies_expression" => true,
         // Numeric literals
@@ -1502,6 +1517,64 @@ export class Dog extends Animal implements Pet {
             0,
             "data-only object literals should be filtered"
         );
+    }
+
+    #[test]
+    fn keep_named_empty_array_literal_const() {
+        let adapter = TypeScriptAdapter;
+        // hono, src/jsx/context.ts:13 (098e11912ab244c5c33931de007f04dc8e3c2929).
+        // `globalContexts` is a real top-level singleton other code pushes
+        // into and reads from, but an empty array has no function-like
+        // child, so `is_trivial_reexport` answered trivial the same way it
+        // does for a data literal and the declarator minted no entity at
+        // all. `find_references` on it then answered an authoritative
+        // "entity not found" instead of its real references.
+        let source = b"export const globalContexts: unknown[] = [];
+
+export function useContext() { return globalContexts.length; }
+";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("context.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            1,
+            "an empty-array top-level const should mint an entity, got: {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(constants[0].name, "globalContexts");
+    }
+
+    #[test]
+    fn keep_named_empty_object_literal_const() {
+        let adapter = TypeScriptAdapter;
+        // Same shape as `keep_named_empty_array_literal_const`, for the
+        // sibling `object` arm the fix touched: `export const REGISTRY = {}`
+        // used as a mutable map elsewhere must mint an entity too, while a
+        // non-empty data literal like `CONFIG = { port: 3000 }` (the case
+        // `filter_data_only_object_literal_const` pins) still does not.
+        let source = b"export const REGISTRY: Record<string, unknown> = {};";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(constants.len(), 1, "got: {:?}", constants);
+        assert_eq!(constants[0].name, "REGISTRY");
     }
 
     #[test]

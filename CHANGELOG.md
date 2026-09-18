@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A top-level TypeScript `const`, `let`, or `var` bound to an empty array or
+  object literal, such as `export const globalContexts: Context<unknown>[] =
+  []` in `honojs/hono`'s `src/jsx/context.ts`, now gets its own `constant`
+  entity, so `list_file_entities` lists it and `find_references` on it
+  resolves instead of an authoritative "entity not found". The declarator's
+  data-literal filter answered trivial for every object or array value with no
+  regard for whether it held any elements, the one shape a config-token
+  literal (the filter's own reason for existing) never takes; coverage for
+  that exact shape went from zero percent to one hundred percent, with a
+  named, non-empty literal such as a theme or config object still filtered
+  exactly as before.
 - The reconcile pass now reports `waiting_deferred` instead of `idle` once the
   startup catch-up after a large pull has admitted everything it safely can
   and a directory this graph has never met is still left unadmitted on
