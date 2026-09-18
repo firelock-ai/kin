@@ -1971,16 +1971,8 @@ pub fn handle_trace_computation<G: GraphStore>(
 
 pub const FIND_REFERENCES_DESC: &str = "\
 Find who depends on an entity: its direct upstream callers, importers, and references. \
-Address the focal three ways. An entity_id is exact. A `file`, or a `file` and a `line`, \
-is exact too and is the address the question usually arrives in: \"who calls the thing \
-declared at pkg/cmd/issue/list/list.go:123\". A bare symbol name is NOT exact -- when the \
-repository declares that name more than once the resolver ranks the candidates and \
-answers about one of them, which is reported under `focal_resolution` and as an \
-`ambiguous_name` degradation, so prefer `file` whenever you know where the declaration \
-is. `file` also spares you having to know that Kin stores a method under a \
-receiver-qualified name (`App.List`, not `List`). A `file` that pins nothing is refused \
-rather than quietly answered by name. \
-It returns ONE ROW PER REFERENCING ENTITY, with that caller's entity id, \
+Give it an entity_id or an exact symbol name (it resolves the best-matching canonical \
+definition) and it returns ONE ROW PER REFERENCING ENTITY, with that caller's entity id, \
 name, kind, file path, its own definition line (start_line), and every line inside it \
 that references the focal (reference_lines). Two callers in one file are two rows, and \
 `total_upstream` is the number of referencing entities, the same unit `kin refs` prints. \
@@ -2881,51 +2873,21 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         default_reference_kinds()
     };
 
+    let addressed_by_name = get_optional_string_param(args, "entity_id").is_none();
     // Kept for the resolution accounting below. The count that answers "how
     // ambiguous was what I typed" can only be taken against the caller's own
     // string, and the resolver consumes it and hands back a winner.
     let resolution_query = get_optional_string_param(args, "query");
-    let focal_file = get_optional_string_param(args, "file");
-    let focal_line = args
-        .get("line")
-        .and_then(serde_json::Value::as_u64)
-        .map(|line| line as u32);
-    if focal_line.is_some() && focal_file.is_none() {
-        return Err(McpError::InvalidParams(
-            "line addresses a declaration inside a file, so it needs file beside it: pass the \
-             declaration's repository-relative path as file"
-                .into(),
-        ));
-    }
-
-    let (target, focal_address) = if let Some(entity_id_str) =
-        get_optional_string_param(args, "entity_id")
-    {
+    let target = if let Some(entity_id_str) = get_optional_string_param(args, "entity_id") {
         let entity_id = parse_entity_id(&entity_id_str)?;
-        (
-            store.get_entity(&entity_id).map_err(McpError::graph)?,
-            FocalAddress::EntityId,
-        )
-    } else if let Some(file) = focal_file.as_deref() {
-        // A location the caller supplied is exact, so a miss is an error
-        // naming what the graph does hold there. Falling back to the name
-        // ranker would answer about a different declaration than the one
-        // addressed, which is the failure this parameter exists to end.
-        match resolve_focal_by_file_line(store, file, focal_line, resolution_query.as_deref())? {
-            Ok(entity) => (Some(entity), FocalAddress::FileLine),
-            Err(miss) => return Err(file_line_focal_error(file, focal_line, miss)),
-        }
-    } else if let Some(query) = resolution_query.as_deref() {
-        (
-            select_best_reference_target(store, query).map_err(McpError::graph)?,
-            FocalAddress::Name(query),
-        )
+        store.get_entity(&entity_id).map_err(McpError::graph)?
+    } else if let Some(query) = get_optional_string_param(args, "query") {
+        select_best_reference_target(store, &query).map_err(McpError::graph)?
     } else {
         return Err(McpError::InvalidParams(
-            "missing required parameter: entity_id, file, or query".into(),
+            "missing required parameter: entity_id or query".into(),
         ));
     };
-    let addressed_by_name = matches!(focal_address, FocalAddress::Name(_));
 
     let Some(target) = target else {
         return Ok(ToolCallResult::error(FIND_REFERENCES_FOCAL_MISS));
@@ -3187,7 +3149,15 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // `semantic_search` for the same string returned six. An ambiguity counter
     // pinned at one is worse than no counter: a reader who checks it is handed
     // an explicit assurance that there was nothing to disambiguate (FIR-2475).
-    let resolution = focal_resolution_addressed(store, &target, focal_address)?;
+    let resolution = focal_resolution_for(
+        store,
+        &target,
+        if addressed_by_name {
+            resolution_query.as_deref()
+        } else {
+            None
+        },
+    )?;
     let same_name_candidates = resolution["same_name_candidates"].as_u64().unwrap_or(1);
     result["focal_resolution"] = resolution;
     if addressed_by_name && same_name_candidates > 1 {
@@ -5941,200 +5911,6 @@ fn query_resolution_candidates<G: GraphStore>(
     Ok((count, others))
 }
 
-/// How the caller addressed the focal entity this answer describes.
-///
-/// The three forms are not interchangeable and the response has to say which
-/// one it is, because each carries a different claim about ambiguity. A name is
-/// a guess the resolver settled; an id is the caller's own choice; a file and
-/// line is a location the graph either holds one declaration for or does not.
-#[derive(Debug, Clone, Copy)]
-pub enum FocalAddress<'a> {
-    /// An exact entity id. The caller already chose.
-    EntityId,
-    /// A symbol name the resolver ranked. Carries the caller's own string,
-    /// because the ambiguity count is only honest against what was typed.
-    Name(&'a str),
-    /// A repository-relative file and a declaration line. Exact by
-    /// construction: at most one declaration starts on a given line.
-    FileLine,
-}
-
-/// Why a file-and-line address did not land on a declaration.
-///
-/// A miss is reported rather than quietly downgraded to the name ranker. Pinning
-/// is the whole point of the address, and a silent fall back to the ranked
-/// winner would hand the caller the same unannounced guess it asked to avoid,
-/// under a parameter whose presence says it did not want one.
-pub enum FileLineFocalMiss {
-    /// The graph holds no entity for that path at all.
-    UnknownFile,
-    /// The path is known but nothing is declared at or around that line. Names
-    /// the lines that are declared, so the caller can correct by one hop.
-    NoDeclarationAtLine { declared_lines: Vec<u32> },
-    /// A file and a name, no line, and the file holds several of that name.
-    AmbiguousInFile { candidates: Vec<kin_model::Entity> },
-}
-
-/// Resolve the focal entity a repository-relative `file` and optional `line`
-/// address, optionally checked against a `name`.
-///
-/// The address every one of these questions actually arrives in is a location:
-/// "the declaration at pkg/cmd/issue/list/list.go:123". Before this existed the
-/// only exact address was an entity id, which a caller can only get from a
-/// second tool call, and which it can only match to the location it was given
-/// if it also knows that Kin stores a method under a receiver-qualified name
-/// (`App.List`, not `List`). Measured on the gh CLI corpus on 2026-09-17, six
-/// questions of exactly that shape scored F1 0.1702 addressed by name and
-/// 0.7895 addressed by the entity declared at the line, on one graph and one
-/// binary, so the whole of that gap was addressing.
-///
-/// `line` is matched against the declaration's own `start_line` first. A line
-/// inside the body still resolves, to the innermost declaration whose span
-/// contains it, because a caller reading a stack trace or a diff hunk has a line
-/// in the body rather than the signature.
-fn resolve_focal_by_file_line<G: GraphStore>(
-    store: &G,
-    file: &str,
-    line: Option<u32>,
-    name: Option<&str>,
-) -> Result<std::result::Result<kin_model::Entity, FileLineFocalMiss>> {
-    let file_id = kin_model::ids::FilePathId::new(file.to_string());
-    let entities = store
-        .query_entities(&EntityFilter {
-            file_path: Some(file_id),
-            ..Default::default()
-        })
-        .map_err(McpError::graph)?;
-    if entities.is_empty() {
-        return Ok(Err(FileLineFocalMiss::UnknownFile));
-    }
-
-    // A name check narrows but never decides alone: a receiver-qualified method
-    // name ends with the bare name the caller wrote.
-    let name_matches = |entity: &kin_model::Entity| match name {
-        None => true,
-        Some(wanted) => {
-            entity.name == wanted
-                || entity.name.ends_with(&format!(".{wanted}"))
-                || entity.name.ends_with(&format!("::{wanted}"))
-        }
-    };
-
-    let Some(line) = line else {
-        let mut named: Vec<_> = entities.into_iter().filter(name_matches).collect();
-        return Ok(match named.len() {
-            0 => Err(FileLineFocalMiss::UnknownFile),
-            1 => Ok(named.remove(0)),
-            _ => Err(FileLineFocalMiss::AmbiguousInFile { candidates: named }),
-        });
-    };
-
-    // The declaration line, not the span start: a span opens on the first doc
-    // comment or attribute, and a caller who writes list.go:123 means the line
-    // the declaration is written on. `entity_presentation_start_line` is the
-    // same reading `list_file_entities` publishes, so the line a caller reads
-    // out of one tool addresses the same entity in this one.
-    let start_of = entity_presentation_start_line;
-    let end_of = entity_presentation_end_line;
-
-    // Exact declaration line wins outright, and a name check only breaks a tie
-    // between two entities that start on one line.
-    let mut exact: Vec<_> = entities
-        .iter()
-        .filter(|entity| start_of(entity) == Some(line))
-        .cloned()
-        .collect();
-    if exact.len() > 1 {
-        let narrowed: Vec<_> = exact.iter().filter(|e| name_matches(e)).cloned().collect();
-        if !narrowed.is_empty() {
-            exact = narrowed;
-        }
-    }
-    if let Some(found) = exact.into_iter().next() {
-        return Ok(Ok(found));
-    }
-
-    // Otherwise the innermost declaration whose span contains the line.
-    let containing = entities
-        .iter()
-        .filter(|entity| match (start_of(entity), end_of(entity)) {
-            (Some(start), Some(end)) => start <= line && line <= end,
-            _ => false,
-        })
-        .filter(|entity| name_matches(entity))
-        .min_by_key(|entity| match (start_of(entity), end_of(entity)) {
-            (Some(start), Some(end)) => end.saturating_sub(start),
-            _ => u32::MAX,
-        })
-        .cloned();
-    if let Some(found) = containing {
-        return Ok(Ok(found));
-    }
-
-    let mut declared_lines: Vec<u32> = entities
-        .iter()
-        .filter(|entity| name_matches(entity))
-        .filter_map(start_of)
-        .collect();
-    declared_lines.sort_unstable();
-    declared_lines.dedup();
-    declared_lines.truncate(RESOLUTION_CANDIDATES_LISTED_MAX);
-    Ok(Err(FileLineFocalMiss::NoDeclarationAtLine {
-        declared_lines,
-    }))
-}
-
-/// Turn a file-and-line miss into a refusal that says what the graph does hold.
-///
-/// Every arm names the next call that would work. A caller that addressed a
-/// location and got "not found" back has no way to tell an unindexed file from
-/// a line it read off a stale diff, and the graph knows which it is.
-fn file_line_focal_error(file: &str, line: Option<u32>, miss: FileLineFocalMiss) -> McpError {
-    match miss {
-        FileLineFocalMiss::UnknownFile => McpError::InvalidParams(format!(
-            "this graph holds no declaration for file {file:?}. Check the repository-relative \
-             path, or call list_file_entities on it to see what the graph holds"
-        )),
-        FileLineFocalMiss::NoDeclarationAtLine { declared_lines } => {
-            let listed = declared_lines
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let at = line.map(|l| l.to_string()).unwrap_or_default();
-            if listed.is_empty() {
-                McpError::InvalidParams(format!(
-                    "{file}:{at} is not a declaration this graph holds, and no declaration in \
-                     that file matches the name given. Call list_file_entities on {file:?} to \
-                     see what it holds"
-                ))
-            } else {
-                McpError::InvalidParams(format!(
-                    "{file}:{at} is not a declaration this graph holds. Declarations in that \
-                     file start at lines {listed}. Call list_file_entities on {file:?} for the \
-                     whole list"
-                ))
-            }
-        }
-        FileLineFocalMiss::AmbiguousInFile { candidates } => {
-            let listed = candidates
-                .iter()
-                .take(RESOLUTION_CANDIDATES_LISTED_MAX)
-                .map(|entity| match entity_presentation_start_line(entity) {
-                    Some(line) => format!("{} at line {line}", entity.name),
-                    None => entity.name.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            McpError::InvalidParams(format!(
-                "{} declarations in {file:?} match that name, so the file alone does not pin \
-                 one: {listed}. Add line beside file to choose",
-                candidates.len()
-            ))
-        }
-    }
-}
-
 /// The `focal_resolution` block, for every surface that resolves a focal and
 /// then answers about it.
 ///
@@ -6156,26 +5932,8 @@ pub fn focal_resolution_for<G: GraphStore>(
     target: &kin_model::Entity,
     query: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let address = match query {
-        Some(query) => FocalAddress::Name(query),
-        None => FocalAddress::EntityId,
-    };
-    focal_resolution_addressed(store, target, address)
-}
-
-/// [`focal_resolution_for`], told how the caller addressed the focal.
-///
-/// The `addressed_by` field is what a reader checks before trusting the answer
-/// is about the entity they meant, so it has to name the address that was
-/// actually used. A file-and-line pin reported as `entity_id` would be a
-/// truthful-sounding field describing a call that never carried one.
-pub fn focal_resolution_addressed<G: GraphStore>(
-    store: &G,
-    target: &kin_model::Entity,
-    address: FocalAddress<'_>,
-) -> Result<serde_json::Value> {
-    let (same_name_candidates, other_candidates, matched_by) = match address {
-        FocalAddress::Name(query) => {
+    let (same_name_candidates, other_candidates, matched_by) = match query {
+        Some(query) => {
             let (count, others) = query_resolution_candidates(store, query, &target.id)?;
             (count, others, "query_name_pattern")
         }
@@ -6183,21 +5941,13 @@ pub fn focal_resolution_addressed<G: GraphStore>(
         // ambiguity to report. What still applies is the twin question: a name
         // the graph holds twice (two cfg arms admitted as distinct entities)
         // means an edge the extractor could not attribute sits on neither.
-        //
-        // A file-and-line pin is exact for the same reason and reports the same
-        // twin count: the location chose the entity, so nothing was guessed,
-        // but a name the graph holds twice is still a fact about the graph.
-        FocalAddress::EntityId | FocalAddress::FileLine => {
+        None => {
             let count = same_name_entity_count(store, &target.name)?;
             (count, Vec::new(), "exact_focal_name")
         }
     };
     Ok(serde_json::json!({
-        "addressed_by": match address {
-            FocalAddress::Name(_) => "name",
-            FocalAddress::EntityId => "entity_id",
-            FocalAddress::FileLine => "file_line",
-        },
+        "addressed_by": if query.is_some() { "name" } else { "entity_id" },
         "same_name_candidates": same_name_candidates,
         // Which rule produced the number. Without it the same field means two
         // different things depending on how the call was addressed, and a
@@ -9611,236 +9361,6 @@ mod tests {
                 .as_array()
                 .is_none_or(|entries| entries.iter().all(|e| e["reason"] != "ambiguous_name")),
             "a pinned address is not an ambiguous one: {body}"
-        );
-    }
-
-    /// Put an entity at a 1-based declaration line, the way a caller reads one
-    /// out of a stack trace, a diff hunk or `list_file_entities`.
-    ///
-    /// The graph stores lines 0-based and presents them 1-based, so a fixture
-    /// that sets the raw span is asserting against the wrong number by one.
-    /// This takes the presented line and stores what produces it.
-    fn at_line(mut entity: Entity, presented_start: u32, presented_end: u32) -> Entity {
-        let file = entity
-            .file_origin
-            .clone()
-            .expect("a declaration needs a file to be addressed in");
-        entity.span = Some(kin_model::entity::SourceSpan {
-            file,
-            start_byte: 0,
-            end_byte: 0,
-            start_line: presented_start - 1,
-            start_col: 0,
-            end_line: presented_end - 1,
-            end_col: 0,
-        });
-        entity
-    }
-
-    /// A file and a line pin the declaration the caller meant, even when the
-    /// name ranker prefers a different one.
-    ///
-    /// This is the shape every "who calls this" question actually arrives in:
-    /// the asker names a location, not an id. Measured on the gh CLI corpus on
-    /// 2026-09-17, `find_references(query: "listRun")` resolved the twin in
-    /// `pkg/cmd/repo/list/list.go` because the ranker breaks an exact-name tie
-    /// on incoming call count, and returned five references, none of which were
-    /// the three the compiler gold holds for the declaration the question named.
-    /// The most-referenced twin winning is exactly backwards for a question that
-    /// already says which one it means.
-    #[tokio::test]
-    async fn find_references_pinned_by_file_and_line_beats_the_ranked_twin() {
-        let store = InMemoryGraph::new();
-        let wanted = at_line(
-            make_entity_in(LanguageId::Go, "listRun", "pkg/cmd/issue/list/list.go"),
-            123,
-            140,
-        );
-        let ranked_twin = at_line(
-            make_entity_in(LanguageId::Go, "listRun", "pkg/cmd/repo/list/list.go"),
-            79,
-            95,
-        );
-        // Callers that make the twin win the ranker's incoming-reference tie.
-        let twin_caller_one = make_entity_in(
-            LanguageId::Go,
-            "NewCmdRepoList",
-            "pkg/cmd/repo/list/list.go",
-        );
-        let twin_caller_two = make_entity_in(
-            LanguageId::Go,
-            "TestRepoList_tty",
-            "pkg/cmd/repo/list/list_test.go",
-        );
-        let wanted_caller = make_entity_in(
-            LanguageId::Go,
-            "NewCmdIssueList",
-            "pkg/cmd/issue/list/list.go",
-        );
-        for entity in [
-            &wanted,
-            &ranked_twin,
-            &twin_caller_one,
-            &twin_caller_two,
-            &wanted_caller,
-        ] {
-            store.upsert_entity(entity).unwrap();
-        }
-        for (src, dst) in [
-            (&twin_caller_one, &ranked_twin),
-            (&twin_caller_two, &ranked_twin),
-            (&wanted_caller, &wanted),
-        ] {
-            store
-                .upsert_relation(&make_relation(src.id, dst.id, RelationKind::Calls))
-                .unwrap();
-        }
-
-        // Control: the bare name really does resolve to the other one here, or
-        // this test cannot fail.
-        let by_name = HashMap::from([("query".to_string(), serde_json::json!("listRun"))]);
-        let ranked = parsed_response(
-            &handle_find_references(&by_name, &store, None)
-                .await
-                .unwrap(),
-        );
-        assert_eq!(
-            ranked["focal_entity"]["file_path"], "pkg/cmd/repo/list/list.go",
-            "control: the ranker must prefer the twin, or the pin proves nothing: {ranked}"
-        );
-
-        let args = HashMap::from([
-            ("query".to_string(), serde_json::json!("listRun")),
-            (
-                "file".to_string(),
-                serde_json::json!("pkg/cmd/issue/list/list.go"),
-            ),
-            ("line".to_string(), serde_json::json!(123)),
-        ]);
-        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
-
-        assert_eq!(
-            body["focal_entity"]["id"].as_str().unwrap(),
-            wanted.id.to_string(),
-            "the location the caller named must choose the focal: {body}"
-        );
-        assert_eq!(
-            body["focal_resolution"]["addressed_by"], "file_line",
-            "a reader checks this field before trusting the answer is about their entity: {body}"
-        );
-        assert_eq!(
-            body["focal_resolution"]["matched"], "exact_focal_name",
-            "a pinned location guessed nothing, so it counts twins, not query matches: {body}"
-        );
-        assert!(
-            body["degradations"]
-                .as_array()
-                .is_none_or(|entries| entries.iter().all(|e| e["reason"] != "ambiguous_name")),
-            "nothing was ambiguous once the caller pinned the line: {body}"
-        );
-    }
-
-    /// A line inside the body resolves to the declaration containing it.
-    ///
-    /// A caller reading a stack frame or a diff hunk holds a line in the body,
-    /// not the signature, and refusing that would make the parameter useless
-    /// for the two places a line most often comes from.
-    #[tokio::test]
-    async fn a_line_inside_the_body_resolves_to_its_declaration() {
-        let store = InMemoryGraph::new();
-        let outer = at_line(
-            make_entity_in(LanguageId::Go, "listRun", "pkg/cmd/issue/list/list.go"),
-            123,
-            140,
-        );
-        store.upsert_entity(&outer).unwrap();
-
-        let args = HashMap::from([
-            (
-                "file".to_string(),
-                serde_json::json!("pkg/cmd/issue/list/list.go"),
-            ),
-            ("line".to_string(), serde_json::json!(131)),
-        ]);
-        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
-        assert_eq!(
-            body["focal_entity"]["id"].as_str().unwrap(),
-            outer.id.to_string(),
-            "a body line belongs to the declaration whose span holds it: {body}"
-        );
-    }
-
-    /// A file and line that pin nothing is refused, never quietly answered by
-    /// the name ranker.
-    ///
-    /// The silent fall back is the whole bug this parameter exists to end. A
-    /// caller that supplied a location asked NOT to be handed a ranked guess,
-    /// so answering about a different declaration under a parameter whose
-    /// presence rejects guessing would be worse than the behaviour before it.
-    #[tokio::test]
-    async fn a_file_and_line_that_pins_nothing_is_refused_rather_than_ranked() {
-        let store = InMemoryGraph::new();
-        let elsewhere = at_line(
-            make_entity_in(LanguageId::Go, "listRun", "pkg/cmd/repo/list/list.go"),
-            79,
-            95,
-        );
-        let here = at_line(
-            make_entity_in(LanguageId::Go, "listRun", "pkg/cmd/issue/list/list.go"),
-            123,
-            140,
-        );
-        for entity in [&elsewhere, &here] {
-            store.upsert_entity(entity).unwrap();
-        }
-
-        let args = HashMap::from([
-            ("query".to_string(), serde_json::json!("listRun")),
-            (
-                "file".to_string(),
-                serde_json::json!("pkg/cmd/issue/list/list.go"),
-            ),
-            ("line".to_string(), serde_json::json!(999)),
-        ]);
-        let error = handle_find_references(&args, &store, None)
-            .await
-            .expect_err("a location that pins nothing must refuse");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("999") && rendered.contains("123"),
-            "the refusal must name the line asked for and the lines the file holds: {rendered}"
-        );
-        assert!(
-            !rendered.contains("pkg/cmd/repo/list/list.go"),
-            "a refusal must not have answered about the other twin: {rendered}"
-        );
-    }
-
-    /// A line with no file beside it is refused rather than ignored.
-    ///
-    /// The schema accepts unknown keys, so a line silently dropped would read to
-    /// the caller as a pin that was honoured, and the answer would be the ranked
-    /// guess wearing a pinned caller's confidence.
-    #[tokio::test]
-    async fn a_line_without_a_file_is_refused() {
-        let store = InMemoryGraph::new();
-        let entity = at_line(
-            make_entity_in(LanguageId::Go, "listRun", "pkg/cmd/issue/list/list.go"),
-            123,
-            140,
-        );
-        store.upsert_entity(&entity).unwrap();
-
-        let args = HashMap::from([
-            ("query".to_string(), serde_json::json!("listRun")),
-            ("line".to_string(), serde_json::json!(123)),
-        ]);
-        let error = handle_find_references(&args, &store, None)
-            .await
-            .expect_err("a line with nothing to be a line in must refuse");
-        assert!(
-            error.to_string().contains("file"),
-            "the refusal must name what is missing: {error}"
         );
     }
 
