@@ -533,6 +533,30 @@ pub struct GraphState {
     /// Daemon `/health` reconciliation status (e.g. `"clean"`, `"reconciling"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_status: Option<String>,
+    /// What an idle loop left behind, which is a different question from whether
+    /// a pass is running.
+    ///
+    /// The status word above answers "is a pass running right now". It is
+    /// `idle` when the loop finished with nothing left to do, and it is also
+    /// `idle` when the loop stopped with host paths graph truth still does not
+    /// hold, because the loop's own backlog predicate counts queued events and a
+    /// path it declined is deliberately in neither queue
+    /// (`admit_file_event_with_exact_tree` explains why: a deferral there is a
+    /// promise the ladder cannot keep). Measured on a store 942 commits behind
+    /// its checkout, the daemon admitted 1,043 of 1,403 files and went back to
+    /// `idle` while every answer still reported unadmitted bytes.
+    ///
+    /// So the outcome is published beside the status rather than folded into it.
+    /// Folding it in was considered and refused: two callers branch on the word
+    /// `idle` for lifecycle rather than for display
+    /// (`daemon::work_would_be_lost_by_shutdown` and the supervisor's reaper
+    /// probe), and a fourth status value would make a daemon with unadmitted
+    /// paths never idle out and never be reaped.
+    ///
+    /// Absent while a pass is running or parked, because the status word already
+    /// says so and a second field repeating it is a second thing to keep in step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_outcome: Option<String>,
     /// Daemon-reported entity count at answer time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity_count: Option<u64>,
@@ -552,9 +576,62 @@ pub struct GraphState {
     pub initialized: Option<bool>,
 }
 
+/// What an idle reconciliation loop left behind, or `None` while one is running.
+///
+/// Read from the walk the daemon has already published rather than from a second
+/// measurement: `/health`'s `reconcile` block carries `untracked_path_count`,
+/// the count of host paths the last complete scan saw that repository authority
+/// does not track, and it is written by the same pass that stores the idle
+/// status. So the number needed to tell a finished loop from a stopped one was
+/// already in the same response as the word that could not tell them apart.
+///
+/// Three outcomes, because a zero has two producers and only one of them is an
+/// all-clear, which is the distinction [`GraphBehind::from_health`] already
+/// draws one object over. A count nobody took is not a zero.
+fn idle_outcome(status: &str, health: &Value) -> Option<String> {
+    if !status.eq_ignore_ascii_case(RECONCILIATION_IDLE) {
+        return None;
+    }
+    let reconcile = health.get("reconcile")?;
+    let unadmitted = reconcile
+        .get("untracked_path_count")
+        .and_then(Value::as_u64)?;
+    let measured = reconcile
+        .get("untracked_observed_age_seconds")
+        .and_then(Value::as_u64)
+        .is_some();
+    let not_applicable = reconcile
+        .get("untracked_observation_not_applicable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(
+        match (unadmitted, measured || not_applicable) {
+            (0, true) => RECONCILIATION_SETTLED,
+            (0, false) => RECONCILIATION_UNMEASURED,
+            _ => RECONCILIATION_WORK_OUTSTANDING,
+        }
+        .to_string(),
+    )
+}
+
+/// The status word this outcome qualifies. One spelling, read rather than
+/// repeated, so the two cannot come apart.
+const RECONCILIATION_IDLE: &str = "idle";
+/// A pass finished and the walk beside it found no host path graph truth has
+/// not taken.
+const RECONCILIATION_SETTLED: &str = "settled";
+/// A pass finished with host paths still outstanding. `kin admit` completes it;
+/// the loop will not, because the paths it declined are in neither of the queues
+/// its backlog predicate counts.
+const RECONCILIATION_WORK_OUTSTANDING: &str = "work_outstanding";
+/// A pass finished and nothing measured the working copy, so whether work
+/// remains is unknown. Not an all-clear and not a backlog.
+const RECONCILIATION_UNMEASURED: &str = "unmeasured";
+
 impl GraphState {
     fn is_empty(&self) -> bool {
         self.reconciliation_status.is_none()
+            && self.reconciliation_outcome.is_none()
             && self.entity_count.is_none()
             && self.entity_count_scope.is_none()
             && self.loaded.is_none()
@@ -883,10 +960,17 @@ impl GraphBehind {
                  told apart from content the graph has not taken yet"
             );
         }
+        // The command is named, not implied. This object's own doc one screen up
+        // already says a count "still sends a reader to `kin admit`", and the
+        // string it produced said no such thing, so the reader was told the graph
+        // was behind and left to work out what closes the gap. `kin admit` is the
+        // one that does: it takes the complete exact working tree into graph
+        // authority, which is precisely the case "waiting for churn that is not
+        // coming" describes.
         format!(
             "graph_behind_working_tree: {} host path(s) on disk have never been admitted and \
              {clock}, so an absence here cannot be told apart from content the graph has not \
-             taken yet",
+             taken yet; `kin admit` takes the complete working tree now",
             self.unadmitted_paths
         )
     }
@@ -2506,6 +2590,7 @@ impl Envelope {
         }
         if let Some(value) = health.get("reconciliation_status").and_then(Value::as_str) {
             self.graph_state.reconciliation_status = Some(value.to_string());
+            self.graph_state.reconciliation_outcome = idle_outcome(value, health);
         }
         if let Some(value) = health.get("graph_entity_count").and_then(Value::as_u64) {
             self.graph_state.entity_count = Some(value);
@@ -3865,6 +3950,98 @@ mod tests {
             "a working copy nobody measured cannot report its work recorded: {durability:?}"
         );
         assert_eq!(durability.live_only_entities, None);
+    }
+
+    /// A loop that stopped with work outstanding does not read like one that
+    /// finished, and the reply names what finishes it.
+    ///
+    /// The status word is `idle` in both arms here, because it is the same word
+    /// for both states and this change does not touch it: two callers branch on
+    /// it for lifecycle rather than for display, and a fourth status value would
+    /// make a daemon with unadmitted paths never idle out and never be reaped.
+    /// So the outcome is a field beside it, computed from the walk the same
+    /// `/health` body already carries.
+    ///
+    /// Measured shape: a store 942 commits behind its checkout, where the daemon
+    /// admitted 1,043 of 1,403 files and returned to `idle` with the rest
+    /// outstanding.
+    #[test]
+    fn an_idle_loop_that_stopped_with_work_outstanding_says_so_and_names_the_command() {
+        let health = |untracked: u64, measured: bool| {
+            let mut reconcile = serde_json::json!({ "untracked_path_count": untracked });
+            if measured {
+                reconcile["untracked_observed_age_seconds"] = serde_json::json!(2);
+            }
+            serde_json::json!({
+                "graph_entity_count": 6082,
+                "durable_entity_count": 6082,
+                "graph_relation_count": 69713,
+                "durable_relation_count": 69713,
+                "graph_loaded": true,
+                "initialized": true,
+                "reconciliation_status": "idle",
+                "reconcile": reconcile,
+            })
+        };
+
+        let outstanding = Envelope::daemon().with_health(&health(360, true));
+        assert_eq!(
+            outstanding.graph_state.reconciliation_status.as_deref(),
+            Some("idle"),
+            "the status word is unchanged, which is the point"
+        );
+        assert_eq!(
+            outstanding.graph_state.reconciliation_outcome.as_deref(),
+            Some("work_outstanding"),
+            "a loop that stopped with paths outstanding is not a loop that finished"
+        );
+        let behind = outstanding
+            .behind
+            .as_ref()
+            .expect("360 unadmitted paths are a count");
+        assert!(
+            behind.limiting_factor().contains("kin admit"),
+            "the reply has to name the command that completes the repair: {}",
+            behind.limiting_factor()
+        );
+
+        // The control. Same status word, same shape of body, nothing left over,
+        // and it must not borrow the outstanding arm's words or the disclosure
+        // would fire on every healthy daemon and mean nothing.
+        let settled = Envelope::daemon().with_health(&health(0, true));
+        assert_eq!(
+            settled.graph_state.reconciliation_status.as_deref(),
+            Some("idle")
+        );
+        assert_eq!(
+            settled.graph_state.reconciliation_outcome.as_deref(),
+            Some("settled")
+        );
+        assert!(
+            settled.behind.is_none(),
+            "a measured zero is silence, not a count: {:?}",
+            settled.behind
+        );
+
+        // A zero nobody took is neither. It is the third producer of a zero, and
+        // reporting it as settled would be the same silent all-clear one field
+        // over.
+        let unmeasured = Envelope::daemon().with_health(&health(0, false));
+        assert_eq!(
+            unmeasured.graph_state.reconciliation_outcome.as_deref(),
+            Some("unmeasured")
+        );
+
+        // While a pass is running the status word already answers, so the
+        // outcome stays absent rather than repeating it.
+        let mut running_body = health(360, true);
+        running_body["reconciliation_status"] = serde_json::json!("processing");
+        let running = Envelope::daemon().with_health(&running_body);
+        assert_eq!(
+            running.graph_state.reconciliation_status.as_deref(),
+            Some("processing")
+        );
+        assert_eq!(running.graph_state.reconciliation_outcome, None);
     }
 
     /// One enumeration, five host readings, and the three that are not a

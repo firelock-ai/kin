@@ -56141,6 +56141,10 @@ mod tests {
         let mut envelope = kin_mcp::Envelope::daemon();
         envelope.graph_state = kin_mcp::envelope::GraphState {
             reconciliation_status: Some("clean".to_string()),
+            // Not `idle`, so no outcome is derived: this fixture is about the
+            // disclosure the payload carries, not about what a finished loop
+            // left behind.
+            reconciliation_outcome: None,
             entity_count: Some(2),
             entity_count_scope: None,
             loaded: Some(true),

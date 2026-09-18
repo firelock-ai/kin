@@ -1914,7 +1914,7 @@ mod tests {
         );
         assert!(
             crate::verdict::CLAUSE_CODES.iter().any(|entry| {
-                entry.code == "file_bytes_unadmitted" && entry.meaning.contains("kin reconcile")
+                entry.code == "file_bytes_unadmitted" && entry.meaning.contains("kin admit")
             }),
             "and the code's one written meaning must name the remedy the caller can act on"
         );
