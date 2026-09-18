@@ -3163,6 +3163,43 @@ fn stamp_edge_coverage_limits(map: &mut serde_json::Map<String, Value>, limits: 
     );
 }
 
+/// The `_kin` an `answer_only` reply carries: the verdict, and nothing else.
+///
+/// `_kin.verdict` is the one field this server's instructions tell an agent to
+/// read first, and it is what stops a row list reading as a complete set. It
+/// costs 143 characters of the 2,245 an answer-only reply measures across the 75
+/// replies of the 0.7.20 Go study, so there is no version of "the answer alone"
+/// worth dropping it for. `inputs` goes with the rest: it is the working, and
+/// `limiting_factor` already names what stopped the walk.
+///
+/// `negative` is not attached. Its unique content is prose around the same codes
+/// `verdict.limiting_factor` carries, which is why this file already collapses
+/// `negative.advice` into a pointer once a response is over its ceiling. A
+/// caller who wants those sentences omits the parameter and gets them.
+///
+/// `shape` is what tells a reader this is a narrowed reply rather than a whole
+/// one that happened to carry little. Without it an agent cannot tell the two
+/// apart, and the one it must not do is conclude an absence from a reply that
+/// was never carrying the evidence for one.
+fn answer_only_envelope(envelope_value: &Value) -> Value {
+    const KEPT: [&str; 3] = ["state", "safe_to_conclude_absent", "limiting_factor"];
+    let mut verdict = Map::new();
+    if let Some(full) = envelope_value.get("verdict").and_then(Value::as_object) {
+        for key in KEPT {
+            if let Some(value) = full.get(key) {
+                verdict.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let mut envelope = Map::new();
+    envelope.insert(
+        "shape".to_string(),
+        Value::String(crate::budget::ANSWER_ONLY_PARAM.to_string()),
+    );
+    envelope.insert("verdict".to_string(), Value::Object(verdict));
+    Value::Object(envelope)
+}
+
 fn annotate_block(
     block: ContentBlock,
     envelope_value: &Value,
@@ -3172,16 +3209,35 @@ fn annotate_block(
     edge_coverage_limits: &[String],
 ) -> ContentBlock {
     let ContentBlock::Text { text } = block;
+    let answer_only = budget.answer_only && tool_name == "find_references";
     let annotated = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut map)) => {
             stamp_edge_coverage_limits(&mut map, edge_coverage_limits);
-            map.entry(ENVELOPE_KEY.to_string())
-                .or_insert_with(|| envelope_value.clone());
-            if let Some(negative) = negative {
-                map.entry(crate::negative::NEGATIVE_KEY.to_string())
-                    .or_insert_with(|| negative.clone());
+            if answer_only {
+                // Narrowed HERE, after `finalize_bounded` computed the verdict
+                // from the whole payload. The blocks this drops are the blocks
+                // the verdict was computed from, so narrowing any earlier would
+                // hand the caller a verdict nothing had checked.
+                let mut value = Value::Object(map);
+                crate::handlers::entities::project_answer_only(&mut value);
+                map = match value {
+                    Value::Object(map) => map,
+                    _ => unreachable!("projection keeps an object an object"),
+                };
+                map.insert(
+                    ENVELOPE_KEY.to_string(),
+                    answer_only_envelope(envelope_value),
+                );
+                Value::Object(map)
+            } else {
+                map.entry(ENVELOPE_KEY.to_string())
+                    .or_insert_with(|| envelope_value.clone());
+                if let Some(negative) = negative {
+                    map.entry(crate::negative::NEGATIVE_KEY.to_string())
+                        .or_insert_with(|| negative.clone());
+                }
+                Value::Object(map)
             }
-            Value::Object(map)
         }
         Ok(other) => {
             let mut map = Map::new();

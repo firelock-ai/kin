@@ -2325,6 +2325,62 @@ pub(crate) const INTERFACE_DISPATCH_CANDIDATES_REASON: &str = "interface_dispatc
 /// Key the interface-dispatch block is published under.
 pub(crate) const INTERFACE_DISPATCH_KEY: &str = "interface_dispatch";
 
+/// What an `answer_only` reply keeps, and nothing else keeps.
+///
+/// Read this list as the answer to one question: what would a reader of these
+/// rows get wrong if this key were gone.
+///
+/// `references` is the answer. `focal_entity` says what the rows are about, and
+/// without it a row list is unattributable. `relation_kinds` says which classes
+/// were searched. `total_upstream` is the headline count and `unconfirmed_
+/// candidates` is the number held out of it, which is the cheapest thing in the
+/// payload that tells a reader the headline is a floor. `degradations` is where
+/// a held-out count is stated in words. `truncated`, `references_withheld` and
+/// `elisions` are the budget's own disclosure channel, and dropping those would
+/// let a bounded answer ship silently, which is the defect the budget exists to
+/// prevent.
+///
+/// Everything else goes: `candidates`, `interface_dispatch`, `cross_repo`,
+/// `edge_coverage`, `caller_arrival`, `counts` and `focal_resolution`. None of
+/// them is deleted from the tool, and a caller who wants them omits this
+/// parameter and gets the whole reply, which is what makes this selection rather
+/// than removal.
+const ANSWER_ONLY_KEYS: [&str; 9] = [
+    "focal_entity",
+    "relation_kinds",
+    "total_upstream",
+    "unconfirmed_candidates",
+    "references",
+    "truncated",
+    "references_withheld",
+    crate::budget::ELISIONS_KEY,
+    "degradations",
+];
+
+/// Narrow a finished reply to the answer and what qualifies it.
+///
+/// Called by the envelope, not here, and the ordering is the whole point. This
+/// reply is built WHOLE and then narrowed, rather than built narrow: the verdict
+/// an `answer_only` reply keeps is computed from `edge_coverage`,
+/// `caller_arrival`, `cross_repo` and the withheld-candidate partition, so a
+/// reply that had skipped building them would carry a verdict it had not earned.
+/// What the caller asks to be spared is the bytes, not the checking.
+///
+/// A caller asking for the answer alone is asking for bytes, so the reply is
+/// serialized compactly: pretty printing was 14% of the payload across the 75
+/// measured replies. `crate::budget::render` strips that control field on the
+/// way out.
+pub(crate) fn project_answer_only(result: &mut serde_json::Value) {
+    let Some(map) = result.as_object_mut() else {
+        return;
+    };
+    map.retain(|key, _| ANSWER_ONLY_KEYS.contains(&key.as_str()));
+    map.insert(
+        crate::budget::JSON_FORMAT_KEY.to_string(),
+        serde_json::json!("compact"),
+    );
+}
+
 /// How many candidate rows an answered dispatch question produced.
 ///
 /// Zero for every outcome that is not a list of them, including the one where
@@ -8723,6 +8779,79 @@ mod tests {
         );
     }
 
+    /// Every row-bearing list a `find_references` reply carries, named against
+    /// the response budget's own shape table.
+    ///
+    /// A list is row-bearing when its entries are entity rows, and that is what
+    /// ties this to the defect: a list of entity rows grows with the repository,
+    /// so one the budget cannot count is one that can take the answer's room.
+    /// Lists of strings, line numbers and disclosure entries are bounded by the
+    /// question rather than by the graph, and are not the hazard.
+    fn unbudgeted_row_lists(body: &serde_json::Value) -> Vec<String> {
+        let governed = crate::budget::governed_collections("find_references");
+        let rows = |value: &serde_json::Value| -> bool {
+            value
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry.get("entity_id").is_some()))
+        };
+        let mut unbudgeted = Vec::new();
+        let Some(top) = body.as_object() else {
+            return unbudgeted;
+        };
+        for (key, value) in top {
+            if rows(value) && !governed.contains(&key.as_str()) {
+                unbudgeted.push(key.clone());
+            }
+            let Some(block) = value.as_object() else {
+                continue;
+            };
+            for (inner, nested) in block {
+                let path = format!("{key}.{inner}");
+                if rows(nested) && !governed.contains(&path.as_str()) {
+                    unbudgeted.push(path);
+                }
+            }
+        }
+        unbudgeted
+    }
+
+    /// This is the test that would have caught the defect.
+    ///
+    /// The shape table named `references` alone, so the answer was the only
+    /// array the bounder could reach. A reply for `api/queries_repo.go:232` on
+    /// the gh CLI then spent 57,323 characters on `interface_dispatch.candidates`
+    /// and 39,607 on `candidates`, withheld two of its three real reference rows
+    /// with `"reason": "response_budget"` to make room, and shipped 99,799
+    /// characters against a 60,000 ceiling anyway.
+    #[tokio::test]
+    async fn every_row_list_a_reply_carries_is_one_the_budget_can_cut() {
+        let (store, buffer_write, ..) = go_dispatch_graph();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(buffer_write.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        // The fixture has to carry the nested list, or this passes by asserting
+        // nothing about the key the defect was hiding behind.
+        assert!(
+            body[INTERFACE_DISPATCH_KEY]["candidates"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "the fixture must carry dispatch candidates: {body}"
+        );
+        assert!(
+            !body["references"].as_array().unwrap().is_empty(),
+            "the fixture must carry an answer to protect: {body}"
+        );
+        assert_eq!(
+            unbudgeted_row_lists(&body),
+            Vec::<String>::new(),
+            "these lists grow with the repository and the response budget cannot reach them, \
+             so they can take the answer's room: {body}"
+        );
+    }
+
     /// The control the section is worth nothing without, and the control on the
     /// control. A type that misses one contract method satisfies nothing, and
     /// the section still answers, because a section that appears only when it
@@ -13621,8 +13750,156 @@ mod tests {
             max_chars: RESPONSE_MAX_MAX_CHARS,
             compact: false,
             explicit_max_chars: true,
-            envelope_reserve: 0,
+            ..ResponseBudget::default()
         }
+    }
+
+    /// The budget a caller who asked for the answer alone is served under.
+    fn answer_only_budget() -> ResponseBudget {
+        ResponseBudget {
+            answer_only: true,
+            ..ResponseBudget::default()
+        }
+    }
+
+    /// Every block an `answer_only` reply must not carry.
+    const SHED_BY_ANSWER_ONLY: [&str; 7] = [
+        "candidates",
+        INTERFACE_DISPATCH_KEY,
+        "cross_repo",
+        "edge_coverage",
+        "caller_arrival",
+        "counts",
+        "focal_resolution",
+    ];
+
+    /// The parameter serves the answer and the one verdict that qualifies it.
+    ///
+    /// The published Go study compares assembled state: 25,167 bytes through
+    /// text search against 2,241 through Kin. A caller could not get the 2,241
+    /// from the tool, because the envelope shipped on every reply and no
+    /// parameter asked for the answer alone. This is that parameter.
+    #[tokio::test]
+    async fn answer_only_serves_the_answer_and_the_verdict_and_nothing_else() {
+        let (store, buffer_write, ..) = go_dispatch_graph();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(buffer_write.id.to_string()),
+        )]);
+        let whole: serde_json::Value = serde_json::from_str(&client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &ResponseBudget::default(),
+        ))
+        .expect("the whole reply is json");
+        let narrow_text = client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &answer_only_budget(),
+        );
+        let narrow: serde_json::Value =
+            serde_json::from_str(&narrow_text).expect("the narrowed reply is json");
+
+        // The answer is byte-identical. Narrowing selects; it does not re-answer.
+        assert_eq!(
+            narrow["references"], whole["references"],
+            "the answer changed when the caller asked for it alone: {narrow}"
+        );
+        assert_eq!(narrow["total_upstream"], whole["total_upstream"]);
+        assert_eq!(
+            narrow["unconfirmed_candidates"], whole["unconfirmed_candidates"],
+            "the count that says the headline is a floor must survive: {narrow}"
+        );
+
+        // The verdict is the whole reply's verdict, computed from the blocks the
+        // narrowed reply no longer carries. That ordering is the point: a
+        // verdict computed from a stripped payload would be one nothing checked.
+        for field in ["state", "safe_to_conclude_absent", "limiting_factor"] {
+            assert_eq!(
+                narrow["_kin"]["verdict"][field], whole["_kin"]["verdict"][field],
+                "the narrowed reply reports a different `{field}`: {narrow}"
+            );
+        }
+        assert_eq!(
+            narrow["_kin"]["shape"],
+            serde_json::json!("answer_only"),
+            "a narrowed reply must say it is narrowed, or a reader cannot tell it              from a whole one that found little: {narrow}"
+        );
+
+        for key in SHED_BY_ANSWER_ONLY {
+            assert!(
+                narrow.get(key).is_none(),
+                "`{key}` survived a request for the answer alone: {narrow}"
+            );
+        }
+        assert!(
+            narrow.get(crate::negative::NEGATIVE_KEY).is_none(),
+            "the negative block survived: {narrow}"
+        );
+        assert!(
+            narrow["_kin"].get("completeness").is_none()
+                && narrow["_kin"].get("durability").is_none()
+                && narrow["_kin"]["verdict"].get("inputs").is_none(),
+            "the envelope was not reduced to the verdict: {narrow}"
+        );
+        assert!(
+            !narrow_text.contains('\n'),
+            "an answer-only reply is serialized compactly, and pretty printing was              14% of the measured payload"
+        );
+        assert!(
+            narrow_text.len() * 2
+                < client_text(
+                    handle_find_references(&args, &store, None).await.unwrap(),
+                    "find_references",
+                    &ResponseBudget::default(),
+                )
+                .len(),
+            "asking for the answer alone did not materially reduce the reply"
+        );
+    }
+
+    /// A bounded answer-only reply still says what it lost.
+    ///
+    /// The budget's disclosure channel is not a block a caller can trade away:
+    /// a reply that quietly dropped rows AND quietly dropped the record of
+    /// dropping them is the one shape a size cut must never produce.
+    #[tokio::test]
+    async fn answer_only_keeps_the_disclosure_that_the_budget_cut_it() {
+        let (store, focal_id) = wide_store(400);
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        )]);
+        let narrow: serde_json::Value = serde_json::from_str(&client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &ResponseBudget {
+                answer_only: true,
+                max_chars: 6_000,
+                explicit_max_chars: true,
+                ..ResponseBudget::default()
+            },
+        ))
+        .expect("the narrowed reply is json");
+
+        let rows = narrow["references"].as_array().expect("rows").len();
+        assert!(
+            (1..400).contains(&rows),
+            "the fixture must be cut: {rows} rows"
+        );
+        assert_eq!(
+            narrow["total_upstream"],
+            serde_json::json!(400),
+            "the full count must survive the cut: {narrow}"
+        );
+        assert!(
+            narrow["elisions"]["references"]["elided"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "a cut answer-only reply did not publish its elision: {narrow}"
+        );
+        assert_eq!(narrow["references_withheld"], serde_json::json!(400 - rows));
     }
 
     /// Assert one tool's overflow and its bound in the one unit the refusal was

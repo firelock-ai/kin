@@ -52,6 +52,13 @@ use serde_json::{json, Map, Value};
 /// empty.
 pub const RESPONSE_DEFAULT_MAX_CHARS: usize = 45_000;
 
+/// The parameter a caller passes to be served the answer and nothing else.
+///
+/// Read here rather than in the handler because the projection happens in the
+/// envelope, after the verdict has been computed from the whole payload, and
+/// this is the one object both arms already carry.
+pub const ANSWER_ONLY_PARAM: &str = "answer_only";
+
 /// Floor for a caller-supplied budget. Below this the envelope and the
 /// disclosure alone do not fit, so a smaller number could only be honoured by
 /// returning nothing.
@@ -105,6 +112,19 @@ pub struct ResponseBudget {
     pub compact: bool,
     /// True when the caller named a budget rather than taking the default.
     pub explicit_max_chars: bool,
+    /// Whether the caller asked to be served the answer and nothing else.
+    ///
+    /// Beside `compact` because it is the same kind of thing: a size contract
+    /// the caller names, not a change to what was searched. `compact` sheds the
+    /// diagnostics about a hit; this sheds the blocks that qualify the answer as
+    /// a whole, keeping the one verdict that says whether the rows are a floor
+    /// or a total.
+    ///
+    /// Measured over the 75 `find_references` replies of the 0.7.20 Go study: a
+    /// whole reply is 10,541 bytes on the wire and 8,974 re-serialized compactly;
+    /// the same answer alone is 2,245. The blocks it sheds are not removed from
+    /// the tool, and a caller who omits the parameter gets all of them.
+    pub answer_only: bool,
     /// Characters [`ResponseBudget::less_envelope_reserve`] took off a default
     /// budget, or 0 when nothing was reserved.
     ///
@@ -123,6 +143,7 @@ impl Default for ResponseBudget {
         Self {
             max_chars: RESPONSE_DEFAULT_MAX_CHARS,
             compact: true,
+            answer_only: false,
             explicit_max_chars: false,
             envelope_reserve: 0,
         }
@@ -157,6 +178,15 @@ impl ResponseBudget {
                 .get("compact")
                 .and_then(Value::as_bool)
                 .unwrap_or(!explain),
+            // Off by default, and deliberately. The default reply is what makes
+            // a Kin answer auditable, and an agent that never read the tool
+            // description never passes this, so the default is what protects the
+            // caller who does not know to ask. Reaching the knob should cost
+            // knowing what it gives up.
+            answer_only: args
+                .get(ANSWER_ONLY_PARAM)
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             explicit_max_chars: requested.is_some(),
             envelope_reserve: 0,
         }
@@ -437,7 +467,12 @@ pub fn record_elision_for(
 }
 
 /// Internal format choice retained across budget passes and omitted on emission.
-const JSON_FORMAT_KEY: &str = "_kin_json_format";
+///
+/// Visible to the crate because a handler can make the same choice for its own
+/// reason: `find_references` sets it on an `answer_only` reply, where the
+/// caller's whole request is for fewer bytes and pretty printing was 14% of
+/// them.
+pub(crate) const JSON_FORMAT_KEY: &str = "_kin_json_format";
 
 /// Serialize in the budget-selected format without emitting its control field.
 pub fn render(value: &Value) -> serde_json::Result<String> {
@@ -787,6 +822,63 @@ struct ResponseShape {
     narrow_param: &'static str,
 }
 
+/// Split one collection name into the block that holds it and the key inside
+/// that block.
+///
+/// A bare name is a top-level key, which is what every entry in this table was
+/// until a tool turned out to keep a list INSIDE a block rather than beside it.
+/// `find_references` is that tool: the callers it holds back because Go
+/// interface satisfaction is structural are published under
+/// `interface_dispatch.candidates`, one level down, and the sentence this file
+/// already repeats twice -- a key the table does not name is a key the bounder
+/// cannot cut -- held for that list even though the table could have named its
+/// parent, because nothing here could reach through a parent to the array.
+///
+/// One level of nesting, deliberately. A second would want a path grammar, and
+/// a grammar nothing in the table needs is a grammar that only adds ways to be
+/// wrong.
+fn split_collection(key: &str) -> (Option<&str>, &str) {
+    match key.split_once('.') {
+        Some((parent, leaf)) => (Some(parent), leaf),
+        None => (None, key),
+    }
+}
+
+/// The value one collection name points at, or `None` when this response does
+/// not carry it. A nested name whose parent block is absent carries nothing,
+/// which is the same reading a caller gets from the JSON.
+fn collection_of<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
+    match split_collection(key) {
+        (Some(parent), leaf) => payload.get(parent)?.get(leaf),
+        (None, leaf) => payload.get(leaf),
+    }
+}
+
+/// The same, mutably.
+fn collection_of_mut<'a>(payload: &'a mut Value, key: &str) -> Option<&'a mut Value> {
+    match split_collection(key) {
+        (Some(parent), leaf) => payload.get_mut(parent)?.get_mut(leaf),
+        (None, leaf) => payload.get_mut(leaf),
+    }
+}
+
+/// Install a value at a collection name.
+///
+/// A nested name whose parent block is not an object installs nothing. The table
+/// may name a list a given response does not carry -- `interface_dispatch` is
+/// absent unless the dispatch question applies -- and minting the parent to hold
+/// a cut would fabricate a block rather than bound one.
+fn set_collection(payload: &mut Value, key: &str, value: Value) {
+    let (parent, leaf) = split_collection(key);
+    let host = match parent {
+        Some(parent) => payload.get_mut(parent),
+        None => Some(payload),
+    };
+    if let Some(map) = host.and_then(Value::as_object_mut) {
+        map.insert(leaf.to_string(), value);
+    }
+}
+
 /// The retrieval tools this budget governs, and the shape of what each returns.
 ///
 /// Membership is deliberately not "every tool". A tool whose whole purpose is to
@@ -890,8 +982,43 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             bulk_keys: &[],
             narrow_param: "depth",
         },
+        // Every array a `find_references` response carries, ranked by what a
+        // caller loses when it goes, because the ladder trims from the end.
+        //
+        // Naming only `references` was the same defect on this tool, reached by
+        // a third route. `references` is the ANSWER -- the positions the caller
+        // asked for -- and it was the only array the bounder could see, so it
+        // was the only array the bounder could cut. Measured on the published
+        // 0.7.20 over 75 Go queries: the answer was 17.9% of the payload, and
+        // the one reply that went over its ceiling spent 57,323 characters on
+        // `interface_dispatch` and 39,607 on `candidates`, then withheld two of
+        // its three real reference rows with `"reason": "response_budget"` and
+        // returned the survivor in 434. It still shipped 99,799 characters
+        // against a 60,000 ceiling, because the 96,930 it had spent on the two
+        // lists it could not name were not reachable by any rung. The blocks
+        // that were not the answer consumed the budget the answer needed.
+        //
+        // The ranking, most important first:
+        //
+        // `references` is the answer and is cut last.
+        //
+        // `interface_dispatch.candidates` are callers of an interface method the
+        // focal's receiver satisfies. Nothing at the call site proves the
+        // dynamic type, so the payload holds them out of `total_upstream` on
+        // purpose -- but a type-resolved interface edge is still evidence, and
+        // it outranks a match made on a name alone.
+        //
+        // `candidates` sheds first. Each is a same-name match whose destination
+        // nothing at the reference site proves, which is the weakest thing this
+        // response carries; the payload's own comment says never to add them to
+        // `total_upstream`.
+        //
+        // Both lists keep the floor of one entry every cut collection keeps, and
+        // both already publish their true totals in a `call_resolution`
+        // degradation and in `counts`, so a reader of a cut list is not left
+        // inferring the count from the rows.
         "find_references" => ResponseShape {
-            collections: &["references"],
+            collections: &["references", "interface_dispatch.candidates", "candidates"],
             body_keys: &["body", "snippet"],
             explain_keys: &[],
             top_explain_keys: &[],
@@ -1000,7 +1127,7 @@ fn primary_collection(payload: &Value, tool: &str, shape: &ResponseShape) -> Opt
             .collections
             .iter()
             .copied()
-            .find(|key| payload.get(*key).is_some_and(Value::is_array))
+            .find(|key| collection_of(payload, key).is_some_and(Value::is_array))
     })
 }
 
@@ -1086,6 +1213,18 @@ const FILE_ENTITIES_TOOL: &str = crate::handlers::file_entities::TOOL_NAME;
 
 pub fn is_budgeted(tool: &str) -> bool {
     shape_for(tool).is_some()
+}
+
+/// The collection names one tool's shape governs.
+///
+/// Exposed so a handler's own tests can check a real payload against this table
+/// rather than against a second copy of it. A tool that grows a row-bearing list
+/// the table does not name grows a list the bounder cannot cut, which is the
+/// defect `find_references` shipped: the answer was the only array named, so the
+/// answer was the only array that could be withheld.
+#[cfg(test)]
+pub(crate) fn governed_collections(tool: &str) -> &'static [&'static str] {
+    shape_for(tool).map_or(&[] as &[&str], |shape| shape.collections)
 }
 
 /// Compact and bound one retrieval payload in place, disclosing every cut.
@@ -1323,8 +1462,7 @@ pub fn enforce(
 /// Public to the crate so the envelope's placeholder accounting counts rows
 /// through this function rather than through a third inline copy of it.
 pub(crate) fn collection_rows(payload: &Value, key: &str) -> usize {
-    payload
-        .get(key)
+    collection_of(payload, key)
         .and_then(Value::as_array)
         .map_or(0, Vec::len)
 }
@@ -1552,10 +1690,7 @@ fn run_ladder(
     // used to be the primary alone, so the last bucket of an `impact_analysis`
     // emptied first and `"affected_tests": []` shipped beside a
     // `covering_tests: 16` that said sixteen tests cover it.
-    let primary_found = primary
-        .and_then(|key| payload.get(key))
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+    let primary_found = primary.map_or(0, |key| collection_rows(payload, key));
     let mut locate_cursor = (tool == "semantic_locate")
         .then(|| {
             payload
@@ -1583,10 +1718,7 @@ fn run_ladder(
     let mut primary_withheld = 0usize;
     let mut cursor_rebased = false;
     for key in shape.collections.iter().rev() {
-        let found = payload
-            .get(*key)
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
+        let found = collection_rows(payload, key);
         // Every collection is cut, including a final page's primary one.
         // `max_chars` is the caller's context budget rather than a preference,
         // so nothing licenses exceeding it, and a page with no cursor is not an
@@ -1598,7 +1730,30 @@ fn run_ladder(
         // follow. Retaining rows here instead shipped a response over the
         // ceiling and published no elision at all, which is what took
         // `response_budget:3` to UNREADABLE on main.
-        let (withheld, cut_shape) = trim_collection(payload, key, target, 1);
+        // The suffix search fits a list to `target` within one row, and the
+        // elision record written for that cut is then measured too. On a list of
+        // large rows that record pushed the payload back over `target` by less
+        // than one row, and the ladder moved on to the next list, which for
+        // `find_references` is the answer, and cut a reference row to pay for
+        // bookkeeping about a list it could have shortened by one more entry.
+        // So keep cutting the same list while it still has rows to give and the
+        // record keeps the payload over target: the answer is cut only when
+        // nothing before it is left to cut.
+        let mut withheld = 0usize;
+        let mut cut_shape = CutShape::Suffix;
+        loop {
+            let (more, shape_now) = trim_collection(payload, key, target, 1);
+            if more == 0 {
+                break;
+            }
+            withheld += more;
+            cut_shape = shape_now;
+            record_elision(payload, key, found.saturating_sub(withheld), more);
+            payload["truncated"] = Value::Bool(true);
+            if measure(payload) <= target {
+                break;
+            }
+        }
         if withheld > 0 {
             accounting.bounded = true;
             withheld_any = true;
@@ -1612,8 +1767,6 @@ fn run_ladder(
             cuts.push(format!(
                 "{withheld} of {found} entries withheld from `{key}`, {how}"
             ));
-            record_elision(payload, key, found.saturating_sub(withheld), withheld);
-            payload["truncated"] = Value::Bool(true);
             if Some(*key) == primary {
                 primary_withheld = withheld;
                 let kept = found.saturating_sub(withheld);
@@ -1639,10 +1792,7 @@ fn run_ladder(
     // the next person who reads the arithmetic and not the history.
 
     if withheld_any {
-        let kept = primary
-            .and_then(|key| payload.get(key))
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
+        let kept = primary.map_or(0, |key| collection_rows(payload, key));
         if primary_withheld > 0 && cursor_rebased && kept > 0 {
             remediations.push(format!(
                 "re-issue with `page_size: {kept}` and follow `next_cursor`"
@@ -2024,7 +2174,8 @@ fn strip_keys_marking(
         true
     };
     for collection in shape.collections {
-        let Some(entries) = payload.get_mut(*collection).and_then(Value::as_array_mut) else {
+        let Some(entries) = collection_of_mut(payload, collection).and_then(Value::as_array_mut)
+        else {
             continue;
         };
         for entry in entries.iter_mut() {
@@ -2070,7 +2221,7 @@ fn rows_carrying(payload: &Value, shape: &ResponseShape, keys: &[&str]) -> usize
     let in_collections: usize = shape
         .collections
         .iter()
-        .filter_map(|collection| payload.get(*collection))
+        .filter_map(|collection| collection_of(payload, collection))
         .filter_map(Value::as_array)
         .map(|entries| entries.iter().filter(|entry| carries(entry)).count())
         .sum();
@@ -2147,7 +2298,7 @@ fn trim_parented_collection(
                 .is_some_and(|name| entry.get("entity_name").and_then(Value::as_str) == Some(name))
         },
         &mut |candidate: &[Value]| {
-            payload[key] = Value::Array(candidate.to_vec());
+            set_collection(payload, key, Value::Array(candidate.to_vec()));
             measure(payload) <= target
         },
     )?;
@@ -2162,13 +2313,9 @@ fn trim_parented_collection(
             .iter()
             .any(|entry| entry.get("entity_name").and_then(Value::as_str) == named.as_deref());
     let withheld = full.len() - kept.len();
-    payload[key] = Value::Array(kept);
+    set_collection(payload, key, Value::Array(kept));
     if withheld > 0 {
-        let prior = payload
-            .get(format!("{key}_withheld"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
+        record_withheld(payload, key, withheld);
     }
     Some((withheld, held))
 }
@@ -2234,7 +2381,10 @@ fn trim_collection(
     target: usize,
     min_keep: usize,
 ) -> (usize, CutShape) {
-    let Some(full) = payload.get(key).and_then(Value::as_array).cloned() else {
+    let Some(full) = collection_of(payload, key)
+        .and_then(Value::as_array)
+        .cloned()
+    else {
         return (0, CutShape::Suffix);
     };
     if full.len() <= min_keep || measure(payload) <= target {
@@ -2256,7 +2406,7 @@ fn trim_collection(
     let mut high = full.len();
     while low <= high {
         let mid = (low + high) / 2;
-        payload[key] = Value::Array(full[..mid].to_vec());
+        set_collection(payload, key, Value::Array(full[..mid].to_vec()));
         if measure(payload) <= target {
             kept = mid;
             low = mid + 1;
@@ -2266,21 +2416,35 @@ fn trim_collection(
             high = mid - 1;
         }
     }
-    payload[key] = Value::Array(full[..kept].to_vec());
+    set_collection(payload, key, Value::Array(full[..kept].to_vec()));
     let withheld = full.len() - kept;
     if withheld > 0 {
-        // Added to, not overwritten. Two arms bound one response and a pack's
-        // own token budget cuts before either, so a list can arrive here having
-        // already lost rows. Assigning would make this scalar describe the last
-        // cut while `elisions` described them all, and the two channels are
-        // asserted against each other.
-        let prior = payload
-            .get(format!("{key}_withheld"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
+        record_withheld(payload, key, withheld);
     }
     (withheld, CutShape::Suffix)
+}
+
+/// Add to the `<collection>_withheld` scalar beside one cut list.
+///
+/// Added to, not overwritten. Two arms bound one response and a pack's own token
+/// budget cuts before either, so a list can arrive here having already lost
+/// rows. Assigning would make this scalar describe the last cut while `elisions`
+/// described them all, and the two channels are asserted against each other.
+///
+/// A nested list's counter is written beside the list, inside the block that
+/// holds it, so `interface_dispatch.candidates` publishes
+/// `interface_dispatch.candidates_withheld` rather than a top-level key whose
+/// name has a dot in it and whose meaning a reader has to reconstruct.
+fn record_withheld(payload: &mut Value, key: &str, withheld: usize) {
+    let counter = format!("{key}_withheld");
+    let prior = collection_of(payload, &counter)
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    set_collection(
+        payload,
+        &counter,
+        Value::from(prior.saturating_add(withheld)),
+    );
 }
 
 /// Append the cuts to the `degradations` channel the retrieval tools already
@@ -3804,7 +3968,7 @@ mod tests {
             max_chars: 18_000,
             compact: true,
             explicit_max_chars: true,
-            envelope_reserve: 0,
+            ..ResponseBudget::default()
         };
         enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
         let bounded = payload["degradations"]
@@ -3854,7 +4018,7 @@ mod tests {
             max_chars: 18_000,
             compact: true,
             explicit_max_chars: true,
-            envelope_reserve: 0,
+            ..ResponseBudget::default()
         };
         enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
         let bounded = payload["degradations"]
@@ -3895,7 +4059,7 @@ mod tests {
             max_chars: RESPONSE_MAX_MAX_CHARS,
             compact: true,
             explicit_max_chars: true,
-            envelope_reserve: 0,
+            ..ResponseBudget::default()
         };
         let accounting = enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
         assert!(
@@ -3945,7 +4109,7 @@ mod tests {
             max_chars: 18_000,
             compact: true,
             explicit_max_chars: true,
-            envelope_reserve: 0,
+            ..ResponseBudget::default()
         };
         let accounting = enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
         assert!(
@@ -5002,5 +5166,287 @@ mod tests {
         );
         assert_eq!(accounting.primary_rows, Some(shipped));
         assert_eq!(payload["total_ranked"], json!(60));
+    }
+
+    /// One `find_references` reply, shaped like the ones the published 0.7.20
+    /// returned on the Go corpus.
+    ///
+    /// `references` is the answer: the positions that resolve to the target.
+    /// `candidates` are same-name matches nothing at the reference site proves.
+    /// `interface_dispatch.candidates` are callers of an interface method the
+    /// focal's receiver satisfies, which Go cannot prove at the call site. The
+    /// counts mirror the real reply for `api/queries_repo.go:232`, where three
+    /// real rows sat beside 100 name-only candidates and 116 dispatch
+    /// candidates, and the two unproven lists were 96,930 of its 106,308
+    /// characters.
+    fn references_payload(refs: usize, candidates: usize, dispatch: usize) -> Value {
+        let row = |index: usize, file: &str, resolution: &str| {
+            json!({
+                "entity_id": format!("{:08x}-0000-4000-8000-000000000000", index),
+                "file_path": format!("pkg/cmd/{file}/f{index}.go"),
+                "kind": "Function",
+                "name": format!("Caller{index}"),
+                "reference_line_count": 2,
+                "reference_lines": [100 + index, 200 + index],
+                "reference_lines_absent_reason": Value::Null,
+                "reference_lines_partial_reason": "language_server_edge",
+                "relation_kinds": ["calls"],
+                "resolution": resolution,
+                "role": "source",
+                "start_line": index,
+                "via_override_of": Value::Null,
+            })
+        };
+        let reference_rows: Vec<Value> = (0..refs)
+            .map(|i| row(i, "answer", "type_resolved"))
+            .collect();
+        let candidate_rows: Vec<Value> = (0..candidates)
+            .map(|i| row(1_000 + i, "name_only", "name_only"))
+            .collect();
+        let dispatch_rows: Vec<Value> = (0..dispatch)
+            .map(|i| {
+                let mut entry = row(2_000 + i, "dispatch", "type_resolved");
+                entry["dispatch"] = json!("interface_candidate");
+                entry["dispatch_via"] = json!(["Interface.RepoOwner"]);
+                entry
+            })
+            .collect();
+        let sites = refs * 2;
+        let mut payload = json!({
+            "focal_entity": {
+                "id": "974902eb-e473-4f3a-98c7-c3fdca15c668",
+                "name": "RepoOwner",
+                "kind": "Method",
+                "file_path": "api/queries_repo.go",
+                "signature": "func (r Repository) RepoOwner() string",
+            },
+            "relation_kinds": ["calls", "imports", "references"],
+            "total_upstream": refs,
+            "unconfirmed_candidates": candidates,
+            "counts": { "counted": "referencing_entities", "reference_sites": sites },
+            "references": reference_rows,
+            "candidates": candidate_rows,
+            "cross_repo": { "status": "not_configured" },
+            "edge_coverage": { "status": "partial" },
+        });
+        if dispatch > 0 {
+            payload["interface_dispatch"] = json!({
+                "status": "candidates_held_out",
+                "detail": "Go interface satisfaction is structural, so nothing at the call \
+                           site proves the dynamic type.",
+                "candidate_count": dispatch,
+                "contracts": ["Interface.RepoOwner"],
+                "candidates": dispatch_rows,
+            });
+        }
+        payload
+    }
+
+    /// The defect this test exists for, measured on the published 0.7.20: the
+    /// answer was the only array the bounder could name, so it was the only
+    /// array the bounder could cut. One reply spent 57,323 characters on
+    /// `interface_dispatch` and 39,607 on `candidates`, then withheld two of its
+    /// three real reference rows and returned the survivor in 434.
+    ///
+    /// Neither unproven list may outlive a row of the answer.
+    #[test]
+    fn the_unproven_candidate_lists_are_cut_before_the_references_they_qualify() {
+        const BUDGET: usize = 20_000;
+        let mut payload = references_payload(3, 100, 116);
+        assert!(
+            measure(&payload) > BUDGET,
+            "the fixture must overflow or nothing is trimmed"
+        );
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+
+        assert_eq!(
+            payload["references"].as_array().map(Vec::len),
+            Some(3),
+            "the answer lost rows while unproven candidates survived: {payload}"
+        );
+        let candidates = payload["candidates"].as_array().expect("candidates").len();
+        let dispatch = payload["interface_dispatch"]["candidates"]
+            .as_array()
+            .expect("dispatch candidates")
+            .len();
+        assert!(
+            candidates < 100 && dispatch < 116,
+            "the bounder still cannot cut the two unproven lists: kept {candidates} name-only \
+             and {dispatch} dispatch candidates"
+        );
+        assert!(
+            measure(&payload) <= BUDGET,
+            "the response still ships over its ceiling: {} characters",
+            measure(&payload)
+        );
+        assert!(
+            payload.get("references_withheld").is_none(),
+            "the answer reported a loss it did not take: {payload}"
+        );
+    }
+
+    /// A nested list the budget cut says so in the one map that answers "did
+    /// this response lose anything", under the name the shape table uses, and
+    /// publishes its counter beside itself rather than as a top-level key with a
+    /// dot in its name.
+    #[test]
+    fn a_cut_nested_candidate_list_publishes_its_loss_where_a_reader_finds_it() {
+        const BUDGET: usize = 20_000;
+        let mut payload = references_payload(3, 100, 116);
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+
+        let kept = payload["interface_dispatch"]["candidates"]
+            .as_array()
+            .expect("dispatch candidates survive")
+            .len();
+        assert!(kept >= 1, "a cut list must never render empty: {payload}");
+        assert_eq!(
+            payload["elisions"]["interface_dispatch.candidates"]["kept"],
+            json!(kept)
+        );
+        assert_eq!(
+            payload["elisions"]["interface_dispatch.candidates"]["elided"],
+            json!(116 - kept)
+        );
+        assert_eq!(
+            payload["elisions"]["interface_dispatch.candidates"]["reason"],
+            json!(ELISION_REASON_BUDGET)
+        );
+        assert_eq!(
+            payload["interface_dispatch"]["candidates_withheld"],
+            json!(116 - kept),
+            "the nested counter must sit beside the list it describes: {payload}"
+        );
+        assert!(
+            payload
+                .get("interface_dispatch.candidates_withheld")
+                .is_none(),
+            "a dotted top-level key was minted instead: {payload}"
+        );
+        // `candidate_count` is the handler's own record of what the dispatch
+        // question found, and a budget cut must not rewrite it into the number
+        // of rows that survived the cut.
+        assert_eq!(payload["interface_dispatch"]["candidate_count"], json!(116));
+    }
+
+    /// A ceiling too small for the answer alone still cuts the answer LAST.
+    ///
+    /// The floor of one entry per list is deliberate and stays: an empty array
+    /// reads as "nothing matched", which is the one thing a size cut must never
+    /// produce. So "exhaust the envelope first" means exhaust it to that floor,
+    /// and the assertion is that both unproven lists are standing at it before
+    /// a single reference row is withheld.
+    #[test]
+    fn the_answer_is_the_last_thing_a_find_references_budget_cuts() {
+        let mut payload = references_payload(40, 100, 116);
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MIN_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+
+        let refs = payload["references"].as_array().expect("references").len();
+        assert!(
+            refs < 40,
+            "the fixture must be tight enough to reach the answer: kept {refs}"
+        );
+        assert!(refs >= 1, "a cut list must never render empty: {payload}");
+        assert_eq!(
+            payload["candidates"].as_array().map(Vec::len),
+            Some(1),
+            "a reference row was withheld while name-only candidates were not at their floor: \
+             {payload}"
+        );
+        assert_eq!(
+            payload["interface_dispatch"]["candidates"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "a reference row was withheld while dispatch candidates were not at their floor: \
+             {payload}"
+        );
+    }
+
+    /// The suffix search fits a list to the target within one row, and the
+    /// elision record written for that cut is measured too. Before the ladder
+    /// re-trimmed the same list, that record could push the payload back over
+    /// the target by less than a row, and the next list, which is the answer,
+    /// paid for it: measured on the study's largest reply, 106 of 116 dispatch
+    /// candidates kept and one of three reference rows cut. Sweep the ceiling
+    /// so the fit lands at every offset: while a list before the answer still
+    /// has a row to give, the answer keeps every row.
+    #[test]
+    fn bookkeeping_for_a_cut_list_never_costs_a_row_of_the_answer() {
+        let mut violations = Vec::new();
+        for max_chars in (RESPONSE_MIN_MAX_CHARS..RESPONSE_MAX_MAX_CHARS).step_by(211) {
+            let mut payload = references_payload(3, 100, 116);
+            let budget = ResponseBudget {
+                max_chars,
+                ..ResponseBudget::default()
+            };
+            enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+            let refs = payload["references"].as_array().map_or(0, Vec::len);
+            let dispatch = payload["interface_dispatch"]["candidates"]
+                .as_array()
+                .map_or(0, Vec::len);
+            let candidates = payload["candidates"].as_array().map_or(0, Vec::len);
+            if refs < 3 && (dispatch > 1 || candidates > 1) {
+                violations.push((max_chars, refs, dispatch, candidates));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "a reference row was cut while an unproven list still had rows to give \
+             (max_chars, references, dispatch candidates, candidates): {violations:?}"
+        );
+    }
+
+    /// A reply carrying no `interface_dispatch` block at all -- the ordinary
+    /// shape, 61 of the 75 measured replies -- is bounded exactly as before, and
+    /// the absent block is not minted to hold a cut.
+    #[test]
+    fn a_reply_without_the_dispatch_block_is_bounded_without_inventing_it() {
+        const BUDGET: usize = 20_000;
+        let mut payload = references_payload(3, 200, 0);
+        assert!(measure(&payload) > BUDGET, "the fixture must overflow");
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+
+        assert_eq!(
+            payload["references"].as_array().map(Vec::len),
+            Some(3),
+            "the answer was cut while name-only candidates survived: {payload}"
+        );
+        assert!(payload.get("interface_dispatch").is_none());
+        assert!(payload["elisions"]
+            .get("interface_dispatch.candidates")
+            .is_none());
+    }
+
+    /// The find_references answer stays the collection the accounting names, so
+    /// `_kin.response.primary_collection` and `primary_rows` keep describing the
+    /// references rather than one of the lists added to the table beside them.
+    #[test]
+    fn the_find_references_primary_is_still_the_answer() {
+        let mut payload = references_payload(3, 100, 116);
+        let budget = ResponseBudget {
+            max_chars: 20_000,
+            ..ResponseBudget::default()
+        };
+        let accounting =
+            enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+        assert_eq!(accounting.primary_collection.as_deref(), Some("references"));
+        assert_eq!(accounting.primary_rows, Some(3));
     }
 }

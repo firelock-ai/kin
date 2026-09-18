@@ -132,12 +132,19 @@ pub fn spine_clipped(
 /// A `needed` over the ceiling is the case the stranger hit twice. It is a
 /// measured lower bound rather than an estimate, so the sentence it produces is
 /// checkable against `chars_before_withholding` on the same degradation.
+///
+/// It says "this response", not "the answer", and the difference is not
+/// pedantry. `needed` is the whole payload, and on a tool whose payload is
+/// mostly qualification the two are nowhere near the same number: a
+/// `find_references` reply that withheld reference rows reported that "the
+/// answer still measures 94836 characters" while the answer it had returned was
+/// 434 of them. A caller who reads that stops looking for a lever that exists.
 pub fn response_budget_clause(param: &str, in_force: usize, needed: Option<usize>) -> String {
     if let Some(needed) = needed {
         if needed > RESPONSE_MAX_MAX_CHARS {
             return format!(
                 "raising {param} cannot reach the withheld entries: with every diagnostic, \
-                 roll-up and inline body this budget can shed already dropped, the answer \
+                 roll-up and inline body this budget can shed already dropped, this response \
                  still measures {needed} characters against the {RESPONSE_MAX_MAX_CHARS} this \
                  server will build, so no budget this call accepts returns them"
             );
