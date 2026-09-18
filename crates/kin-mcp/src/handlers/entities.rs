@@ -2021,6 +2021,15 @@ zero no more than the one: `counts.upstream_including_unconfirmed` is the matchi
 ceiling, and the caller set lies between them. Read `references` alone and you get the \
 proven subset, which is the right answer to \"who provably calls this\" and the wrong \
 one to \"who calls this\". \
+For a Go INTERFACE method the response also carries `interface_implementations`: the \
+concrete methods whose receiver types satisfy that contract, each with the file AND LINE \
+of its declaration, plus `files`, the files those declarations live in and no others. A \
+method declaration is not a reference to the contract it satisfies and Go writes no \
+`implements` clause, so no edge above can carry one and `references` is correctly silent \
+about them; read this block for \"where is this implemented\", and read its `files` for \
+that question at file granularity rather than projecting any other list to paths. \
+Satisfaction is structural, so each row is a possible implementation and none is a \
+recorded one, and none is ever added to `total_upstream`. \
 `_kin.verdict` is the one verdict for the whole response and outranks every count in it. \
 The response bounds its own size (max_chars, default 45000 serialized characters, ceiling \
 60000): a symbol \
@@ -2427,6 +2436,96 @@ fn dispatch_candidate_row_json(
     // reader can open the call site and check the claim rather than take it.
     value["dispatch_via"] = serde_json::json!(candidate.via);
     value
+}
+
+/// Where a Go interface method is implemented, published under its own key.
+pub(crate) const INTERFACE_IMPLEMENTATIONS_KEY: &str = "interface_implementations";
+
+/// The one value an implementation row's marker field takes. A row carrying it
+/// is a concrete method whose receiver type's method set satisfies the focal's
+/// contract, and nothing in the graph records that it was written to.
+pub(crate) const IMPLEMENTS_INTERFACE_CANDIDATE: &str = "interface_candidate";
+
+/// One implementation candidate row, as JSON.
+///
+/// `line` is the load-bearing field. Naming the file a contract is implemented
+/// in is the answer a reader already had from the type; naming the line is the
+/// answer they asked for.
+fn implementation_row_json(row: &ImplementationRow) -> serde_json::Value {
+    serde_json::json!({
+        "entity_id": row.entity_id,
+        "name": row.name,
+        "receiver": row.receiver,
+        "file_path": row.file_path,
+        "line": row.line,
+        "signature": row.signature,
+        // Marked for the same reason a dispatch candidate is: Go interface
+        // satisfaction is structural, so the graph can say this method's
+        // receiver type satisfies the contract and holds nothing that says the
+        // author wrote it to.
+        "implements": IMPLEMENTS_INTERFACE_CANDIDATE,
+    })
+}
+
+/// The implementations block a response carries for a Go interface method.
+///
+/// Emitted at zero as well, and for the walk that failed, because a section that
+/// appears only when it has rows is one no reader learns to look for, and the
+/// reader who most needs this one is the reader who asked where a contract is
+/// implemented and got a caller list back.
+///
+/// `files` is the same answer at file granularity, and it is published rather
+/// than left to the reader for the reason the measurement found: the reply
+/// already carried these rows and the reader still built a file answer out of
+/// the neighborhood around them, which is the contract's CALLERS. Deriving it
+/// here, from the rows themselves, is what makes a caller's file impossible to
+/// mistake for an implementation's.
+fn interface_implementations_json(implementations: &InterfaceImplementations) -> serde_json::Value {
+    let files = implementations.files();
+    let file_count = files.len();
+    match implementations {
+        InterfaceImplementations::NoImplementation { interface } => serde_json::json!({
+            "status": "no_implementation",
+            "detail": format!(
+                "No type in this graph offers the whole method set of {interface}, so nothing \
+                 here implements this method."
+            ),
+            "interface": interface,
+            "candidate_count": 0,
+            "candidates": [],
+            "file_count": file_count,
+            "files": files,
+        }),
+        InterfaceImplementations::Candidates { interface, rows } => serde_json::json!({
+            "status": "candidates",
+            "detail": format!(
+                "{} concrete method{} whose receiver type satisfies {interface}, in {file_count} \
+                 file{}. Go interface satisfaction is structural, so each is a possible \
+                 implementation and none is a recorded one.",
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" },
+                if file_count == 1 { "" } else { "s" },
+            ),
+            "interface": interface,
+            "candidate_count": rows.len(),
+            "candidates": rows.iter().map(implementation_row_json).collect::<Vec<_>>(),
+            // The files those candidates are declared in and no others. The
+            // walk's own `entities` cannot answer this: an incoming walk around
+            // a contract returns the things that CALL it, and their files are
+            // not where it is implemented.
+            "file_count": file_count,
+            "files": files,
+        }),
+        InterfaceImplementations::Unavailable { reason } => serde_json::json!({
+            "status": "unavailable",
+            "detail": format!("Interface implementations unavailable: {reason}"),
+            "interface": serde_json::Value::Null,
+            "candidate_count": 0,
+            "candidates": [],
+            "file_count": file_count,
+            "files": files,
+        }),
+    }
 }
 
 /// Declare the dispatch candidates this answer is holding outside its headline.
@@ -2949,6 +3048,20 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     let dispatch =
         collect_interface_dispatch_candidates(store, &target, repository_authority, source_scope)?;
 
+    // The other direction of the same gap, and the one a reader asks about more
+    // often: where is this interface method implemented. A concrete method
+    // declaration is not a reference to the contract it satisfies, and Go writes
+    // no `implements` clause for it to be one, so no edge above can carry it and
+    // the reference list is correctly silent about it. A pre-registered,
+    // compiler-graded measurement on the gh CLI put that silence at zero correct
+    // implementation sites out of 142 across 75 interface methods, against a
+    // one-line grep that returned every one.
+    //
+    // Held outside `references` deliberately. These rows are not references and
+    // folding them in would both lie about what an edge proves and pad the
+    // answer to "who calls this contract" with declarations nobody calls.
+    let implementations = collect_interface_implementations(store, &target)?;
+
     // What this answer counted, computed before the rows are projected. One row
     // is one referencing entity, so `referencing_entities` is the row count and
     // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
@@ -3032,6 +3145,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     });
     if let Some(dispatch) = dispatch {
         result[INTERFACE_DISPATCH_KEY] = interface_dispatch_json(dispatch, include_snippets);
+    }
+    if let Some(implementations) = implementations.as_ref() {
+        result[INTERFACE_IMPLEMENTATIONS_KEY] = interface_implementations_json(implementations);
     }
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
     // Whether a caller could have reached this focal through a call site the
@@ -6133,7 +6249,20 @@ adapter for that language is named as the sharper reason where it applies. A foc
 rather than as an isolated entity. Every edge also carries `resolution` \
 (`type_resolved`, `import_scoped`, `name_only`) saying how strongly its destination was \
 proven; a `name_only` edge was matched by bare name and is a candidate, not structure you \
-can rely on.";
+can rely on. \
+For a Go INTERFACE method walked with direction 'in' or 'both', the answer also carries \
+`interface_implementations`: the concrete methods whose receiver types satisfy that \
+contract, each with the file AND LINE of its declaration, plus `files`, the files those \
+declarations live in and no others. Go writes no `implements` clause, so no edge binds a \
+concrete method to the spec it satisfies and the walk alone returns the contract's \
+callers; this block is what answers \"where is this interface method implemented\". Do \
+NOT project `entities` to file paths to answer that: an incoming walk around a contract \
+returns the things that CALL it, so those paths are where it is used, not where it is \
+implemented. Read `interface_implementations.files` instead; it is derived from the rows \
+above it, so it and their lines cannot disagree, and it stays complete when `limit` \
+truncates `entities`. Satisfaction is structural, so each row is a possible \
+implementation and none is a recorded one. The rows also appear among `entities`, marked \
+`implements: interface_candidate`.";
 
 /// Traverse the neighborhood around a focal entity in the requested direction.
 ///
@@ -6255,6 +6384,56 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
         frontier = next_frontier;
     }
 
+    // Where a Go interface method is implemented. An implementation stands
+    // behind a contract, so an incoming walk is exactly the question, and until
+    // now it was the one walk that could not answer: Go writes no `implements`
+    // clause, the adapter's own satisfaction inference is same-file and
+    // type-to-type, and so no edge binds a concrete method to the spec it
+    // satisfies. The walk above therefore returns the contract's CALLERS and a
+    // reader asking where it is implemented reads a caller list.
+    //
+    // Computed rather than walked, from what the graph already persists, the
+    // same discipline `kin refs --kind dispatch` uses for the other direction.
+    // The rows are spliced in behind the focal rather than appended, so `limit`
+    // cannot truncate away the part of the answer that was asked for.
+    let implementations = if want_incoming {
+        match store.get_entity(&entity_id).map_err(McpError::graph)? {
+            Some(focal) => collect_interface_implementations(store, &focal)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(InterfaceImplementations::Candidates { rows, .. }) = implementations.as_ref() {
+        let mut spliced = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Ok(id) = parse_entity_id(&row.entity_id) else {
+                continue;
+            };
+            if !visited.insert(id) {
+                continue;
+            }
+            // Carries the line the generic summary has no room for. For every
+            // other neighbor the line is a convenience; for an implementation it
+            // is the answer, and a file-granularity answer to "where is this
+            // implemented" is the finding this block exists to close.
+            spliced.push(serde_json::json!({
+                "id": row.entity_id,
+                "name": row.name,
+                "kind": "Method",
+                "file_path": row.file_path,
+                "line": row.line,
+                "signature": row.signature,
+                // Says how this row arrived. It is not on the far side of an
+                // edge in `relations`, because the graph holds no such edge.
+                "implements": IMPLEMENTS_INTERFACE_CANDIDATE,
+            }));
+        }
+        let tail = entities.split_off(usize::min(1, entities.len()));
+        entities.extend(spliced);
+        entities.extend(tail);
+    }
+
     let total_entities = entities.len();
     let total_relations = relations.len();
 
@@ -6274,6 +6453,9 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
         "entities": entities,
         "relations": relations,
     });
+    if let Some(implementations) = implementations.as_ref() {
+        result[INTERFACE_IMPLEMENTATIONS_KEY] = interface_implementations_json(implementations);
+    }
 
     // A walk that expanded no edge is claiming the focal has no neighbors on the
     // side that was walked, and for an incoming walk that is the same claim
@@ -8879,6 +9061,403 @@ mod tests {
             body.get(INTERFACE_DISPATCH_KEY).is_none(),
             "the contract is not dispatched to itself: {body}"
         );
+    }
+
+    /// The dispatch fixture with declaration spans, so a row that claims to
+    /// carry a line can be checked against one.
+    ///
+    /// Returns the interface's `Write` spec and the concrete `Buffer.Write` it
+    /// is satisfied by, which is the pair every assertion below is about.
+    fn go_implementations_graph() -> (InMemoryGraph, Entity, Entity) {
+        let (store, buffer_write, _counter_write, _emit, _flush) = go_dispatch_graph();
+        let spec = store
+            .query_entities(&EntityFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "Writer.Write")
+            .expect("the fixture holds the contract's Write spec");
+
+        // Spans the hand-built fixture leaves unset. `Buffer.Write` is declared
+        // on line 8 of its file, which reads back as 8 through the same 1-based
+        // presentation `list_file_entities` uses, so a caller who resolved an
+        // entity by line resolves this row back to the same one.
+        let mut located = buffer_write.clone();
+        located.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new("internal/buf/buffer.go"),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 7,
+            start_col: 0,
+            end_line: 10,
+            end_col: 1,
+        });
+        store.upsert_entity(&located).unwrap();
+        (store, spec, located)
+    }
+
+    /// The finding this closes, at the surface a caller reaches for.
+    ///
+    /// Measured on `cli/cli` at `14d339d9` with published 0.7.20: asked where an
+    /// interface method is implemented, Kin returned zero correct
+    /// implementation sites out of 142 across 75 queries, against a one-line
+    /// grep that returned every one. It named the implementing TYPE and the file
+    /// it lives in and never the implementing method's line, because
+    /// `graph_neighborhood` answered at file granularity in every direction.
+    ///
+    /// The line is the assertion. A file-granularity answer is what scored zero.
+    #[test]
+    fn graph_neighborhood_names_where_an_interface_method_is_implemented() {
+        let (store, spec, buffer_write) = go_implementations_graph();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(spec.id.to_string()),
+            ),
+            ("direction".to_string(), serde_json::json!("in")),
+            ("depth".to_string(), serde_json::json!(1)),
+        ]);
+        let body = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+
+        let block = &body[INTERFACE_IMPLEMENTATIONS_KEY];
+        assert_eq!(block["status"], "candidates", "{body}");
+        assert_eq!(block["candidate_count"], 1, "{body}");
+        let row = &block["candidates"][0];
+        assert_eq!(row["name"], "Buffer.Write");
+        assert_eq!(row["receiver"], "Buffer");
+        assert_eq!(row["file_path"], "internal/buf/buffer.go");
+        assert_eq!(
+            row["line"], 8,
+            "the declaration's line is the answer; the file alone is what scored zero: {body}"
+        );
+        assert_eq!(row["implements"], IMPLEMENTS_INTERFACE_CANDIDATE);
+        assert_eq!(row["entity_id"], buffer_write.id.to_string());
+
+        // And among the neighbors, because a reader walking `entities` must not
+        // have to know about a second key to see the answer.
+        let listed = body["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entity| entity["name"] == "Buffer.Write")
+            .unwrap_or_else(|| panic!("the implementation is one of the neighbors: {body}"));
+        assert_eq!(listed["line"], 8);
+        assert_eq!(listed["implements"], IMPLEMENTS_INTERFACE_CANDIDATE);
+    }
+
+    /// The control. A type that misses one contract method is not an
+    /// implementation, which is exactly the mistake the one-line grep makes and
+    /// pays for in precision.
+    #[test]
+    fn graph_neighborhood_does_not_name_a_type_that_misses_a_contract_method() {
+        let (store, spec, _) = go_implementations_graph();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(spec.id.to_string()),
+            ),
+            ("direction".to_string(), serde_json::json!("in")),
+            ("depth".to_string(), serde_json::json!(1)),
+        ]);
+        let body = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        let named = serde_json::to_string(&body[INTERFACE_IMPLEMENTATIONS_KEY]).unwrap();
+        assert!(
+            !named.contains("Counter.Write"),
+            "Counter has no Close, so it implements nothing here: {named}"
+        );
+    }
+
+    /// An outgoing walk is asking what the contract depends on. Implementations
+    /// stand behind it, not in front of it, so the section does not appear and
+    /// every existing `direction: out` response stays byte-identical.
+    #[test]
+    fn graph_neighborhood_out_does_not_answer_the_implementations_question() {
+        let (store, spec, _) = go_implementations_graph();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(spec.id.to_string()),
+            ),
+            ("direction".to_string(), serde_json::json!("out")),
+        ]);
+        let body = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        assert!(body.get(INTERFACE_IMPLEMENTATIONS_KEY).is_none(), "{body}");
+    }
+
+    /// A focal with no implementations story at all gets no section, so a Rust
+    /// function's neighborhood is unchanged and a reader never learns to read a
+    /// section that means nothing where they found it.
+    #[test]
+    fn graph_neighborhood_leaves_a_non_contract_focal_alone() {
+        let (store, _spec, buffer_write) = go_implementations_graph();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(buffer_write.id.to_string()),
+            ),
+            ("direction".to_string(), serde_json::json!("in")),
+        ]);
+        let body = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        assert!(
+            body.get(INTERFACE_IMPLEMENTATIONS_KEY).is_none(),
+            "a concrete method is an implementation, not a contract: {body}"
+        );
+    }
+
+    /// `find_references` answers the same question, in its own block, and does
+    /// not move one row of the answer it already gave.
+    ///
+    /// The dispatch half of this document's measurement is a Kin win that rests
+    /// on `references` holding exactly the sites that dispatch through the
+    /// contract. A method declaration is not one of those sites, so folding
+    /// implementations into `references` would buy this axis by selling that
+    /// one.
+    #[tokio::test]
+    async fn find_references_answers_implementations_without_moving_its_references() {
+        let (store, spec, buffer_write) = go_implementations_graph();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(spec.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        let block = &body[INTERFACE_IMPLEMENTATIONS_KEY];
+        assert_eq!(block["status"], "candidates", "{body}");
+        assert_eq!(block["candidates"][0]["name"], "Buffer.Write");
+        assert_eq!(block["candidates"][0]["line"], 8);
+
+        // The dispatch answer, untouched. `emit` calls the contract and the
+        // implementation is not among the rows or the count.
+        assert_eq!(body["total_upstream"], 1, "{body}");
+        let referenced: Vec<&str> = body["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(referenced, vec!["emit"]);
+        assert!(
+            !referenced.contains(&"Buffer.Write"),
+            "an implementation is not a reference to the contract it satisfies: {body}"
+        );
+        assert!(
+            !serde_json::to_string(&body["candidates"])
+                .unwrap()
+                .contains(&buffer_write.id.to_string()),
+            "nor a same-name reference candidate: {body}"
+        );
+    }
+
+    /// A contract nothing satisfies answers none, at zero, and says which fact
+    /// it is reporting. A section that appears only when it has rows is one no
+    /// reader learns to look for, and the reader who most needs this one is the
+    /// reader deciding whether a contract is dead.
+    #[test]
+    fn graph_neighborhood_answers_the_implementations_question_at_zero() {
+        let store = InMemoryGraph::new();
+        let writer = go_entity(
+            EntityKind::Interface,
+            "Writer",
+            "internal/gh/contract.go",
+            "type Writer interface",
+        );
+        let spec = go_entity(
+            EntityKind::Method,
+            "Writer.Write",
+            "internal/gh/contract.go",
+            "Write(p []byte) (int, error)",
+        );
+        for entity in [&writer, &spec] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(writer.id, spec.id, RelationKind::Contains))
+            .unwrap();
+
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(spec.id.to_string()),
+            ),
+            ("direction".to_string(), serde_json::json!("in")),
+        ]);
+        let body = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        let block = &body[INTERFACE_IMPLEMENTATIONS_KEY];
+        assert_eq!(block["status"], "no_implementation", "{body}");
+        assert_eq!(block["candidate_count"], 0);
+        assert_eq!(block["interface"], "Writer");
+        // No implementation is no file, stated rather than left absent, so a
+        // reader asking the file question is answered at zero instead of being
+        // pushed back to `entities` to project one for themselves.
+        assert_eq!(block["file_count"], 0, "{body}");
+        assert_eq!(block["files"], serde_json::json!([]), "{body}");
+    }
+
+    /// The second half of the same finding, at the same surface.
+    ///
+    /// Measured on `cli/cli` at `14d339d9` against the same compiler gold that
+    /// graded the site axis, over the same 75 replies: the implementation SITES
+    /// came back at precision 0.9216, and the implementation FILES at precision
+    /// 0.1334, 812 false-positive files against 125 true ones. 800 of those 812
+    /// were named by a row carrying no position at all, because the only
+    /// file-granularity answer the reply offered was `entities`, and an incoming
+    /// walk around a contract is the set of things that CALL it. On the pooled
+    /// collision strata the published headline reports the same pair as F1
+    /// 0.9469 and 0.2286.
+    ///
+    /// So the assertion is a pair. `emit` calls the contract and its file is in
+    /// the walk; it must not be in the implementation files. The file answer is
+    /// the files the rows above it are declared in, and nothing else.
+    #[test]
+    fn graph_neighborhood_names_the_files_an_interface_method_is_implemented_in() {
+        let (store, spec, _buffer_write) = go_implementations_graph();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(spec.id.to_string()),
+            ),
+            ("direction".to_string(), serde_json::json!("in")),
+            ("depth".to_string(), serde_json::json!(1)),
+        ]);
+        let body = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+
+        let block = &body[INTERFACE_IMPLEMENTATIONS_KEY];
+        assert_eq!(block["status"], "candidates", "{body}");
+        assert_eq!(
+            block["files"],
+            serde_json::json!(["internal/buf/buffer.go"]),
+            "the files the candidates are declared in and no others: {body}"
+        );
+        assert_eq!(block["file_count"], 1, "{body}");
+
+        // The neighborhood really does name the caller's file, which is why
+        // projecting it was wrong and why this block has to answer instead.
+        let walked: Vec<&str> = body["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entity| entity["file_path"].as_str())
+            .collect();
+        assert!(
+            walked.contains(&"cmd/app/emit.go"),
+            "the fixture's caller is in the walk, or this test is not about the finding: {body}"
+        );
+        let answered: Vec<&str> = block["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file.as_str().unwrap())
+            .collect();
+        assert!(
+            !answered.contains(&"cmd/app/emit.go"),
+            "a caller's file is where the contract is USED, not where it is implemented: {body}"
+        );
+        // Nor the contract's own file, which every one of those 75 queries also
+        // carried, because the focal is part of its own neighborhood.
+        assert!(
+            !answered.contains(&"internal/gh/contract.go"),
+            "the declaration's own file is not an implementation of it: {body}"
+        );
+    }
+
+    /// The file answer is the site answer, read at a coarser granularity. It is
+    /// derived from the rows rather than collected beside them, so there is no
+    /// arrangement of this graph in which the two disagree.
+    #[test]
+    fn interface_implementation_files_are_exactly_the_files_of_its_candidates() {
+        let (store, spec, _) = go_implementations_graph();
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(spec.id.to_string()),
+            ),
+            ("direction".to_string(), serde_json::json!("in")),
+        ]);
+        let body = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        let block = &body[INTERFACE_IMPLEMENTATIONS_KEY];
+
+        let mut from_rows: Vec<&str> = block["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["file_path"].as_str())
+            .collect();
+        from_rows.sort_unstable();
+        from_rows.dedup();
+        let answered: Vec<&str> = block["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file.as_str().unwrap())
+            .collect();
+        assert_eq!(answered, from_rows, "{body}");
+    }
+
+    /// `limit` truncates `entities`; it does not truncate the answer.
+    ///
+    /// A reader who projected `entities` to paths got a file answer that shrank
+    /// with the walk's page size. This one is computed from the whole candidate
+    /// set before any of that, so the same question gets the same answer at
+    /// `limit: 1` as at `limit: 200`.
+    #[test]
+    fn interface_implementation_files_survive_the_entity_limit() {
+        let (store, spec, _) = go_implementations_graph();
+        let answer_at = |limit: u64| {
+            let args = HashMap::from([
+                (
+                    "entity_id".to_string(),
+                    serde_json::json!(spec.id.to_string()),
+                ),
+                ("direction".to_string(), serde_json::json!("in")),
+                ("limit".to_string(), serde_json::json!(limit)),
+            ]);
+            parsed_response(&handle_graph_neighborhood(&args, &store).unwrap())
+        };
+
+        let clipped = answer_at(1);
+        assert_eq!(clipped["truncated"], true, "{clipped}");
+        assert_eq!(clipped["entities"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            clipped[INTERFACE_IMPLEMENTATIONS_KEY]["files"],
+            serde_json::json!(["internal/buf/buffer.go"]),
+            "the answer is not a page of the walk: {clipped}"
+        );
+        assert_eq!(
+            clipped[INTERFACE_IMPLEMENTATIONS_KEY]["files"],
+            answer_at(200)[INTERFACE_IMPLEMENTATIONS_KEY]["files"]
+        );
+    }
+
+    /// Both surfaces answer the file question, with the same files.
+    ///
+    /// They share one derivation for the reason they share the block: a reader
+    /// who asks `find_references` where a contract is implemented and a reader
+    /// who walks its neighborhood are asking the same question, and two answers
+    /// to it would be one answer too many.
+    #[tokio::test]
+    async fn find_references_names_the_same_implementation_files() {
+        let (store, spec, _) = go_implementations_graph();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(spec.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let block = &body[INTERFACE_IMPLEMENTATIONS_KEY];
+        assert_eq!(
+            block["files"],
+            serde_json::json!(["internal/buf/buffer.go"]),
+            "{body}"
+        );
+        assert_eq!(block["file_count"], 1, "{body}");
+
+        // And the reference rows, which answer the other question, still name
+        // the caller's file. The two answers are different on purpose.
+        let referenced: Vec<&str> = body["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["file_path"].as_str())
+            .collect();
+        assert!(referenced.contains(&"cmd/app/emit.go"), "{body}");
     }
 
     /// FIR-2475. The ambiguity counter above cannot count ambiguity on any

@@ -43,8 +43,9 @@ pub use admission::{
 pub use artifacts::extract_artifact;
 pub use classifier::{FileClassification, FileClassifier};
 pub use dispatch::{
-    dispatch_candidate_callers, go_method_arity, interface_dispatch_targets, method_set_satisfies,
-    split_qualified_method, DispatchTarget, GoArity, DISPATCH_FIELD, DISPATCH_INTERFACE_CANDIDATE,
+    dispatch_candidate_callers, go_method_arity, implementations_apply, interface_dispatch_targets,
+    interface_implementations, method_set_satisfies, split_qualified_method, DispatchTarget,
+    GoArity, ImplementationCandidate, DISPATCH_FIELD, DISPATCH_INTERFACE_CANDIDATE,
 };
 pub use error::{IndexError, Result};
 pub use fingerprint::{

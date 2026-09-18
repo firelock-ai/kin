@@ -1553,6 +1553,147 @@ fn merge_dispatch_row(held: &mut ReferenceRow, incoming: ReferenceRow) {
     }
 }
 
+/// One implementation candidate row: the concrete method's declaration, which
+/// is what "where is this implemented" asks for.
+///
+/// It carries a LINE, and that is the whole point of the row. A reader handed
+/// the file a method is implemented in still has to search it; the measurement
+/// that found this gap scored a file-granularity answer at zero on the site axis
+/// for exactly that reason.
+#[derive(Debug, Clone)]
+pub struct ImplementationRow {
+    pub entity_id: String,
+    /// `Receiver.Method`, the concrete method's qualified name.
+    pub name: String,
+    /// The receiver type whose method set satisfies the contract.
+    pub receiver: String,
+    pub file_path: Option<String>,
+    /// The declaration line, `None` only when the entity carries no usable span.
+    pub line: Option<u32>,
+    pub signature: String,
+}
+
+/// What a focal's implementations question was answered with.
+///
+/// Three outcomes rather than an empty list, for the reason
+/// [`DispatchCandidates`] has four: an interface method nothing implements and a
+/// walk that failed are different facts, and a reader deciding whether a
+/// contract is dead needs to know which one they were handed.
+#[derive(Debug, Clone)]
+pub enum InterfaceImplementations {
+    /// No type this graph holds offers the contract's whole method set.
+    NoImplementation { interface: String },
+    /// Types whose method sets satisfy the contract this method belongs to.
+    Candidates {
+        interface: String,
+        rows: Vec<ImplementationRow>,
+    },
+    /// The walk failed. Reported rather than swallowed, for the same reason the
+    /// dispatch walk reports its failures: an errored walk is not an
+    /// implementation-free answer.
+    Unavailable { reason: String },
+}
+
+impl InterfaceImplementations {
+    /// The files this contract is implemented in.
+    ///
+    /// Exactly the files the candidate rows are declared in, deduplicated and
+    /// ordered, so the file answer and the line answer are the same evidence
+    /// read at two granularities and cannot disagree.
+    ///
+    /// This exists because the projection is the part that was wrong. On the
+    /// compiler-graded measurement of `cli/cli` at `14d339d9`, the change that
+    /// took implementation SITES from F1 0.0000 to 0.9469 left implementation
+    /// FILES at 0.2286, precision 0.1292, off the very same replies. The false
+    /// positives came from a consumer projecting the neighborhood to file paths:
+    /// the incoming walk around a contract is its CALLERS, so a reader who asks
+    /// which files implement a contract and reads the walk is handed the files
+    /// that call it. The rows below are the only rows that answer that question,
+    /// so the files they are declared in are the only files in the answer.
+    ///
+    /// A candidate whose entity carries no file origin contributes no file. It
+    /// stays in `candidates` with a null path rather than being dropped, because
+    /// an implementation Kin cannot place is a thing the reader should see.
+    pub fn files(&self) -> Vec<String> {
+        let Self::Candidates { rows, .. } = self else {
+            return Vec::new();
+        };
+        let mut files: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.file_path.clone())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+}
+
+/// The concrete methods that may implement `focal`.
+///
+/// `None` when the implementations question does not apply to this focal at all,
+/// which [`kin_index::dispatch::implementations_apply`] decides: anything that is
+/// not a Go method spec on an interface has no implementations story, and a
+/// surface that reported one for a Rust function would be inventing a section.
+///
+/// On the default path, like the dispatch direction beside it and for the same
+/// reason: an agent has no flag to learn about, so the only way it sees this
+/// class is for the answer to carry it. The cost is paid only by a Go method:
+/// `implementations_apply` costs one incoming-edge read, and the walk behind it
+/// scans the repository's Go methods for the focal's bare name and pays a
+/// method-set read only for the owners that spell it.
+///
+/// Which methods COUNT is decided by `kin_index::dispatch`, the same authority
+/// the dispatch direction reads, so the two directions cannot drift about which
+/// types satisfy which contract.
+pub fn collect_interface_implementations<G: GraphStore>(
+    store: &G,
+    focal: &Entity,
+) -> Result<Option<InterfaceImplementations>> {
+    if !kin_index::dispatch::implementations_apply(store, focal).map_err(McpError::graph)? {
+        return Ok(None);
+    }
+    let interface = kin_index::dispatch::split_qualified_method(&focal.name)
+        .map(|(owner, _)| owner.to_string())
+        .unwrap_or_else(|| focal.name.clone());
+    let candidates = match kin_index::dispatch::interface_implementations(store, focal) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            return Ok(Some(InterfaceImplementations::Unavailable {
+                reason: error.to_string(),
+            }))
+        }
+    };
+    if candidates.is_empty() {
+        return Ok(Some(InterfaceImplementations::NoImplementation {
+            interface,
+        }));
+    }
+    let mut rows = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Some(entity) = store
+            .get_entity(&candidate.method_id)
+            .map_err(McpError::graph)?
+        else {
+            continue;
+        };
+        rows.push(ImplementationRow {
+            entity_id: candidate.method_id.to_string(),
+            name: candidate.method_name,
+            receiver: candidate.receiver_name,
+            file_path: entity.file_origin.as_ref().map(|path| path.to_string()),
+            // The same line `list_file_entities` presents and `kin refs` prints,
+            // so a reader who resolved this entity by line resolves it back to
+            // the same one.
+            line: entity_presentation_start_line(&entity),
+            signature: entity.signature.clone(),
+        });
+    }
+    Ok(Some(InterfaceImplementations::Candidates {
+        interface,
+        rows,
+    }))
+}
+
 /// Whether a reference row projects its caller's body.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReferenceBodies {
@@ -4468,5 +4609,83 @@ mod override_composition_tests {
         graph.upsert_entity(&other).unwrap();
         let rows = rows_for(&graph, &focal.id);
         assert!(rows.is_empty(), "{rows:?}");
+    }
+}
+
+#[cfg(test)]
+mod interface_implementation_file_tests {
+    use super::{ImplementationRow, InterfaceImplementations};
+
+    fn row(name: &str, file: Option<&str>) -> ImplementationRow {
+        ImplementationRow {
+            entity_id: name.to_string(),
+            name: name.to_string(),
+            receiver: name.split('.').next().unwrap_or(name).to_string(),
+            file_path: file.map(str::to_string),
+            line: Some(1),
+            signature: String::new(),
+        }
+    }
+
+    fn candidates(rows: Vec<ImplementationRow>) -> InterfaceImplementations {
+        InterfaceImplementations::Candidates {
+            interface: "Writer".to_string(),
+            rows,
+        }
+    }
+
+    /// Two implementations in one file is one file. A reader counting files to
+    /// decide how much to open is counting what they will open.
+    #[test]
+    fn two_implementations_in_one_file_answer_one_file() {
+        let answer = candidates(vec![
+            row("Buffer.Write", Some("internal/buf/buffer.go")),
+            row("Buffer.Close", Some("internal/buf/buffer.go")),
+        ]);
+        assert_eq!(answer.files(), vec!["internal/buf/buffer.go".to_string()]);
+    }
+
+    /// Ordered, so two identical answers serialize identically and a reader
+    /// diffing yesterday's reply against today's sees only what moved.
+    #[test]
+    fn the_files_are_ordered() {
+        let answer = candidates(vec![
+            row("Zed.Write", Some("z/zed.go")),
+            row("Buffer.Write", Some("internal/buf/buffer.go")),
+        ]);
+        assert_eq!(
+            answer.files(),
+            vec!["internal/buf/buffer.go".to_string(), "z/zed.go".to_string()]
+        );
+    }
+
+    /// An implementation Kin cannot place contributes no file and is not
+    /// invented one. It stays in `candidates` with a null path, so the reader
+    /// sees an implementation they will have to find themselves rather than a
+    /// file that does not hold it.
+    #[test]
+    fn a_candidate_with_no_file_contributes_none() {
+        let answer = candidates(vec![
+            row("Buffer.Write", Some("internal/buf/buffer.go")),
+            row("Ghost.Write", None),
+        ]);
+        assert_eq!(answer.files(), vec!["internal/buf/buffer.go".to_string()]);
+    }
+
+    /// The two non-answers answer no files, rather than answering nothing. A
+    /// contract nothing implements is implemented in no file; a walk that failed
+    /// names none because it does not know.
+    #[test]
+    fn the_non_answers_name_no_files() {
+        assert!(InterfaceImplementations::NoImplementation {
+            interface: "Writer".to_string(),
+        }
+        .files()
+        .is_empty());
+        assert!(InterfaceImplementations::Unavailable {
+            reason: "store closed".to_string(),
+        }
+        .files()
+        .is_empty());
     }
 }
