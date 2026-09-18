@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `kin agent run`'s result record now carries every row a `find_references`
+  call returned, under `kin_agent.reference_rows`, independent of what the
+  model's own final answer text kept. A study task found Kin's
+  `find_references` returning six rows for `toSSG`, all resolved with
+  equal confidence, and the model's own prose answer keeping four while
+  dropping two, with no code anywhere between the tool result and the
+  model's turn filtering on the referencing entity's kind or on anything
+  else: the drop was the model's own composition, not the belt's. A belt
+  cannot make a model's free text complete, so this record does not try to;
+  instead it holds the full, deduplicated row set the run actually saw, so a
+  consumer reading the structured result depends on zero percent prose and
+  gets one hundred percent of the resolved rows.
+
 - `find_references` held `name_only` rows, a bare same-name match with nothing
   at the reference site proving it, out of `total_upstream` by description but
   not by code: the headline partitioned on a single receiver-guess tier, so

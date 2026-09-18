@@ -278,6 +278,27 @@ struct Counters {
     /// with the work in it, which is the shape the thesis wants: the run
     /// records which entity changed, and the file it landed in is derived.
     entity_edits: Vec<String>,
+    /// Every row `find_references` returned in this run, keyed by (focal
+    /// entity id, referenced entity id) so a second call in the same run
+    /// merges instead of colliding or duplicating.
+    ///
+    /// A T1 study task found Kin's `find_references` returning six rows for
+    /// `toSSG`, every one `resolution: "type_resolved"`, and the model's own
+    /// final ANSWER text dropping two of them (`bun/ssg.ts:2`,
+    /// `deno/ssg.ts:1`, both attributed to a `Module`-kind entity) while
+    /// keeping four others, including two more `Module`-kind rows from test
+    /// files. Reading the transcript end to end found no code anywhere
+    /// between the tool result and the model's turn that touches row content
+    /// by kind or by anything else: `annotate` only ever appends an advisory
+    /// note to Kin's own text, never removes from it, and the appended text
+    /// goes to the model exactly as Kin returned the JSON. The drop was the
+    /// model's own prose composition, not a belt filter. A belt that cannot
+    /// make a model's free-text answer complete can still make completeness
+    /// available without it: this field carries the full row set `to_json`
+    /// reports, so a consumer who wants every reference Kin resolved,
+    /// regardless of the referencing entity's kind, never has to depend on
+    /// what the model chose to keep in its final text.
+    reference_rows: BTreeMap<(String, String), Value>,
 }
 
 impl Counters {
@@ -309,6 +330,7 @@ impl Counters {
             api_ms: 0,
             edits: Vec::new(),
             entity_edits: Vec::new(),
+            reference_rows: BTreeMap::new(),
         }
     }
 
@@ -358,6 +380,52 @@ impl Counters {
         cost.bytes_returned = cost.bytes_returned.saturating_add(produced as u64);
         cost.bytes_shown = cost.bytes_shown.saturating_add(shown as u64);
         cost.wall_ms = cost.wall_ms.saturating_add(wall_ms);
+    }
+
+    /// Read a `find_references` result's `references` array and fold every row
+    /// into the run's own record of what Kin returned, keyed by (focal entity,
+    /// referenced entity) so a second call in the same run merges rather than
+    /// duplicating or overwriting a different question's rows.
+    ///
+    /// Best-effort and silent on anything that is not this exact shape: a
+    /// result from a different tool, an error payload, or text that does not
+    /// parse as the expected JSON adds nothing and never fails the call it
+    /// came from. The row a consumer gets back is a fixed, minimal subset of
+    /// what Kin returned, not the whole object, so this record does not grow
+    /// a new implicit schema every time Kin adds a field to the real one.
+    fn record_reference_rows(&mut self, tool: &str, raw_text: &str) {
+        if tool != "find_references" {
+            return;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(raw_text) else {
+            return;
+        };
+        let Some(references) = payload.get("references").and_then(Value::as_array) else {
+            return;
+        };
+        let focal_id = payload
+            .get("focal_entity")
+            .and_then(|focal| focal.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        for row in references {
+            let Some(entity_id) = row.get("entity_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let record = json!({
+                "focal_entity_id": focal_id,
+                "entity_id": entity_id,
+                "file_path": row.get("file_path").cloned().unwrap_or(Value::Null),
+                "name": row.get("name").cloned().unwrap_or(Value::Null),
+                "kind": row.get("kind").cloned().unwrap_or(Value::Null),
+                "resolution": row.get("resolution").cloned().unwrap_or(Value::Null),
+                "role": row.get("role").cloned().unwrap_or(Value::Null),
+                "reference_lines": row.get("reference_lines").cloned().unwrap_or(Value::Null),
+            });
+            self.reference_rows
+                .insert((focal_id.clone(), entity_id.to_string()), record);
+        }
     }
 
     /// Which counting produced this run's token numbers.
@@ -462,6 +530,7 @@ impl Counters {
             "session_heartbeats": self.session_heartbeats,
             "files_changed": self.edits,
             "entities_changed": self.entity_edits,
+            "reference_rows": self.reference_rows.values().cloned().collect::<Vec<_>>(),
         })
     }
 }
@@ -1332,6 +1401,14 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                             let result_bytes = outcome.text.len();
                                             produced_bytes = Some(result_bytes);
                                             let mut shown_bytes = result_bytes;
+                                            // Read off the FULL text, before any clip below
+                                            // shortens what the model is shown: the run's own
+                                            // record of what Kin returned must not depend on
+                                            // how much of it fit in the model's window.
+                                            if !outcome.is_error {
+                                                counters
+                                                    .record_reference_rows(&name, &outcome.text);
+                                            }
                                             if result_bytes > result_ceiling {
                                                 counters.clipped_results += 1;
                                                 let advice = context::how_to_ask_for_less(
@@ -3018,6 +3095,100 @@ mod annotate_tests {
             "the warning must name the gap it was given: {annotated}"
         );
         assert_eq!(counters.unsafe_absence_events, 1);
+    }
+}
+
+#[cfg(test)]
+mod reference_rows_tests {
+    use super::*;
+
+    /// Trimmed from the real `find_references` result a T1 study task's
+    /// `toSSG` query returned: six rows, every one `resolution:
+    /// "type_resolved"`, two of them (`bun/ssg.ts`, `deno/ssg.ts`, both
+    /// `kind: "Module"`) attributed to the aliased-import lines the task was
+    /// built to require. The model's own final ANSWER text kept four of the
+    /// six and dropped exactly those two, even though nothing about them was
+    /// less certain than the four it kept.
+    const TOSSG_FIND_REFERENCES_RESULT: &str = r#"{
+        "focal_entity": {"id": "9407382b-fdc1-42b6-a0b8-3944d23daed1", "name": "toSSG"},
+        "references": [
+            {"entity_id": "ade70b82-85aa-4f01-8291-b5f1955f094d", "file_path": "src/adapter/bun/ssg.ts", "kind": "Module", "name": "ssg", "reference_lines": [2], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "84ef6563-5c14-41da-9a96-3a962c025845", "file_path": "src/adapter/bun/ssg.ts", "kind": "Function", "name": "toSSG", "reference_lines": [26], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "dee91665-f43c-4025-a5c4-19f9ee5ac89a", "file_path": "src/adapter/deno/ssg.ts", "kind": "Module", "name": "ssg", "reference_lines": [1], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "f7d3013b-7853-4f2f-8509-4880542c0f65", "file_path": "src/adapter/deno/ssg.ts", "kind": "Function", "name": "toSSG", "reference_lines": [26], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "5e662ffe-3ec6-4cf7-84a0-410f63e86e14", "file_path": "src/helper/ssg/plugins.test.tsx", "kind": "Module", "name": "plugins.test", "reference_lines": [4, 32], "resolution": "type_resolved", "role": "test"},
+            {"entity_id": "b5a9d3b0-4d6d-47f7-b159-c9f772c6109d", "file_path": "src/helper/ssg/ssg.test.tsx", "kind": "Module", "name": "ssg.test", "reference_lines": [12], "resolution": "type_resolved", "role": "test"}
+        ]
+    }"#;
+
+    /// The exact defect: Kin returned six correctly `type_resolved` rows and
+    /// the model's own prose kept only four, dropping the two `Module`-kind
+    /// source rows while keeping two more `Module`-kind rows from test files.
+    /// No code in this crate touches row content by kind (see the field's own
+    /// doc comment on `Counters::reference_rows`), so the belt cannot make
+    /// the model keep all six in its prose. It can still make all six
+    /// available to a consumer that does not read the prose: this asserts
+    /// that every row Kin returned survives into the structured record,
+    /// including the two the model's own answer text would have dropped.
+    #[test]
+    fn every_type_resolved_row_survives_regardless_of_kind() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("find_references", TOSSG_FIND_REFERENCES_RESULT);
+
+        let agent = counters.to_json(0, &Stop::new(ExitStatus::Success, "final_answer", None));
+        let rows = agent["reference_rows"]
+            .as_array()
+            .expect("reference_rows must be an array");
+        assert_eq!(rows.len(), 6, "expected all six rows, got: {rows:#?}");
+
+        let kept_by_a_model_that_drops_module_kind_source_rows =
+            ["src/adapter/bun/ssg.ts", "src/adapter/deno/ssg.ts"];
+        for file in kept_by_a_model_that_drops_module_kind_source_rows {
+            let module_row = rows
+                .iter()
+                .find(|row| row["file_path"] == file && row["kind"] == "Module");
+            assert!(
+                module_row.is_some(),
+                "the Module-kind row for {file} must survive into the structured record even \
+                 though a model's own prose dropped it: {rows:#?}"
+            );
+            assert_eq!(module_row.unwrap()["resolution"], "type_resolved");
+        }
+    }
+
+    /// A result from any other tool is not `find_references`-shaped and must
+    /// add nothing, so a consumer never sees, say, `get_entity_source` bodies
+    /// misread as reference rows.
+    #[test]
+    fn a_result_from_a_different_tool_is_ignored() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("get_entity_source", TOSSG_FIND_REFERENCES_RESULT);
+        let agent = counters.to_json(0, &Stop::new(ExitStatus::Success, "final_answer", None));
+        assert_eq!(agent["reference_rows"].as_array().unwrap().len(), 0);
+    }
+
+    /// Text that is not the expected JSON shape, or not JSON at all, must not
+    /// panic the run; it is read best-effort and adds nothing on a miss.
+    #[test]
+    fn malformed_or_unrelated_text_is_read_best_effort() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("find_references", "not json at all");
+        counters.record_reference_rows("find_references", r#"{"message": "Entity not found"}"#);
+        let agent = counters.to_json(0, &Stop::new(ExitStatus::Success, "final_answer", None));
+        assert_eq!(agent["reference_rows"].as_array().unwrap().len(), 0);
+    }
+
+    /// A second `find_references` call in the same run, naming the same
+    /// focal and referenced entity, merges onto one row rather than
+    /// duplicating it, the way a multi-turn run that re-asks the same
+    /// question would.
+    #[test]
+    fn a_repeated_call_merges_rather_than_duplicates() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("find_references", TOSSG_FIND_REFERENCES_RESULT);
+        counters.record_reference_rows("find_references", TOSSG_FIND_REFERENCES_RESULT);
+        let agent = counters.to_json(0, &Stop::new(ExitStatus::Success, "final_answer", None));
+        assert_eq!(agent["reference_rows"].as_array().unwrap().len(), 6);
     }
 }
 
