@@ -2021,7 +2021,11 @@ default headline is the proven subset. Nothing is dropped at any setting: a row 
 the floor moves to `candidates` whole, keeping its `resolution` and its site lines, and \
 `min_resolution: \"name_only\"` counts every one of them in the headline again. \
 `counts.receiver_name_candidates` and `counts.unresolved_name_candidates` say which \
-ground held each withheld row. \
+ground held each withheld row. The floor only withholds where it has something to trade \
+a row for: where nothing this query resolved for the focal reached `import_scoped` or \
+`type_resolved` -- a store whose language links no imports across files at all is the case \
+that finds this -- its `name_only` rows stay in `references` rather than emptying the \
+headline, and `degradations` says so. \
 For a Go INTERFACE method the response also carries `interface_implementations`: the \
 concrete methods whose receiver types satisfy that contract, each with the file AND LINE \
 of its declaration, plus `files`, the files those declarations live in and no others. A \
@@ -2379,6 +2383,12 @@ fn min_resolution_from_args(
 /// publishes `via_override_of=<base>` rather than a tier: the caller provably
 /// calls the base and the focal provably overrides it, which is a resolved
 /// chain and not a name match.
+///
+/// `floor` may already have been dropped to `name_only` by the caller below,
+/// when nothing this query resolved for the focal reached above it. That
+/// leaves this function's own logic untouched: the fan-out ground still holds
+/// unconditionally, and the resolution ground still compares against whatever
+/// floor it is handed, simply never against one with nothing to prefer.
 fn is_withheld_candidate(row: &ReferenceRow, floor: RelationResolution) -> bool {
     if row.receiver_name_guess {
         return true;
@@ -2398,6 +2408,11 @@ const RECEIVER_NAME_CANDIDATES_REASON: &str = "receiver_name_candidates";
 /// above and under the same component: both say the headline is a floor because
 /// this answer is holding rows that may be callers and are not proven to be.
 pub(crate) const INTERFACE_DISPATCH_CANDIDATES_REASON: &str = "interface_dispatch_candidates";
+/// The reason a name-only-floor-bypass disclosure is filed under, under the
+/// same component as the two above. Where those say a row is held BACK because
+/// it is weak, this one says the opposite: a row this weak is being KEPT,
+/// because nothing else this query resolved for the focal is any stronger.
+const NAME_ONLY_CEILING_REASON: &str = "name_only_ceiling";
 
 /// Key the interface-dispatch block is published under.
 pub(crate) const INTERFACE_DISPATCH_KEY: &str = "interface_dispatch";
@@ -2715,6 +2730,45 @@ fn disclose_withheld_candidates(result: &mut serde_json::Value) {
             "read `candidates` for the rows withheld, and confirm each at its reference site \
              before treating it as a caller; pass min_resolution=\"name_only\" to count them \
              in the headline instead",
+    });
+    match result
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(disclosure),
+        None => result["degradations"] = serde_json::Value::Array(vec![disclosure]),
+    }
+}
+
+/// Declare that this answer's floor let `name_only` rows stay in `references`
+/// because nothing else here cleared it.
+///
+/// The resolution ground of [`is_withheld_candidate`] only fires where it has
+/// something to trade a row for: a row this query resolved to `import_scoped`
+/// or `type_resolved` for the SAME focal. Where nothing did, holding a
+/// `name_only` row back would not raise precision, because there is no
+/// stronger row behind it to prefer instead; it would only delete a row the
+/// graph did find, which is the recall loss a batch Go ingest with no gopls
+/// paid before this disclosure existed. The row stays, reading its own
+/// `resolution` honestly, and this says why a `references` row can still read
+/// `name_only` under the default floor.
+fn disclose_name_only_ceiling(result: &mut serde_json::Value, kept: usize) {
+    if kept == 0 {
+        return;
+    }
+    let disclosure = serde_json::json!({
+        "component": CALL_RESOLUTION_COMPONENT,
+        "reason": NAME_ONLY_CEILING_REASON,
+        "detail": format!(
+            "{kept} row(s) counted here read resolution `name_only` because nothing this \
+             query resolved for this focal reached `import_scoped` or `type_resolved`; there \
+             is no stronger row here to prefer them over, so the floor that would otherwise \
+             hold them back left them in `references` instead of `candidates`"
+        ),
+        "remediation":
+            "confirm each row at its reference site before treating it as certain; a store \
+             with cross-file linking for this language, or a language server where one \
+             applies, may resolve these past name_only and let the floor withhold them",
     });
     match result
         .get_mut("degradations")
@@ -3137,9 +3191,52 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // held, never dropped: they travel in `candidates` at full fidelity, they
     // carry their own `resolution`, and `min_resolution: "name_only"` puts every
     // one of them back in the headline for a caller that wants the wide read.
+    //
+    // The floor only pays where it has something to trade a row for. A Go
+    // store the batch ingest arm built with no gopls links no import across
+    // files at all, so every cross-file call for a focal in it resolves at
+    // best to `name_only`, and holding that row back for `import_scoped`
+    // would not raise precision: there is no stronger row behind it to
+    // prefer, so the trade removes a real caller and returns nothing in
+    // exchange. `reference_rows_carry_call_site_lines_on_both_ingest_arms`
+    // caught exactly this: the batch arm's only row for a Go caller read
+    // `name_only`, the default floor withheld it, and `references` came back
+    // empty over a call the graph had found. So the floor is computed once
+    // here, over every row this query resolved for the focal before any of
+    // them is withheld by it: where nothing reached `import_scoped` or
+    // `type_resolved`, the floor drops to `name_only`, which withholds
+    // nothing through this ground (below, `is_withheld_candidate` never
+    // withholds a row whose resolution is not strictly under the floor it is
+    // handed). The receiver fan-out ground is untouched by this and stays
+    // unconditional: a same-leaf-name match is a candidate because the call
+    // is genuinely ambiguous, a fact about the call and not about what else
+    // this query resolved.
+    let any_row_is_proven = rows
+        .iter()
+        .any(|row| row.resolution.is_some_and(RelationResolution::is_proven));
+    let floor = if any_row_is_proven {
+        min_resolution
+    } else {
+        RelationResolution::NameOnly
+    };
     let (rows, candidate_rows): (Vec<ReferenceRow>, Vec<ReferenceRow>) = rows
         .into_iter()
-        .partition(|row| !is_withheld_candidate(row, min_resolution));
+        .partition(|row| !is_withheld_candidate(row, floor));
+
+    // Rows this response counts at `name_only` only because the floor above
+    // dropped to `name_only` for lack of anything stronger here, not because a
+    // caller asked for the wide read (which leaves `min_resolution` itself at
+    // `name_only`, where nothing is withheld either way and there is nothing
+    // to disclose). Counted while `rows` still holds only the kept set, and
+    // disclosed below beside the other `degradations`.
+    let name_only_ceiling_kept =
+        if any_row_is_proven || min_resolution == RelationResolution::NameOnly {
+            0
+        } else {
+            rows.iter()
+                .filter(|row| row.resolution == Some(RelationResolution::NameOnly))
+                .count()
+        };
 
     // Who a Go interface value may have routed here. A call written `w.Write(p)`
     // where `w` holds an interface resolves to the INTERFACE method object, so a
@@ -3278,6 +3375,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         crate::caller_arrival::observe_caller_arrival(store, &target).to_json();
     disclose_withheld_candidates(&mut result);
     disclose_interface_dispatch_candidates(&mut result);
+    disclose_name_only_ceiling(&mut result, name_only_ceiling_kept);
 
     // Say that a bare name was resolved, and to how many candidates.
     //
@@ -10766,6 +10864,143 @@ mod tests {
         assert!(
             matches!(refused, Err(McpError::InvalidParams(_))),
             "an unknown floor must be refused, not silently widened"
+        );
+    }
+
+    /// A `name_only` row with nothing stronger for the same focal is kept in
+    /// `references` rather than withheld, because the floor has nothing to
+    /// trade it for.
+    ///
+    /// This is `reference_rows_carry_call_site_lines_on_both_ingest_arms`'s
+    /// unit-level twin. That kin-cli integration test failed with "Go batch:
+    /// no row for caller `run`": the batch ingest arm links no import across
+    /// files for Go, so its only row for the caller resolved at the `0.7`
+    /// exact-name tier, the default `import_scoped` floor withheld it into
+    /// `candidates`, and `references` came back empty over a call the graph
+    /// had found. This fixture is that failure at unit scale: one caller, one
+    /// `name_only` edge, no fan-out and no stronger sibling anywhere, so a
+    /// floor that still withholds here cannot pass this test.
+    #[tokio::test]
+    async fn a_name_only_row_with_nothing_stronger_for_the_focal_is_not_withheld() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("compute", "src/defs.rs");
+        store.upsert_entity(&target).unwrap();
+        let caller = make_entity("run", "src/caller.rs");
+        store.upsert_entity(&caller).unwrap();
+        // 0.7 is the exact-name `name_only` tier, not the 0.3 receiver
+        // fan-out: this row is withheld only through the resolution floor,
+        // which is the ground this test exists to exercise.
+        let mut relation = make_relation_with_site(
+            caller.id,
+            target.id,
+            RelationKind::Calls,
+            "src/caller.rs",
+            4,
+        );
+        relation.confidence = 0.7;
+        store.upsert_relation(&relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(
+            body["total_upstream"], 1,
+            "the only row for this focal is name_only, and nothing stronger exists here to \
+             prefer over it, so it counts in the headline: {body:#}"
+        );
+        let references = body["references"].as_array().unwrap();
+        assert_eq!(references.len(), 1, "{body:#}");
+        assert_eq!(references[0]["name"], "run", "{body:#}");
+        assert_eq!(
+            references[0]["resolution"], "name_only",
+            "kept, not upgraded: the row reads its own tier honestly: {body:#}"
+        );
+        assert_eq!(
+            body["candidates"].as_array().unwrap().len(),
+            0,
+            "nothing is withheld when nothing here beats it: {body:#}"
+        );
+        assert_eq!(body["counts"]["unresolved_name_candidates"], 0, "{body:#}");
+        assert_eq!(body["counts"]["receiver_name_candidates"], 0, "{body:#}");
+
+        let degradations = body["degradations"].as_array().cloned().unwrap_or_default();
+        assert!(
+            degradations.iter().any(|entry| {
+                entry["component"] == CALL_RESOLUTION_COMPONENT
+                    && entry["reason"] == NAME_ONLY_CEILING_REASON
+            }),
+            "the bypass is disclosed so the verdict can say why a references row still reads \
+             name_only: {body:#}"
+        );
+    }
+
+    /// The control for the test above: a store where cross-file linking DOES
+    /// work still withholds a `name_only` row when a `type_resolved` one
+    /// exists for the same focal.
+    ///
+    /// The floor's bypass turns off exactly where it still has something to
+    /// trade a row for, so this fails if that bypass ever widens from an
+    /// unlinked store to a linked one.
+    #[tokio::test]
+    async fn a_name_only_row_is_still_withheld_beside_a_type_resolved_one() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("compute", "src/defs.rs");
+        store.upsert_entity(&target).unwrap();
+
+        let proven = make_entity("proven_caller", "src/callers.rs");
+        store.upsert_entity(&proven).unwrap();
+        let proven_relation = make_relation_with_site(
+            proven.id,
+            target.id,
+            RelationKind::Calls,
+            "src/callers.rs",
+            4,
+        );
+        // 1.0 is parser-certain: `type_resolved`.
+        store.upsert_relation(&proven_relation).unwrap();
+
+        let weak = make_entity("weak_caller", "src/callers.rs");
+        store.upsert_entity(&weak).unwrap();
+        let mut weak_relation =
+            make_relation_with_site(weak.id, target.id, RelationKind::Calls, "src/callers.rs", 8);
+        weak_relation.confidence = 0.7; // the exact-name `name_only` tier
+        store.upsert_relation(&weak_relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        let names = |rows: &serde_json::Value| -> Vec<String> {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&body["references"]),
+            vec!["proven_caller".to_string()],
+            "the type_resolved row proves the floor has something to trade the other one for: \
+             {body:#}"
+        );
+        assert_eq!(
+            names(&body["candidates"]),
+            vec!["weak_caller".to_string()],
+            "so the name_only row is still held back, exactly as before this change: {body:#}"
+        );
+        assert_eq!(body["counts"]["unresolved_name_candidates"], 1, "{body:#}");
+
+        let degradations = body["degradations"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !degradations
+                .iter()
+                .any(|entry| entry["reason"] == NAME_ONLY_CEILING_REASON),
+            "a linked store never earns the bypass disclosure: {body:#}"
         );
     }
 

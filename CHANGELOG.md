@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool now takes `min_resolution`, defaulting to `import_scoped`. Setting
   `min_resolution: "name_only"` returns the old headline. `counts` reports
   `receiver_name_candidates` and `unresolved_name_candidates` apart.
+- `find_references`'s resolution floor no longer withholds every row for a
+  focal when nothing found for it ever resolved above `name_only`. A Go store
+  the batch ingest arm builds with no gopls links no import across files at
+  all, so a caller's only row resolved at `name_only` and the default floor
+  moved it out of `references` into `candidates`. The graph had found the
+  call, and the floor emptied the headline over it anyway: it removed one
+  hundred percent of the answer and gained no precision, because no stronger
+  row was there to prefer it over. The floor now withholds a `name_only` row
+  only where an `import_scoped` or `type_resolved` row exists for the same
+  focal to prefer, and `degradations` says when the floor could not trade.
 
 ## [0.7.21] - 2026-09-18
 
