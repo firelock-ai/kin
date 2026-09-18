@@ -12,6 +12,13 @@ This project includes the following third-party components:
   Copyright (c) 2018-2024 Max Brunsfeld and contributors
   Used for: source code parsing across supported languages
 
+- tree-sitter-typescript (MIT License), vendored and modified
+  Copyright (c) 2018-2024 Max Brunsfeld and contributors
+  Used for: TypeScript and TSX parsing
+  Modified: crates/kin-grammar-typescript carries v0.23.2 with the two patches
+  in its patches/ directory applied and the parsers regenerated. See that
+  directory's README.md and LICENSE.
+
 - KinDB (Apache-2.0 License)
   Copyright 2026 Firelock, LLC
   Used for: embedded graph database storage

@@ -1,0 +1,21 @@
+Accept type-only export star.
+
+Upstream: tree-sitter/tree-sitter-typescript, applies to v0.23.2.
+
+diff -u -r a/common/define-grammar.js b/common/define-grammar.js
+--- a/common/define-grammar.js	2026-09-17 08:35:42.965599710 -0700
++++ b/common/define-grammar.js	2026-09-17 08:35:42.985724732 -0700
+@@ -323,8 +323,11 @@
+         seq(
+           'export',
+           'type',
+-          $.export_clause,
+-          optional($._from_clause),
++          choice(
++            seq($.export_clause, optional($._from_clause)),
++            seq('*', $._from_clause),
++            seq($.namespace_export, $._from_clause),
++          ),
+           $._semicolon,
+         ),
+         seq('export', '=', $.expression, $._semicolon),

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# The grammar under `grammar/` is tree-sitter-typescript, MIT licensed. See
+# LICENSE and README.md.
+
+[package]
+name = "kin-grammar-typescript"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+description = "tree-sitter TypeScript and TSX grammars, patched so Kin can read two constructs tsc accepts"
+repository.workspace = true
+publish = false
+autoexamples = false
+build = "build.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.1"
+
+[dev-dependencies]
+tree-sitter = { workspace = true }

@@ -521,7 +521,7 @@ export interface Config {
 
 const MAX = 100;
 "#;
-        let result = parse_and_extract(source, &tree_sitter_typescript::LANGUAGE_TSX);
+        let result = parse_and_extract(source, &kin_grammar_typescript::LANGUAGE_TSX);
         assert!(!result.imports.is_empty());
         assert!(result.declarations.len() >= 2);
     }
