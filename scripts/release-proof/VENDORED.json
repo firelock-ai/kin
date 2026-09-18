@@ -4,7 +4,7 @@
   "note": "The hashes are the authority for the exact proof bytes this tree runs. source_commit identifies the last umbrella vendor snapshot. bin/kin-lane is local to this tree. bin/kin-release-preflight, bin/kin-release-preflight.d/proof-flow.sh, and bin/kin-release-preflight.d/validate.mjs carry the Kin-side VFS retirement update: future release packages omit the external kin-vfs executable and preload shims while complete legacy archives remain verifiable. Re-vendor the corresponding umbrella update before calling those copies byte-identical again.",
   "files": {
     "bin/kin-release-preflight": {"source": "bin/kin-release-preflight", "sha256": "71ca13cdcacde94c1f1cbc67aa351f3bb7c7b13eb0ad525fc6c82bc4d9c302cd"},
-    "bin/kin-release-preflight.d/Dockerfile": {"source": "bin/kin-release-preflight.d/Dockerfile", "sha256": "e6c0e30c2bf46fc889484fb7e32c73163c3cf315d60351be3acd2428d22d12f6"},
+    "bin/kin-release-preflight.d/Dockerfile": {"source": "bin/kin-release-preflight.d/Dockerfile", "sha256": "ae616f8898dcf1c093d16f90ce655072a495e29e74d61e3f30733646ae43b394"},
     "bin/kin-release-preflight.d/proof-flow.sh": {"source": "bin/kin-release-preflight.d/proof-flow.sh", "sha256": "ea81918079bbe7662391836b2a1341471da4487a184ed6086e7450a7757f8738"},
     "bin/kin-release-preflight.d/validate.mjs": {"source": "bin/kin-release-preflight.d/validate.mjs", "sha256": "01990b6d943c18b977e34d72eb068f795a35b0f6856d36995e484351f953ae70"},
     "bin/kin-evidence-publish": {"source": "bin/kin-evidence-publish", "sha256": "8912fd933ba37e2570ea2ff685a885551543f2a01e3baeb394876121f8811679"},
