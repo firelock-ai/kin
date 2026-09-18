@@ -46,7 +46,7 @@ use crate::handlers::common::{
     entity_presentation_end_line, entity_presentation_start_line, recorded_span_source_digest,
 };
 use crate::types::ToolCallResult;
-use crate::working_copy::{HostEntryReading, WorkingCopyProbe};
+use crate::working_copy::WorkingCopySurface;
 
 /// The tool's registered name, spelled once so the registry, the dispatcher,
 /// the budget table and the negative registry cannot drift from each other.
@@ -146,12 +146,25 @@ impl From<Entity> for FileEntityRow {
 /// `Absent` is not `Failed`. A file nothing ever tried to parse and a file whose
 /// parse failed both hold no entities, and only the second one is evidence about
 /// the code; collapsing them is how "no entities" comes to read as "no exports".
+///
+/// `Unrecorded` is not `Absent` either, for the same reason one step along. A
+/// file with no layout and no entities is one nothing parsed. A file with no
+/// layout and a graph full of entities for it, each carrying a span, is not:
+/// something parsed it and the record of how completely did not survive. Both
+/// used to answer `Absent`, and the sentence that word carries -- "the graph
+/// holds no entity set for it to be missing from" -- was then published over
+/// answers that had just returned one.
+///
+/// Measured on the staleness study's own saved replies: 1,292 of 1,292 calls
+/// that reported `parsed: absent` returned a non-empty entity set for the file
+/// they reported it about. The claim was false on every call that made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedState {
     Full,
     Partial,
     Failed,
     Absent,
+    Unrecorded,
 }
 
 impl ParsedState {
@@ -163,11 +176,17 @@ impl ParsedState {
             Self::Partial => "partial",
             Self::Failed => "failed",
             Self::Absent => "absent",
+            Self::Unrecorded => "unrecorded",
         }
     }
 
     /// Whether this state licenses reading the enumeration as the file's whole
     /// entity surface. Only a complete parse does.
+    ///
+    /// `Unrecorded` refuses with the rest, and deliberately. Entities with
+    /// verified spans prove a parse happened; they cannot prove it finished, and
+    /// the record that would have is the one that is missing. Splitting the word
+    /// out is about saying the true thing, not about relaxing the gate.
     pub fn certifies_enumeration(self) -> bool {
         matches!(self, Self::Full)
     }
@@ -518,12 +537,12 @@ fn sort_key(entity: &Entity) -> (usize, String, String) {
 /// Enumerate the entities the graph holds for one file.
 ///
 /// `host` is the working copy this repository's graph is supposed to be level
-/// with, when the caller has one to offer. It qualifies the answer and never
+/// with, as the calling layer understands it. It qualifies the answer and never
 /// produces any part of it: see [`crate::working_copy`].
 pub fn handle_list_file_entities<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    host: Option<&WorkingCopyProbe>,
+    host: WorkingCopySurface<'_>,
 ) -> Result<ToolCallResult> {
     let cursor = match args.get("cursor").and_then(serde_json::Value::as_str) {
         Some(token) if !token.trim().is_empty() => {
@@ -610,6 +629,13 @@ pub fn handle_list_file_entities<G: GraphStore>(
         Some(ParseCompleteness::Full) => ParsedState::Full,
         Some(ParseCompleteness::Partial(_)) => ParsedState::Partial,
         Some(ParseCompleteness::Failed(_)) => ParsedState::Failed,
+        // The entity count decides between the two no-layout states, and it is
+        // the count this answer just took rather than a second reading. A file
+        // the graph holds entities for was parsed by something; only the record
+        // of how completely is missing, and calling that "no adapter produced a
+        // layout" tells a reader a false thing about an answer that is looking
+        // at rows.
+        None if total_in_file > 0 => ParsedState::Unrecorded,
         None => ParsedState::Absent,
     };
     let parse_detail = match layout.as_ref().map(|layout| &layout.parse_completeness) {
@@ -670,9 +696,7 @@ pub fn handle_list_file_entities<G: GraphStore>(
     //
     // Taken after the graph-gap refusal above, so a path this graph has never
     // seen costs no host read at all.
-    let host_entry = host
-        .map(|probe| probe.observe(&repo_path, tree_entry.as_ref()))
-        .unwrap_or(HostEntryReading::Unobserved);
+    let host_entry = host.observe(&repo_path, tree_entry.as_ref());
 
     let enriched = language_server_edges(store, &entities)?;
 
@@ -785,6 +809,8 @@ pub fn handle_list_file_entities<G: GraphStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::working_copy::WorkingCopyProbe;
 
     use kin_db::InMemoryGraph;
     use kin_model::graph::EntityStore;
@@ -901,7 +927,7 @@ mod tests {
         store: &InMemoryGraph,
         args: &[(&str, serde_json::Value)],
     ) -> Result<serde_json::Value> {
-        call_over_host(store, args, None)
+        call_over_surface(store, args, WorkingCopySurface::NotApplicable)
     }
 
     /// The same call with a working copy offered, for the arms that grade what
@@ -910,6 +936,23 @@ mod tests {
         store: &InMemoryGraph,
         args: &[(&str, serde_json::Value)],
         host: Option<&WorkingCopyProbe>,
+    ) -> Result<serde_json::Value> {
+        call_over_surface(
+            store,
+            args,
+            match host {
+                Some(probe) => WorkingCopySurface::Probe(probe),
+                None => WorkingCopySurface::NotApplicable,
+            },
+        )
+    }
+
+    /// The same call over a named working-copy standing, for the arms that grade
+    /// what a surface with no probe publishes.
+    fn call_over_surface(
+        store: &InMemoryGraph,
+        args: &[(&str, serde_json::Value)],
+        host: WorkingCopySurface<'_>,
     ) -> Result<serde_json::Value> {
         let args: HashMap<String, serde_json::Value> = args
             .iter()
@@ -1094,7 +1137,8 @@ mod tests {
     fn finalized_limits(store: &InMemoryGraph, path: &str) -> String {
         let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
         let finalized = crate::finalize_with_envelope(
-            handle_list_file_entities(&args, store, None).expect("the tool answers"),
+            handle_list_file_entities(&args, store, WorkingCopySurface::NotApplicable)
+                .expect("the tool answers"),
             structural_authoritative_envelope(),
             TOOL_NAME,
         );
@@ -1235,23 +1279,31 @@ mod tests {
     /// Parse state decides certification, and each state is distinguishable.
     /// A file the extractor never parsed and a file it parsed completely both
     /// return rows; only one of them may be read as the file's whole surface.
+    ///
+    /// The two no-layout rows are the split: with no layout and no entities
+    /// nothing parsed the file, and with no layout and entities something did
+    /// and the record of how completely is gone. Same missing row, opposite
+    /// facts, and only the first is evidence about extraction coverage.
     #[test]
     fn parse_state_decides_whether_the_enumeration_is_certified() {
-        for (parse, expected, certified) in [
-            (Some(ParseCompleteness::Full), "full", true),
+        for (entities, parse, expected, certified) in [
+            (4, Some(ParseCompleteness::Full), "full", true),
             (
+                4,
                 Some(ParseCompleteness::Partial("2 parse error range(s)".into())),
                 "partial",
                 false,
             ),
             (
+                4,
                 Some(ParseCompleteness::Failed("last known good".into())),
                 "failed",
                 false,
             ),
-            (None, "absent", false),
+            (4, None, "unrecorded", false),
+            (0, None, "absent", false),
         ] {
-            let store = store_with(4, parse);
+            let store = store_with(entities, parse);
             let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
             assert_eq!(
                 payload[FILE_COVERAGE_KEY]["parsed"],
@@ -1265,7 +1317,7 @@ mod tests {
             // Rows are served either way. Withholding real graph truth because
             // it cannot be certified teaches an agent nothing and costs it the
             // answer it can still act on.
-            assert_eq!(payload["total_in_file"], serde_json::json!(4));
+            assert_eq!(payload["total_in_file"], serde_json::json!(entities));
         }
     }
 
@@ -1896,7 +1948,7 @@ mod tests {
         );
         assert!(
             crate::verdict::CLAUSE_CODES.iter().any(|entry| {
-                entry.code == "file_bytes_unadmitted" && entry.meaning.contains("kin reconcile")
+                entry.code == "file_bytes_unadmitted" && entry.meaning.contains("kin admit")
             }),
             "and the code's one written meaning must name the remedy the caller can act on"
         );
@@ -1958,27 +2010,186 @@ mod tests {
         );
     }
 
-    /// A caller with no working copy to offer is unchanged, which is what keeps
-    /// every offline and hosted answer off a floor it has no evidence for.
+    /// A caller with no working copy for this graph to be level with is
+    /// unchanged, which is what keeps every offline and hosted answer off a
+    /// floor it has no evidence for.
+    ///
+    /// The word is `not_applicable` rather than `unobserved`. `unobserved` is
+    /// one path a probe declined over a repository that has a working copy;
+    /// this is a repository that does not, and the two used to be spelled the
+    /// same.
     #[test]
-    fn an_answer_with_no_working_copy_offered_reports_unobserved_and_certifies() {
+    fn an_answer_with_no_working_copy_to_be_level_with_certifies() {
         let body = b"exports.setCharset = function () {};\n";
-        // The host holds other bytes, and nobody offered the probe that would
-        // see them. The reading must be the absence of evidence rather than the
-        // divergence a probe would have found.
+        // The host holds other bytes, and this route has no working copy the
+        // graph is supposed to be level with. The reading must be the absence
+        // of the question rather than the divergence a probe would have found.
         let (store, _root, _probe) = store_over_working_copy(body, b"// edited\n");
 
         let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
         let coverage = &payload[FILE_COVERAGE_KEY];
         assert_eq!(
             coverage["host_bytes"],
-            serde_json::json!("unobserved"),
+            serde_json::json!("not_applicable"),
             "{payload}"
         );
         assert_eq!(
             coverage["certifies_enumeration"],
             serde_json::json!(true),
             "{payload}"
+        );
+    }
+
+    /// A file the graph holds entities for and no parse record for is not a
+    /// file no adapter read, and the two must not send a reader to the same
+    /// place.
+    ///
+    /// Both arms have no layout. The only difference is whether the graph holds
+    /// entities for the file, which is the fact that separates "nothing parsed
+    /// this" from "something parsed this and the completeness record is gone".
+    /// Both still refuse to certify, and that is deliberate: entities with spans
+    /// prove a parse happened and cannot prove it finished. What changes is the
+    /// sentence, because the old one asserted the graph held no entity set for
+    /// the file while returning one.
+    ///
+    /// The study that found this measured 1,292 calls reporting `parsed:
+    /// absent`, and all 1,292 of them returned a non-empty entity set.
+    #[test]
+    fn a_parse_record_that_is_missing_is_not_a_parse_that_never_ran() {
+        let unrecorded = call(&store_with(2, None), &[("path", serde_json::json!(FILE))]).unwrap();
+        assert_eq!(
+            unrecorded["total_in_file"],
+            serde_json::json!(2),
+            "the arm only means something if the graph returns rows: {unrecorded}"
+        );
+        assert_eq!(
+            unrecorded[FILE_COVERAGE_KEY]["parsed"],
+            serde_json::json!("unrecorded"),
+            "{unrecorded}"
+        );
+        assert_eq!(
+            unrecorded[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(false),
+            "a parse nothing recorded the completeness of still cannot certify: {unrecorded}"
+        );
+
+        // The control, and the reason this is a split rather than a rename: a
+        // file with no layout AND no entities keeps the old word and the old
+        // sentence, which are both true of it.
+        let absent = call(&store_with(0, None), &[("path", serde_json::json!(FILE))]).unwrap();
+        assert_eq!(absent["total_in_file"], serde_json::json!(0), "{absent}");
+        assert_eq!(
+            absent[FILE_COVERAGE_KEY]["parsed"],
+            serde_json::json!("absent"),
+            "{absent}"
+        );
+
+        let factor_of = |payload: &serde_json::Value| -> String {
+            let annotated = crate::envelope::finalize(
+                ToolCallResult::text(serde_json::to_string(payload).unwrap()),
+                structural_authoritative_envelope(),
+                TOOL_NAME,
+            );
+            let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+            let value: serde_json::Value = serde_json::from_str(text).unwrap();
+            value["_kin"]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let unrecorded_factor = factor_of(&unrecorded);
+        assert!(
+            unrecorded_factor.contains("file_parse_unrecorded"),
+            "the reader has to be told which of the two they have: {unrecorded_factor:?}"
+        );
+        assert!(
+            !unrecorded_factor.contains("file_not_parsed"),
+            "and must not be told the graph never parsed a file it just enumerated: \
+             {unrecorded_factor:?}"
+        );
+
+        let absent_factor = factor_of(&absent);
+        assert!(
+            absent_factor.contains("file_not_parsed"),
+            "the genuinely unparsed file keeps its own code: {absent_factor:?}"
+        );
+        assert!(
+            crate::verdict::CLAUSE_CODES
+                .iter()
+                .any(|entry| entry.code == "file_parse_unrecorded"),
+            "and the new code carries one written meaning a reader can look up"
+        );
+    }
+
+    /// The defect this split exists for, at the handler.
+    ///
+    /// A daemon with its filesystem-to-graph ingestion switched off serves a
+    /// real working copy that nothing is comparing with graph truth. It used to
+    /// publish the same word as a probe that ran and declined one path, so the
+    /// answer certified and the caller was told nothing at all. The store here
+    /// is byte-identical to the certifying control above; only the standing the
+    /// calling layer declares is different.
+    #[test]
+    fn an_unchecked_working_copy_says_so_and_cannot_certify() {
+        let body = b"exports.setCharset = function () {};\n";
+        let (store, _root, _probe) = store_over_working_copy(body, body);
+
+        let level = call_over_surface(
+            &store,
+            &[("path", serde_json::json!(FILE))],
+            WorkingCopySurface::NotApplicable,
+        )
+        .unwrap();
+        assert_eq!(
+            level[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(true),
+            "the control has to certify or this arm proves nothing: {level}"
+        );
+
+        let payload = call_over_surface(
+            &store,
+            &[("path", serde_json::json!(FILE))],
+            WorkingCopySurface::Unchecked,
+        )
+        .unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["host_bytes"],
+            serde_json::json!("unchecked"),
+            "{payload}"
+        );
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(false),
+            "an answer over a working copy nothing compared cannot be certified: {payload}"
+        );
+
+        let annotated = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::to_string(&payload).unwrap()),
+            structural_authoritative_envelope(),
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_ne!(
+            value["_kin"]["verdict"]["state"],
+            serde_json::json!("certified"),
+            "the one verdict a reader acts on must not certify: {value}"
+        );
+        let limiting = value["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            limiting.contains("file_bytes_unchecked"),
+            "the verdict must name the comparison that did not run: {limiting:?}"
+        );
+        assert!(
+            crate::verdict::CLAUSE_CODES
+                .iter()
+                .any(|entry| entry.code == "file_bytes_unchecked"),
+            "and the code must carry one written meaning a reader can look up"
         );
     }
 

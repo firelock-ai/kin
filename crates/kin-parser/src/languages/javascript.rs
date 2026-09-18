@@ -220,8 +220,8 @@ pub fn parse_javascript_family(source: &[u8]) -> Result<Tree> {
     // than on a tiebreak.
     let mut best_unparsed = unparsed;
     let mut best = javascript;
-    let tsx = tree_sitter_typescript::LANGUAGE_TSX;
-    let typescript = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
+    let tsx = kin_grammar_typescript::LANGUAGE_TSX;
+    let typescript = kin_grammar_typescript::LANGUAGE_TYPESCRIPT;
     // Tracked apart from `best`, because the repair below is a TypeScript
     // repair and the tree winning on bytes may still be the JavaScript one.
     // That is not the rare case: it is exactly what happens on the files the
@@ -3205,7 +3205,7 @@ export function renderList(items: Array<string>): Node {
     #[test]
     fn a_flow_file_carrying_jsx_is_read_by_the_tsx_grammar() {
         let source = FLOW_JSX_SOURCE;
-        let typescript = parse_with(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT, source).unwrap();
+        let typescript = parse_with(&kin_grammar_typescript::LANGUAGE_TYPESCRIPT, source).unwrap();
         assert!(
             typescript.root_node().has_error(),
             "the fixture must defeat the non-JSX TypeScript grammar, or TSX is not what is being tested"
@@ -3315,8 +3315,8 @@ export function renderList(items: Array<string>): Node {
     fn typescript_family_detection_is_grammar_backed() {
         let source = b"const x = 1;\n";
         let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source).unwrap();
-        let tsx = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
-        let typescript = parse_with(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT, source).unwrap();
+        let tsx = parse_with(&kin_grammar_typescript::LANGUAGE_TSX, source).unwrap();
+        let typescript = parse_with(&kin_grammar_typescript::LANGUAGE_TYPESCRIPT, source).unwrap();
         assert!(!tree_is_typescript_family(&javascript));
         assert!(tree_is_typescript_family(&tsx));
         assert!(tree_is_typescript_family(&typescript));
@@ -3458,7 +3458,7 @@ export function updateState<S>(initialState: (() => S) | S): [S, Dispatch<BasicS
     #[test]
     fn the_repair_leaves_the_shorthand_fixture_fully_parsed() {
         let unrepaired =
-            parse_with(&tree_sitter_typescript::LANGUAGE_TSX, FLOW_SHORTHAND_SOURCE).unwrap();
+            parse_with(&kin_grammar_typescript::LANGUAGE_TSX, FLOW_SHORTHAND_SOURCE).unwrap();
         let before = unparsed_byte_total(&unrepaired);
         assert!(
             before > FLOW_SHORTHAND_SOURCE.len() / 2,
@@ -3484,7 +3484,7 @@ export function updateState<S>(initialState: (() => S) | S): [S, Dispatch<BasicS
     #[test]
     fn the_repair_refuses_a_round_that_costs_a_declaration() {
         let source = FLOW_MATCH_FIXTURE;
-        let plain = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
+        let plain = parse_with(&kin_grammar_typescript::LANGUAGE_TSX, source).unwrap();
         assert!(
             !sites_near_errors(&plain, source, shorthand_function_type_scan).is_empty(),
             "the match arms must look like shorthand parameters, or this guards nothing"
@@ -3603,7 +3603,7 @@ export function clearContainer(container: Container): void {
     #[test]
     fn the_repair_leaves_the_anonymous_interface_fixture_fully_parsed() {
         let unrepaired = parse_with(
-            &tree_sitter_typescript::LANGUAGE_TSX,
+            &kin_grammar_typescript::LANGUAGE_TSX,
             FLOW_ANONYMOUS_INTERFACE_SOURCE,
         )
         .unwrap();
@@ -3794,7 +3794,7 @@ export type Container =
         );
         let source = source.as_slice();
 
-        let plain = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
+        let plain = parse_with(&kin_grammar_typescript::LANGUAGE_TSX, source).unwrap();
         let union = normalize_sites(
             FLOW_REPAIRS
                 .iter()
@@ -3809,7 +3809,7 @@ export type Container =
                 }
             }
         }
-        let all_at_once = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, &blanked).unwrap();
+        let all_at_once = parse_with(&kin_grammar_typescript::LANGUAGE_TSX, &blanked).unwrap();
         assert!(
             top_level_declaration_count(&all_at_once) < top_level_declaration_count(&plain),
             "the round offering every construct must cost a declaration, or the retry beneath it \
@@ -3819,7 +3819,7 @@ export type Container =
         );
 
         let repaired =
-            repair_flow_constructs(&tree_sitter_typescript::LANGUAGE_TSX, source).expect("repair");
+            repair_flow_constructs(&kin_grammar_typescript::LANGUAGE_TSX, source).expect("repair");
         assert!(
             unparsed_byte_total(&repaired) < unparsed_byte_total(&plain),
             "the interface construct's own round must still be kept: {} to {}",
@@ -3875,7 +3875,7 @@ export type Container =
         let source = b"type Handler = (event: Event) => void;
 const run = (a) => a + 1;
 ";
-        let tree = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
+        let tree = parse_with(&kin_grammar_typescript::LANGUAGE_TSX, source).unwrap();
         assert_eq!(unparsed_byte_total(&tree), 0);
         assert!(
             sites_near_errors(&tree, source, shorthand_function_type_scan).is_empty(),

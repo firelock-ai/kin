@@ -3373,6 +3373,17 @@ pub struct DaemonState {
     /// write authority. When true, no filesystem/session/VFS compatibility
     /// surface may reconcile bytes back into graph truth.
     pub(crate) filesystem_reconcile_disabled: AtomicBool,
+    /// Whether the reason for the line above is the storage backend rather than
+    /// the environment.
+    ///
+    /// The two reasons were OR-ed into one bool and they are not the same fact.
+    /// A graph-authority backend serves a checkout that is a PROJECTION of graph
+    /// truth, so no host entry there can be content an admission failed to take.
+    /// The environment switch is set over an ordinary working copy that can and
+    /// does move underneath the graph. Answers over the first are not qualified
+    /// by the host; answers over the second are qualified by a comparison nobody
+    /// is making, and a caller has to be told which they have.
+    pub(crate) graph_authority_storage_backend: bool,
     /// Generation from the last snapshot load (for CAS on save).
     pub snapshot_generation: AtomicU64,
     /// A graph authority commit advanced, but its local generation marker and
@@ -5888,6 +5899,7 @@ impl DaemonState {
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(false),
             ),
+            graph_authority_storage_backend: false,
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
             #[cfg(test)]
@@ -6306,6 +6318,7 @@ impl DaemonState {
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
             ),
+            graph_authority_storage_backend: true,
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
             #[cfg(test)]
@@ -10586,6 +10599,15 @@ impl DaemonState {
     /// cannot drift if the process environment later changes.
     pub(crate) fn filesystem_reconcile_disabled(&self) -> bool {
         self.filesystem_reconcile_disabled.load(Ordering::Relaxed)
+    }
+
+    /// Whether this daemon's checkout is a projection of graph truth rather than
+    /// a working copy the graph is supposed to be level with.
+    ///
+    /// Read only to decide what an answer may say about the host, never to
+    /// decide what an answer contains.
+    pub(crate) fn graph_authority_storage_backend(&self) -> bool {
+        self.graph_authority_storage_backend
     }
 
     /// Advance this process's repository-authority cursor after a successful

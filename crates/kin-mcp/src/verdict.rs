@@ -219,7 +219,11 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "file_bytes_unadmitted",
-        meaning: "The working copy holds content at this path that graph truth does not carry, so the spans describe earlier bytes; `kin reconcile` takes the edit.",
+        meaning: "The working copy holds content at this path that graph truth does not carry, so the spans describe earlier bytes; `kin admit` takes the working tree.",
+    },
+    ClauseCode {
+        code: "file_bytes_unchecked",
+        meaning: "This repository has a working copy the graph is supposed to be level with and nothing is comparing them, so whether the answer describes the file as it is now is not known.",
     },
     ClauseCode {
         code: "file_coverage_unreported",
@@ -236,6 +240,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     ClauseCode {
         code: "file_parse_state_unknown",
         meaning: "The answer reported a parse state this build does not recognise.",
+    },
+    ClauseCode {
+        code: "file_parse_unrecorded",
+        meaning: "The graph holds entities for the file and no record of how completely they were extracted, so the rows are real and their being the whole set is unestablished.",
     },
     ClauseCode {
         code: "file_parsed_partially",

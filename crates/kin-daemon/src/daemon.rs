@@ -11913,6 +11913,33 @@ mod lsp_query_column_tests {
         assert_eq!(lsp_query_column("def send(self):", "send", 4), 8);
     }
 
+    /// A generic declaration's query column is its NAME, never its type
+    /// parameter list.
+    ///
+    /// `file_enrichment`'s container guard reads this column to decide whether
+    /// a definition landing on a class header named the class or named one of
+    /// its type parameters, so the two have to disagree. They do here by a wide
+    /// margin: the name opens at 22 and `E` sits at 37.
+    #[test]
+    fn a_generic_declaration_is_queried_at_its_name_not_its_type_parameters() {
+        // hono, src/adapter/aws-lambda/handler.ts:282, which reads
+        // `export abstract class EventProcessor<E extends LambdaEvent> {`.
+        let line = "export abstract class EventProcessor<E extends LambdaEvent> {";
+        let signature = "abstract class EventProcessor<E extends LambdaEvent>";
+        let start_col = line.find("abstract").expect("declaration start") as u32;
+
+        let name_col = lsp_query_column(signature, "EventProcessor", start_col);
+        assert_eq!(
+            name_col,
+            line.find("EventProcessor").expect("class name") as u32
+        );
+        let type_param_col = line.find("<E ").expect("type parameter") as u32 + 1;
+        assert!(
+            type_param_col >= name_col + "EventProcessor".len() as u32,
+            "the type parameter must fall outside the name token: name at {name_col}, `E` at {type_param_col}"
+        );
+    }
+
     /// A deeper receiver chain still resolves to the last segment.
     #[test]
     fn only_the_final_segment_is_addressed() {

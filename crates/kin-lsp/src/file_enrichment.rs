@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::enrichment::{deterministic_relation_id, enrich_entity_calls, EntityIndex};
+use crate::enrichment::{deterministic_relation_id, enrich_entity_calls, EntityIndex, EntityRef};
 use crate::error::{LspError, Result};
 use crate::lifecycle::LspServer;
 use crate::protocol;
@@ -76,6 +76,72 @@ pub(crate) fn identifier_positions_in_line(line_text: &str) -> Vec<u32> {
     }
 
     positions
+}
+
+/// The identifier token that starts at `col`, as a string.
+///
+/// `col` is a character offset, the same unit `identifier_positions_in_line`
+/// hands out, so the scan is over characters and not bytes.
+fn identifier_at(line_text: &str, col: u32) -> String {
+    line_text
+        .chars()
+        .skip(col as usize)
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// Whether an identifier inside an entity resolved to that entity's own
+/// container without naming it, so no edge should be minted for it.
+///
+/// An entity nested inside another refers to its container by writing the
+/// container's name. Two things that are not the container's name resolved to
+/// it anyway, because a definition location is matched to an entity by LINE and
+/// a container's declaration line carries more than its name.
+///
+/// A generic declaration's type parameters sit on that line: `class
+/// SmartRouter<T>` owns line 3, so every member that writes `T` (`#routers:
+/// Router<T>[]`, `add(handler: T)`, `match(): Result<T>`) resolved `T` there.
+/// And `this` resolves to the class's own name token, so the first `this` in
+/// every method body resolved to the class as well. Between them, six of the
+/// eleven references `find_references` returned for `SmartRouter` were its own
+/// members, and ten of fifteen for `EventProcessor<E>`. The TypeScript compiler
+/// counts none of them, because none of them writes the name.
+///
+/// So the identifier has to spell the container's name AND resolve to the
+/// container's own name token. `this` and `T` fail the first test, a type
+/// parameter fails the second, and a member that really does name its class
+/// (`static create() { return new Foo() }`) passes both and keeps its edge. The
+/// rule is applied only when the destination CONTAINS the source, so the only
+/// edges it can remove are a member's edges to its own container, which the
+/// container's own `Contains` edge already carries in the other direction.
+/// Every edge between entities that do not contain one another is left exactly
+/// as it was.
+fn lands_inside_container_without_naming_it(
+    source: &EntityRef,
+    dst: &EntityRef,
+    queried: &str,
+    target_line: u32,
+    target_col: u32,
+) -> bool {
+    let contains = dst.file_path == source.file_path
+        && dst.start_line <= source.start_line
+        && dst.end_line >= source.end_line;
+    if !contains {
+        return false;
+    }
+    // A dotted entity name (`Owner.member`) is spelled in the source as its
+    // final segment alone, which is both what a call site writes and what
+    // `name_col` points at.
+    let simple_name = dst.name.rsplit('.').next().unwrap_or(dst.name.as_str());
+    if queried != simple_name {
+        return true;
+    }
+    if target_line != dst.name_line {
+        return true;
+    }
+    // `name_col` is where the name STARTS; the token runs its own length.
+    let width = simple_name.chars().count() as u32;
+    target_col < dst.name_col || target_col >= dst.name_col.saturating_add(width)
 }
 
 /// Enrich a file by querying textDocument/definition at every identifier position.
@@ -259,6 +325,16 @@ pub async fn enrich_file_definitions(
                                 continue;
                             }
 
+                            if lands_inside_container_without_naming_it(
+                                source,
+                                dst,
+                                &identifier_at(line_text, col),
+                                target_line,
+                                location.range.start.character,
+                            ) {
+                                continue;
+                            }
+
                             definitions_resolved += 1;
 
                             let kind_str = if target_uri.contains(&rel_path) {
@@ -395,6 +471,124 @@ mod tests {
                 "line {line} is outside every entity span and is safe to skip"
             );
         }
+    }
+
+    /// A class's own members are not references to the class.
+    ///
+    /// `textDocument/definition` answers with a POSITION, and this pass matches
+    /// a position to an entity by line alone. A generic class declares its type
+    /// parameters on the same line as its name, so every member of
+    /// `SmartRouter<T>` that writes `T` resolved to line 3; and `this` resolves
+    /// to the class's own name token, so the first `this` in every method body
+    /// resolved there too. Both were recorded as referencing `SmartRouter`: six
+    /// of the eleven rows `find_references` returned for it were its own
+    /// members, and the TypeScript compiler counts none of them.
+    ///
+    /// The columns below are read out of the source text rather than written
+    /// down, so the test pins the geometry of the declaration and not the
+    /// arithmetic of the guard.
+    #[test]
+    fn a_members_use_of_its_owners_type_parameter_is_not_a_reference_to_the_owner() {
+        // hono, src/router/smart-router/router.ts, lines 4 and 13 (1-based).
+        let header = "export class SmartRouter<T> implements Router<T> {";
+        let name_col = header.find("SmartRouter").expect("class name") as u32;
+        let type_param_col = header.find("<T>").expect("type parameter") as u32 + 1;
+
+        let class = EntityRef {
+            id: EntityId::new(),
+            name: "SmartRouter".to_string(),
+            file_path: "src/router/smart-router/router.ts".to_string(),
+            start_line: 3,
+            start_col: 7,
+            end_line: 70,
+            name_line: 3,
+            name_col,
+        };
+        let member = EntityRef {
+            id: EntityId::new(),
+            name: "SmartRouter.add".to_string(),
+            file_path: "src/router/smart-router/router.ts".to_string(),
+            start_line: 12,
+            start_col: 2,
+            end_line: 18,
+            name_line: 12,
+            name_col: 2,
+        };
+
+        // `add(method: string, path: string, handler: T)` resolves `T` to the
+        // class header, one column past the end of the class name. No edge.
+        assert!(
+            super::lands_inside_container_without_naming_it(
+                &member,
+                &class,
+                "T",
+                class.name_line,
+                type_param_col,
+            ),
+            "a use of the owner's type parameter must not become a reference to the owner"
+        );
+
+        // `this.#routes` resolves `this` to the class's own NAME token, so the
+        // position test alone lets it through. `this` names no declaration.
+        assert!(
+            super::lands_inside_container_without_naming_it(
+                &member,
+                &class,
+                "this",
+                class.name_line,
+                name_col,
+            ),
+            "`this` must not become a reference to the class that encloses it"
+        );
+
+        // `static create() { return new SmartRouter(...) }` writes the class
+        // name and resolves to it. That is a real reference and keeps its edge.
+        assert!(
+            !super::lands_inside_container_without_naming_it(
+                &member,
+                &class,
+                "SmartRouter",
+                class.name_line,
+                name_col,
+            ),
+            "a member that really names its class must keep its edge"
+        );
+        // The last column of the name is still inside the name.
+        assert!(!super::lands_inside_container_without_naming_it(
+            &member,
+            &class,
+            "SmartRouter",
+            class.name_line,
+            name_col + "SmartRouter".len() as u32 - 1,
+        ));
+
+        // The guard is scoped to containment: two entities that do not contain
+        // one another are untouched whatever the identifier or the column.
+        let sibling = EntityRef {
+            id: EntityId::new(),
+            name: "Hono".to_string(),
+            file_path: "src/hono.ts".to_string(),
+            start_line: 15,
+            start_col: 7,
+            end_line: 40,
+            name_line: 15,
+            name_col: 13,
+        };
+        assert!(
+            !super::lands_inside_container_without_naming_it(&member, &sibling, "this", 15, 99),
+            "an edge between entities that do not contain one another must be left alone"
+        );
+    }
+
+    /// The token the pass asked about, read back from the line it asked on.
+    #[test]
+    fn the_queried_identifier_is_read_back_from_its_column() {
+        let line = "    this.#routers = init.routers";
+        assert_eq!(super::identifier_at(line, 4), "this");
+        assert_eq!(super::identifier_at(line, 20), "init");
+        let generic = "  add(method: string, path: string, handler: T) {";
+        let t_col = generic.find("T)").expect("type parameter") as u32;
+        assert_eq!(super::identifier_at(generic, t_col), "T");
     }
 
     #[test]

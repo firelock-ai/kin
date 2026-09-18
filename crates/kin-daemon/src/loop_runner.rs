@@ -5395,7 +5395,7 @@ mod tests {
         let result = kin_mcp::handlers::file_entities::handle_list_file_entities(
             &args,
             state.graph.as_ref(),
-            None,
+            kin_mcp::WorkingCopySurface::NotApplicable,
         )
         .expect("the enumeration answers");
         let kin_mcp::types::ContentBlock::Text { text } = &result.content[0];
@@ -5480,10 +5480,13 @@ mod tests {
         assert_ne!(first_blob, second_blob, "the tree must hold the new bytes");
 
         // The window: new blob, old spans. The enumeration must not certify.
+        // The graph still holds alpha from the retired layout, so this is a
+        // missing parse record for the new blob, not a file nothing parsed;
+        // that reads as `unrecorded` rather than `absent`.
         let window = file_coverage(&state, path);
         assert_eq!(
             window["parsed"],
-            serde_json::json!("absent"),
+            serde_json::json!("unrecorded"),
             "a layout describing the replaced blob must not stand: {window}"
         );
         assert_eq!(

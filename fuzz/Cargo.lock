@@ -642,6 +642,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-grammar-typescript"
+version = "0.7.21"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "kin-model"
 version = "0.7.28"
 dependencies = [
@@ -662,8 +670,9 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.7.20"
+version = "0.7.21"
 dependencies = [
+ "kin-grammar-typescript",
  "kin-model",
  "serde",
  "serde_json",
@@ -685,7 +694,6 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-swift",
- "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -1335,16 +1343,6 @@ name = "tree-sitter-swift"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe36052155b9dd69ca82b3b8f1b4ccfb2d867125ac1a4db1dd7331829242668c"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-typescript"
-version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
 dependencies = [
  "cc",
  "tree-sitter-language",

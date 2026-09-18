@@ -748,8 +748,10 @@ enum Command {
         /// bulk mode). Suffix with +dispatch (or pass dispatch on its own) to
         /// list interface-dispatch candidates beside the answer: Go call sites
         /// that reach an interface method this method's receiver type
-        /// satisfies. They are possible callers, not confirmed ones, and are
-        /// never added to the count.
+        /// satisfies. On a Go interface method it lists the other direction
+        /// instead, the concrete methods whose receiver types satisfy that
+        /// contract. Either way they are possible, not confirmed, and are never
+        /// added to the count.
         #[arg(long, default_value = "all")]
         kind: String,
         /// Exact repo-relative file of the entity, when its name has twins

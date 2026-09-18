@@ -1240,6 +1240,20 @@ fn dispatch_candidate_lines(
             target.name, target.kind, target.language
         )];
     }
+    // The focal IS the contract. Asked which interfaces it may be dispatched
+    // through, the honest answer is that a caller here already reaches it
+    // directly; what they are almost certainly after is the other direction,
+    // which this section answers instead of printing "satisfies no interface"
+    // about a thing that is one.
+    match kin_index::dispatch::implementations_apply(graph, target) {
+        Ok(true) => return implementation_candidate_lines(layout, graph, target),
+        Ok(false) => {}
+        Err(error) => {
+            return vec![format!(
+                "Interface-dispatch candidates unavailable: {error}"
+            )]
+        }
+    }
     let targets = match kin_index::dispatch::interface_dispatch_targets(graph, target) {
         Ok(targets) if !targets.is_empty() => targets,
         Ok(_) => {
@@ -1310,6 +1324,67 @@ fn dispatch_candidate_lines(
     lines
 }
 
+/// Where a Go interface method is implemented, rendered.
+///
+/// The mirror of [`dispatch_candidate_lines`], for a focal that is the contract
+/// rather than an implementation of one. Every row is labelled a candidate and
+/// none is added to the reference count above it, for the reason that direction
+/// gives: Go interface satisfaction is structural, so the graph can say this
+/// method's receiver type satisfies the contract and holds nothing that says the
+/// author wrote it to.
+///
+/// Each row carries a LINE. A reader handed only the file still has to search
+/// it, and the measurement that found this gap scored a file-granularity answer
+/// at zero on the site axis for exactly that reason.
+fn implementation_candidate_lines(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+) -> Vec<String> {
+    let contract = kin_index::dispatch::split_qualified_method(&target.name)
+        .map(|(owner, _)| owner.to_string())
+        .unwrap_or_else(|| target.name.clone());
+    let candidates = match kin_index::dispatch::interface_implementations(graph, target) {
+        Ok(candidates) => candidates,
+        // A walk that failed is not an implementation-free answer, and saying so
+        // is not this command's verdict to change.
+        Err(error) => return vec![format!("Interface implementations unavailable: {error}")],
+    };
+    if candidates.is_empty() {
+        return vec![format!(
+            "0 implementation candidates: no type this graph holds offers the whole method set \
+             of {contract}, so nothing here implements this method."
+        )];
+    }
+    let mut lines = vec![format!(
+        "{} implementation candidate{} not counted above; each is a concrete method whose \
+         receiver type satisfies {contract}, so the binding here is possible and unproven:",
+        candidates.len(),
+        if candidates.len() == 1 { "" } else { "s" },
+    )];
+    for candidate in &candidates {
+        let Ok(Some(method)) = graph.get_entity(&candidate.method_id) else {
+            continue;
+        };
+        let file_path = method
+            .file_origin
+            .as_ref()
+            .map(|origin| display_read_path(layout, &origin.0))
+            .unwrap_or_else(|| "unknown".to_string());
+        let pointer = crate::entity_identity::entity_pointer(graph, &method);
+        let location = match (pointer.line, pointer.stale) {
+            (_, true) => format!("{file_path} {}", crate::entity_identity::STALE_SPAN_MARK),
+            (Some(line), false) => format!("{file_path}:{line}"),
+            (None, false) => file_path,
+        };
+        lines.push(format!(
+            "  {} @ {} [Implements] (implementation_candidate) on {}",
+            candidate.method_name, location, candidate.receiver_name
+        ));
+    }
+    lines
+}
+
 fn relation_kinds_label(kinds: &[RelationKind]) -> String {
     kinds
         .iter()
@@ -1335,8 +1410,9 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 mod tests {
     use super::{
         build_bulk_refs_response, build_refs_response, collect_graph_references,
-        parse_relation_kinds, refs_not_found_guidance, strip_dispatch_modifier, BulkRefsRequest,
-        BulkRefsResponse, ReferenceLinesAbsent, RefsRequest, RelationResolution,
+        dispatch_candidate_lines, parse_relation_kinds, refs_not_found_guidance,
+        strip_dispatch_modifier, BulkRefsRequest, BulkRefsResponse, ReferenceLinesAbsent,
+        RefsRequest, RelationResolution,
     };
 
     /// MEASUREMENT, not an assertion. Prints which of a C prototype and its
@@ -1954,6 +2030,223 @@ mod tests {
         .expect("refs response");
         assert!(response.negative.is_none());
         assert!(!response.lines.join("\n").contains("Kin cannot rule out"));
+    }
+
+    /// A Go contract, one type that satisfies it and one that misses a method,
+    /// with the implementation's declaration line set so a printed row can be
+    /// checked against one.
+    ///
+    /// Hand built. The graph SHAPE it assumes is graded in
+    /// `kin-index/tests/go_interface_implementations.rs`, which runs the real Go
+    /// adapter over source; this test is about what `kin refs --kind dispatch`
+    /// PRINTS for that shape.
+    fn go_contract_fixture() -> (
+        kin_db::InMemoryGraph,
+        kin_core::KinLayout,
+        tempfile::TempDir,
+        kin_model::Entity,
+    ) {
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, Hash256, LanguageId, RelationId, RelationOrigin,
+            SemanticFingerprint, SourceSpan, Visibility,
+        };
+
+        fn go(
+            kind: EntityKind,
+            name: &str,
+            path: &str,
+            signature: &str,
+            line: Option<u32>,
+        ) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind,
+                name: name.to_string(),
+                language: LanguageId::Go,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(path)),
+                span: line.map(|line| SourceSpan {
+                    file: FilePathId::new(path),
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: line,
+                    start_col: 0,
+                    end_line: line + 2,
+                    end_col: 1,
+                }),
+                signature: signature.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let graph = kin_db::InMemoryGraph::new();
+        let writer = go(
+            EntityKind::Interface,
+            "Writer",
+            "internal/gh/contract.go",
+            "type Writer interface",
+            None,
+        );
+        let writer_write = go(
+            EntityKind::Method,
+            "Writer.Write",
+            "internal/gh/contract.go",
+            "Write(p []byte) (int, error)",
+            None,
+        );
+        let writer_close = go(
+            EntityKind::Method,
+            "Writer.Close",
+            "internal/gh/contract.go",
+            "Close() error",
+            None,
+        );
+        let buffer = go(
+            EntityKind::Class,
+            "Buffer",
+            "internal/buf/buffer.go",
+            "type Buffer struct",
+            None,
+        );
+        let buffer_write = go(
+            EntityKind::Method,
+            "Buffer.Write",
+            "internal/buf/buffer.go",
+            "func (b *Buffer) Write(p []byte) (int, error)",
+            Some(7),
+        );
+        let buffer_close = go(
+            EntityKind::Method,
+            "Buffer.Close",
+            "internal/buf/buffer.go",
+            "func (b *Buffer) Close() error",
+            Some(12),
+        );
+        // The control: a Write and no Close, so it satisfies no Writer.
+        let counter = go(
+            EntityKind::Class,
+            "Counter",
+            "internal/count/counter.go",
+            "type Counter struct",
+            None,
+        );
+        let counter_write = go(
+            EntityKind::Method,
+            "Counter.Write",
+            "internal/count/counter.go",
+            "func (c *Counter) Write(p []byte) (int, error)",
+            Some(5),
+        );
+
+        for entity in [
+            &writer,
+            &writer_write,
+            &writer_close,
+            &buffer,
+            &buffer_write,
+            &buffer_close,
+            &counter,
+            &counter_write,
+        ] {
+            EntityStore::upsert_entity(&graph, entity).unwrap();
+        }
+        for (owner, member) in [
+            (&writer, &writer_write),
+            (&writer, &writer_close),
+            (&buffer, &buffer_write),
+            (&buffer, &buffer_close),
+            (&counter, &counter_write),
+        ] {
+            EntityStore::upsert_relation(
+                &graph,
+                &kin_model::Relation {
+                    id: RelationId::new(),
+                    kind: kin_model::RelationKind::Contains,
+                    src: kin_model::GraphNodeId::Entity(owner.id),
+                    dst: kin_model::GraphNodeId::Entity(member.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        (graph, layout, dir, writer_write)
+    }
+
+    /// Asked about a Go INTERFACE method, `--kind dispatch` used to say the
+    /// focal's receiver type satisfies no interface, which describes a contract
+    /// as if it were a failed implementation. It now answers the question a
+    /// reader is actually asking there: where is this implemented.
+    ///
+    /// The LINE is the assertion. A compiler-graded measurement on `cli/cli` at
+    /// `14d339d9` put Kin at zero correct implementation sites out of 142
+    /// because the file was the most it could name.
+    #[test]
+    fn refs_dispatch_on_a_contract_names_where_it_is_implemented() {
+        let (graph, layout, _dir, spec) = go_contract_fixture();
+        let printed = dispatch_candidate_lines(&layout, &graph, &spec).join("\n");
+
+        assert!(
+            printed.contains("1 implementation candidate not counted above"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("Buffer.Write @ internal/buf/buffer.go:8"),
+            "the row must carry the declaration line, not only the file: {printed}"
+        );
+        assert!(printed.contains("(implementation_candidate)"), "{printed}");
+        assert!(
+            !printed.contains("Counter.Write"),
+            "Counter has no Close, so it implements nothing here: {printed}"
+        );
+        assert!(
+            !printed.contains("satisfies no interface"),
+            "that sentence is about an implementation, and the focal is a contract: {printed}"
+        );
+    }
+
+    /// The other direction is unchanged: a concrete method still gets the
+    /// dispatch answer, and the two sections cannot be confused for each other.
+    #[test]
+    fn refs_dispatch_on_a_concrete_method_still_answers_dispatch() {
+        let (graph, layout, _dir, _spec) = go_contract_fixture();
+        let concrete = kin_model::EntityStore::query_entities(
+            &graph,
+            &kin_model::graph::EntityFilter::default(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|entity| entity.name == "Buffer.Write")
+        .expect("the fixture holds the implementation");
+
+        let printed = dispatch_candidate_lines(&layout, &graph, &concrete).join("\n");
+        assert!(
+            printed.contains("interface-dispatch candidate"),
+            "a concrete method keeps the dispatch section: {printed}"
+        );
+        assert!(
+            !printed.contains("implementation candidate"),
+            "and never the implementations one: {printed}"
+        );
     }
 
     /// A three-entity fixture whose focal has no incoming edges, with a

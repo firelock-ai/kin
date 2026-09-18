@@ -109,12 +109,49 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
     // reads `full` and `span_provenance` reads `digest_verified` over spans into
     // a file that has since moved. Naming the reconcile is also the only remedy
     // of the five the caller can act on immediately.
-    if coverage.get("host_bytes").and_then(Value::as_str) == Some("diverged") {
+    let host_bytes = coverage.get("host_bytes").and_then(Value::as_str);
+    if host_bytes == Some("diverged") {
         return Some(
             "file_bytes_unadmitted: the working copy holds content at this path that graph \
              truth does not carry, so every span here was derived from earlier bytes and the \
-             line numbers do not describe the file as it is now. `kin reconcile` takes the \
-             edit, and a commit takes it anyway"
+             line numbers do not describe the file as it is now. `kin admit` takes the \
+             complete working tree, and a commit takes it anyway"
+                .to_string(),
+        );
+    }
+
+    // Beside the divergence rather than after the graph-internal readings,
+    // because it is the same question and the two answers are mutually
+    // exclusive: nothing that was never compared can be shown to have diverged.
+    // This is the state a divergence check reports when it did not run, and it
+    // used to be reported as nothing at all, so a store whose bytes no one was
+    // watching answered exactly like one whose bytes had just been verified.
+    if host_bytes == Some("unchecked") {
+        return Some(
+            "file_bytes_unchecked: this repository has a working copy the graph is supposed to \
+             be level with and nothing in this daemon is comparing them, so whether the spans \
+             here describe the file as it is now is not known and this answer is not evidence \
+             either way. Filesystem-to-graph ingestion is switched off for this daemon \
+             (`KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE`); `kin admit` takes the complete \
+             working tree into graph authority now"
+                .to_string(),
+        );
+    }
+
+    // Beside the divergence rather than after the graph-internal readings,
+    // because it is the same question and the two answers are mutually
+    // exclusive: nothing that was never compared can be shown to have diverged.
+    // This is the state a divergence check reports when it did not run, and it
+    // used to be reported as nothing at all, so a store whose bytes no one was
+    // watching answered exactly like one whose bytes had just been verified.
+    if host_bytes == Some("unchecked") {
+        return Some(
+            "file_bytes_unchecked: this repository has a working copy the graph is supposed to \
+             be level with and nothing in this daemon is comparing them, so whether the spans \
+             here describe the file as it is now is not known and this answer is not evidence \
+             either way. Filesystem-to-graph ingestion is switched off for this daemon \
+             (`KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE`); `kin admit` takes the complete \
+             working tree into graph authority now"
                 .to_string(),
         );
     }
@@ -141,6 +178,16 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
                 "file_not_parsed: no language adapter produced a layout for this file, so the \
                  graph holds no entity set for it to be missing from. An empty enumeration here \
                  is a fact about Kin's extraction coverage, not about the file's contents"
+                    .to_string(),
+            )
+        }
+        "unrecorded" => {
+            return Some(
+                "file_parse_unrecorded: the graph holds entities for this file and no record of \
+                 how completely they were extracted, so the rows here are real and the claim \
+                 that they are all of them is one nothing in the store stands behind. This is \
+                 not a file no adapter read: it is a parse whose completeness record did not \
+                 survive. `kin admit` re-parses the working tree and writes one"
                     .to_string(),
             )
         }

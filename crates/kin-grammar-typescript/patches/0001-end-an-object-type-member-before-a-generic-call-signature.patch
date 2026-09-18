@@ -1,0 +1,71 @@
+End an object type member before a generic call signature.
+
+Upstream: tree-sitter/tree-sitter-typescript, applies to v0.23.2.
+
+diff -u -r base/common/define-grammar.js a/common/define-grammar.js
+--- a/common/define-grammar.js	2026-09-17 08:35:42.940411319 -0700
++++ b/common/define-grammar.js	2026-09-17 08:35:42.965599710 -0700
+@@ -6,6 +6,7 @@
+ 
+     externals: ($, previous) => previous.concat([
+       $._function_signature_automatic_semicolon,
++      $._type_member_automatic_semicolon,
+       $.__error_recovery,
+     ]),
+ 
+@@ -963,7 +964,7 @@
+         optional(seq(
+           optional(choice(',', ';')),
+           sepBy1(
+-            choice(',', $._semicolon),
++            choice(',', $._semicolon, $._type_member_automatic_semicolon),
+             choice(
+               $.export_statement,
+               $.property_signature,
+diff -u -r base/common/scanner.h a/common/scanner.h
+--- a/common/scanner.h	2026-09-17 08:35:42.945811638 -0700
++++ b/common/scanner.h	2026-09-17 08:35:42.965729290 -0700
+@@ -12,6 +12,7 @@
+     REGEX_PATTERN,
+     JSX_TEXT,
+     FUNCTION_SIGNATURE_AUTOMATIC_SEMICOLON,
++    TYPE_MEMBER_AUTOMATIC_SEMICOLON,
+     ERROR_RECOVERY,
+ };
+ 
+@@ -123,7 +124,6 @@
+         case '*':
+         case '%':
+         case '>':
+-        case '<':
+         case '=':
+         case '?':
+         case '^':
+@@ -138,6 +138,27 @@
+                 return false;
+             }
+             break;
++
++            // Between the members of an object type a '<' opens the type
++            // parameters of a generic call signature, so the member before it
++            // has already ended:
++            //
++            //   interface I {
++            //     p: string
++            //     <T>(): void
++            //   }
++            //
++            // which is how TypeScript itself reads it. Everywhere else a '<'
++            // continues the line, as in `a\n< b`. TYPE_MEMBER_AUTOMATIC_SEMICOLON
++            // is never returned; the grammar makes it valid only at an object
++            // type member boundary, so its validity is the question being
++            // asked, the same way FUNCTION_SIGNATURE_AUTOMATIC_SEMICOLON is read
++            // above rather than returned.
++        case '<':
++            if (!valid_symbols[TYPE_MEMBER_AUTOMATIC_SEMICOLON]) {
++                return false;
++            }
++            break;
+ 
+             // Don't insert a semicolon before a '[' or '(', unless we're parsing
+             // a type. Detect whether we're parsing a type or an expression using

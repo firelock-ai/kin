@@ -35,7 +35,7 @@ impl LanguageAdapter for TypeScriptAdapter {
     }
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
-        let mut parser = make_parser(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT)?;
+        let mut parser = make_parser(&kin_grammar_typescript::LANGUAGE_TYPESCRIPT)?;
         parser
             .parse(source, None)
             .ok_or_else(|| crate::error::ParseError::ParseFailed {
@@ -239,16 +239,20 @@ fn extract_ts_node(
         "interface_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                let vis = detect_ts_visibility(node, source);
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Interface,
-                    name,
+                    name: name.clone(),
                     signature: node_signature(node, source),
-                    visibility: detect_ts_visibility(node, source),
+                    visibility: vis,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                     declaration_line: None,
                 });
+                extract_ts_interface_members(
+                    node, &name, vis, source, file_id, entities, relations,
+                );
             }
         }
         "type_alias_declaration" => {
@@ -340,7 +344,9 @@ fn extract_ts_node(
                 if declarator.kind() == "variable_declarator" {
                     if let Some(name_node) = declarator.child_by_field_name("name") {
                         let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        let value_node = declarator.child_by_field_name("value");
+                        let value_node = declarator
+                            .child_by_field_name("value")
+                            .map(|value| ts_effective_value(&value));
 
                         // A `require(...)` binding is a dependency line, not a
                         // constant; it is already carried as a `FileImport`.
@@ -605,6 +611,85 @@ fn extract_ts_class_like(
     }
 }
 
+/// Emit one entity per named member signature of an interface body, each
+/// contained by the interface that declares it.
+///
+/// An interface member is a declaration a caller can ask "who uses this" about,
+/// and the answer is not the interface's: `ExecutionContext.waitUntil` and
+/// `ExecutionContext.passThroughOnException` have different use sites. Without
+/// an entity of its own, a member signature resolved to nothing and every such
+/// question returned an empty answer.
+///
+/// The shape is the one this crate already uses for a member in every other
+/// language that has them: a [`EntityKind::Method`] under the qualified name
+/// `Owner.member`, plus a `Contains` edge from the owner. Go's `method_elem`
+/// arm in `go.rs` emits an interface's method specs exactly this way, and
+/// `extract_ts_class_member` below emits a TypeScript class's `method_signature`
+/// and `public_field_definition` this way too, so a property signature lands on
+/// `Method` here for the same reason a class field does: the graph distinguishes
+/// members from free functions, not data members from callable ones.
+///
+/// `call_signature` and `construct_signature` carry no name, and
+/// `index_signature`'s name is the index variable (`key` in `[key: string]`),
+/// which is not a member any call site writes. All three stay out, which is the
+/// same cut `extract_ts_class_member` makes.
+///
+/// TypeScript lets an interface declare one member several times as an overload
+/// set, so a repeated name collapses onto its first occurrence. Emitting per
+/// node would leave one interface holding several entities under one name, which
+/// the linker's (file, name) index cannot tell apart.
+fn extract_ts_interface_members(
+    node: &tree_sitter::Node,
+    interface_name: &str,
+    visibility: Visibility,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    let mut cursor = body.walk();
+    for member in body.children(&mut cursor) {
+        if !matches!(member.kind(), "method_signature" | "property_signature") {
+            continue;
+        }
+        let Some(member_name) = member
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(str::to_string)
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(member_name.clone()) {
+            continue;
+        }
+        let qualified = format!("{}.{}", interface_name, member_name);
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Method,
+            name: qualified.clone(),
+            signature: node_signature(&member, source),
+            visibility,
+            doc_summary: extract_preceding_comment(&member, source),
+            fingerprint: compute_fingerprint(&member, source),
+            span: span_from_node(&member, file_id),
+            declaration_line: None,
+        });
+        relations.push(ExtractedRelation {
+            site: None,
+            receiver: None,
+            call_shape: None,
+            kind: kin_model::RelationKind::Contains,
+            src_name: interface_name.to_string(),
+            dst_name: qualified,
+            import_source: None,
+        });
+    }
+}
+
 fn extract_ts_class_member(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -654,6 +739,38 @@ fn extract_ts_class_member(
             }
         }
         _ => {}
+    }
+}
+
+/// The expression a declarator actually binds, with the type-only and grouping
+/// wrappers TypeScript allows around it removed.
+///
+/// `as`, `satisfies`, `!` and parentheses change a value's static type or its
+/// precedence and nothing else, so what they wrap is what the binding holds.
+/// Classifying the wrapper instead threw away real exported declarations:
+/// `is_trivial_reexport` answers true for every `as_expression`, so
+/// `export const METHOD_NAME_ALL = 'ALL' as const` was filtered as a re-export
+/// (and its named-constant rescue never fired, because the rescue asks whether
+/// the value is a scalar literal and an `as_expression` is not), and
+/// `export const ErrorBoundary = ((props) => {...}) as any` was filtered too,
+/// leaving `hono`'s `src/jsx/dom/components.ts` holding no entity but its own
+/// module. A re-export written `export const Foo = Bar as Baz` still filters:
+/// unwrapping reaches `Bar`, a bare identifier, which is the case the filter
+/// was written for.
+fn ts_effective_value<'a>(node: &tree_sitter::Node<'a>) -> tree_sitter::Node<'a> {
+    let mut current = *node;
+    loop {
+        let inner = match current.kind() {
+            "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression" => current.named_child(0),
+            _ => None,
+        };
+        match inner {
+            Some(next) => current = next,
+            None => return current,
+        }
     }
 }
 
@@ -2055,6 +2172,206 @@ export declare const MAX_LENGTH = 256;
                 .iter()
                 .any(|(kind, name)| *kind == EntityKind::Constant && *name == "MAX_LENGTH"),
             "the exported ambient const is missing: {named:?}"
+        );
+    }
+
+    /// A member signature of an interface is a declaration a caller asks about
+    /// by itself, so it has to be an entity by itself.
+    ///
+    /// `hono`'s `ExecutionContext` declares `waitUntil` and
+    /// `passThroughOnException`; the compiler names different use sites for
+    /// each. With no entity for either, a reference question about one of them
+    /// resolved to nothing and came back empty, which is what cost Kin the
+    /// `iface` shape of the TypeScript reference round: 15 of 92 subjects were
+    /// interface members and every one scored zero.
+    ///
+    /// The assertions below are what a caller gets: an entity carrying the
+    /// member's own declaration line, named the way every other member in this
+    /// crate is named, and reachable from the interface that declares it.
+    #[test]
+    fn an_interface_member_is_an_entity_contained_by_its_interface() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"export interface ExecutionContext {
+  waitUntil(promise: Promise<unknown>): void
+  passThroughOnException(): void
+  readonly props: Record<string, unknown>
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("context.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let member = |name: &str| {
+            output
+                .entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no entity named {name:?}; have: {:?}",
+                        output
+                            .entities
+                            .iter()
+                            .map(|e| (e.kind, e.name.as_str()))
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        // A method signature and a property signature both land on Method,
+        // which is what a class's `method_signature` and
+        // `public_field_definition` already do a few lines above.
+        for (name, line) in [
+            ("ExecutionContext.waitUntil", 1),
+            ("ExecutionContext.passThroughOnException", 2),
+            ("ExecutionContext.props", 3),
+        ] {
+            let entity = member(name);
+            assert_eq!(entity.kind, EntityKind::Method, "{name}");
+            // The declaration line is how a caller resolves a file position to
+            // a subject, so it has to be the member's own line rather than the
+            // interface's.
+            assert_eq!(entity.span.start_line, line, "{name} is on the wrong line");
+            assert!(!entity.signature.is_empty(), "{name} has no signature");
+        }
+
+        let contains: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|r| {
+                r.kind == kin_model::RelationKind::Contains && r.src_name == "ExecutionContext"
+            })
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert!(
+            contains.contains(&"ExecutionContext.waitUntil")
+                && contains.contains(&"ExecutionContext.passThroughOnException")
+                && contains.contains(&"ExecutionContext.props"),
+            "the interface does not contain its own members: {contains:?}"
+        );
+        // The interface itself is still one entity and did not turn into its
+        // members.
+        assert!(output
+            .entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Interface && e.name == "ExecutionContext"));
+    }
+
+    /// The three interface members that carry no name a call site could write.
+    ///
+    /// `call_signature` and `construct_signature` have no name field at all,
+    /// and `index_signature`'s name is the index variable (`key` in
+    /// `[key: string]: unknown`), which names no member. `extract_ts_class_member`
+    /// makes the same cut for a class's `index_signature`.
+    #[test]
+    fn an_unnamed_interface_signature_mints_no_entity() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"export interface Callable {
+  (input: string): void;
+  new (input: string): Callable;
+  [key: string]: unknown;
+  named(input: string): void;
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("callable.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let names: Vec<&str> = output.entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"Callable.named"),
+            "the one named member is missing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| *n == "Callable.key"),
+            "an index signature's index variable became a member: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with("Callable.")).count(),
+            1,
+            "an unnamed signature became a member: {names:?}"
+        );
+    }
+
+    /// An interface can declare one member several times as an overload set,
+    /// the same way a class can. One symbol, one entity, because otherwise the
+    /// linker's (file, name) index holds two rows it cannot tell apart.
+    #[test]
+    fn an_interface_overload_set_is_one_member_entity() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"export interface Lexer {
+  lex(src: string): Token[];
+  lex(src: string, options: Options): Token[];
+  inline(src: string): Token[];
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lexer.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let names: Vec<&str> = output.entities.iter().map(|e| e.name.as_str()).collect();
+
+        let count = |needle: &str| names.iter().filter(|n| **n == needle).count();
+        assert_eq!(count("Lexer.lex"), 1, "{names:?}");
+        assert_eq!(count("Lexer.inline"), 1, "{names:?}");
+    }
+
+    /// `as` and `satisfies` change a value's static type and nothing else, so
+    /// the binding holds what they wrap.
+    ///
+    /// Reading the wrapper instead lost real exported declarations:
+    /// `is_trivial_reexport` answers true for every `as_expression`, so
+    /// `export const METHOD_NAME_ALL = 'ALL' as const` filtered as a re-export
+    /// with its named-constant rescue unable to fire, and
+    /// `export const ErrorBoundary = ((props) => {}) as any` filtered too.
+    /// `hono`'s `src/jsx/dom/components.ts` exports two components that way and
+    /// the graph held one entity for the file, its own module.
+    #[test]
+    fn a_type_assertion_is_read_through_to_the_value_it_wraps() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+export const METHOD_NAME_ALL = 'ALL' as const
+export const ErrorBoundary = ((props: Props) => { return render(props); }) as any
+export const Config = ({ port: 3000 }) satisfies Options
+export const Reexported = Bar as Baz
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("router.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named: Vec<(EntityKind, &str)> = output
+            .entities
+            .iter()
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect();
+
+        assert!(
+            named.contains(&(EntityKind::Constant, "METHOD_NAME_ALL")),
+            "a named scalar constant written `as const` is missing: {named:?}"
+        );
+        // The arrow inside the assertion is what the binding holds, so the
+        // entity is a Function and its body's calls are extracted.
+        assert!(
+            named.contains(&(EntityKind::Function, "ErrorBoundary")),
+            "a function wrapped in `as any` is missing: {named:?}"
+        );
+        assert!(
+            output
+                .relations
+                .iter()
+                .any(|r| r.kind == kin_model::RelationKind::Calls
+                    && r.src_name == "ErrorBoundary"
+                    && r.dst_name == "render"),
+            "the wrapped function's body was never walked for calls"
+        );
+        // The controls. Unwrapping must not defeat the two filters it passes
+        // through: a data-only object literal is still data, and a bare
+        // identifier is still a re-export barrel.
+        assert!(
+            !named.iter().any(|(_, n)| *n == "Config"),
+            "a data-only object literal survived `satisfies`: {named:?}"
+        );
+        assert!(
+            !named.iter().any(|(_, n)| *n == "Reexported"),
+            "`export const X = Y as Z` is a re-export and must stay filtered: {named:?}"
         );
     }
 }

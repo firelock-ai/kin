@@ -109,6 +109,14 @@
             "null"
           ]
         },
+        "reconciliation_outcome": {
+          "enum": [
+            "settled",
+            "work_outstanding",
+            "unmeasured",
+            null
+          ]
+        },
         "entity_count": {
           "type": [
             "integer",

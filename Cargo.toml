@@ -4,6 +4,10 @@
 [workspace]
 resolver = "2"
 members = [
+    # Third-party parser assets vendored because upstream has no release with
+    # the fix. See crates/kin-grammar-typescript/README.md.
+    "crates/kin-grammar-typescript",
+
     # Kin libraries, developed here and published as independent packages.
     "crates/kin-blobs",
     "crates/kin-db",
@@ -40,7 +44,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.20"
+version = "0.7.21"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -88,7 +92,9 @@ notify = "8"
 
 # Tree-sitter
 tree-sitter = "0.26"
-tree-sitter-typescript = "0.23"
+# The TypeScript and TSX grammars, vendored rather than pinned: 0.23.2 is
+# upstream's newest release and it cannot read two constructs `tsc` accepts.
+kin-grammar-typescript = { path = "crates/kin-grammar-typescript" }
 tree-sitter-python = "0.25"
 tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"

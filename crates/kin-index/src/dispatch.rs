@@ -295,10 +295,25 @@ pub fn interface_dispatch_targets<G: GraphStore>(
 /// which answers with a node's OUTGOING edges only. The owner is on the incoming
 /// side of `Contains`, so the narrower read returns an empty list for every
 /// method in the graph and this function would answer `None` always.
+///
+/// A method can have more than one incoming `Contains`, and which one is the
+/// real owner decides whether either direction of this module answers at all.
+/// Go lets an interface in one package and a struct in another share a name, so
+/// their method entities share a qualified name too: on the gh CLI
+/// `gh.AuthConfig` and `config.AuthConfig` both produce `AuthConfig.TokenForUser`,
+/// and a `Contains` edge the linker resolved by name alone lands on whichever
+/// one it matched. Taking the first edge the store lists makes the answer depend
+/// on adjacency order, which is not a fact about the code.
+///
+/// So: one owner is the owner. Past that, the owner declared in the same file
+/// wins, because an interface's method spec is written INSIDE its interface and
+/// a concrete method is usually written beside its receiver type. Past that, the
+/// lowest id, so the answer is at least the same answer twice.
 fn owner_of_method<G: GraphStore>(store: &G, focal: &Entity) -> Result<Option<Entity>> {
     let relations = store
         .get_all_relations_for_entity(&focal.id)
         .map_err(|error| IndexError::Graph(error.to_string()))?;
+    let mut owners: Vec<Entity> = Vec::new();
     for relation in relations {
         if relation.kind != RelationKind::Contains {
             continue;
@@ -309,6 +324,9 @@ fn owner_of_method<G: GraphStore>(store: &G, focal: &Entity) -> Result<Option<En
         let Some(src) = relation.src.as_entity() else {
             continue;
         };
+        if owners.iter().any(|held| held.id == src) {
+            continue;
+        }
         let owner = store
             .get_entity(&src)
             .map_err(|error| IndexError::Graph(error.to_string()))?;
@@ -317,11 +335,16 @@ fn owner_of_method<G: GraphStore>(store: &G, focal: &Entity) -> Result<Option<En
                 owner.kind,
                 EntityKind::Class | EntityKind::Interface | EntityKind::TypeAlias
             ) {
-                return Ok(Some(owner));
+                owners.push(owner);
             }
         }
     }
-    Ok(None)
+    owners.sort_by(|a, b| {
+        let a_local = a.file_origin == focal.file_origin;
+        let b_local = b.file_origin == focal.file_origin;
+        b_local.cmp(&a_local).then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(owners.into_iter().next())
 }
 
 /// Every method name `owner` offers, including those it gains by embedding.
@@ -432,6 +455,162 @@ pub fn dispatch_applies<G: GraphStore>(store: &G, focal: &Entity) -> Result<bool
         return Ok(false);
     };
     Ok(owner.kind != EntityKind::Interface)
+}
+
+/// A concrete method that may be what an interface method's contract is
+/// satisfied by.
+///
+/// The mirror of [`DispatchTarget`]. That type answers "which contracts can
+/// reach this implementation"; this one answers "which implementations can this
+/// contract reach", which is the question a reader asks as "where is this
+/// interface method implemented".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplementationCandidate {
+    /// The concrete method's entity, whose span is the declaration a reader
+    /// wants to open.
+    pub method_id: EntityId,
+    /// That method's qualified name, `Receiver.Method`.
+    pub method_name: String,
+    /// The receiver type whose method set satisfies the contract.
+    pub receiver_id: EntityId,
+    /// That type's declared name, for a reader to recognize.
+    pub receiver_name: String,
+}
+
+/// Whether the implementations question is one worth answering about `focal`.
+///
+/// True for a Go method spec declared on an INTERFACE, which is the only shape
+/// [`interface_implementations`] can ever return a candidate for. The mirror of
+/// [`dispatch_applies`], and it separates the same two empty answers for the
+/// same reason: an interface method nothing implements has an implementations
+/// story and the answer to it is none, while a concrete method, a free function
+/// or a method in another language has no implementations story at all.
+/// Reporting "nothing implements this" for `Buffer.Write` would be describing an
+/// implementation as if it were a contract.
+///
+/// Costs the one incoming `Contains` read [`interface_implementations`] already
+/// makes, and never the method scan behind it.
+pub fn implementations_apply<G: GraphStore>(store: &G, focal: &Entity) -> Result<bool> {
+    if focal.kind != EntityKind::Method || focal.language != LanguageId::Go {
+        return Ok(false);
+    }
+    if split_qualified_method(&focal.name).is_none() {
+        return Ok(false);
+    }
+    let Some(owner) = owner_of_method(store, focal)? else {
+        return Ok(false);
+    };
+    Ok(owner.kind == EntityKind::Interface)
+}
+
+/// The concrete methods that may implement this interface method.
+///
+/// Empty for anything that is not a Go method spec on an interface, and empty
+/// when no type in the graph satisfies the contract. The satisfaction rule is
+/// the one [`interface_dispatch_targets`] uses, read the other way round, so the
+/// two directions cannot disagree about which types satisfy which contract: a
+/// method-name superset expanded through `Extends` so Go embedding promotes what
+/// it promotes, with the same parameter and result arity filter on the focal
+/// method, and the same refusal to treat an empty contract as satisfied.
+///
+/// What it produces is a CANDIDATE and never a fact, for the reason stated at
+/// the top of this module: Go interface satisfaction is structural and the graph
+/// holds no edge that records it. A surface presenting one of these as a proven
+/// implementation is lying in the same way a surface presenting a dispatch
+/// candidate as a proven caller is.
+///
+/// The scan is over Go METHODS filtered by name rather than over every named
+/// type, because the method name is the discriminator and a type that does not
+/// declare a method of that name cannot satisfy a contract requiring one. On the
+/// gh CLI that turns a walk over 941 named types into a walk over the handful
+/// that spell the name, and the expensive per-owner method-set read is paid only
+/// for those.
+pub fn interface_implementations<G: GraphStore>(
+    store: &G,
+    focal: &Entity,
+) -> Result<Vec<ImplementationCandidate>> {
+    if focal.kind != EntityKind::Method || focal.language != LanguageId::Go {
+        return Ok(Vec::new());
+    }
+    let Some((_, method_name)) = split_qualified_method(&focal.name) else {
+        return Ok(Vec::new());
+    };
+    let Some(interface) = owner_of_method(store, focal)? else {
+        return Ok(Vec::new());
+    };
+    // A concrete method is an implementation, not a contract. Asking what
+    // implements `Buffer.Write` would be asking what implements an
+    // implementation.
+    if interface.kind != EntityKind::Interface {
+        return Ok(Vec::new());
+    }
+
+    let required = expanded_method_names(store, &interface)?;
+    if !required.contains(method_name) {
+        return Ok(Vec::new());
+    }
+    let spec_arity = go_method_arity(&focal.signature, method_name);
+
+    let methods = store
+        .query_entities(&EntityFilter {
+            kinds: Some(vec![EntityKind::Method]),
+            languages: Some(vec![LanguageId::Go]),
+            ..EntityFilter::default()
+        })
+        .map_err(|error| IndexError::Graph(error.to_string()))?;
+
+    let mut candidates = Vec::new();
+    for method in methods {
+        if method.id == focal.id {
+            continue;
+        }
+        let Some((_, name)) = split_qualified_method(&method.name) else {
+            continue;
+        };
+        if name != method_name {
+            continue;
+        }
+        // Arity first, because it is text arithmetic and the method-set read
+        // below is a graph walk. A signature neither side can be read from keeps
+        // the candidate, which is what "unproven" already means.
+        if let (Some(spec_arity), Some(impl_arity)) =
+            (spec_arity, go_method_arity(&method.signature, method_name))
+        {
+            if spec_arity != impl_arity {
+                continue;
+            }
+        }
+        let Some(owner) = owner_of_method(store, &method)? else {
+            continue;
+        };
+        if owner.id == interface.id {
+            continue;
+        }
+        // Another interface declaring the same method is a second contract, not
+        // an implementation of the first. Go lets one interface embed another,
+        // and the embedded contract's spec would otherwise read as satisfying
+        // the embedding one.
+        if owner.kind == EntityKind::Interface {
+            continue;
+        }
+        let offered = expanded_method_names(store, &owner)?;
+        if !method_set_satisfies(&required, &offered) {
+            continue;
+        }
+        candidates.push(ImplementationCandidate {
+            method_id: method.id,
+            method_name: method.name.clone(),
+            receiver_id: owner.id,
+            receiver_name: owner.name.clone(),
+        });
+    }
+    candidates.sort_by(|a, b| {
+        a.method_name
+            .cmp(&b.method_name)
+            .then_with(|| a.method_id.cmp(&b.method_id))
+    });
+    candidates.dedup_by(|a, b| a.method_id == b.method_id);
+    Ok(candidates)
 }
 
 /// The entities that call `targets`, keyed by caller, with the interface
