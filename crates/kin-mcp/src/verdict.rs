@@ -246,6 +246,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "The answer reported a parse state this build does not recognise.",
     },
     ClauseCode {
+        code: "file_parse_unrecorded",
+        meaning: "The graph holds entities for the file and no record of how completely they were extracted, so the rows are real and their being the whole set is unestablished.",
+    },
+    ClauseCode {
         code: "file_parsed_partially",
         meaning: "The adapter hit parse errors in the file, so its entities are a floor.",
     },

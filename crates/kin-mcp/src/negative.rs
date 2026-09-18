@@ -181,6 +181,16 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
                     .to_string(),
             )
         }
+        "unrecorded" => {
+            return Some(
+                "file_parse_unrecorded: the graph holds entities for this file and no record of \
+                 how completely they were extracted, so the rows here are real and the claim \
+                 that they are all of them is one nothing in the store stands behind. This is \
+                 not a file no adapter read: it is a parse whose completeness record did not \
+                 survive. `kin admit` re-parses the working tree and writes one"
+                    .to_string(),
+            )
+        }
         "partial" => {
             return Some(format!(
                 "file_parsed_partially: the adapter hit parse errors in this file{detail}, so the \

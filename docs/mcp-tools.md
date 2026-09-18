@@ -185,6 +185,7 @@ in `negative.trust_reason`. The list is closed: a code not in it is never sent, 
 | `file_not_parsed` | No language adapter produced a layout for the file, so an empty enumeration is a fact about extraction coverage, not the file. |
 | `file_parse_failed` | The adapter could not parse the file, so the entities the graph still carries for it describe an earlier state. |
 | `file_parse_state_unknown` | The answer reported a parse state this build does not recognise. |
+| `file_parse_unrecorded` | The graph holds entities for the file and no record of how completely they were extracted, so the rows are real and their being the whole set is unestablished. |
 | `file_parsed_partially` | The adapter hit parse errors in the file, so its entities are a floor. |
 | `file_spans_stale` | Some entity spans in the file were derived from bytes the repository tree no longer holds at this path. |
 | `focal_not_in_graph` | The focal entity was not found, so an empty neighbourhood is not evidence that it is isolated. |

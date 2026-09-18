@@ -146,12 +146,25 @@ impl From<Entity> for FileEntityRow {
 /// `Absent` is not `Failed`. A file nothing ever tried to parse and a file whose
 /// parse failed both hold no entities, and only the second one is evidence about
 /// the code; collapsing them is how "no entities" comes to read as "no exports".
+///
+/// `Unrecorded` is not `Absent` either, for the same reason one step along. A
+/// file with no layout and no entities is one nothing parsed. A file with no
+/// layout and a graph full of entities for it, each carrying a span, is not:
+/// something parsed it and the record of how completely did not survive. Both
+/// used to answer `Absent`, and the sentence that word carries -- "the graph
+/// holds no entity set for it to be missing from" -- was then published over
+/// answers that had just returned one.
+///
+/// Measured on the staleness study's own saved replies: 1,292 of 1,292 calls
+/// that reported `parsed: absent` returned a non-empty entity set for the file
+/// they reported it about. The claim was false on every call that made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedState {
     Full,
     Partial,
     Failed,
     Absent,
+    Unrecorded,
 }
 
 impl ParsedState {
@@ -163,11 +176,17 @@ impl ParsedState {
             Self::Partial => "partial",
             Self::Failed => "failed",
             Self::Absent => "absent",
+            Self::Unrecorded => "unrecorded",
         }
     }
 
     /// Whether this state licenses reading the enumeration as the file's whole
     /// entity surface. Only a complete parse does.
+    ///
+    /// `Unrecorded` refuses with the rest, and deliberately. Entities with
+    /// verified spans prove a parse happened; they cannot prove it finished, and
+    /// the record that would have is the one that is missing. Splitting the word
+    /// out is about saying the true thing, not about relaxing the gate.
     pub fn certifies_enumeration(self) -> bool {
         matches!(self, Self::Full)
     }
@@ -610,6 +629,13 @@ pub fn handle_list_file_entities<G: GraphStore>(
         Some(ParseCompleteness::Full) => ParsedState::Full,
         Some(ParseCompleteness::Partial(_)) => ParsedState::Partial,
         Some(ParseCompleteness::Failed(_)) => ParsedState::Failed,
+        // The entity count decides between the two no-layout states, and it is
+        // the count this answer just took rather than a second reading. A file
+        // the graph holds entities for was parsed by something; only the record
+        // of how completely is missing, and calling that "no adapter produced a
+        // layout" tells a reader a false thing about an answer that is looking
+        // at rows.
+        None if total_in_file > 0 => ParsedState::Unrecorded,
         None => ParsedState::Absent,
     };
     let parse_detail = match layout.as_ref().map(|layout| &layout.parse_completeness) {
@@ -1253,23 +1279,31 @@ mod tests {
     /// Parse state decides certification, and each state is distinguishable.
     /// A file the extractor never parsed and a file it parsed completely both
     /// return rows; only one of them may be read as the file's whole surface.
+    ///
+    /// The two no-layout rows are the split: with no layout and no entities
+    /// nothing parsed the file, and with no layout and entities something did
+    /// and the record of how completely is gone. Same missing row, opposite
+    /// facts, and only the first is evidence about extraction coverage.
     #[test]
     fn parse_state_decides_whether_the_enumeration_is_certified() {
-        for (parse, expected, certified) in [
-            (Some(ParseCompleteness::Full), "full", true),
+        for (entities, parse, expected, certified) in [
+            (4, Some(ParseCompleteness::Full), "full", true),
             (
+                4,
                 Some(ParseCompleteness::Partial("2 parse error range(s)".into())),
                 "partial",
                 false,
             ),
             (
+                4,
                 Some(ParseCompleteness::Failed("last known good".into())),
                 "failed",
                 false,
             ),
-            (None, "absent", false),
+            (4, None, "unrecorded", false),
+            (0, None, "absent", false),
         ] {
-            let store = store_with(4, parse);
+            let store = store_with(entities, parse);
             let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
             assert_eq!(
                 payload[FILE_COVERAGE_KEY]["parsed"],
@@ -1283,7 +1317,7 @@ mod tests {
             // Rows are served either way. Withholding real graph truth because
             // it cannot be certified teaches an agent nothing and costs it the
             // answer it can still act on.
-            assert_eq!(payload["total_in_file"], serde_json::json!(4));
+            assert_eq!(payload["total_in_file"], serde_json::json!(entities));
         }
     }
 
@@ -2003,6 +2037,88 @@ mod tests {
             coverage["certifies_enumeration"],
             serde_json::json!(true),
             "{payload}"
+        );
+    }
+
+    /// A file the graph holds entities for and no parse record for is not a
+    /// file no adapter read, and the two must not send a reader to the same
+    /// place.
+    ///
+    /// Both arms have no layout. The only difference is whether the graph holds
+    /// entities for the file, which is the fact that separates "nothing parsed
+    /// this" from "something parsed this and the completeness record is gone".
+    /// Both still refuse to certify, and that is deliberate: entities with spans
+    /// prove a parse happened and cannot prove it finished. What changes is the
+    /// sentence, because the old one asserted the graph held no entity set for
+    /// the file while returning one.
+    ///
+    /// The study that found this measured 1,292 calls reporting `parsed:
+    /// absent`, and all 1,292 of them returned a non-empty entity set.
+    #[test]
+    fn a_parse_record_that_is_missing_is_not_a_parse_that_never_ran() {
+        let unrecorded = call(&store_with(2, None), &[("path", serde_json::json!(FILE))]).unwrap();
+        assert_eq!(
+            unrecorded["total_in_file"],
+            serde_json::json!(2),
+            "the arm only means something if the graph returns rows: {unrecorded}"
+        );
+        assert_eq!(
+            unrecorded[FILE_COVERAGE_KEY]["parsed"],
+            serde_json::json!("unrecorded"),
+            "{unrecorded}"
+        );
+        assert_eq!(
+            unrecorded[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(false),
+            "a parse nothing recorded the completeness of still cannot certify: {unrecorded}"
+        );
+
+        // The control, and the reason this is a split rather than a rename: a
+        // file with no layout AND no entities keeps the old word and the old
+        // sentence, which are both true of it.
+        let absent = call(&store_with(0, None), &[("path", serde_json::json!(FILE))]).unwrap();
+        assert_eq!(absent["total_in_file"], serde_json::json!(0), "{absent}");
+        assert_eq!(
+            absent[FILE_COVERAGE_KEY]["parsed"],
+            serde_json::json!("absent"),
+            "{absent}"
+        );
+
+        let factor_of = |payload: &serde_json::Value| -> String {
+            let annotated = crate::envelope::finalize(
+                ToolCallResult::text(serde_json::to_string(payload).unwrap()),
+                structural_authoritative_envelope(),
+                TOOL_NAME,
+            );
+            let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+            let value: serde_json::Value = serde_json::from_str(text).unwrap();
+            value["_kin"]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let unrecorded_factor = factor_of(&unrecorded);
+        assert!(
+            unrecorded_factor.contains("file_parse_unrecorded"),
+            "the reader has to be told which of the two they have: {unrecorded_factor:?}"
+        );
+        assert!(
+            !unrecorded_factor.contains("file_not_parsed"),
+            "and must not be told the graph never parsed a file it just enumerated: \
+             {unrecorded_factor:?}"
+        );
+
+        let absent_factor = factor_of(&absent);
+        assert!(
+            absent_factor.contains("file_not_parsed"),
+            "the genuinely unparsed file keeps its own code: {absent_factor:?}"
+        );
+        assert!(
+            crate::verdict::CLAUSE_CODES
+                .iter()
+                .any(|entry| entry.code == "file_parse_unrecorded"),
+            "and the new code carries one written meaning a reader can look up"
         );
     }
 

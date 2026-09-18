@@ -1724,12 +1724,18 @@ fn merge_file_coverage_classes(
         .get(crate::handlers::file_entities::FILE_COVERAGE_KEY)
         .and_then(Value::as_object);
 
-    let parsed = match coverage
+    let parsed_wire = coverage
         .and_then(|coverage| coverage.get("parsed"))
-        .and_then(Value::as_str)
-    {
+        .and_then(Value::as_str);
+    let parsed = match parsed_wire {
         Some("full") => STATE_PRESENT,
-        Some("absent") | Some("partial") | Some("failed") => STATE_ABSENT,
+        // `unrecorded` is absent as a CLASS and not as a sentence. The class
+        // answers "can this answer be read as the file's whole entity surface",
+        // and a parse whose completeness nothing recorded cannot, whatever the
+        // rows show. What changes below is the limit the reader acts on, because
+        // `file_parsed_absent` over a file the graph holds entities for sends
+        // them to fix an extraction that already ran.
+        Some("absent") | Some("partial") | Some("failed") | Some("unrecorded") => STATE_ABSENT,
         _ => STATE_UNKNOWN,
     };
     // A full parse of bytes the tree no longer holds is not a present class, and
@@ -1796,6 +1802,10 @@ fn merge_file_coverage_classes(
                 .and_then(Value::as_str)
             {
                 Some(reason) => format!("file_content_opaque_{reason}"),
+                // Read from the wire word rather than from the class, because
+                // the class folded `unrecorded` in with `absent` above and this
+                // is the field a reader acts on.
+                None if parsed_wire == Some("unrecorded") => "file_parse_unrecorded".to_string(),
                 None => format!("file_parsed_{raw_parsed}"),
             },
         );
