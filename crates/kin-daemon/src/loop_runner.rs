@@ -698,6 +698,56 @@ fn refresh_untracked_reading_with(
     Ok(true)
 }
 
+/// Host content a fresh untracked-paths reading still finds, taken right
+/// before the pass is about to report whether it still owes work.
+struct AdmissionOwed {
+    count: u64,
+    sample: Vec<String>,
+}
+
+/// Whether the pass still owes an admission no queue it tracks will ever
+/// drain on its own.
+///
+/// [`refresh_untracked_reading`]'s own contract is that the reading is taken
+/// when a surface is about to state it, not inherited from whatever ran
+/// last; `kin status`, `find_references` and the durability block already
+/// follow that contract. Gated by the same `untracked_refresh_due` duty
+/// cycle those callers already pay for, so a large repository does not pay
+/// for this walk a second time on top of the one `kin graph status` already
+/// triggers.
+///
+/// A directory the startup catch-up declined by design is exactly
+/// what this still finds after `pending_events` drains: `plan_catch_up_events`
+/// never proposed it, so nothing ever admitted it and neither `pending_events`
+/// nor the retry lane ever heard of it, and this walk carries no
+/// modification-time heuristic of its own to misjudge it by. Returns `None`
+/// on an unmeasured or not-applicable reading, which keeps this addition
+/// silent rather than guessing: a caller that finds nothing here falls back
+/// to whatever it would have reported before this existed.
+fn admission_owed(state: &DaemonState) -> Option<AdmissionOwed> {
+    if let Err(error) = refresh_untracked_reading(state) {
+        debug!(
+            error = %error,
+            "could not refresh the untracked-paths reading for the pass's deferred-work clock; \
+             reporting against whatever reading already stands"
+        );
+    }
+    let report = state.background_work.reconcile().report(Instant::now());
+    if report.untracked_observation_not_applicable {
+        return None;
+    }
+    // No reading has ever been taken, which is the weakest possible basis for
+    // a claim either way; fall back to the idle report rather than guess.
+    report.untracked_observed_age_seconds?;
+    if report.untracked_path_count == 0 {
+        return None;
+    }
+    Some(AdmissionOwed {
+        count: report.untracked_path_count,
+        sample: report.untracked_paths_sample,
+    })
+}
+
 /// What one complete walk declined to observe, taken from its own diagnostics.
 ///
 /// Read off the scan rather than recomputed, so the counts a surface prints and
@@ -3671,6 +3721,11 @@ pub async fn run_loop_armed(
     // larger than `batch_size` is deferred instead of silently discarded.
     let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
     let mut backlog_warning_active = false;
+    // Set once the loop has logged that the pass's deferred-work clock is
+    // running for content the startup catch-up declined on purpose, so the
+    // reason is logged on the rising edge and not on every tick the
+    // condition remains true.
+    let mut admission_owed_disclosed = false;
     // The admission policy the last complete pass planned against, kept so the
     // event filter below costs no authority load of its own. `None` until the
     // first pass resolves one, which is the safe direction: nothing is dropped
@@ -3904,7 +3959,39 @@ pub async fn run_loop_armed(
         // visible: the loop keeps deferring the same paths, each individual tick
         // truthfully has nothing it may admit, and without this the pass reports
         // idle for the entire livelock.
-        pass.set_deferred(retry_lane.deferred_owed(), tick_started);
+        //
+        // A directory the startup catch-up declined on purpose (a directory
+        // arriving whole cannot be told from a clone or a move by its
+        // modification time) owes this pass work the same way: it never
+        // reaches `pending_events` or the retry lane at all, so without this
+        // it too would read as a pass with nothing left to do. It shares the
+        // one clock with the retry ladder rather than adding a second, which
+        // is also why `reconciliation_status` itself stays untouched here:
+        // two lifecycle callers already branch on that word (idle-shutdown
+        // eligibility and the background-work supervisor), and
+        // `waiting_deferred` is the signal already built for "the queue is
+        // empty and the pass still owes work".
+        let admission_owed_reading = admission_owed(&state);
+        pass.set_deferred(
+            retry_lane.deferred_owed() || admission_owed_reading.is_some(),
+            tick_started,
+        );
+        if let Some(owed) = &admission_owed_reading {
+            if !admission_owed_disclosed {
+                warn!(
+                    count = owed.count,
+                    sample = %owed.sample.join(", "),
+                    "startup catch-up left host paths under a directory this graph has never \
+                     met unadmitted; modification time cannot tell a clone or a move from \
+                     authored work there, so it was declined on purpose rather than swept in; \
+                     this pass reports waiting_deferred rather than idle until `kin admit` \
+                     brings the graph level"
+                );
+                admission_owed_disclosed = true;
+            }
+        } else {
+            admission_owed_disclosed = false;
+        }
 
         if pending_events.is_empty() {
             // Nothing to admit this tick, so the working stretch ends.
@@ -4925,6 +5012,7 @@ mod tests {
     include!("loop_runner/tests/authority_split.rs");
     include!("loop_runner/tests/admission_worker.rs");
     include!("loop_runner/tests/graph_only_repair.rs");
+    include!("loop_runner/tests/catch_up_completion.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {

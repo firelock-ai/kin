@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The reconcile pass now reports `waiting_deferred` instead of `idle` once the
+  startup catch-up after a large pull has admitted everything it safely can
+  and a directory this graph has never met is still left unadmitted on
+  purpose. A directory arriving whole cannot be told from a clone or a move
+  by its modification time, so the daemon still declines to sweep it in
+  silently, but the pass no longer describes that state the way it describes
+  a fully caught-up store, and the daemon log names the count and a sample of
+  the paths. Admitting the content, by an explicit command or by an ordinary
+  later edit, clears the pass back to idle on its own. `reconciliation_status`
+  itself is unchanged. Measured on a corpus checkout nine hundred forty-two
+  commits ahead of its store, roughly twenty-six percent of its files were in
+  this previously unreported state.
 - `kin agent run`'s result record now carries every row a `find_references`
   call returned, under `kin_agent.reference_rows`, independent of what the
   model's own final answer text kept. A study task found Kin's
@@ -21,7 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead it holds the full, deduplicated row set the run actually saw, so a
   consumer reading the structured result depends on zero percent prose and
   gets one hundred percent of the resolved rows.
-
 - `find_references` held `name_only` rows, a bare same-name match with nothing
   at the reference site proving it, out of `total_upstream` by description but
   not by code: the headline partitioned on a single receiver-guess tier, so
