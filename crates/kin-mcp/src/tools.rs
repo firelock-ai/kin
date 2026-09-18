@@ -828,8 +828,10 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
-                        "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query is provided." },
-                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided." },
+                        "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query or file is provided." },
+                        "query": { "type": "string", "description": "Exact symbol name to resolve. On its own it is ranked, not exact: when the repository holds several declarations of the name, the ranking picks one and `focal_resolution` reports the rest. Pass file, or file and line, to pin which one." },
+                        "file": { "type": "string", "description": "Repository-relative path of the file that DECLARES the entity, such as \"pkg/cmd/issue/list/list.go\". Addresses the declaration by where it is rather than what it is called, which is exact where a name is not, and needs no knowledge of how Kin qualifies a method name." },
+                        "line": { "type": "integer", "minimum": 1, "description": "The declaration's line in `file`. A line inside the body also resolves, to the innermost declaration containing it. With file it names exactly one declaration; without file it is refused." },
                         "relation_kinds": {
                             "type": "array",
                             "description": "Filter relation kinds. Supported values: calls, imports, references. Defaults to all three.",

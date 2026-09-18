@@ -230,7 +230,7 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "find_references",
-            "Find who depends on one entity: callers, importers and references, one row each with id, name, kind and file. One hop only; use trace_data_flow for a chain.",
+            "Who calls, imports or references one entity, one row each with id, name, kind and file. Pass file and line to pin WHICH one when a name is shared. Chain? Use trace_data_flow.",
         ),
         (
             "get_context_pack",
@@ -380,7 +380,17 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
         // path a caller uses when it has a name and no id.
         (
             "find_references",
-            &["entity_id", "query", "relation_kinds", "max_chars"] as &[&str],
+            // `file` and `line` travel with `query` on the belt because the
+            // question a coding agent is handed names a location, not an id,
+            // and without them the only exact address costs a second call.
+            &[
+                "entity_id",
+                "query",
+                "file",
+                "line",
+                "relation_kinds",
+                "max_chars",
+            ] as &[&str],
         ),
         (
             "trace_data_flow",
@@ -876,6 +886,18 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
         (
             ("find_references", "relation_kinds"),
             "Filter to calls, imports or references. Defaults to all three.",
+        ),
+        (
+            ("find_references", "query"),
+            "Exact symbol name. Ranked, not exact, when several share it: add `file` to pin one.",
+        ),
+        (
+            ("find_references", "file"),
+            "Repo-relative path of the file that DECLARES it. Pins which same-named one you mean.",
+        ),
+        (
+            ("find_references", "line"),
+            "The declaration's line in `file`. With `file` it names exactly one declaration.",
         ),
         (
             ("graph_neighborhood", "direction"),

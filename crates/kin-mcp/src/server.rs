@@ -1212,7 +1212,8 @@ did not list.
 semantic_locate: find code by describing what it does, when you do not know the name.
 semantic_search: find declarations by exact name, kind or language.
 get_context_pack: one token-bounded bundle of the code around an entity or a question.
-find_references: who calls, imports or references one entity.
+find_references: who calls, imports or references one entity; pass file and line to say which \
+one when a name is shared.
 trace_data_flow: the ordered call chain out from one entity.
 trace_path: how one entity reaches another.
 impact_analysis: what a change to one entity could affect.
