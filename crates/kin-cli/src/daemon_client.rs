@@ -13811,11 +13811,24 @@ mod tests {
         // start and never reached the line to retire. The pid cannot be alive,
         // so this is deterministic rather than a race against whatever holds
         // that number today.
+        //
+        // `oom_kills_at_start` is read live, the same way `publish_serving_daemon`
+        // reads it for a real daemon, rather than hardcoded to `Some(0)`. The
+        // cgroup counter this is compared against at grading time is cumulative
+        // for the cgroup's whole lifetime, not scoped to this test or this
+        // process: a self-hosted runner whose container has recorded even one
+        // OOM kill before or during this test (its own build, an unrelated
+        // concurrent job, another test's subprocess) would make a hardcoded
+        // zero baseline read as a positive delta, misclassifying this
+        // no-signal-observed ending as a memory-limit kill. Starting from the
+        // live count keeps the delta at zero unless a kill happens in the
+        // instant between this line and the grading read, which is what the
+        // synthetic "no signal observed" case is actually supposed to test.
         std::fs::write(
             kin_daemon_spawn::serving_path(dir.path()),
             serde_json::to_vec(&kin_daemon_spawn::ServingDaemon {
                 pid: u32::MAX,
-                oom_kills_at_start: Some(0),
+                oom_kills_at_start: kin_daemon_spawn::cgroup_memory().oom_kills,
                 at_unix: 1_000,
             })
             .unwrap(),
