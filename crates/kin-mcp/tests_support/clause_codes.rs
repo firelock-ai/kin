@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use kin_mcp::verdict::{CLAUSE_CODES, UNLISTED_CLAUSE_CODE};
+use crate::verdict::{CLAUSE_CODES, UNLISTED_CLAUSE_CODE};
 
 /// Labels the scan finds that are not verdict clauses, each with where it lives
 /// and what it is instead. Every entry must still be found by the scan, so a

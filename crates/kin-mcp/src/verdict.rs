@@ -291,7 +291,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "lexical_lookup_not_structural",
-        meaning: "This is lexical evidence over indexed text fields, not a resolved call or reference edge; a hit or a miss here is not proof the identifier is or is not used.",
+        meaning: "This is lexical evidence over stored graph fields, not a resolved call or reference edge; a hit or a miss here is not proof the identifier is or is not used.",
     },
     ClauseCode {
         code: "method_call_resolution_incomplete",
@@ -1610,6 +1610,10 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
     }
     found
 }
+
+#[cfg(test)]
+#[path = "../tests_support/clause_codes.rs"]
+mod clause_codes_tests;
 
 #[cfg(test)]
 mod tests {
