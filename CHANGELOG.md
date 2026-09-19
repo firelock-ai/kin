@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `find_references` asked for a bare name that several owner-qualified
+  entities share, such as `Blueprint.register_blueprint` and
+  `App.register_blueprint` in a Flask-shaped Python store, now answers a
+  full, labelled section for every one of them, under `candidates_by_owner`,
+  instead of silently ranking one and dropping the rest from the answer. The
+  resolver still has to pick a single winner for every other caller that asks
+  it to resolve a name, which is the right contract for them. `find_references`
+  itself already knows each candidate's whole reference list, and answering
+  for one while discarding what it knows about a sibling is what this closes.
+  Sectioning only fires on a real owner-qualified collision: two bare,
+  unrelated same-named declarations with no owner segment to relabel by keep
+  the existing single-answer-with-a-count behavior, because there is no
+  owner-qualified name a caller could retype to pin one instead. The answer
+  carries an `ambiguous_name` degradation naming how many candidates were
+  sectioned and how to address one directly, and it folds into `_kin.verdict`
+  through the same path any other degradation does.
 - A top-level TypeScript `const`, `let`, or `var` bound to an empty array or
   object literal, such as `export const globalContexts: Context<unknown>[] =
   []` in `honojs/hono`'s `src/jsx/context.ts`, now gets its own `constant`

@@ -2112,6 +2112,10 @@ pub struct FindReferencesAuthority<'a> {
     pub spine: Option<&'a dyn kin_spine::SpineBackend>,
 }
 
+// `Clone` lets `build_sectioned_reference_reply` hand each labelled section
+// its own copy: a sectioned answer calls `build_reference_reply_for_focal`
+// once per candidate, and every call needs this value, not just the first.
+#[derive(Clone)]
 enum FindReferencesAuthoritySource<'a> {
     Ambient(AmbientCrossRepoBinding),
     Daemon(FindReferencesAuthority<'a>),
@@ -3091,10 +3095,260 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         return Ok(ToolCallResult::error(FIND_REFERENCES_FOCAL_MISS));
     };
 
+    // A bare name that several OWNER-QUALIFIED entities share is answered for
+    // every one of them, labelled and sectioned, instead of quietly keeping
+    // the resolver's single ranked winner and discarding the rest. See
+    // `owner_qualified_siblings` for exactly which collisions qualify: two
+    // entities that happen to carry an identical bare name with NEITHER of
+    // them owner-qualified (a `resolve` free function in each of two
+    // unrelated files, say) do not, because there is no owner-qualified name
+    // a caller could retype to pin one, and this feature exists to offer that
+    // escape rather than to section every same-named pair on the strength of
+    // a coincidence. That case keeps its existing single-answer behavior and
+    // `ambiguous_name` disclosure below, unchanged.
+    if addressed_by_name {
+        if let Some(query) = resolution_query.as_deref() {
+            let siblings = owner_qualified_siblings(store, query)?;
+            if siblings.len() > 1 {
+                return build_sectioned_reference_reply(
+                    store,
+                    siblings,
+                    query,
+                    &relation_kinds,
+                    include_snippets,
+                    min_resolution,
+                    authority_source,
+                    repository_authority,
+                    source_scope,
+                )
+                .await;
+            }
+        }
+    }
+
+    let result = build_reference_reply_for_focal(
+        store,
+        &target,
+        &relation_kinds,
+        include_snippets,
+        min_resolution,
+        authority_source,
+        repository_authority,
+        source_scope,
+        if addressed_by_name {
+            resolution_query.as_deref()
+        } else {
+            None
+        },
+    )
+    .await?;
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+/// Every entity `query`'s bare name resolves to, when at least one of them is
+/// genuinely owner-qualified: its own full name carries an owner prefix
+/// (`Owner.member`, `Receiver::method`) that `query` does not, and stripping
+/// that prefix would still leave exactly `query`.
+///
+/// Matched the same way [`kin_ranking::entity_ranking::select_best_entity`]
+/// matches -- the same `name_pattern` query, filtered the same way it filters
+/// -- because this set only means what it claims to mean when it is the set
+/// the resolver actually chose among. A name-pattern match also catches a
+/// name that merely CONTAINS `query` as a substring or shares a token with it
+/// (`query_resolution_candidates` counts those too, which is why
+/// `focal_resolution.matched` carries two readings), and neither is what this
+/// feature sections on: `find_references(query: "get")` is not several
+/// declarations sharing the bare name "get", and a section labelled by an
+/// unrelated entity's name would be worse than today's single ranked answer.
+///
+/// Returns every match once at least one qualifies, the eventual resolver's
+/// own winner included: there is no winner to exclude here, because the whole
+/// point of this set is that none of its members should have been preferred
+/// over the others without saying so. Returns an empty vector, never a
+/// single-element one, when nothing in the match set is owner-qualified: that
+/// shape carries no ambiguity this feature can name, and its caller reads
+/// length rather than emptiness, so `vec![]` and a one-element vec have to
+/// mean the same thing to it -- nothing to section.
+///
+/// Sorted the way [`query_resolution_candidates`] orders its own matches (by
+/// file, then name, then id), so two runs against one store section the
+/// answer in the same order.
+fn owner_qualified_siblings<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> Result<Vec<kin_model::Entity>> {
+    let filter = EntityFilter {
+        name_pattern: Some(query.to_string()),
+        ..Default::default()
+    };
+    let mut matched: Vec<kin_model::Entity> = store
+        .query_entities(&filter)
+        .map_err(McpError::graph)?
+        .into_iter()
+        .filter(|entity| {
+            entity.file_origin.is_some() || entity.role != kin_model::entity::EntityRole::External
+        })
+        .filter(|entity| kin_ranking::entity_ranking::bare_member_name(&entity.name) == query)
+        .collect();
+    let any_owner_qualified = matched
+        .iter()
+        .any(|entity| kin_ranking::entity_ranking::qualified_owner_prefix(&entity.name).is_some());
+    if !any_owner_qualified {
+        return Ok(Vec::new());
+    }
+    // A total order, so two runs of one store list the same candidates in the
+    // same order. Mirrors `query_resolution_candidates`' own sort exactly.
+    matched.sort_by(|left, right| {
+        left.file_origin
+            .as_ref()
+            .map(|path| path.0.as_str())
+            .cmp(&right.file_origin.as_ref().map(|path| path.0.as_str()))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    matched.dedup_by(|left, right| left.id == right.id);
+    Ok(matched)
+}
+
+/// Top-level key a sectioned `find_references` answer files its labelled
+/// candidates under: one full reply body per entity `owner_qualified_siblings`
+/// found.
+pub(crate) const AMBIGUOUS_CANDIDATES_KEY: &str = "candidates_by_owner";
+
+/// Answer `find_references` for every entity a bare name resolves to, rather
+/// than the resolver's single ranked winner.
+///
+/// `kin_ranking::entity_ranking::select_best_entity` has to pick one match and
+/// discard the rest, which is the right contract for a resolver with one
+/// winner to hand back. It is the wrong contract for `find_references`
+/// itself, whose graph already knows every candidate's own full reference
+/// list: a repository holding `Flask.dispatch_request`,
+/// `View.dispatch_request` and `MethodView.dispatch_request` answered
+/// `find_references(query: "dispatch_request")` with one of the three and its
+/// caller list, and nothing in the response said the other two existed or
+/// what called them.
+///
+/// Each `siblings` entry gets its own labelled section --
+/// [`build_reference_reply_for_focal`]'s ordinary reply body, addressed by
+/// that entity directly (`resolution_query_for_focal: None`), unchanged --
+/// filed under its own `owner_qualified_name` and `entity_id`. The response
+/// carries no top-level `focal_entity`, `references`, or `total_upstream`:
+/// there is no single one of those left to name, which is the fact this whole
+/// reply exists to disclose rather than paper over with a silent pick. Its
+/// top-level `degradations` entry is what a generic reader already folds into
+/// `_kin.verdict`: this query reported a degradation, so the answer did not
+/// run at full, single-focal capability.
+async fn build_sectioned_reference_reply<G: GraphStore>(
+    store: &G,
+    mut siblings: Vec<kin_model::Entity>,
+    query: &str,
+    relation_kinds: &[RelationKind],
+    include_snippets: bool,
+    min_resolution: RelationResolution,
+    authority_source: FindReferencesAuthoritySource<'_>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<ToolCallResult> {
+    let total_candidates = siblings.len();
+    // Bounded the way a resolution disclosure's own candidate list already is
+    // (`RESOLUTION_CANDIDATES_LISTED_MAX`): each section pays for a full
+    // reference collection, cross-repo lookup and edge-coverage scan, and an
+    // unbounded fan-out over a pathological collision would turn one call
+    // into dozens. The cap is disclosed, never silent.
+    siblings.truncate(RESOLUTION_CANDIDATES_LISTED_MAX);
+    let sectioned_count = siblings.len();
+
+    let mut sections = Vec::with_capacity(sectioned_count);
+    for sibling in &siblings {
+        let mut section = build_reference_reply_for_focal(
+            store,
+            sibling,
+            relation_kinds,
+            include_snippets,
+            min_resolution,
+            authority_source.clone(),
+            repository_authority,
+            source_scope,
+            None,
+        )
+        .await?;
+        if let Some(object) = section.as_object_mut() {
+            object.insert(
+                "owner_qualified_name".to_string(),
+                serde_json::Value::String(sibling.name.clone()),
+            );
+            object.insert("entity_id".to_string(), serde_json::json!(sibling.id));
+        }
+        sections.push(section);
+    }
+
+    let detail = if sectioned_count < total_candidates {
+        format!(
+            "{sectioned_count} of {total_candidates} entities share the bare name '{query}' \
+             once each one's own owner prefix is stripped, and this answer sections a full \
+             reply for the first {sectioned_count} (ordered by file, then name) under \
+             `{AMBIGUOUS_CANDIDATES_KEY}` rather than silently choosing one; the rest are not \
+             shown here. Address one directly by its owner-qualified name -- \
+             `{AMBIGUOUS_CANDIDATES_KEY}[].owner_qualified_name` -- for a single, unsectioned \
+             answer about just that entity."
+        )
+    } else {
+        format!(
+            "{total_candidates} entities share the bare name '{query}' once each one's own \
+             owner prefix is stripped, and this answer sections a full reply for every one of \
+             them under `{AMBIGUOUS_CANDIDATES_KEY}` rather than silently choosing one. \
+             Address one directly by its owner-qualified name -- \
+             `{AMBIGUOUS_CANDIDATES_KEY}[].owner_qualified_name` -- for a single, unsectioned \
+             answer about just that entity."
+        )
+    };
+    let result = serde_json::json!({
+        "ambiguous_focal": true,
+        "candidate_count": total_candidates,
+        AMBIGUOUS_CANDIDATES_KEY: sections,
+        "degradations": [{
+            "component": "focal_resolution",
+            "reason": "ambiguous_name",
+            "detail": detail,
+        }],
+    });
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+/// Build one `find_references` reply body: reference rows, withheld
+/// candidates, counts, cross-repo xrefs, Go interface dispatch and
+/// implementations, edge coverage, caller arrival, this call's own
+/// `degradations`, and `focal_resolution` for `target`.
+///
+/// Every `find_references` answer is assembled this way, whether it serves
+/// the whole response for an unambiguous focal or one labelled section of a
+/// sectioned answer for a bare name several owner-qualified entities share
+/// (see [`build_sectioned_reference_reply`]). `resolution_query_for_focal` is
+/// the string [`focal_resolution_for`] counts ambiguity against: `Some`
+/// reproduces exactly what an ordinary name-addressed call reports, including
+/// its own `ambiguous_name` disclosure when the query's pattern match still
+/// carries more candidates than this one call answered for; `None` is what a
+/// call already pinned to one entity reports, which is what a labelled
+/// section IS once it has its label: `target` was not chosen by ranking a
+/// query against rivals, it is being answered for directly.
+async fn build_reference_reply_for_focal<G: GraphStore>(
+    store: &G,
+    target: &kin_model::Entity,
+    relation_kinds: &[RelationKind],
+    include_snippets: bool,
+    min_resolution: RelationResolution,
+    authority_source: FindReferencesAuthoritySource<'_>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+    resolution_query_for_focal: Option<&str>,
+) -> Result<serde_json::Value> {
     let mut rows = collect_graph_reference_rows_at(
         store,
         &target.id,
-        &relation_kinds,
+        relation_kinds,
         repository_authority,
         source_scope,
     )?;
@@ -3123,7 +3377,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             kin_spine::SpineQuery::Found(body) => {
                 let federated_rows = spine_reference_rows(&repo_id, &target.id, &body);
                 let relation_subtype_complete =
-                    reference_filter_covers_unknown_subtypes(&relation_kinds)
+                    reference_filter_covers_unknown_subtypes(relation_kinds)
                         || federated_rows.is_empty();
                 let reference_count = if relation_subtype_complete {
                     rows.extend(federated_rows.iter().cloned());
@@ -3177,7 +3431,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // or not: a `name_only` edge is still an edge of that class, and reading
     // only the resolved rows here would report a class absent on a graph
     // holding it.
-    let witnessed = answer_witnessed_classes(store, &target, &rows);
+    let witnessed = answer_witnessed_classes(store, target, &rows);
 
     // FIR-1552. A `name_only` row was matched on a bare name with nothing at the
     // reference site proving the destination. Counting one beside a proven
@@ -3239,7 +3493,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         || crate::edge_coverage::language_has_a_proven_cross_file_reference(
             store,
             target.language,
-            &relation_kinds,
+            relation_kinds,
         );
     let floor = if store_resolves_language_above_name_only {
         min_resolution
@@ -3282,7 +3536,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // for, and the reader who most needs this one is the reader who got an empty
     // reference list and is deciding whether the method is dead.
     let dispatch =
-        collect_interface_dispatch_candidates(store, &target, repository_authority, source_scope)?;
+        collect_interface_dispatch_candidates(store, target, repository_authority, source_scope)?;
 
     // The other direction of the same gap, and the one a reader asks about more
     // often: where is this interface method implemented. A concrete method
@@ -3296,7 +3550,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // Held outside `references` deliberately. These rows are not references and
     // folding them in would both lie about what an edge proves and pad the
     // answer to "who calls this contract" with declarations nobody calls.
-    let implementations = collect_interface_implementations(store, &target)?;
+    let implementations = collect_interface_implementations(store, target)?;
 
     // What this answer counted, computed before the rows are projected. One row
     // is one referencing entity, so `referencing_entities` is the row count and
@@ -3333,8 +3587,8 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // paying a language scan for a fact it is holding.
     let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
         store,
-        &target,
-        &relation_kinds,
+        target,
+        relation_kinds,
         &witnessed,
     );
 
@@ -3400,42 +3654,15 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // from here so the verdict and the evidence a reader audits it against are
     // the same object.
     result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
-        crate::caller_arrival::observe_caller_arrival(store, &target).to_json();
+        crate::caller_arrival::observe_caller_arrival(store, target).to_json();
     disclose_withheld_candidates(&mut result);
     disclose_interface_dispatch_candidates(&mut result);
     disclose_name_only_ceiling(&mut result, name_only_ceiling_kept, target.language);
 
-    // Say that a bare name was resolved, and to how many candidates.
-    //
-    // A repository holding both `Database.resolve` and `LinkGraph.resolve`
-    // answered `find_references(query: "resolve")` with one of them and its
-    // reference list, and nothing in the response said the other existed. The
-    // answer was right, and a rename driven by it on a colliding name is a
-    // rename driven by an unannounced guess. `trace_data_flow` already reports
-    // this as `focal_resolution`; the shape is copied deliberately so the two
-    // tools answer the same question with the same key.
-    //
-    // The count has to be taken against what the CALLER addressed, not against
-    // what the resolver returned. Taking it against the winner's own name made
-    // it structurally unable to count on any language that qualifies a method:
-    // `find_references(query: "dispatch_request")` on pallets/flask resolved
-    // `Flask.dispatch_request` and reported one candidate, while the graph held
-    // `View.dispatch_request` and `MethodView.dispatch_request` beside it and
-    // `semantic_search` for the same string returned six. An ambiguity counter
-    // pinned at one is worse than no counter: a reader who checks it is handed
-    // an explicit assurance that there was nothing to disambiguate (FIR-2475).
-    let resolution = focal_resolution_for(
-        store,
-        &target,
-        if addressed_by_name {
-            resolution_query.as_deref()
-        } else {
-            None
-        },
-    )?;
+    let resolution = focal_resolution_for(store, target, resolution_query_for_focal)?;
     let same_name_candidates = resolution["same_name_candidates"].as_u64().unwrap_or(1);
     result["focal_resolution"] = resolution;
-    if addressed_by_name && same_name_candidates > 1 {
+    if resolution_query_for_focal.is_some() && same_name_candidates > 1 {
         let entry = serde_json::json!({
             "component": "focal_resolution",
             "reason": "ambiguous_name",
@@ -3443,7 +3670,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
                 "{same_name_candidates} entities match the name '{}' that was queried, and this \
                  answer describes the one reported as focal_entity. Address it by entity_id, \
                  from focal_resolution.other_candidates, to pin the choice.",
-                resolution_query.as_deref().unwrap_or(target.name.as_str())
+                resolution_query_for_focal.unwrap_or(target.name.as_str())
             ),
         });
         match result
@@ -3455,8 +3682,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         }
     }
 
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(result)
 }
 
 /// Batched reachability check: classify many entities in a single call.
@@ -9558,8 +9784,10 @@ mod tests {
         assert!(referenced.contains(&"cmd/app/emit.go"), "{body}");
     }
 
-    /// FIR-2475. The ambiguity counter above cannot count ambiguity on any
-    /// language that qualifies a method name, which is most of them.
+    /// The ambiguity counter alone cannot count ambiguity on any language
+    /// that qualifies a method name, which is most of them, and even naming
+    /// the count could only ever describe one winner and discard the other
+    /// candidates' own reference lists.
     ///
     /// Measured on pallets/flask at d318b683 with npm `@kinlab/kin@0.5.42`:
     /// `find_references(query: "dispatch_request")` resolved
@@ -9568,14 +9796,17 @@ mod tests {
     /// `total_matches: 6`. Three of those are source-role methods whose
     /// unqualified name is exactly `dispatch_request`, in two files.
     ///
-    /// Two bugs stack. The count is taken against the RESOLVED focal's qualified
-    /// name rather than against the query the caller typed, and it is taken with
-    /// exact string equality rather than the substring rule the resolver ranked
-    /// with. So for a qualified-name language the answer is pinned at one
-    /// whatever the caller asked, the `ambiguous_name` degradation can never
-    /// fire, and a reader following FIR-2439's own advice gets an explicit
-    /// assurance that there was nothing to disambiguate. The fixture above
-    /// passes only because its two entities carry bare identical names.
+    /// The original count bug is fixed elsewhere (the count is taken against
+    /// what the CALLER typed, not the resolved focal's qualified name, and by
+    /// the same pattern rule the resolver ranked with). This is the sharper
+    /// fix on top of it: rather than count three candidates and still answer
+    /// for only one, `find_references` now sections a full reply for each of
+    /// the three under `candidates_by_owner`, labelled by its own
+    /// owner-qualified name. `find_references_reports_an_ambiguous_name_resolution`
+    /// beside this test is the fixture that does NOT section: two bare,
+    /// unqualified identically-named functions have no owner-qualified name
+    /// to label a section with, so that case keeps the single-answer-plus-count
+    /// shape this one used to have.
     #[tokio::test]
     async fn find_references_counts_what_the_query_could_have_meant() {
         let store = InMemoryGraph::new();
@@ -9599,8 +9830,8 @@ mod tests {
         }
 
         // The control. Three distinct entities really do answer to this query in
-        // this store, so a response reporting one candidate is reporting a fact
-        // the store contradicts rather than a small repository.
+        // this store, so a response reporting fewer is reporting a fact the
+        // store contradicts rather than a small repository.
         let matched = store
             .query_entities(&kin_model::graph::EntityFilter {
                 name_pattern: Some("dispatch_request".to_string()),
@@ -9618,35 +9849,57 @@ mod tests {
         args.insert("query".to_string(), serde_json::json!("dispatch_request"));
         let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
 
-        assert_eq!(body["focal_resolution"]["addressed_by"], "name");
         assert_eq!(
-            body["focal_resolution"]["same_name_candidates"], 3,
-            "the count must answer what the QUERY could have meant, not how many \
-             entities carry the winner's qualified name: {body}"
+            body["ambiguous_focal"], true,
+            "three owner-qualified entities share this bare name, so the answer must say so: \
+             {body}"
         );
         assert_eq!(
-            body["focal_resolution"]["matched"], "query_name_pattern",
-            "the response must name the rule it counted by, or the number is unreadable: {body}"
+            body["candidate_count"], 3,
+            "the count must answer what the QUERY could have meant, not how many entities \
+             carry any one winner's qualified name: {body}"
+        );
+        assert!(
+            body.get("focal_entity").is_none()
+                && body.get("references").is_none()
+                && body.get("total_upstream").is_none(),
+            "a sectioned answer names no single winner at the top level: {body}"
         );
 
-        // A count alone tells an agent it guessed and leaves it no way to ask
-        // again. The rejected candidates travel with it, addressable by id.
-        let others = body["focal_resolution"]["other_candidates"]
+        // Every candidate gets its own labelled, full section rather than being
+        // rejected and reduced to an id a caller could look up.
+        let sections = body[AMBIGUOUS_CANDIDATES_KEY]
             .as_array()
-            .unwrap_or_else(|| {
-                panic!("an ambiguous resolution must name what it did not pick: {body}")
-            });
-        assert_eq!(others.len(), 2, "two candidates were not chosen: {body}");
-        let focal_id = body["focal_entity"]["id"].as_str().unwrap().to_string();
-        for other in others {
-            assert_ne!(
-                other["id"].as_str().unwrap(),
-                focal_id,
-                "the chosen entity is not one of the rejected ones: {body}"
+            .unwrap_or_else(|| panic!("an ambiguous resolution must section every match: {body}"));
+        assert_eq!(sections.len(), 3, "{body}");
+        let mut owner_qualified_names: Vec<&str> = sections
+            .iter()
+            .map(|section| {
+                section["owner_qualified_name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("every section must label itself: {section}"))
+            })
+            .collect();
+        owner_qualified_names.sort_unstable();
+        assert_eq!(
+            owner_qualified_names,
+            vec![
+                "Flask.dispatch_request",
+                "MethodView.dispatch_request",
+                "View.dispatch_request",
+            ],
+            "every candidate is labelled by its own owner-qualified name, none dropped, none \
+             merged into another's section: {body}"
+        );
+        for section in sections {
+            let label = section["owner_qualified_name"].as_str().unwrap();
+            assert_eq!(
+                section["focal_entity"]["name"], label,
+                "a section's own focal_entity must be the entity its label names: {section}"
             );
             assert!(
-                other["name"].is_string() && other["file_path"].is_string(),
-                "a rejected candidate must be re-askable: {other}"
+                section["references"].is_array() && section["total_upstream"].is_number(),
+                "a section carries a single-focal reply's own fields: {section}"
             );
         }
 
@@ -9656,8 +9909,11 @@ mod tests {
         assert!(
             degradations
                 .iter()
-                .any(|entry| entry["reason"] == "ambiguous_name"),
-            "the ambiguity must be named: {body}"
+                .any(|entry| entry["reason"] == "ambiguous_name"
+                    && entry["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains('3'))),
+            "the ambiguity must be named, with how many candidates: {body}"
         );
 
         // The verdict half of this is asserted where `negative_for` is callable
@@ -9759,6 +10015,187 @@ mod tests {
         assert!(
             exact.get("degradations").is_none(),
             "pinning by id resolves nothing and must not degrade: {exact}"
+        );
+    }
+
+    /// A bare name that only ONE owner-qualified entity carries keeps today's
+    /// single-focal answer exactly as before: no sectioning, no
+    /// `ambiguous_focal`, and `focal_resolution.same_name_candidates` at 1.
+    ///
+    /// The control for the two tests beside it. Without it, a filter bug that
+    /// sectioned every owner-qualified query -- even one with nothing to
+    /// disambiguate -- could not be told apart from the feature working.
+    #[tokio::test]
+    async fn find_references_with_one_owner_qualified_match_is_not_sectioned() {
+        let store = InMemoryGraph::new();
+        let target = make_entity_in(
+            LanguageId::Python,
+            "Flask.dispatch_request",
+            "src/flask/app.py",
+        );
+        store.upsert_entity(&target).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("dispatch_request"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert!(
+            body.get("ambiguous_focal").is_none() && body.get(AMBIGUOUS_CANDIDATES_KEY).is_none(),
+            "one match is not an ambiguity: {body}"
+        );
+        assert_eq!(
+            body["focal_entity"]["name"], "Flask.dispatch_request",
+            "{body}"
+        );
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 1,
+            "{body}"
+        );
+        assert!(
+            body.get("degradations").is_none(),
+            "one match must not degrade: {body}"
+        );
+    }
+
+    /// The core of this feature: a bare name two owner-qualified entities
+    /// share answers a full, labelled section for EACH of them in one reply,
+    /// with the ambiguity disclosed, rather than the resolver's single ranked
+    /// winner and the other's rows nowhere in the response.
+    ///
+    /// Each candidate gets its own caller, deliberately different ones, so a
+    /// version that merged the two candidates' rows into one undifferentiated
+    /// list -- or that answered for one and left the other's callers out --
+    /// fails this test where a same-shaped single-section answer would not.
+    #[tokio::test]
+    async fn find_references_sections_a_bare_name_two_owners_share() {
+        let store = InMemoryGraph::new();
+        let base = make_entity_in(LanguageId::Python, "Database.resolve", "src/database.py");
+        let other = make_entity_in(LanguageId::Python, "LinkGraph.resolve", "src/link_graph.py");
+        store.upsert_entity(&base).unwrap();
+        store.upsert_entity(&other).unwrap();
+
+        let base_caller = make_entity_in(LanguageId::Python, "load_record", "src/database.py");
+        store.upsert_entity(&base_caller).unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                base_caller.id,
+                base.id,
+                RelationKind::Calls,
+                "src/database.py",
+                10,
+            ))
+            .unwrap();
+
+        let other_caller = make_entity_in(LanguageId::Python, "walk_edges", "src/link_graph.py");
+        store.upsert_entity(&other_caller).unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                other_caller.id,
+                other.id,
+                RelationKind::Calls,
+                "src/link_graph.py",
+                20,
+            ))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("resolve"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(body["ambiguous_focal"], true, "{body}");
+        assert_eq!(body["candidate_count"], 2, "{body}");
+        let sections = body[AMBIGUOUS_CANDIDATES_KEY].as_array().unwrap();
+        assert_eq!(sections.len(), 2, "{body}");
+
+        let section_for = |owner_qualified_name: &str| {
+            sections
+                .iter()
+                .find(|section| section["owner_qualified_name"] == owner_qualified_name)
+                .unwrap_or_else(|| panic!("no section labelled '{owner_qualified_name}': {body}"))
+        };
+
+        let base_section = section_for("Database.resolve");
+        assert_eq!(
+            base_section["entity_id"],
+            base.id.to_string(),
+            "{base_section}"
+        );
+        assert_eq!(base_section["total_upstream"], 1, "{base_section}");
+        let base_callers: Vec<&str> = base_section["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            base_callers,
+            vec!["load_record"],
+            "Database.resolve's own section must carry its own caller, not the other \
+             candidate's: {base_section}"
+        );
+
+        let other_section = section_for("LinkGraph.resolve");
+        assert_eq!(
+            other_section["entity_id"],
+            other.id.to_string(),
+            "{other_section}"
+        );
+        assert_eq!(other_section["total_upstream"], 1, "{other_section}");
+        let other_callers: Vec<&str> = other_section["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            other_callers,
+            vec!["walk_edges"],
+            "LinkGraph.resolve's own section must carry its own caller, and not \
+             Database.resolve's: {other_section}"
+        );
+
+        // Neither section's own `degradations` (if any) is what discloses the
+        // ambiguity -- that is a fact about the QUERY, not about one candidate
+        // -- so it travels once, at the top.
+        let degradations = body["degradations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a sectioned answer must degrade: {body}"));
+        let disclosure = degradations
+            .iter()
+            .find(|entry| entry["reason"] == "ambiguous_name")
+            .unwrap_or_else(|| panic!("the ambiguity must be named: {body}"));
+        assert_eq!(disclosure["component"], "focal_resolution", "{disclosure}");
+        let detail = disclosure["detail"].as_str().unwrap();
+        assert!(detail.contains("resolve"), "{detail}");
+        assert!(
+            detail.contains("owner-qualified"),
+            "the disclosure must point the caller at the remedy: {detail}"
+        );
+    }
+
+    /// A bare name matching no entity at all keeps today's refusal exactly:
+    /// sectioning only ever applies to a resolved focal, and this call never
+    /// reaches that code because nothing here resolves in the first place.
+    #[tokio::test]
+    async fn find_references_with_zero_matches_still_refuses() {
+        let store = InMemoryGraph::new();
+        // A single, unrelated entity, so the store is not simply empty.
+        store
+            .upsert_entity(&make_entity("unrelated_function", "src/lib.rs"))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "query".to_string(),
+            serde_json::json!("nothing_shares_this_name"),
+        );
+        let result = handle_find_references(&args, &store, None).await.unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = result.content.first().unwrap();
+        assert_eq!(
+            text, FIND_REFERENCES_FOCAL_MISS,
+            "a query matching nothing refuses exactly as it did before this feature existed"
         );
     }
 
