@@ -182,6 +182,31 @@ pub fn qualified_owner_prefix(name: &str) -> Option<&str> {
         .filter(|prefix| !prefix.is_empty())
 }
 
+/// The trailing, unqualified segment of a name: `embed_batch` for
+/// `CodeEmbedder::embed_batch`, `Raspbian` for `constant.Raspbian`, the whole
+/// name for one with no owner segment. The complement of
+/// [`qualified_owner_prefix`]: it steps past whatever prefix that function
+/// found, through whichever separator immediately follows it, so the two can
+/// never disagree about where a name splits.
+///
+/// This is what several owner-qualified declarations "share" when a caller
+/// addresses them by a bare name: `Flask.dispatch_request`,
+/// `View.dispatch_request` and `MethodView.dispatch_request` disagree on
+/// [`qualified_owner_prefix`] and agree here, on `dispatch_request`, which is
+/// the fact `find_references` sections a bare-name answer on rather than a
+/// substring or token overlap a name-pattern search would also match.
+pub fn bare_member_name(name: &str) -> &str {
+    match qualified_owner_prefix(name) {
+        Some(prefix) => {
+            let rest = &name[prefix.len()..];
+            rest.strip_prefix("::")
+                .or_else(|| rest.strip_prefix('.'))
+                .unwrap_or(rest)
+        }
+        None => name,
+    }
+}
+
 /// Relation count of one entity excluding temporal `CoChanges` edges, so the
 /// number is a fact about code structure rather than commit history.
 fn structural_relation_count<G: GraphStore>(
@@ -1502,5 +1527,33 @@ mod tests {
         assert_eq!(qualified_owner_prefix("seal_change"), None);
         assert_eq!(qualified_owner_prefix("::rooted"), None);
         assert_eq!(qualified_owner_prefix(".hidden"), None);
+    }
+
+    #[test]
+    fn bare_member_name_steps_past_the_same_separator_qualified_owner_prefix_found() {
+        assert_eq!(bare_member_name("CodeEmbedder::embed_batch"), "embed_batch");
+        assert_eq!(bare_member_name("constant.Raspbian"), "Raspbian");
+        assert_eq!(bare_member_name("a::b::c"), "c");
+        assert_eq!(bare_member_name("&G::delete_work_item"), "delete_work_item");
+        // The three owner-qualified siblings `find_references` sections a
+        // bare-name answer over: distinct full names, one shared bare one.
+        assert_eq!(
+            bare_member_name("Flask.dispatch_request"),
+            "dispatch_request"
+        );
+        assert_eq!(
+            bare_member_name("View.dispatch_request"),
+            "dispatch_request"
+        );
+        assert_eq!(
+            bare_member_name("MethodView.dispatch_request"),
+            "dispatch_request"
+        );
+        // A bare name has nothing to step past, so it is its own answer --
+        // including the two cases where `qualified_owner_prefix` recognizes no
+        // usable prefix despite a separator being present.
+        assert_eq!(bare_member_name("seal_change"), "seal_change");
+        assert_eq!(bare_member_name("::rooted"), "::rooted");
+        assert_eq!(bare_member_name(".hidden"), ".hidden");
     }
 }
