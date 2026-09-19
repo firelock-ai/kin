@@ -56,7 +56,7 @@ use crate::pipeline::IndexPipeline;
 /// version keeps whatever its past was authored to contain until it is admitted
 /// again. Carrying the authoring version on the wire, automatic re-derivation,
 /// migration and refusing to answer over a gap all remain open follow-up work.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 11;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 12;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///

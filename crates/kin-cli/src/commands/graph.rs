@@ -1778,6 +1778,11 @@ fn entity_source_outcome(
     entity: &Entity,
     mint_current_source_base: bool,
 ) -> Result<EntitySourceOutcome> {
+    if let Err(reason) = kin_model::require_independent_source(entity) {
+        return Ok(EntitySourceOutcome::NoSource(entity_no_source_message(
+            entity, &reason,
+        )));
+    }
     // A structurally sourceless entity (no file origin or no span) is a valid ID
     // with nothing to return, reported as `NoSource` rather than as the genuine
     // extraction error below, which signals corrupt spans or unavailable blobs.
@@ -1923,7 +1928,7 @@ fn entity_no_source_message(entity: &Entity, reason: &str) -> String {
     )
 }
 
-fn resolve_source_entity(
+pub fn resolve_source_entity(
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<Option<Entity>> {
@@ -1994,6 +1999,7 @@ pub(crate) fn graph_source_record_bounded_from(
     entity: &Entity,
     max_bytes: usize,
 ) -> Result<Option<GraphSourceRecord>> {
+    kin_model::require_independent_source(entity).map_err(anyhow::Error::msg)?;
     let file_origin = entity
         .file_origin
         .as_ref()
@@ -4938,6 +4944,48 @@ mod tests {
 
     fn commit_source_entity(fixture: &GraphSourceFixture, entity: &Entity) {
         fixture.graph.upsert_entity(entity).unwrap();
+    }
+
+    #[test]
+    fn derived_member_legacy_source_and_rename_refuse_generator_body() {
+        let text = "for (const name of names) { app[name] = function() {}; }";
+        let fixture = graph_source_fixture(Some(text.as_bytes()));
+        let mut entity = source_entity("app.get", fixture.file_id.clone(), 0, text.len());
+        entity.language = LanguageId::JavaScript;
+        entity.kind = EntityKind::Method;
+        entity.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        commit_source_entity(&fixture, &entity);
+        match build_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &entity.id.to_string(),
+        )
+        .unwrap()
+        {
+            EntitySourceOutcome::NoSource(message) => assert!(message.contains("independent")),
+            other => panic!("a generator must not be returned as the member body: {other:?}"),
+        }
+        let authority = fixture.authority().open().unwrap();
+        let workspace = authority.workspace().unwrap();
+        let error = graph_source_record_bounded_from(&authority, &workspace, &entity, usize::MAX)
+            .unwrap_err();
+        assert!(error.to_string().contains("independent"));
+        let request = crate::commands::rename::RenameRequest {
+            symbol: entity.name.clone(),
+            new_name: "renamed".into(),
+            file: None,
+            line: None,
+            column: None,
+            json: false,
+            operation_id: kin_model::OperationId::new(),
+            actor: kin_model::AuthorId("derived-source-test".into()),
+        };
+        let error = crate::commands::rename::plan_rename(&fixture.graph, &request, |_, _| {
+            panic!("rename must refuse a derived declaration before loading source")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("independent"), "{error}");
     }
 
     #[test]

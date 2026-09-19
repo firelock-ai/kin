@@ -155,6 +155,7 @@ where
     let tree = graph.resolved_tree();
     let mut bodies = HashMap::<FilePathId, String>::new();
     let target = resolve_target(graph, request, &tree, &mut bodies, &mut load_source)?;
+    kin_model::require_independent_source(&target).map_err(anyhow::Error::msg)?;
     if target.name == request.new_name {
         bail!("rename target already has name '{}'", request.new_name);
     }

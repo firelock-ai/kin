@@ -18,6 +18,32 @@ use crate::extract::{
 
 pub struct GoAdapter;
 
+/// Package identity is parser evidence, not a directory-name guess. Go test
+/// files can declare a separate package in the same directory.
+pub fn attach_go_package_metadata(tree: &Tree, source: &[u8], entities: &mut [Entity]) {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let package = root.named_children(&mut cursor).find_map(|node| {
+        if node.kind() != "package_clause" {
+            return None;
+        }
+        let mut cursor = node.walk();
+        let package = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "package_identifier")
+            .and_then(|name| name.utf8_text(source).ok());
+        package
+    });
+    if let Some(package) = package.filter(|name| !name.is_empty()) {
+        for entity in entities {
+            entity
+                .metadata
+                .extra
+                .insert("go_package".into(), json!(package));
+        }
+    }
+}
+
 pub fn attach_go_command_effect_contract_metadata(
     tree: &Tree,
     source: &[u8],
@@ -166,13 +192,24 @@ impl LanguageAdapter for GoAdapter {
                 kin_model::RelationKind::Calls | kin_model::RelationKind::References
             ) && rel.import_source.is_none()
             {
-                if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
+                // A value selector belongs to its receiver's namespace.
+                // Its leaf may coincidentally match an unrelated import alias.
+                let import_name = if rel.kind == kin_model::RelationKind::References {
+                    rel.receiver
+                        .as_deref()
+                        .map(|receiver| receiver.split('.').next().unwrap_or(receiver).trim())
+                        .unwrap_or(rel.dst_name.as_str())
+                } else {
+                    rel.dst_name.as_str()
+                };
+                if let Some(&module) = import_map.get(import_name) {
                     rel.import_source = Some(module.to_string());
                 }
             }
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -452,6 +489,7 @@ fn extract_go_node(
                     node,
                     source,
                     &name,
+                    None,
                     relations,
                     call_prefixes,
                     &mut ref_seen,
@@ -506,10 +544,12 @@ fn extract_go_node(
                 }
 
                 let mut ref_seen = std::collections::HashSet::new();
+                let receiver = GoMethodReceiver::from_method(node, source);
                 extract_calls_from_body(
                     node,
                     source,
                     &qualified,
+                    receiver.as_ref(),
                     relations,
                     call_prefixes,
                     &mut ref_seen,
@@ -600,6 +640,39 @@ fn extract_go_node(
                                         kind: kin_model::RelationKind::Extends,
                                         src_name: name.clone(),
                                         dst_name: embedded,
+                                        import_source: None,
+                                    });
+                                }
+
+                                // Every NAMED field becomes a first-class entity,
+                                // owner-qualified (`Struct.Field`) the same way a
+                                // method is `Receiver.Method`, so it is
+                                // addressable and `find_references` has
+                                // something in the graph to answer against. An
+                                // embedded field (no name at all) stays out of
+                                // this: it already produced the Extends relation
+                                // above, and Go reaches its promoted members
+                                // through THAT type's own fields, not through an
+                                // entity named after the embedder.
+                                for field in extract_struct_fields(struct_node, source, file_id) {
+                                    let qualified = format!("{}.{}", name, field.name);
+                                    entities.push(ExtractedEntity {
+                                        kind: EntityKind::Field,
+                                        name: qualified.clone(),
+                                        signature: field.signature,
+                                        visibility: go_visibility_with_path(&field.name, file_id),
+                                        doc_summary: field.doc_summary,
+                                        fingerprint: field.fingerprint,
+                                        span: field.span,
+                                        declaration_line: None,
+                                    });
+                                    relations.push(ExtractedRelation {
+                                        site: None,
+                                        receiver: None,
+                                        call_shape: None,
+                                        kind: kin_model::RelationKind::Contains,
+                                        src_name: name.clone(),
+                                        dst_name: qualified,
                                         import_source: None,
                                     });
                                 }
@@ -696,6 +769,72 @@ fn extract_embedded_types(node: &tree_sitter::Node, source: &[u8]) -> Vec<String
         }
     }
     embedded
+}
+
+/// One named field declared directly in a Go struct body, carrying
+/// everything needed to materialize it as a graph entity.
+struct StructFieldSpec {
+    name: String,
+    signature: String,
+    doc_summary: Option<String>,
+    fingerprint: kin_model::SemanticFingerprint,
+    span: kin_model::SourceSpan,
+}
+
+/// Extract the named fields of a Go struct_type node.
+///
+/// A `field_declaration` either declares one or more named fields sharing a
+/// type (`X, Y int` is one `field_declaration` with two `name` children), or
+/// embeds a type with no name at all (`Shape`, which
+/// [`extract_embedded_types`] turns into an Extends relation instead and
+/// which this function skips). Every co-declared name shares its
+/// declaration's signature, doc comment, and span — the same choice the Java
+/// adapter already makes for `int x, y;` — so `X` and `Y` above both read
+/// "X, Y int" rather than a fabricated single-name signature neither wrote.
+fn extract_struct_fields(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+) -> Vec<StructFieldSpec> {
+    let mut fields = Vec::new();
+    let mut cursor = node.walk();
+    for list in node.children(&mut cursor) {
+        if list.kind() != "field_declaration_list" {
+            continue;
+        }
+        let mut list_cursor = list.walk();
+        for decl in list.children(&mut list_cursor) {
+            if decl.kind() != "field_declaration" {
+                continue;
+            }
+            let mut name_cursor = decl.walk();
+            let names: Vec<tree_sitter::Node> = decl
+                .children_by_field_name("name", &mut name_cursor)
+                .collect();
+            if names.is_empty() {
+                // An embedded field: a type with no name at all.
+                continue;
+            }
+            let signature = node_signature(&decl, source);
+            let doc_summary = extract_preceding_comment(&decl, source);
+            let fingerprint = compute_fingerprint(&decl, source);
+            let span = span_from_node(&decl, file_id);
+            for name_node in names {
+                let field_name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if field_name.is_empty() {
+                    continue;
+                }
+                fields.push(StructFieldSpec {
+                    name: field_name,
+                    signature: signature.clone(),
+                    doc_summary: doc_summary.clone(),
+                    fingerprint: fingerprint.clone(),
+                    span: span.clone(),
+                });
+            }
+        }
+    }
+    fields
 }
 
 /// One method spec declared directly in a Go interface body, carrying
@@ -912,12 +1051,141 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
 /// own position while a subtree the walk reaches twice still yields one edge.
 type ValueReadsSeen = std::collections::HashSet<(String, usize)>;
 
+struct GoMethodReceiver {
+    name: String,
+    owner: String,
+    shadows: Vec<std::ops::Range<usize>>,
+}
+
+impl GoMethodReceiver {
+    fn from_method(method: &tree_sitter::Node, source: &[u8]) -> Option<Self> {
+        let receiver = method.child_by_field_name("receiver")?;
+        let mut cursor = receiver.walk();
+        let declaration = receiver
+            .named_children(&mut cursor)
+            .find(|node| node.kind() == "parameter_declaration")?;
+        let name = declaration
+            .child_by_field_name("name")?
+            .utf8_text(source)
+            .ok()?;
+        if name.is_empty() || name == "_" {
+            return None;
+        }
+        let owner = extract_receiver_type(&receiver, source)?;
+        let body = method.child_by_field_name("body")?;
+        let mut shadows = Vec::new();
+        collect_receiver_shadows(&body, &body, name, source, &mut shadows);
+        Some(Self {
+            name: name.to_string(),
+            owner,
+            shadows,
+        })
+    }
+
+    fn binds(&self, name: &str, position: usize) -> bool {
+        name == self.name && !self.shadows.iter().any(|range| range.contains(&position))
+    }
+}
+
+fn go_binding_scope(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "block"
+                | "if_statement"
+                | "for_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "communication_case"
+                | "expression_case"
+                | "type_case"
+                | "default_case"
+        ) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+/// Receiver parameters remain in scope inside captured closures, but a local
+/// declaration can hide them. A declaration's RHS still sees the outer binding.
+fn collect_receiver_shadows(
+    node: &tree_sitter::Node,
+    method_body: &tree_sitter::Node,
+    name: &str,
+    source: &[u8],
+    shadows: &mut Vec<std::ops::Range<usize>>,
+) {
+    let declares = |field: &str| {
+        node.child_by_field_name(field).is_some_and(|part| {
+            assigned_identifier_names(&part, source)
+                .iter()
+                .any(|n| n == name)
+        })
+    };
+    match node.kind() {
+        "short_var_declaration" | "range_clause" | "receive_statement" => {
+            let mut cursor = node.walk();
+            let short = node.children(&mut cursor).any(|child| child.kind() == ":=");
+            if short && declares("left") {
+                if let Some(scope) = go_binding_scope(*node) {
+                    // A short declaration in the method's outer block reuses
+                    // its receiver parameter; a nested block declares a new name.
+                    if scope.id() != method_body.id() {
+                        shadows.push(node.end_byte()..scope.end_byte());
+                    }
+                }
+            }
+        }
+        "var_spec" | "const_spec" | "type_spec" => {
+            let mut cursor = node.walk();
+            let declares_name = node
+                .children_by_field_name("name", &mut cursor)
+                .any(|part| part.utf8_text(source).ok() == Some(name));
+            if declares_name {
+                if let Some(scope) = go_binding_scope(*node) {
+                    shadows.push(node.end_byte()..scope.end_byte());
+                }
+            }
+        }
+        "func_literal" => {
+            for field in ["parameters", "result"] {
+                if let Some(parameters) = node.child_by_field_name(field) {
+                    let mut cursor = parameters.walk();
+                    let hides = parameters.named_children(&mut cursor).any(|parameter| {
+                        let mut cursor = parameter.walk();
+                        let hides = parameter
+                            .children_by_field_name("name", &mut cursor)
+                            .any(|part| part.utf8_text(source).ok() == Some(name));
+                        hides
+                    });
+                    if hides {
+                        if let Some(body) = node.child_by_field_name("body") {
+                            shadows.push(body.byte_range());
+                        }
+                    }
+                }
+            }
+        }
+        "type_switch_statement" if declares("alias") => {
+            if let Some(value) = node.child_by_field_name("value") {
+                shadows.push(value.end_byte()..node.end_byte());
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_receiver_shadows(&child, method_body, name, source, shadows);
+    }
+}
+
 /// Recursively walk a function/method body to find `call_expression` nodes.
 ///
-/// Callee names are extracted as *simple* identifiers: for a selector
-/// expression like `fmt.Println(x)`, the emitted `dst_name` is `"Println"`,
-/// not `"fmt.Println"`. This matches name-based edge resolution against
-/// entity names elsewhere in the graph.
+/// Package selectors retain their simple name and import prefix. Calls on
+/// the declared method receiver carry the owner-qualified method name; a
+/// shadowed receiver retains its local identity without claiming a type.
 ///
 /// The leftmost qualifier (e.g. `"fmt"` in `fmt.Println`) is recorded as a
 /// side channel in `call_prefixes` — parallel to `relations` at the index of
@@ -927,6 +1195,7 @@ fn extract_calls_from_body(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    method_receiver: Option<&GoMethodReceiver>,
     relations: &mut Vec<ExtractedRelation>,
     call_prefixes: &mut Vec<(usize, String)>,
     ref_seen: &mut ValueReadsSeen,
@@ -942,7 +1211,26 @@ fn extract_calls_from_body(
             "argument_list" | "literal_value" | "return_statement" => {
                 emit_value_references(&child, source, context_name, relations, ref_seen);
             }
-            "assignment_statement" | "short_var_declaration" => {
+            "assignment_statement" => {
+                // The write side: `t.Field = v` (or `t.Field += v`, whose
+                // operator still binds through the `left`/`right` fields)
+                // reads whatever locates the slot being written — a struct
+                // field, an index, a pointer deref — but never the plain
+                // local or global identifier being freshly bound, which is a
+                // write with nothing to read. A struct field write has to
+                // reach the graph as a reference the same way a read does, or
+                // `find_references` on a field only ever sees half its sites.
+                if let Some(lhs) = child.child_by_field_name("left") {
+                    emit_write_target_references(&lhs, source, context_name, relations, ref_seen);
+                }
+                if let Some(rhs) = child.child_by_field_name("right") {
+                    emit_value_references(&rhs, source, context_name, relations, ref_seen);
+                }
+            }
+            "short_var_declaration" => {
+                // `x := v` only ever binds fresh local names on its left, so
+                // there is nothing there to read; unlike `assignment_statement`
+                // it cannot write through a selector or index expression.
                 if let Some(rhs) = child.child_by_field_name("right") {
                     emit_value_references(&rhs, source, context_name, relations, ref_seen);
                 }
@@ -979,6 +1267,14 @@ fn extract_calls_from_body(
                     _ => (String::new(), None),
                 };
                 if is_valid_callee_name(&callee) {
+                    let local_receiver = prefix.as_deref().and_then(|prefix| {
+                        method_receiver.filter(|receiver| receiver.name == prefix)
+                    });
+                    let declared_receiver = local_receiver
+                        .filter(|receiver| receiver.binds(&receiver.name, child.start_byte()));
+                    let callee = declared_receiver
+                        .map(|receiver| format!("{}.{}", receiver.owner, callee))
+                        .unwrap_or(callee);
                     let idx = relations.len();
                     relations.push(ExtractedRelation {
                         // The call expression itself, so a reference row can
@@ -986,14 +1282,14 @@ fn extract_calls_from_body(
                         // linker has no span to store and every consuming
                         // surface reports the edge as having no evidence span.
                         site: Some(crate::adapter::site_from_node(&child)),
-                        receiver: None,
+                        receiver: local_receiver.map(|receiver| receiver.name.clone()),
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,
                         import_source: None,
                     });
-                    if let Some(p) = prefix {
+                    if let Some(p) = prefix.filter(|_| local_receiver.is_none()) {
                         call_prefixes.push((idx, p));
                     }
                 }
@@ -1043,6 +1339,7 @@ fn extract_calls_from_body(
             &child,
             source,
             context_name,
+            method_receiver,
             relations,
             call_prefixes,
             ref_seen,
@@ -1071,15 +1368,62 @@ fn emit_value_references(
 ) {
     let mut reads = Vec::new();
     collect_value_refs(node, source, &mut reads);
-    for (name, site) in reads {
-        if name != context_name && ref_seen.insert((name.clone(), site.start_byte)) {
+    emit_references(reads, context_name, relations, ref_seen);
+}
+
+/// The write-side counterpart of [`emit_value_references`]: emits a
+/// `References` edge for whatever a write TARGET reads to locate its slot.
+///
+/// `t.Field = v` still reads `t` to find the struct and reads `Field` to name
+/// the member being written, the same two names a read of `t.Field` produces;
+/// only a bare local or global identifier target (`x = v`) is a pure write
+/// with nothing underneath it to read, which [`collect_write_target_refs`]
+/// is what excludes.
+fn emit_write_target_references(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+    ref_seen: &mut ValueReadsSeen,
+) {
+    let mut reads = Vec::new();
+    collect_write_target_refs(node, source, &mut reads);
+    emit_references(reads, context_name, relations, ref_seen);
+}
+
+struct ValueReference {
+    name: String,
+    receiver: Option<String>,
+    site: crate::extract::RelationSite,
+}
+
+/// Turn collected reads into deduplicated `References` relations.
+///
+/// Shared by the read side ([`emit_value_references`]) and the write side
+/// ([`emit_write_target_references`]) so a name read while being written and
+/// a name read while being used are recorded identically.
+fn emit_references(
+    reads: Vec<ValueReference>,
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+    ref_seen: &mut ValueReadsSeen,
+) {
+    for ValueReference {
+        name,
+        receiver,
+        site,
+    } in reads
+    {
+        if (receiver.is_some() || name != context_name)
+            && ref_seen.insert((name.clone(), site.start_byte))
+        {
             relations.push(ExtractedRelation {
                 // The identifier that read the name. The linker merges the
                 // evidence of every edge that resolves to the same
                 // (source, destination, kind), so the sites of repeated reads
                 // accumulate onto one relation.
                 site: Some(site),
-                receiver: None,
+                receiver,
                 call_shape: None,
                 kind: kin_model::RelationKind::References,
                 src_name: context_name.to_string(),
@@ -1090,32 +1434,77 @@ fn emit_value_references(
     }
 }
 
-/// Collect bare identifier names read as VALUES within an expression subtree,
-/// each paired with the position the identifier sits at.
+/// Collect the names a write TARGET reads to locate the slot it assigns into.
 ///
-/// Walks value expressions while pruning positions that are not value reads:
-/// a call's callee (already captured as a `Calls` edge), a selector's `.field`
-/// selector, a composite literal's `type`, and a `keyed_element`'s key. Type
-/// identifiers and the blank identifier `_` are never collected. The receiver
-/// of a method call (`obj` in `obj.M()`) and every call argument ARE collected,
-/// since they are genuine value reads.
-fn collect_value_refs(
+/// A bare identifier (`x` in `x = v`, whether freshly bound, an existing
+/// local, or the blank `_`) is a pure write with nothing to read, so it
+/// contributes nothing. `expression_list` unpacks a multi-assignment (`a,
+/// t.Field = 1, 2`) so each target is judged on its own rather than as one
+/// blob. Every other shape — a selector (`t.Field`), an index (`arr[i]`), a
+/// pointer deref (`*p`) — genuinely reads something to find the slot, and is
+/// handed to [`collect_value_refs`] once the bare-identifier case has been
+/// ruled out, which is what lets `t.Field = v` collect both `t` and `Field`
+/// the same way a read of `t.Field` does.
+fn collect_write_target_refs(
     node: &tree_sitter::Node,
     source: &[u8],
-    out: &mut Vec<(String, crate::extract::RelationSite)>,
+    out: &mut Vec<ValueReference>,
 ) {
+    match node.kind() {
+        // The blank identifier `_` arrives as a plain `identifier` node
+        // whose text is "_", not a distinct node kind, so this arm already
+        // covers it: nothing here pushes to `out` unconditionally.
+        "identifier" => {}
+        "expression_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_write_target_refs(&child, source, out);
+            }
+        }
+        _ => collect_value_refs(node, source, out),
+    }
+}
+
+/// Collect bare identifier and field names read as VALUES within an
+/// expression subtree, each paired with the position it sits at.
+///
+/// Walks value expressions while pruning positions that are not value reads:
+/// a call's callee (already captured as a `Calls` edge), a composite
+/// literal's `type`, and a `keyed_element`'s key. Type identifiers and the
+/// blank identifier `_` are never collected. The receiver of a method call
+/// (`obj` in `obj.M()`), every call argument, and a selector's `.field`
+/// (`t.Name`, read as `t` AND `Name`) ARE collected, since they are genuine
+/// value reads — a struct field access is exactly the same shape as a
+/// method call's receiver, just without the trailing `()`.
+fn collect_value_refs(node: &tree_sitter::Node, source: &[u8], out: &mut Vec<ValueReference>) {
     match node.kind() {
         "identifier" => {
             let name = node.utf8_text(source).unwrap_or("");
             if !name.is_empty() && name != "_" {
-                out.push((name.to_string(), crate::adapter::site_from_node(node)));
+                out.push(ValueReference {
+                    name: name.to_string(),
+                    receiver: None,
+                    site: crate::adapter::site_from_node(node),
+                });
             }
         }
-        // `x.Field` reads the operand value `x`; the `.Field` selector itself
-        // is not an independent value read.
+        // A selector's leaf belongs to its receiver, not to a free symbol
+        // with the same spelling. Preserve the operand, including chained
+        // selectors and call/index expressions, for conservative linking.
         "selector_expression" => {
             if let Some(operand) = node.child_by_field_name("operand") {
                 collect_value_refs(&operand, source, out);
+                if let Some(field) = node.child_by_field_name("field") {
+                    let name = field.utf8_text(source).unwrap_or("");
+                    let receiver = operand.utf8_text(source).unwrap_or("");
+                    if !name.is_empty() && !receiver.is_empty() {
+                        out.push(ValueReference {
+                            name: name.to_string(),
+                            receiver: Some(receiver.to_string()),
+                            site: crate::adapter::site_from_node(&field),
+                        });
+                    }
+                }
             }
         }
         // A call in value position contributes its receiver (for `obj.M()`) and
@@ -1958,6 +2347,173 @@ func build() {
             refs.iter().filter(|(_, dst)| *dst == "handler").count(),
             1,
             "handler should be referenced exactly once, found: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn struct_field_is_a_first_class_entity() {
+        let adapter = GoAdapter;
+        let source = br#"
+package task
+
+type Task struct {
+    Name string
+    X, Y int
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("task.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let fields: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Field)
+            .collect();
+        let name_field = fields
+            .iter()
+            .find(|e| e.name == "Task.Name")
+            .unwrap_or_else(|| panic!("Task.Name must be a Field entity, got: {fields:?}"));
+        assert_eq!(name_field.visibility, Visibility::Public);
+        assert_eq!(name_field.signature, "Name string");
+        assert!(
+            name_field.span.start_line > 0,
+            "the field's span must point at its declaration line"
+        );
+
+        // A field_declaration naming several fields off one type (`X, Y int`)
+        // mints one entity per name, not one entity for the whole line.
+        assert!(
+            fields.iter().any(|e| e.name == "Task.X"),
+            "Task.X must be a Field entity, got: {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|e| e.name == "Task.Y"),
+            "Task.Y must be a Field entity, got: {fields:?}"
+        );
+
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .collect();
+        assert!(
+            contains
+                .iter()
+                .any(|r| r.src_name == "Task" && r.dst_name == "Task.Name"),
+            "Task should contain Task.Name, found: {contains:?}"
+        );
+    }
+
+    #[test]
+    fn embedded_field_is_not_minted_as_a_field_entity() {
+        // An embedded field (a type with no name of its own) already produces
+        // an Extends relation; it must not also become a Field entity named
+        // after the embedder, which would misrepresent it as a member Task
+        // itself declares.
+        let adapter = GoAdapter;
+        let source = br#"
+package task
+
+type Base struct {
+    ID string
+}
+
+type Task struct {
+    Base
+    Name string
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("task.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let fields: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Field)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            fields.contains(&"Task.Name"),
+            "the real field must still be minted, found: {fields:?}"
+        );
+        assert!(
+            !fields.contains(&"Task.Base"),
+            "an embedded type must not be minted as a field entity, found: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn struct_field_reads_and_writes_emit_references_with_sites() {
+        // A field read as a call argument in one function and written by
+        // assignment in another. Both must produce a `References` edge to the
+        // bare field name (the linker resolves it to `Task.Name`, mirroring
+        // how a bare method name resolves to `Owner.Method`), each carrying
+        // the line the access is written on.
+        let adapter = GoAdapter;
+        let source = br#"
+package task
+
+import "fmt"
+
+type Task struct {
+    Name string
+}
+
+func describe(t Task) {
+    fmt.Println(t.Name)
+}
+
+func rename(t *Task, next string) {
+    t.Name = next
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("task.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+
+        assert!(
+            refs.contains(&("describe", "Name")),
+            "the argument read t.Name must reference the bare field name, found: {refs:?}"
+        );
+        assert!(
+            refs.contains(&("rename", "Name")),
+            "the assignment target t.Name must reference the bare field name, found: {refs:?}"
+        );
+
+        let read_line = source
+            .split(|&b| b == b'\n')
+            .position(|line| line.ends_with(b"fmt.Println(t.Name)"))
+            .expect("the read line exists in the fixture");
+        let write_line = source
+            .split(|&b| b == b'\n')
+            .position(|line| line.ends_with(b"t.Name = next"))
+            .expect("the write line exists in the fixture");
+
+        let name_sites: Vec<u32> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::References && r.dst_name == "Name")
+            .filter_map(|r| r.site.as_ref())
+            .map(|site| site.start_line)
+            .collect();
+        assert!(
+            name_sites.contains(&(read_line as u32)),
+            "the read site must carry the line t.Name is read on, found: {name_sites:?}"
+        );
+        assert!(
+            name_sites.contains(&(write_line as u32)),
+            "the write site must carry the line t.Name is written on, found: {name_sites:?}"
+        );
+
+        // The receiver `t` is a genuine value read in both cases too — a
+        // struct field access reads its receiver the same way a method call
+        // does.
+        assert!(
+            refs.contains(&("describe", "t")) || refs.contains(&("rename", "t")),
+            "the receiver `t` should also be read, found: {refs:?}"
         );
     }
 }

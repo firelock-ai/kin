@@ -46,11 +46,12 @@ use crate::storage::authority::{
 #[cfg(test)]
 use crate::storage::backend::load_recovered_repository_authority;
 use crate::storage::backend::{
-    load_recovered_repository_authority_streaming, validate_source_blob_size,
-    verify_source_blob_digest, AuthorityPayloadStats, DurableAuthorityIdentity, Generation,
-    LocalAuthorityFreezeLock, LocalFileBackend, PreparedWorkspaceGraphArtifact, RecoveredSnapshot,
-    SnapshotCursor, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
-    StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
+    load_recovered_repository_authority_streaming, try_reopen_repository_authority_streaming,
+    validate_source_blob_size, verify_source_blob_digest, AuthorityPayloadStats,
+    DurableAuthorityIdentity, Generation, LocalAuthorityFreezeLock, LocalFileBackend,
+    PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotCursor, SnapshotSaveOutcome,
+    SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch,
+    MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::canonical_hash::canonical_hash_into;
 use crate::storage::change_map::ChangeMap;
@@ -2863,7 +2864,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 .clone()
                 .filter(|identity| identity.head_generation() == recovered.recovered.generation)
         });
-        let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
+        let (mut snapshot, backend_cursor) = if let Some(recovered) = recovered {
             let recovered = recovered.recovered;
             // Recovery already refused an incremental graph delta over an
             // authority base and applied every acknowledged authority frame.
@@ -2906,6 +2907,60 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             )?);
             (snapshot, SnapshotCursor::INITIAL)
         };
+
+        // A retained handle inside `snapshot.changes`'s on-disk base can only
+        // be recovered by reopening this history fresh: a superseding
+        // snapshot is a whole new file, so a record's byte range in it bears
+        // no relation to that record's range in whatever file the failing
+        // handle was opened from, and only a fresh index over fresh bytes can
+        // be trusted to name the fresh range correctly. Wire that recovery in
+        // now, while this open still uniquely owns the change map it just
+        // built: `install_stale_handle_recovery` mutates the encoded base in
+        // place and does nothing once this map has been shared, so it must
+        // run here and not after `RepositoryAuthorityState` wraps `snapshot`
+        // in the `Arc` every reader clones from.
+        let physical_generation = backend_cursor.backend_generation();
+        let logical_generation = snapshot
+            .repository_authority
+            .as_ref()
+            .map(|authority| authority.roots.generation)
+            .unwrap_or(physical_generation);
+        let reopen_backend = Arc::clone(&backend);
+        let reopen_repository_id = repository_id.clone();
+        let reopen: crate::storage::change_map::HistoryReopen = Arc::new(move || {
+            let recovered = try_reopen_repository_authority_streaming(
+                reopen_backend.as_ref(),
+                reopen_repository_id.as_str(),
+                HISTORY_VALIDATION_VERSION,
+            )?
+            .ok_or_else(|| {
+                storage(format!(
+                    "repository {reopen_repository_id} has no persisted authority to reopen \
+                     its history from"
+                ))
+            })?
+            .recovered;
+            let physical_generation = recovered.generation;
+            let logical_generation = recovered
+                .snapshot
+                .repository_authority
+                .as_ref()
+                .map(|authority| authority.roots.generation)
+                .unwrap_or(physical_generation);
+            Ok(crate::storage::change_map::ReopenedHistory {
+                changes: recovered.snapshot.changes,
+                physical_generation,
+                logical_generation,
+            })
+        });
+        // `false` means this open's change map has no on-disk base to protect
+        // (generation zero, constructed in memory above), which is normal and
+        // leaves nothing for a stale handle to happen to.
+        let _ = snapshot.changes.install_stale_handle_recovery(
+            reopen,
+            physical_generation,
+            logical_generation,
+        );
 
         // Recovery either performed storage admission itself or proved that
         // these exact, journal-free bytes already passed this validator
@@ -22369,6 +22424,75 @@ mod tests {
                 history_replays: after.history_replays - before.history_replays,
                 body_sweeps: after.body_sweeps - before.body_sweeps,
             }
+        }
+    }
+
+    #[test]
+    fn history_recovery_under_a_freeze_is_bounded() {
+        const CHILD_ROOT: &str = "KIN_DB_FROZEN_RECOVERY_CHILD";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let directory = tempfile::tempdir_in(&root).unwrap();
+            let backend = committed_local_repository(&directory);
+            let manager = reopen(&directory);
+            let authority = manager.read_authority();
+            let changes = &authority.snapshot().changes;
+            assert!(changes.has_admitted_encoded_base());
+            let id = changes.change_ids().unwrap()[0];
+            let expected = changes.read_change(&id).unwrap().unwrap();
+            let frozen = manager.freeze_current_authority(authority.roots()).unwrap();
+            assert!(backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap());
+            assert!(changes.shares_storage(&frozen.authority().snapshot().changes));
+            changes.fail_retained_reads_for_test();
+            std::fs::write(
+                std::path::Path::new(&root).join("reading-frozen-history"),
+                b"ready",
+            )
+            .unwrap();
+            let error = frozen
+                .authority()
+                .snapshot()
+                .changes
+                .read_change(&id)
+                .expect_err("a busy recovery lock must refuse without blocking the holder");
+            assert!(error.to_string().contains("busy"), "{error}");
+            drop(frozen);
+            assert_eq!(changes.read_change(&id).unwrap(), Some(expected));
+            assert!(!backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap());
+            return;
+        }
+
+        // A regressed lock acquisition is killed and reaped with its fixture
+        // contained in the parent's TempDir; no blocked thread or lock survives.
+        let directory = TempDir::new().unwrap();
+        let name = format!(
+            "{}::history_recovery_under_a_freeze_is_bounded",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD_ROOT, directory.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "recovery child failed: {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                assert!(
+                    directory.path().join("reading-frozen-history").exists(),
+                    "child did not reach the frozen read"
+                );
+                panic!("retained history recovery blocked under a held freeze; child reaped");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 

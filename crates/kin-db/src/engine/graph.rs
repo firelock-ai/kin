@@ -8375,6 +8375,19 @@ impl EntityStore for InMemoryGraph {
         Ok(results)
     }
 
+    fn text_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(kin_model::RetrievalKey, f32)>, KinDbError> {
+        // Fully qualified so this reaches the inherent method below rather than
+        // recursing into this trait method: an inherent method and a trait
+        // method of the same name both named `text_search` on the same type is
+        // legal and Rust prefers the inherent one on a plain `self.text_search`
+        // call, but spelling it out removes any doubt for a reader.
+        InMemoryGraph::text_search(self, query, limit)
+    }
+
     fn list_all_entities(&self) -> Result<Vec<Entity>, KinDbError> {
         Ok(self
             .entities

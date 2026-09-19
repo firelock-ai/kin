@@ -152,13 +152,17 @@ impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
         id: &EntityId,
         kinds: &[RelationKind],
     ) -> Result<Vec<Relation>, ReviewError> {
-        self.0.get_relations(id, kinds).map_err(ReviewError::graph)
+        let mut relations = self
+            .0
+            .get_relations(id, kinds)
+            .map_err(ReviewError::graph)?;
+        kin_index::relation_read::project_relations_for_read(self.0, &mut relations)
+            .map_err(ReviewError::graph)?;
+        Ok(relations)
     }
 
     fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, ReviewError> {
-        self.0
-            .get_all_relations_for_entity(id)
-            .map_err(ReviewError::graph)
+        kin_index::relation_read::relations_for_read(self.0, id).map_err(ReviewError::graph)
     }
 
     fn get_downstream_impact(
@@ -648,7 +652,10 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 let is_derived = consumer_is_derived(&entity);
                 // Only a real consumer surface counts as a migrated consumer;
                 // a co-updated test or regenerated copy was never a break.
-                if !is_test && !is_derived {
+                if !is_test
+                    && !is_derived
+                    && !kin_index::resolution::is_derived_member_candidate(rel)
+                {
                     ent_migrated.insert(affected_id);
                 }
                 continue;
@@ -677,7 +684,9 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 if RelationResolution::of(&rel).is_proven() {
                     ent_proven_consumers.insert(affected_id);
                 }
-                if rel.kind == RelationKind::ConsumesContract {
+                if rel.kind == RelationKind::ConsumesContract
+                    && !kin_index::resolution::is_derived_member_candidate(rel)
+                {
                     ent_contract_consumers.insert(affected_id);
                 }
                 if let Some(file) = entity_file(&entity) {
@@ -900,7 +909,9 @@ fn entity_file(entity: &Entity) -> Option<String> {
 /// counted one it was not already), and `role` is not part of entity identity,
 /// so this changes no persisted state.
 fn consumer_is_derived(entity: &Entity) -> bool {
-    if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored) {
+    if kin_model::is_derived_member(entity)
+        || matches!(entity.role, EntityRole::Generated | EntityRole::Vendored)
+    {
         return true;
     }
     entity_file(entity)
@@ -971,6 +982,50 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    #[test]
+    fn derived_member_live_impact_does_not_count_proven_or_strong_consumers() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut target = entity_in_file("app.get", "members.js", 1);
+        target.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        let caller = entity_in_file("caller", "caller.js", 1);
+        let ordinary = entity_in_file("ordinary", "ordinary.js", 1);
+        for entity in [&target, &caller, &ordinary] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let mut contract = calls(&caller, &target);
+        contract.kind = RelationKind::ConsumesContract;
+        let mut overrides = calls(&caller, &target);
+        overrides.kind = RelationKind::Overrides;
+        for relation in [
+            calls(&caller, &target),
+            contract,
+            overrides,
+            calls(&caller, &ordinary),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target), modified(&ordinary)],
+            ..Default::default()
+        };
+        let report = analyze_impact(&graph, &diff).unwrap();
+        let candidate = report.entity_impact(&target.id).unwrap();
+        assert_eq!(candidate.proven_consumer_count, 0);
+        assert_eq!(candidate.strong_consumer_count, 0);
+        assert_eq!(candidate.contract_consumer_count, 0);
+        let control = report.entity_impact(&ordinary.id).unwrap();
+        assert_eq!(control.proven_consumer_count, 1);
+        assert_eq!(control.strong_consumer_count, 1);
+        let ranked = crate::ranked_impact::rank_impact(&graph, &target.id, 1).unwrap();
+        assert_eq!(ranked.candidates.len(), 1);
+        let row = &ranked.candidates[0];
+        assert_eq!(row.score_components.confidence_points, 30);
+        assert_eq!(row.path[0].confidence_basis_points, 3000);
+        assert_eq!(row.path[0].resolution, "name_only");
+        assert_ne!(row.path[0].relation_kind, RelationKind::Overrides);
     }
 
     #[test]

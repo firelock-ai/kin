@@ -93,6 +93,7 @@ impl LanguageAdapter for CppAdapter {
         extract_cpp_tests(&root, source, &mut tests);
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,

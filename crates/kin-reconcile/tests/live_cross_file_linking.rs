@@ -614,3 +614,126 @@ fn a_repository_written_one_file_at_a_time_reports_cross_file_relations() {
         "and two artifact Imports edges"
     );
 }
+
+#[test]
+fn derived_member_candidates_and_generator_evidence_survive_live_edit_and_reopen() {
+    use kin_model::derivation::generator_relation_matches;
+    let mut repo = LiveRepo::new();
+    let source =
+        "export const app = {}; for (const key of ['get','post']) { app[key] = () => {}; }";
+    repo.commit("members.js", source);
+    repo.commit(
+        "caller.js",
+        "import { app } from './members'; export function run() { app.get(); }",
+    );
+    let verify = |repo: &LiveRepo| {
+        let id = repo.entity("members.js", "app.get");
+        let member = repo.graph.get_entity(&id).unwrap().unwrap();
+        assert!(member.span.is_none());
+        let artifact = repo
+            .graph
+            .artifact_id_at_path(&RepoPath::from_utf8("members.js").unwrap())
+            .unwrap();
+        let hash = match repo
+            .graph
+            .get_tree_entry(&kin_model::FilePathId::new("members.js"))
+            .unwrap()
+            .unwrap()
+        {
+            TreeEntry::Blob { hash, .. } => hash.to_string(),
+            _ => panic!("blob"),
+        };
+        let edges = repo
+            .graph
+            .traverse(&GraphNodeId::Entity(id), &[], 1)
+            .unwrap()
+            .relations;
+        assert!(
+            edges
+                .iter()
+                .any(|r| generator_relation_matches(&member, r, artifact, &hash)),
+            "{edges:?}"
+        );
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert!(!calls.is_empty(), "candidate remains useful to callers");
+        assert!(calls.iter().all(
+            |r| kin_index::RelationResolution::of(r) == kin_index::RelationResolution::NameOnly
+        ));
+        assert!(kin_model::require_independent_source(&member).is_err());
+        id
+    };
+    let previous = verify(&repo);
+    // Restored graph + fresh linker seed, then caller-only edit.
+    repo.graph = InMemoryGraph::from_snapshot_without_text_index(repo.graph.to_snapshot()).unwrap();
+    repo.reconciler = Reconciler::new(repo.dir.path().to_path_buf());
+    repo.reconciler
+        .seed_cross_file_linker_from_graph(&repo.graph);
+    repo.commit(
+        "caller.js",
+        "import { app } from './members'; export function run() { app.get(); app.post(); }",
+    );
+    verify(&repo);
+    // Generator-only source movement and new RHS; provenance must bind new bytes.
+    repo.commit(
+        "members.js",
+        &format!(
+            "// moved generator\n{}",
+            source.replace("() => {}", "() => 1")
+        ),
+    );
+    verify(&repo);
+    repo.commit(
+        "members.js",
+        "export const app = {}; app.ready = () => true;",
+    );
+    assert!(repo.graph.get_entity(&previous).unwrap().is_none());
+    assert!(!repo
+        .graph
+        .list_all_entities()
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "app.get"));
+}
+
+#[test]
+fn derived_member_file_removal_collects_generator_edges_and_projection_refuses_metadata_stripping()
+{
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "members.js",
+        "export const app={}; for(const key of ['get']) { app[key]=()=>1; }",
+    );
+    let candidate = repo
+        .graph
+        .get_entity(&repo.entity("members.js", "app.get"))
+        .unwrap()
+        .unwrap();
+    let mut stripped = candidate.clone();
+    stripped.metadata.extra.clear();
+    let delta = TransactionDelta {
+        entity_deltas: vec![kin_model::EntityDelta::Modified {
+            old: candidate.clone(),
+            new: stripped,
+        }],
+        ..Default::default()
+    };
+    let error = repo
+        .reconciler
+        .project_transaction_to_files(
+            &delta,
+            &std::collections::HashMap::from([(candidate.id, b"() => 2".to_vec())]),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("generator"), "{error}");
+    repo.remove("members.js");
+    assert!(repo.graph.get_entity(&candidate.id).unwrap().is_none());
+    assert!(repo
+        .graph
+        .traverse(&GraphNodeId::Entity(candidate.id), &[], 1)
+        .unwrap()
+        .relations
+        .is_empty());
+}

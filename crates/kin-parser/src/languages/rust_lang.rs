@@ -114,6 +114,7 @@ impl LanguageAdapter for RustAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,

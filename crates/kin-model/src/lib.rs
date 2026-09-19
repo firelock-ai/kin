@@ -44,6 +44,7 @@ pub mod collaboration;
 pub mod conflict;
 pub mod context;
 pub mod contract;
+pub mod derivation;
 pub mod entity;
 pub mod error;
 pub mod evidence;
@@ -96,6 +97,9 @@ pub use context::{
     WorkItemEntry,
 };
 pub use contract::{Contract, ContractKind};
+pub use derivation::{
+    entity_derivation, is_derived_member, require_independent_source, EntityDerivation,
+};
 pub use entity::{
     Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, ParseState,
     SemanticFingerprint, SourceSpan, Visibility,

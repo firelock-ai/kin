@@ -1440,8 +1440,14 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
     let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, _) = open_authority(&layout);
     pin_native_identity(&layout);
-    fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
-        .expect("hide admitted Git metadata");
+    // Keep the hidden Git database outside the watched working copy. Inside it,
+    // the renamed database is ordinary arriving content and correctly gets
+    // admitted, independently of the Gitlink this fixture is exercising.
+    fs::rename(
+        repo.join(".git"),
+        root.path().join("git-authority-disabled"),
+    )
+    .expect("hide admitted Git metadata");
 
     let add_absent = run_kin(&runtime, &repo, &["branch", "switch", "gitlink-a"]);
     assert!(
@@ -1494,26 +1500,31 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
     );
     assert_workspace_has_no_path(&open_authority(&layout).1, b"vendor/dependency");
 
-    // Let the watcher finish with the events these switches produced before
-    // asking for another one. A switch refuses over a workspace holding content
-    // ahead of its base, and admitting observed host content is what the
-    // watcher now does, so a second switch issued while the loop is still
-    // draining is racing the product rather than testing it.
-    //
-    // The wait is bounded and its failure is specific. If the loop settles and
-    // the workspace is still ahead of its base, that is the one corner this
-    // pairing has: events beneath a graph-only member are dropped against the
-    // tree as it stands when they are drained, so events that outlive the
-    // member's removal are no longer recognised as belonging to an independent
-    // checkout, and the content underneath it is admitted like any other new
-    // file. The message says so rather than leaving a later reader to rediscover
-    // it from a timeout.
+    // A removed Gitlink must leave its independently owned content outside the
+    // workspace however late the watcher observes it. Keep the workspace/base
+    // check as well as the exact path checks, and report actual membership if
+    // another source of pending content makes this bounded wait fail.
     let settled = wait_for_level_workspace(&layout, Duration::from_secs(30));
+    let (_, authority) = open_authority(&layout);
+    let workspace_paths = {
+        let lease = authority.read_authority();
+        lease
+            .metadata()
+            .workspaces
+            .first()
+            .expect("workspace")
+            .tree
+            .artifacts_by_path()
+            .map(|artifact| artifact.path.to_string())
+            .collect::<Vec<_>>()
+    };
     assert!(
         settled,
-        "the workspace never came level with its base. Host content beneath the removed Gitlink \
-         was admitted as ordinary new content, which happens when its watcher events are drained \
-         after the member is gone rather than while it is still there"
+        "workspace remained ahead of its base after Gitlink removal; actual paths: {workspace_paths:?}"
+    );
+    assert!(
+        workspace_paths.iter().all(|path| path != "vendor/dependency" && !path.starts_with("vendor/dependency/")),
+        "removed Gitlink or independent descendants reached workspace authority: {workspace_paths:?}"
     );
 
     let add_retained = run_kin(&runtime, &repo, &["branch", "switch", "gitlink-a"]);

@@ -45,6 +45,7 @@ pub(crate) fn require_source_bases(
             .get_entity(&expected.entity_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("entity {} no longer exists", expected.entity_id))?;
+        kin_model::require_independent_source(&entity)?;
         let span = entity
             .span
             .as_ref()

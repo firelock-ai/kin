@@ -752,6 +752,13 @@ fn build_multi_focal_pack_inner<G: GraphStore>(
     let mut demands = Vec::with_capacity(focals.len());
     let mut exact_demands = Vec::with_capacity(focals.len());
     for entity in &focals {
+        if let Err(reason) = kin_model::require_independent_source(entity) {
+            projections.downgrades.insert(entity.id, reason);
+            demands.push(estimate_tokens(&project_signature_only(entity)));
+            full_bodies.push(None);
+            exact_demands.push(false);
+            continue;
+        }
         if let Some(source) = provider.as_deref_mut() {
             // Probe one candidate at a time. Its allocation is released before
             // the next probe; only costs survive into water filling.

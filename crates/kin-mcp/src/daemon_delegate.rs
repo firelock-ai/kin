@@ -3315,12 +3315,53 @@ mod tests {
     // sockets, so reqwest's own error classification is exercised rather than
     // assumed. No daemon process is ever spawned.
 
-    /// A loopback URL whose port is closed: what an exited daemon leaves behind.
-    async fn exited_daemon_url() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}")
+    /// A real refused-connection endpoint whose port stays owned for the test.
+    /// Dropping a listener and keeping only its URL would let another parallel
+    /// fixture bind that port and answer the request meant to fail.
+    struct RefusingEndpoint {
+        _socket: tokio::net::TcpSocket,
+        url: String,
+    }
+
+    impl RefusingEndpoint {
+        fn new() -> Self {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            // Do not enable address reuse or listen: binding reserves the port,
+            // while the absence of a listener makes actual connections fail.
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let url = format!("http://{}", socket.local_addr().unwrap());
+            Self {
+                _socket: socket,
+                url,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusing_endpoint_keeps_its_port_reserved() {
+        let endpoint = RefusingEndpoint::new();
+        let addr: std::net::SocketAddr = endpoint
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let replacement = tokio::net::TcpListener::bind(addr).await;
+        assert!(
+            replacement.is_err(),
+            "another fixture must not be able to answer at the refusing endpoint"
+        );
+        let err = post_session(&probe_client(), &endpoint.url, Duration::from_secs(3))
+            .await
+            .expect_err("a bound socket without a listener must refuse the request");
+        assert!(
+            matches!(err, DaemonCallError::ConnectionLost(_)),
+            "the reserved endpoint must exercise reqwest's connection-loss class, got {err:?}"
+        );
+        assert!(
+            !daemon_is_provably_alive(&endpoint.url).await,
+            "port ownership alone must not be mistaken for HTTP proof of life"
+        );
     }
 
     /// Minimal HTTP responder answering every request with `200 OK` and `body`.
@@ -3756,13 +3797,13 @@ mod tests {
     /// error and every later one did too, for the life of the agent process.
     #[tokio::test]
     async fn session_forward_survives_daemon_exit_by_reviving() {
-        let dead = exited_daemon_url().await;
+        let dead = RefusingEndpoint::new();
         let (revived, revived_handle) = stub_daemon(r#"{"session_id":"s-1"}"#).await;
         let reviver = FakeReviver::new(Ok(revived.clone()));
         let client = probe_client();
 
         let value: serde_json::Value =
-            attempt_with_revival("session start", &dead, &reviver, |base, patience| {
+            attempt_with_revival("session start", &dead.url, &reviver, |base, patience| {
                 let client = client.clone();
                 async move { post_session(&client, &base, patience).await }
             })
@@ -3801,11 +3842,11 @@ mod tests {
     /// "daemon exited" class rather than a generic delegate failure.
     #[tokio::test]
     async fn unrecoverable_respawn_surfaces_the_daemon_exited_class() {
-        let dead = exited_daemon_url().await;
+        let dead = RefusingEndpoint::new();
         let reviver = FakeReviver::new(Err("kin-daemon binary not found".to_string()));
         let client = probe_client();
 
-        let err = attempt_with_revival("session start", &dead, &reviver, |base, patience| {
+        let err = attempt_with_revival("session start", &dead.url, &reviver, |base, patience| {
             let client = client.clone();
             async move { post_session(&client, &base, patience).await }
         })
@@ -5306,26 +5347,20 @@ mod tests {
 
     /// FALSIFICATION, "a dead daemon is still recovered" direction.
     ///
-    /// A real daemon is killed — its listener is dropped, so the port refuses
-    /// connections exactly as an exited daemon's does — and the very next
-    /// forward must revive and succeed. Patience must not have cost the client
-    /// its recovery.
+    /// A real refused connection exercises the bounded patience ladder's
+    /// recovery path. This is a transport fixture, not an OS-daemon lifecycle
+    /// test; the healthy-socket control separately verifies direct success.
     #[tokio::test]
-    async fn a_proven_dead_daemon_is_still_revived_after_the_patience_change() {
-        let (dying, dying_handle) = stub_daemon(r#"{"session_id":"s-doomed"}"#).await;
+    async fn a_refusing_endpoint_is_still_revived_after_the_patience_change() {
+        let dead = RefusingEndpoint::new();
         let client = probe_client();
-        post_session(&client, &dying, Duration::from_secs(3))
-            .await
-            .expect("the daemon must be genuinely alive before it is killed");
-        dying_handle.abort();
-        await_refused(&dying).await;
 
         let (revived, revived_handle) = stub_daemon(r#"{"session_id":"s-revived"}"#).await;
         let reviver = FakeReviver::new(Ok(revived.clone()));
 
         let value: serde_json::Value = attempt_with_revival_within(
             "session start",
-            &dying,
+            &dead.url,
             &reviver,
             |base, patience| {
                 let client = client.clone();
@@ -5335,7 +5370,7 @@ mod tests {
             Duration::from_secs(10),
         )
         .await
-        .expect("a genuinely dead daemon must still be revived");
+        .expect("a refusing endpoint without proof of life must still be revived");
 
         assert_eq!(
             value["session_id"], "s-revived",
@@ -5351,13 +5386,13 @@ mod tests {
     /// told what is actually true rather than that the daemon exited.
     #[tokio::test]
     async fn a_daemon_proven_alive_is_never_replaced_by_a_doomed_respawn() {
-        let unreachable = exited_daemon_url().await;
-        let reviver = FakeReviver::with_a_live_daemon(Ok("http://127.0.0.1:1".to_string()));
+        let unreachable = RefusingEndpoint::new();
+        let reviver = FakeReviver::with_a_live_daemon(Err("revival must not run".to_string()));
         let client = probe_client();
 
         let err = attempt_with_revival_within::<serde_json::Value, _, _>(
             "session start",
-            &unreachable,
+            &unreachable.url,
             &reviver,
             |base, patience| {
                 let client = client.clone();
@@ -5416,23 +5451,6 @@ mod tests {
             "a daemon that answered 503 daemon_opening is listening, so it is alive"
         );
         handle.abort();
-    }
-
-    /// Block until nothing is listening at `base`, so a test that killed a stub
-    /// is asserting against a genuinely closed port rather than racing the
-    /// listener's teardown.
-    async fn await_refused(base: &str) {
-        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
-        for _ in 0..200 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the killed stub daemon never stopped accepting connections on {base}");
     }
 
     /// Serves `warming` warming refusals, then `body` with 200, per connection
@@ -5560,7 +5578,8 @@ mod tests {
             "an established connection with no reply is a timeout, got {slow:?}"
         );
 
-        let closed = post_session(&client, &exited_daemon_url().await, Duration::from_secs(3))
+        let endpoint = RefusingEndpoint::new();
+        let closed = post_session(&client, &endpoint.url, Duration::from_secs(3))
             .await
             .expect_err("a closed port must not answer");
         assert!(
@@ -5582,8 +5601,9 @@ mod tests {
         );
         handle.abort();
 
+        let endpoint = RefusingEndpoint::new();
         assert!(
-            !daemon_is_provably_alive(&exited_daemon_url().await).await,
+            !daemon_is_provably_alive(&endpoint.url).await,
             "a closed port offers no proof of life"
         );
     }

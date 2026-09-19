@@ -847,6 +847,9 @@ fn render_entity_source(
     max_lines: usize,
     max_chars: usize,
 ) -> Result<Option<String>> {
+    if kin_model::is_derived_member(entity) {
+        return Ok(None);
+    }
     let Some(span) = entity.span.as_ref() else {
         return Ok(None);
     };
@@ -1449,6 +1452,22 @@ mod tests {
         assert_eq!(
             response.entities[0].file, "src/buffer.c",
             "the definition must be ranked first, not the header's declaration"
+        );
+    }
+
+    #[test]
+    fn derived_member_trace_never_reads_a_legacy_span_as_a_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(temp.path().to_path_buf());
+        let binding = absent_binding(&layout);
+        let mut entity = buffer_grow_twin("members.js", "app.get()", 0);
+        entity.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        let graph = InMemoryGraph::new();
+        assert!(
+            super::render_entity_source(&binding, &graph, &entity, 20, 2400)
+                .unwrap()
+                .is_none()
         );
     }
 

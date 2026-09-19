@@ -1080,7 +1080,7 @@ pub(crate) fn collect_graph_references(
     let mut edges_by_caller: HashMap<EntityId, Vec<kin_model::relation::Relation>> = HashMap::new();
     let mut matched_kinds = Vec::new();
 
-    for rel in graph.get_all_relations_for_entity(entity_id)? {
+    for rel in kin_index::relation_read::relations_for_read(graph, entity_id)? {
         if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
             continue;
         }

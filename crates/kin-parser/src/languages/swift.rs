@@ -99,6 +99,7 @@ impl LanguageAdapter for SwiftAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,

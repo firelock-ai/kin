@@ -2394,6 +2394,21 @@ pub(crate) fn load_recovered_repository_authority_streaming<B: StorageBackend + 
     )
 }
 
+/// Reopen a failed retained history handle without waiting for a lock the
+/// caller may already hold through an authority freeze.
+pub(crate) fn try_reopen_repository_authority_streaming<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+    expected_validator_version: u32,
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
+    recover_loaded_snapshot(
+        backend.try_load_recovery_state(repo_id)?,
+        repo_id,
+        Some(expected_validator_version),
+        HistoryDecode::Streamed(&mut |_change| Ok(())),
+    )
+}
+
 /// How recovery decodes a base, independently of complete-validation reuse.
 pub(crate) enum HistoryDecode<'v> {
     /// The whole body, change map included, as every open did before
@@ -2411,7 +2426,21 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
     expected_validator_version: Option<u32>,
     history: HistoryDecode<'_>,
 ) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
-    let (loaded, raw_deltas) = backend.load_recovery_state(repo_id)?;
+    recover_loaded_snapshot(
+        backend.load_recovery_state(repo_id)?,
+        repo_id,
+        expected_validator_version,
+        history,
+    )
+}
+
+fn recover_loaded_snapshot(
+    state: SnapshotRecoveryState,
+    repo_id: &str,
+    expected_validator_version: Option<u32>,
+    history: HistoryDecode<'_>,
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
+    let (loaded, raw_deltas) = state;
 
     let Some(authority) = loaded else {
         if raw_deltas.is_empty() {
@@ -3126,6 +3155,15 @@ pub trait StorageBackend: Send + Sync {
             .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
         let deltas = self.load_deltas_since(repo_id, since)?;
         Ok((authority, deltas))
+    }
+
+    /// Read a coherent recovery view without waiting for an authority lock.
+    /// Retained-history readers may themselves hold a freeze. Backends must
+    /// opt into a nonblocking implementation rather than inherit a lock cycle.
+    fn try_load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+        Err(KinDbError::StorageError(format!(
+            "repo {repo_id}: nonblocking history recovery is unsupported by this backend"
+        )))
     }
 
     /// Load a repo's graph snapshot.
@@ -6144,6 +6182,49 @@ impl LocalFileBackend {
         })
     }
 
+    fn load_recovery_state_under_lock(
+        &self,
+        repo_id: &str,
+        lock: &LocalRepositoryLock,
+    ) -> Result<SnapshotRecoveryState, KinDbError> {
+        let authority = self.load_authority_unlocked(&lock.namespace)?;
+        let authority_record = self.read_authority_record_raw_unlocked(&lock.namespace)?;
+        match (authority.as_ref(), authority_record.as_ref()) {
+            (Some(authority), Some(record))
+                if authority.snapshot_generation == record.snapshot_generation
+                    && authority.head_generation == record.head_generation
+                    && Self::snapshot_digest(&authority.snapshot_bytes)
+                        == record.snapshot_sha256 => {}
+            (None, None) => {}
+            _ => {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} snapshot authority changed while loading recovery state"
+                )));
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.recovery_after_authority_hook.lock().take() {
+            hook();
+        }
+        if let Some(record) = authority_record.as_ref() {
+            self.finalize_retired_quarantines_unlocked(&lock.namespace, record)?;
+        }
+        let all_deltas = self.load_deltas_since_unlocked(&lock.namespace, GENERATION_INIT)?;
+        if let Some(record) = authority_record.as_ref() {
+            Self::validate_loaded_residual_deltas(repo_id, record, &all_deltas)?;
+            Self::validate_loaded_acknowledged_deltas(repo_id, record, &all_deltas)?;
+        }
+        let since = authority
+            .as_ref()
+            .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
+        let deltas = all_deltas
+            .into_iter()
+            .filter(|(_, generation)| *generation > since)
+            .collect();
+        self.confirm_repository_visible(&lock.namespace)?;
+        Ok((authority, deltas))
+    }
+
     fn acquire_existing_lock(&self, repo_id: &str) -> Result<LocalRepositoryLock, KinDbError> {
         self.acquire_existing_lock_with_access(repo_id, LocalRepositoryLockAccess::Exclusive)
     }
@@ -6166,6 +6247,15 @@ impl LocalFileBackend {
         &self,
         repo_id: &str,
         access: LocalRepositoryLockAccess,
+    ) -> Result<LocalRepositoryLock, KinDbError> {
+        self.acquire_existing_lock_with_policy(repo_id, access, false)
+    }
+
+    fn acquire_existing_lock_with_policy(
+        &self,
+        repo_id: &str,
+        access: LocalRepositoryLockAccess,
+        nonblocking: bool,
     ) -> Result<LocalRepositoryLock, KinDbError> {
         let namespace = self
             .repository_capability(repo_id, false)?
@@ -6200,11 +6290,24 @@ impl LocalFileBackend {
         // methods that shadow this trait's, so an unqualified call would take
         // one lock through `std` and its exclusive counterpart, which `std`
         // does not provide under that name, through `fs2`.
-        let acquired = match access {
-            LocalRepositoryLockAccess::Exclusive => fs2::FileExt::lock_exclusive(&lock_target),
-            LocalRepositoryLockAccess::Shared => fs2::FileExt::lock_shared(&lock_target),
+        let acquired = match (access, nonblocking) {
+            (LocalRepositoryLockAccess::Exclusive, false) => {
+                fs2::FileExt::lock_exclusive(&lock_target)
+            }
+            (LocalRepositoryLockAccess::Shared, false) => fs2::FileExt::lock_shared(&lock_target),
+            (LocalRepositoryLockAccess::Exclusive, true) => {
+                fs2::FileExt::try_lock_exclusive(&lock_target)
+            }
+            (LocalRepositoryLockAccess::Shared, true) => {
+                fs2::FileExt::try_lock_shared(&lock_target)
+            }
         };
         acquired.map_err(|error| {
+            if nonblocking && error.kind() == fs2::lock_contended_error().kind() {
+                return KinDbError::StorageError(format!(
+                    "repo {repo_id}: authority lock is busy during retained history recovery"
+                ));
+            }
             KinDbError::StorageError(format!(
                 "failed to acquire existing local repository authority lock {}: {error}",
                 lock_path.display()
@@ -8618,42 +8721,19 @@ impl StorageBackend for LocalFileBackend {
         // Exclusive: this finalizes retired quarantines directly as well as
         // through the authority load.
         let lock = self.acquire_existing_lock(repo_id)?;
-        let authority = self.load_authority_unlocked(&lock.namespace)?;
-        let authority_record = self.read_authority_record_raw_unlocked(&lock.namespace)?;
-        match (authority.as_ref(), authority_record.as_ref()) {
-            (Some(authority), Some(record))
-                if authority.snapshot_generation == record.snapshot_generation
-                    && authority.head_generation == record.head_generation
-                    && Self::snapshot_digest(&authority.snapshot_bytes)
-                        == record.snapshot_sha256 => {}
-            (None, None) => {}
-            _ => {
-                return Err(KinDbError::StorageError(format!(
-                    "repo {repo_id} snapshot authority changed while loading recovery state"
-                )));
-            }
+        self.load_recovery_state_under_lock(repo_id, &lock)
+    }
+
+    fn try_load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok((None, Vec::new()));
         }
-        #[cfg(test)]
-        if let Some(hook) = self.recovery_after_authority_hook.lock().take() {
-            hook();
-        }
-        if let Some(record) = authority_record.as_ref() {
-            self.finalize_retired_quarantines_unlocked(&lock.namespace, record)?;
-        }
-        let all_deltas = self.load_deltas_since_unlocked(&lock.namespace, GENERATION_INIT)?;
-        if let Some(record) = authority_record.as_ref() {
-            Self::validate_loaded_residual_deltas(repo_id, record, &all_deltas)?;
-            Self::validate_loaded_acknowledged_deltas(repo_id, record, &all_deltas)?;
-        }
-        let since = authority
-            .as_ref()
-            .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
-        let deltas = all_deltas
-            .into_iter()
-            .filter(|(_, generation)| *generation > since)
-            .collect();
-        self.confirm_repository_visible(&lock.namespace)?;
-        Ok((authority, deltas))
+        let lock = self.acquire_existing_lock_with_policy(
+            repo_id,
+            LocalRepositoryLockAccess::Exclusive,
+            true,
+        )?;
+        self.load_recovery_state_under_lock(repo_id, &lock)
     }
 
     fn save_snapshot(

@@ -1151,7 +1151,9 @@ fn observe_language<S: EntityStore>(
                         break;
                     }
                     examined += 1;
-                    let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
+                    let Ok(relations) =
+                        kin_index::relation_read::relations_for_read(store, &entity.id)
+                    else {
                         continue;
                     };
                     for relation in relations {
@@ -1173,6 +1175,11 @@ fn observe_language<S: EntityStore>(
                         };
                         if !seen_any.contains(&relation.kind) {
                             seen_any.push(relation.kind);
+                        }
+                        // A derived candidate can disclose a producible class, but
+                        // cannot witness a resolved cross-file destination.
+                        if kin_index::resolution::is_derived_member_candidate(&relation) {
+                            continue;
                         }
                         let source_file = endpoint_file(store, &files, &source);
                         let destination_file = endpoint_file(store, &files, &destination);
@@ -1353,7 +1360,7 @@ pub fn language_has_a_proven_cross_file_reference<S: EntityStore>(
         if examined >= WITNESS_BUDGET {
             break;
         }
-        let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
+        let Ok(relations) = kin_index::relation_read::relations_for_read(store, &entity.id) else {
             continue;
         };
         for relation in relations {

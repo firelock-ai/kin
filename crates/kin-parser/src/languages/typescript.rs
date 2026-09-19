@@ -184,6 +184,7 @@ pub(super) fn extract_typescript_tree(
     }
 
     Ok(ParseOutput {
+        derived_members: Vec::new(),
         entities,
         relations,
         imports,

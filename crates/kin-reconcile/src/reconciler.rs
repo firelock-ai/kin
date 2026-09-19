@@ -35,6 +35,31 @@ fn is_parser_derived(relation: &Relation) -> bool {
     )
 }
 
+/// Both inputs describe this pass's fresh source, so match occurrences rather
+/// than summing the two resolvers' counts or reviving old graph evidence.
+fn incorporate_dispatch_evidence(parsed_relation: &mut Relation, informed: &Relation) {
+    parsed_relation.confidence = informed.confidence;
+    parsed_relation.origin = informed.origin;
+    for record in &informed.evidence {
+        let corresponding = parsed_relation.evidence.iter_mut().find(|parsed| {
+            parsed.source_span == record.source_span
+                && parsed.call_shape == record.call_shape
+                && parsed.parser_rule == record.parser_rule
+                && parsed.source_path == record.source_path
+                && parsed.resolved_path == record.resolved_path
+                && parsed.occurrence_count == record.occurrence_count
+                && (parsed.token == record.token
+                    || record.token.as_deref()
+                        == Some(kin_index::SELF_DISPATCH_OVERRIDE_EVIDENCE_V1))
+        });
+        if let Some(parsed) = corresponding {
+            *parsed = record.clone();
+        } else {
+            parsed_relation.evidence.push(record.clone());
+        }
+    }
+}
+
 /// The existing relation a freshly derived parser edge keeps the identity of.
 ///
 /// One logical edge can be held twice under one `(src, dst, kind)` key with two
@@ -1000,6 +1025,11 @@ impl Reconciler {
             &indexed.imports,
             kin_model::ParseCompleteness::from_parse_state(&indexed.parse_state),
         );
+        if let Some(error) = &cross_file.failure {
+            return Err(ReconcileError::Graph(format!(
+                "cross-file resolution unavailable: {error}"
+            )));
+        }
 
         // Collect existing relations for all entities in this file.
         type RelationKey = (GraphNodeId, GraphNodeId, RelationKind);
@@ -1033,6 +1063,17 @@ impl Reconciler {
         // identity check below and the removal collection further down.
         let mut held_relations: HashMap<GraphNodeId, HashMap<RelationId, Relation>> =
             HashMap::new();
+        // The live linker sees override facts the intra-file resolver cannot.
+        // Fold its qualification into the fresh occurrences before choosing
+        // a retained graph identity or staging any delta. Neither resolver
+        // may erase a fresh site only the other resolver represented.
+        let dispatch_calls: HashMap<_, _> = cross_file
+            .resolved
+            .iter()
+            .chain(&cross_file.same_file)
+            .filter(|relation| kin_index::is_self_dispatch_candidate(relation))
+            .map(|relation| ((relation.src, relation.dst, relation.kind), relation))
+            .collect();
         for relation in &indexed.relations {
             // Remap src/dst to stable IDs if they were matched to existing entities.
             let stable_src = relation
@@ -1058,6 +1099,9 @@ impl Reconciler {
             let mut stable_relation = relation.clone();
             stable_relation.src = stable_src;
             stable_relation.dst = stable_dst;
+            if let Some(informed) = dispatch_calls.get(&key) {
+                incorporate_dispatch_evidence(&mut stable_relation, informed);
+            }
 
             if let Some(old) = parser_identity_to_keep(existing_relations.get(&key)) {
                 matched_relation_ids.insert(old.id);
@@ -1152,6 +1196,43 @@ impl Reconciler {
                     .into_iter()
                     .all(|node| match node {
                         GraphNodeId::Entity(id) => admits_entity(id),
+                        GraphNodeId::Artifact(id) if relation.kind == RelationKind::DerivedFrom => {
+                            let entity = relation.src.as_entity().and_then(|source| {
+                                stable_entities
+                                    .iter()
+                                    .find(|e| e.id == source)
+                                    .cloned()
+                                    .or_else(|| graph.get_entity(&source).ok().flatten())
+                            });
+                            entity.is_some_and(|entity| {
+                                kin_model::entity_derivation(&entity)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|derivation| {
+                                        let admitted = kin_model::RepoPath::from_utf8(
+                                            derivation.generator.file.0.clone(),
+                                        )
+                                        .ok()
+                                        .and_then(|path| graph.artifact_id_at_path(&path));
+                                        let hash = graph
+                                            .get_tree_entry(&derivation.generator.file)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|entry| match entry {
+                                                kin_model::TreeEntry::Blob { hash, .. } => {
+                                                    Some(hash.to_string())
+                                                }
+                                                _ => None,
+                                            });
+                                        admitted == Some(id)
+                                            && hash.is_some_and(|hash| {
+                                                kin_model::derivation::generator_relation_matches(
+                                                    &entity, relation, id, &hash,
+                                                )
+                                            })
+                                    })
+                            })
+                        }
                         _ => false,
                     });
             if !endpoints_admitted {
@@ -1710,6 +1791,23 @@ impl Reconciler {
             {
                 relations.insert(relation.id, relation);
             }
+            if kin_model::is_derived_member(entity) {
+                for relation in graph
+                    .traverse(
+                        &GraphNodeId::Entity(entity.id),
+                        &[RelationKind::DerivedFrom],
+                        1,
+                    )
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                    .relations
+                {
+                    if relation.src == GraphNodeId::Entity(entity.id)
+                        || relation.dst == GraphNodeId::Entity(entity.id)
+                    {
+                        relations.insert(relation.id, relation);
+                    }
+                }
+            }
             self.lkg.remove(&entity.id);
             removed.push(entity.id);
         }
@@ -1764,6 +1862,17 @@ impl Reconciler {
         kin_model::validate_transaction_delta(delta)
             .map_err(|error| ReconcileError::InvalidTransaction(error.to_string()))?;
 
+        for entity_delta in &delta.entity_deltas {
+            if let EntityDelta::Modified { old, .. } = entity_delta {
+                kin_model::require_independent_source(old).map_err(|reason| {
+                    ReconcileError::BodyExtractionFailed {
+                        entity_id: old.id,
+                        reason,
+                    }
+                })?;
+            }
+        }
+
         let modified_entities: HashMap<EntityId, &Entity> = delta
             .entity_deltas
             .iter()
@@ -1806,6 +1915,12 @@ impl Reconciler {
         // and corrupt body extraction.
         let mut mutations: HashMap<EntityId, Vec<u8>> = HashMap::new();
         for (id, entity) in modified_entities {
+            kin_model::require_independent_source(&entity).map_err(|reason| {
+                ReconcileError::BodyExtractionFailed {
+                    entity_id: id,
+                    reason,
+                }
+            })?;
             // Prefer an explicitly supplied entity body. This turns a graph
             // mutation into a real file edit. Fall back to exact span extraction
             // only for metadata-only modifications.
@@ -2821,6 +2936,64 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+    }
+
+    #[test]
+    fn dispatch_fold_preserves_fresh_direct_sites_shapes_counts_and_relation_identity() {
+        use kin_model::{CallArgShape, RelationEvidence, RelationOrigin, SourceSpan};
+        let record = |line, positional| RelationEvidence {
+            source_span: Some(SourceSpan {
+                file: FilePathId::new("base.py"),
+                start_byte: line as usize * 10,
+                end_byte: line as usize * 10 + 8,
+                start_line: line,
+                end_line: line,
+                start_col: 0,
+                end_col: 8,
+            }),
+            parser_rule: Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
+            call_shape: Some(CallArgShape::new(positional, vec![], false, false)),
+            ..RelationEvidence::default()
+        };
+        let mut parsed = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(EntityId::new()),
+            dst: GraphNodeId::Entity(EntityId::new()),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![record(4, 1), record(5, 2)],
+        };
+        let id = parsed.id;
+        let direct = parsed.evidence[1].clone();
+        let mut informed = parsed.clone();
+        informed.id = RelationId::new();
+        informed.confidence = 0.86;
+        informed.origin = RelationOrigin::Inferred;
+        informed.evidence.truncate(1);
+        informed.evidence[0].token =
+            Some(kin_index::SELF_DISPATCH_OVERRIDE_EVIDENCE_V1.to_string());
+        let mut additional = record(6, 3);
+        additional.token = Some(kin_index::SELF_DISPATCH_OVERRIDE_EVIDENCE_V1.to_string());
+        informed.evidence.push(additional);
+        incorporate_dispatch_evidence(&mut parsed, &informed);
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.confidence, 0.86);
+        assert_eq!(parsed.evidence.len(), 3);
+        assert_eq!(parsed.evidence[0], informed.evidence[0]);
+        assert_eq!(
+            parsed.evidence[1], direct,
+            "direct site only the parser resolved remains intact"
+        );
+        assert_eq!(parsed.evidence[2], informed.evidence[1]);
+        let once = parsed.clone();
+        incorporate_dispatch_evidence(&mut parsed, &informed);
+        assert_eq!(
+            parsed, once,
+            "seeing the same fresh sites twice must not double their counts"
+        );
     }
 
     fn partial_fixture(

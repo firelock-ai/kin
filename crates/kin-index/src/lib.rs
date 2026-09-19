@@ -28,7 +28,9 @@ pub mod fingerprint;
 pub mod history;
 pub mod linker;
 pub mod overlay;
+pub mod overrides;
 pub mod pipeline;
+pub mod relation_read;
 pub mod repository;
 pub mod resolution;
 pub mod support;
@@ -58,21 +60,24 @@ pub use history::{
 pub use linker::{
     bare_entity_name, build_projection_derived_relations_for_file,
     build_projection_derived_relations_from_markers, extract_projection_source_markers,
-    link_cross_file, link_cross_file_against_entities,
+    is_self_dispatch_candidate, link_cross_file, link_cross_file_against_entities,
     link_cross_file_against_entities_with_completeness, link_cross_file_borrowed_with_completeness,
     link_cross_file_incremental, link_cross_file_incremental_with_completeness,
-    link_cross_file_with_completeness, CrossFileLinker, FileParseCompletenessMap, FileParseData,
-    IncrementalLinker, IncrementalLinkerCheckpointV1, LinkingOutcome, UnresolvedRelation,
-    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1,
-    CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1, CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
-    CALL_SHAPE_PARSE_COVERAGE_FULL_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
-    IMPORT_RESOLUTION_COVERAGE_V1, INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
+    link_cross_file_incremental_with_graph, link_cross_file_with_completeness, CrossFileLinker,
+    FileParseCompletenessMap, FileParseData, IncrementalLinker, IncrementalLinkerCheckpointV1,
+    LinkingOutcome, UnresolvedRelation, CALL_SHAPE_EVIDENCE_AGGREGATION_V1,
+    CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
+    CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1, CALL_SHAPE_PARSE_COVERAGE_FULL_V1,
+    CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1, IMPORT_RESOLUTION_COVERAGE_V1,
+    INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
+    SELF_DISPATCH_OVERRIDE_EVIDENCE_V1,
 };
 pub use linker::{
     is_external_import_placeholder, is_raise_classifiable_call_edge, is_raise_target_edge,
     trace_crossing_for, TraceCrossing, EXTERNAL_IMPORT_REFERENCE_RULE, RAISE_TARGET_CALL_RULE,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
+pub use overrides::{overriding_methods, OverrideCandidate, OVERRIDDEN_BY_FIELD};
 pub use pipeline::{
     classify_file_role, normalize_file_path_id, IndexPipeline, IndexedAny, IndexedFile,
     COMMAND_EFFECT_CONTRACT_KEY,

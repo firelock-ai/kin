@@ -7,8 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `lexical_lookup` finds exact literals, including punctuation, in stored
+  graph fields: names, signatures, summaries, body previews and file context.
+  It reports the matching field and verified source line when available.
+  Stable content-bound pagination retains hits withheld by response limits.
+  Each page scans the scoped graph; previews can be bounded, so a miss does
+  not prove repository absence. Literal hits are distinct from resolved calls
+  and references.
+
 ### Fixed
 
+- Named Go struct fields are addressable as `Owner.Field`. Read and write
+  selectors retain their receiver and source sites. Without receiver-type
+  evidence, same-file and cross-file field matches remain disclosed
+  `name_only` candidates; they cannot bind unrelated free globals. Imported
+  package selectors remain unresolved when their namespace is not established.
+  Embedded fields retain their existing Extends relation. Existing compact
+  index entity-kind codes remain unchanged.
+- `kin rollback` now requires `--discard-later` before restoring an earlier
+  change's complete content, including targets outside its bounded
+  first-parent preview. The daemon checks the preview's exact repository,
+  workspace and tip under the mutation lock, then publishes against those
+  expectations; a concurrent change requires a fresh preview. Rollback
+  publishes a new restoring change and keeps all immutable history. Help and
+  recovery instructions now describe that operation, and the misleading
+  `revert` alias is replaced by a refusal explaining that Kin has no
+  single-change revert.
+- Retained snapshot history reads can recover from positional I/O failures by
+  reopening current durable history. Recovery refuses promptly if an authority
+  freeze holds the required lock, so a stale read cannot deadlock its own
+  caller; retrying after release can succeed. Indexed readers share a verified
+  replacement while preserving the original change membership and content.
+  Corruption, missing changes and changed content still refuse. Recovery and
+  refusal diagnostics name the relevant path and generations. This is a
+  defensive correction: the originally reported post-idle HTTP 409 trigger
+  remains unproven, while the freeze/recovery lock cycle has a deterministic
+  real-backend regression test.
+- Incremental linking retains the import aliases that give recorded class bases
+  meaning. Editing a base file alone, or restoring a linker checkpoint before
+  that edit, no longer upgrades an overridden self-call to `type_resolved`
+  because its unchanged subclass imported the base under another name. Import
+  changes and removals replace the prior binding context.
+
+- Python `self`/`cls` calls to a definition with a known override now retain
+  dispatch qualification at confidence 0.86 (`import_scoped`), including after
+  a persisted graph reopen and a base-only edit. Batch linking derives this
+  knowledge from parsed hierarchy; live reconcile also consults persisted
+  `Overrides` edges at current entity identities. Fresh source slices replace
+  obsolete override facts. The classification survives reconcile's same-edge
+  fold while preserving the relation ID and fresh per-site spans, shapes and
+  occurrence counts. Graph-read errors are surfaced instead of publishing an
+  intra-file guess. Ordinary calls without known overrides keep their tier.
+  This does not reconstruct the complete class hierarchy or establish the
+  runtime destination: `import_scoped` still passes the existing `is_proven`
+  predicate, and consumers do not yet enumerate all override candidates. The
+  `overriding_methods` graph helper is available for that follow-up. Explicit
+  Python `Base.send(self, ...)` resolution remains incomplete; its missing
+  call-shape coverage remains disclosed.
+- Go calls on a method's declared receiver now resolve to that type's method
+  within the same declared package, including methods defined in another
+  file and methods on named scalar types. A local binding that shadows the
+  receiver stays a candidate instead of borrowing the receiver's type or a
+  same-named import. Package identity survives incremental linker checkpoints;
+  missing, conflicting or removed targets do not resolve to another package.
 - `kin agent run`'s final answer now always carries the literal `ANSWER`
   marker a caller parses for, and now always names every reference row
   `find_references` resolved with confidence, even when the model's own
@@ -22,6 +85,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved row is untouched, and an ordinary prose answer with no reference
   rows and no position-shaped line is never forced into a fence it does not
   need.
+- `list_file_entities` on a JavaScript file no longer certifies its listing as
+  complete when a loop bulk-assigns computed members it cannot read the names
+  of, such as Express's own `methods.forEach(function (method) { app[method]
+  = ...; })`. The extractor now recognizes that shape across `forEach`, `map`,
+  `for...of`, and a plain counting `for` over a list, checking whether the
+  iterated list is statically knowable: an array literal
+  at the loop site, a `const` bound to one elsewhere in the file, or a
+  `require`/`import` of the `methods` package, whose HTTP-method table is
+  carried as a small versioned constant rather than read from the dependency.
+  When it is, every member is minted as a real, owner-qualified entity (such
+  as `app.get`) with a signature and a note explaining where it came from, so
+  `find_references` and `list_file_entities` both see it. When it is not, or
+  when only part of a file's sites resolve, nothing is fabricated: the file's
+  listing is reported as a floor, `_kin.verdict` reads inconclusive for
+  completeness instead of certified, and the disclosure names the loop's own
+  iterated expression rather than a generic warning. Measured against
+  Express's real `lib/application.js`: the graph held 22 entities for the
+  file, 17 of them the statically-assigned methods, with none of the 35 the
+  `methods.forEach` loop creates at runtime; it now holds 57, all 35 present
+  under their own owner-qualified name, and because that loop's list resolves
+  through the `methods` package route, the listing is certified rather than
+  merely disclosed.
+- Computed assignments inside `for...in` retain an unresolved-member disclosure,
+  including nested and conditional assignments. This loop visits enumerable
+  property keys, including inherited keys, rather than array values; Kin no
+  longer invents `app.get` from `for (key in ['get'])`. Ordinary static methods
+  remain available with their original source spans.
 - `find_references` asked for a bare name that several owner-qualified
   entities share, such as `Blueprint.register_blueprint` and
   `App.register_blueprint` in a Flask-shaped Python store, now answers a

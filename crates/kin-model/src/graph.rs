@@ -103,6 +103,25 @@ pub trait EntityStore: Send + Sync {
             page,
         ))
     }
+    /// Ranked token candidates for `query` across this store's indexed text
+    /// fields. This is not exhaustive literal membership: tokenization and
+    /// `limit` can exclude literal matches. Returns up to `limit` candidates as
+    /// `(RetrievalKey, score)` pairs, higher score first.
+    ///
+    /// The default returns no candidates when an implementor has no text
+    /// index. An empty vector does not distinguish index unavailability from
+    /// zero candidates and cannot establish literal absence. This is a
+    /// best-effort, bounded derived-index read; [`Self::query_entities`] is the
+    /// graph-owned entity predicate. An implementor that keeps a text index (
+    /// `InMemoryGraph`, today, backed by `kin_search`) owes its callers an
+    /// override, not this default.
+    fn text_search(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> std::result::Result<Vec<(crate::retrieval::RetrievalKey, f32)>, Self::Error> {
+        Ok(Vec::new())
+    }
     fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
     fn upsert_entity(&self, entity: &Entity) -> std::result::Result<(), Self::Error>;
     fn upsert_relation(&self, relation: &Relation) -> std::result::Result<(), Self::Error>;
@@ -1908,6 +1927,17 @@ impl<G: EntityStore> EntityStore for &G {
         page: &EntityPage,
     ) -> std::result::Result<EntityPageResult, Self::Error> {
         (**self).query_entities_page(filter, page)
+    }
+    // Forwarded for the same reason `query_entities_page` is just above: the
+    // trait default is silently correct (it returns empty), which is exactly
+    // the regression. A reference to a store that DOES override `text_search`
+    // would lose the override and read as unindexed forever.
+    fn text_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<(crate::retrieval::RetrievalKey, f32)>, Self::Error> {
+        (**self).text_search(query, limit)
     }
     fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
         (**self).list_all_entities()

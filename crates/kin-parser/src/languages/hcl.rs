@@ -72,6 +72,7 @@ impl LanguageAdapter for HclAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,

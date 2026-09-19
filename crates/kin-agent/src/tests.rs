@@ -443,6 +443,43 @@ fn the_system_prompt_names_only_the_write_tools_the_belt_carries() {
     }
 }
 
+/// The routing rule for the literal-lookup tool: named in the prompt, on the
+/// default belt (never withheld behind `KIN_AGENT_BELT=wide`), and routed by
+/// bare name like any other Kin tool, with no fold and no special case needed.
+#[test]
+fn lexical_lookup_is_on_the_default_belt_and_named_in_its_routing_rule() {
+    let locate = kin_tool(0, "semantic_locate", None);
+    let lexical_lookup = kin_tool(0, "lexical_lookup", None);
+
+    let prompt = crate::run::system_prompt_for(&Belt::pure_kin(vec![
+        locate.clone(),
+        lexical_lookup.clone(),
+    ]));
+    assert!(
+        prompt.contains("mcp__kin__lexical_lookup"),
+        "the routing rule must name the tool: {prompt}"
+    );
+    assert!(
+        prompt.contains("inconclusive verdict"),
+        "the routing rule must name the second trigger (an inconclusive structural verdict): {prompt}"
+    );
+
+    assert!(
+        !belt::is_opt_in("lexical_lookup"),
+        "lexical_lookup must ride the default belt, not KIN_AGENT_BELT=wide"
+    );
+
+    let belt = Belt::pure_kin(vec![locate, lexical_lookup]);
+    assert_eq!(
+        belt.route("mcp__kin__lexical_lookup"),
+        Route::Kin {
+            server: 0,
+            tool: "lexical_lookup".to_string(),
+        },
+        "an ordinary declared Kin tool routes by its bare name with no fold"
+    );
+}
+
 /// The harness supplies the session `kin_mutate` needs and the model cannot see.
 ///
 /// `kin_session_start` is harness-owned, so the model never learns the session

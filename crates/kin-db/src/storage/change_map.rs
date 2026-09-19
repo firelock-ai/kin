@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::KinDbError;
+use crate::storage::backend::Generation;
 use crate::types::{SemanticChange, SemanticChangeId};
 
 /// The decoded shape of the map, which is what every reader sees.
@@ -108,25 +109,30 @@ impl fmt::Debug for HistorySource {
 }
 
 impl HistorySource {
-    fn read_record(&self, range: Range<usize>) -> Result<Vec<u8>, KinDbError> {
+    /// The positionally-encoded record at `range`, or the failure to read it,
+    /// distinguishing a retained handle's own I/O failure from a range that
+    /// never made sense for this frame.
+    ///
+    /// Only [`RecordReadFailure::Io`] is a candidate for a reopen-and-retry: an
+    /// out-of-range record is a mismatch between this source and the index
+    /// that named the range, which a fresh handle onto different bytes cannot
+    /// fix and must not be asked to.
+    fn read_record_or_failure(&self, range: Range<usize>) -> Result<Vec<u8>, RecordReadFailure> {
         let mut bytes = vec![0; range.len()];
         match self {
             Self::File {
                 file, frame_len, ..
             } => {
                 if range.end as u64 > *frame_len {
-                    return Err(KinDbError::StorageError(
-                        "history record exceeds its frame".into(),
-                    ));
+                    return Err(RecordReadFailure::OutOfRange);
                 }
-                read_exact_at(file, &mut bytes, range.start as u64).map_err(|error| {
-                    KinDbError::StorageError(format!("history record read failed: {error}"))
-                })?;
+                read_exact_at(file, &mut bytes, range.start as u64)
+                    .map_err(RecordReadFailure::Io)?;
             }
             #[cfg(test)]
-            Self::Memory(frame) => bytes.copy_from_slice(frame.get(range).ok_or_else(|| {
-                KinDbError::StorageError("history record exceeds its frame".into())
-            })?),
+            Self::Memory(frame) => {
+                bytes.copy_from_slice(frame.get(range).ok_or(RecordReadFailure::OutOfRange)?)
+            }
         }
         Ok(bytes)
     }
@@ -164,6 +170,75 @@ impl HistorySource {
             #[cfg(test)]
             Self::Memory(frame) => Ok(FrameBytes::Borrowed(frame)),
         }
+    }
+}
+
+/// Why [`HistorySource::read_record_or_failure`] failed.
+enum RecordReadFailure {
+    /// The positional read did not produce the requested bytes.
+    /// [`Self::stale_retained_handle`] draws the line between an I/O failure
+    /// that means the retained handle has gone bad and one that means
+    /// something else is wrong; only the first is worth a reopen.
+    Io(std::io::Error),
+    /// The range asked for lies outside the frame this source describes: a
+    /// defect in the caller or its index, never in the handle, so a reopen
+    /// cannot help and is never tried.
+    OutOfRange,
+}
+
+impl RecordReadFailure {
+    fn to_storage_error(&self) -> KinDbError {
+        match self {
+            Self::OutOfRange => KinDbError::StorageError("history record exceeds its frame".into()),
+            Self::Io(error) => {
+                KinDbError::StorageError(format!("history record read failed: {error}"))
+            }
+        }
+    }
+
+    /// The I/O error underneath, only when [`is_stale_retained_handle_error`]
+    /// accepts it as a reason the HANDLE has gone bad rather than a reason the
+    /// BYTES it names are wrong.
+    fn stale_retained_handle(&self) -> Option<&std::io::Error> {
+        match self {
+            Self::Io(error) if is_stale_retained_handle_error(error) => Some(error),
+            Self::Io(_) | Self::OutOfRange => None,
+        }
+    }
+}
+
+/// Whether a read through a retained snapshot handle failed for a reason that
+/// means the HANDLE has gone bad, as distinct from a reason that means the
+/// BYTES it names are wrong.
+///
+/// `NotFound`: the file this handle was opened from was unlinked, and this
+/// platform does not keep an unlinked-but-open file readable through a
+/// descriptor that was already open on it. Virtiofs is the one seen doing
+/// this; ordinary POSIX keeps reading such a file exactly as before, which is
+/// why [`super::mmap::map_regular_file_keeping_handle_at`]'s retained-handle
+/// design has held there. `UnexpectedEof`: the file changed length under the
+/// handle, which is what a reused or truncated name reads as, and which
+/// `read_exact_at` reports this way rather than as `NotFound`. `EBADF`/`EIO`:
+/// the descriptor itself stopped answering.
+///
+/// Never a checksum mismatch, a decode failure, or an index mismatch: those
+/// are the bytes disagreeing with what the open verified, over a read that
+/// already succeeded by the time any of them are checked, so this function is
+/// never asked about them. A reopened handle onto a different generation
+/// cannot make disagreeing bytes agree, and must keep refusing exactly as
+/// before.
+fn is_stale_retained_handle_error(error: &std::io::Error) -> bool {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof => return true,
+        _ => {}
+    }
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::EIO))
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -216,10 +291,49 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
     Ok(())
 }
 
+/// Reopens the durable history a [`HistorySource`] was built from, at
+/// whatever generation is on disk when a retained read through it goes bad.
+///
+/// Returns a complete fresh [`ChangeMap`] rather than patched bytes: a
+/// superseding snapshot is a whole new file, so a record's byte range within
+/// it has no relation to that record's range in the file the failing source
+/// was opened from, and only a fresh index built over the fresh bytes can be
+/// trusted to name the fresh range correctly.
+pub(crate) type HistoryReopen = Arc<dyn Fn() -> Result<ReopenedHistory, KinDbError> + Send + Sync>;
+
+/// What a [`HistoryReopen`] hands back.
+pub(crate) struct ReopenedHistory {
+    /// The durable history read fresh, at whatever generation is on disk
+    /// right now.
+    pub(crate) changes: ChangeMap,
+    /// The backend's own physical generation counter for the snapshot this
+    /// reopen read: what names the file on disk, not the repository's logical
+    /// generation.
+    pub(crate) physical_generation: Generation,
+    /// The repository's logical generation this reopen resolved: `RootBundle`'s
+    /// `generation`, which a representation-only rewrite (a materialized graph
+    /// section refresh, for one) advances the physical generation without
+    /// moving.
+    pub(crate) logical_generation: Generation,
+}
+
+/// How an [`EncodedChanges`] recovers from a retained handle that has gone
+/// stale underneath it, and what generations it was opened at, so a refusal
+/// that exhausts the recovery can still name them.
+struct StaleHandleRecovery {
+    reopen: HistoryReopen,
+    physical_generation: Generation,
+    logical_generation: Generation,
+    /// Clones share one verified replacement. Serialize the first recovery so
+    /// concurrent readers do not each stream the entire durable history.
+    recovered: Mutex<Option<Arc<ReopenedHistory>>>,
+}
+
 /// A change map that is still bytes on disk.
-#[derive(Debug)]
 pub(crate) struct EncodedChanges {
     source: HistorySource,
+    #[cfg(test)]
+    fail_retained_reads: std::sync::atomic::AtomicBool,
     /// The map element's byte range within the frame BODY, not the file.
     range: Range<usize>,
     /// The element count the map header declared, so `len` needs no decode.
@@ -229,6 +343,30 @@ pub(crate) struct EncodedChanges {
     /// opened and is refused rather than decoded.
     body_checksum: [u8; 32],
     index: Option<HashMap<SemanticChangeId, HistoryRecord>>,
+    /// Set once, by whoever opened `source` from a backend, when this history
+    /// has a current on-disk generation a stale read can be recovered from.
+    /// `None` describes every encoded change map that could never go stale
+    /// this way: a test fixture, or history admitted without a backend at all.
+    stale_handle_recovery: Option<StaleHandleRecovery>,
+}
+
+impl fmt::Debug for EncodedChanges {
+    /// Never the index or the checksum bytes: an admitted history's index has
+    /// one entry per change, and a converted repository's is hundreds of
+    /// thousands of them.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncodedChanges")
+            .field("source", &self.source)
+            .field("range", &self.range)
+            .field("len", &self.len)
+            .field("indexed", &self.index.is_some())
+            .field(
+                "stale_handle_recovery",
+                &self.stale_handle_recovery.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Metadata derived only while decoding a checksum-verified frame. Record
@@ -350,16 +488,36 @@ impl EncodedChanges {
     ) -> Self {
         Self {
             source,
+            #[cfg(test)]
+            fail_retained_reads: std::sync::atomic::AtomicBool::new(false),
             range,
             len,
             body_checksum,
             index: None,
+            stale_handle_recovery: None,
         }
     }
 
     pub(crate) fn with_index(mut self, index: HashMap<SemanticChangeId, HistoryRecord>) -> Self {
         self.index = Some(index);
         self
+    }
+
+    /// Give this source a way to recover from a retained handle that has gone
+    /// stale underneath it: reopen the durable history at its current
+    /// on-disk generation and retry the one read that failed, once.
+    pub(crate) fn set_stale_handle_recovery(
+        &mut self,
+        reopen: HistoryReopen,
+        physical_generation: Generation,
+        logical_generation: Generation,
+    ) {
+        self.stale_handle_recovery = Some(StaleHandleRecovery {
+            reopen,
+            physical_generation,
+            logical_generation,
+            recovered: Mutex::new(None),
+        });
     }
 
     fn read_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
@@ -369,7 +527,61 @@ impl EncodedChanges {
         let Some(record) = index.get(id) else {
             return Ok(None);
         };
-        let bytes = self.source.read_record(record.range.clone())?;
+        if let Some(recovery) = &self.stale_handle_recovery {
+            let fresh = recovery.recovered.lock().clone();
+            if let Some(fresh) = fresh {
+                return self.read_reopened_change(id, record, &fresh);
+            }
+        }
+        #[cfg(test)]
+        if self
+            .fail_retained_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return self.read_change_after_retained_read_failure(
+                id,
+                record,
+                &RecordReadFailure::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            );
+        }
+        match self.source.read_record_or_failure(record.range.clone()) {
+            Ok(bytes) => self.verify_and_decode_record(id, record, bytes),
+            Err(failure) => self.read_change_after_retained_read_failure(id, record, &failure),
+        }
+    }
+
+    fn read_reopened_change(
+        &self,
+        id: &SemanticChangeId,
+        record: &HistoryRecord,
+        fresh: &ReopenedHistory,
+    ) -> Result<Option<SemanticChange>, KinDbError> {
+        let change = fresh.changes.read_change(id)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "reopened history is missing previously indexed change {id}"
+            ))
+        })?;
+        let leaf_digest = super::repository::canonical_leaf_hash("changes", &(id, &change))?;
+        if change.id != *id || change.parents != record.parents || leaf_digest != record.leaf_digest
+        {
+            return Err(KinDbError::StorageError(format!(
+                "reopened history changed the content of previously indexed change {id}"
+            )));
+        }
+        Ok(Some(change))
+    }
+
+    /// Finish [`Self::read_change`] once its positional read produced bytes:
+    /// check them against the digest and parents the open recorded, then
+    /// decode. Unchanged from before this module could retry a read: a
+    /// mismatch here is the bytes disagreeing with what the open verified,
+    /// which reopening a different generation cannot excuse.
+    fn verify_and_decode_record(
+        &self,
+        id: &SemanticChangeId,
+        record: &HistoryRecord,
+        bytes: Vec<u8>,
+    ) -> Result<Option<SemanticChange>, KinDbError> {
         let actual: [u8; 32] = Sha256::digest(&bytes).into();
         if actual != record.sha256 {
             return Err(KinDbError::StorageError(format!(
@@ -385,6 +597,95 @@ impl EncodedChanges {
             )));
         }
         Ok(Some(change))
+    }
+
+    /// [`Self::read_change`]'s failure path.
+    ///
+    /// Retries once through a reopened history when `failure` means the
+    /// retained handle itself went bad and this source has a way to reopen
+    /// one; surfaces the original refusal unchanged otherwise. Either way a
+    /// refusal that follows an attempted reopen names the path and every
+    /// generation involved, so the next occurrence is diagnosable without a
+    /// debugger.
+    fn read_change_after_retained_read_failure(
+        &self,
+        id: &SemanticChangeId,
+        record: &HistoryRecord,
+        failure: &RecordReadFailure,
+    ) -> Result<Option<SemanticChange>, KinDbError> {
+        let Some(io_error) = failure.stale_retained_handle() else {
+            return Err(failure.to_storage_error());
+        };
+        let Some(recovery) = &self.stale_handle_recovery else {
+            return Err(failure.to_storage_error());
+        };
+        let mut cached = recovery.recovered.lock();
+        if let Some(fresh) = cached.clone() {
+            drop(cached);
+            return self.read_reopened_change(id, record, &fresh);
+        }
+        let path = self.source.describe();
+        match (recovery.reopen)() {
+            Ok(fresh) => match self.read_reopened_change(id, record, &fresh) {
+                Ok(answer) => {
+                    tracing::warn!(
+                        path = %path,
+                        change = %id,
+                        opened_physical_generation = recovery.physical_generation,
+                        opened_logical_generation = recovery.logical_generation,
+                        current_physical_generation = fresh.physical_generation,
+                        current_logical_generation = fresh.logical_generation,
+                        error = %io_error,
+                        "a history read's retained snapshot handle failed; recovered by \
+                         reopening the current on-disk generation and retrying"
+                    );
+                    *cached = Some(Arc::new(fresh));
+                    Ok(answer)
+                }
+                Err(retry_error) => {
+                    tracing::error!(
+                        path = %path,
+                        change = %id,
+                        opened_physical_generation = recovery.physical_generation,
+                        opened_logical_generation = recovery.logical_generation,
+                        current_physical_generation = fresh.physical_generation,
+                        current_logical_generation = fresh.logical_generation,
+                        error = %io_error,
+                        retry_error = %retry_error,
+                        "a history read's retained snapshot handle failed and the reopened \
+                         current generation could not answer it either"
+                    );
+                    Err(KinDbError::StorageError(format!(
+                        "history record read failed: {io_error}; the retained handle for {path} \
+                         was opened at physical generation {}/logical generation {}; reopening \
+                         the current on-disk generation (physical {}/logical {}) did not \
+                         recover the read: {retry_error}",
+                        recovery.physical_generation,
+                        recovery.logical_generation,
+                        fresh.physical_generation,
+                        fresh.logical_generation,
+                    )))
+                }
+            },
+            Err(reopen_error) => {
+                tracing::error!(
+                    path = %path,
+                    change = %id,
+                    opened_physical_generation = recovery.physical_generation,
+                    opened_logical_generation = recovery.logical_generation,
+                    error = %io_error,
+                    reopen_error = %reopen_error,
+                    "a history read's retained snapshot handle failed and reopening the \
+                     current on-disk generation also failed"
+                );
+                Err(KinDbError::StorageError(format!(
+                    "history record read failed: {io_error}; the retained handle for {path} was \
+                     opened at physical generation {}/logical generation {}; reopening its \
+                     current on-disk generation failed: {reopen_error}",
+                    recovery.physical_generation, recovery.logical_generation,
+                )))
+            }
+        }
     }
 
     fn decode(&self) -> Result<ChangeMapInner, KinDbError> {
@@ -491,6 +792,17 @@ pub(crate) struct LeafDigestMemo {
 }
 
 impl ChangeMap {
+    #[cfg(test)]
+    pub(crate) fn fail_retained_reads_for_test(&self) {
+        assert!(self.has_admitted_encoded_base());
+        self.body
+            .encoded
+            .as_ref()
+            .unwrap()
+            .fail_retained_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(crate) fn shares_storage(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.body, &other.body) && Arc::ptr_eq(&self.overlay, &other.overlay)
     }
@@ -499,6 +811,34 @@ impl ChangeMap {
         self.body.encoded.is_some()
             && self.body.decoded.get().is_none()
             && self.combined.get().is_none()
+    }
+
+    /// Give this map's on-disk base a way to recover from a retained handle
+    /// that goes stale underneath it: reopen the durable history at its
+    /// current on-disk generation and retry the one read that failed, once.
+    /// See [`HistoryReopen`].
+    ///
+    /// Returns `false`, doing nothing, when there is no on-disk base to
+    /// protect (this map was built directly in memory: `ChangeMap::new`, a
+    /// Git bootstrap, a test fixture) or this map no longer uniquely owns
+    /// its base because it has already been shared. A caller installs this
+    /// immediately after building a fresh encoded map, before publishing or
+    /// cloning it anywhere, which is the only time that ownership is
+    /// guaranteed.
+    pub(crate) fn install_stale_handle_recovery(
+        &mut self,
+        reopen: HistoryReopen,
+        physical_generation: Generation,
+        logical_generation: Generation,
+    ) -> bool {
+        let Some(body) = Arc::get_mut(&mut self.body) else {
+            return false;
+        };
+        let Some(encoded) = body.encoded.as_mut() else {
+            return false;
+        };
+        encoded.set_stale_handle_recovery(reopen, physical_generation, logical_generation);
+        true
     }
 
     /// Check identity membership using the compact index.

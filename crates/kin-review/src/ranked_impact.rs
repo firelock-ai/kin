@@ -415,7 +415,8 @@ pub fn inbound_impact_relations(all: &[Relation], id: &EntityId) -> Vec<Relation
 }
 
 fn impact_bucket(entity: &Entity, relation: RelationKind) -> ImpactBucket {
-    if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored)
+    if kin_model::is_derived_member(entity)
+        || matches!(entity.role, EntityRole::Generated | EntityRole::Vendored)
         || relation == RelationKind::DerivedFrom
     {
         ImpactBucket::Derived
@@ -483,8 +484,16 @@ fn confidence_basis_points(confidence: f32) -> u32 {
 fn candidate_location(entity: &Entity) -> CandidateLocation {
     CandidateLocation {
         file: entity_file(entity).unwrap_or_default(),
-        start_line: entity.span.as_ref().map(|span| span.start_line),
-        end_line: entity.span.as_ref().map(|span| span.end_line),
+        start_line: entity
+            .span
+            .as_ref()
+            .filter(|_| !kin_model::is_derived_member(entity))
+            .map(|span| span.start_line),
+        end_line: entity
+            .span
+            .as_ref()
+            .filter(|_| !kin_model::is_derived_member(entity))
+            .map(|span| span.end_line),
     }
 }
 
