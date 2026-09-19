@@ -66,6 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row was there to prefer it over. The floor now withholds a `name_only` row
   only where an `import_scoped` or `type_resolved` row exists for the same
   focal to prefer, and `degradations` says when the floor could not trade.
+- The floor bypass above read "nothing stronger" off the FOCAL's own rows,
+  which let a store that resolves a language fine in general still keep every
+  guess for one focal reached only by calling through an interface value: an
+  interface method whose own call sites all sit at `name_only` looks
+  identical, row for row, to a focal in a store with no resolver for the
+  language at all, and the first cut of the bypass could not tell them apart.
+  It now asks the STORE, not the focal: the bypass only holds where nothing
+  anywhere in the store resolves that language above `name_only`, which is a
+  fact about the build, not about which focal happened to be asked about.
+  Where the store resolves the language elsewhere, the floor withholds this
+  focal's `name_only` rows exactly as it would for any other, and the
+  disclosure now names the store rather than the focal as the reason a row
+  was kept.
 
 ## [0.7.21] - 2026-09-18
 
