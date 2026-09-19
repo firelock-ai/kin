@@ -40,12 +40,20 @@ use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<ExactSourceArchiveExportQueue>> = OnceLock::new();
+#[cfg(not(test))]
 static HOSTED_REPOSITORY_HYDRATIONS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
-fn hosted_repository_hydrations() -> Arc<tokio::sync::Semaphore> {
-    Arc::clone(
-        HOSTED_REPOSITORY_HYDRATIONS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))),
-    )
+fn hosted_repository_hydrations(_state: &DaemonState) -> Arc<tokio::sync::Semaphore> {
+    #[cfg(test)]
+    {
+        Arc::clone(&_state.hosted_repository_hydration_slots_for_test)
+    }
+    #[cfg(not(test))]
+    {
+        Arc::clone(
+            HOSTED_REPOSITORY_HYDRATIONS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))),
+        )
+    }
 }
 
 fn exact_source_archive_exports() -> Arc<ExactSourceArchiveExportQueue> {
@@ -12940,6 +12948,23 @@ fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
     }
 }
 
+/// Match the source tool's existing UUID/name selection before deciding whether
+/// the result has a generator instead of an independently editable declaration.
+fn mcp_derived_source_for_query(
+    held: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
+    query: &str,
+    scope: kin_mcp::handlers::common::EntitySourceScope,
+) -> kin_mcp::Result<Option<serde_json::Value>> {
+    let entity = kin_cli::commands::graph::resolve_source_entity(held.store(), query)
+        .map_err(|error| kin_mcp::McpError::Other(error.to_string()))?;
+    match entity {
+        Some(entity) => {
+            kin_mcp::handlers::entities::derived_entity_source_at(held, &entity, scope, 1_000_000)
+        }
+        None => Ok(None),
+    }
+}
+
 /// One coherent hosted repository authority selected for a single MCP call.
 pub(crate) struct HostedRepositoryMcpView {
     repository_id: RepositoryId,
@@ -13494,7 +13519,7 @@ async fn load_hosted_repository_mcp_view(
     let worker_repo_id = repo_id.to_string();
     let error_repo_id = worker_repo_id.clone();
     let view = run_hosted_repository_hydration(
-        hosted_repository_hydrations(),
+        hosted_repository_hydrations(state),
         &error_repo_id,
         move || {
             open_hosted_repository_mcp_view_blocking(
@@ -15277,6 +15302,41 @@ async fn mcp_tools_call_dispatch(
                     .to_string(),
             )));
         }
+        let source_scope = match state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+        {
+            Some(scope) => scope,
+            None => {
+                return Ok(Json(kin_mcp::ToolCallResult::error(
+                    "selected source scope expired or was replaced",
+                )))
+            }
+        };
+        let source_authority = match mcp_repository_authority_source(&state) {
+            Ok(authority) => authority,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
+        let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
+            graph.as_ref(),
+            source_authority.as_ref(),
+        );
+        match mcp_derived_source_for_query(&held, entity_id, source_scope) {
+            Ok(Some(value)) => {
+                if state
+                    .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+                    .await
+                    != Some(source_scope)
+                {
+                    return Ok(Json(kin_mcp::ToolCallResult::error(
+                        "selected generator source scope changed during reconstruction",
+                    )));
+                }
+                return Ok(Json(kin_mcp::ToolCallResult::text(value.to_string())));
+            }
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+            Ok(None) => {}
+        }
         let repository_authority = match require_mcp_command_repository_authority(&state) {
             Ok(authority) => authority,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
@@ -15321,9 +15381,40 @@ async fn mcp_tools_call_dispatch(
             Ok(authority) => authority,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
+        let source_scope = match state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+        {
+            Some(scope) => scope,
+            None => {
+                return Ok(Json(kin_mcp::ToolCallResult::error(
+                    "selected batch source scope expired or was replaced",
+                )))
+            }
+        };
+        let source_authority = match mcp_repository_authority_source(&state) {
+            Ok(authority) => authority,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
+        let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
+            graph.as_ref(),
+            source_authority.as_ref(),
+        );
         let resolved = entity_ids
             .iter()
             .map(|entity_id| {
+                match mcp_derived_source_for_query(&held, entity_id, source_scope) {
+                    Ok(Some(value)) => {
+                        return kin_mcp::handlers::entities::ResolvedEntitySource::Derived { value }
+                    }
+                    Err(error) => {
+                        return kin_mcp::handlers::entities::ResolvedEntitySource::NoSource {
+                            id: entity_id.clone(),
+                            message: error.to_string(),
+                        }
+                    }
+                    Ok(None) => {}
+                }
                 resolved_entity_source_from_outcome(
                     entity_id,
                     kin_cli::commands::graph::build_entity_source_outcome(
@@ -15334,6 +15425,15 @@ async fn mcp_tools_call_dispatch(
                 )
             })
             .collect();
+        if state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+            != Some(source_scope)
+        {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                "selected batch generator source scope changed during reconstruction",
+            )));
+        }
         let result = kin_mcp::handlers::entities::assemble_entity_sources_response(resolved, &opts);
         return Ok(Json(result));
     }
@@ -17664,7 +17764,7 @@ fn repo_entity_ranks(
     let mut edges: HashSet<(EntityId, EntityId, kin_model::RelationKind)> = HashSet::new();
     let mut dependents: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
     for entity in &entities {
-        for relation in graph.get_all_relations_for_entity(&entity.id)? {
+        for relation in kin_index::relation_read::relations_for_read(graph, &entity.id)? {
             let (Some(source), Some(destination)) =
                 (relation.src.as_entity(), relation.dst.as_entity())
             else {
@@ -23788,6 +23888,317 @@ mod tests {
         .is_none());
     }
 
+    #[tokio::test]
+    async fn derived_member_daemon_dispatch_serves_only_generator_source() {
+        let source = "export const app = {}; for (const key of ['café','post']) { app[key] = () => 41; }\nexport function ordinary() { return 7; }\n";
+        let state = test_state_with_committed_sources(&[("members.js", source)]);
+        let candidate = state
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("app.café".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "app.café")
+            .unwrap();
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        let expected = &source[derivation.generator.start_byte..derivation.generator.end_byte];
+        let app = router(Arc::clone(&state));
+        for (tool, query) in [
+            ("get_entity_source", candidate.id.to_string()),
+            ("get_entity_body", candidate.id.to_string()),
+            ("get_entity_source", candidate.name.clone()),
+        ] {
+            let result = mcp_call(app.clone(), tool, json!({"entity_id":query})).await;
+            assert!(
+                !result.is_error.unwrap_or(false),
+                "{}",
+                mcp_result_text(&result)
+            );
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            assert!(value["body"].is_null(), "{value}");
+            assert!(value["source_base"].is_null(), "{value}");
+            assert_eq!(value["independently_editable"], false, "{value}");
+            assert_eq!(value["definition_status"], "derived_candidate", "{value}");
+            assert_eq!(value["generator_source"]["body"], expected, "{value}");
+            assert_eq!(
+                value["generator_source"]["independent_member_body"], false,
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_member_daemon_mixed_batch_keeps_budgets_and_untrusted_gaps() {
+        let source = "export const app = {}; for (const key of ['café','post']) {\n  app[key] = () => 'réponse';\n}\nexport function ordinary() { return 7; }\n";
+        let state = test_state_with_committed_sources(&[("members.js", source)]);
+        let entities = state.graph.list_all_entities().unwrap();
+        let candidate = entities
+            .iter()
+            .find(|entity| entity.name == "app.café")
+            .unwrap()
+            .clone();
+        let ordinary = entities
+            .iter()
+            .find(|entity| entity.name == "ordinary")
+            .unwrap()
+            .clone();
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        let expected = &source[derivation.generator.start_byte..derivation.generator.end_byte];
+        let mut legacy = candidate.clone();
+        legacy.id = EntityId::new();
+        legacy.name = "legacy.get".into();
+        legacy.span = Some(derivation.generator.clone());
+        legacy
+            .metadata
+            .extra
+            .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+        legacy.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        let mut malformed = legacy.clone();
+        malformed.id = EntityId::new();
+        malformed.name = "malformed.get".into();
+        malformed.metadata.extra.insert(
+            kin_model::derivation::ENTITY_DERIVATION_KEY.into(),
+            json!({"schema":"unknown"}),
+        );
+        state.graph.upsert_entity(&legacy).unwrap();
+        state.graph.upsert_entity(&malformed).unwrap();
+        let app = router(Arc::clone(&state));
+        for entity in [&legacy, &malformed] {
+            let result = mcp_call(
+                app.clone(),
+                "get_entity_source",
+                json!({"entity_id":entity.id.to_string()}),
+            )
+            .await;
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            assert_eq!(
+                value["definition_status"], "untrusted_derivation",
+                "{value}"
+            );
+            assert!(
+                value["body"].is_null()
+                    && value["source_base"].is_null()
+                    && value["span"].is_null(),
+                "{value}"
+            );
+            assert!(value["generator_source"].is_null(), "{value}");
+            assert!(value["generator_source_unavailable"].is_string(), "{value}");
+        }
+        let result = mcp_call(
+            app.clone(),
+            "get_entity_source",
+            json!({"entity_id":ordinary.id.to_string()}),
+        )
+        .await;
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "{}",
+            mcp_result_text(&result)
+        );
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert!(
+            value["body"].as_str().unwrap().contains("return 7"),
+            "{value}"
+        );
+        assert!(value["generator_source"].is_null(), "{value}");
+        let ids = vec![
+            candidate.id.to_string(),
+            ordinary.id.to_string(),
+            legacy.id.to_string(),
+            malformed.id.to_string(),
+            EntityId::new().to_string(),
+        ];
+        let result = mcp_call(
+            app.clone(),
+            "get_entity_sources",
+            json!({"entity_ids":ids,"compact":false,"max_chars":50000}),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(value["returned"], 2, "{value}");
+        assert_eq!(
+            value["results"][0]["generator_source"]["body"], expected,
+            "{value}"
+        );
+        assert!(
+            value["results"][0]["body"].is_null() && value["results"][0]["source_base"].is_null(),
+            "{value}"
+        );
+        assert!(
+            value["results"][1]["body"]
+                .as_str()
+                .unwrap()
+                .contains("return 7"),
+            "{value}"
+        );
+        for index in [2, 3] {
+            assert_eq!(value["results"][index]["reason"], "no_source", "{value}");
+            assert_eq!(
+                value["results"][index]["definition_status"], "untrusted_derivation",
+                "{value}"
+            );
+        }
+        assert_eq!(value["results"][4]["reason"], "not_found", "{value}");
+        for options in [json!({"token_budget":0}), json!({"compact":true})] {
+            let mut args = json!({"entity_ids":[candidate.id.to_string(),ordinary.id.to_string()],"compact":false});
+            args.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let result = mcp_call(app.clone(), "get_entity_sources", args).await;
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            assert!(
+                value["results"][0]["body"].is_null()
+                    && value["results"][0]["generator_source"].is_null(),
+                "{value}"
+            );
+            assert!(value["results"][1]["body"].is_null(), "{value}");
+            if options.get("token_budget").is_some() {
+                assert_eq!(value["truncated"], true, "{value}");
+                assert_eq!(value["results"][0]["reason"], "budget", "{value}");
+                assert_eq!(value["results"][1]["reason"], "budget", "{value}");
+            } else {
+                assert_eq!(value["results"][0]["omitted"], false, "{value}");
+            }
+        }
+        let result = mcp_call(app.clone(), "get_entity_sources", json!({"entity_ids":[candidate.id.to_string()],"max_bytes_per_body":13,"compact":false})).await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(
+            value["results"][0]["generator_source"]["body_complete"], false,
+            "{value}"
+        );
+        assert!(value["results"][0]["body"].is_null(), "{value}");
+        // Generator membership must be graph-bound, even when the recorded bytes exist.
+        let generator_relations = state
+            .graph
+            .traverse(
+                &GraphNodeId::Entity(candidate.id),
+                &[RelationKind::DerivedFrom],
+                1,
+            )
+            .unwrap()
+            .relations;
+        assert!(
+            !generator_relations.is_empty(),
+            "the admitted generator must have provenance"
+        );
+        for relation in generator_relations {
+            state.graph.remove_relation(&relation.id).unwrap();
+        }
+        let result = mcp_call(
+            app,
+            "get_entity_source",
+            json!({"entity_id":candidate.id.to_string()}),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert!(value["generator_source"].is_null(), "{value}");
+        assert!(
+            value["generator_source_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("provenance"),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_member_daemon_history_uses_committed_generator_and_refuses_mismatch() {
+        let old_body =
+            "export const app = {}; for (const key of ['get']) { app[key] = () => 41; }\n";
+        let new_body = "// shifted current source\nexport const app = {}; for (const key of ['get']) { app[key] = () => 99; }\n";
+        let state = test_state_with_committed_sources(&[("members.js", old_body)]);
+        let binding = state.local_repository_authority_binding().unwrap();
+        let old = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &binding,
+            Some("HEAD"),
+        )
+        .unwrap();
+        let authority = projection_repository_authority(&state).unwrap();
+        let historical = Arc::new(kin_core::build_graph_at_ref(&authority.manager, &old).unwrap());
+        let candidate = historical
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "app.get")
+            .unwrap();
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        let expected = &old_body[derivation.generator.start_byte..derivation.generator.end_byte];
+        let app = router(Arc::clone(&state));
+        install_working_copy_file(&state, "members.js", new_body.as_bytes(), false);
+        let current = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "change candidate generator",
+        )
+        .await;
+        assert_ne!(old, current);
+        let session = SessionId::new();
+        state
+            .set_session_scope(&session, old.to_string(), old, Arc::clone(&historical))
+            .await;
+        for tool in ["get_entity_source", "get_entity_body", "get_entity_sources"] {
+            let args = if tool == "get_entity_sources" {
+                json!({"entity_ids":[candidate.id.to_string()],"compact":false})
+            } else {
+                json!({"entity_id":candidate.id.to_string()})
+            };
+            let result = mcp_call_as(app.clone(), tool, args, session).await;
+            assert!(
+                !result.is_error.unwrap_or(false),
+                "{}",
+                mcp_result_text(&result)
+            );
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            let row = if tool == "get_entity_sources" {
+                &value["results"][0]
+            } else {
+                &value
+            };
+            assert!(
+                row["body"].is_null() && row["source_base"].is_null(),
+                "{value}"
+            );
+            assert_eq!(row["generator_source"]["body"], expected, "{value}");
+            assert_eq!(
+                row["generator_source"]["source_state"], "committed",
+                "{value}"
+            );
+            assert_eq!(
+                row["generator_source"]["source_change_id"],
+                old.to_string(),
+                "{value}"
+            );
+        }
+        // A scope graph altered after selection must not lend today's evidence an old label.
+        let mut mismatched = candidate.clone();
+        mismatched
+            .metadata
+            .extra
+            .get_mut(kin_model::derivation::ENTITY_DERIVATION_KEY)
+            .unwrap()["source_blob_hash"] = json!("f".repeat(64));
+        historical.upsert_entity(&mismatched).unwrap();
+        let result = mcp_call_as(
+            app,
+            "get_entity_source",
+            json!({"entity_id":candidate.id.to_string()}),
+            session,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert!(value["generator_source"].is_null(), "{value}");
+        assert!(
+            value["generator_source_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("committed generator revision"),
+            "{value}"
+        );
+    }
+
     #[test]
     fn entity_source_tool_result_not_found_surfaces_error_not_missing_source() {
         use kin_cli::commands::graph::EntitySourceOutcome;
@@ -27559,12 +27970,12 @@ mod tests {
 
     #[tokio::test]
     async fn hosted_hydration_warm_cache_bypasses_busy_cold_admission() {
-        let slots = hosted_repository_hydrations();
-        assert!(Arc::ptr_eq(&slots, &hosted_repository_hydrations()));
-        assert_eq!(slots.available_permits(), 2);
         let repo_id = format!("repo-hydration-warm-{}", Uuid::new_v4());
         let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
         let (state, _working, storage) = replica_state(&repo_id);
+        let slots = hosted_repository_hydrations(&state);
+        assert!(Arc::ptr_eq(&slots, &hosted_repository_hydrations(&state)));
+        assert_eq!(slots.available_permits(), 2);
         publish_hosted_semantic_change(
             storage.path(),
             &repository_id,
@@ -27593,6 +28004,37 @@ mod tests {
         load_hosted_repository_mcp_view(&state, &repo_id)
             .await
             .unwrap();
+        assert_eq!(slots.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn hosted_hydration_saturation_is_isolated_between_test_states() {
+        let saturated_id = format!("repo-hydration-saturated-{}", Uuid::new_v4());
+        let independent_id = format!("repo-hydration-independent-{}", Uuid::new_v4());
+        let (saturated, _saturated_working, _saturated_storage) = replica_state(&saturated_id);
+        let (independent, _working, storage) = replica_state(&independent_id);
+        let repository_id = RepositoryId::new(independent_id.clone()).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8ef2,
+            "publish independent admission fixture",
+            &[(
+                "independent_symbol",
+                "src/independent.rs",
+                "fn independent_symbol() {}\n",
+            )],
+        );
+        let slots = hosted_repository_hydrations(&saturated);
+        let held = Arc::clone(&slots).try_acquire_many_owned(2).unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        assert!(independent.repo_semantic_views.read().await.is_empty());
+        load_hosted_repository_mcp_view(&independent, &independent_id)
+            .await
+            .expect("another test state's occupied slots must not refuse this cold fixture");
+        assert_eq!(slots.available_permits(), 0);
+        drop(held);
         assert_eq!(slots.available_permits(), 2);
     }
 
@@ -42034,10 +42476,50 @@ mod tests {
         )
     }
 
+    fn rollback_expectation(
+        state: &DaemonState,
+    ) -> kin_cli::commands::rollback::RollbackExpectation {
+        let authority = ActiveApiRepositoryAuthority::open(state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        kin_cli::commands::rollback::RollbackExpectation {
+            repository_id: authority.repository_id.clone(),
+            roots: lease.roots().clone(),
+            workspace_id: workspace.workspace_id,
+            workspace_generation: workspace.generation,
+            head_change_id: lease
+                .resolve_target_change_id(workspace.base_target.as_ref().unwrap())
+                .unwrap(),
+        }
+    }
+
     async fn rollback_through_api(
+        state: &DaemonState,
         app: &axum::Router,
         operation_id: kin_model::OperationId,
         change_id: SemanticChangeId,
+    ) -> (StatusCode, String) {
+        rollback_with_expectation_through_api(
+            app,
+            operation_id,
+            change_id,
+            rollback_expectation(state),
+            true,
+        )
+        .await
+    }
+
+    async fn rollback_with_expectation_through_api(
+        app: &axum::Router,
+        operation_id: kin_model::OperationId,
+        change_id: SemanticChangeId,
+        expected: kin_cli::commands::rollback::RollbackExpectation,
+        discard_later: bool,
     ) -> (StatusCode, String) {
         let response = app
             .clone()
@@ -42048,7 +42530,9 @@ mod tests {
                         json!({
                             "change_id": change_id.to_string(),
                             "operation_id": operation_id,
-                            "actor": AuthorId::new("rollback-acceptance")
+                            "actor": AuthorId::new("rollback-acceptance"),
+                            "expected": expected,
+                            "discard_later": discard_later,
                         })
                         .to_string(),
                     ))
@@ -43119,7 +43603,7 @@ mod tests {
         assert_eq!(branch_change(&state), regression);
 
         let (status, body) =
-            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+            rollback_through_api(&state, &app, kin_model::OperationId::new(), restored).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -43971,7 +44455,7 @@ mod tests {
         let loads_before = state.projection_authority.loads();
 
         let (status, body) =
-            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+            rollback_through_api(&state, &app, kin_model::OperationId::new(), restored).await;
         assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
@@ -44081,6 +44565,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn command_rollback_binds_consent_to_the_previewed_authority() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+        std::fs::write(root.join("service.txt"), b"shipped\n").unwrap();
+        let target = commit_through_api(&app, kin_model::OperationId::new(), "base").await;
+        let at_tip = rollback_expectation(&state);
+
+        // The requested target needed no consent when previewed. A real commit
+        // then makes that same target a destructive restoration.
+        std::fs::write(root.join("service.txt"), b"later work\n").unwrap();
+        let later = commit_through_api(&app, kin_model::OperationId::new(), "later work").await;
+        for discard_later in [false, true] {
+            let (status, body) = rollback_with_expectation_through_api(
+                &app,
+                kin_model::OperationId::new(),
+                target,
+                at_tip.clone(),
+                discard_later,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert!(
+                body.contains("changed since the rollback preview"),
+                "{body}"
+            );
+            assert_eq!(branch_change(&state), later);
+            assert_eq!(
+                std::fs::read(root.join("service.txt")).unwrap(),
+                b"later work\n"
+            );
+        }
+
+        // Even a current preview cannot authorize restoration without consent.
+        // This reaches the mutation owner directly, bypassing the CLI guard.
+        let current = rollback_expectation(&state);
+        let (status, body) = rollback_with_expectation_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            target,
+            current.clone(),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("--discard-later"), "{body}");
+        assert_eq!(branch_change(&state), later);
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"later work\n"
+        );
+
+        let operation = kin_model::OperationId::new();
+        let (status, body) =
+            rollback_with_expectation_through_api(&app, operation, target, current.clone(), true)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let published = branch_change(&state);
+        assert_ne!(published, target);
+        assert_ne!(published, later);
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"shipped\n"
+        );
+
+        // A lost-response replay carries the original, now-old expectation.
+        // It must return the published receipt, never perform a second restore.
+        let (status, body) =
+            rollback_with_expectation_through_api(&app, operation, target, current, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(replay["mutated"], false);
+        assert_eq!(branch_change(&state), published);
+    }
+
     /// An operation id is matched before any history validation runs, and an
     /// ordinary commit publishes the same receipt shape a rollback does. Only
     /// the restored content separates them, so reusing a commit's operation id
@@ -44110,7 +44673,7 @@ mod tests {
         // one ref mutation onto a change under a MustEqual expectation and a
         // workspace mutation, so every shape check passes; only the restored
         // content refutes it.
-        let (status, body) = rollback_through_api(&app, reused, restored).await;
+        let (status, body) = rollback_through_api(&state, &app, reused, restored).await;
         assert_eq!(
             status,
             StatusCode::CONFLICT,
@@ -44130,6 +44693,7 @@ mod tests {
         // The same reuse against a change this repository never materialized is
         // refused for the same reason: the echoed target is never trusted.
         let (status, body) = rollback_through_api(
+            &state,
             &app,
             reused,
             SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
@@ -44145,7 +44709,7 @@ mod tests {
         // with its own operation id reports what it published and commits
         // nothing further.
         let rollback_operation = kin_model::OperationId::new();
-        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        let (status, body) = rollback_through_api(&state, &app, rollback_operation, restored).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let first: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(first["mutated"], true);
@@ -44153,7 +44717,7 @@ mod tests {
         let published = branch_change(&state);
         assert_ne!(published, regression, "rollback published no change");
 
-        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        let (status, body) = rollback_through_api(&state, &app, rollback_operation, restored).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(

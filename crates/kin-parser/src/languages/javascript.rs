@@ -126,6 +126,36 @@ impl LanguageAdapter for JavaScriptAdapter {
             });
         }
 
+        let derived_members = super::javascript_dynamic::extract(&root, source, file_id);
+        if !derived_members.is_empty() {
+            let sites = derived_members
+                .iter()
+                .map(|site| {
+                    format!(
+                        "line {}: {} ({})",
+                        site.assignment.start_line + 1,
+                        source
+                            .get(site.generator.start_byte..site.generator.end_byte)
+                            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                            .unwrap_or("computed write")
+                            .lines()
+                            .next()
+                            .unwrap_or("computed write")
+                            .chars()
+                            .take(160)
+                            .collect::<String>(),
+                        site.conditions.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Some(module) = entities.iter_mut().find(|e| e.kind == EntityKind::Module) {
+                module.doc_summary = Some(format!(
+                    "{DYNAMIC_MEMBERS_DISCLOSURE_PREFIX}enumeration is not complete; {sites}"
+                ));
+            }
+        }
+
         owners.finish(&mut entities);
 
         // Build import lookup: local_name -> module_path
@@ -152,6 +182,7 @@ impl LanguageAdapter for JavaScriptAdapter {
 
         Ok(ParseOutput {
             entities,
+            derived_members,
             relations,
             imports,
             tests,
@@ -1874,6 +1905,23 @@ pub(super) fn js_method_owner(receiver_path: &str) -> Option<&str> {
         .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
         .then_some(base)
 }
+
+/// Lead-in text this adapter writes as a file's own [`EntityKind::Module`]
+/// entity's `doc_summary` when a bulk computed-member assignment inside a loop
+/// body -- `owner[loopVar] = value`, running once per element some loop hands
+/// `loopVar`, such as Express's
+/// `methods.forEach(function (method) { app[method] = ...; })` -- may create
+/// members this extraction could not read the names of.
+///
+/// A JS/TS file's module entity carries no doc comment of its own today: it is
+/// synthesized rather than read off a `comment` sibling the way a declaration's
+/// is, so `doc_summary` is unwritten for it everywhere else in this adapter.
+/// That makes this prefix's presence there unambiguous, and `list_file_entities`
+/// matches it exactly rather than inferring intent from prose, so a real
+/// file-level doc comment this adapter learns to read later cannot be mistaken
+/// for it as long as it does not open with the same words, which nothing
+/// legitimate would.
+pub const DYNAMIC_MEMBERS_DISCLOSURE_PREFIX: &str = "Kin dynamic members: ";
 
 /// Extract entities from a top-level assignment statement:
 /// `res.status = function status() {}`, `res.set = res.header = function() {}`,
@@ -4093,6 +4141,299 @@ const run = (a) => a + 1;
             .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
             .collect();
         assert_eq!(contains, vec![("View", "View.lookup")]);
+    }
+
+    /// Every minted `app.<method>` name, sorted, for the assertions below.
+    fn minted_method_names(output: &ParseOutput) -> Vec<String> {
+        let mut names: Vec<String> = output
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Method)
+            .map(|entity| entity.name.clone())
+            .collect();
+        for site in &output.derived_members {
+            if site.callable {
+                if let Some(owner) = &site.owner {
+                    for key in &site.keys {
+                        names.push(format!("{owner}.{key}"));
+                    }
+                }
+            }
+        }
+        names.sort_unstable();
+        names
+    }
+
+    /// The file's own `Module` entity's `doc_summary`, or `None` when it
+    /// carries none -- the disclosure this feature writes when a dynamic
+    /// loop site did not resolve.
+    fn module_doc_summary(output: &ParseOutput) -> Option<&str> {
+        output
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Module)
+            .and_then(|entity| entity.doc_summary.as_deref())
+    }
+
+    #[test]
+    fn parse_js_dynamic_literals_are_candidates_with_real_generator_evidence() {
+        let source = "var app = {}; app.init = function() {}; const methods = ['café', 'post']; methods.forEach(method => { app[method] = function(path) { return path; }; });";
+        let adapter = JavaScriptAdapter;
+        let tree = adapter.parse(source.as_bytes()).unwrap();
+        let output = adapter
+            .extract(&tree, source.as_bytes(), &FilePathId::new("test.js"))
+            .unwrap();
+        assert_eq!(
+            minted_method_names(&output),
+            vec!["app.café", "app.init", "app.post"]
+        );
+        assert!(!output.entities.iter().any(|e| e.name == "app.café"));
+        assert_eq!(output.derived_members.len(), 1);
+        let site = &output.derived_members[0];
+        assert!(source
+            .get(site.generator.start_byte..site.generator.end_byte)
+            .unwrap()
+            .starts_with("methods.forEach"));
+        assert!(source
+            .get(site.assignment.start_byte..site.assignment.end_byte)
+            .unwrap()
+            .starts_with("app[method]"));
+        assert!(module_doc_summary(&output).is_some());
+    }
+
+    #[test]
+    fn parse_js_dynamic_dependency_members_are_not_a_hardcoded_runtime_table() {
+        for binding in [
+            "var methods = require('methods');",
+            "import methods from 'methods';",
+        ] {
+            let source = format!(
+                "{binding} methods.forEach(method => {{ app[method] = function() {{}}; }});"
+            );
+            let adapter = JavaScriptAdapter;
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let output = adapter
+                .extract(&tree, source.as_bytes(), &FilePathId::new("test.js"))
+                .unwrap();
+            assert!(minted_method_names(&output).is_empty());
+            assert_eq!(output.derived_members.len(), 1);
+            assert!(output.derived_members[0]
+                .conditions
+                .iter()
+                .any(|c| c.contains("dependency_unresolved")));
+            assert!(module_doc_summary(&output).is_some());
+        }
+    }
+
+    #[test]
+    fn parse_js_dynamic_for_each_members_unresolved_opaque_expression_discloses_a_floor() {
+        // `dynamicMethods` is bound to a call this adapter cannot read
+        // through, so the list is not statically knowable: nothing is
+        // minted, and the file's module entity must carry the disclosure
+        // naming the loop rather than certifying the enumeration whole.
+        let adapter = JavaScriptAdapter;
+        let source = b"var app = {};\n\
+             var dynamicMethods = getMethodList();\n\
+             dynamicMethods.forEach(function (method) {\n\
+               app[method] = function (path) {\n\
+                 return this;\n\
+               };\n\
+             });\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/application.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(
+            minted_method_names(&output),
+            Vec::<&str>::new(),
+            "an unresolved list must mint nothing"
+        );
+        let disclosure = module_doc_summary(&output).expect("disclosure expected");
+        assert!(disclosure.starts_with(DYNAMIC_MEMBERS_DISCLOSURE_PREFIX));
+        assert!(disclosure.contains("dynamicMethods"));
+        assert!(disclosure.contains("enumeration is not complete"));
+    }
+
+    #[test]
+    fn parse_js_dynamic_members_a_let_bound_array_is_not_trusted() {
+        // The ticket's coverage rule names `const` specifically: a `let`
+        // binding to an array literal could be reassigned before this loop
+        // runs, so it is read the same as an opaque expression rather than
+        // minted.
+        let adapter = JavaScriptAdapter;
+        let source = b"var app = {};\n\
+             let methods = ['get', 'post'];\n\
+             methods.forEach(function (method) {\n\
+               app[method] = function (path) { return this; };\n\
+             });\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(minted_method_names(&output), Vec::<&str>::new());
+        assert!(module_doc_summary(&output).is_some());
+    }
+
+    #[test]
+    fn parse_js_dynamic_for_of_members_from_local_array_literal() {
+        let adapter = JavaScriptAdapter;
+        let source = b"var app = {};\n\
+             const methods = ['get', 'post'];\n\
+             for (const method of methods) {\n\
+               app[method] = function (path) { return this; };\n\
+             }\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(minted_method_names(&output), vec!["app.get", "app.post"]);
+        assert!(module_doc_summary(&output).is_some());
+    }
+
+    #[test]
+    fn parse_js_dynamic_for_in_over_an_opaque_object_discloses_a_floor() {
+        let adapter = JavaScriptAdapter;
+        let source = b"var app = {};\n\
+             for (const method in registry) {\n\
+               app[method] = function (path) { return this; };\n\
+             }\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(minted_method_names(&output), Vec::<&str>::new());
+        let disclosure = module_doc_summary(&output).expect("disclosure expected");
+        assert!(disclosure.contains("registry"));
+    }
+
+    #[test]
+    fn parse_js_dynamic_for_in_never_substitutes_array_values_for_enumerable_keys() {
+        for source in [
+            "var app = {}; for (const method in ['get', 'post']) { app[method] = function () {}; }",
+            "var app = {}; const methods = ['get', 'post']; for (const method in methods) { app[method] = function () {}; }",
+            "var app = {}; for (const method in {get: 1, post: 2}) { app[method] = function () {}; }",
+            "var app = {}; for (const method in registry) { app[method] = function () {}; }",
+        ] {
+            let adapter = JavaScriptAdapter;
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let output = adapter
+                .extract(&tree, source.as_bytes(), &FilePathId::new("test.js"))
+                .unwrap();
+            assert_eq!(
+                minted_method_names(&output),
+                Vec::<&str>::new(),
+                "enumerable keys, including inherited keys, are not proven by values: {source}"
+            );
+            assert!(
+                module_doc_summary(&output)
+                    .is_some_and(|note| note.starts_with(DYNAMIC_MEMBERS_DISCLOSURE_PREFIX)),
+                "an unproven enumerable-key set must retain the coverage gap: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_js_dynamic_for_in_nested_and_multiple_assignments_retain_coverage_gap() {
+        for source in [
+            "for (const key in registry) { if (enabled) app[key] = function () {}; }",
+            "function install(registry) { for (const key in registry) { app[key] = function () {}; } }",
+            "for (const key in ['get']) { app[key] = function () {}; router[key] = function () {}; }",
+            "for (const key in registry) { app[normalize(key)] = function () {}; }",
+        ] {
+            let adapter = JavaScriptAdapter;
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let output = adapter
+                .extract(&tree, source.as_bytes(), &FilePathId::new("test.js"))
+                .unwrap();
+            assert_eq!(minted_method_names(&output), Vec::<&str>::new(), "{source}");
+            assert!(
+                module_doc_summary(&output)
+                    .is_some_and(|note| note.starts_with(DYNAMIC_MEMBERS_DISCLOSURE_PREFIX)),
+                "computed assignments remain uncertain wherever the loop is nested: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_js_dynamic_for_in_preserves_static_methods_and_their_real_source_spans() {
+        let source = "const obj = { ready() { return markReady(); } };\n\
+                      app.staticMethod = function () { return 'static'; };\n\
+                      for (const key in ['café', 'post']) {\n\
+                        app[key] = function () { return 'dynamique'; };\n\
+                      }\n";
+        let adapter = JavaScriptAdapter;
+        let tree = adapter.parse(source.as_bytes()).unwrap();
+        let output = adapter
+            .extract(&tree, source.as_bytes(), &FilePathId::new("test.js"))
+            .unwrap();
+        assert_eq!(
+            minted_method_names(&output),
+            vec!["app.staticMethod", "obj.ready"]
+        );
+        for (name, expected_body) in [
+            (
+                "app.staticMethod",
+                "app.staticMethod = function () { return 'static'; };",
+            ),
+            ("obj.ready", "ready() { return markReady(); }"),
+        ] {
+            let entity = output
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap();
+            assert_eq!(
+                source.get(entity.span.start_byte..entity.span.end_byte),
+                Some(expected_body),
+                "a remaining method must retain its real, UTF-8-valid implementation span"
+            );
+        }
+        assert!(module_doc_summary(&output).is_some());
+    }
+
+    #[test]
+    fn parse_js_dynamic_counting_for_members_from_local_array_literal() {
+        // `for (var i = 0; i < methods.length; i++) { app[methods[i]] = ...; }`
+        // -- the plain index-counting shape the ticket names alongside
+        // `forEach`/`map`/`for...of`/`for...in`.
+        let adapter = JavaScriptAdapter;
+        let source = b"var app = {};\n\
+             const methods = ['get', 'post'];\n\
+             for (var i = 0; i < methods.length; i++) {\n\
+               app[methods[i]] = function (path) { return this; };\n\
+             }\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(minted_method_names(&output), vec!["app.get", "app.post"]);
+        assert!(module_doc_summary(&output).is_some());
+    }
+
+    #[test]
+    fn parse_js_dynamic_members_keeps_disclosure_beside_a_resolved_site() {
+        // Two sites in one file, one resolved and one not: the resolved
+        // site's members must still mint, and the file must still disclose a
+        // floor for the one that did not, per the ticket's own "keep the
+        // disclosure when only part of the list is knowable".
+        let adapter = JavaScriptAdapter;
+        let source = b"var app = {};\n\
+             var admin = {};\n\
+             const methods = ['get', 'post'];\n\
+             methods.forEach(function (method) {\n\
+               app[method] = function (path) { return this; };\n\
+             });\n\
+             var adminMethods = loadAdminMethods();\n\
+             adminMethods.forEach(function (method) {\n\
+               admin[method] = function (path) { return this; };\n\
+             });\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(minted_method_names(&output), vec!["app.get", "app.post"]);
+        let disclosure = module_doc_summary(&output).expect("disclosure expected");
+        assert!(disclosure.contains("adminMethods"));
     }
 
     #[test]

@@ -1752,6 +1752,7 @@ fn record_source_edit(
     existing: Entity,
     body: &[u8],
 ) -> Result<(), String> {
+    kin_model::require_independent_source(&existing)?;
     if !edited_entities.insert(existing.id) {
         return Err(format!(
             "entity {} is edited more than once in one transaction; overlapping source authority is ambiguous",
@@ -5697,6 +5698,56 @@ pub(crate) mod tests {
             )]),
             None,
         )
+    }
+
+    #[test]
+    fn derived_member_edit_refusal_preserves_generator_and_siblings() {
+        let (_dir, state) = test_state();
+        let source =
+            "export const app = {}; for (const key of ['get','post']) { app[key] = () => 1; }";
+        let (candidate, _) =
+            install_exact_source(&state, "src/members.js", source.as_bytes(), "app.get");
+        assert!(candidate.span.is_none());
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "test", "derived-member-edit");
+        let result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &session.session_id.to_string(),
+            &candidate,
+            "() => 2",
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(&result).contains("generator"),
+            "{}",
+            result_text(&result)
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.layout.working_dir().join("src/members.js")).unwrap(),
+            source
+        );
+        let base = load_native_commit_base(&state.layout).unwrap();
+        let mut legacy = candidate.clone();
+        let derivation = kin_model::entity_derivation(&legacy).unwrap().unwrap();
+        legacy
+            .metadata
+            .extra
+            .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+        legacy.span = Some(derivation.generator);
+        legacy.doc_summary = Some(
+            "Derived from a loop over `keys`; no literal `app.get` assignment appears in source."
+                .into(),
+        );
+        let mut edits = BTreeMap::new();
+        let mut edited = HashSet::new();
+        assert!(
+            record_source_edit(&mut edits, &mut edited, &base, legacy, b"() => 2")
+                .unwrap_err()
+                .contains("legacy derived member")
+        );
+        assert!(edits.is_empty());
+        assert!(edited.is_empty());
     }
 
     /// An agent's commit has to be attributable afterwards, by name.

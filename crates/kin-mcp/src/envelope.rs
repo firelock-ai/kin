@@ -1765,8 +1765,21 @@ fn merge_file_coverage_classes(
     // declined, and not the same as `not_applicable`, which is a checkout that is
     // a projection of graph truth and has no divergence to have.
     let bytes_unchecked = host_bytes == Some("unchecked");
+    // The bulk computed-member-loop disclosure: the
+    // extractor read a `obj[loopVar] = ...` site inside a loop whose iterated
+    // list it could not read statically, so real members exist that this
+    // enumeration never saw. A `full` parse is not a present class over that,
+    // the same way it is not one over a stale span: the handler's own
+    // `certifies_enumeration` already refuses for the identical reason, and
+    // this is that refusal read back into one class rather than a second,
+    // disagreeing computation of it.
+    let dynamic_members_disclosed = coverage
+        .and_then(|coverage| coverage.get("dynamic_members_disclosed"))
+        .and_then(Value::as_bool)
+        == Some(true);
     let raw_parsed = parsed;
-    let parsed = if spans_stale || bytes_unadmitted || bytes_unchecked {
+    let parsed = if spans_stale || bytes_unadmitted || bytes_unchecked || dynamic_members_disclosed
+    {
         STATE_ABSENT
     } else {
         parsed
@@ -1809,6 +1822,12 @@ fn merge_file_coverage_classes(
                 None => format!("file_parsed_{raw_parsed}"),
             },
         );
+    } else if dynamic_members_disclosed {
+        // Named only once the parse itself is healthy, so a file that both
+        // failed to parse and disclosed a dynamic-members site reports the
+        // parse failure a reader can act on first rather than a floor that
+        // would still apply after they fixed it.
+        limits.push("file_dynamic_members_disclosed".to_string());
     }
 
     let enriched = match coverage
@@ -1865,6 +1884,10 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
         .and_then(Value::as_str);
     let bytes_unadmitted = host_bytes == Some("diverged");
     let bytes_unchecked = host_bytes == Some("unchecked");
+    let dynamic_members_disclosed = coverage
+        .and_then(|coverage| coverage.get("dynamic_members_disclosed"))
+        .and_then(Value::as_bool)
+        == Some(true);
 
     let mut counted = json!({
         "unit": "entities_in_file",
@@ -1891,6 +1914,12 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
         counted["floor_reason"] = json!("file_bytes_unchecked");
     } else if spans_stale {
         counted["floor_reason"] = json!("file_spans_stale");
+    } else if dynamic_members_disclosed {
+        // A `full` parse with a disclosed dynamic-members site: express's own
+        // case, where every OTHER floor here reads healthy and the count is
+        // still short by however many `methods.forEach(...)` minted no member
+        // for because it could not read the list.
+        counted["floor_reason"] = json!("file_dynamic_members_disclosed");
     } else if shifted {
         counted["floor_reason"] = json!("enumeration_shifted");
     } else if !whole_file {
@@ -4255,6 +4284,124 @@ mod tests {
         assert_ne!(state_of(&admitted), state_of(&unchecked));
         assert_ne!(state_of(&unobserved), state_of(&unchecked));
         assert_ne!(state_of(&not_applicable), state_of(&unchecked));
+    }
+
+    /// A bulk computed-member-loop disclosure, express's own case, reaches
+    /// the one verdict, not just the handler's own `certifies_enumeration`
+    /// flag.
+    ///
+    /// Every field here reads exactly as healthy as `admitted` above except
+    /// `dynamic_members_disclosed`: the graph is healthy, the parse is full,
+    /// the spans are digest verified, and the host bytes are admitted. If
+    /// this test passed with the assertions swapped, the handler's own gate
+    /// would be the only thing standing between a caller and a certified
+    /// verdict over a floor.
+    #[test]
+    fn a_dynamic_members_disclosure_reaches_the_verdict_as_inconclusive() {
+        let health = serde_json::json!({
+            "graph_entity_count": 21,
+            "durable_entity_count": 21,
+            "graph_relation_count": 21,
+            "durable_relation_count": 21,
+            "reconciliation_status": "idle",
+            "graph_loaded": true,
+            "initialized": true,
+        });
+        let note = "Kin dynamic members: members are created at runtime from `methods`; the \
+                    enumeration is not complete";
+        let reading_of = |disclosed: bool| -> Value {
+            let payload = serde_json::json!({
+                "path": "lib/application.js",
+                "entities": [],
+                "returned": 21,
+                "total_in_file": 21,
+                "page_size": 200,
+                "offset": 0,
+                "next_cursor": Value::Null,
+                "truncated": false,
+                "enumeration_shifted": false,
+                crate::handlers::file_entities::FILE_COVERAGE_KEY: {
+                    "path": "lib/application.js",
+                    "tracked_in_graph": true,
+                    "tier": "entity_source",
+                    "content_opaque": false,
+                    "opaque_reason": Value::Null,
+                    "parsed": "full",
+                    "parse_detail": Value::Null,
+                    "layout_entity_regions": 21,
+                    "enriched": "absent",
+                    "embedded": "not_measured_per_file",
+                    "span_provenance": "digest_verified",
+                    "stale_spans": 0,
+                    "host_bytes": "admitted",
+                    "whole_file_in_response": true,
+                    "dynamic_members_disclosed": disclosed,
+                    "dynamic_members_note": if disclosed { serde_json::json!(note) } else { Value::Null },
+                    // The handler's own gate, computed the same way the real
+                    // handler computes it: healthy on every other reading, and
+                    // refusing on this one alone.
+                    "certifies_enumeration": !disclosed,
+                },
+            });
+            envelope_of(&finalize(
+                ToolCallResult::text(payload.to_string()),
+                Envelope::daemon().with_health(&health),
+                crate::handlers::file_entities::TOOL_NAME,
+            ))
+        };
+
+        let certified = reading_of(false);
+        assert_eq!(
+            certified["verdict"]["state"],
+            serde_json::json!("certified")
+        );
+        assert_eq!(
+            certified["completeness"]["classes"]["file_parsed"],
+            serde_json::json!(STATE_PRESENT)
+        );
+        assert_eq!(
+            certified["completeness"]["counted"]["exact"],
+            serde_json::json!(true)
+        );
+
+        let disclosed = reading_of(true);
+        assert_eq!(
+            disclosed["verdict"]["state"],
+            serde_json::json!("inconclusive"),
+            "a disclosed dynamic-members site must not carry a certified verdict: {disclosed:#?}"
+        );
+        let factor = disclosed["verdict"]["limiting_factor"]
+            .as_str()
+            .expect("an inconclusive verdict names its factor");
+        assert!(
+            factor.contains("substrate_partial"),
+            "the completeness input's own code names the substrate reading: {factor:?}"
+        );
+        assert_eq!(
+            disclosed["completeness"]["classes"]["file_parsed"],
+            serde_json::json!(STATE_ABSENT)
+        );
+        assert!(
+            disclosed["completeness"]["limits"]
+                .as_array()
+                .expect("limits")
+                .iter()
+                .any(|limit| limit == "file_dynamic_members_disclosed"),
+            "the limit names the disclosure: {:#?}",
+            disclosed["completeness"]
+        );
+        assert_eq!(
+            disclosed["completeness"]["counted"]["floor_reason"],
+            serde_json::json!("file_dynamic_members_disclosed")
+        );
+        assert_eq!(
+            disclosed["completeness"]["counted"]["exact"],
+            serde_json::json!(false),
+            "the count must read as a floor, not as the file's whole surface: {:#?}",
+            disclosed["completeness"]["counted"]
+        );
+
+        assert_ne!(certified["verdict"]["state"], disclosed["verdict"]["state"]);
     }
 
     /// A tool that changes state carries the minimal envelope, and a read keeps

@@ -4021,6 +4021,7 @@ fn entity_kind_label(kind: EntityKind) -> &'static str {
         EntityKind::File => "file",
         EntityKind::DocumentNode => "document_node",
         EntityKind::Method => "method",
+        EntityKind::Field => "field",
         EntityKind::EnumDef => "enum",
         EntityKind::EnumVariant => "enum_variant",
         EntityKind::Constant => "constant",

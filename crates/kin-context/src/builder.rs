@@ -770,6 +770,12 @@ pub(crate) fn source_projection(
     remaining_tokens: usize,
     report: &mut ProjectionReport,
 ) -> Result<Option<String>> {
+    if let Err(reason) = kin_model::require_independent_source(entity) {
+        report.full_bodies.remove(&entity.id);
+        report.budget_withheld.remove(&entity.id);
+        report.downgrades.insert(entity.id, reason);
+        return Ok(None);
+    }
     let reason = match provider.full_body(entity, limits)? {
         BodyCandidate::Exact { body } => {
             if body.len() > limits.max_candidate_bytes.min(limits.max_retained_bytes) {
@@ -1068,20 +1074,27 @@ fn build_context_pack_inner<G: GraphStore>(
         .map_err(|e| ContextError::Graph(e.to_string()))?
         .ok_or_else(|| ContextError::EntityNotFound(focal_id.to_string()))?;
 
-    let (focal_content, focal_level) = if let Some(source) = provider.as_deref_mut() {
-        match source_projection(source, &focal, limits, budget_max, &mut projections)? {
-            Some(body) => {
-                retained_body_bytes += body.len();
-                (body, ProjectionLevel::FullBody)
-            }
-            None => (
+    let (focal_content, focal_level) =
+        if let Err(reason) = kin_model::require_independent_source(&focal) {
+            projections.downgrades.insert(focal.id, reason);
+            (
                 project_signature_only(&focal),
                 ProjectionLevel::SignatureOnly,
-            ),
-        }
-    } else {
-        (project_full_body(&focal), ProjectionLevel::FullBody)
-    };
+            )
+        } else if let Some(source) = provider.as_deref_mut() {
+            match source_projection(source, &focal, limits, budget_max, &mut projections)? {
+                Some(body) => {
+                    retained_body_bytes += body.len();
+                    (body, ProjectionLevel::FullBody)
+                }
+                None => (
+                    project_signature_only(&focal),
+                    ProjectionLevel::SignatureOnly,
+                ),
+            }
+        } else {
+            (project_full_body(&focal), ProjectionLevel::FullBody)
+        };
     let focal_tokens = estimate_tokens(&focal_content);
     total_tokens += focal_tokens;
     let focal_entry = ContextEntry {
@@ -1997,6 +2010,9 @@ pub const FULL_BODY_PROJECTION_NAME: &str = "header_and_signature";
 pub const SERVED_BODY_PROJECTION_NAME: &str = "full_body";
 
 pub(crate) fn project_full_body(entity: &Entity) -> String {
+    if let Some(disclosure) = derived_member_projection(entity) {
+        return disclosure;
+    }
     let mut content = String::new();
     content.push_str(&format!(
         "// {} ({:?}, {})\n",
@@ -2011,6 +2027,9 @@ pub(crate) fn project_full_body(entity: &Entity) -> String {
 }
 
 pub(crate) fn project_signature_only(entity: &Entity) -> String {
+    if let Some(disclosure) = derived_member_projection(entity) {
+        return disclosure;
+    }
     let mut content = String::new();
     content.push_str(&entity.signature);
     if let Some(ref summary) = entity.doc_summary {
@@ -2021,10 +2040,19 @@ pub(crate) fn project_signature_only(entity: &Entity) -> String {
 }
 
 pub(crate) fn project_name_and_kind(entity: &Entity) -> String {
+    if let Some(disclosure) = derived_member_projection(entity) {
+        return disclosure;
+    }
     format!(
         "{} ({:?}): {}\n",
         entity.name, entity.kind, entity.signature
     )
+}
+
+fn derived_member_projection(entity: &Entity) -> Option<String> {
+    kin_model::require_independent_source(entity)
+        .err()
+        .map(|reason| format!("// derived member: {reason}\n"))
 }
 
 fn format_work_item(item: &kin_model::WorkItem) -> String {
@@ -2073,6 +2101,95 @@ mod tests {
 
     struct BoundedProvider {
         calls: Vec<usize>,
+    }
+
+    fn derived_context_entity(malformed: bool) -> Entity {
+        let mut entity = make_entity("app.get", EntityKind::Method);
+        if malformed {
+            entity.metadata.extra.insert(
+                kin_model::derivation::ENTITY_DERIVATION_KEY.into(),
+                serde_json::json!({"schema": "unknown"}),
+            );
+        } else {
+            entity.doc_summary =
+                Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        }
+        entity
+    }
+
+    struct NoDerivedBodyProvider;
+
+    impl ContextProjectionProvider for NoDerivedBodyProvider {
+        fn full_body(&mut self, _: &Entity, _: ProjectionLimits) -> crate::Result<BodyCandidate> {
+            panic!("a derived member cannot be probed as an independent body");
+        }
+    }
+
+    #[test]
+    fn derived_member_single_context_never_probes_or_labels_an_independent_body() {
+        for malformed in [false, true] {
+            let graph = kin_db::InMemoryGraph::new();
+            let entity = derived_context_entity(malformed);
+            graph.upsert_entity(&entity).unwrap();
+            let plain = build_context_pack(&graph, &entity.id, &ContextOptions::default()).unwrap();
+            assert_ne!(
+                plain.focal_entities[0].projection_level,
+                ProjectionLevel::FullBody
+            );
+            assert!(plain.focal_entities[0].content.contains("derived"));
+            let (pack, _, report) = build_context_pack_with_provider(
+                &graph,
+                &entity.id,
+                &ContextOptions::default(),
+                &mut NoDerivedBodyProvider,
+                ProjectionLimits::default(),
+                true,
+                |pack, _, _| Ok(estimate_tokens(&serde_json::to_string(pack).unwrap())),
+            )
+            .unwrap();
+            assert_ne!(
+                pack.focal_entities[0].projection_level,
+                ProjectionLevel::FullBody
+            );
+            assert!(report.full_bodies.is_empty());
+            assert!(report.downgrades.contains_key(&entity.id));
+            assert!(report.budget_withheld.is_empty());
+        }
+    }
+
+    #[test]
+    fn derived_member_multi_context_never_probes_or_labels_an_independent_body() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entities = [derived_context_entity(false), derived_context_entity(true)];
+        for entity in &entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let ids: Vec<_> = entities.iter().map(|entity| entity.id).collect();
+        let opts = crate::multi::MultiFocalOptions::default();
+        let (plain, _) = crate::multi::build_multi_focal_pack(&graph, &ids, &opts).unwrap();
+        assert_eq!(plain.focal_entities.len(), 2);
+        assert!(plain
+            .focal_entities
+            .iter()
+            .all(|entry| entry.projection_level != ProjectionLevel::FullBody
+                && entry.content.contains("derived")));
+        let (pack, _, report) = crate::multi::build_multi_focal_pack_with_provider(
+            &graph,
+            &ids,
+            &opts,
+            &mut NoDerivedBodyProvider,
+            ProjectionLimits::default(),
+            |pack, _, _| Ok(estimate_tokens(&serde_json::to_string(pack).unwrap())),
+        )
+        .unwrap();
+        assert_eq!(pack.focal_entities.len(), 2);
+        assert!(pack
+            .focal_entities
+            .iter()
+            .all(|entry| entry.projection_level != ProjectionLevel::FullBody));
+        assert_eq!(report.downgrades.len(), 2);
+        assert!(report.full_bodies.is_empty());
+        assert!(report.budget_withheld.is_empty());
     }
     impl ContextProjectionProvider for BoundedProvider {
         fn full_body(

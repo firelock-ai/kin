@@ -390,6 +390,7 @@ impl LanguageAdapter for PythonAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,

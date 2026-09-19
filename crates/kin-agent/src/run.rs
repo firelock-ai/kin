@@ -36,6 +36,14 @@ mcp__kin__semantic_search to find things by meaning, use mcp__kin__get_context_p
 mcp__kin__get_entity_source to read exact source, and use mcp__kin__find_references or \
 mcp__kin__trace_data_flow to follow relationships.
 
+Reach for mcp__kin__lexical_lookup when the question names an exact identifier, string, or \
+symbol to find, or when mcp__kin__find_references or mcp__kin__trace_data_flow answered with \
+an inconclusive verdict for the entity you asked about. Resolve the entity first as usual, \
+then call mcp__kin__lexical_lookup with that bare token, not a sentence describing it: it \
+matches stored graph fields literally. A hit there is lexical evidence, never a \
+resolved reference, so mcp__kin__find_references stays the answer of record whenever it \
+certifies.
+
 When a Kin result is empty, read what Kin says about that emptiness. If it reports the \
 absence cannot be trusted, the honest answer is that you do not know, and you should say \
 what the gap is. Never turn an untrusted absence into a claim that something does not exist.

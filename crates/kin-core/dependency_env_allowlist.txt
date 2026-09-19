@@ -43,6 +43,11 @@ KIN_EMBED_FLOOR_GRACE_SECS
 # than a read shape, so it also sees names that exist only inside a dependency's
 # own `#[cfg(test)]` module. These never reach a kin process.
 
+# kin-db storage/repository.rs: selects the bounded frozen-history recovery
+# subprocess and passes its parent-owned temporary directory. The read exists
+# only in the dependency's own test module, not in production recovery.
+KIN_DB_FROZEN_RECOVERY_CHILD
+
 # kin-infer resource.rs: the deliberately-absent name its env_flag_override test
 # asserts parses to None.
 KIN_INFER_NONEXISTENT_FLAG_XYZ

@@ -8,7 +8,7 @@ Kin is pre-1.0 and the command surface moves. Where this page and your build dis
 
 Descriptions are the command's own help text. A `--json` flag switches that command to machine-readable output. Angle brackets mark a required argument, square brackets an optional one, and a trailing `...` an argument that takes the rest of the line.
 
-84 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
+84 commands are documented below. 5 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `revert`, `semantic-only-guard`) are hidden from `kin --help` because they are not part of the supported surface. `revert` specifically refuses on purpose and names `rollback` instead, so typing it out of Git habit gets that explanation rather than a real command.
 
 `kin capabilities` prints the readiness matrix for the Git-replacement command set, and `kin capabilities --json` gives the same inventory to a machine. Reach for it before scripting against a command you have not used.
 
@@ -825,7 +825,9 @@ kin stash list [options]
 
 ### `kin rollback`
 
-Publish an exact restoration of a previous change
+Publish a new change restoring an earlier change's complete content
+
+This is not a single-change undo. Later changes remain in immutable history, but their effects are removed from the working view. Unless the target already is the tip, `--discard-later` must accept restoring its complete content, including when the bounded preview cannot count later changes. If repository or workspace authority changes after the preview, rollback refuses; run it again to preview the current state. Restore the previous tip's content with another rollback using `--discard-later`; the output names that command.
 
 ```
 kin rollback [change-id] [options]
@@ -833,11 +835,12 @@ kin rollback [change-id] [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `[change-id]` | no | Change ID to rollback to. Omit when naming a work item with --feature. |
+| `[change-id]` | no | Change whose complete content the new restoring change will carry. Omit when naming a work item with --feature. |
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--feature <feature>` |  | Roll back every change the named work item records |
+| `--discard-later` |  | Accept replacing current content, even when the preview count is unknown |
 
 ### `kin tag`
 

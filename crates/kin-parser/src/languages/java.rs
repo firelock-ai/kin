@@ -84,6 +84,7 @@ impl LanguageAdapter for JavaAdapter {
         extract_java_tests(&root, source, &mut tests);
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,

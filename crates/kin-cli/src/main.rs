@@ -1223,15 +1223,30 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Publish an exact restoration of a previous change
-    #[command(visible_alias = "revert")]
+    /// Publish a new change restoring an earlier change's complete content
+    ///
+    /// This is not a single-change undo. Later changes remain in immutable
+    /// history, but their effects are removed from the working view. Unless
+    /// the target already is the tip, --discard-later must accept restoring
+    /// its complete content. Restore the previous tip's content with another
+    /// rollback using --discard-later; the output names that command.
     Rollback {
-        /// Change ID to rollback to. Omit when naming a work item with --feature.
+        /// Change whose complete content the new restoring change will carry.
+        /// Omit when naming a work item with --feature.
         #[arg(required_unless_present = "feature", conflicts_with = "feature")]
         change_id: Option<String>,
         /// Roll back every change the named work item records
         #[arg(long)]
         feature: Option<String>,
+        /// Accept replacing current content, even when the preview count is unknown
+        #[arg(long)]
+        discard_later: bool,
+    },
+    /// No single-change undo; rollback publishes a complete restoration
+    #[command(hide = true)]
+    Revert {
+        /// Ignored; kin has no revert. See the refusal this prints.
+        change_id: Option<String>,
     },
     /// Run benchmarks (delegates to kin-bench binary)
     Bench {
@@ -4347,10 +4362,15 @@ fn run() -> Result<()> {
                     commands::capabilities::require_ready("tag")?;
                     commands::tag::run(tag, require_proof, require_approval, force).await
                 }
-                Command::Rollback { change_id, feature } => {
+                Command::Rollback {
+                    change_id,
+                    feature,
+                    discard_later,
+                } => {
                     commands::capabilities::require_ready("rollback")?;
-                    commands::rollback::run(change_id, feature).await
+                    commands::rollback::run(change_id, feature, discard_later).await
                 }
+                Command::Revert { .. } => commands::rollback::refuse_revert(),
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate { source, target } => commands::migrate::run(source, target).await,
                 Command::Cache { action } => match action {
@@ -6310,6 +6330,7 @@ mod tests {
                 Command::Rollback {
                     change_id: None,
                     feature: Some(ref work_id),
+                    ..
                 } if work_id == "some-work-id"
             ));
 
@@ -6320,8 +6341,51 @@ mod tests {
                 Command::Rollback {
                     change_id: Some(ref change),
                     feature: None,
+                    ..
                 } if change == "abc123"
             ));
+        });
+    }
+
+    /// `--discard-later` is off by default, and naming it does not need a
+    /// change id in the same slot the flag itself occupies.
+    #[test]
+    fn rollback_discard_later_flag_parses_and_defaults_off() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["kin", "rollback", "abc123"])
+                .expect("a bare change id stays a complete rollback invocation");
+            assert!(matches!(
+                cli.command,
+                Command::Rollback {
+                    discard_later: false,
+                    ..
+                }
+            ));
+
+            let cli = Cli::try_parse_from(["kin", "rollback", "abc123", "--discard-later"])
+                .expect("the flag stays a complete rollback invocation");
+            assert!(matches!(
+                cli.command,
+                Command::Rollback {
+                    discard_later: true,
+                    ..
+                }
+            ));
+        });
+    }
+
+    /// `revert` used to be a `rollback` alias that suggested a single-change
+    /// undo. It is its own command now, so a Git habit reaches a refusal
+    /// that names rollback instead of running rollback's destructive path
+    /// under a misleading name.
+    #[test]
+    fn revert_is_its_own_command_not_a_rollback_alias() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["kin", "revert", "abc123"])
+                .expect("revert parses on its own so it can explain itself");
+            assert!(
+                matches!(cli.command, Command::Revert { change_id: Some(ref id) } if id == "abc123")
+            );
         });
     }
 

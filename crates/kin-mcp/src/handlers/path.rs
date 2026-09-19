@@ -920,9 +920,8 @@ fn containment_closure<G: GraphStore>(
     for _ in 0..CONTAINMENT_DEPTH {
         let mut next = Vec::new();
         'frontier: for node in frontier.drain(..) {
-            let relations = store
-                .get_all_relations_for_entity(&node)
-                .map_err(graph_error)?;
+            let relations =
+                kin_index::relation_read::relations_for_read(store, &node).map_err(graph_error)?;
             for relation in relations {
                 meter.charge_edge();
                 if relation.kind != RelationKind::Contains || relation.src.as_entity() != Some(node)
@@ -1063,8 +1062,7 @@ fn walk_outgoing<G: GraphStore>(
                     ceiling = Some(reason);
                     break 'level;
                 }
-                let relations = store
-                    .get_all_relations_for_entity(node)
+                let relations = kin_index::relation_read::relations_for_read(store, node)
                     .map_err(graph_error)?;
                 nodes += 1;
                 for relation in &relations {

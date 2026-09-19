@@ -505,7 +505,8 @@ semantic_search (or any traversal) has handed you its ID — no need to open the
 and hunt for line numbers yourself. It returns just the focal entity's body, so it is \
 the most economical way to inspect a single function/method/class; when you also need \
 the surrounding callers, callees, and imports, use get_context_pack or trace_data_flow \
-instead so you don't have to call this repeatedly.";
+instead so you don't have to call this repeatedly. Derived candidates have no independent \
+body or edit base; their validated shared generator is returned separately as generator_source.";
 
 pub const GET_ENTITY_BODY_DESC: &str = "\
 Alias for get_entity_source — same behavior and return shape. Provided so that whichever \
@@ -524,6 +525,16 @@ pub fn handle_get_entity_source<G: GraphStore>(
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
             let held = HeldSourceAuthority::new(store, repository_authority);
+            if let Some(value) = derived_entity_source_at(
+                &held,
+                &entity,
+                EntitySourceScope::WorkspaceHead,
+                1_000_000,
+            )? {
+                return Ok(ToolCallResult::text(
+                    serde_json::to_string_pretty(&value).map_err(McpError::Json)?,
+                ));
+            }
             let exact_source = read_entity_source_exact(&held, &entity, 1_000_000)?
                 .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let source_base =
@@ -556,6 +567,29 @@ pub fn handle_get_entity_source<G: GraphStore>(
     }
 }
 
+/// Resolve a candidate's generator separately from an independently editable body.
+/// A legacy or malformed candidate remains useful metadata with an explicit gap.
+pub fn derived_entity_source_at<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &kin_model::Entity,
+    scope: EntitySourceScope,
+    max_bytes: usize,
+) -> Result<Option<serde_json::Value>> {
+    let Some(fields) = derived_member_fields(entity) else {
+        return Ok(None);
+    };
+    let mut value = serde_json::to_value(entity).map_err(McpError::Json)?;
+    value
+        .as_object_mut()
+        .expect("entity object")
+        .extend(fields.as_object().expect("object").clone());
+    match derived_generator_source_at(held, entity, max_bytes, scope) {
+        Ok(generator) => value["generator_source"] = generator,
+        Err(error) => value["generator_source_unavailable"] = serde_json::json!(error.to_string()),
+    }
+    Ok(Some(value))
+}
+
 pub const GET_ENTITY_SOURCES_DESC: &str = "\
 Return the source bodies for many entities in one budgeted call — the batch form of \
 get_entity_source. Hand it a list of entity IDs (up to 50, in priority order) and it \
@@ -570,7 +604,8 @@ compact=true for signature-only rows when you only need to confirm shape, and \
 max_lines_per_body / max_bytes_per_body to bound each body. One bad ID never fails the \
 batch — an unresolved ID returns its own row with reason=\"not_found\" or \"no_source\". \
 Prefer get_context_pack when you need one entity plus its neighborhood rather than a \
-flat set of bodies.";
+flat set of bodies. Derived candidates retain body=null; separately named generator_source \
+bytes use the same batch budget and bounds, with body_complete=false when clipped.";
 
 /// Upper bound on IDs per `get_entity_sources` call. Smaller than
 /// `bulk_check_references`' 200 because each row can carry a full source body,
@@ -619,6 +654,8 @@ pub struct EntitySourceRow {
 pub enum ResolvedEntitySource {
     /// The entity resolved and its source body was read from graph truth.
     Found(EntitySourceRow),
+    /// Candidate metadata with a separately budgeted shared generator, never a member body.
+    Derived { value: serde_json::Value },
     /// The ID did not resolve (invalid, stale, or not a UUID). Non-retryable.
     NotFound { id: String, message: String },
     /// The ID resolved but no source body could be served.
@@ -780,6 +817,51 @@ pub fn assemble_entity_sources_response(
                     None => results.push(source_row_json(&row, Some(body.as_str()), false, None)),
                 }
             }
+            ResolvedEntitySource::Derived { mut value } => {
+                let mut generator = value
+                    .as_object_mut()
+                    .expect("entity object")
+                    .remove("generator_source");
+                let body = generator
+                    .as_ref()
+                    .and_then(|generator| generator.get("body"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(body) = body {
+                    returned += 1;
+                    if opts.compact {
+                        value["omitted"] = serde_json::json!(false);
+                    } else {
+                        let clamped = clamp_source_body(
+                            body,
+                            opts.max_lines_per_body,
+                            opts.max_bytes_per_body,
+                        );
+                        let tokens = kin_context::estimate_tokens(&clamped);
+                        if budget_exhausted
+                            || opts
+                                .token_budget
+                                .is_some_and(|budget| budget_used.saturating_add(tokens) > budget)
+                        {
+                            budget_exhausted = true;
+                            truncated = true;
+                            value["omitted"] = serde_json::json!(true);
+                            value["reason"] = serde_json::json!("budget");
+                        } else {
+                            budget_used = budget_used.saturating_add(tokens);
+                            let complete = clamped == body;
+                            let generator = generator.as_mut().expect("generator with body");
+                            generator["body"] = serde_json::json!(clamped);
+                            generator["body_complete"] = serde_json::json!(complete);
+                            value["generator_source"] = generator.clone();
+                            value["omitted"] = serde_json::json!(false);
+                        }
+                    }
+                } else {
+                    value["omitted"] = serde_json::json!(true);
+                    value["reason"] = serde_json::json!("no_source");
+                }
+                results.push(value);
+            }
             ResolvedEntitySource::NotFound { id, message } => {
                 results.push(serde_json::json!({
                     "id": id,
@@ -834,6 +916,21 @@ fn resolve_entity_source_generic<G: GraphStore>(
     };
     match store.get_entity(&entity_id) {
         Ok(Some(entity)) => {
+            match derived_entity_source_at(
+                held,
+                &entity,
+                EntitySourceScope::WorkspaceHead,
+                1_000_000,
+            ) {
+                Ok(Some(value)) => return ResolvedEntitySource::Derived { value },
+                Err(error) => {
+                    return ResolvedEntitySource::NoSource {
+                        id: id.to_string(),
+                        message: error.to_string(),
+                    }
+                }
+                Ok(None) => {}
+            }
             match read_entity_source_excerpt_detailed_held(
                 held,
                 &entity,
@@ -3827,9 +3924,9 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
         }
 
         let mut reference_count = 0usize;
+        let mut derived_candidate_count = 0usize;
         let mut matched_kinds: Vec<RelationKind> = Vec::new();
-        for rel in store
-            .get_all_relations_for_entity(&entity_id)
+        for rel in kin_index::relation_read::relations_for_read(store, &entity_id)
             .map_err(McpError::graph)?
         {
             let Some(src_entity_id) = rel.src.as_entity() else {
@@ -3842,6 +3939,10 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
                 continue;
             }
             if src_entity_id == entity_id {
+                continue;
+            }
+            if kin_index::resolution::is_derived_member_candidate(&rel) {
+                derived_candidate_count += 1;
                 continue;
             }
             reference_count += 1;
@@ -3915,8 +4016,9 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             !relation_subtype_complete && entity_federated_reference_count > 0;
         saw_unknown_federated_subtype |= federated_count_incomplete;
         let federated_subtype_unknown = federated_count_incomplete && !known_positive;
-        let reference_count_complete =
-            entity_cross_repo_authority_complete && !federated_count_incomplete;
+        let reference_count_complete = entity_cross_repo_authority_complete
+            && !federated_count_incomplete
+            && derived_candidate_count == 0;
         let has_references = if known_positive {
             Some(true)
         } else if reference_count_complete {
@@ -3926,7 +4028,9 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
         };
         let verdict_complete = has_references.is_some();
         let reported_reference_count = reference_count_complete.then_some(reference_count);
-        let verdict_reason = if federated_subtype_unknown {
+        let verdict_reason = if derived_candidate_count > 0 && !known_positive {
+            Some("derived member references remain candidates")
+        } else if federated_subtype_unknown {
             Some("federated relation subtype unavailable")
         } else if !entity_cross_repo_authority_complete && !known_positive {
             Some("cross-repo authority incomplete")
@@ -3940,6 +4044,7 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
                 "has_references": has_references,
                 "reference_count": reported_reference_count,
                 "known_reference_count": reference_count,
+                "derived_candidate_count": derived_candidate_count,
                 "reference_count_complete": reference_count_complete,
                 "federated_reference_count": entity_federated_reference_count,
                 "verdict_complete": verdict_complete,
@@ -3958,6 +4063,7 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
                 "has_references": has_references,
                 "reference_count": reported_reference_count,
                 "known_reference_count": reference_count,
+                "derived_candidate_count": derived_candidate_count,
                 "reference_count_complete": reference_count_complete,
                 "federated_reference_count": entity_federated_reference_count,
                 "verdict_complete": verdict_complete,
@@ -4740,9 +4846,8 @@ fn has_incoming_reference_edge<G: GraphStore>(
     entity_id: &kin_model::EntityId,
     kinds: &[RelationKind],
 ) -> Result<bool> {
-    for relation in store
-        .get_all_relations_for_entity(entity_id)
-        .map_err(McpError::graph)?
+    for relation in
+        kin_index::relation_read::relations_for_read(store, entity_id).map_err(McpError::graph)?
     {
         let Some(source) = relation.src.as_entity() else {
             continue;
@@ -4835,8 +4940,7 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
         }
         let mut reference_count = 0usize;
         let mut proven_reference_count = 0usize;
-        for rel in store
-            .get_all_relations_for_entity(&entity.id)
+        for rel in kin_index::relation_read::relations_for_read(store, &entity.id)
             .map_err(McpError::graph)?
         {
             let Some(src_entity_id) = rel.src.as_entity() else {
@@ -5139,8 +5243,7 @@ fn trace_reach_set_toward<G: GraphStore>(
     for _ in 0..depth {
         let mut next = Vec::new();
         for node in frontier.drain(..) {
-            let relations = store
-                .get_all_relations_for_entity(&node)
+            let relations = kin_index::relation_read::relations_for_read(store, &node)
                 .map_err(McpError::graph)?;
             for rel in &relations {
                 if !allowed.contains(&rel.kind) {
@@ -5808,8 +5911,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             if node.depth >= depth {
                 continue;
             }
-            let relations = store
-                .get_all_relations_for_entity(&node.id)
+            let relations = kin_index::relation_read::relations_for_read(store, &node.id)
                 .map_err(McpError::graph)?;
             // Every neighbor is collected before any is kept: a per-step cap is
             // a choice between candidates, and a loop that admits as it reads
@@ -6578,8 +6680,7 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
             if current_depth >= depth {
                 continue;
             }
-            let edges = store
-                .get_all_relations_for_entity(&current)
+            let edges = kin_index::relation_read::relations_for_read(store, &current)
                 .map_err(McpError::graph)?;
             for rel in &edges {
                 let src_entity = rel.src.as_entity();
@@ -8778,6 +8879,140 @@ mod tests {
                 .starts_with("focal_not_in_graph"),
             "the focal miss stays the limiting factor: {negative}"
         );
+    }
+
+    #[tokio::test]
+    async fn derived_member_persisted_legacy_edges_remain_candidates_before_relink() {
+        let source = "const app = {}; for (const key of ['get']) { app[key] = () => 1; }";
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let hash = kin_blobs::BlobStore::new(blobs_dir.path().join("objects"))
+            .unwrap()
+            .write(source.as_bytes())
+            .unwrap();
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(&FilePathId::new("members.js"), source.as_bytes(), hash)
+            .unwrap()
+            .indexed_file;
+        let candidate = indexed
+            .entities
+            .iter()
+            .find(|e| e.name == "app.get")
+            .unwrap();
+        for representation in ["typed", "legacy", "malformed"] {
+            let mut target = candidate.clone();
+            if representation == "legacy" {
+                let derivation = kin_model::entity_derivation(&target).unwrap().unwrap();
+                target
+                    .metadata
+                    .extra
+                    .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+                target.span = Some(derivation.generator);
+                target.doc_summary =
+                    Some("Derived from a loop over `names`; no literal `get` declaration".into());
+            } else if representation == "malformed" {
+                target.metadata.extra.insert(
+                    kin_model::derivation::ENTITY_DERIVATION_KEY.into(),
+                    serde_json::json!({"schema": "unknown"}),
+                );
+            }
+            let graph = InMemoryGraph::new();
+            let caller = make_entity_in(LanguageId::JavaScript, "caller", "caller.js");
+            let ordinary = make_entity_in(LanguageId::JavaScript, "ordinary", "ordinary.js");
+            for entity in [&target, &caller, &ordinary] {
+                graph.upsert_entity(entity).unwrap();
+            }
+            let mut old_call = make_relation(caller.id, target.id, RelationKind::Calls);
+            old_call.origin = match representation {
+                "typed" => RelationOrigin::Manual,
+                "malformed" => RelationOrigin::Lsp,
+                _ => RelationOrigin::Parsed,
+            };
+            let mut old_override = make_relation(target.id, ordinary.id, RelationKind::Overrides);
+            old_override.origin = RelationOrigin::Lsp;
+            let ordinary_call = make_relation(caller.id, ordinary.id, RelationKind::Calls);
+            for relation in [&old_call, &old_override, &ordinary_call] {
+                graph.upsert_relation(relation).unwrap();
+            }
+            // Persist the pre-upgrade shape through the product snapshot format,
+            // close it and reopen without a parser or linker ever visiting it.
+            let dir = tempfile::tempdir().unwrap();
+            let snapshot_path = dir.path().join("legacy.kndb");
+            std::fs::write(&snapshot_path, graph.to_snapshot().to_bytes().unwrap()).unwrap();
+            drop(graph);
+            let snapshot = kin_db::storage::format::GraphSnapshot::from_bytes(
+                &std::fs::read(&snapshot_path).unwrap(),
+            )
+            .unwrap();
+            let graph = InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+            let raw = graph.get_all_relations_for_entity(&target.id).unwrap();
+            assert!(raw
+                .iter()
+                .all(|r| r.confidence == 1.0 && r.evidence.is_empty()));
+            assert!(raw.iter().all(|r| RelationResolution::of(r).is_proven()));
+            let view = kin_index::relation_read::relations_for_read(&graph, &target.id).unwrap();
+            assert_eq!(view.len(), 1, "{representation}");
+            assert_eq!(view[0].kind, RelationKind::Calls);
+            assert_eq!(view[0].confidence, 0.3);
+            assert!(!RelationResolution::of(&view[0]).is_proven());
+            assert!(kin_index::resolution::is_receiver_name_guess(&view[0]));
+            let ordinary_view =
+                kin_index::relation_read::relations_for_read(&graph, &ordinary.id).unwrap();
+            assert_eq!(ordinary_view.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&ordinary_view[0]).unwrap(),
+                serde_json::to_value(&ordinary_call).unwrap()
+            );
+            // Explicit candidate evidence cannot be laundered by ordinary
+            // endpoint records or a later language-server origin/confidence.
+            let mut marked = ordinary_call.clone();
+            marked.origin = RelationOrigin::Lsp;
+            marked.evidence.push(RelationEvidence {
+                parser_rule: Some(kin_model::derivation::DERIVED_MEMBER_CANDIDATE_RULE.into()),
+                ..Default::default()
+            });
+            let mut marked_view = vec![marked];
+            kin_index::relation_read::project_relations_for_read(&graph, &mut marked_view).unwrap();
+            assert_eq!(marked_view[0].confidence, 0.3);
+            assert!(kin_index::resolution::is_receiver_name_guess(
+                &marked_view[0]
+            ));
+            let args = HashMap::from([("entity_id".into(), serde_json::json!(target.id))]);
+            let refs = parsed_response(&handle_find_references(&args, &graph, None).await.unwrap());
+            assert_eq!(refs["total_upstream"], 0, "{representation}: {refs}");
+            assert_eq!(refs["candidates"].as_array().unwrap().len(), 1, "{refs}");
+            assert_eq!(refs["candidates"][0]["resolution"], "name_only");
+            assert!(
+                !has_incoming_reference_edge(&graph, &target.id, &[RelationKind::Calls]).unwrap()
+            );
+            let bulk_args = HashMap::from([(
+                "entity_ids".into(),
+                serde_json::json!([target.id, ordinary.id]),
+            )]);
+            let bulk = parsed_response(&handle_bulk_check_references(&bulk_args, &graph).unwrap());
+            let rows = bulk["results"].as_array().unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r["entity_id"] == serde_json::json!(target.id))
+                .unwrap();
+            assert!(row["has_references"].is_null(), "{representation}: {bulk}");
+            assert_eq!(row["known_reference_count"], 0);
+            assert_eq!(row["derived_candidate_count"], 1);
+            assert_eq!(row["verdict_complete"], false);
+            assert_eq!(row["reference_count_complete"], false);
+            let control = rows
+                .iter()
+                .find(|r| r["entity_id"] == serde_json::json!(ordinary.id))
+                .unwrap();
+            assert_eq!(control["has_references"], true);
+            assert_eq!(control["known_reference_count"], 1);
+            assert_eq!(control["derived_candidate_count"], 0);
+            // A semantic read neither rewrites history nor silently repairs the store.
+            assert_eq!(
+                serde_json::to_value(graph.get_all_relations_for_entity(&target.id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(raw).unwrap()
+            );
+        }
     }
 
     #[test]

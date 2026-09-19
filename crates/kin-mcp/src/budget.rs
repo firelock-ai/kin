@@ -932,6 +932,17 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             bulk_keys: &[],
             narrow_param: "limit",
         },
+        // Literal continuation is bound to matching stored contents. The
+        // rebase arm preserves that binding when budget pressure withholds rows.
+        crate::handlers::lexical::TOOL_NAME => ResponseShape {
+            collections: &["hits"],
+            body_keys: &["excerpt"],
+            explain_keys: &[],
+            top_explain_keys: &[],
+            duplicate_keys: &[],
+            bulk_keys: &[],
+            narrow_param: "limit",
+        },
         // `clipped_steps` sheds before `chain`, because the ladder trims from
         // the end of this list. A clip is a note about breadth the walk gave
         // up; the chain is the answer, and `spine_clipped_steps` beside it
@@ -1470,9 +1481,7 @@ pub(crate) fn collection_rows(payload: &Value, key: &str) -> usize {
 /// The budgeted tools whose responses carry a `next_cursor`, and so the tools
 /// whose withheld rows a caller can be handed a way back to.
 ///
-/// Two producers mint one today: the daemon's locate route
-/// (`kin-daemon/src/api.rs`, a [`LocateCursor`]) and the file enumeration
-/// (`crate::handlers::file_entities`, a `PageCursor`). Every other budgeted tool
+/// Locate, file enumeration, and literal lookup mint continuations. Every other budgeted tool
 /// answers one question in one response, so a cut there is recoverable only by
 /// asking a smaller question, which is what the remediation says.
 ///
@@ -1481,7 +1490,11 @@ pub(crate) fn collection_rows(payload: &Value, key: &str) -> usize {
 /// added without an arm silently reintroduces FIR-3554: the rows go, the cursor
 /// does not move, and nothing in the response says the remainder became
 /// unreachable.
-const PAGED_TOOLS: [&str; 2] = ["semantic_locate", FILE_ENTITIES_TOOL];
+const PAGED_TOOLS: [&str; 3] = [
+    "semantic_locate",
+    FILE_ENTITIES_TOOL,
+    crate::handlers::lexical::TOOL_NAME,
+];
 
 /// Re-point a paged tool's cursor after the ladder withheld a suffix of the
 /// primary collection, so the rows this response dropped stay reachable.
@@ -1490,7 +1503,7 @@ const PAGED_TOOLS: [&str; 2] = ["semantic_locate", FILE_ENTITIES_TOOL];
 /// means the caller has to be told so, which the remediation beside the call
 /// does, rather than being handed a token that skips past what it lost.
 ///
-/// The two paged tools rebase differently because their cursors mean different
+/// The paged tools rebase differently because their cursors mean different
 /// things. A locate cursor names a held ranking and an absolute offset into it,
 /// so the recovery is to move that offset back by exactly the suffix withheld.
 /// A file-enumeration cursor names a path and an absolute offset into a stable
@@ -1532,6 +1545,13 @@ fn repage_primary_after_cut(
             // the array it can see. The elision says how many went and why;
             // this keeps the plain count honest.
             payload["returned"] = json!(kept);
+            true
+        }
+        crate::handlers::lexical::TOOL_NAME => {
+            let Some(token) = crate::handlers::lexical::cursor_after_withheld(payload, kept) else {
+                return false;
+            };
+            payload["next_cursor"] = Value::String(token);
             true
         }
         _ => false,
@@ -1794,8 +1814,13 @@ fn run_ladder(
     if withheld_any {
         let kept = primary.map_or(0, |key| collection_rows(payload, key));
         if primary_withheld > 0 && cursor_rebased && kept > 0 {
+            let page_param = if tool == crate::handlers::lexical::TOOL_NAME {
+                "limit"
+            } else {
+                "page_size"
+            };
             remediations.push(format!(
-                "re-issue with `page_size: {kept}` and follow `next_cursor`"
+                "re-issue with `{page_param}: {kept}` and follow `next_cursor`"
             ));
         } else if PAGED_TOOLS.contains(&tool) && primary_withheld > 0 {
             // A paged tool whose cursor could not be re-pointed. Naming a cursor
@@ -3462,6 +3487,13 @@ mod tests {
                     }),
                 ),
                 FILE_ENTITIES_TOOL => (file_entities_final_page(40, 200, 240, 600), None),
+                crate::handlers::lexical::TOOL_NAME => (
+                    json!({
+                        "literal": "needle", "kind": null, "page_offset": 200,
+                        "total_matching": 240, "matching_snapshot": "a".repeat(64),
+                    }),
+                    None,
+                ),
                 other => panic!("{other} is in PAGED_TOOLS with no case here"),
             };
             assert!(

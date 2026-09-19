@@ -308,6 +308,12 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
             "Transaction plumbing for writes. Stage a create, update, delete or rename onto an open transaction. An update replaces the whole body, so send the complete new text.",
         ),
         (
+            crate::handlers::lexical::TOOL_NAME,
+            "Find exact literals, including punctuation, in stored graph fields. Scans the \
+             scoped graph per page. Lexical evidence only; find_references remains the \
+             structural authority.",
+        ),
+        (
             "list_file_entities",
             "List every entity the graph holds for one file by repo-relative path, and say whether that list is complete, before concluding a file holds nothing.",
         ),
@@ -591,7 +597,7 @@ pub const AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET: u64 = 2_500;
 /// building the registry there to rediscover eight names would cost more than
 /// it saves. `the_budget_tool_list_matches_the_registry` fails if the registry
 /// and this list ever disagree, so it cannot go stale quietly.
-const BUDGET_TOOLS: [&str; 8] = [
+const BUDGET_TOOLS: [&str; 9] = [
     "semantic_locate",
     DECLARATION_FILTER_CANONICAL,
     "find_references",
@@ -600,6 +606,7 @@ const BUDGET_TOOLS: [&str; 8] = [
     "graph_neighborhood",
     "impact_analysis",
     "get_context_pack",
+    crate::handlers::lexical::TOOL_NAME,
 ];
 
 /// Whole input schemas this belt serves in place of the registered ones.
@@ -884,6 +891,14 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
         (
             ("graph_neighborhood", "direction"),
             "`out` for what the focal depends on, `in` for what depends on it, `both` merges.",
+        ),
+        (
+            (crate::handlers::lexical::TOOL_NAME, "literal"),
+            "Bare literal, including punctuation; ASCII case-insensitive. Optional with cursor.",
+        ),
+        (
+            (crate::handlers::lexical::TOOL_NAME, "cursor"),
+            "Resume same literal/kind and matching contents. Changed results require a fresh lookup.",
         ),
         (
             (crate::handlers::tool_search::TOOL_NAME, "need"),

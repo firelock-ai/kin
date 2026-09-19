@@ -352,6 +352,55 @@ mod tests {
     }
 
     #[test]
+    fn compact_index_preserves_existing_entity_kind_codes() {
+        // Version 1 has persisted these numeric codes since before Field
+        // existed. A new kind must not reinterpret old entries or counts.
+        let kinds = [
+            (EntityKind::Function, 0),
+            (EntityKind::Class, 1),
+            (EntityKind::Interface, 2),
+            (EntityKind::TraitDef, 3),
+            (EntityKind::TypeAlias, 4),
+            (EntityKind::Module, 5),
+            (EntityKind::Package, 6),
+            (EntityKind::Test, 7),
+            (EntityKind::Schema, 8),
+            (EntityKind::ApiEndpoint, 9),
+            (EntityKind::EventContract, 10),
+            (EntityKind::File, 11),
+            (EntityKind::DocumentNode, 12),
+            (EntityKind::Method, 13),
+            (EntityKind::EnumDef, 14),
+            (EntityKind::EnumVariant, 15),
+            (EntityKind::Constant, 16),
+            (EntityKind::StaticVar, 17),
+            (EntityKind::Macro, 18),
+            (EntityKind::Field, 19),
+        ];
+        let graph = InMemoryGraph::new();
+        for (kind, code) in kinds {
+            let mut entity = make_entity(&format!("kind_{code}"), LanguageId::Go, "types.go");
+            entity.kind = kind;
+            graph.upsert_entity(&entity).unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.kidx");
+        ReadIndex::from_graph(&graph).unwrap().save(&path).unwrap();
+        let loaded = ReadIndex::load(&path).unwrap();
+        assert_eq!(loaded.version, 1);
+        for (_, code) in kinds {
+            let name = format!("kind_{code}");
+            let entity = loaded
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap();
+            assert_eq!(entity.kind, code, "persisted kind code for {name}");
+            assert_eq!(loaded.kind_counts.get(&code), Some(&1));
+        }
+    }
+
+    #[test]
     fn from_graph_preserves_full_language_distribution() {
         let graph = InMemoryGraph::new();
         let entities = [

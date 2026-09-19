@@ -2832,6 +2832,7 @@ fn validate_external_reference_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::change_map::{HistoryReopen, ReopenedHistory};
 
     /// Regression (found by fuzzing): a snapshot header whose body_len is near
     /// usize::MAX must be rejected with an error, never wrap `16 + body_len`
@@ -5196,6 +5197,359 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&frame).unwrap();
         assert_eq!(changes.change_ids().unwrap(), expected);
+    }
+
+    /// How many `tracing` events at `WARN` or above a scoped subscriber
+    /// observed, so a test can assert that a code path did, or did not, emit
+    /// one, without parsing formatted log output.
+    #[derive(Clone, Default)]
+    struct WarnAndAboveEventCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl WarnAndAboveEventCounter {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl tracing::Subscriber for WarnAndAboveEventCounter {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() <= tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    // Like the repository's tracing tests, keep a no-op global dispatcher
+    // interested so an uninstrumented parallel reader cannot cache `never`
+    // for the recovery event before this test installs its scoped counter.
+    fn keep_history_callsites_dynamic() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            struct DynamicNoop;
+            impl tracing::Subscriber for DynamicNoop {
+                fn register_callsite(
+                    &self,
+                    _: &'static tracing::Metadata<'static>,
+                ) -> tracing::subscriber::Interest {
+                    tracing::subscriber::Interest::sometimes()
+                }
+                fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                    false
+                }
+                fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                    tracing::span::Id::from_u64(1)
+                }
+                fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+                fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+                fn event(&self, _: &tracing::Event<'_>) {}
+                fn enter(&self, _: &tracing::span::Id) {}
+                fn exit(&self, _: &tracing::span::Id) {}
+            }
+            let _ = tracing::subscriber::set_global_default(DynamicNoop);
+        });
+    }
+
+    /// The storage-layer half of the idle-restart 409: a positional read
+    /// through a retained snapshot handle whose file has been superseded and
+    /// is no longer readable through that handle must reopen the durable
+    /// history at its current on-disk generation and retry, once, rather than
+    /// surfacing a refusal for bytes that are actually still there.
+    #[test]
+    fn history_read_recovers_once_through_a_reopen_after_a_stale_retained_handle() {
+        use std::io::Write;
+        keep_history_callsites_dynamic();
+        let original = a_snapshot_with_history(3);
+        let target_id = original
+            .changes
+            .iter()
+            .find(|(_, change)| change.message == "history change 1")
+            .map(|(id, _)| *id)
+            .expect("fixture carries the targeted change");
+        let expected_change = original.changes.get(&target_id).cloned().unwrap();
+
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (decoded, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "stale handle fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let mut changes = decoded.changes;
+
+        // What a reopen of the current on-disk generation would hand back:
+        // the same history, decoded straight into memory, with no file
+        // dependency of its own to go stale.
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reopen_calls_for_closure = Arc::clone(&reopen_calls);
+        let recovered_changes = original.changes.clone();
+        let reopen: HistoryReopen = Arc::new(move || {
+            reopen_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ReopenedHistory {
+                changes: recovered_changes.clone(),
+                physical_generation: 9,
+                logical_generation: 8,
+            })
+        });
+        assert!(
+            changes.install_stale_handle_recovery(reopen, 3, 3),
+            "a freshly decoded, not-yet-shared map must accept stale-handle recovery"
+        );
+
+        // Simulate the superseded-and-unreadable case by truncating the file
+        // behind the retained handle, so the positional read for the target
+        // record runs past the end of the file. `read_exact_at` reports that
+        // as `UnexpectedEof` on every platform, which is the failure class a
+        // platform that does not keep an unlinked file's bytes readable
+        // through an already-open handle produces here.
+        file.set_len(0).unwrap();
+
+        let events = WarnAndAboveEventCounter::default();
+        let events_for_assert = events.clone();
+        let answer =
+            tracing::subscriber::with_default(events, || changes.read_change(&target_id)).unwrap();
+        assert_eq!(answer, Some(expected_change));
+        // Every other record and every shared view must stop reading the
+        // failed source too; the recovery is for the source, not one lookup.
+        for shared in [changes.clone(), changes.clone()] {
+            for (id, expected) in original.changes.iter() {
+                assert_eq!(shared.read_change(id).unwrap().as_ref(), Some(expected));
+            }
+        }
+        assert_eq!(
+            reopen_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stale read must reopen exactly once"
+        );
+        assert_eq!(
+            events_for_assert.count(),
+            1,
+            "a recovered stale-handle read must emit exactly one tracing event"
+        );
+    }
+
+    fn stale_history_with_reopen(
+        original: &GraphSnapshot,
+        reopen: HistoryReopen,
+    ) -> crate::storage::change_map::ChangeMap {
+        use std::io::Write;
+        let frame = encode_snapshot_without_admission_validation(original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (decoded, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "stale shared history fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let mut changes = decoded.changes;
+        assert!(changes.install_stale_handle_recovery(reopen, 3, 3));
+        file.set_len(0).unwrap();
+        changes
+    }
+
+    #[test]
+    fn history_recovery_is_shared_by_concurrent_readers_without_widening_the_view() {
+        let original = a_snapshot_with_history(3);
+        let mut current = original.clone();
+        let extra = a_history_change(99, None);
+        let extra_id = extra.id;
+        current.changes.insert(extra_id, extra);
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&reopen_calls);
+        let changes = stale_history_with_reopen(
+            &original,
+            Arc::new(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ReopenedHistory {
+                    changes: current.changes.clone(),
+                    physical_generation: 9,
+                    logical_generation: 8,
+                })
+            }),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let shared = changes.clone();
+                let expected = &original.changes;
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for (id, change) in expected.iter() {
+                        assert_eq!(shared.read_change(id).unwrap().as_ref(), Some(change));
+                    }
+                });
+            }
+        });
+        assert_eq!(reopen_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(changes.len(), original.changes.len());
+        assert!(!changes.contains_key(&extra_id));
+        assert_eq!(changes.read_change(&extra_id).unwrap(), None);
+        assert_eq!(
+            changes.change_ids().unwrap(),
+            original.changes.change_ids().unwrap()
+        );
+    }
+
+    #[test]
+    fn history_recovery_refuses_missing_or_changed_indexed_records() {
+        let original = a_snapshot_with_history(3);
+        let target_id = original.changes.change_ids().unwrap()[0];
+        for missing in [true, false] {
+            let mut replacement = original.changes.clone();
+            if missing {
+                replacement.remove(&target_id);
+            } else {
+                let mut changed = replacement.get(&target_id).unwrap().clone();
+                changed.message.push_str(" altered");
+                replacement.insert(target_id, changed);
+            }
+            let changes = stale_history_with_reopen(
+                &original,
+                Arc::new(move || {
+                    Ok(ReopenedHistory {
+                        changes: replacement.clone(),
+                        physical_generation: 9,
+                        logical_generation: 8,
+                    })
+                }),
+            );
+            let error = changes.read_change(&target_id).unwrap_err();
+            let expected = if missing {
+                "missing previously indexed change"
+            } else {
+                "changed the content"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(changes.contains_key(&target_id));
+        }
+    }
+
+    #[test]
+    fn history_recovery_can_retry_after_a_busy_refusal() {
+        let original = a_snapshot_with_history(3);
+        let target_id = original.changes.change_ids().unwrap()[0];
+        let expected = original.changes.get(&target_id).unwrap().clone();
+        let replacement = original.changes.clone();
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&reopen_calls);
+        let changes = stale_history_with_reopen(
+            &original,
+            Arc::new(move || {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Err(crate::KinDbError::StorageError(
+                        "authority lock is busy".into(),
+                    ));
+                }
+                Ok(ReopenedHistory {
+                    changes: replacement.clone(),
+                    physical_generation: 9,
+                    logical_generation: 8,
+                })
+            }),
+        );
+        assert!(changes
+            .read_change(&target_id)
+            .unwrap_err()
+            .to_string()
+            .contains("busy"));
+        assert_eq!(
+            changes.read_change(&target_id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(changes.read_change(&target_id).unwrap(), Some(expected));
+        assert_eq!(reopen_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The reopen path above must never run for a corruption mismatch: bytes
+    /// that disagree with what the open verified are a different and more
+    /// serious question than a handle that stopped answering, and reopening a
+    /// different generation cannot make disagreeing bytes agree.
+    #[test]
+    fn history_read_refuses_a_corruption_mismatch_without_reopening() {
+        use std::io::{Seek, SeekFrom, Write};
+        keep_history_callsites_dynamic();
+        let original = a_snapshot_with_history(3);
+        let target_id = original
+            .changes
+            .iter()
+            .find(|(_, change)| change.message == "history change 1")
+            .map(|(id, _)| *id)
+            .expect("fixture carries the targeted change");
+
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (decoded, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "corruption fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let mut changes = decoded.changes;
+
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reopen_calls_for_closure = Arc::clone(&reopen_calls);
+        let recovered_changes = original.changes.clone();
+        let reopen: HistoryReopen = Arc::new(move || {
+            reopen_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ReopenedHistory {
+                changes: recovered_changes.clone(),
+                physical_generation: 9,
+                logical_generation: 8,
+            })
+        });
+        assert!(changes.install_stale_handle_recovery(reopen, 3, 3));
+
+        // Flip one byte inside the target record's own serialized bytes, in
+        // place, so the file keeps its recorded length and the positional
+        // read succeeds; only what it reads is wrong.
+        let position = frame
+            .windows(b"history change 1".len())
+            .position(|part| part == b"history change 1")
+            .expect("fixture contains the targeted change's message bytes");
+        file.seek(SeekFrom::Start(position as u64)).unwrap();
+        file.write_all(&[frame[position] ^ 1]).unwrap();
+
+        let events = WarnAndAboveEventCounter::default();
+        let events_for_assert = events.clone();
+        let error = tracing::subscriber::with_default(events, || changes.read_change(&target_id))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after open"), "{error}");
+        assert_eq!(
+            reopen_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a corruption mismatch must never trigger a reopen"
+        );
+        assert_eq!(
+            events_for_assert.count(),
+            0,
+            "a corruption mismatch must not emit the stale-handle recovery event"
+        );
     }
 
     #[test]

@@ -2061,6 +2061,7 @@ impl TemporalScope {
 /// Maximum attempts to capture one repo's entity/relation authority without
 /// straddling a graph mutation.
 const SPINE_GRAPH_CAPTURE_ATTEMPTS: usize = 3;
+const DERIVED_MEMBER_SPINE_GAP: &str = "spine_candidate_representation_gap";
 
 /// Fixed upper bound for hosted repository reload coordination.
 ///
@@ -3895,6 +3896,10 @@ pub struct DaemonState {
     /// Each request probes the backend cursor before reusing an entry.
     pub(crate) repo_semantic_views:
         RwLock<HashMap<String, Arc<crate::api::HostedRepositoryMcpView>>>,
+    /// Independent test daemons must not consume each other's cold admission.
+    /// Requests sharing one state still share the same two-slot bound.
+    #[cfg(test)]
+    pub(crate) hosted_repository_hydration_slots_for_test: Arc<tokio::sync::Semaphore>,
     /// Hosted-only locate rankings. The legacy unscoped route never reads this
     /// cache, so it cannot address a hosted ranking even with a forged inner
     /// locate cursor.
@@ -6015,6 +6020,8 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             repo_semantic_views: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            hosted_repository_hydration_slots_for_test: Arc::new(tokio::sync::Semaphore::new(2)),
             repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
             repo_semantic_instance_id: uuid::Uuid::new_v4(),
             repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
@@ -6434,6 +6441,8 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             repo_semantic_views: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            hosted_repository_hydration_slots_for_test: Arc::new(tokio::sync::Semaphore::new(2)),
             repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
             repo_semantic_instance_id: uuid::Uuid::new_v4(),
             repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
@@ -7165,6 +7174,10 @@ impl DaemonState {
         let spine = match self.ensure_spine_under_publication(&mut publication) {
             Ok(spine) => spine,
             Err(error) => {
+                *self
+                    .spine_initialization_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
                 warn!(%error, "spine publication refused before an external mutation");
                 return None;
             }
@@ -8018,6 +8031,13 @@ impl DaemonState {
 
     /// Whether the spine's registered primary watermark is the live graph root.
     fn primary_spine_registration_is_current(&self, spine: &dyn kin_spine::SpineBackend) -> bool {
+        // Matching roots do not prove that an older publisher preserved member
+        // derivation authority; force capture/refusal even at the same root.
+        if self.graph.list_all_entities().map_or(true, |entities| {
+            entities.iter().any(kin_model::is_derived_member)
+        }) {
+            return false;
+        }
         let live_root = hex::encode(self.graph.compute_root_hash());
         spine.root_hash(&self.cached_repo_id).as_deref() == Some(live_root.as_str())
     }
@@ -8059,6 +8079,11 @@ impl DaemonState {
                             error = %capture_error,
                             "spine re-registration deferred until primary graph authority is stable"
                         );
+                        if capture_error.starts_with(DERIVED_MEMBER_SPINE_GAP) {
+                            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                                capture_error,
+                            )));
+                        }
                         return Ok(());
                     }
                 };
@@ -8202,6 +8227,15 @@ impl DaemonState {
             let entity_ids = snapshot.entities.keys().copied().collect::<HashSet<_>>();
             let mut entities = snapshot.entities.into_values().collect::<Vec<_>>();
             entities.sort_by_key(|entity| entity.id);
+            if let Some(entity) = entities
+                .iter()
+                .find(|entity| kin_model::is_derived_member(entity))
+            {
+                return Err(format!(
+                    "{DERIVED_MEMBER_SPINE_GAP}: repo {repo_id} contains inferred member {}; the current spine format cannot preserve candidate authority. Local Kin queries and generator edits remain available. Federation requires versioned candidate-status support before this graph can be published.",
+                    entity.id
+                ));
+            }
             let mut relations = snapshot
                 .relations
                 .into_values()
@@ -9186,10 +9220,14 @@ impl DaemonState {
         let mut captures = Vec::with_capacity(registry_ids.len());
         for repo_id in &registry_ids {
             let entry = self.get_repo_cache_entry(repo_id).await?;
-            captures.push(
-                self.capture_spine_repo(repo_id, Arc::clone(&entry.graph))
-                    .map_err(storage_error)?,
-            );
+            match self.capture_spine_repo(repo_id, Arc::clone(&entry.graph)) {
+                Ok(capture) => captures.push(capture),
+                Err(reason) => {
+                    publication.reassert_before_mutation()?;
+                    spine.invalidate_cross_repo_edges(repo_id);
+                    return Err(storage_error(reason));
+                }
+            }
         }
         if !self.graph_authority_epoch_is_current(graph_authority_epoch)
             || captures
@@ -9391,6 +9429,9 @@ impl DaemonState {
                         error = %error,
                         "skipping cross-repo refresh: graph authority capture failed"
                     );
+                    if error.starts_with(DERIVED_MEMBER_SPINE_GAP) {
+                        return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(error)));
+                    }
                 }
             }
         }
@@ -16189,6 +16230,121 @@ mod tests {
             state.graph.get_file_layout(&file_id).unwrap().is_none(),
             "a failed content precondition must leave no query-facing layout"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn derived_member_spine_publication_refuses_and_invalidates_prior_authority() {
+        use kin_model::{
+            GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        };
+        use kin_spine::SpineBackend as _;
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        let source = "const app = {}; for (const key of ['get']) { app[key] = () => 1; }";
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("members.js"),
+                source.as_bytes(),
+                kin_blobs::Hash256::from_bytes(kin_blobs::digest_bytes(source.as_bytes())),
+            )
+            .unwrap()
+            .indexed_file;
+        let typed = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "app.get")
+            .unwrap();
+        for legacy in [false, true] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let init = kin_core::init(repo_dir.path()).unwrap();
+            let state = test_state(init.layout, repo_dir.path());
+            let repo = state.cached_repo_id.as_str();
+            let normal = test_entity("normal", "normal.rs");
+            state.graph.upsert_entity(&normal).unwrap();
+            assert!(state
+                .capture_spine_repo(repo, Arc::clone(&state.graph))
+                .is_ok());
+            let mut candidate = typed.clone();
+            if legacy {
+                candidate
+                    .metadata
+                    .extra
+                    .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+                candidate.doc_summary =
+                    Some("Derived from a loop over `names`; no literal `get` declaration".into());
+            }
+            state.graph.upsert_entity(&candidate).unwrap();
+            let relation = Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(candidate.id),
+                dst: GraphNodeId::Entity(kin_model::EntityId::new()),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some("foreign".into()),
+                evidence: vec![RelationEvidence {
+                    token: Some("foreign::target".into()),
+                    ..Default::default()
+                }],
+            };
+            state.graph.upsert_relation(&relation).unwrap();
+            let refusal = state
+                .capture_spine_repo(repo, Arc::clone(&state.graph))
+                .err()
+                .unwrap();
+            assert!(refusal.contains("spine_candidate_representation_gap"));
+            assert!(refusal.contains("Local Kin queries and generator edits remain available"));
+            // Reproduce an older publisher at the exact SAME graph root. This
+            // proves a matching watermark cannot bypass the new capture gate.
+            let spine = Arc::new(kin_spine::InMemorySpineBackend::new());
+            spine.register_repo(
+                repo,
+                DaemonState::entities_to_spine_entries(repo, &[candidate.clone(), normal]),
+                &hex::encode(state.graph.compute_root_hash()),
+            );
+            let foreign = test_entity("target", "target.rs");
+            spine.register_repo(
+                "foreign",
+                DaemonState::entities_to_spine_entries("foreign", &[foreign]),
+                "foreign-root",
+            );
+            let registry = vec![repo.to_string(), "foreign".to_string()];
+            spine.refresh_cross_repo_edges("foreign", &[], &[], &registry);
+            spine.refresh_cross_repo_edges(repo, &[candidate.clone()], &[relation], &registry);
+            let before = spine.cross_repo_xref_response(repo, &candidate.id);
+            assert!(before.authority_complete_for(repo, &candidate.id));
+            assert!(!before.edges.is_empty());
+            assert!(before.edges.iter().all(|edge| edge.confidence >= 0.9));
+            assert!(state.spine.set(spine.clone()).is_ok());
+            let mut publication = HostedPublicationGuard::local();
+            let error = state
+                .reregister_primary_at_current_root(spine.as_ref(), &mut publication)
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("spine_candidate_representation_gap"));
+            assert!(!spine.authority_complete());
+            let after = spine.cross_repo_xref_response(repo, &candidate.id);
+            assert!(!after.authority_complete_for(repo, &candidate.id));
+            assert!(state.ensure_spine().is_none());
+            assert!(state
+                .spine_unavailable_reason()
+                .contains("spine_candidate_representation_gap"));
+            assert!(state.graph.get_entity(&candidate.id).unwrap().is_some());
+            let local =
+                kin_index::relation_read::relations_for_read(state.graph.as_ref(), &candidate.id)
+                    .unwrap();
+            assert!(local
+                .iter()
+                .all(|edge| !kin_index::RelationResolution::of(edge).is_proven()));
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use kin_index::{
-    bare_entity_name, link_cross_file_incremental_with_completeness, FileParseCompletenessMap,
+    bare_entity_name, link_cross_file_incremental_with_graph, FileParseCompletenessMap,
     FileParseData, IncrementalLinker,
 };
 use kin_model::{
@@ -404,10 +404,14 @@ impl PriorCallSites {
 /// What one cross-file pass produced.
 #[derive(Debug, Default)]
 pub struct CrossFilePass {
+    /// A failed authority read or link pass cannot authorize replacing an
+    /// informed graph edge with an intra-file guess.
+    pub failure: Option<String>,
     /// Cross-file relations, entity-level and artifact-level, that the pass
     /// resolved. Entity-level relations here always cross a file boundary;
     /// same-file relations travel in [`CrossFilePass::same_file`].
     pub resolved: Vec<Relation>,
+    /// Source-local relations, including candidate-to-generator artifact evidence.
     /// Entity-level relations the pass resolved whose endpoints are both in a
     /// file it resolved.
     ///
@@ -696,19 +700,21 @@ impl LiveCrossFileLinker {
 
         let files_resolved = batch.len();
         self.last_files_resolved = files_resolved;
-        let relations = match link_cross_file_incremental_with_completeness(
+        let relations = match link_cross_file_incremental_with_graph(
             &batch,
             &self.linker,
             &completeness_map,
+            graph,
         ) {
             Ok(relations) => relations,
             Err(error) => {
                 warn!(
                     file = %file_path,
                     error = %error,
-                    "cross-file resolution failed; keeping intra-file edges only"
+                    "cross-file resolution failed; withdrawing publication authority"
                 );
                 return CrossFilePass {
+                    failure: Some(error.to_string()),
                     referenced,
                     files_resolved,
                     ..CrossFilePass::default()
@@ -748,6 +754,35 @@ impl LiveCrossFileLinker {
                     }
                     resolved.push(relation);
                 }
+                (GraphNodeId::Entity(src), GraphNodeId::Artifact(dst))
+                    if relation.kind == RelationKind::DerivedFrom =>
+                {
+                    let Some(src_file) = self.file_by_entity.get(&src) else {
+                        continue;
+                    };
+                    let entity = batch
+                        .iter()
+                        .flat_map(|file| file.entities.iter())
+                        .find(|entity| entity.id == src);
+                    let hash = graph
+                        .get_tree_entry(&kin_model::FilePathId::new(&**src_file))
+                        .ok()
+                        .flatten()
+                        .and_then(|entry| match entry {
+                            kin_model::TreeEntry::Blob { hash, .. } => Some(hash.to_string()),
+                            _ => None,
+                        });
+                    if batched_paths.contains(&**src_file)
+                        && self.artifact_id_by_file.get(&**src_file) == Some(&dst)
+                        && entity.zip(hash.as_deref()).is_some_and(|(entity, hash)| {
+                            kin_model::derivation::generator_relation_matches(
+                                entity, &relation, dst, hash,
+                            )
+                        })
+                    {
+                        same_file.push(relation);
+                    }
+                }
                 (GraphNodeId::Artifact(src), GraphNodeId::Artifact(_)) => {
                     if !matches!(
                         relation.kind,
@@ -783,6 +818,7 @@ impl LiveCrossFileLinker {
         }
 
         CrossFilePass {
+            failure: None,
             resolved,
             same_file,
             artifact_imports,

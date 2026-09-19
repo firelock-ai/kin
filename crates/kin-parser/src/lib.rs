@@ -29,7 +29,7 @@ pub const PARSER_SCHEMA_EPOCH: &str = "parser-schema-2026-03-29-v1";
 /// doubt, bump — a spurious bump only costs a cold re-parse, while a missed bump
 /// silently serves stale semantics (the stale-binary class of bug). Mirrors
 /// kin-db's `GraphSnapshot::CURRENT_VERSION` convention.
-pub const PARSER_SEMANTICS_VERSION: u32 = 7;
+pub const PARSER_SEMANTICS_VERSION: u32 = 10;
 
 pub mod adapter;
 pub mod error;
@@ -53,17 +53,18 @@ pub use extract::{
     attach_file_context_metadata, attach_file_reference_parse_counts,
     call_extraction_incomplete_marker, is_call_extraction_incomplete_marker,
     is_scoped_call_extraction_incomplete_marker, scoped_call_extraction_incomplete_marker,
-    CallArgShape, ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport,
-    ImportedName, ParseOutput, RelationSite, RelationSyntacticRole,
+    CallArgShape, ExtractedDerivedMember, ExtractedEntity, ExtractedRelation, ExtractedTest,
+    ExtractedTestKind, FileImport, ImportedName, ParseOutput, RelationSite, RelationSyntacticRole,
     CALL_EXTRACTION_INCOMPLETE_MARKER_V1, COMMAND_EFFECT_CONTRACT_KEY, DECLARATION_LINE_KEY,
     FILE_IMPORT_CONTEXT_KEY, FILE_PARSED_CALL_SITES_KEY, FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY,
     FILE_PARSED_IMPORT_STATEMENTS_KEY, FILE_SURFACE_CONTEXT_KEY,
 };
 pub use languages::{
-    attach_go_command_effect_contract_metadata, is_python_builtin_name, language_ordinal,
-    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, HclAdapter, JavaAdapter,
-    JavaScriptAdapter, KotlinAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter,
-    SwiftAdapter, TypeScriptAdapter, ALL_LANGUAGE_IDS, PYTHON_BUILTIN_NAMES,
+    attach_go_command_effect_contract_metadata, attach_go_package_metadata, is_python_builtin_name,
+    language_ordinal, AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, HclAdapter,
+    JavaAdapter, JavaScriptAdapter, KotlinAdapter, PhpAdapter, PythonAdapter, RubyAdapter,
+    RustAdapter, SwiftAdapter, TypeScriptAdapter, ALL_LANGUAGE_IDS,
+    DYNAMIC_MEMBERS_DISCLOSURE_PREFIX, PYTHON_BUILTIN_NAMES,
 };
 pub use shallow::{
     extract_shallow, get_shallow_grammar, parse_shallow_file, ShallowDecl, ShallowDeclKind,

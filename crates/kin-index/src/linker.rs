@@ -14,9 +14,9 @@ use tracing::debug;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    ArtifactId, Entity, EntityId, EntityKind, EntityRole, FilePathId, GraphNodeId, LanguageId,
-    ParseCompleteness, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
-    SourceSpan, Visibility,
+    ArtifactId, Entity, EntityId, EntityKind, EntityRole, EntityStore, FilePathId, GraphNodeId,
+    LanguageId, ParseCompleteness, Relation, RelationEvidence, RelationId, RelationKind,
+    RelationOrigin, SourceSpan, Visibility,
 };
 use kin_parser::{
     is_call_extraction_incomplete_marker, is_python_builtin_name, CallArgShape, ExtractedRelation,
@@ -24,7 +24,7 @@ use kin_parser::{
 };
 
 use crate::error::{IndexError, Result as IndexResult};
-use crate::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE;
+use crate::resolution::{DISPATCH_CANDIDATE_CONFIDENCE, RECEIVER_NAME_FANOUT_CONFIDENCE};
 
 /// Graph-assigned artifact identities keyed by repository-relative path.
 ///
@@ -58,6 +58,29 @@ fn require_artifact_identities<'a>(
 /// be neutralized. `parser_rule` is defaultable in storage, making an older
 /// record's absent marker a conservative, backward-compatible `unknown`.
 pub const CALL_SHAPE_EVIDENCE_AGGREGATION_V1: &str = "call_shape_aggregation_v1";
+
+/// Qualification of an individual self/cls call occurrence whose target has
+/// an override. Stored in its existing evidence record's token so the shape,
+/// span and occurrence count still describe exactly one source occurrence.
+pub const SELF_DISPATCH_OVERRIDE_EVIDENCE_V1: &str = "self_dispatch_override_v1";
+
+pub fn is_self_dispatch_candidate(relation: &Relation) -> bool {
+    relation.kind == RelationKind::Calls
+        && relation
+            .evidence
+            .iter()
+            .any(|record| record.token.as_deref() == Some(SELF_DISPATCH_OVERRIDE_EVIDENCE_V1))
+}
+
+fn qualify_self_dispatch(mut relation: Relation) -> Relation {
+    if relation.evidence.is_empty() {
+        relation.evidence.push(RelationEvidence::default());
+    }
+    for record in &mut relation.evidence {
+        record.token = Some(SELF_DISPATCH_OVERRIDE_EVIDENCE_V1.to_string());
+    }
+    relation
+}
 
 /// Persisted fail-closed marker for call evidence recovered from a parse that
 /// was not fully valid. A recovered tree can omit call sites, so even a shaped
@@ -480,6 +503,7 @@ struct LinkContext<'a> {
     /// inference must fail closed when either side is absent and may only
     /// connect equal or explicitly compatible language families.
     entity_language_by_id: HashMap<EntityId, LanguageId>,
+    go_package_by_id: HashMap<EntityId, String>,
     /// C/C++ callee id -> the argument-count bounds parsed from its signature.
     /// Absent for a callee whose language does not carry call arity or whose
     /// parameter list could not be read, so the linker prunes an overloaded
@@ -514,6 +538,19 @@ struct LinkContext<'a> {
     /// because class names repeat across a repository, and the caller resolves
     /// its root type to one class before asking.
     declared_attribute_types: HashMap<(&'a str, &'a str, &'a str), &'a str>,
+    /// Every method/function entity that is the base half of at least one
+    /// `Overrides` edge anywhere in this batch, computed once from
+    /// [`derive_override_relations`] over every file rather than only the one
+    /// [`resolve_one_file`] happens to be resolving.
+    ///
+    /// A `self`/`cls` receiver-method call resolves through the SAME-file
+    /// exact-name tier or the Extends-chain walk before `Overrides` edges for
+    /// the file being resolved are themselves emitted (they are derived once
+    /// per file, after that file's calls), so a resolver cannot simply check
+    /// "did I already emit an Overrides edge for this". This index answers the
+    /// same question from the batch's full class hierarchy instead: it is what
+    /// [`DISPATCH_CANDIDATE_CONFIDENCE`] is keyed on.
+    overridden_bases: HashSet<EntityId>,
 }
 
 /// Whether two parser-reported languages may participate in a relation inferred
@@ -734,7 +771,12 @@ fn build_link_context<'a>(
     // it replaces is the safer wrong answer.
     let declared_attribute_types = build_declared_attribute_types(files.iter().copied());
 
-    LinkContext {
+    let go_package_by_id = sorted_universe
+        .iter()
+        .filter_map(|entity| go_package(entity).map(|package| (entity.id, package.to_string())))
+        .collect();
+    let mut ctx = LinkContext {
+        go_package_by_id,
         sorted_universe,
         entity_by_file_name,
         entity_by_name,
@@ -751,7 +793,31 @@ fn build_link_context<'a>(
         include_graph,
         class_bases_by_file_class,
         declared_attribute_types,
-    }
+        overridden_bases: HashSet::new(),
+    };
+    // Step 5: which method/function entities an `Overrides` edge somewhere in
+    // the batch names as a base. Every other field above is now in place, so
+    // this reuses `derive_override_relations` itself — the batch's own
+    // override producer — rather than a second, independently maintained walk
+    // that could drift from what actually gets emitted per file below.
+    let overridden_bases = {
+        let _span = tracing::info_span!(
+            "kin.index.link_cross_file.build_overridden_bases",
+            files = files.len()
+        )
+        .entered();
+        let mut overridden_bases = HashSet::new();
+        for file in files {
+            for relation in derive_override_relations(file, &ctx) {
+                if let Some(base_id) = relation.dst.as_entity() {
+                    overridden_bases.insert(base_id);
+                }
+            }
+        }
+        overridden_bases
+    };
+    ctx.overridden_bases = overridden_bases;
+    ctx
 }
 
 /// (file, class, attribute) -> declared type name, read off the reference edges
@@ -822,6 +888,53 @@ fn resolve_two_hop_declared_method(
     resolve_declared_method(&owner_file, &owner_class, method, ctx)
 }
 
+/// Go value selectors preserve an operand separately from their bare leaf.
+/// Other adapters may use `receiver` for different evidence (e.g. annotations).
+pub(crate) fn is_go_selector_reference(
+    rel: &ExtractedRelation,
+    language: Option<LanguageId>,
+) -> bool {
+    language == Some(LanguageId::Go)
+        && rel.kind == RelationKind::References
+        && rel
+            .receiver
+            .as_deref()
+            .is_some_and(|receiver| !receiver.is_empty())
+}
+
+/// Until receiver types are established, only named Go fields are candidates.
+/// Include same-file fields, but never promote uniqueness to type evidence.
+fn go_field_reference_candidates(
+    rel: &ExtractedRelation,
+    imports: &[FileImport],
+    candidates: impl Iterator<Item = EntityId>,
+    kinds: &HashMap<EntityId, EntityKind>,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> Vec<EntityId> {
+    let receiver = rel.receiver.as_deref().unwrap_or_default();
+    let root = receiver.split('.').next().unwrap_or(receiver).trim();
+    if rel.import_source.is_some()
+        || imports
+            .iter()
+            .flat_map(|import| &import.specifiers)
+            .any(|specifier| specifier.local_name == root)
+    {
+        // Go packages span files and their declared name may differ from the
+        // import path. A package selector needs namespace evidence, not field
+        // fanout. Leave it unresolved until that evidence is available.
+        return Vec::new();
+    }
+    let ids: HashSet<_> = candidates
+        .filter(|id| {
+            kinds.get(id) == Some(&EntityKind::Field) && languages.get(id) == Some(&LanguageId::Go)
+        })
+        .collect();
+    if ids.len() > AMBIGUOUS_CALL_FANOUT_CAP {
+        return Vec::new();
+    }
+    sorted_fanout_targets(ids)
+}
+
 /// Resolve the name-based relations of a single file into entity-ID relations.
 ///
 /// All reads are against the shared read-only [`LinkContext`]; the only mutable
@@ -881,6 +994,36 @@ fn resolve_one_file(
             }
         };
 
+        if is_go_selector_reference(rel, ctx.entity_language_by_id.get(&src_id).copied()) {
+            let candidates = go_field_reference_candidates(
+                rel,
+                &file.imports,
+                ctx.entity_by_bare_name
+                    .get(rel.dst_name.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, id)| *id),
+                &ctx.entity_kind_by_id,
+                &ctx.entity_language_by_id,
+            );
+            for dst_id in candidates {
+                let mut candidate =
+                    make_relation(rel, src_id, dst_id, RECEIVER_NAME_FANOUT_CONFIDENCE);
+                for evidence in &mut candidate.evidence {
+                    evidence.parser_rule = Some("go_field_selector_name_candidate_v1".to_string());
+                    evidence.token = Some(format!(
+                        "{}.{}",
+                        rel.receiver.as_deref().unwrap(),
+                        rel.dst_name
+                    ));
+                }
+                accumulate_relation(&mut resolved, &mut relation_indices, candidate);
+            }
+            // The owner type is not established. No later free-symbol tier
+            // may turn an unresolved selector into a proven global reference.
+            continue;
+        }
+
         // Positional arity the call's overloads are pruned by, `None` when the
         // shape is absent or splat-widened (fail-open). Resolved once per
         // relation and threaded through every same-name fan-out tier below.
@@ -922,6 +1065,30 @@ fn resolve_one_file(
             continue;
         }
 
+        if is_go_declared_receiver_call(rel, src_id, &ctx.entity_language_by_id) {
+            let candidates = ctx
+                .entity_by_name
+                .get(rel.dst_name.as_str())
+                .into_iter()
+                .flatten()
+                .map(|(file, id)| (*file, *id));
+            if let Some(dst_id) = go_receiver_method_target(
+                &file.file_path,
+                src_id,
+                candidates,
+                &ctx.entity_kind_by_id,
+                &ctx.entity_language_by_id,
+                &ctx.go_package_by_id,
+            ) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                );
+            }
+            continue;
+        }
+
         // (a0) Receiver-scoped resolution. An attribute call carries its
         // receiver as written; the calling file's imports say whether that
         // receiver is a module or a value, and that decides which entities can
@@ -936,12 +1103,20 @@ fn resolve_one_file(
             .map(|receiver| {
                 (
                     receiver,
-                    classify_receiver(
-                        receiver,
-                        &file.file_path,
-                        ctx.import_map.get(file.file_path.as_str()),
-                        &ctx.known_files,
-                    ),
+                    if ctx.entity_language_by_id.get(&src_id) == Some(&LanguageId::Go)
+                        && rel.import_source.is_none()
+                    {
+                        // Go records this local receiver from its declaration.
+                        // A file import cannot override a local binding.
+                        ReceiverScope::Object
+                    } else {
+                        classify_receiver(
+                            receiver,
+                            &file.file_path,
+                            ctx.import_map.get(file.file_path.as_str()),
+                            &ctx.known_files,
+                        )
+                    },
                 )
             });
         let mut receiver_is_object = false;
@@ -980,6 +1155,47 @@ fn resolve_one_file(
                     accumulate_relation(&mut resolved, &mut relation_indices, external);
                 }
                 continue;
+            }
+        }
+
+        // (a-dispatch) Self/cls receiver-method call whose enclosing class
+        // directly declares the callee AND that declaration is itself named as
+        // a base by an `Overrides` edge somewhere in this batch
+        // (`ctx.overridden_bases`). `self.send(...)` written inside
+        // `SessionRedirectMixin.resolve_redirects` names
+        // `SessionRedirectMixin.send` right here in the same file, which is
+        // exactly the shape the (a) tier below claims at full, parser-certain
+        // confidence — but when `Session(SessionRedirectMixin)` overrides
+        // `send`, Python's method resolution order runs `Session.send`
+        // whenever the receiver is a `Session`, never the body this edge
+        // points at. Stamping that at `type_resolved` is a confident wrong
+        // answer, so this tier intercepts it first and stamps
+        // [`DISPATCH_CANDIDATE_CONFIDENCE`] instead: the destination named is
+        // real, but not proven to be the one that runs.
+        //
+        // Gated on `receiver.is_none()` because that is exactly the shape
+        // `extract_named_callee` reserves for a direct `self`/`cls` receiver —
+        // every other receiver keeps its own text in `rel.receiver` and is a
+        // different class asking about a type it holds, not this call's own
+        // class talking about itself. A dotted bare call can only land on an
+        // `overridden_bases` member through a class-qualified entity name
+        // (`Class.method`/`Class::method`), which is what `Overrides` edges
+        // connect, so no separate owner/class check is needed here.
+        if rel.kind == RelationKind::Calls && rel.receiver.is_none() && !receiver_is_object {
+            if let Some(&dst_id) = dst_same_file {
+                if ctx.overridden_bases.contains(&dst_id) {
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        qualify_self_dispatch(make_relation(
+                            rel,
+                            src_id,
+                            dst_id,
+                            DISPATCH_CANDIDATE_CONFIDENCE,
+                        )),
+                    );
+                    continue;
+                }
             }
         }
 
@@ -1109,10 +1325,31 @@ fn resolve_one_file(
                     if let Some(dst_id) =
                         resolve_inherited_method(&file.file_path, owner, method, ctx)
                     {
+                        // A self/cls call that walked to a defining ancestor:
+                        // proven evidence ordinarily (`INHERITED_METHOD_CONFIDENCE`),
+                        // unless that very ancestor method is itself overridden
+                        // somewhere in the batch, in which case the receiver's
+                        // runtime class — not this walk — decides which body
+                        // runs. `rel.receiver.is_none()` keeps this to the
+                        // self/cls shape; a declared-typed receiver that fell
+                        // through from (a2a) above stays on the proven tier,
+                        // matching the design's own scope.
+                        let dynamic_dispatch =
+                            rel.receiver.is_none() && ctx.overridden_bases.contains(&dst_id);
+                        let confidence = if dynamic_dispatch {
+                            DISPATCH_CANDIDATE_CONFIDENCE
+                        } else {
+                            INHERITED_METHOD_CONFIDENCE
+                        };
+                        let relation = make_relation(rel, src_id, dst_id, confidence);
                         accumulate_relation(
                             &mut resolved,
                             &mut relation_indices,
-                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                            if dynamic_dispatch {
+                                qualify_self_dispatch(relation)
+                            } else {
+                                relation
+                            },
                         );
                         continue;
                     }
@@ -1615,6 +1852,59 @@ fn resolve_one_file(
 /// Merge per-file resolved relations in input-file order, deduplicating across
 /// files (a no-op when sources are disjoint, but kept so output is identical to
 /// a single serial pass), then append artifact-level import/include edges.
+/// Candidate presence participates in lookup, but cannot certify dispatch or overrides.
+/// Keeping it in the lookup maps also prevents fallback to an unrelated free function.
+pub(crate) fn limit_derived_relations(relations: &mut Vec<Relation>, derived: &HashSet<EntityId>) {
+    let is_candidate = |node| matches!(node, GraphNodeId::Entity(id) if derived.contains(&id));
+    relations.retain_mut(|relation| {
+        if !is_candidate(relation.src) && !is_candidate(relation.dst) {
+            return true;
+        }
+        if relation.kind == RelationKind::Overrides {
+            return false;
+        }
+        if relation.kind != RelationKind::DerivedFrom {
+            crate::resolution::limit_derived_relation(relation);
+        }
+        true
+    });
+}
+
+fn append_derivation_relations<'a>(
+    relations: &mut Vec<Relation>,
+    entities: impl Iterator<Item = &'a Entity>,
+    artifacts: &ArtifactIdentityMap,
+) {
+    for entity in entities {
+        let Ok(Some(derivation)) = kin_model::entity_derivation(entity) else {
+            continue;
+        };
+        let Some(artifact) = artifacts.get(&derivation.generator.file.0) else {
+            continue;
+        };
+        relations.push(Relation {
+            id: RelationId::from_content(
+                &entity.id.to_string(),
+                &artifact.0.to_string(),
+                "DerivedFrom",
+            ),
+            kind: RelationKind::DerivedFrom,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(*artifact),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![kin_model::RelationEvidence {
+                source_span: Some(derivation.generator),
+                parser_rule: Some("derived_member_generator_v1".into()),
+                token: Some(derivation.source_blob_hash),
+                ..Default::default()
+            }],
+        });
+    }
+}
+
 fn merge_resolved(
     per_file_relations: Vec<Vec<Relation>>,
     files: &[&FileParseData],
@@ -1698,6 +1988,18 @@ fn merge_resolved(
         &ctx.known_files,
     );
 
+    let derived = ctx
+        .sorted_universe
+        .iter()
+        .filter(|e| kin_model::is_derived_member(e))
+        .map(|e| e.id)
+        .collect();
+    limit_derived_relations(&mut resolved, &derived);
+    append_derivation_relations(
+        &mut resolved,
+        files.iter().flat_map(|file| file.entities.iter()),
+        artifact_ids,
+    );
     resolved
 }
 
@@ -2072,6 +2374,11 @@ fn relation_origin_priority(origin: RelationOrigin) -> u8 {
 /// strength signal; retain one deterministically instead of dropping a later
 /// source-bearing occurrence.
 fn merge_relation_metadata(existing: &mut Relation, incoming: &Relation) {
+    // One direct call occurrence cannot prove which body a different self
+    // occurrence dispatches to. Keep the qualification on the logical edge;
+    // the evidence below retains which individual occurrences need it.
+    let dynamic_dispatch =
+        is_self_dispatch_candidate(existing) || is_self_dispatch_candidate(incoming);
     let incoming_is_stronger = match incoming.confidence.total_cmp(&existing.confidence) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Equal => {
@@ -2082,6 +2389,10 @@ fn merge_relation_metadata(existing: &mut Relation, incoming: &Relation) {
     if incoming_is_stronger {
         existing.confidence = incoming.confidence;
         existing.origin = incoming.origin;
+    }
+    if dynamic_dispatch {
+        existing.confidence = DISPATCH_CANDIDATE_CONFIDENCE;
+        existing.origin = RelationOrigin::Inferred;
     }
 
     match (&existing.import_source, &incoming.import_source) {
@@ -2151,6 +2462,67 @@ fn split_member_access(name: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((prefix, leaf))
+}
+
+fn go_package(entity: &Entity) -> Option<&str> {
+    (entity.language == LanguageId::Go)
+        .then(|| {
+            entity
+                .metadata
+                .extra
+                .get("go_package")
+                .and_then(|value| value.as_str())
+        })
+        .flatten()
+        .filter(|package| !package.is_empty())
+}
+
+fn is_go_declared_receiver_call(
+    rel: &ExtractedRelation,
+    src: EntityId,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> bool {
+    rel.kind == RelationKind::Calls
+        && rel.receiver.is_some()
+        && languages.get(&src) == Some(&LanguageId::Go)
+        && split_owner_method(&rel.dst_name)
+            .zip(split_owner_method(&rel.src_name))
+            .is_some_and(|((dst_owner, _), (src_owner, _))| dst_owner == src_owner)
+}
+
+/// Match the full receiver type and method inside the declared Go package.
+/// Equal directory names alone cannot distinguish an external test package.
+fn go_receiver_method_target<'a>(
+    src_file: &str,
+    src: EntityId,
+    candidates: impl Iterator<Item = (&'a str, EntityId)>,
+    kinds: &HashMap<EntityId, EntityKind>,
+    languages: &HashMap<EntityId, LanguageId>,
+    packages: &HashMap<EntityId, String>,
+) -> Option<EntityId> {
+    let mut target = None;
+    for (file, id) in candidates {
+        if kinds.get(&id) != Some(&EntityKind::Method)
+            || languages.get(&id) != Some(&LanguageId::Go)
+            || std::path::Path::new(file).parent() != std::path::Path::new(src_file).parent()
+        {
+            continue;
+        }
+        if file != src_file
+            && packages
+                .get(&src)
+                .zip(packages.get(&id))
+                .is_none_or(|(source, target)| source != target)
+        {
+            continue;
+        }
+        match target {
+            None => target = Some(id),
+            Some(previous) if previous == id => {}
+            Some(_) => return None,
+        }
+    }
+    target
 }
 
 /// Confidence for a call/reference edge resolved by reducing a path-qualified
@@ -3247,10 +3619,9 @@ fn derive_override_relations(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec
 
 /// Incremental-linker counterpart of [`locate_base_class`], kept in exact
 /// resolution parity: same-file class, then the caller file's import bindings,
-/// then a repo-globally unique class name. `import_map` is the step-local
-/// import index, so the import tier only sees files parsed this step — files
-/// recorded at earlier steps still resolve through the same-file and
-/// global-unique tiers.
+/// then a repo-globally unique class name. The import overlay retains the
+/// bindings that accompanied previously recorded class hierarchies, so an
+/// unchanged class's aliased base resolves through its declaring file.
 fn locate_base_class_incremental(
     class_file: &str,
     base_raw: &str,
@@ -5827,6 +6198,8 @@ pub struct IncrementalLinker {
     /// entity_id -> parser-reported language. Blind name/locality inference is
     /// fail-closed against this map.
     pub entity_language_by_id: HashMap<EntityId, LanguageId>,
+    /// Parser-recorded Go package clause, retained through incremental reopen.
+    pub go_package_by_id: HashMap<EntityId, String>,
     /// C/C++ callee id -> argument-count bounds parsed from its signature. The
     /// incremental mirror of the batch linker's `entity_arity_by_id`; backs
     /// overload arity pruning on the live-edit path.
@@ -5839,6 +6212,7 @@ pub struct IncrementalLinker {
     /// mirror of the batch linker's `declaration_ids`; backs the
     /// definition-over-declaration tiebreak on the live-edit path.
     pub declaration_ids: HashSet<EntityId>,
+    pub derived_member_ids: HashSet<EntityId>,
     /// Set of all known files
     pub known_files: HashSet<String>,
     /// file_path -> Vec<(EntityId, Visibility)>
@@ -5855,6 +6229,10 @@ pub struct IncrementalLinker {
     /// `include_targets_by_file` so an inheritance walk can cross into files
     /// recorded at earlier steps.
     pub class_bases_by_file: HashMap<String, Vec<(String, Vec<String>)>>,
+    /// Import bindings that give each recorded hierarchy's base names meaning:
+    /// file -> local name -> (module path, original name). Stored with the
+    /// hierarchy so a later step need not reparse an unchanged subclass.
+    class_imports_by_file: HashMap<String, HashMap<String, (String, String)>>,
 }
 
 /// Serialization contract for [`IncrementalLinker`] inside history-hydration
@@ -5868,6 +6246,7 @@ pub struct IncrementalLinker {
 /// field therefore requires changing both exhaustive conversions below and
 /// bumping [`INCREMENTAL_LINKER_CHECKPOINT_VERSION`], or the build fails.
 type ClassBasesByFileCheckpointV1 = Vec<(String, Vec<(String, Vec<String>)>)>;
+type ClassImportsByFileCheckpointV1 = Vec<(String, Vec<(String, (String, String))>)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -5878,17 +6257,20 @@ pub struct IncrementalLinkerCheckpointV1 {
     entity_by_bare_name: Vec<(String, Vec<(String, EntityId)>)>,
     entity_kind_by_id: Vec<(EntityId, EntityKind)>,
     entity_language_by_id: Vec<(EntityId, LanguageId)>,
+    go_package_by_id: Vec<(EntityId, String)>,
     entity_arity_by_id: Vec<(EntityId, ArityBounds)>,
     entity_role_by_id: Vec<(EntityId, EntityRole)>,
     declaration_ids: Vec<EntityId>,
+    derived_member_ids: Vec<EntityId>,
     known_files: Vec<String>,
     entities_by_file: Vec<(String, Vec<(EntityId, Visibility)>)>,
     include_targets_by_file: Vec<(String, Vec<String>)>,
     class_bases_by_file: ClassBasesByFileCheckpointV1,
+    class_imports_by_file: ClassImportsByFileCheckpointV1,
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 8;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 11;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -5942,13 +6324,16 @@ impl IncrementalLinker {
             entity_owner_segment_by_id: HashMap::new(),
             entity_kind_by_id: HashMap::new(),
             entity_language_by_id: HashMap::new(),
+            go_package_by_id: HashMap::new(),
             entity_arity_by_id: HashMap::new(),
             entity_role_by_id: HashMap::new(),
             declaration_ids: HashSet::new(),
+            derived_member_ids: HashSet::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
             include_targets_by_file: HashMap::new(),
             class_bases_by_file: HashMap::new(),
+            class_imports_by_file: HashMap::new(),
         }
     }
 
@@ -5963,13 +6348,16 @@ impl IncrementalLinker {
             entity_owner_segment_by_id: _,
             entity_kind_by_id,
             entity_language_by_id,
+            go_package_by_id,
             entity_arity_by_id,
             entity_role_by_id,
             declaration_ids,
+            derived_member_ids,
             known_files,
             entities_by_file,
             include_targets_by_file,
             class_bases_by_file,
+            class_imports_by_file,
         } = self;
 
         let mut artifact_ids: Vec<_> = artifact_ids
@@ -6014,6 +6402,11 @@ impl IncrementalLinker {
             .map(|(id, language)| (*id, *language))
             .collect();
         entity_language_by_id.sort_by_key(|(id, _)| *id);
+        let mut go_package_by_id: Vec<_> = go_package_by_id
+            .iter()
+            .map(|(id, package)| (*id, package.clone()))
+            .collect();
+        go_package_by_id.sort_by_key(|(id, _)| *id);
 
         let mut entity_arity_by_id: Vec<_> = entity_arity_by_id
             .iter()
@@ -6029,6 +6422,8 @@ impl IncrementalLinker {
 
         let mut declaration_ids: Vec<_> = declaration_ids.iter().copied().collect();
         declaration_ids.sort();
+        let mut derived_member_ids: Vec<_> = derived_member_ids.iter().copied().collect();
+        derived_member_ids.sort();
 
         let mut known_files: Vec<_> = known_files.iter().cloned().collect();
         known_files.sort();
@@ -6051,6 +6446,19 @@ impl IncrementalLinker {
             .collect();
         class_bases_by_file.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let mut class_imports_by_file: Vec<_> = class_imports_by_file
+            .iter()
+            .map(|(file, imports)| {
+                let mut imports: Vec<_> = imports
+                    .iter()
+                    .map(|(local, binding)| (local.clone(), binding.clone()))
+                    .collect();
+                imports.sort_by(|a, b| a.0.cmp(&b.0));
+                (file.clone(), imports)
+            })
+            .collect();
+        class_imports_by_file.sort_by(|a, b| a.0.cmp(&b.0));
+
         IncrementalLinkerCheckpointV1 {
             artifact_ids,
             entity_by_file_name,
@@ -6058,13 +6466,16 @@ impl IncrementalLinker {
             entity_by_bare_name,
             entity_kind_by_id,
             entity_language_by_id,
+            go_package_by_id,
             entity_arity_by_id,
             entity_role_by_id,
             declaration_ids,
+            derived_member_ids,
             known_files,
             entities_by_file,
             include_targets_by_file,
             class_bases_by_file,
+            class_imports_by_file,
         }
     }
 
@@ -6077,13 +6488,16 @@ impl IncrementalLinker {
             entity_by_bare_name,
             entity_kind_by_id,
             entity_language_by_id,
+            go_package_by_id,
             entity_arity_by_id,
             entity_role_by_id,
             declaration_ids,
+            derived_member_ids,
             known_files,
             entities_by_file,
             include_targets_by_file,
             class_bases_by_file,
+            class_imports_by_file,
         } = checkpoint;
 
         let entity_by_file_name = checkpoint_hash_map(
@@ -6095,6 +6509,17 @@ impl IncrementalLinker {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             "entity_by_file_name",
+        )?;
+
+        let class_imports_by_file = checkpoint_hash_map(
+            class_imports_by_file
+                .into_iter()
+                .map(|(file, imports)| {
+                    checkpoint_hash_map(imports, "class_imports_by_file.inner")
+                        .map(|imports| (file, imports))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            "class_imports_by_file",
         )?;
 
         let artifact_ids = checkpoint_hash_map(artifact_ids, "artifact_ids")?;
@@ -6132,6 +6557,11 @@ impl IncrementalLinker {
             );
         }
 
+        let derived_member_ids = checkpoint_hash_set(derived_member_ids, "derived_member_ids")?;
+        if !derived_member_ids.is_subset(&kind_ids) {
+            return Err("incremental-linker checkpoint derived member has no entity".into());
+        }
+
         let entity_by_name = checkpoint_hash_map(entity_by_name, "entity_by_name")?;
         // Every owner-qualified name the index holds already names its owner, so
         // the owner index is rebuilt here rather than stored in the checkpoint.
@@ -6155,9 +6585,11 @@ impl IncrementalLinker {
             entity_owner_segment_by_id,
             entity_kind_by_id,
             entity_language_by_id,
+            go_package_by_id: checkpoint_hash_map(go_package_by_id, "go_package_by_id")?,
             entity_arity_by_id: checkpoint_hash_map(entity_arity_by_id, "entity_arity_by_id")?,
             entity_role_by_id: checkpoint_hash_map(entity_role_by_id, "entity_role_by_id")?,
             declaration_ids: checkpoint_hash_set(declaration_ids, "declaration_ids")?,
+            derived_member_ids,
             known_files,
             entities_by_file: checkpoint_hash_map(entities_by_file, "entities_by_file")?,
             include_targets_by_file: checkpoint_hash_map(
@@ -6165,6 +6597,7 @@ impl IncrementalLinker {
                 "include_targets_by_file",
             )?,
             class_bases_by_file: checkpoint_hash_map(class_bases_by_file, "class_bases_by_file")?,
+            class_imports_by_file,
         })
     }
 
@@ -6203,15 +6636,18 @@ impl IncrementalLinker {
         if let Some(entities) = self.entities_by_file.remove(file_path) {
             for (entity_id, _) in &entities {
                 self.entity_owner_segment_by_id.remove(entity_id);
+                self.go_package_by_id.remove(entity_id);
+                self.derived_member_ids.remove(entity_id);
             }
         }
         self.include_targets_by_file.remove(file_path);
         self.class_bases_by_file.remove(file_path);
+        self.class_imports_by_file.remove(file_path);
     }
 
-    /// Record each file's class hierarchy (Extends declarations), replacing any
-    /// prior entry — a file whose classes lost all bases is cleared. The
-    /// incremental counterpart of the batch linker's hierarchy index; call
+    /// Record each file's class hierarchy (Extends declarations) and the import
+    /// bindings needed to interpret its base names, replacing prior entries.
+    /// Entries are cleared when a file loses all class bases. Call
     /// alongside [`IncrementalLinker::record_file_includes`] wherever a step's
     /// parse data is recorded.
     pub fn record_class_bases(&mut self, files: &[FileParseData]) {
@@ -6219,9 +6655,35 @@ impl IncrementalLinker {
             let classes = collect_class_bases(&file.relations);
             if classes.is_empty() {
                 self.class_bases_by_file.remove(&file.file_path);
+                self.class_imports_by_file.remove(&file.file_path);
             } else {
                 self.class_bases_by_file
                     .insert(file.file_path.clone(), classes);
+                let imports: HashMap<String, (String, String)> = file
+                    .imports
+                    .iter()
+                    .flat_map(|import| {
+                        import.specifiers.iter().map(move |specifier| {
+                            (
+                                specifier.local_name.clone(),
+                                (
+                                    import.module_path.clone(),
+                                    specifier
+                                        .original_name
+                                        .as_ref()
+                                        .unwrap_or(&specifier.local_name)
+                                        .clone(),
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                if imports.is_empty() {
+                    self.class_imports_by_file.remove(&file.file_path);
+                } else {
+                    self.class_imports_by_file
+                        .insert(file.file_path.clone(), imports);
+                }
             }
         }
     }
@@ -6259,6 +6721,12 @@ impl IncrementalLinker {
         let mut file_entities_list = Vec::new();
 
         for entity in entities {
+            if let Some(package) = go_package(entity) {
+                self.go_package_by_id.insert(entity.id, package.to_string());
+            }
+            if kin_model::is_derived_member(entity) {
+                self.derived_member_ids.insert(entity.id);
+            }
             self.entity_kind_by_id.insert(entity.id, entity.kind);
             let slot_free = file_entities_map
                 .get(&entity.name)
@@ -6377,7 +6845,12 @@ pub fn link_cross_file_incremental(
     files: &[FileParseData],
     linker: &IncrementalLinker,
 ) -> IndexResult<Vec<Relation>> {
-    link_cross_file_incremental_internal(files, linker, None)
+    link_cross_file_incremental_internal(
+        files,
+        linker,
+        None,
+        build_incremental_link_overlays(files, linker),
+    )
 }
 
 /// Resolve cross-file relations through the incremental indexes while
@@ -6387,13 +6860,127 @@ pub fn link_cross_file_incremental_with_completeness(
     linker: &IncrementalLinker,
     completeness: &FileParseCompletenessMap,
 ) -> IndexResult<Vec<Relation>> {
-    link_cross_file_incremental_internal(files, linker, Some(completeness))
+    link_cross_file_incremental_internal(
+        files,
+        linker,
+        Some(completeness),
+        build_incremental_link_overlays(files, linker),
+    )
+}
+
+/// Live resolution also consults persisted override facts for the exact
+/// self-call destinations this batch can reach. Fresh source files replace
+/// their old override slice, and missing/replaced identities cannot qualify
+/// a new declaration merely because its name was reused.
+pub fn link_cross_file_incremental_with_graph<G: EntityStore>(
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+    completeness: &FileParseCompletenessMap,
+    graph: &G,
+) -> IndexResult<Vec<Relation>> {
+    let mut overlays = build_incremental_link_overlays(files, linker);
+    let persisted = graph_overridden_targets(
+        files,
+        linker,
+        &overlays,
+        |id| {
+            graph
+                .get_entity(id)
+                .map_err(|error| IndexError::Graph(error.to_string()))
+        },
+        |id| {
+            graph
+                .get_all_relations_for_entity(id)
+                .map_err(|error| IndexError::Graph(error.to_string()))
+        },
+    )?;
+    overlays.overridden_bases.extend(persisted);
+    link_cross_file_incremental_internal(files, linker, Some(completeness), overlays)
+}
+
+fn graph_overridden_targets(
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+    overlays: &IncrementalLinkOverlays<'_>,
+    mut get_entity: impl FnMut(&EntityId) -> IndexResult<Option<Entity>>,
+    mut get_relations: impl FnMut(&EntityId) -> IndexResult<Vec<Relation>>,
+) -> IndexResult<HashSet<EntityId>> {
+    let fresh_files: HashSet<_> = files.iter().map(|file| file.file_path.as_str()).collect();
+    let mut targets = HashSet::new();
+    for file in files {
+        for relation in &file.relations {
+            if relation.kind != RelationKind::Calls || relation.receiver.is_some() {
+                continue;
+            }
+            if let Some(target) = linker
+                .entity_by_file_name
+                .get(&file.file_path)
+                .and_then(|names| names.get(&relation.dst_name))
+            {
+                targets.insert(*target);
+            } else if let Some((owner, method)) = split_owner_method(&relation.dst_name) {
+                if let Some(target) = resolve_inherited_method_incremental(
+                    &file.file_path,
+                    owner,
+                    method,
+                    linker,
+                    &overlays.import_map,
+                    &overlays.class_bases,
+                ) {
+                    targets.insert(target);
+                }
+            }
+        }
+    }
+    let current_identity = |entity: &Entity| {
+        entity.file_origin.as_ref().is_some_and(|file| {
+            linker
+                .entity_by_file_name
+                .get(&file.0)
+                .and_then(|names| names.get(&entity.name))
+                == Some(&entity.id)
+        })
+    };
+    let mut overridden = HashSet::new();
+    let mut entities = HashMap::new();
+    for target in targets {
+        let target_entity = get_entity(&target)?;
+        if !target_entity.as_ref().is_some_and(current_identity) {
+            continue;
+        }
+        for relation in get_relations(&target)? {
+            if relation.kind != RelationKind::Overrides || relation.dst.as_entity() != Some(target)
+            {
+                continue;
+            }
+            let Some(source) = relation.src.as_entity() else {
+                continue;
+            };
+            if !entities.contains_key(&source) {
+                entities.insert(source, get_entity(&source)?);
+            }
+            let Some(source) = entities.get(&source).and_then(Option::as_ref) else {
+                continue;
+            };
+            if current_identity(source)
+                && source
+                    .file_origin
+                    .as_ref()
+                    .is_some_and(|file| !fresh_files.contains(file.0.as_str()))
+            {
+                overridden.insert(target);
+                break;
+            }
+        }
+    }
+    Ok(overridden)
 }
 
 fn link_cross_file_incremental_internal(
     files: &[FileParseData],
     linker: &IncrementalLinker,
     completeness: Option<&FileParseCompletenessMap>,
+    overlays: IncrementalLinkOverlays<'_>,
 ) -> IndexResult<Vec<Relation>> {
     let _span =
         tracing::info_span!("kin.index.link_cross_file_incremental", files = files.len()).entered();
@@ -6410,7 +6997,8 @@ fn link_cross_file_incremental_internal(
         include_graph,
         class_bases,
         declared_attribute_types,
-    } = build_incremental_link_overlays(files, linker);
+        overridden_bases,
+    } = overlays;
 
     // Resolve each file independently: every relation's source entity is owned
     // by its own file, so the (src, dst, kind) triples produced by different
@@ -6434,6 +7022,7 @@ fn link_cross_file_incremental_internal(
                 &include_graph,
                 &class_bases,
                 &declared_attribute_types,
+                &overridden_bases,
                 completeness,
             );
             if shows_progress_bar(total_files) {
@@ -6469,10 +7058,10 @@ fn link_cross_file_incremental_internal(
 /// using the incrementally updated linker state.
 ///
 /// All reads are against the shared read-only `linker` and the step-local
-/// overlays (`import_map`, `include_graph`, `class_bases`); the only mutable
-/// state is a file-local dedup set, so this is pure with respect to other files
-/// and safe to run across files in parallel. Mirrors the batch
-/// [`resolve_one_file`].
+/// overlays (`import_map`, `include_graph`, `class_bases`, `overridden_bases`);
+/// the only mutable state is a file-local dedup set, so this is pure with
+/// respect to other files and safe to run across files in parallel. Mirrors
+/// the batch [`resolve_one_file`].
 #[allow(clippy::too_many_arguments)]
 fn resolve_one_file_incremental(
     file: &FileParseData,
@@ -6481,6 +7070,7 @@ fn resolve_one_file_incremental(
     include_graph: &HashMap<String, Vec<String>>,
     class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
     declared_attribute_types: &HashMap<(&str, &str, &str), &str>,
+    overridden_bases: &HashSet<EntityId>,
     completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
@@ -6535,6 +7125,37 @@ fn resolve_one_file_incremental(
             }
         };
 
+        if is_go_selector_reference(rel, linker.entity_language_by_id.get(&src_id).copied()) {
+            let candidates = go_field_reference_candidates(
+                rel,
+                &file.imports,
+                linker
+                    .entity_by_bare_name
+                    .get(rel.dst_name.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, id)| *id),
+                &linker.entity_kind_by_id,
+                &linker.entity_language_by_id,
+            );
+            for dst_id in candidates {
+                let mut candidate =
+                    make_relation(rel, src_id, dst_id, RECEIVER_NAME_FANOUT_CONFIDENCE);
+                for evidence in &mut candidate.evidence {
+                    evidence.parser_rule = Some("go_field_selector_name_candidate_v1".to_string());
+                    evidence.token = Some(format!(
+                        "{}.{}",
+                        rel.receiver.as_deref().unwrap(),
+                        rel.dst_name
+                    ));
+                }
+                accumulate_relation(&mut resolved, &mut relation_indices, candidate);
+            }
+            // The owner type is not established. No later free-symbol tier
+            // may turn an unresolved selector into a proven global reference.
+            continue;
+        }
+
         // Positional arity the call's overloads are pruned by (fail-open on an
         // absent or splat-widened shape) — the incremental mirror of the batch
         // linker's per-relation derivation.
@@ -6575,6 +7196,30 @@ fn resolve_one_file_incremental(
             continue;
         }
 
+        if is_go_declared_receiver_call(rel, src_id, &linker.entity_language_by_id) {
+            let candidates = linker
+                .entity_by_name
+                .get(&rel.dst_name)
+                .into_iter()
+                .flatten()
+                .map(|(file, id)| (file.as_str(), *id));
+            if let Some(dst_id) = go_receiver_method_target(
+                &file.file_path,
+                src_id,
+                candidates,
+                &linker.entity_kind_by_id,
+                &linker.entity_language_by_id,
+                &linker.go_package_by_id,
+            ) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, RECEIVER_TYPE_CONFIDENCE),
+                );
+            }
+            continue;
+        }
+
         // (a) Same-file resolution. Mirrors the batch linker: the same-file
         // entity wins and is emitted first at full confidence, but when
         // cross-file entities share the exact name (a declaration/prototype
@@ -6591,12 +7236,20 @@ fn resolve_one_file_incremental(
             .map(|receiver| {
                 (
                     receiver,
-                    classify_receiver(
-                        receiver,
-                        &file.file_path,
-                        import_map.get(file.file_path.as_str()),
-                        &linker.known_files,
-                    ),
+                    if linker.entity_language_by_id.get(&src_id) == Some(&LanguageId::Go)
+                        && rel.import_source.is_none()
+                    {
+                        // Go records this local receiver from its declaration.
+                        // A file import cannot override a local binding.
+                        ReceiverScope::Object
+                    } else {
+                        classify_receiver(
+                            receiver,
+                            &file.file_path,
+                            import_map.get(file.file_path.as_str()),
+                            &linker.known_files,
+                        )
+                    },
                 )
             });
         let mut receiver_is_object = false;
@@ -6644,6 +7297,32 @@ fn resolve_one_file_incremental(
                     accumulate_relation(&mut resolved, &mut relation_indices, external);
                 }
                 continue;
+            }
+        }
+
+        // (a-dispatch) Mirrors the batch linker: a self/cls call whose
+        // enclosing class directly declares the callee, where that
+        // declaration is itself named as a base by an `Overrides` edge
+        // (`overridden_bases`), must not be stamped at the same-file tier's
+        // parser-certain confidence below — the receiver's runtime class, not
+        // this same-file hit, decides which body runs. `receiver.is_none()`
+        // is the shape `extract_named_callee` reserves for a direct
+        // `self`/`cls` receiver.
+        if rel.kind == RelationKind::Calls && rel.receiver.is_none() && !receiver_is_object {
+            if let Some(dst_id) = dst_same_file {
+                if overridden_bases.contains(&dst_id) {
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        qualify_self_dispatch(make_relation(
+                            rel,
+                            src_id,
+                            dst_id,
+                            DISPATCH_CANDIDATE_CONFIDENCE,
+                        )),
+                    );
+                    continue;
+                }
             }
         }
 
@@ -6756,10 +7435,25 @@ fn resolve_one_file_incremental(
                         import_map,
                         class_bases,
                     ) {
+                        // Mirrors the batch linker's override-aware downgrade:
+                        // a self/cls walk to a defining ancestor that is itself
+                        // overridden elsewhere is not proof of which body runs.
+                        let dynamic_dispatch =
+                            rel.receiver.is_none() && overridden_bases.contains(&dst_id);
+                        let confidence = if dynamic_dispatch {
+                            DISPATCH_CANDIDATE_CONFIDENCE
+                        } else {
+                            INHERITED_METHOD_CONFIDENCE
+                        };
+                        let relation = make_relation(rel, src_id, dst_id, confidence);
                         accumulate_relation(
                             &mut resolved,
                             &mut relation_indices,
-                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                            if dynamic_dispatch {
+                                qualify_self_dispatch(relation)
+                            } else {
+                                relation
+                            },
                         );
                         continue;
                     }
@@ -7238,13 +7932,25 @@ struct IncrementalLinkOverlays<'a> {
     include_graph: HashMap<String, Vec<String>>,
     class_bases: HashMap<String, Vec<(String, Vec<String>)>>,
     /// (file, class, attribute) -> declared type name, for the two-hop
-    /// receiver tier. Step-local like `import_map` above rather than merged
-    /// with persistent state like `class_bases`: both halves of a two-hop join
-    /// are read out of relations, and this step's relations are the ones the
-    /// linker holds. A step that re-links one file therefore joins only
-    /// against declarations that step carries, which is the same bound the
-    /// import overlay beside it already has.
+    /// receiver tier. These declarations remain step-local: unlike class-base
+    /// import bindings, attribute annotations are not retained by the linker.
     declared_attribute_types: HashMap<(&'a str, &'a str, &'a str), &'a str>,
+    /// The incremental mirror of the batch linker's
+    /// `LinkContext::overridden_bases`: every method/function entity that is
+    /// the base half of at least one `Overrides` edge the current hierarchy
+    /// state implies.
+    ///
+    /// Computed from `class_bases` and `linker.entity_by_file_name` rather
+    /// than from `Contains` edges, unlike the batch computation: the
+    /// incremental linker holds parsed relations only for the files THIS step
+    /// re-parsed, and a base and its override can each have last changed in a
+    /// different, earlier step. Python and C++ both key a method's entity name
+    /// off its owning class (`Class.method`, `Class::method`), so a class's own
+    /// declared members are exactly the names in its file starting with that
+    /// prefix — no `Contains` edge is needed to enumerate them, and this index
+    /// stays correct across step boundaries the same way `class_bases` already
+    /// does.
+    overridden_bases: HashSet<EntityId>,
 }
 
 /// The incremental mirror of [`resolve_two_hop_declared_method`]. Same three
@@ -7277,14 +7983,84 @@ fn resolve_two_hop_declared_method_incremental(
     )
 }
 
+/// The incremental mirror of the batch linker's override-base index. See
+/// [`IncrementalLinkOverlays::overridden_bases`] for why this reads class
+/// membership off entity-name prefixes instead of calling
+/// [`derive_override_relations_incremental`] over every known file: that
+/// function needs a file's parsed `Contains` edges, which only exist for the
+/// files the CURRENT step re-parsed, while `class_bases` (and the entity-name
+/// index below it) carries every file the linker has ever seen.
+fn compute_overridden_bases_incremental(
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+) -> HashSet<EntityId> {
+    let mut overridden = HashSet::new();
+    for (file_path, classes) in class_bases {
+        let Some(names) = linker.entity_by_file_name.get(file_path) else {
+            continue;
+        };
+        for (class_name, _bases) in classes {
+            let prefixes = receiver_method_keys(class_name, "");
+            for (name, &child_id) in names {
+                let Some(method) = prefixes
+                    .iter()
+                    .find_map(|prefix| name.strip_prefix(prefix.as_str()))
+                else {
+                    continue;
+                };
+                // An empty or further-dotted remainder is not one of this
+                // class's own direct members (a nested owner segment, or the
+                // class entity itself), so it cannot be the overriding side of
+                // an `Overrides` edge.
+                if method.is_empty() || method.contains(['.', ':']) {
+                    continue;
+                }
+                if !is_overridable_member(linker.entity_kind_by_id.get(&child_id)) {
+                    continue;
+                }
+                if let Some(base_id) = resolve_inherited_method_incremental(
+                    file_path,
+                    class_name,
+                    method,
+                    linker,
+                    import_map,
+                    class_bases,
+                ) {
+                    if base_id != child_id {
+                        overridden.insert(base_id);
+                    }
+                }
+            }
+        }
+    }
+    overridden
+}
+
 fn build_incremental_link_overlays<'a>(
     files: &'a [FileParseData],
-    linker: &IncrementalLinker,
+    linker: &'a IncrementalLinker,
 ) -> IncrementalLinkOverlays<'a> {
-    // Import map per file: local_name -> (module_path, original_name).
+    // A stored base name is meaningful only with the bindings from the same
+    // parse. Fresh files replace that context, including removal of imports.
     let import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = {
-        let mut import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = HashMap::new();
+        let mut import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = linker
+            .class_imports_by_file
+            .iter()
+            .map(|(file, imports)| {
+                (
+                    file.as_str(),
+                    imports
+                        .iter()
+                        .map(|(local, (module, original))| {
+                            (local.as_str(), (module.as_str(), original.as_str()))
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
         for file in files {
+            import_map.remove(file.file_path.as_str());
             let mut file_imports: HashMap<&str, (&str, &str)> = HashMap::new();
             for imp in &file.imports {
                 for spec in &imp.specifiers {
@@ -7335,11 +8111,14 @@ fn build_incremental_link_overlays<'a>(
         merged
     };
 
+    let overridden_bases = compute_overridden_bases_incremental(linker, &import_map, &class_bases);
+
     IncrementalLinkOverlays {
         import_map,
         include_graph,
         class_bases,
         declared_attribute_types: build_declared_attribute_types(files.iter()),
+        overridden_bases,
     }
 }
 
@@ -7427,6 +8206,12 @@ fn merge_incremental_resolved(
         &linker.known_files,
     );
 
+    limit_derived_relations(&mut resolved, &linker.derived_member_ids);
+    append_derivation_relations(
+        &mut resolved,
+        files.iter().flat_map(|file| file.entities.iter()),
+        &linker.artifact_ids,
+    );
     resolved
 }
 
@@ -7442,6 +8227,7 @@ fn link_cross_file_incremental_serial(
         include_graph,
         class_bases,
         declared_attribute_types,
+        overridden_bases,
     } = build_incremental_link_overlays(files, linker);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
@@ -7453,6 +8239,7 @@ fn link_cross_file_incremental_serial(
                 &include_graph,
                 &class_bases,
                 &declared_attribute_types,
+                &overridden_bases,
                 None,
             )
         })
@@ -7696,6 +8483,56 @@ mod tests {
     }
 
     #[test]
+    fn persisted_override_lookup_discloses_entity_and_relation_read_failures() {
+        use kin_parser::{LanguageAdapter, PythonAdapter};
+        let source = b"class Base:\n    def send(self, request):\n        return request\n    def resolve(self, request):\n        return self.send(request)\n";
+        let file = FilePathId::new("base.py");
+        let adapter = PythonAdapter;
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter.extract(&tree, source, &file).unwrap();
+        let parsed = FileParseData {
+            file_path: file.0.clone(),
+            entities: output
+                .entities
+                .into_iter()
+                .map(|entity| {
+                    entity.into_entity_with_source(adapter.language_id(), &file, Some(source))
+                })
+                .collect(),
+            relations: output.relations,
+            imports: output.imports,
+        };
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(&file.0, ArtifactId::new(), &parsed.entities);
+        let files = [parsed];
+        let overlays = build_incremental_link_overlays(&files, &linker);
+        let entity_error = graph_overridden_targets(
+            &files,
+            &linker,
+            &overlays,
+            |_| Err(IndexError::Graph("entity read failed".to_string())),
+            |_| panic!("failed entity read cannot be treated as present"),
+        )
+        .unwrap_err();
+        assert!(entity_error.to_string().contains("entity read failed"));
+        let relation_error = graph_overridden_targets(
+            &files,
+            &linker,
+            &overlays,
+            |id| {
+                Ok(files[0]
+                    .entities
+                    .iter()
+                    .find(|entity| entity.id == *id)
+                    .cloned())
+            },
+            |_| Err(IndexError::Graph("relation read failed".to_string())),
+        )
+        .unwrap_err();
+        assert!(relation_error.to_string().contains("relation read failed"));
+    }
+
+    #[test]
     fn incremental_remove_then_path_reuse_cannot_retain_artifact_identity() {
         let mut linker = IncrementalLinker::new();
         let removed_identity = ArtifactId::new();
@@ -7771,6 +8608,18 @@ mod tests {
                     file.to_string(),
                     vec![(format!("{name}Class"), vec!["Base".to_string()])],
                 );
+                let mut imports = HashMap::new();
+                let bindings = if reverse {
+                    ["Zed", "Alias"]
+                } else {
+                    ["Alias", "Zed"]
+                };
+                for local in bindings {
+                    imports.insert(local.to_string(), ("base".to_string(), "Base".to_string()));
+                }
+                linker
+                    .class_imports_by_file
+                    .insert(file.to_string(), imports);
             }
             linker
         };
@@ -7796,6 +8645,171 @@ mod tests {
             serde_json::from_value::<IncrementalLinkerCheckpointV1>(missing_field).is_err(),
             "missing newly-required linker state must fail loudly; no serde defaults"
         );
+
+        let mut old_shape: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        old_shape
+            .as_object_mut()
+            .unwrap()
+            .remove("class_imports_by_file");
+        assert!(
+            serde_json::from_value::<IncrementalLinkerCheckpointV1>(old_shape).is_err(),
+            "the old checkpoint shape must not silently restore without alias bindings"
+        );
+
+        let mut duplicate: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        let bindings = duplicate["class_imports_by_file"][0][1]
+            .as_array_mut()
+            .unwrap();
+        bindings.push(bindings[0].clone());
+        let checkpoint = serde_json::from_value(duplicate).unwrap();
+        assert!(
+            IncrementalLinker::from_checkpoint_v1(checkpoint).is_err(),
+            "a checkpoint cannot choose between duplicate class import bindings"
+        );
+    }
+
+    fn derived_fixture(path: &str, source: &str) -> FileParseData {
+        let indexed = crate::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new(path),
+                source.as_bytes(),
+                kin_blobs::digest(source.as_bytes()),
+            )
+            .unwrap()
+            .indexed_file;
+        FileParseData {
+            file_path: path.into(),
+            entities: indexed.entities,
+            relations: indexed.extracted_relations,
+            imports: indexed.imports,
+        }
+    }
+
+    #[test]
+    fn derived_member_lifecycle_preserves_candidates_and_refuses_false_dispatch() {
+        use crate::resolution::RelationResolution;
+        let definitions = derived_fixture(
+            "members.js",
+            "export const app = {}; for (const key of ['get','post']) { app[key] = () => {}; }",
+        );
+        let callers = derived_fixture(
+            "caller.js",
+            "import { app } from './members'; export function run() { app.get(); }",
+        );
+        let unrelated = derived_fixture("unrelated.js", "export function get() { return 42; }");
+        let candidate = definitions
+            .entities
+            .iter()
+            .find(|e| e.name == "app.get")
+            .unwrap();
+        assert!(candidate.span.is_none());
+        assert_eq!(candidate.role, EntityRole::Source);
+        assert!(kin_model::require_independent_source(candidate)
+            .unwrap_err()
+            .contains("generator"));
+        let files = vec![definitions.clone(), callers.clone(), unrelated.clone()];
+        let check = |relations: Vec<Relation>| {
+            let calls: Vec<_> = relations
+                .iter()
+                .filter(|r| r.kind == RelationKind::Calls)
+                .collect();
+            assert!(
+                calls
+                    .iter()
+                    .any(|r| r.dst == GraphNodeId::Entity(candidate.id)),
+                "{calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|r| RelationResolution::of(r) == RelationResolution::NameOnly),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|r| r.dst
+                == GraphNodeId::Entity(
+                    unrelated
+                        .entities
+                        .iter()
+                        .find(|e| e.name == "get")
+                        .unwrap()
+                        .id
+                )));
+        };
+        let linked = link_cross_file(&files);
+        assert!(linked.iter().any(|r| r.kind == RelationKind::DerivedFrom
+            && r.src == GraphNodeId::Entity(candidate.id)
+            && r.dst == GraphNodeId::Artifact(admitted_artifact_id("members.js"))));
+        check(linked);
+        let mut incremental = IncrementalLinker::new();
+        for file in &files {
+            incremental.add_file(
+                &file.file_path,
+                admitted_artifact_id(&file.file_path),
+                &file.entities,
+            );
+        }
+        check(link_cross_file_incremental(
+            std::slice::from_ref(&callers),
+            &incremental,
+        ));
+        let encoded = serde_json::to_vec(&incremental.to_checkpoint_v1()).unwrap();
+        let restored =
+            IncrementalLinker::from_checkpoint_v1(serde_json::from_slice(&encoded).unwrap())
+                .unwrap();
+        check(link_cross_file_incremental(
+            std::slice::from_ref(&callers),
+            &restored,
+        ));
+        let mut old: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        old.as_object_mut().unwrap().remove("derived_member_ids");
+        assert!(serde_json::from_value::<IncrementalLinkerCheckpointV1>(old).is_err());
+        // Reparse the generator only: retired candidate IDs leave the index.
+        let replacement =
+            derived_fixture("members.js", "export const app = {}; app.get = () => {};");
+        incremental.add_file(
+            "members.js",
+            admitted_artifact_id("members.js"),
+            &replacement.entities,
+        );
+        assert!(!incremental.derived_member_ids.contains(&candidate.id));
+        let links = link_cross_file_incremental(&[callers], &incremental);
+        assert!(links
+            .iter()
+            .all(|r| r.src != GraphNodeId::Entity(candidate.id)
+                && r.dst != GraphNodeId::Entity(candidate.id)));
+    }
+
+    #[test]
+    fn derived_member_gate_drops_overrides_and_cannot_be_upgraded_by_origin() {
+        let mut candidate = make_entity("App.get", "member.js");
+        candidate.doc_summary = Some(
+            "Derived from a loop over `names`; no literal `App.get` assignment appears in source."
+                .into(),
+        );
+        let source = make_entity("Other.get", "caller.js");
+        let mut relations: Vec<_> = [RelationKind::Overrides, RelationKind::Calls]
+            .into_iter()
+            .map(|kind| Relation {
+                id: RelationId::new(),
+                kind,
+                src: GraphNodeId::Entity(source.id),
+                dst: GraphNodeId::Entity(candidate.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: vec![],
+            })
+            .collect();
+        let ids = HashSet::from([candidate.id]);
+        limit_derived_relations(&mut relations, &ids);
+        assert_eq!(relations.len(), 1);
+        relations[0].origin = RelationOrigin::Lsp;
+        assert_eq!(
+            crate::resolution::RelationResolution::of(&relations[0]),
+            crate::resolution::RelationResolution::NameOnly
+        );
+        assert!(kin_model::require_independent_source(&candidate).is_err());
     }
 
     fn test_fingerprint() -> SemanticFingerprint {
@@ -8419,6 +9433,74 @@ mod tests {
         assert_eq!(batch_forward.origin, RelationOrigin::Inferred);
         assert_eq!(batch_forward.evidence.len(), 1);
         assert_eq!(batch_forward.evidence[0].occurrence_count, 2);
+    }
+
+    #[test]
+    fn resolved_direct_and_dynamic_occurrences_keep_dispatch_qualification_in_either_order() {
+        let caller = make_entity("Base.resolve", "base.py");
+        let target = make_entity("Base.send", "base.py");
+        let mut extracted = calls_relation("Base.resolve", "Base.send");
+        extracted.call_shape = Some(CallArgShape {
+            positional: 1,
+            ..CallArgShape::default()
+        });
+        let dynamic = qualify_self_dispatch(make_relation(
+            &extracted,
+            caller.id,
+            target.id,
+            DISPATCH_CANDIDATE_CONFIDENCE,
+            &FilePathId::new("base.py"),
+            &ParseCompleteness::Full,
+            true,
+        ));
+        extracted.call_shape = Some(CallArgShape {
+            positional: 2,
+            ..CallArgShape::default()
+        });
+        let direct = make_relation(
+            &extracted,
+            caller.id,
+            target.id,
+            1.0,
+            &FilePathId::new("base.py"),
+            &ParseCompleteness::Full,
+            true,
+        );
+        let mut answers = Vec::new();
+        for input in [[direct.clone(), dynamic.clone()], [dynamic, direct]] {
+            let mut relations = Vec::new();
+            let mut keys = HashMap::new();
+            for relation in input {
+                accumulate_relation(&mut relations, &mut keys, relation);
+            }
+            assert_eq!(relations.len(), 1);
+            let merged = relations.pop().unwrap();
+            assert_eq!(merged.confidence, DISPATCH_CANDIDATE_CONFIDENCE);
+            assert_eq!(merged.origin, RelationOrigin::Inferred);
+            assert_eq!(merged.evidence.len(), 2);
+            assert_eq!(
+                merged
+                    .evidence
+                    .iter()
+                    .map(|record| record.occurrence_count)
+                    .sum::<u32>(),
+                2
+            );
+            let dynamic = merged
+                .evidence
+                .iter()
+                .find(|record| record.token.as_deref() == Some(SELF_DISPATCH_OVERRIDE_EVIDENCE_V1))
+                .unwrap();
+            assert_eq!(dynamic.call_shape.as_ref().unwrap().positional, 1);
+            let direct = merged
+                .evidence
+                .iter()
+                .find(|record| record.token.is_none())
+                .unwrap();
+            assert_eq!(direct.call_shape.as_ref().unwrap().positional, 2);
+            answers.push(merged);
+        }
+        assert_eq!(answers[0], answers[1]);
     }
 
     #[test]

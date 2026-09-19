@@ -424,6 +424,7 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, source, file_id)?;
         let kin_parser::ParseOutput {
             entities: extracted_entities,
+            derived_members,
             relations: extracted_relations,
             imports,
             tests,
@@ -453,6 +454,14 @@ impl IndexPipeline {
                 ent
             })
             .collect();
+        materialize_derived_members(
+            &mut entities,
+            derived_members,
+            language,
+            file_id,
+            role,
+            blob_hash,
+        );
         attach_span_source_digest(&mut entities, blob_hash);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
@@ -463,6 +472,7 @@ impl IndexPipeline {
         );
         attach_equivalence_class(&mut entities, &tree, source, language);
         if language == LanguageId::Go {
+            kin_parser::attach_go_package_metadata(&tree, source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
         }
 
@@ -584,6 +594,7 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, &source, file_id)?;
         let kin_parser::ParseOutput {
             entities: extracted_entities,
+            derived_members,
             relations: extracted_relations,
             imports,
             tests,
@@ -614,6 +625,14 @@ impl IndexPipeline {
                 ent
             })
             .collect();
+        materialize_derived_members(
+            &mut entities,
+            derived_members,
+            language,
+            file_id,
+            role,
+            blob_hash,
+        );
         attach_span_source_digest(&mut entities, blob_hash);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
@@ -624,6 +643,7 @@ impl IndexPipeline {
         );
         attach_equivalence_class(&mut entities, &tree, &source, language);
         if language == LanguageId::Go {
+            kin_parser::attach_go_package_metadata(&tree, &source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);
         }
 
@@ -1125,6 +1145,76 @@ pub fn classify_file_role(path: &str) -> EntityRole {
     EntityRole::Source
 }
 
+/// A generated member has identity and provenance, but no independent source span.
+fn materialize_derived_members(
+    entities: &mut Vec<Entity>,
+    sites: Vec<kin_parser::ExtractedDerivedMember>,
+    language: LanguageId,
+    file: &FilePathId,
+    role: EntityRole,
+    blob_hash: kin_blobs::Hash256,
+) {
+    use kin_model::derivation::{
+        DerivationSchema, EntityDerivation, ENTITY_DERIVATION_KEY, MEMBER_COVERAGE_KEY,
+    };
+    if sites.is_empty() {
+        return;
+    }
+    let coverage = serde_json::json!({"schema":"kin.computed.members.v1", "scope":"javascript_bracket_writes", "observed_write_sites":sites.len(),
+        "runtime_enumeration_complete":false, "sites":sites.iter().map(|site| serde_json::json!({
+            "generator":site.generator,"assignment":site.assignment,"owner":site.owner,
+            "candidate_keys":site.keys,"rule":site.rule,"conditions":site.conditions
+        })).collect::<Vec<_>>()});
+    if let Some(module) = entities
+        .iter_mut()
+        .find(|e| e.kind == kin_model::EntityKind::Module)
+    {
+        module
+            .metadata
+            .extra
+            .insert(MEMBER_COVERAGE_KEY.into(), coverage);
+    }
+    for site in sites {
+        // Noncallable writes remain typed coverage evidence until Field support is integrated.
+        if !site.callable {
+            continue;
+        }
+        let Some(owner) = site.owner else {
+            continue;
+        };
+        for key in site.keys {
+            if key.is_empty() {
+                continue;
+            }
+            let name = format!("{owner}.{key}");
+            let derivation = EntityDerivation {
+                schema: DerivationSchema::V1,
+                generator: site.generator.clone(),
+                assignment: site.assignment.clone(),
+                source_blob_hash: blob_hash.to_string(),
+                owner: owner.clone(),
+                member_key: key,
+                rule: site.rule.clone(),
+                conditions: site.conditions.clone(),
+            };
+            let mut metadata = kin_model::EntityMetadata::default();
+            metadata.extra.insert(
+                ENTITY_DERIVATION_KEY.into(),
+                serde_json::to_value(&derivation).expect("derivation serializes"),
+            );
+            entities.push(Entity {
+                id: kin_model::EntityId::from_content(&file.0, &name,
+                    &format!("derived_member_candidate:{}", site.assignment.start_byte), site.assignment.start_line),
+                kind: kin_model::EntityKind::Method,
+                name, language, fingerprint: site.fingerprint.clone(), file_origin: Some(file.clone()),
+                span: None, signature: site.signature.clone(), visibility: kin_model::Visibility::Public,
+                role, doc_summary: Some("Candidate generated member; inspect the shared generator and unresolved conditions.".into()),
+                metadata, lineage_parent: None, created_in: None, superseded_by: None,
+            });
+        }
+    }
+}
+
 /// Resolve extracted name-based relations to entity-ID-based relations.
 ///
 /// Returns both same-file resolved relations and cross-file unresolved ones.
@@ -1147,7 +1237,18 @@ fn resolve_relations(
             continue;
         }
         let src = entities.iter().find(|e| e.name == rel.src_name);
-        let dst = entities.iter().find(|e| e.name == rel.dst_name);
+        let dst = entities
+            .iter()
+            .find(|e| e.name == rel.dst_name)
+            .filter(|_| {
+                // Receiver-shaped fields and unproven local method calls must
+                // reach the linker instead of capturing a bare free symbol.
+                !(crate::linker::is_go_selector_reference(rel, src.map(|entity| entity.language))
+                    || (src.is_some_and(|s| s.language == kin_model::LanguageId::Go)
+                        && rel.kind == kin_model::RelationKind::Calls
+                        && rel.receiver.is_some()
+                        && !rel.dst_name.contains('.')))
+            });
 
         match (src, dst) {
             (Some(s), Some(d)) => {
@@ -1202,6 +1303,12 @@ fn resolve_relations(
             }
         }
     }
+    let derived = entities
+        .iter()
+        .filter(|entity| kin_model::is_derived_member(entity))
+        .map(|entity| entity.id)
+        .collect();
+    crate::linker::limit_derived_relations(&mut resolved, &derived);
     (resolved, unresolved)
 }
 

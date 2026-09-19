@@ -91,6 +91,7 @@ fn extract_csharp_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pa
     annotate_import_sources(&mut relations, &imports);
 
     ParseOutput {
+        derived_members: Vec::new(),
         entities,
         relations,
         imports,
@@ -538,6 +539,7 @@ fn extract_ruby_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pars
     annotate_import_sources(&mut relations, &imports);
 
     ParseOutput {
+        derived_members: Vec::new(),
         entities,
         relations,
         imports,

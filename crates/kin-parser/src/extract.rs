@@ -732,8 +732,23 @@ pub enum ExtractedTestKind {
 
 /// Output of parsing a single file.
 #[derive(Debug, Clone)]
+pub struct ExtractedDerivedMember {
+    pub fingerprint: SemanticFingerprint,
+    pub owner: Option<String>,
+    pub keys: Vec<String>,
+    pub callable: bool,
+    pub signature: String,
+    pub generator: SourceSpan,
+    pub assignment: SourceSpan,
+    pub rule: String,
+    pub conditions: Vec<String>,
+}
+
+/// Physical declarations and candidate facts are separate parser outputs.
+#[derive(Debug, Clone)]
 pub struct ParseOutput {
     pub entities: Vec<ExtractedEntity>,
+    pub derived_members: Vec<ExtractedDerivedMember>,
     pub relations: Vec<ExtractedRelation>,
     /// Detailed import declarations for cross-file resolution.
     pub imports: Vec<FileImport>,

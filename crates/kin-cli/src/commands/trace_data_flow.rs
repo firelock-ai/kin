@@ -1001,8 +1001,7 @@ pub fn build_trace_data_flow_response_within(
                 break 'walk;
             }
 
-            let relations = graph
-                .get_all_relations_for_entity(&node.id)
+            let relations = kin_index::relation_read::relations_for_read(graph, &node.id)
                 .context("read relations for trace step")?;
 
             // Expand outgoing edges (parent calls these) when direction allows.
@@ -1518,8 +1517,7 @@ fn reach_set_toward(
             if meter.should_stop().is_some() {
                 return Ok((seen, false));
             }
-            let relations = graph
-                .get_all_relations_for_entity(&node)
+            let relations = kin_index::relation_read::relations_for_read(graph, &node)
                 .context("read relations for target reachability")?;
             for rel in &relations {
                 if meter.charge_edge().is_some() {

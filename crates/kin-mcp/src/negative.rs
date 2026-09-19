@@ -405,6 +405,27 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             always: true,
             class: NegativeClass::Structural,
         },
+        // Structural for the same reason `semantic_search` is: this tool reads
+        // the entity index's own stored text fields through a bounded lexical
+        // scan, never the vector index and never a relation edge.
+        //
+        // `always: false`, deliberately, even though a POPULATED answer still
+        // needs its caution attached. `always: true` is for a tool whose whole
+        // output IS a set of verdicts (`impact_analysis`,
+        // `bulk_check_references`), and it makes every answer, populated or
+        // not, claim an absence -- wrong for this tool, whose populated answer
+        // is an ordinary hit list that asserts nothing is missing.
+        // `qualifies_populated_answers` below is what attaches the caution to a
+        // populated answer without also making it claim one; the unconditional
+        // `lexical_lookup_not_structural` gap further down is what the caution
+        // actually says.
+        crate::handlers::lexical::TOOL_NAME => RetrievalSpec {
+            field: "hits",
+            kind: "no_lexical_match",
+            subject: "no stored graph field contained the literal",
+            always: false,
+            class: NegativeClass::Structural,
+        },
         _ => return None,
     };
     Some(spec)
@@ -431,9 +452,10 @@ pub(crate) fn negative_class_for(tool: &str) -> Option<NegativeClass> {
 fn absence_substrate(tool: &str, class: NegativeClass) -> AbsenceSubstrate {
     match (class, tool) {
         (NegativeClass::Semantic, _) => AbsenceSubstrate::Vectors,
-        (NegativeClass::Structural, FILE_ENTITIES_TOOL | "semantic_search") => {
-            AbsenceSubstrate::EntityIndex
-        }
+        (
+            NegativeClass::Structural,
+            FILE_ENTITIES_TOOL | "semantic_search" | crate::handlers::lexical::TOOL_NAME,
+        ) => AbsenceSubstrate::EntityIndex,
         (NegativeClass::Structural, "entity_history") => AbsenceSubstrate::History,
         (NegativeClass::Structural, _) => AbsenceSubstrate::Relations,
     }
@@ -502,6 +524,7 @@ pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<Str
 /// | tool | language-scoped | why |
 /// |---|---|---|
 /// | `semantic_search` | yes | "no declaration carries this name/kind" is a claim about what the extractor admitted as an entity for that language |
+/// | `lexical_lookup` | yes | "no stored graph field carries this literal" is the same claim, over the stored graph text fields rather than its name/kind fields |
 /// | `find_dead_code_seeded` | yes | its seed match is the same name/kind filter over the same entity index |
 /// | `graph_neighborhood` | yes | an empty neighborhood for a focal that IS in the graph claims nothing reaches it, which is a claim about that language's edges |
 /// | `find_references`, `bulk_check_references`, `trace_data_flow`, `impact_analysis` | yes | already gated this way by FIR-2404; the flag records the fact rather than changing it |
@@ -522,6 +545,7 @@ fn absence_is_language_scoped(tool: &str) -> bool {
             | "find_dead_code_seeded"
             | "graph_neighborhood"
             | "get_context_pack"
+            | crate::handlers::lexical::TOOL_NAME
             | TRACE_PATH_TOOL
     )
 }
@@ -2624,6 +2648,29 @@ pub fn negative_for(
         if let Some(gap) = crate::query_tokens::absence_gap(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, gap);
         }
+    }
+
+    // This tool's whole contract is narrower than the structural tools beside
+    // it, on a populated answer as much as an empty one: a hit is a literal
+    // occurring in the graph's OWN stored text fields (name, signature, doc
+    // summary, a body preview capped at 8000 characters, file import and
+    // surface context), never a resolved call or reference edge, and a miss is
+    // bounded by those same fields rather than by the repository. Unconditional
+    // on purpose, unlike every gap above it: a page of real hits is exactly
+    // where a reader is tempted to read "lexical_lookup found it" as
+    // "find_references would find it too", and the two can disagree, so the
+    // caution has to ride every response this tool sends, not only its empty
+    // ones.
+    if tool == crate::handlers::lexical::TOOL_NAME {
+        push_gap(
+            &mut trustworthy,
+            &mut trust_reason,
+            "lexical_lookup_not_structural: a hit or a miss here is lexical evidence over this \
+             tool's own stored graph fields, never a resolved call or reference edge, so it \
+             cannot certify or refute what find_references or trace_data_flow would answer for \
+             the same entity"
+                .to_string(),
+        );
     }
 
     // Gaps the response carries that this function cannot observe from the
@@ -8553,5 +8600,109 @@ mod tests {
         .unwrap();
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(!reason.contains("walk_depth_bounded"), "{reason}");
+    }
+
+    /// The negative-gate review the design for this tool flagged by name:
+    /// `lexical_lookup`'s caution has to ride a POPULATED answer exactly as it
+    /// rides an empty one, unlike every other qualifier above, which is why it
+    /// is wired as its own unconditional gap rather than folded into the
+    /// `claims_absence` branch the others share. A hit list on a fully healthy
+    /// graph must still read as lexical evidence, never a resolved reference.
+    #[test]
+    fn lexical_lookup_populated_answer_still_carries_its_caution_and_claims_no_absence() {
+        let populated = json!({
+            "literal": "fetchCodespaces",
+            "hits": [{ "entity_id": "e1", "matched_field": "body_preview" }],
+            "total_matching": 1,
+            "truncated": false,
+        });
+        let negative = negative_for(
+            crate::handlers::lexical::TOOL_NAME,
+            &populated,
+            &structural_ready_envelope(),
+        )
+        .expect("every retrieval answer carries the response verdict");
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a hit list asserts no absence, so there is nothing to certify absent: {negative}"
+        );
+        assert_eq!(
+            negative["trust"],
+            json!("inconclusive"),
+            "a hit here can never certify as a resolved reference: {negative}"
+        );
+        // Joined with `answer_coverage_unreported`, the same caveat
+        // `a_search_that_returned_rows_is_not_qualified_by_a_caveat_about_absences`
+        // proves for `semantic_search`: neither handler attaches `edge_coverage`
+        // on its populated path, only its empty one, so a fixture payload with
+        // no block reads exactly the way a real populated response does.
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("lexical_lookup_not_structural"), "{reason}");
+    }
+
+    /// The same gate's other half: an empty page must not read as an
+    /// authoritative "the literal is not used", however healthy the graph is,
+    /// because the substrate this tool reads is a lexical index over indexed
+    /// fields, not the graph's structural truth.
+    #[test]
+    fn lexical_lookup_empty_answer_never_certifies_absence() {
+        let empty = json!({
+            "literal": "fetchCodespaces",
+            "hits": [],
+            "total_matching": 0,
+            "truncated": false,
+        });
+        let negative = negative_for(
+            crate::handlers::lexical::TOOL_NAME,
+            &empty,
+            &structural_ready_envelope(),
+        )
+        .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "{negative}"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("lexical_lookup_not_structural"));
+    }
+
+    /// The full verdict, not just the negative object: a `lexical_lookup`
+    /// answer can never read `state: certified`, on a healthy graph, with real
+    /// hits, precisely because the unconditional gap above always refuses. This
+    /// is the mechanism that keeps `find_references` and `trace_data_flow` the
+    /// answer of record: nothing this tool returns can outrank them in
+    /// `_kin.verdict`.
+    #[test]
+    fn lexical_lookup_verdict_never_certifies_even_with_real_hits_on_a_healthy_graph() {
+        let populated = json!({
+            "literal": "fetchCodespaces",
+            "hits": [{ "entity_id": "e1", "matched_field": "body_preview" }],
+            "total_matching": 1,
+            "truncated": false,
+        });
+        let envelope = structural_ready_envelope();
+        let negative = negative_for(crate::handlers::lexical::TOOL_NAME, &populated, &envelope);
+        let verdict = crate::verdict::Verdict::compute(
+            crate::handlers::lexical::TOOL_NAME,
+            &populated,
+            &envelope,
+            negative.as_ref(),
+        )
+        .expect("a populated lexical_lookup answer has inputs to compute a verdict from");
+        let value = verdict.to_value();
+        assert_eq!(value["state"], json!("inconclusive"), "{value}");
+        let limiting_factor = value["limiting_factor"].as_str().unwrap();
+        assert!(
+            limiting_factor.contains("lexical_lookup_not_structural"),
+            "{value}"
+        );
+        assert_eq!(value["absence_claim"], json!("not_applicable"), "{value}");
+        assert_eq!(value["safe_to_conclude_absent"], json!(false), "{value}");
     }
 }

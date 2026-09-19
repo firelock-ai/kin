@@ -290,6 +290,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "A phrase query matched no name, and the per-token fallback ranks by word overlap rather than meaning.",
     },
     ClauseCode {
+        code: "lexical_lookup_not_structural",
+        meaning: "This is lexical evidence over indexed text fields, not a resolved call or reference edge; a hit or a miss here is not proof the identifier is or is not used.",
+    },
+    ClauseCode {
         code: "method_call_resolution_incomplete",
         meaning: "Receiver-method calls are linked by bare name and may be unresolved, so an empty result is not authoritative for a method.",
     },

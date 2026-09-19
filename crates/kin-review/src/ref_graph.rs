@@ -138,8 +138,35 @@ impl<'a, G: GraphStore> GraphAtRef<'a, G> {
         live: &'a G,
         at: SemanticChangeId,
         ancestry: HashSet<SemanticChangeId>,
-        state: ResolvedGraphState,
+        mut state: ResolvedGraphState,
     ) -> Self {
+        // Read authority belongs to the reviewed ref, never today's entities.
+        // Tombstones keep removed inferred members from regaining authority in
+        // the severed-edge view used to review deletion impact.
+        let derived: HashSet<EntityId> = state
+            .entities
+            .values()
+            .chain(
+                state
+                    .entity_tombstones
+                    .iter()
+                    .filter(|(id, _)| !state.entities.contains_key(id))
+                    .map(|(_, (entity, _))| entity),
+            )
+            .filter(|entity| kin_model::is_derived_member(entity))
+            .map(|entity| entity.id)
+            .collect();
+        let project = |relation: &mut Relation| {
+            let derived_endpoint = [relation.src.as_entity(), relation.dst.as_entity()]
+                .into_iter()
+                .flatten()
+                .any(|id| derived.contains(&id));
+            kin_index::relation_read::project_entity_relation_for_read(relation, derived_endpoint)
+        };
+        state.relations.retain(|_, relation| project(relation));
+        state
+            .relation_tombstones
+            .retain(|_, (relation, _)| project(relation));
         let mut outgoing: BTreeMap<EntityId, Vec<RelationId>> = BTreeMap::new();
         let mut incoming: BTreeMap<EntityId, Vec<RelationId>> = BTreeMap::new();
         for relation in state.relations.values() {
@@ -765,6 +792,98 @@ mod tests {
         let ids = [first.id, second.id, third.id];
 
         (graph, target, caller, test, ids)
+    }
+
+    #[test]
+    fn derived_member_committed_and_severed_edges_use_historical_endpoint_authority() {
+        let graph = InMemoryGraph::new();
+        let mut target = test_entity("app.get");
+        target.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        let caller = test_entity("caller");
+        let calls = test_relation(31, caller.id, target.id, RelationKind::Calls);
+        let overrides = test_relation(32, caller.id, target.id, RelationKind::Overrides);
+        let first = change(
+            change_id(31),
+            vec![],
+            vec![
+                EntityDelta::Added {
+                    new: target.clone(),
+                },
+                EntityDelta::Added {
+                    new: caller.clone(),
+                },
+            ],
+            vec![
+                RelationDelta::Added { new: calls.clone() },
+                RelationDelta::Added {
+                    new: overrides.clone(),
+                },
+            ],
+        );
+        let removed = change(
+            change_id(32),
+            vec![first.id],
+            vec![EntityDelta::Removed {
+                old: target.clone(),
+            }],
+            vec![
+                RelationDelta::Removed { old: calls.clone() },
+                RelationDelta::Removed { old: overrides },
+            ],
+        );
+        graph.create_change(&first).unwrap();
+        graph.create_change(&removed).unwrap();
+        // Today's same-ID declaration has no derivation marker. It has no
+        // authority to upgrade the historical relation or deletion evidence.
+        let mut present = target.clone();
+        present.doc_summary = None;
+        graph.upsert_entity(&present).unwrap();
+        let mut marked = calls.clone();
+        marked.evidence.push(kin_model::RelationEvidence {
+            parser_rule: Some(kin_model::derivation::DERIVED_MEMBER_CANDIDATE_RULE.into()),
+            ..Default::default()
+        });
+        let readded = change(
+            change_id(33),
+            vec![removed.id],
+            vec![EntityDelta::Added { new: present }],
+            vec![RelationDelta::Added {
+                new: marked.clone(),
+            }],
+        );
+        let ordinary = change(
+            change_id(34),
+            vec![readded.id],
+            vec![],
+            vec![RelationDelta::Modified {
+                old: marked,
+                new: calls.clone(),
+            }],
+        );
+        graph.create_change(&readded).unwrap();
+        graph.create_change(&ordinary).unwrap();
+        for at in [first.id, removed.id, readded.id] {
+            let historical = GraphAtRef::materialize(&graph, &at).unwrap();
+            let edges = historical.get_all_relations_for_entity(&target.id).unwrap();
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0].kind, RelationKind::Calls);
+            assert_eq!(edges[0].confidence, 0.3);
+            assert!(!kin_index::RelationResolution::of(&edges[0]).is_proven());
+        }
+        // A real re-added declaration with new ordinary evidence does not
+        // inherit a stale tombstone's candidate status.
+        let ordinary_view = GraphAtRef::materialize(&graph, &ordinary.id).unwrap();
+        let ordinary_edges = ordinary_view
+            .get_all_relations_for_entity(&target.id)
+            .unwrap();
+        assert_eq!(ordinary_edges.len(), 1);
+        assert_eq!(ordinary_edges[0].confidence, 1.0);
+        assert!(kin_index::RelationResolution::of(&ordinary_edges[0]).is_proven());
+        // The immutable commit still records the evidence exactly as admitted.
+        let stored = graph.get_change(&first.id).unwrap().unwrap();
+        assert!(stored.relation_deltas.iter().all(|delta| matches!(delta,
+            RelationDelta::Added { new } if new.confidence == 1.0 && new.evidence.is_empty())));
     }
 
     #[test]

@@ -1029,6 +1029,25 @@ fn registered_tools() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: crate::handlers::lexical::TOOL_NAME.into(),
+                description: crate::handlers::lexical::LEXICAL_LOOKUP_DESC.into(),
+                annotations: read_only("Lexical lookup"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "max_chars": max_chars_property(),
+                        "literal": { "type": "string", "description": "The exact token, call/member fragment, string, or short phrase to find. A bare literal, not a sentence describing it: 'fetchCodespaces', not 'where is fetchCodespaces called from'. Optional only when `cursor` is given, which already carries it. ASCII case-insensitive, including punctuation; max 4096 bytes." },
+                        "kind": { "type": "string", "description": "Entity kind (function, class, etc.); test selects test role. Unknown kinds refuse." },
+                        "limit": { "type": "integer", "description": "Max hits per page (default 20, clamped 1..100).", "default": 20, "minimum": 1, "maximum": 100 },
+                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`, returning the next page of the same lookup. Carries `literal`, `kind`, and a digest of matching entity contents. Supplied filters must agree; changed contents require restarting without the cursor." }
+                    },
+                    "anyOf": [
+                        { "required": ["literal"] },
+                        { "required": ["cursor"] }
+                    ]
+                }),
+            },
+            ToolDefinition {
                 name: "benchmark".into(),
                 description: crate::handlers::bench::BENCHMARK_DESC.into(),
                 annotations: read_only("Benchmark metrics"),
@@ -1776,6 +1795,11 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         // one call where the locate-then-trace loop cost five.
         crate::handlers::path::TOOL_NAME,
         "find_references",
+        // The literal-lookup complement to `find_references`: a lexical hit
+        // over indexed text, for a literal-shaped question or for
+        // corroboration when a structural tool's own verdict came back
+        // inconclusive (see `kin-agent`'s system prompt for the routing rule).
+        crate::handlers::lexical::TOOL_NAME,
         "graph_neighborhood",
         // The enumeration half of discovery. Every other retrieval tool in this
         // profile ranks, filters, or walks, and none of them can say what it
@@ -1844,6 +1868,7 @@ pub fn agent_query_tool_names() -> &'static [&'static str] {
         "trace_data_flow",
         crate::handlers::path::TOOL_NAME,
         "find_references",
+        crate::handlers::lexical::TOOL_NAME,
         "graph_neighborhood",
         crate::handlers::file_entities::TOOL_NAME,
         "kin_provenance_query",
@@ -2741,8 +2766,8 @@ mod tests {
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
         // + 1 get_entity_sources + 2 exact artifact tools
         // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search + 1 kin_mutate
-        // + 6 durable entity draft tools = 74
-        assert_eq!(list.tools.len(), 74);
+        // + 6 durable entity draft tools + 1 lexical_lookup = 75
+        assert_eq!(list.tools.len(), 75);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -2971,9 +2996,12 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         let profile = agent_default_tool_names();
 
         // 22 since kin_mutate joined: atomic one-shot mutation lets agents commit
-        // graph edits without multi-step transaction ceremonies.
+        // graph edits without multi-step transaction ceremonies. 23 since
+        // lexical_lookup joined: a literal-shaped question, or a structural
+        // tool's own inconclusive verdict, needs a lexical-index answer the rest
+        // of this profile has no way to give.
         assert!(
-            profile.len() >= 10 && profile.len() <= 22,
+            profile.len() >= 10 && profile.len() <= 23,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -3089,6 +3117,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
                 "kin_artifact_read",
                 "kin_graph_status",
                 "kin_provenance_query",
+                "lexical_lookup",
                 "list_file_entities",
                 "semantic_locate",
                 "semantic_search",

@@ -83,7 +83,12 @@ language adapter parsed it completely, `partial` or `failed` when it did not, an
 when no adapter parsed it at all. When `absent` is because no adapter claims the file's type \
 at all -- Kin admits such a file, hashes it and stores a preview, and extracts nothing -- \
 `content_opaque` is true and `opaque_reason` names the extension, so a file that produced \
-zero entities by design is never read as one whose parse failed. Only a `full` parse licenses reading this list as the file's \
+zero entities by design is never read as one whose parse failed. In JavaScript/TypeScript, a \
+loop that bulk-assigns computed members (`methods.forEach(function (method) { app[method] = \
+...; })`) mints the members Kin can read the list of and, when part of that list is not \
+statically knowable, sets `dynamic_members_disclosed` and names the loop in \
+`dynamic_members_note` rather than certifying a short list as whole. Only a `full` parse with \
+no such disclosure licenses reading this list as the file's \
 whole surface, and `_kin.completeness` and `negative.safe_to_conclude_absent` are computed \
 from that fact rather than from store-wide health. A path the graph does not track is refused \
 by name instead of answered with an empty list, because those two answers are \
@@ -112,17 +117,37 @@ pub struct FileEntityRow {
     pub end_byte: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_summary: Option<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<serde_json::Value>,
+    pub independently_editable: bool,
 }
 
 impl From<Entity> for FileEntityRow {
     fn from(entity: Entity) -> Self {
-        let start_line = entity_presentation_start_line(&entity);
-        let end_line = entity_presentation_end_line(&entity);
+        let mut derivation = super::common::derived_member_fields(&entity);
+        let independently_editable = derivation.is_none() && entity.span.is_some();
+        let start_line = derivation
+            .is_none()
+            .then(|| entity_presentation_start_line(&entity))
+            .flatten();
+        let end_line = derivation
+            .is_none()
+            .then(|| entity_presentation_end_line(&entity))
+            .flatten();
         let (start_byte, end_byte) = entity
             .span
             .as_ref()
+            .filter(|_| derivation.is_none())
             .map(|span| (Some(span.start_byte), Some(span.end_byte)))
             .unwrap_or((None, None));
+        if let Some(fields) = derivation
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for key in ["independently_editable", "start_line", "end_line"] {
+                fields.remove(key);
+            }
+        }
         Self {
             id: entity.id,
             name: entity.name,
@@ -136,6 +161,8 @@ impl From<Entity> for FileEntityRow {
             start_byte,
             end_byte,
             doc_summary: entity.doc_summary,
+            derivation,
+            independently_editable,
         }
     }
 }
@@ -249,6 +276,39 @@ impl SpanProvenance {
     pub fn permits_certification(self) -> bool {
         !matches!(self, Self::Stale { .. })
     }
+}
+
+/// Whether this file's own extraction disclosed a bulk computed-member
+/// assignment loop it could not read the members of, and the sentence to
+/// surface when it did.
+///
+/// The JavaScript adapter writes this on the file's `Module` entity when a
+/// loop such as `methods.forEach(function (method) { app[method] = ...; })`
+/// assigns computed members Kin could not statically enumerate
+/// (`kin_parser::DYNAMIC_MEMBERS_DISCLOSURE_PREFIX`). A resolved site mints
+/// real entities instead and needs no disclosure here; this only fires for
+/// the part of the file, if any, a loop's own list could not be read
+/// statically, which is why a file can mint members from one site and still
+/// carry this disclosure for another.
+///
+/// Reads the entity set the store returned rather than the graph itself: this
+/// is disclosure the extractor already computed once, not a fact this handler
+/// re-derives from source, which this tool never reads.
+fn dynamic_members_disclosure(entities: &[Entity]) -> Option<String> {
+    if entities.iter().any(|e| {
+        kin_model::is_derived_member(e)
+            || e.metadata
+                .extra
+                .contains_key(kin_model::derivation::MEMBER_COVERAGE_KEY)
+    }) {
+        return Some("Computed member candidates and unresolved write sites are recorded; runtime enumeration is not complete.".into());
+    }
+    entities
+        .iter()
+        .find(|entity| entity.kind == EntityKind::Module)
+        .and_then(|module| module.doc_summary.as_deref())
+        .filter(|summary| summary.starts_with(kin_parser::DYNAMIC_MEMBERS_DISCLOSURE_PREFIX))
+        .map(str::to_string)
 }
 
 /// Decide [`SpanProvenance`] for one file's entities against the blob the tree
@@ -699,6 +759,10 @@ pub fn handle_list_file_entities<G: GraphStore>(
     let host_entry = host.observe(&repo_path, tree_entry.as_ref());
 
     let enriched = language_server_edges(store, &entities)?;
+    // Read before the enumeration is consumed into the served page below: the
+    // disclosure, when the extractor left one, rides on the file's own Module
+    // entity, which any page of this file might have paged past.
+    let dynamic_members = dynamic_members_disclosure(&entities);
 
     let offset = cursor.as_ref().map(|cursor| cursor.offset).unwrap_or(0);
     // A cursor minted against a different-sized enumeration is describing a file
@@ -793,11 +857,23 @@ pub fn handle_list_file_entities<G: GraphStore>(
             // truth, and does not.
             "host_bytes": host_entry.wire(),
             "whole_file_in_response": whole_file_in_response,
+            // Whether the extractor disclosed a bulk computed-member
+            // assignment loop (`obj[loopVar] = ...`) it could not read the
+            // members of. `true` refuses certification below the same way a
+            // stale span or an unadmitted host does: express's own
+            // `methods.forEach(function (method) { app[method] = ...; })`
+            // used to certify 21 statically-assigned methods as the file's
+            // whole surface while creating 35 more this enumeration never
+            // saw. A resolved site mints real entities instead and sets no
+            // disclosure, so it never reaches here.
+            "dynamic_members_disclosed": dynamic_members.is_some(),
+            "dynamic_members_note": dynamic_members.clone(),
             "certifies_enumeration": parsed.certifies_enumeration()
                 && provenance.permits_certification()
                 && host_entry.permits_certification()
                 && whole_file_in_response
-                && !enumeration_shifted,
+                && !enumeration_shifted
+                && dynamic_members.is_none(),
         },
     });
 
@@ -855,6 +931,16 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// A `Module`-kind entity for `file`, carrying `doc_summary` verbatim --
+    /// the exact shape [`dynamic_members_disclosure`] reads its signal off,
+    /// the way the JavaScript adapter writes one.
+    fn module_entity(file: &str, doc_summary: Option<&str>) -> Entity {
+        let mut entity = entity_at("module", file, 900);
+        entity.kind = EntityKind::Module;
+        entity.doc_summary = doc_summary.map(str::to_string);
+        entity
     }
 
     fn layout_for(file: &str, completeness: ParseCompleteness, regions: usize) -> FileLayout {
@@ -1181,6 +1267,144 @@ mod tests {
         assert!(!ParsedState::Partial.certifies_enumeration());
         assert!(!ParsedState::Failed.certifies_enumeration());
         assert!(!ParsedState::Absent.certifies_enumeration());
+    }
+
+    /// Express's own case: `methods.forEach(function (method) { app[method]
+    /// = ...; })` used to certify 21 statically-assigned methods as the
+    /// file's whole surface while creating 35 more this enumeration never
+    /// saw. A `full` parse alone must no longer be enough once the adapter
+    /// has disclosed a bulk computed-member loop it could not read the list
+    /// of.
+    #[test]
+    fn a_dynamic_members_disclosure_floors_the_enumeration() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        let disclosure = format!(
+            "{}members are created at runtime from `methods`; the enumeration is not complete",
+            kin_parser::DYNAMIC_MEMBERS_DISCLOSURE_PREFIX
+        );
+        store
+            .upsert_entity(&module_entity(FILE, Some(&disclosure)))
+            .unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["dynamic_members_disclosed"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            coverage["dynamic_members_note"],
+            serde_json::json!(disclosure)
+        );
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(false),
+            "a disclosed dynamic-members site must refuse certification: {coverage}"
+        );
+    }
+
+    #[test]
+    fn parsed_for_in_members_remain_uncertified_after_snapshot_restore() {
+        use kin_parser::{JavaScriptAdapter, LanguageAdapter};
+
+        for (source, certifies) in [
+            (
+                "for (const key in ['get', 'post']) { app[key] = function () {}; }",
+                false,
+            ),
+            (
+                "function install(registry) { for (const key in registry) { if (enabled) app[key] = function () {}; router[key] = function () {}; } }",
+                false,
+            ),
+            ("app.ready = function () { return true; };", true),
+        ] {
+            let adapter = JavaScriptAdapter;
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let parsed = adapter
+                .extract(&tree, source.as_bytes(), &FilePathId::new(FILE))
+                .unwrap();
+            let store = store_with(0, Some(ParseCompleteness::Full));
+            for entity in parsed.entities {
+                store
+                    .upsert_entity(&entity.into_entity_with_source(
+                        LanguageId::JavaScript,
+                        &FilePathId::new(FILE),
+                        Some(source.as_bytes()),
+                    ))
+                    .unwrap();
+            }
+            let restored = InMemoryGraph::from_snapshot_without_text_index(store.to_snapshot())
+                .expect("the parsed entities and their coverage survive graph restoration");
+            for graph in [&store, &restored] {
+                let payload = call(graph, &[("path", serde_json::json!(FILE))]).unwrap();
+                let coverage = &payload[FILE_COVERAGE_KEY];
+                assert_eq!(coverage["parsed"], serde_json::json!("full"), "{payload}");
+                assert_eq!(
+                    coverage["dynamic_members_disclosed"],
+                    serde_json::json!(!certifies),
+                    "{payload}"
+                );
+                assert_eq!(
+                    coverage["certifies_enumeration"],
+                    serde_json::json!(certifies),
+                    "{payload}"
+                );
+                let annotated = crate::envelope::finalize(
+                    ToolCallResult::text(serde_json::to_string(&payload).unwrap()),
+                    structural_authoritative_envelope(),
+                    TOOL_NAME,
+                );
+                let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+                let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(
+                    value["_kin"]["verdict"]["state"] == serde_json::json!("certified"),
+                    certifies,
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    /// The control for the check above: a module entity that carries no
+    /// disclosure at all -- the ordinary state of every file this feature
+    /// does not touch -- must certify exactly as it did before this feature
+    /// existed.
+    #[test]
+    fn a_module_entity_with_no_dynamic_members_disclosure_still_certifies() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        store.upsert_entity(&module_entity(FILE, None)).unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["dynamic_members_disclosed"],
+            serde_json::json!(false)
+        );
+        assert_eq!(coverage["dynamic_members_note"], serde_json::json!(null));
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(true));
+    }
+
+    /// A real file-overview doc comment must not be mistaken for the
+    /// disclosure just because it is non-null prose on the module entity: the
+    /// gate matches the adapter's exact reserved prefix, not "any doc
+    /// summary at all".
+    #[test]
+    fn an_ordinary_module_doc_summary_is_not_mistaken_for_a_disclosure() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        store
+            .upsert_entity(&module_entity(
+                FILE,
+                Some("The application's HTTP surface."),
+            ))
+            .unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["dynamic_members_disclosed"],
+            serde_json::json!(false)
+        );
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(true));
     }
 
     /// The ticket's own case: a file with N entities enumerates exactly N, and a

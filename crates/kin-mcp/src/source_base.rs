@@ -60,6 +60,7 @@ impl EntitySourceBase {
         source_blob_hash: kin_model::Hash256,
         body: &str,
     ) -> Result<Self, String> {
+        kin_model::require_independent_source(entity)?;
         let span = entity
             .span
             .as_ref()

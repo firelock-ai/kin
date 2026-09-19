@@ -11,6 +11,7 @@ pub mod common;
 pub mod bench;
 pub mod entities;
 pub mod file_entities;
+pub mod lexical;
 pub mod path;
 pub mod provenance;
 pub(crate) mod repository_authority;
@@ -172,6 +173,9 @@ async fn dispatch_tool_call<G: GraphStore>(
         "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
         "list_file_entities" => file_entities::handle_list_file_entities(arguments, store, host),
+        lexical::TOOL_NAME => {
+            lexical::handle_lexical_lookup(arguments, store, repository_authority)
+        }
         // Review
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
         "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
@@ -7059,7 +7063,7 @@ mod tests {
     }
 
     use std::sync::{Mutex, OnceLock};
-    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    pub(super) static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn exact_artifact_tools_preserve_every_repository_leaf_without_entities() {
@@ -7709,6 +7713,171 @@ mod tests {
         assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
     }
 
+    #[test]
+    fn derived_member_source_is_a_separate_graph_bound_generator_not_an_editable_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let blobs = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+        let source =
+            "export const app = {}; for (const key of ['café','post']) { app[key] = () => 1; }";
+        let hash = blobs.write(source.as_bytes()).unwrap();
+        let file = FilePathId::new("members.js");
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(&file, source.as_bytes(), hash)
+            .unwrap()
+            .indexed_file;
+        let candidate = indexed
+            .entities
+            .iter()
+            .find(|e| e.name == "app.café")
+            .unwrap()
+            .clone();
+        let mut store = EmptyStore::default();
+        for entity in &indexed.entities {
+            store.insert_test_entity(entity.clone());
+        }
+        store.file_hashes.insert(file.clone(), hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+        let artifact = {
+            let held = HeldSourceAuthority::new(&store, Some(&authority));
+            held.workspace_sample()
+                .unwrap()
+                .tree
+                .artifact_at_path(&kin_model::RepoPath::from_utf8("members.js").unwrap())
+                .unwrap()
+                .artifact_id
+        };
+        let files = [kin_index::FileParseData {
+            file_path: file.0.clone(),
+            entities: indexed.entities,
+            relations: indexed.extracted_relations,
+            imports: indexed.imports,
+        }];
+        let relations =
+            kin_index::link_cross_file(&files, &HashMap::from([(file.0.clone(), artifact)]))
+                .unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: artifact,
+                    new: kin_model::LocatedEntry::new(
+                        kin_model::RepoPath::from_utf8("members.js").unwrap(),
+                        kin_model::TreeEntry::blob(Hash256::from_bytes(hash.0), false),
+                    ),
+                }],
+                entity_deltas: files[0]
+                    .entities
+                    .iter()
+                    .cloned()
+                    .map(|new| kin_model::EntityDelta::Added { new })
+                    .collect(),
+                relation_deltas: relations
+                    .into_iter()
+                    .map(|new| kin_model::RelationDelta::Added { new })
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let args = HashMap::from([(
+            "entity_id".into(),
+            serde_json::json!(candidate.id.to_string()),
+        )]);
+        let value = tool_result_json(
+            entities::handle_get_entity_source(&args, &graph, Some(&authority)).unwrap(),
+        );
+        assert!(value["body"].is_null());
+        assert!(value["source_base"].is_null());
+        assert_eq!(value["independently_editable"], false);
+        assert_eq!(value["generator_source"]["source"], "graph", "{value}");
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        assert_eq!(
+            value["generator_source"]["body"].as_str(),
+            source.get(derivation.generator.start_byte..derivation.generator.end_byte)
+        );
+        let held = HeldSourceAuthority::new(&graph, Some(&authority));
+        assert!(common::read_entity_source_exact(&held, &candidate, 10000)
+            .unwrap()
+            .is_none());
+        let context = common::focal_context_json_held(&held, &candidate).unwrap();
+        assert!(context["body"].is_null());
+        assert_eq!(context["projection"], "SignatureOnly");
+        assert_eq!(context["derivation"]["source_blob_hash"], hash.to_string());
+        assert!(context["generator_read"].is_object());
+        // Wrong artifact identity cannot borrow the path's real bytes.
+        let generator_edge = graph
+            .traverse(
+                &kin_model::GraphNodeId::Entity(candidate.id),
+                &[RelationKind::DerivedFrom],
+                1,
+            )
+            .unwrap()
+            .relations
+            .into_iter()
+            .find(|r| r.src == kin_model::GraphNodeId::Entity(candidate.id))
+            .unwrap();
+        let mut projected = vec![generator_edge.clone()];
+        kin_index::relation_read::project_relations_for_read(&graph, &mut projected).unwrap();
+        assert!(kin_index::RelationResolution::of(&projected[0]).is_proven());
+        assert_eq!(
+            serde_json::to_value(&projected[0]).unwrap(),
+            serde_json::to_value(&generator_edge).unwrap()
+        );
+        let mut forged = generator_edge.clone();
+        for evidence in &mut forged.evidence {
+            evidence.token = Some("0".repeat(64));
+        }
+        let mut projected_forgery = vec![forged];
+        kin_index::relation_read::project_relations_for_read(&graph, &mut projected_forgery)
+            .unwrap();
+        assert!(!kin_index::RelationResolution::of(&projected_forgery[0]).is_proven());
+        graph.remove_relation(&generator_edge.id).unwrap();
+        let wrong = tool_result_json(
+            entities::handle_get_entity_source(&args, &graph, Some(&authority)).unwrap(),
+        );
+        assert!(wrong["generator_source"].is_null());
+        assert!(wrong["generator_source_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("provenance"));
+        graph.upsert_relation(&generator_edge).unwrap();
+        // A moved tree cannot reuse the old generator's plausible in-bounds span.
+        admit_test_workspace_tree(
+            dir.path(),
+            &kin_model::RepoPath::from_utf8("members.js").unwrap(),
+            source.replace("=> 1", "=> 2").as_bytes(),
+        );
+        let stale = tool_result_json(
+            entities::handle_get_entity_source(&args, &graph, Some(&authority)).unwrap(),
+        );
+        assert!(stale["generator_source"].is_null());
+        assert!(stale["generator_source_unavailable"].is_string());
+        // Old PR155 synthetic spans are refused even when they are in bounds.
+        let mut legacy = candidate.clone();
+        legacy
+            .metadata
+            .extra
+            .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+        legacy.span = Some(derivation.generator);
+        legacy.doc_summary = Some(
+            "Derived from a loop over `keys`; no literal `app.café` assignment appears in source."
+                .into(),
+        );
+        assert!(common::read_entity_source_exact(
+            &HeldSourceAuthority::new(&graph, Some(&authority)),
+            &legacy,
+            10000
+        )
+        .unwrap()
+        .is_none());
+    }
+
     /// Which source digest the live entity records, relative to a workspace tree
     /// that has moved past its base.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7978,6 +8147,47 @@ mod tests {
             message.contains("re-derived"),
             "the refusal must tell the caller this is transient and retryable, got: {message}"
         );
+    }
+
+    #[test]
+    fn lexical_lookup_exact_lines_require_the_matching_entity_source_digest() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = "export function alpha(){crowdneedle();\nreturn 1;}\n";
+        let after = "export function alpha(){\ncrowdneedle();return 2;}\n";
+        assert_eq!(before.len(), after.len());
+        for stamp in [SpanStamp::Current, SpanStamp::Stale, SpanStamp::Absent] {
+            let dir = tempdir().unwrap();
+            let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+            let (mut entity, mut store, authority, _) =
+                divergent_tree_fixture(dir.path(), before, after, stamp);
+            entity.metadata.extra.insert(
+                "embedding_body_preview".into(),
+                serde_json::json!("crowdneedle()"),
+            );
+            store.entities_by_id.insert(entity.id, entity);
+            let args = HashMap::from([("literal".into(), serde_json::json!("crowdneedle"))]);
+            let payload = tool_result_json(
+                lexical::handle_lexical_lookup(&args, &store, Some(&authority)).unwrap(),
+            );
+            assert_eq!(payload["total_matching"], serde_json::json!(1));
+            let hit = &payload["hits"][0];
+            match stamp {
+                SpanStamp::Current => {
+                    assert_eq!(hit["line"], serde_json::json!(2));
+                    assert_eq!(hit["line_confidence"], serde_json::json!("exact"));
+                }
+                SpanStamp::Stale | SpanStamp::Absent => {
+                    assert_eq!(hit["line"], serde_json::Value::Null);
+                    assert_eq!(
+                        hit["line_confidence"],
+                        serde_json::json!("entity_span_only")
+                    );
+                }
+            }
+        }
     }
 
     /// The digest check must not reject a read it cannot verify.
