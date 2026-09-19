@@ -14,7 +14,7 @@ use crate::repeat;
 use crate::transcript::{now_iso, TranscriptWriter};
 use crate::{AgentConfig, ExitStatus, RunOutcome};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -2945,6 +2945,162 @@ fn truncate(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect::<String>() + "..."
 }
 
+/// Resolution tiers meaning Kin bound this row to a real entity rather than
+/// a same-name guess. Both are a real reference: an import line is exactly
+/// that, not a lesser hit, so `import_scoped` counts on the same footing as
+/// `type_resolved`. An unresolved `name_only` guess is not in this set.
+fn is_resolved_reference(resolution: Option<&str>) -> bool {
+    matches!(resolution, Some("type_resolved") | Some("import_scoped"))
+}
+
+/// Every `path:line` this run's `find_references` calls actually resolved,
+/// across every recorded row and every line in a row's `reference_lines`,
+/// deduplicated and in a stable order.
+///
+/// A study task found the belt keeping four of the six rows Kin resolved for
+/// a symbol and dropping exactly the two aliased-import lines, both
+/// attributed to a `Module`-kind entity, while an unrelated pair of
+/// `Module`-kind test-file rows survived. Nothing here reads `kind` or
+/// `role`: a resolved row counts on the same footing regardless of the
+/// referencing entity's kind, so an import line stays with every other one.
+fn resolved_reference_lines(reference_rows: &BTreeMap<(String, String), Value>) -> Vec<String> {
+    let mut lines = BTreeSet::new();
+    for row in reference_rows.values() {
+        if !is_resolved_reference(row.get("resolution").and_then(Value::as_str)) {
+            continue;
+        }
+        let Some(file_path) = row.get("file_path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(reference_lines) = row.get("reference_lines").and_then(Value::as_array) else {
+            continue;
+        };
+        for line in reference_lines {
+            if let Some(line) = line.as_u64() {
+                lines.insert(format!("{file_path}:{line}"));
+            }
+        }
+    }
+    lines.into_iter().collect()
+}
+
+/// Whether `position` (a `path:line` string) is already in `text` as
+/// itself, not merely as a prefix of a longer line number: `ssg.ts:2` must
+/// not read as present because `ssg.ts:26` is in the text. A match counts
+/// unless the character right after it is another ASCII digit.
+fn contains_position(text: &str, position: &str) -> bool {
+    text.match_indices(position)
+        .any(|(start, _)| !text[start + position.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// A line that is nothing but the literal word `ANSWER`, case-insensitive,
+/// once whitespace, any wrapping backticks, and one trailing colon are
+/// stripped. This is the shape both a fenced ANSWER block's opening line and
+/// a standalone `ANSWER:` line take, so one check finds either.
+fn is_answer_marker_line(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('`').trim();
+    let trimmed = trimmed.strip_suffix(':').unwrap_or(trimmed).trim();
+    trimmed.eq_ignore_ascii_case("answer")
+}
+
+/// A bare fenced block's opening line: three backticks and nothing else.
+/// Checked only once [`is_answer_marker_line`] has ruled out an ANSWER
+/// fence. A fence carrying a language tag reads as a deliberate example
+/// rather than an untitled answer, so it is left alone.
+fn is_bare_fence_open_line(line: &str) -> bool {
+    line.trim() == "```"
+}
+
+/// A line ending in a colon followed by one or more ASCII digits: the shape
+/// every position a caller of this run keys on takes (`path:line`). Used
+/// only to decide whether an answer with no marker is a position list that
+/// should get one. A plain conversational or diagnostic line has no such
+/// shape and is left alone.
+fn looks_like_a_position_line(line: &str) -> bool {
+    let line = line.trim().trim_matches('`');
+    let Some(colon) = line.rfind(':') else {
+        return false;
+    };
+    let (head, tail) = (&line[..colon], &line[colon + 1..]);
+    !head.is_empty() && !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Guarantee this run's reported answer always carries a literal `ANSWER`
+/// marker a caller can key off, and that every reference `find_references`
+/// actually resolved in this run is named somewhere in it, even when the
+/// model's own prose dropped one.
+///
+/// This applies two repairs together, found on the same study, because
+/// either alone leaves a caller "recording the answer" empty-handed:
+///
+/// - A task where Kin's data was perfect and the model's own answer held
+///   every gold row, but inside a bare fence with no `ANSWER` token anywhere
+///   in the output, so a caller parsing for the marker got nothing even
+///   though the list underneath it was exactly right.
+/// - The task described on [`resolved_reference_lines`], where the marker
+///   was present but two resolved rows were missing from it.
+///
+/// Neither repair removes anything the model wrote. An answer that already
+/// carries the marker and already names every resolved row is returned
+/// unchanged, and so is a plain answer with nothing missing, no marker, and
+/// no line shaped like a position: an ordinary conversational reply is not
+/// forced into a fence it never needed. This does not parse nested fences.
+/// Relabelling stops at the first bare, tagless fence found, which is the
+/// shape the evidenced case took.
+fn compose_final_answer(
+    model_text: &str,
+    reference_rows: &BTreeMap<(String, String), Value>,
+) -> String {
+    let missing: Vec<String> = resolved_reference_lines(reference_rows)
+        .into_iter()
+        .filter(|position| !contains_position(model_text, position))
+        .collect();
+    let lines: Vec<&str> = model_text.lines().collect();
+    let marker_at = lines.iter().copied().position(is_answer_marker_line);
+    let trimmed_empty = model_text.trim().is_empty();
+
+    if !trimmed_empty
+        && missing.is_empty()
+        && (marker_at.is_some() || !lines.iter().copied().any(looks_like_a_position_line))
+    {
+        return model_text.to_string();
+    }
+
+    // Extend an existing marker line in place, or relabel the first bare
+    // fence if there is one, so injected rows land inside the same block a
+    // caller's parser will read rather than after it.
+    let insert_at = marker_at.or_else(|| lines.iter().copied().position(is_bare_fence_open_line));
+
+    if let Some(index) = insert_at {
+        let mut composed = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i == index && marker_at.is_none() {
+                composed.push_str("```ANSWER");
+            } else {
+                composed.push_str(line);
+            }
+            composed.push('\n');
+            if i == index {
+                for extra in &missing {
+                    composed.push_str(extra);
+                    composed.push('\n');
+                }
+            }
+        }
+        return composed;
+    }
+
+    let mut body = model_text.trim().to_string();
+    if body.is_empty() {
+        body = "(empty: this run produced no final answer text)".to_string();
+    }
+    for extra in &missing {
+        body.push('\n');
+        body.push_str(extra);
+    }
+    format!("```ANSWER\n{body}\n```")
+}
+
 fn finish(
     mut writer: TranscriptWriter,
     config: &AgentConfig,
@@ -2971,13 +3127,17 @@ fn finish(
     // The budget as it stood when the run stopped, so a context stop can be read against
     // the numbers that decided it.
     agent["context"] = meter.map_or(Value::Null, ContextMeter::to_json);
+    // The model's own text, completed: any resolved reference row it left
+    // out is added, and a literal ANSWER marker is guaranteed, so a caller
+    // recording this run's answer never comes back with nothing under it.
+    let final_text = compose_final_answer(final_text, &counters.reference_rows);
     let record = writer.result(
         status.subtype(),
         status != ExitStatus::Success,
         counters.turns,
         started.elapsed().as_millis(),
         counters.api_ms,
-        final_text,
+        &final_text,
         counters.usage_json(),
         agent,
     )?;
@@ -2987,7 +3147,7 @@ fn finish(
     )?;
     Ok(RunOutcome {
         status,
-        final_text: final_text.to_string(),
+        final_text,
         transcript_path: config.out_dir.join("transcript.jsonl"),
         trace_path: config.out_dir.join("kin-trace.jsonl"),
         result: record,
@@ -3189,6 +3349,128 @@ mod reference_rows_tests {
         counters.record_reference_rows("find_references", TOSSG_FIND_REFERENCES_RESULT);
         let agent = counters.to_json(0, &Stop::new(ExitStatus::Success, "final_answer", None));
         assert_eq!(agent["reference_rows"].as_array().unwrap().len(), 6);
+    }
+}
+
+#[cfg(test)]
+mod final_answer_tests {
+    use super::*;
+
+    /// A minimal `find_references` result: four resolved rows, two of them
+    /// aliased-import lines (`kind: "Module"`), the same shape and the same
+    /// line numbers a study task handed the belt. Line 2 and line 26 on the
+    /// same path are deliberately both present, so a naive substring check
+    /// for "is line 2 already in the text" would wrongly match inside "26".
+    /// This fixture doubles as a regression guard for that.
+    const FOUR_RESOLVED_ROWS: &str = r#"{
+        "focal_entity": {"id": "9407382b-fdc1-42b6-a0b8-3944d23daed1", "name": "toSSG"},
+        "references": [
+            {"entity_id": "ade70b82-85aa-4f01-8291-b5f1955f094d", "file_path": "src/adapter/bun/ssg.ts", "kind": "Module", "name": "ssg", "reference_lines": [2], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "84ef6563-5c14-41da-9a96-3a962c025845", "file_path": "src/adapter/bun/ssg.ts", "kind": "Function", "name": "toSSG", "reference_lines": [26], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "dee91665-f43c-4025-a5c4-19f9ee5ac89a", "file_path": "src/adapter/deno/ssg.ts", "kind": "Module", "name": "ssg", "reference_lines": [1], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "f7d3013b-7853-4f2f-8509-4880542c0f65", "file_path": "src/adapter/deno/ssg.ts", "kind": "Function", "name": "toSSG", "reference_lines": [26], "resolution": "type_resolved", "role": "source"}
+        ]
+    }"#;
+
+    /// The exact defect: the belt kept the two `Function`-kind rows and
+    /// dropped the two `Module`-kind aliased-import rows, even though
+    /// `find_references` resolved all four with equal confidence. The
+    /// composed answer must carry all four, not just the two the model's
+    /// own prose kept: an import line is a reference like any other.
+    #[test]
+    fn missing_resolved_rows_including_import_lines_are_added_to_the_answer() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("find_references", FOUR_RESOLVED_ROWS);
+        let model_text = "```ANSWER\nsrc/adapter/bun/ssg.ts:26\nsrc/adapter/deno/ssg.ts:26\n```";
+
+        let composed = compose_final_answer(model_text, &counters.reference_rows);
+
+        let rows: Vec<&str> = composed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !is_answer_marker_line(line) && *line != "```")
+            .collect();
+        assert_eq!(rows.len(), 4, "expected four answer rows, got: {rows:?}");
+        for expected in [
+            "src/adapter/bun/ssg.ts:2",
+            "src/adapter/bun/ssg.ts:26",
+            "src/adapter/deno/ssg.ts:1",
+            "src/adapter/deno/ssg.ts:26",
+        ] {
+            assert!(
+                rows.contains(&expected),
+                "the answer must carry {expected}, an import line is a reference like any \
+                 other: {composed}"
+            );
+        }
+    }
+
+    /// A run whose model produced no final text at all still reports an
+    /// answer a caller can find: the block is emitted and says plainly that
+    /// the run had nothing to put in it.
+    #[test]
+    fn an_empty_model_answer_still_carries_the_answer_block() {
+        let counters = Counters::new();
+        let composed = compose_final_answer("", &counters.reference_rows);
+        assert!(
+            composed.lines().any(is_answer_marker_line),
+            "an empty answer must still carry the marker: {composed:?}"
+        );
+        assert!(
+            composed.to_ascii_lowercase().contains("empty"),
+            "an empty answer must say so inside the block: {composed:?}"
+        );
+    }
+
+    /// The exact other defect: the model wrote the complete, correct row
+    /// list inside a bare fence with no literal `ANSWER` token anywhere, so
+    /// a caller parsing for the marker found nothing even though the rows
+    /// underneath were exactly right.
+    #[test]
+    fn a_bare_fenced_list_gains_the_marker_without_losing_its_rows() {
+        let counters = Counters::new();
+        let model_text = "The method is referenced in the following places:\n\n\
+                           ```\ntests/test_blueprints.py:899\ntests/test_blueprints.py:900\n```";
+
+        let composed = compose_final_answer(model_text, &counters.reference_rows);
+
+        assert!(
+            composed.lines().any(is_answer_marker_line),
+            "a bare fenced list must gain the marker: {composed:?}"
+        );
+        for expected in [
+            "tests/test_blueprints.py:899",
+            "tests/test_blueprints.py:900",
+        ] {
+            assert!(
+                composed.contains(expected),
+                "relabelling the fence must not lose {expected}: {composed}"
+            );
+        }
+    }
+
+    /// The no-op path: an answer that already carries the marker and
+    /// already names every resolved row is returned byte-for-byte
+    /// unchanged, and so is an ordinary conversational answer with no
+    /// marker, nothing missing, and no line shaped like a position. A plain
+    /// reply is never forced into a fence it never needed.
+    #[test]
+    fn an_already_complete_answer_and_plain_prose_are_left_unchanged() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("find_references", FOUR_RESOLVED_ROWS);
+        let complete = "```ANSWER\nsrc/adapter/bun/ssg.ts:2\nsrc/adapter/bun/ssg.ts:26\n\
+                         src/adapter/deno/ssg.ts:1\nsrc/adapter/deno/ssg.ts:26\n```";
+        assert_eq!(
+            compose_final_answer(complete, &counters.reference_rows),
+            complete
+        );
+
+        let empty_counters = Counters::new();
+        let prose = "greet is defined in src/greet.py and now carries a docstring.";
+        assert_eq!(
+            compose_final_answer(prose, &empty_counters.reference_rows),
+            prose
+        );
     }
 }
 

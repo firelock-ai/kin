@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `kin agent run`'s final answer now always carries the literal `ANSWER`
+  marker a caller parses for, and now always names every reference row
+  `find_references` resolved with confidence, even when the model's own
+  prose did not. A study task found Kin resolving six rows for one symbol,
+  all with equal confidence, and the model's own answer keeping four while
+  dropping exactly the two aliased-import lines. Another task found Kin's
+  retrieval exactly right while the model's own answer was a bare fenced
+  block with no `ANSWER` token anywhere in it, so a caller parsing for the
+  marker got nothing under it. Neither repair rewrites what the model
+  wrote: an answer that already carries the marker and already names every
+  resolved row is untouched, and an ordinary prose answer with no reference
+  rows and no position-shaped line is never forced into a fence it does not
+  need.
 - `find_references` asked for a bare name that several owner-qualified
   entities share, such as `Blueprint.register_blueprint` and
   `App.register_blueprint` in a Flask-shaped Python store, now answers a
