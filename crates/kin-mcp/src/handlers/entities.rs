@@ -2021,11 +2021,12 @@ default headline is the proven subset. Nothing is dropped at any setting: a row 
 the floor moves to `candidates` whole, keeping its `resolution` and its site lines, and \
 `min_resolution: \"name_only\"` counts every one of them in the headline again. \
 `counts.receiver_name_candidates` and `counts.unresolved_name_candidates` say which \
-ground held each withheld row. The floor only withholds where it has something to trade \
-a row for: where nothing this query resolved for the focal reached `import_scoped` or \
-`type_resolved` -- a store whose language links no imports across files at all is the case \
-that finds this -- its `name_only` rows stay in `references` rather than emptying the \
-headline, and `degradations` says so. \
+ground held each withheld row. The floor only withholds where the STORE has something to \
+trade a row for: where nothing anywhere in the store resolved this focal's language above \
+`name_only` -- true of a store whose language links no imports across files at all, \
+whatever this one focal's own rows happen to be -- every `name_only` row for that language \
+stays in `references` rather than emptying the headline, and `degradations` names the \
+store, not the focal, as the reason. \
 For a Go INTERFACE method the response also carries `interface_implementations`: the \
 concrete methods whose receiver types satisfy that contract, each with the file AND LINE \
 of its declaration, plus `files`, the files those declarations live in and no others. A \
@@ -2741,18 +2742,25 @@ fn disclose_withheld_candidates(result: &mut serde_json::Value) {
 }
 
 /// Declare that this answer's floor let `name_only` rows stay in `references`
-/// because nothing else here cleared it.
+/// because the STORE has nothing stronger for this language, not because this
+/// one focal's own rows happen to lack it.
 ///
 /// The resolution ground of [`is_withheld_candidate`] only fires where it has
 /// something to trade a row for: a row this query resolved to `import_scoped`
-/// or `type_resolved` for the SAME focal. Where nothing did, holding a
-/// `name_only` row back would not raise precision, because there is no
-/// stronger row behind it to prefer instead; it would only delete a row the
-/// graph did find, which is the recall loss a batch Go ingest with no gopls
-/// paid before this disclosure existed. The row stays, reading its own
-/// `resolution` honestly, and this says why a `references` row can still read
-/// `name_only` under the default floor.
-fn disclose_name_only_ceiling(result: &mut serde_json::Value, kept: usize) {
+/// or `type_resolved` for the SAME focal, or -- failing that -- a proven
+/// cross-file row [`crate::edge_coverage::language_has_a_proven_cross_file_reference`]
+/// finds anywhere else in the store for the focal's language. Where neither
+/// exists, holding a `name_only` row back would not raise precision, because
+/// there is no stronger row the store could produce to prefer instead; it
+/// would only delete a row the graph did find, which is the recall loss a
+/// batch Go ingest with no gopls paid before this disclosure existed. The row
+/// stays, reading its own `resolution` honestly, and this says why a
+/// `references` row can still read `name_only` under the default floor.
+fn disclose_name_only_ceiling(
+    result: &mut serde_json::Value,
+    kept: usize,
+    language: kin_model::ids::LanguageId,
+) {
     if kept == 0 {
         return;
     }
@@ -2760,10 +2768,11 @@ fn disclose_name_only_ceiling(result: &mut serde_json::Value, kept: usize) {
         "component": CALL_RESOLUTION_COMPONENT,
         "reason": NAME_ONLY_CEILING_REASON,
         "detail": format!(
-            "{kept} row(s) counted here read resolution `name_only` because nothing this \
-             query resolved for this focal reached `import_scoped` or `type_resolved`; there \
-             is no stronger row here to prefer them over, so the floor that would otherwise \
-             hold them back left them in `references` instead of `candidates`"
+            "{kept} row(s) counted here read resolution `name_only` because this store \
+             holds no `import_scoped` or `type_resolved` relation for {language} at all, \
+             not because of anything particular to this focal; there is no stronger row \
+             this store could produce here to prefer them over, so the floor that would \
+             otherwise hold them back left them in `references` instead of `candidates`"
         ),
         "remediation":
             "confirm each row at its reference site before treating it as certain; a store \
@@ -3192,29 +3201,47 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // carry their own `resolution`, and `min_resolution: "name_only"` puts every
     // one of them back in the headline for a caller that wants the wide read.
     //
-    // The floor only pays where it has something to trade a row for. A Go
-    // store the batch ingest arm built with no gopls links no import across
-    // files at all, so every cross-file call for a focal in it resolves at
-    // best to `name_only`, and holding that row back for `import_scoped`
-    // would not raise precision: there is no stronger row behind it to
-    // prefer, so the trade removes a real caller and returns nothing in
-    // exchange. `reference_rows_carry_call_site_lines_on_both_ingest_arms`
-    // caught exactly this: the batch arm's only row for a Go caller read
-    // `name_only`, the default floor withheld it, and `references` came back
-    // empty over a call the graph had found. So the floor is computed once
-    // here, over every row this query resolved for the focal before any of
-    // them is withheld by it: where nothing reached `import_scoped` or
-    // `type_resolved`, the floor drops to `name_only`, which withholds
-    // nothing through this ground (below, `is_withheld_candidate` never
+    // The floor only pays where the STORE has something to trade a row for.
+    // The first cut of this (#140) read that as "nothing THIS QUERY resolved
+    // for the focal reached import_scoped or type_resolved", which happened
+    // to answer the case it was built for correctly: a Go store the batch
+    // ingest arm built with no gopls links no import across files at all, so
+    // every cross-file call for every Go focal there resolves at best to
+    // `name_only`, and a focal-local reading gets that right by accident,
+    // because nothing in that store is ever stronger for any focal either.
+    // It can answer the general question wrongly on a store that DOES
+    // resolve Go cross-file: an interface method reached only by calling
+    // through the interface value, never a concrete type, could have every
+    // one of its OWN rows read `name_only` while the same store proves
+    // `import_scoped` or `type_resolved` for other Go focals, and reading
+    // the floor off that one focal's rows alone would drop it anyway --
+    // putting back exactly the false-positive dispatch guesses the floor
+    // exists to withhold. `a_name_only_row_is_withheld_when_the_store_resolves_the_language_elsewhere`
+    // below is that shape at unit scale. Nothing about one focal's own rows
+    // can tell the two cases apart; only the store can.
+    //
+    // So the floor asks the store, not the focal. `any_row_is_proven` stays
+    // as the fast path: a query whose own rows already cleared
+    // `import_scoped` has its answer for free and never pays a scan. Only
+    // when that comes back empty does
+    // `edge_coverage::language_has_a_proven_cross_file_reference` run its
+    // bounded, language-scoped witness search over the WHOLE store, not just
+    // this focal's rows, and only the combined fact drops the floor.
+    // `is_withheld_candidate` below is unchanged either way: it still never
     // withholds a row whose resolution is not strictly under the floor it is
-    // handed). The receiver fan-out ground is untouched by this and stays
-    // unconditional: a same-leaf-name match is a candidate because the call
-    // is genuinely ambiguous, a fact about the call and not about what else
-    // this query resolved.
+    // handed, and the receiver fan-out ground stays unconditional, because a
+    // same-leaf-name match is a candidate for a fact about the call, not
+    // about what else this query or this store resolved.
     let any_row_is_proven = rows
         .iter()
         .any(|row| row.resolution.is_some_and(RelationResolution::is_proven));
-    let floor = if any_row_is_proven {
+    let store_resolves_language_above_name_only = any_row_is_proven
+        || crate::edge_coverage::language_has_a_proven_cross_file_reference(
+            store,
+            target.language,
+            &relation_kinds,
+        );
+    let floor = if store_resolves_language_above_name_only {
         min_resolution
     } else {
         RelationResolution::NameOnly
@@ -3224,19 +3251,20 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         .partition(|row| !is_withheld_candidate(row, floor));
 
     // Rows this response counts at `name_only` only because the floor above
-    // dropped to `name_only` for lack of anything stronger here, not because a
-    // caller asked for the wide read (which leaves `min_resolution` itself at
-    // `name_only`, where nothing is withheld either way and there is nothing
-    // to disclose). Counted while `rows` still holds only the kept set, and
-    // disclosed below beside the other `degradations`.
-    let name_only_ceiling_kept =
-        if any_row_is_proven || min_resolution == RelationResolution::NameOnly {
-            0
-        } else {
-            rows.iter()
-                .filter(|row| row.resolution == Some(RelationResolution::NameOnly))
-                .count()
-        };
+    // dropped to `name_only` for lack of anything stronger IN THE STORE, not
+    // because a caller asked for the wide read (which leaves `min_resolution`
+    // itself at `name_only`, where nothing is withheld either way and there is
+    // nothing to disclose). Counted while `rows` still holds only the kept
+    // set, and disclosed below beside the other `degradations`.
+    let name_only_ceiling_kept = if store_resolves_language_above_name_only
+        || min_resolution == RelationResolution::NameOnly
+    {
+        0
+    } else {
+        rows.iter()
+            .filter(|row| row.resolution == Some(RelationResolution::NameOnly))
+            .count()
+    };
 
     // Who a Go interface value may have routed here. A call written `w.Write(p)`
     // where `w` holds an interface resolves to the INTERFACE method object, so a
@@ -3375,7 +3403,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         crate::caller_arrival::observe_caller_arrival(store, &target).to_json();
     disclose_withheld_candidates(&mut result);
     disclose_interface_dispatch_candidates(&mut result);
-    disclose_name_only_ceiling(&mut result, name_only_ceiling_kept);
+    disclose_name_only_ceiling(&mut result, name_only_ceiling_kept, target.language);
 
     // Say that a bare name was resolved, and to how many candidates.
     //
@@ -10867,9 +10895,9 @@ mod tests {
         );
     }
 
-    /// A `name_only` row with nothing stronger for the same focal is kept in
-    /// `references` rather than withheld, because the floor has nothing to
-    /// trade it for.
+    /// A `name_only` row with nothing stronger anywhere in the STORE for this
+    /// language is kept in `references` rather than withheld, because the
+    /// floor has nothing to trade it for.
     ///
     /// This is `reference_rows_carry_call_site_lines_on_both_ingest_arms`'s
     /// unit-level twin. That kin-cli integration test failed with "Go batch:
@@ -10878,8 +10906,12 @@ mod tests {
     /// exact-name tier, the default `import_scoped` floor withheld it into
     /// `candidates`, and `references` came back empty over a call the graph
     /// had found. This fixture is that failure at unit scale: one caller, one
-    /// `name_only` edge, no fan-out and no stronger sibling anywhere, so a
-    /// floor that still withholds here cannot pass this test.
+    /// `name_only` edge, no fan-out and no stronger sibling ANYWHERE in the
+    /// store, so a floor that still withholds here cannot pass this test.
+    /// [`a_name_only_row_is_withheld_when_the_store_resolves_the_language_elsewhere`]
+    /// is this fixture's store-versus-focal mirror: same shape of row for the
+    /// same focal, except the STORE holds a stronger row for an unrelated
+    /// focal, and there the floor must withhold.
     #[tokio::test]
     async fn a_name_only_row_with_nothing_stronger_for_the_focal_is_not_withheld() {
         let store = InMemoryGraph::new();
@@ -10934,6 +10966,93 @@ mod tests {
             }),
             "the bypass is disclosed so the verdict can say why a references row still reads \
              name_only: {body:#}"
+        );
+    }
+
+    /// The store-versus-focal mirror of the test above: a `name_only` row IS
+    /// withheld even though its OWN focal has nothing stronger, because the
+    /// STORE proves a stronger resolution exists for the language somewhere
+    /// else entirely.
+    ///
+    /// This is the case the per-focal reading of the floor (#140, as first
+    /// landed) got wrong: an interface method whose own call sites all read
+    /// `name_only`, in a store that otherwise resolves the language past
+    /// `name_only` routinely (a Go interface method reached only by calling
+    /// through the interface value, in a gopls-enriched store, is the
+    /// motivating shape). Reading the floor off this one focal's rows alone
+    /// says "nothing to trade these for" and keeps them; reading it off the
+    /// store says correctly that the store COULD have produced a stronger
+    /// row here if one existed at the call sites, so the floor keeps trading
+    /// and the row belongs in `candidates`. This fixture is that shape at
+    /// unit scale: `target`'s only row is
+    /// `name_only` exactly as in the test above, but a wholly separate pair
+    /// elsewhere in the store proves the language resolves higher.
+    #[tokio::test]
+    async fn a_name_only_row_is_withheld_when_the_store_resolves_the_language_elsewhere() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("compute", "src/defs.rs");
+        store.upsert_entity(&target).unwrap();
+        let caller = make_entity("run", "src/caller.rs");
+        store.upsert_entity(&caller).unwrap();
+        // Same shape as the fixture above: a lone `name_only` row and
+        // nothing else FOR THIS FOCAL.
+        let mut relation = make_relation_with_site(
+            caller.id,
+            target.id,
+            RelationKind::Calls,
+            "src/caller.rs",
+            4,
+        );
+        relation.confidence = 0.7;
+        store.upsert_relation(&relation).unwrap();
+
+        // An unrelated pair, same language, elsewhere in the store. Nothing
+        // here touches `target` or `caller`; it exists only to prove the
+        // STORE can resolve this language above `name_only` in general,
+        // which is the fact the floor now checks before it drops.
+        let other_target = make_entity("other_compute", "src/other_defs.rs");
+        store.upsert_entity(&other_target).unwrap();
+        let other_caller = make_entity("other_run", "src/other_caller.rs");
+        store.upsert_entity(&other_caller).unwrap();
+        let proven_elsewhere = make_relation_with_site(
+            other_caller.id,
+            other_target.id,
+            RelationKind::Calls,
+            "src/other_caller.rs",
+            4,
+        );
+        // Default confidence 1.0: parser-certain, `type_resolved`.
+        store.upsert_relation(&proven_elsewhere).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(
+            body["total_upstream"], 0,
+            "the store resolves this language above name_only for another focal, so the \
+             floor has something to trade this row for even though target's OWN rows do \
+             not: {body:#}"
+        );
+        assert_eq!(body["references"].as_array().unwrap().len(), 0, "{body:#}");
+        let candidates = body["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "{body:#}");
+        assert_eq!(candidates[0]["name"], "run", "{body:#}");
+        assert_eq!(
+            candidates[0]["resolution"], "name_only",
+            "held back, not dropped: the row still carries its own tier: {body:#}"
+        );
+        assert_eq!(body["counts"]["unresolved_name_candidates"], 1, "{body:#}");
+
+        let degradations = body["degradations"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !degradations
+                .iter()
+                .any(|entry| entry["reason"] == NAME_ONLY_CEILING_REASON),
+            "the store can resolve this language, so the bypass must not fire just because \
+             THIS focal's own rows happened to land at name_only: {body:#}"
         );
     }
 

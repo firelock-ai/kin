@@ -71,6 +71,7 @@ use serde_json::{json, Map, Value};
 use kin_core::reference_coverage::{
     reference_enrichment_for, LanguageServerReadinessMap, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
 };
+use kin_index::RelationResolution;
 use kin_model::entity::Entity;
 use kin_model::graph::{EntityFilter, EntityStore};
 use kin_model::ids::{EntityId, FilePathId, LanguageId};
@@ -1296,6 +1297,85 @@ fn endpoint_file<S: EntityStore>(
         .ok()
         .flatten()
         .and_then(|entity| entity.file_origin)
+}
+
+/// Whether the graph holds, anywhere for `language`, at least one entity-rooted
+/// relation among `kinds` whose two endpoints sit in different files and whose
+/// [`RelationResolution`] the linker proved to `import_scoped` or higher.
+///
+/// This is a STORE-level capability fact and is deliberately not scoped to any
+/// one focal. `find_references`' resolution floor (`crate::handlers::entities`)
+/// exists to trade a `name_only` row for a stronger one, and that trade only
+/// pays where the STORE can produce a stronger row for the language at all: a
+/// Go store the batch ingest arm built with no gopls resolves every cross-file
+/// call to `name_only` regardless of which method is asked about, so no
+/// per-focal floor can ever find a stronger row there and withholding would
+/// only empty the headline. A store that DOES resolve Go cross-file in general
+/// can still have individual focals -- an interface method reached only by
+/// calling through the interface value, say -- whose own rows are every one
+/// `name_only`; that is a fact about those call sites, not about the store,
+/// and the floor keeps trading there because a stronger row is possible in
+/// principle and this function finds the witness that proves it.
+///
+/// Intra-file resolution is not a witness and does not satisfy the search. A
+/// same-file call is `type_resolved` on nearly every build, because the
+/// destination's definition sits in the same parse whether or not this
+/// language's cross-file linker or a language server has ever run; counting
+/// one would make this function return `true` on the exact stores this floor
+/// exists to protect. Scoped to `kinds` so a caller that restricted
+/// `relation_kinds` never pays for a class it did not ask about, matching
+/// [`observe_cross_file_reference_coverage_witnessed`].
+///
+/// Bounded exactly like [`observe_language`]'s witness search and for the same
+/// reason: proving `true` needs one example, so a store that has one exits in
+/// single digits, and a store that has none pays a capped scan once rather
+/// than a full walk on every affected query. A scan that exhausts its budget
+/// without finding a witness reads as `false`, the same conservative direction
+/// [`observe_language`] takes on an unproven class: a huge, unluckily-ordered
+/// store may keep a few `name_only` rows this could have withheld, never the
+/// reverse.
+pub fn language_has_a_proven_cross_file_reference<S: EntityStore>(
+    store: &S,
+    language: LanguageId,
+    kinds: &[RelationKind],
+) -> bool {
+    let Ok(candidates) = store.query_entities(&EntityFilter {
+        languages: Some(vec![language]),
+        ..EntityFilter::default()
+    }) else {
+        return false;
+    };
+    let files: std::collections::HashMap<EntityId, Option<FilePathId>> = candidates
+        .iter()
+        .map(|entity| (entity.id, entity.file_origin.clone()))
+        .collect();
+    for (examined, entity) in candidates.iter().enumerate() {
+        if examined >= WITNESS_BUDGET {
+            break;
+        }
+        let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
+            continue;
+        };
+        for relation in relations {
+            if !kinds.contains(&relation.kind) || !RelationResolution::of(&relation).is_proven() {
+                continue;
+            }
+            let Some(source) = relation.src.as_entity() else {
+                continue;
+            };
+            let Some(destination) = relation.dst.as_entity() else {
+                continue;
+            };
+            let source_file = endpoint_file(store, &files, &source);
+            let destination_file = endpoint_file(store, &files, &destination);
+            if let (Some(source_file), Some(destination_file)) = (source_file, destination_file) {
+                if source_file != destination_file {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
