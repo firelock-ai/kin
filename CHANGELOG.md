@@ -48,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself is unchanged. Measured on a corpus checkout nine hundred forty-two
   commits ahead of its store, roughly twenty-six percent of its files were in
   this previously unreported state.
+- Building on the entry above: the directory a large pull leaves this graph
+  having never met is now admitted by startup catch-up, instead of being left
+  to `waiting_deferred` and a manual `kin admit`. A directory arriving whole
+  still cannot be told from a clone or a move by its modification time. The
+  sweep that admits it does not use that modification-time window at all: it
+  asks only whether graph truth has ever met the directory, a question with
+  no window to be wrong about. The admission is recorded under its own
+  provenance, `arrived`, so this bulk sweep-in stays distinguishable from an
+  ordinary watched edit or an explicit admission, neither of which minted a
+  record like it before. Content the daemon cannot read still defers exactly
+  as before. Only the directory-unknown decline is lifted, and reconciliation
+  now reaches `idle` on its own after a pull that adds a directory, with no
+  operator action required.
 - `kin agent run`'s result record now carries every row a `find_references`
   call returned, under `kin_agent.reference_rows`, independent of what the
   model's own final answer text kept. A study task found Kin's

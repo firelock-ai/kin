@@ -3061,6 +3061,134 @@ fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<Fi
         .collect())
 }
 
+/// Repository paths inside a directory graph truth has never met:
+/// [`plan_catch_up_events`]'s complement, not its replacement.
+///
+/// `plan_catch_up_events`, through [`kin_index::scan_repository_modified_since`],
+/// deliberately declines this same population, because modification times
+/// cannot tell a directory arriving whole -- a clone, a move, an unpacked
+/// archive -- from authored work. Left there, that content sits behind the
+/// `waiting_deferred` disclosure until an operator happens to notice and runs
+/// `kin admit`, which is exactly what turns an ordinary `git pull` that added
+/// a directory into a store that reports itself stale until somebody
+/// re-ingests it by hand.
+///
+/// This walk answers a narrower, timeless question instead: not "did the host
+/// touch this since some instant", but "has graph truth ever met this
+/// directory at all". Admitting what it names needs no modification-time
+/// window to be right about, because it carries none; the caller records the
+/// admission's provenance as [`CATCH_UP_ARRIVAL_PROVENANCE`] rather than
+/// folding it into the ordinary ambient population, so a bulk sweep-in stays
+/// distinguishable from a watched edit.
+fn plan_never_met_directory_arrivals(state: &DaemonState) -> Result<Vec<RepoPath>> {
+    let working_dir = state.layout.working_dir();
+    let (_, policy) = current_authority_admission(state)?;
+    let previous = state.graph.resolved_tree();
+    let tracked_paths = previous
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
+    let ignore =
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let never_met = kin_index::scan_repository_never_met_directories(
+        working_dir,
+        &ignore,
+        policy.as_ref(),
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+    )
+    .map_err(kin_index::IndexError::from)?;
+    Ok(never_met)
+}
+
+/// [`plan_never_met_directory_arrivals`]'s paths as the ordinary host events
+/// the ambient admission pipeline already knows how to carry.
+///
+/// Sharing that pipeline, rather than admitting these paths through a seam of
+/// their own, is deliberate: entity derivation, the reconciler, and every
+/// per-path failure and retry rule already proven for a watched edit apply
+/// here unchanged, including the one this population most needs -- content
+/// inside the swept directory that cannot be read still fails and retries
+/// exactly as any other unreadable content does, rather than being silently
+/// skipped. Only the discovery of these paths, and the record that they
+/// arrived this way, is new.
+fn never_met_directory_events(working_dir: &Path, paths: &[RepoPath]) -> Vec<FileEvent> {
+    paths
+        .iter()
+        .filter_map(|path| kin_index::host_path_from_repo_path(working_dir, path).ok())
+        .map(FileEvent::Changed)
+        .collect()
+}
+
+/// The provenance word this daemon records for entities admitted because
+/// startup catch-up met a directory graph truth had never tracked before,
+/// rather than declining them to the behind disclosure and `kin admit`.
+///
+/// No existing provenance vocabulary answers "how did this content enter the
+/// graph" at this grain: an ambient watch and an explicit `kin admit` both
+/// publish their workspace-tree transition under the same actor,
+/// [`DAEMON_ADMISSION_ACTOR`], and neither mints a record a later reader
+/// could use to tell them apart, because neither needs one -- both carry
+/// stronger evidence about when their content changed than this population
+/// ever had. This is the new word, and [`catch_up_arrival_marker_path`] is
+/// where it is recorded.
+pub(crate) const CATCH_UP_ARRIVAL_PROVENANCE: &str = "arrived";
+
+/// Where a daemon records the repository paths it swept into reconciliation
+/// under [`CATCH_UP_ARRIVAL_PROVENANCE`].
+///
+/// Operational state beside the pid and port files, never semantic authority:
+/// nothing reads this back to decide what to admit, and losing it loses a
+/// record, not any content. It exists so an operator or a later tool can
+/// answer "how did this file's entities enter the graph" for a directory a
+/// pull carried in whole.
+fn catch_up_arrival_marker_path(state: &DaemonState) -> PathBuf {
+    state.layout.root().join("catch-up-arrivals.json")
+}
+
+/// Record that this sweep is admitting `paths` under
+/// [`CATCH_UP_ARRIVAL_PROVENANCE`], growing whatever an earlier sweep in this
+/// daemon's life already recorded rather than replacing it.
+///
+/// Written before the admission it documents, matching
+/// [`mark_enrichment_unpublished`]'s own ordering choice: the record of intent
+/// survives a crash the admission itself does not, and re-admitting an
+/// already-recorded path the next time it is still unmet costs nothing, since
+/// this file is read back by nothing this daemon does.
+///
+/// Best-effort and never fatal. The admission this documents is not withheld
+/// by a write that fails, and a store that cannot write it is no worse off
+/// than one built before this existed.
+fn record_catch_up_arrivals(state: &DaemonState, paths: &[RepoPath]) {
+    if paths.is_empty() {
+        return;
+    }
+    let marker = catch_up_arrival_marker_path(state);
+    let mut recorded: Vec<String> = std::fs::read(&marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default();
+    for path in paths {
+        let named = path.to_string();
+        if !recorded.contains(&named) {
+            recorded.push(named);
+        }
+    }
+    match serde_json::to_vec(&recorded) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(&marker, bytes) {
+                debug!(
+                    error = %error,
+                    "could not persist the catch-up arrival marker; the admission this tick \
+                     performs is unaffected"
+                );
+            }
+        }
+        Err(error) => debug!(error = %error, "could not encode the catch-up arrival marker"),
+    }
+}
+
 /// Where a daemon records the paths it derived entities for that durable
 /// authority is not known to hold.
 ///
@@ -3825,6 +3953,41 @@ pub async fn run_loop_armed(
                         "could not plan the startup catch-up, so host content written while \
                          nothing was watching stays unadmitted until `kin admit` or a commit \
                          takes it"
+                    );
+                }
+            }
+
+            // The catch-up's other half: a directory graph truth has never
+            // met, which the walk above declines on purpose because
+            // modification time cannot tell a clone or a move from authored
+            // work. Swept in here instead of left to the behind disclosure and
+            // `kin admit`, so a large pull that added a directory does not
+            // leave the store reporting itself stale until an operator
+            // notices and re-ingests it by hand. Owed once, alongside the
+            // ordinary catch-up above and gated the same way: only a daemon
+            // that resumed against a last-admission marker has a stretch to
+            // catch up on at all.
+            match plan_never_met_directory_arrivals(&state) {
+                Ok(paths) if paths.is_empty() => {
+                    debug!("no directory this graph has never met is present in the working copy");
+                }
+                Ok(paths) => {
+                    info!(
+                        count = paths.len(),
+                        provenance = CATCH_UP_ARRIVAL_PROVENANCE,
+                        "admitting host paths under a directory this graph has never met before \
+                         this pull, instead of declining them to `kin admit`"
+                    );
+                    record_catch_up_arrivals(&state, &paths);
+                    let events = never_met_directory_events(working_dir, &paths);
+                    enqueue_file_events(&mut pending_events, events);
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not plan the never-met-directory catch-up sweep, so a directory \
+                         this graph has never met stays declined until `kin admit` or a live \
+                         edit takes it"
                     );
                 }
             }
@@ -10626,7 +10789,7 @@ mod tests {
         );
     }
 
-    /// FIR-2499. The catch-up names what the host changed inside the window and
+    /// the staleness-decay case. The catch-up names what the host changed inside the window and
     /// nothing older, and what it names is admissible by the ordinary ambient
     /// path.
     ///
@@ -10727,7 +10890,7 @@ mod tests {
         );
     }
 
-    /// FIR-2499. A path graph truth already tracks is projection drift, not
+    /// the staleness-decay case. A path graph truth already tracks is projection drift, not
     /// catch-up work, however recently the host touched it.
     ///
     /// Repository authority holds bytes for a tracked path, so a host edit to
@@ -10779,15 +10942,18 @@ mod tests {
         );
     }
 
-    /// FIR-2499. A directory graph truth has never met is disclosed, not swept
-    /// in.
-    ///
-    /// A directory arriving whole is a clone, a move, an unpacked archive or a
-    /// renamed control directory, and a move restamps every entry it carries,
-    /// so modification times cannot tell that content from authored work.
-    /// Admitting one at daemon start is the working-copy sweep startup must
-    /// never perform. The file beside the tracked one is the positive control:
-    /// it sits where the graph already looks, so the window still reaches it.
+    /// the staleness-decay shape. `plan_catch_up_events` itself still declines a directory
+    /// graph truth has never met, on the same modification-time boundary it
+    /// always has: a directory arriving whole is a clone, a move, an unpacked
+    /// archive or a renamed control directory, and a move restamps every
+    /// entry it carries, so modification time cannot tell that content from
+    /// authored work. This function is not where that content is admitted
+    /// from, and never becomes that; `plan_never_met_directory_arrivals`
+    /// admits it instead, under its own provenance, so this boundary keeps
+    /// gating which mechanism admits the population rather than whether the
+    /// daemon admits it at all. The file beside the tracked one is the
+    /// positive control: it sits where the graph already looks, so the window
+    /// still reaches it.
     #[test]
     fn the_catch_up_declines_a_directory_the_graph_has_never_met() {
         let repo = tempfile::tempdir().unwrap();

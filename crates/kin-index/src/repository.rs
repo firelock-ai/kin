@@ -967,6 +967,21 @@ enum ScanMode {
     /// level with the working copy has to be told about that directory, and its
     /// own comment says the behind disclosure is what counts and names it.
     Untracked,
+    /// Keep the path of every admissible leaf inside a directory graph truth
+    /// has never met, and nothing else. Opens nothing, hashes nothing, stats
+    /// nothing beyond the directory entry the walk already read, and produces
+    /// no completion proof.
+    ///
+    /// [`ScanMode::ModifiedSince`]'s exact complement: that mode declines this
+    /// population because modification times cannot tell a directory arriving
+    /// whole from authored work, and leaves it to the behind disclosure and to
+    /// an explicit seam. A caller that means to admit the population anyway,
+    /// under its own distinct provenance rather than the ordinary
+    /// modified-since window, needs precisely this set: not a leaf beside
+    /// files the graph already tracks (that is catch-up's ordinary population,
+    /// unaffected by this mode), and not a leaf this walk's shared rules
+    /// already exclude.
+    NeverMet,
 }
 
 /// Repository paths whose host entry was last modified at or after `since`.
@@ -1052,6 +1067,44 @@ pub fn scan_repository_untracked_paths<'a>(
     // this list and directory order is whatever the host hands back. A sample
     // that reshuffles between two readings of one unchanged working copy reads
     // as the set having changed.
+    scanner.modified.sort();
+    Ok(scanner.modified)
+}
+
+/// Repository paths inside a directory graph truth has never met.
+///
+/// [`scan_repository_modified_since`] declines to propose this population to
+/// catch-up's own ordinary modified-since walk, on the grounds that
+/// modification times cannot tell a directory arriving whole -- a clone, a
+/// move, an unpacked archive, a renamed control directory -- from authored
+/// work. A caller that means to admit the population anyway, under its own
+/// distinct provenance rather than folding it into the ordinary window, needs
+/// exactly this set and nothing else: not a leaf beside files the graph
+/// already tracks, which is ordinary catch-up's own population and stays
+/// governed by modification time exactly as before, and not a leaf this
+/// walk's shared rules already exclude.
+///
+/// Opens nothing, hashes nothing, and produces no [`CompleteScanToken`]: this
+/// walk observed no content and must never be mistaken for one that did.
+pub fn scan_repository_never_met_directories<'a>(
+    root: &Path,
+    ignore: &RepositoryIgnore,
+    policy: Option<&ResolvedAdmissionMatcher>,
+    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
+) -> Result<Vec<RepoPath>, IncompleteRepositoryScan> {
+    let mut scanner = prepare_scanner(
+        root,
+        ignore,
+        policy,
+        tracked_paths,
+        graph_only_paths,
+        ScanMode::NeverMet,
+    )?;
+    scanner.walk(root, false, true)?;
+    // Sorted for the same reason the untracked measurement sorts: a caller
+    // that logs or persists a sample must not see it reshuffle between two
+    // readings of one unchanged working copy.
     scanner.modified.sort();
     Ok(scanner.modified)
 }
@@ -1314,6 +1367,23 @@ impl Scanner<'_> {
                     if modified == Some(true) {
                         self.modified.push(repo_path);
                     }
+                }
+                continue;
+            }
+
+            // [`ScanMode::ModifiedSince`]'s complement rather than its
+            // replacement: that mode already stops at the same `!tracked_paths
+            // .contains` test above, so what reaches here is exactly the
+            // population it declines for the directory reason, restricted (as
+            // every stat-only mode restricts itself) to the two leaf kinds the
+            // content walk admits, and further restricted to a directory graph
+            // truth has genuinely never met. A leaf beside files the graph
+            // already tracks never reaches this arm at all: it is ordinary
+            // catch-up's own population, admitted or declined by
+            // `ModifiedSince` on modification time exactly as before.
+            if matches!(self.mode, ScanMode::NeverMet) {
+                if !directory_known_to_graph && (file_type.is_file() || file_type.is_symlink()) {
+                    self.modified.push(repo_path);
                 }
                 continue;
             }
@@ -1673,6 +1743,57 @@ mod tests {
             .unwrap()
             .is_empty(),
             "a fully admitted working copy has nothing untracked to name"
+        );
+    }
+
+    /// [`scan_repository_never_met_directories`] names exactly the population
+    /// [`scan_repository_modified_since`] declines for the directory reason,
+    /// and nothing from ordinary catch-up's own population beside it.
+    #[test]
+    fn never_met_directories_names_only_the_unmet_directory_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("known")).unwrap();
+        std::fs::write(root.join("known/tracked.py"), "TRACKED = 1\n").unwrap();
+        std::fs::write(root.join("known/fresh.py"), "FRESH = 2\n").unwrap();
+        // A directory nothing has ever admitted, arriving whole.
+        std::fs::create_dir_all(root.join("brand_new")).unwrap();
+        std::fs::write(root.join("brand_new/module.py"), "NEW = 3\n").unwrap();
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let tracked = [path("known/tracked.py")];
+        let never_met = scan_repository_never_met_directories(
+            root,
+            &ignore,
+            None,
+            tracked.iter(),
+            std::iter::empty::<&RepoPath>(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            never_met,
+            vec![path("brand_new/module.py")],
+            "only the leaf inside the directory graph truth has never met is named; the fresh \
+             leaf beside a tracked file is ordinary catch-up's own population, not this one"
+        );
+
+        // The control that keeps this narrow: once graph truth has met
+        // `brand_new` too -- one tracked leaf is enough to make the directory
+        // known -- nothing under it is proposed, even though `module.py`
+        // itself stays untracked.
+        let met_every_directory = [path("known/tracked.py"), path("brand_new/module.py")];
+        assert!(
+            scan_repository_never_met_directories(
+                root,
+                &ignore,
+                None,
+                met_every_directory.iter(),
+                std::iter::empty::<&RepoPath>(),
+            )
+            .unwrap()
+            .is_empty(),
+            "a directory graph truth has met, however partially, is not this population"
         );
     }
 
