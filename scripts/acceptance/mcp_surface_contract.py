@@ -72,10 +72,11 @@ UNREADABLE = "UNREADABLE"
 AGENT_DEFAULT_PROFILE = "agent-default"
 
 # The query profile and the exact names it serves, read out of
-# crates/kin-mcp/src/tools.rs::agent_query_tool_names on 2026-09-02. Written out
-# rather than derived: the served set is a public surface, and a check that
-# derived it from the binary under test would agree with any surface that
-# binary happened to serve.
+# crates/kin-mcp/src/tools.rs::agent_query_tool_names on 2026-09-02, with
+# lexical_lookup joining the profile when the literal lookup over the graph's
+# text index landed on 2026-09-19. Written out rather than derived: the served
+# set is a public surface, and a check that derived it from the binary under
+# test would agree with any surface that binary happened to serve.
 AGENT_QUERY_PROFILE = "agent-query"
 AGENT_QUERY_NAMES = (
     "find_references",
@@ -87,6 +88,7 @@ AGENT_QUERY_NAMES = (
     "kin_artifact_read",
     "kin_graph_status",
     "kin_provenance_query",
+    "lexical_lookup",
     "list_file_entities",
     "semantic_locate",
     "semantic_search",
