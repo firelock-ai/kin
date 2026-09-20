@@ -60,6 +60,16 @@
       ]
     },
     {
+      "file": "crates/kin-mcp/tests_support/clause_codes.rs",
+      "reason": "Test-only source scan, never a product path. The file is compiled solely by a #[cfg(test)] #[path] module declaration in verdict.rs, so it does not exist in a release build and no tool result can derive from it. The checker still reads it because is_test_file anchors on whole tests and test_* path segments while this directory is named tests_support, so the file is walked like ordinary crate source. Pinned to the two bodies that hold the IO rather than exempted whole, so the label parser and the closed-list assertions beside them stay graded: rust_files recursively collects the .rs paths under a directory it is handed, scanned_labels hands it this crate's src tree and kin-core's, and it then reads every collected file so the test can prove that each clause label a producer in either crate writes is on the verdict's closed code list. Reading producer source is the whole subject of that test, and its result is an assertion rather than a response.",
+      "owner": "kin-mcp",
+      "expiration": "2027-03-11",
+      "allow_fn": [
+        "rust_files",
+        "scanned_labels"
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/retrieval_profile.rs",
       "reason": "Config/capability IO: probes the local model cache directory for reranker availability now and for whether this install ever fetched the model; never reads repo content and is not a semantic answer path",
       "owner": "kin-cli",
@@ -660,7 +670,7 @@
     },
     {
       "file": "crates/kin-daemon/src/loop_runner.rs",
-      "reason": "Host event ingestion boundary. The excused bodies are the file watcher's admission path: reading a host file or symlink target and its mode so the change can be admitted into the graph as exact tree state, and comparing a host entry against what the graph already holds so an unchanged file is not re-admitted. Reading the working tree is the entire job of an ingestion boundary, and the result is written into graph truth rather than returned as an answer. The remaining two are repository binding, which precedes any graph consult: recognizing a bare git layout, and resolving a path relative to the bound root. The helper that canonicalized a host parent while preserving its leaf moved to kin-index, which is a declared ingestion boundary, so the watcher and this runner decide repository containment by one rule instead of two. The cfg-gated executable-bit helper is the pair that carries a count of two. Function-scoped so the rest of the runner stays scanned. Two further bodies are operational state beside the pid and port files, the same class as the sweep's own enrichment marker in daemon.rs: one records the repository paths this daemon derived entities for and could not have published, the other reads that record back on the next open. Neither reads repository content and neither answers a query. What the record names is decided against graph truth before anything acts on it, which is the point: without it a file whose entities died with the daemon that derived them stays admitted and unqueryable forever (FIR-2606).",
+      "reason": "Host event ingestion boundary. The excused bodies are the file watcher's admission path: reading a host file or symlink target and its mode so the change can be admitted into the graph as exact tree state, and comparing a host entry against what the graph already holds so an unchanged file is not re-admitted. Reading the working tree is the entire job of an ingestion boundary, and the result is written into graph truth rather than returned as an answer. The remaining two are repository binding, which precedes any graph consult: recognizing a bare git layout, and resolving a path relative to the bound root. The helper that canonicalized a host parent while preserving its leaf moved to kin-index, which is a declared ingestion boundary, so the watcher and this runner decide repository containment by one rule instead of two. The cfg-gated executable-bit helper is the pair that carries a count of two. Function-scoped so the rest of the runner stays scanned. Two further bodies are operational state beside the pid and port files, the same class as the sweep's own enrichment marker in daemon.rs: one records the repository paths this daemon derived entities for and could not have published, the other reads that record back on the next open. Neither reads repository content and neither answers a query. What the record names is decided against graph truth before anything acts on it, which is the point: without it a file whose entities died with the daemon that derived them stays admitted and unqueryable forever. record_catch_up_arrivals is the same class and weaker still: it appends the repository paths a startup catch-up sweep admitted under the arrived provenance word to catch-up-arrivals.json in the daemon's own layout root, and reads that file back only so a second sweep in the same daemon life grows the record instead of replacing it. It reads no repository content and decides no admission, and the only other reader anywhere in the tree is the test that asserts the record was written. The write is best-effort, so a failure is logged at debug and the admission it documents proceeds regardless. The filesystem is the right home because the record describes one daemon process's own history rather than graph truth, it has to outlive the process that wrote it, and the graph already carries the admission itself, so storing this beside it would mint a second authority for a fact the graph holds.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
@@ -673,7 +683,8 @@
         "host_entry_matches_graph",
         "admit_file_event_with_exact_tree",
         "mark_enrichment_unpublished",
-        "plan_unpublished_enrichment_repair"
+        "plan_unpublished_enrichment_repair",
+        "record_catch_up_arrivals"
       ]
     },
     {
@@ -1830,11 +1841,11 @@
     },
     {
       "file": "crates/kin-db/src/storage/backend.rs",
-      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the storage backend's own store files, locks, identities and fsync. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback.",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the storage backend's own store files, locks, identities and fsync. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback. The lock-custody pin sits on acquire_existing_lock_with_policy rather than its acquire_existing_lock_with_access caller, which now does nothing but forward to it and holds no primitive of its own: the policy body is where the .lock entry's metadata is read, where a symlinked or non-regular lock is refused, and where the fs2 advisory lock is taken or tried. Pinning the caller instead would leave those primitives ungraded while reading as though they were covered.",
       "owner": "kin-db",
       "expiration": "2028-03-31",
       "allow_fn": [
-        "acquire_existing_lock_with_access",
+        "acquire_existing_lock_with_policy",
         "acquire_lock",
         "classify_storage_root_open_error",
         "confirm_existing_lock_visible",
@@ -2040,7 +2051,7 @@
           "count": 2
         },
         "read_frame",
-        "read_record"
+        "read_record_or_failure"
       ],
       "allow_match": [
         "File {",
