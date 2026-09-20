@@ -19,6 +19,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Python class base written `module.Class` resolves through the declaring
+  file's import graph before any leaf-name tier. A class merely sharing the
+  base's leaf name in the same file no longer outranks the module the import
+  named, so the `Overrides` edge stops disagreeing with the `Extends` edge for
+  the same declaration and stops minting the wrong base at full parser
+  confidence. A self-call to a method that the real base's subclass replaces
+  therefore keeps its dispatch qualification instead of being published as a
+  uniquely resolved destination.
+- A class base a module outside the repository owns now mints an `Overrides`
+  edge against the linker's existing external-import placeholder, carrying the
+  module coordinate the declaring file named and the member's owner-qualified
+  name inside it. The edge classifies `name_only` and never satisfies the
+  proven predicate: it records that the subclass declares the member and that
+  its base is external, not that the external base declares that member. Batch
+  linking binds the placeholder target in the same transaction; the live
+  reconcile path withholds the edge rather than publishing an endpoint the
+  graph does not hold, as it already does for an external call or reference.
+- A declared base that binds to nothing at all — a builtin, a name a
+  star-import brought in, a name ambiguous across the repository — is disclosed
+  by a new `base_resolution_coverage_v1` half of the file's coverage
+  certificate, counting bases declared against bases bound, rather than leaving
+  the graph in a silence that reads like a class with no base. The certificate
+  is emitted where the caller supplies parse completeness, as the import half
+  already is.
 - Named Go struct fields are addressable as `Owner.Field`. Read and write
   selectors retain their receiver and source sites. Without receiver-type
   evidence, same-file and cross-file field matches remain disclosed

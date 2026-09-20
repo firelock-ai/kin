@@ -737,3 +737,107 @@ fn derived_member_file_removal_collects_generator_edges_and_projection_refuses_m
         .relations
         .is_empty());
 }
+
+/// A Python base written `module.Class` has to be decided by the import the
+/// declaring file wrote, on this path as much as on a cold index. A class
+/// merely sharing the base's leaf name in the SAME file used to outrank it, and
+/// the resulting `Overrides` edge was minted at full parser confidence onto the
+/// wrong class.
+///
+/// Commit order is the hard direction on purpose: the subclass is written
+/// before the module it imports, so the base binding has to survive until the
+/// base file arrives.
+#[test]
+fn a_qualified_python_base_resolves_through_the_import_on_the_live_path() {
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "pkg/rows.py",
+        "import pkg.models as models\n\n\nclass Model:\n    def save(self):\n        return 'decoy'\n\n\nclass Row(models.Model):\n    def save(self):\n        return 'row'\n",
+    );
+    repo.commit(
+        "pkg/models.py",
+        "class Model:\n    def save(self):\n        return 'real'\n",
+    );
+    // The subclass is relinked once its base exists, which is the step where
+    // the binding is read back.
+    repo.commit(
+        "pkg/rows.py",
+        "import pkg.models as models\n\n\nclass Model:\n    def save(self):\n        return 'decoy'\n\n\nclass Row(models.Model):\n    def save(self):\n        return 'row'\n",
+    );
+
+    let row_save = repo.entity("pkg/rows.py", "Row.save");
+    let real_save = repo.entity("pkg/models.py", "Model.save");
+    let decoy_save = repo.entity("pkg/rows.py", "Model.save");
+
+    let overrides: Vec<Relation> = repo
+        .relations_of(row_save)
+        .into_iter()
+        .filter(|relation| {
+            relation.kind == RelationKind::Overrides
+                && relation.src == GraphNodeId::Entity(row_save)
+        })
+        .collect();
+    assert!(
+        overrides
+            .iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(real_save)),
+        "the live path must reach the `Model` the import named: {overrides:#?}"
+    );
+    assert!(
+        !overrides
+            .iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(decoy_save)),
+        "and must not reach the same-file class that only shares its leaf name: {overrides:#?}"
+    );
+}
+
+/// A base a third-party module owns reaches the linker's external-import
+/// placeholder, whose destination is deliberately absent from this repository's
+/// entity set. The live path publishes no half-bound endpoint: it withholds the
+/// edge the same way it withholds an external call or reference, rather than
+/// admitting an edge into a node the graph does not hold.
+///
+/// This is the documented divergence between the batch path, which binds the
+/// placeholder target in the same transaction, and this one. It is asserted
+/// here so the divergence is a stated contract rather than something a reader
+/// discovers from a missing row.
+#[test]
+fn an_external_python_base_is_withheld_rather_than_half_bound_on_the_live_path() {
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "pkg/cli.py",
+        "from click import Group\n\n\nclass AppGroup(Group):\n    def get_command(self, ctx, name):\n        return None\n",
+    );
+
+    let get_command = repo.entity("pkg/cli.py", "AppGroup.get_command");
+    let published: Vec<Relation> = repo
+        .relations_of(get_command)
+        .into_iter()
+        .filter(|relation| relation.kind == RelationKind::Overrides)
+        .collect();
+    assert!(
+        published.is_empty(),
+        "an unbound external endpoint must not be published: {published:#?}"
+    );
+
+    // Nothing was published, so nothing dangles: every relation this repository
+    // holds names endpoints it also holds.
+    let known: Vec<EntityId> = repo
+        .graph
+        .list_all_entities()
+        .expect("list entities")
+        .into_iter()
+        .map(|entity| entity.id)
+        .collect();
+    for entity_id in &known {
+        for relation in repo.relations_of(*entity_id) {
+            if let Some(dst) = relation.dst.as_entity() {
+                assert!(
+                    known.contains(&dst),
+                    "relation {:?} names a destination the graph does not hold",
+                    relation.id
+                );
+            }
+        }
+    }
+}

@@ -114,6 +114,26 @@ pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1: &str =
 /// means what its label says.
 pub const IMPORT_RESOLUTION_COVERAGE_V1: &str = "import_resolution_coverage_v1";
 
+/// Marks the base-resolution half of a file's coverage certificate.
+///
+/// Carried as its own evidence entry beside the call-coverage and
+/// import-resolution ones, for the reason recorded on
+/// [`IMPORT_RESOLUTION_COVERAGE_V1`]: a per-file certificate is an artifact
+/// self-loop, and a sibling self-loop of the same kind would collide with it.
+///
+/// `occurrence_count` holds the base names the file's class declarations wrote,
+/// and `token` holds how many of them the linker bound — to a class this
+/// repository declares, or to the external-import placeholder for a module it
+/// does not — rendered as a decimal string. `occurrence_count - token` is the
+/// count that stayed unbound: a builtin base, a name a star-import brought in,
+/// a base ambiguous across the repository. Those used to leave the graph in
+/// silence, which reads exactly like a class that declares no base at all.
+///
+/// Both numbers are in the declared-base unit, counting one per `Extends`
+/// declaration rather than one per class, because a class may declare several
+/// bases and only some of them bind.
+pub const BASE_RESOLUTION_COVERAGE_V1: &str = "base_resolution_coverage_v1";
+
 pub const CALL_SHAPE_PARSE_COVERAGE_FULL_V1: &str = "call_shape_parse_coverage_full_v1";
 
 /// File-level marker that call-site coverage is incomplete or unknown.
@@ -809,6 +829,15 @@ fn build_link_context<'a>(
         let mut overridden_bases = HashSet::new();
         for file in files {
             for relation in derive_override_relations(file, &ctx) {
+                // An external base's placeholder destination is a deterministic
+                // id for a symbol no file here declares, so no call can resolve
+                // to it and it is not a member this repository could dispatch
+                // past. Admitting it would also break parity with
+                // `compute_overridden_bases_incremental`, which reaches this
+                // set only through a resolved local base.
+                if is_external_import_placeholder(&relation) {
+                    continue;
+                }
                 if let Some(base_id) = relation.dst.as_entity() {
                     overridden_bases.insert(base_id);
                 }
@@ -1980,12 +2009,14 @@ fn merge_resolved(
         }
     }
 
+    let base_counts = base_resolution_counts(files, ctx);
     append_parse_coverage_relations(
         &mut resolved,
         files,
         artifact_ids,
         completeness,
         &ctx.known_files,
+        &base_counts,
     );
 
     let derived = ctx
@@ -3296,54 +3327,134 @@ fn class_bases_in<'m>(
         .map(|(_, bases)| bases.as_slice())
 }
 
+/// The (module path, symbol) a declared base NAME is bound to by the declaring
+/// file's own imports, or `None` when nothing in that file binds it.
+///
+/// Two spellings reach here and they bind differently. `models.Model` binds
+/// through its first segment and names the leaf inside that module. A bare
+/// `Base` brought in by `from m import Base [as B]` binds directly, and the
+/// symbol the target module declares is the import's original name rather than
+/// the local alias.
+///
+/// Returning the coordinate instead of resolving it is what lets one binding
+/// answer both questions the base tiers ask: which repository file declares
+/// this class, and — when no repository file does — which module outside the
+/// repository owns it.
+fn base_import_binding(
+    base_raw: &str,
+    file_imports: &HashMap<&str, (&str, &str)>,
+) -> Option<(String, String)> {
+    let base_leaf = bare_entity_name(base_raw);
+    let (binding, target_name) = match base_raw.split_once('.') {
+        // `models.Model`: the binding is the first segment, the class is
+        // the leaf inside the imported module.
+        Some((first, _)) => (first, base_leaf),
+        // `Base` bound by `from m import Base [as B]`: the target file
+        // declares the original name.
+        None => (base_raw, ""),
+    };
+    let &(module_path, original_name) = file_imports.get(binding)?;
+    let symbol = if target_name.is_empty() {
+        original_name
+    } else {
+        target_name
+    };
+    Some((module_path.to_string(), symbol.to_string()))
+}
+
+/// The module a declared base NAME is imported from when that module names no
+/// file this repository holds.
+///
+/// Externality is decided exactly the way [`make_external_reference_relation`]
+/// decides it for a call or a reference: the declaring file bound the name to a
+/// module, and [`resolve_module_path`] finds no repository file for that
+/// module. So "outside this repository" means one thing across every edge kind
+/// the linker emits, rather than one thing per producer.
+///
+/// A base nothing imported — a builtin like `Exception`, a name a star-import
+/// brought in, a name the file never bound at all — returns `None`. No module
+/// coordinate was observed for it, and inventing one (`builtins`, say) would
+/// fabricate the very evidence the placeholder is supposed to carry. Those
+/// bases are disclosed by the file's base-resolution certificate instead
+/// ([`BASE_RESOLUTION_COVERAGE_V1`]).
+fn external_base_binding<S>(
+    class_file: &str,
+    base_raw: &str,
+    file_imports: Option<&HashMap<&str, (&str, &str)>>,
+    known_files: &HashSet<S>,
+) -> Option<(String, String)>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let (module_path, symbol) = base_import_binding(base_raw, file_imports?)?;
+    if resolve_module_path(class_file, &module_path, known_files).is_some() {
+        return None;
+    }
+    if module_path.trim().is_empty() || symbol.trim().is_empty() {
+        return None;
+    }
+    Some((module_path, symbol))
+}
+
 /// Locate the class a declared base NAME refers to, from `class_file`'s point
-/// of view: a same-file class shadows everything; then the file's own import
-/// bindings (`from pkg.base import Base [as B]`, or a `models.Model` member of
-/// an imported module); then a repo-globally unique class name (Python's
-/// absolute `pkg.mod` imports do not resolve to files — see
+/// of view.
+///
+/// A base written bare (`Base`) is decided by Python's own scoping: a class
+/// this file declares shadows anything an import brought in, then the file's
+/// own import bindings, then a repo-globally unique class name (Python's
+/// absolute `pkg.mod` imports do not always resolve to files — see
 /// `resolve_import_pinned_target` — so uniqueness is the honest cross-file
-/// evidence tier). Returns the (file, class entity name) to continue the walk
-/// from, or `None` when the base is external, builtin, or ambiguous — a walk
-/// must never guess a hierarchy.
+/// evidence tier).
+///
+/// A base written qualified (`models.Model`, `click.Group`) names its module
+/// outright, so the import graph decides it FIRST. Running the same-file leaf
+/// tier ahead of it let a class merely sharing the leaf name in the declaring
+/// file outrank the module the import actually pinned, and it minted that wrong
+/// base at full parser confidence: the `Extends` edge the generic resolver
+/// produced for the very same declaration already resolved through the import
+/// and disagreed. The leaf tiers still run afterwards, which is where a
+/// repository that re-exports the class under its own name is found.
+///
+/// Returns the (file, class entity name) to continue the walk from, or `None`
+/// when the base is external, builtin, or ambiguous — a walk must never guess a
+/// hierarchy. An external base is not silence: see [`external_base_binding`].
 fn locate_base_class(
     class_file: &str,
     base_raw: &str,
     ctx: &LinkContext<'_>,
 ) -> Option<(String, String)> {
     let base_leaf = bare_entity_name(base_raw);
+    let qualified = base_raw.contains('.');
 
-    if let Some(id) = ctx.entity_by_file_name.get(&(class_file, base_leaf)) {
-        if is_class_like(ctx.entity_kind_by_id.get(id)) {
-            return Some((class_file.to_string(), base_leaf.to_string()));
+    if !qualified {
+        if let Some(id) = ctx.entity_by_file_name.get(&(class_file, base_leaf)) {
+            if is_class_like(ctx.entity_kind_by_id.get(id)) {
+                return Some((class_file.to_string(), base_leaf.to_string()));
+            }
         }
     }
 
     if let Some(file_imports) = ctx.import_map.get(class_file) {
-        let (binding, target_name) = match base_raw.split_once('.') {
-            // `models.Model`: the binding is the first segment, the class is
-            // the leaf inside the imported module.
-            Some((first, _)) => (first, base_leaf),
-            // `Base` bound by `from m import Base [as B]`: the target file
-            // declares the original name.
-            None => (base_raw, ""),
-        };
-        if let Some(&(module_path, original_name)) = file_imports.get(binding) {
-            let target_name = if target_name.is_empty() {
-                original_name
-            } else {
-                target_name
-            };
+        if let Some((module_path, target_name)) = base_import_binding(base_raw, file_imports) {
             if let Some(target_file) =
-                resolve_module_path(class_file, module_path, &ctx.known_files)
+                resolve_module_path(class_file, &module_path, &ctx.known_files)
             {
                 if let Some(id) = ctx
                     .entity_by_file_name
-                    .get(&(target_file.as_str(), target_name))
+                    .get(&(target_file.as_str(), target_name.as_str()))
                 {
                     if is_class_like(ctx.entity_kind_by_id.get(id)) {
-                        return Some((target_file, target_name.to_string()));
+                        return Some((target_file, target_name));
                     }
                 }
+            }
+        }
+    }
+
+    if qualified {
+        if let Some(id) = ctx.entity_by_file_name.get(&(class_file, base_leaf)) {
+            if is_class_like(ctx.entity_kind_by_id.get(id)) {
+                return Some((class_file.to_string(), base_leaf.to_string()));
             }
         }
     }
@@ -3537,6 +3648,65 @@ fn override_relation(child: EntityId, base: EntityId, span: Option<&SourceSpan>)
     }
 }
 
+/// Build the `Overrides` edge for a member whose class extends a base a module
+/// outside this repository owns.
+///
+/// The destination is the linker's existing external-import placeholder: the
+/// same deterministic id derivation ([`EXTERNAL_REFERENCE_KIND_TAG`]), the same
+/// evidence rule ([`EXTERNAL_IMPORT_REFERENCE_RULE`]), the same confidence tier
+/// ([`EXTERNAL_REFERENCE_CONFIDENCE`]), and the same `import_source` that the
+/// cross-repo resolver and [`trace_crossing_for`] already read. The symbol is
+/// the member's owner-qualified name inside the external module
+/// (`Group.get_command`), so two members of one external base stay distinct
+/// nodes and one member reached from two files stays one node.
+///
+/// What the edge asserts is what this repository observed: this class declares
+/// a member of this name, and its base is the symbol `module.Base`. It does not
+/// assert that the external base declares that member, because no file here can
+/// show that. The tier is what says so — at [`EXTERNAL_REFERENCE_CONFIDENCE`]
+/// the edge classifies `name_only` and never satisfies
+/// [`crate::resolution::RelationResolution::is_proven`] — and it is why the
+/// overriding member's own span is deliberately absent: the placeholder
+/// contract reserves evidence for the boundary coordinate, not for a site.
+///
+/// Returns `None` rather than an edge whenever a coordinate component is empty
+/// or untrimmed, which is the same fail-closed guard the placeholder predicate
+/// applies when reading one back.
+fn external_override_relation(
+    child: EntityId,
+    module: &str,
+    base_class: &str,
+    member: &str,
+) -> Option<Relation> {
+    if module != module.trim() || module.is_empty() {
+        return None;
+    }
+    let base_class = base_class.trim();
+    let member = member.trim();
+    if base_class.is_empty() || member.is_empty() {
+        return None;
+    }
+    let symbol = format!("{base_class}.{member}");
+    let dst = EntityId::from_content(module, &symbol, EXTERNAL_REFERENCE_KIND_TAG, 0);
+    let kind = RelationKind::Overrides;
+    Some(Relation {
+        id: stable_relation_id(&child, &dst, &kind),
+        kind,
+        src: GraphNodeId::Entity(child),
+        dst: GraphNodeId::Entity(dst),
+        confidence: EXTERNAL_REFERENCE_CONFIDENCE,
+        origin: RelationOrigin::Inferred,
+        created_in: None,
+        import_source: Some(module.to_string()),
+        evidence: vec![RelationEvidence {
+            token: Some(symbol),
+            parser_rule: Some(EXTERNAL_IMPORT_REFERENCE_RULE.to_string()),
+            source_path: Some(module.to_string()),
+            ..RelationEvidence::default()
+        }],
+    })
+}
+
 /// Emit `Overrides(child member -> base member)` for every member a class
 /// redeclares from an ancestor it declares and the linker can resolve.
 ///
@@ -3548,15 +3718,78 @@ fn override_relation(child: EntityId, base: EntityId, span: Option<&SourceSpan>)
 /// caller of the base as reaching the override would otherwise double count or
 /// miss depending on which of two walks it asked.
 ///
-/// A base that resolves to nothing yields nothing. `locate_base_class` returns
-/// `None` for an external, builtin, or ambiguous base name, and the walk ends
-/// that branch rather than guessing. A name-only base reference never mints an
-/// edge, because it is not evidence that anything was overridden.
+/// A base the repository declares nowhere no longer yields nothing. Three cases
+/// used to collapse into one silence, and they are not the same:
+///
+/// - The base is owned by a module outside this repository and the declaring
+///   file named that module in an import. The member gets an
+///   [`external_override_relation`] against the linker's external-import
+///   placeholder, so the subclass relationship is in the graph instead of
+///   absent, carrying the module coordinate and the unproven tier that say what
+///   it rests on. A class declaring several external bases gets one edge per
+///   base, in `class_bases_by_file_class`'s sorted order: which of them owns the
+///   member is not knowable from here, and a candidate set is the honest answer
+///   to an unknown.
+/// - The base name is bound to nothing at all — a builtin like `Exception`, a
+///   name a star-import brought in. No module coordinate was observed, so no
+///   placeholder can carry one, and the file's base-resolution certificate
+///   ([`BASE_RESOLUTION_COVERAGE_V1`]) discloses the count instead.
+/// - The base name is ambiguous across the repository. `locate_base_class`
+///   still returns `None` and the walk still ends that branch rather than
+///   guessing. A name-only base reference never mints a resolved edge, because
+///   it is not evidence that anything was overridden.
 ///
 /// Class membership comes from the parser's `Contains` edges rather than from
 /// splitting qualified entity names, so a language whose parser names members
 /// bare is covered on the same footing as one that qualifies them. Kept in
 /// exact resolution parity with [`derive_override_relations_incremental`].
+/// Every base a class declares that a module outside this repository owns, as
+/// (module path, base class name) pairs.
+///
+/// Order is `class_bases_by_file_class`'s, which is sorted lexicographically
+/// rather than declaration order for the reason recorded where that index is
+/// built: committed graph edges carry no declaration order, so one uniform
+/// order is what keeps cold, incremental and reopened graphs emitting the same
+/// edges.
+fn external_bases_for_class(
+    class_file: &str,
+    class_name: &str,
+    ctx: &LinkContext<'_>,
+) -> Vec<(String, String)> {
+    let Some(bases) = ctx.class_bases_by_file_class.get(&(class_file, class_name)) else {
+        return Vec::new();
+    };
+    let file_imports = ctx.import_map.get(class_file);
+    bases
+        .iter()
+        .filter_map(|base_raw| {
+            external_base_binding(class_file, base_raw, file_imports, &ctx.known_files)
+        })
+        .collect()
+}
+
+/// Incremental-linker counterpart of [`external_bases_for_class`], reading the
+/// step-local base overlay the incremental override walk already reads so the
+/// two paths see one hierarchy.
+fn external_bases_for_class_incremental(
+    class_file: &str,
+    class_name: &str,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+) -> Vec<(String, String)> {
+    let Some(bases) = class_bases_in(class_bases, class_file, class_name) else {
+        return Vec::new();
+    };
+    let file_imports = import_map.get(class_file);
+    bases
+        .iter()
+        .filter_map(|base_raw| {
+            external_base_binding(class_file, base_raw, file_imports, &linker.known_files)
+        })
+        .collect()
+}
+
 fn derive_override_relations(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
     let file_path = file.file_path.as_str();
     // Nothing in this file declares a base, so nothing in it can override.
@@ -3595,33 +3828,33 @@ fn derive_override_relations(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec
         if !is_overridable_member(ctx.entity_kind_by_id.get(&child_id)) {
             continue;
         }
-        let Some(base_id) = resolve_inherited_method(
-            file_path,
-            &rel.src_name,
-            bare_entity_name(&rel.dst_name),
-            ctx,
-        ) else {
-            continue;
-        };
-        // A cycle in the declared hierarchy could walk back to the member it
-        // started from; a member does not override itself.
-        if base_id == child_id {
-            continue;
+        let member = bare_entity_name(&rel.dst_name);
+        match resolve_inherited_method(file_path, &rel.src_name, member, ctx) {
+            // A cycle in the declared hierarchy could walk back to the member
+            // it started from; a member does not override itself.
+            Some(base_id) if base_id == child_id => {}
+            Some(base_id) => overrides.push(override_relation(
+                child_id,
+                base_id,
+                span_by_id.get(&child_id).copied(),
+            )),
+            None => overrides.extend(
+                external_bases_for_class(file_path, &rel.src_name, ctx)
+                    .iter()
+                    .filter_map(|(module, base_class)| {
+                        external_override_relation(child_id, module, base_class, member)
+                    }),
+            ),
         }
-        overrides.push(override_relation(
-            child_id,
-            base_id,
-            span_by_id.get(&child_id).copied(),
-        ));
     }
     overrides
 }
 
 /// Incremental-linker counterpart of [`locate_base_class`], kept in exact
-/// resolution parity: same-file class, then the caller file's import bindings,
-/// then a repo-globally unique class name. The import overlay retains the
-/// bindings that accompanied previously recorded class hierarchies, so an
-/// unchanged class's aliased base resolves through its declaring file.
+/// resolution parity: the import graph decides a qualified base, then the
+/// same-file class, then a repo-globally unique class name. The import overlay
+/// retains the bindings that accompanied previously recorded class hierarchies,
+/// so an unchanged class's aliased base resolves through its declaring file.
 fn locate_base_class_incremental(
     class_file: &str,
     base_raw: &str,
@@ -3629,40 +3862,46 @@ fn locate_base_class_incremental(
     import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
 ) -> Option<(String, String)> {
     let base_leaf = bare_entity_name(base_raw);
+    let qualified = base_raw.contains('.');
 
-    if let Some(id) = linker
-        .entity_by_file_name
-        .get(class_file)
-        .and_then(|m| m.get(base_leaf))
-    {
-        if is_class_like(linker.entity_kind_by_id.get(id)) {
-            return Some((class_file.to_string(), base_leaf.to_string()));
+    if !qualified {
+        if let Some(id) = linker
+            .entity_by_file_name
+            .get(class_file)
+            .and_then(|m| m.get(base_leaf))
+        {
+            if is_class_like(linker.entity_kind_by_id.get(id)) {
+                return Some((class_file.to_string(), base_leaf.to_string()));
+            }
         }
     }
 
     if let Some(file_imports) = import_map.get(class_file) {
-        let (binding, target_name) = match base_raw.split_once('.') {
-            Some((first, _)) => (first, base_leaf),
-            None => (base_raw, ""),
-        };
-        if let Some(&(module_path, original_name)) = file_imports.get(binding) {
-            let target_name = if target_name.is_empty() {
-                original_name
-            } else {
-                target_name
-            };
+        if let Some((module_path, target_name)) = base_import_binding(base_raw, file_imports) {
             if let Some(target_file) =
-                resolve_module_path(class_file, module_path, &linker.known_files)
+                resolve_module_path(class_file, &module_path, &linker.known_files)
             {
                 if let Some(id) = linker
                     .entity_by_file_name
                     .get(&target_file)
-                    .and_then(|m| m.get(target_name))
+                    .and_then(|m| m.get(target_name.as_str()))
                 {
                     if is_class_like(linker.entity_kind_by_id.get(id)) {
-                        return Some((target_file, target_name.to_string()));
+                        return Some((target_file, target_name));
                     }
                 }
+            }
+        }
+    }
+
+    if qualified {
+        if let Some(id) = linker
+            .entity_by_file_name
+            .get(class_file)
+            .and_then(|m| m.get(base_leaf))
+        {
+            if is_class_like(linker.entity_kind_by_id.get(id)) {
+                return Some((class_file.to_string(), base_leaf.to_string()));
             }
         }
     }
@@ -3784,24 +4023,35 @@ fn derive_override_relations_incremental(
         if !is_overridable_member(linker.entity_kind_by_id.get(&child_id)) {
             continue;
         }
-        let Some(base_id) = resolve_inherited_method_incremental(
+        let member = bare_entity_name(&rel.dst_name);
+        match resolve_inherited_method_incremental(
             file_path,
             &rel.src_name,
-            bare_entity_name(&rel.dst_name),
+            member,
             linker,
             import_map,
             class_bases,
-        ) else {
-            continue;
-        };
-        if base_id == child_id {
-            continue;
+        ) {
+            Some(base_id) if base_id == child_id => {}
+            Some(base_id) => overrides.push(override_relation(
+                child_id,
+                base_id,
+                span_by_id.get(&child_id).copied(),
+            )),
+            None => overrides.extend(
+                external_bases_for_class_incremental(
+                    file_path,
+                    &rel.src_name,
+                    linker,
+                    import_map,
+                    class_bases,
+                )
+                .iter()
+                .filter_map(|(module, base_class)| {
+                    external_override_relation(child_id, module, base_class, member)
+                }),
+            ),
         }
-        overrides.push(override_relation(
-            child_id,
-            base_id,
-            span_by_id.get(&child_id).copied(),
-        ));
     }
     overrides
 }
@@ -4983,10 +5233,19 @@ pub fn trace_crossing_for(entity: &Entity, reached_by: Option<&Relation>) -> Opt
 /// separately establish that the destination is absent from the local entity
 /// set. `created_in` is deliberately not part of this predicate because commit
 /// provenance may stamp it after the linker produces the relation.
+///
+/// `Overrides` joins `Calls` and `References` here rather than getting a
+/// placeholder class of its own. [`placeholder_target_entity`] fails closed on
+/// a class it does not know, so a second representation of "the symbol on the
+/// other side of this edge lives outside the repository" would be a second
+/// thing every admission, reconcile and trace path has to learn, for a fact
+/// already spelled one way.
+///
+/// [`placeholder_target_entity`]: crate::placeholder_target_entity
 pub fn is_external_import_placeholder(relation: &Relation) -> bool {
     if !matches!(
         relation.kind,
-        RelationKind::Calls | RelationKind::References
+        RelationKind::Calls | RelationKind::References | RelationKind::Overrides
     ) || relation.origin != RelationOrigin::Inferred
         || relation.confidence.to_bits() != EXTERNAL_REFERENCE_CONFIDENCE.to_bits()
     {
@@ -5215,6 +5474,18 @@ struct ImportResolutionCounts {
     resolved: usize,
 }
 
+/// A file's declared class bases and how many of them the linker bound.
+///
+/// `declared` counts one per base name a class declaration wrote. `bound`
+/// counts the ones that reached either a class this repository declares or the
+/// external-import placeholder for a module it does not. The difference is the
+/// disclosure: bases the graph holds nothing for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BaseResolutionCounts {
+    declared: usize,
+    bound: usize,
+}
+
 /// Index each file's module entity, the endpoint an entity-level import edge
 /// sources from.
 ///
@@ -5343,6 +5614,71 @@ fn make_entity_import_relations(
 /// one apart from the artifact edge that shares its import.
 const IMPORT_SPECIFIER_BINDING_RULE: &str = "import_specifier_binding";
 
+/// Per-file declared-base counts for the coverage certificate.
+///
+/// Asks the same two resolvers the override walk asks, in the same order, so
+/// the certificate reports the bases that actually bound rather than a second
+/// opinion about them. Counted per `Extends` declaration, which is the unit
+/// [`BASE_RESOLUTION_COVERAGE_V1`] publishes.
+fn base_resolution_counts<'a>(
+    files: &[&'a FileParseData],
+    ctx: &LinkContext<'_>,
+) -> HashMap<&'a str, BaseResolutionCounts> {
+    let mut counts: HashMap<&str, BaseResolutionCounts> = HashMap::new();
+    for file in files {
+        let file_path = file.file_path.as_str();
+        let file_imports = ctx.import_map.get(file_path);
+        let entry = counts.entry(file_path).or_default();
+        for rel in &file.relations {
+            if rel.kind != RelationKind::Extends {
+                continue;
+            }
+            entry.declared += 1;
+            if locate_base_class(file_path, &rel.dst_name, ctx).is_some()
+                || external_base_binding(file_path, &rel.dst_name, file_imports, &ctx.known_files)
+                    .is_some()
+            {
+                entry.bound += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Incremental-linker counterpart of [`base_resolution_counts`], asking the
+/// incremental twins of the same two resolvers so a relinked file's
+/// certificate reads the same as a cold one's.
+fn base_resolution_counts_incremental<'a>(
+    files: &'a [FileParseData],
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+) -> HashMap<&'a str, BaseResolutionCounts> {
+    let mut counts: HashMap<&str, BaseResolutionCounts> = HashMap::new();
+    for file in files {
+        let file_path = file.file_path.as_str();
+        let file_imports = import_map.get(file_path);
+        let entry = counts.entry(file_path).or_default();
+        for rel in &file.relations {
+            if rel.kind != RelationKind::Extends {
+                continue;
+            }
+            entry.declared += 1;
+            if locate_base_class_incremental(file_path, &rel.dst_name, linker, import_map).is_some()
+                || external_base_binding(
+                    file_path,
+                    &rel.dst_name,
+                    file_imports,
+                    &linker.known_files,
+                )
+                .is_some()
+            {
+                entry.bound += 1;
+            }
+        }
+    }
+    counts
+}
+
 /// Build the graph-owned file-level call-coverage certificate used by
 /// ref-scoped review. Coverage state lives in relation evidence; history paths
 /// compare the complete relation payload and replace changed evidence.
@@ -5352,6 +5688,7 @@ fn make_parse_coverage_relation(
     completeness: Option<&ParseCompleteness>,
     call_extraction_complete: bool,
     imports: ImportResolutionCounts,
+    bases: BaseResolutionCounts,
 ) -> Relation {
     let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
     let (parser_rule, token) = if !call_extraction_complete {
@@ -5399,6 +5736,13 @@ fn make_parse_coverage_relation(
                 occurrence_count: imports.statements as u32,
                 ..RelationEvidence::default()
             },
+            RelationEvidence {
+                token: Some(bases.bound.to_string()),
+                source_path: Some(file_path.to_string()),
+                parser_rule: Some(BASE_RESOLUTION_COVERAGE_V1.to_string()),
+                occurrence_count: bases.declared as u32,
+                ..RelationEvidence::default()
+            },
         ],
     }
 }
@@ -5425,6 +5769,7 @@ fn append_parse_coverage_relations<S>(
     artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
     known_files: &HashSet<S>,
+    base_counts: &HashMap<&str, BaseResolutionCounts>,
 ) where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
@@ -5447,6 +5792,10 @@ fn append_parse_coverage_relations<S>(
                 completeness.get(&file.file_path),
                 call_extraction_complete,
                 import_resolution_counts(&file.file_path, &file.imports, known_files),
+                base_counts
+                    .get(file.file_path.as_str())
+                    .copied()
+                    .unwrap_or_default(),
             ));
         }
     }
@@ -6270,7 +6619,14 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 11;
+///
+/// Version 12 is a semantics bump, not a shape one: the struct below is
+/// unchanged, but the class bases and import bindings it carries are now read
+/// in a different order (a base written `module.Class` is decided by the import
+/// graph before any leaf-name tier) and can now reach a base outside this
+/// repository. The same checkpoint bytes therefore resolve to a different
+/// edge set than they did at version 11.
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 12;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -7046,11 +7402,13 @@ fn link_cross_file_incremental_internal(
         draw_progress(format_args!("\n")); // newline after \r progress
     }
 
+    let base_counts = base_resolution_counts_incremental(files, linker, &import_map);
     Ok(merge_incremental_resolved(
         per_file_relations,
         files,
         linker,
         completeness,
+        &base_counts,
     ))
 }
 
@@ -8132,6 +8490,7 @@ fn merge_incremental_resolved(
     files: &[FileParseData],
     linker: &IncrementalLinker,
     completeness: Option<&FileParseCompletenessMap>,
+    base_counts: &HashMap<&str, BaseResolutionCounts>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
@@ -8204,6 +8563,7 @@ fn merge_incremental_resolved(
         &linker.artifact_ids,
         completeness,
         &linker.known_files,
+        base_counts,
     );
 
     limit_derived_relations(&mut resolved, &linker.derived_member_ids);
@@ -8244,7 +8604,8 @@ fn link_cross_file_incremental_serial(
             )
         })
         .collect();
-    merge_incremental_resolved(per_file_relations, files, linker, None)
+    let base_counts = base_resolution_counts_incremental(files, linker, &import_map);
+    merge_incremental_resolved(per_file_relations, files, linker, None, &base_counts)
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching the filesystem.
