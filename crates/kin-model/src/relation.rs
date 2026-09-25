@@ -160,6 +160,30 @@ impl CallArgShape {
     }
 }
 
+/// The evidence rule the language-server references arm records a site under.
+///
+/// On a `References` edge into a Go method, a record under this rule was
+/// written before each site was proven to resolve to that method. gopls answers
+/// a method's references with those of every method related to it through
+/// interface satisfaction, and those builds recorded the widened answer as it
+/// came, so such a record can name a call of a related method: a call on an
+/// interface value confirmed as a call of the concrete method behind it, or a
+/// direct call of a concrete method confirmed as a call of the interface method
+/// it implements. Semantic readers take it as no evidence there; the site-proven
+/// arm records [`LSP_PROVEN_METHOD_REFERENCES_RULE`] instead. Every other
+/// destination keeps this rule, and its meaning.
+pub const LSP_REFERENCES_RULE: &str = "lsp_references";
+
+/// The evidence rule a Go method's language-server reference sites are recorded
+/// under once each one is proven to resolve to the method itself.
+///
+/// A site is proven when gopls's definition there lands in the method, or when
+/// `textDocument/implementation` shows the method corresponds to no interface
+/// method, so its answer cannot have been widened. The rule is distinct from
+/// [`LSP_REFERENCES_RULE`] so that a store can tell the two apart: records a
+/// build wrote before the proof existed are still in stores it enriched.
+pub const LSP_PROVEN_METHOD_REFERENCES_RULE: &str = "lsp_method_references_proven";
+
 /// Concrete evidence supporting a graph relation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RelationEvidence {

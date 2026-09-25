@@ -720,22 +720,35 @@ fn merge_inputs(
     Ok((snapshot, inputs))
 }
 
+fn authored_entity_ids(
+    inputs: &MergeInputs,
+    artifact: kin_model::ArtifactId,
+) -> BTreeSet<kin_model::EntityId> {
+    inputs
+        .iter()
+        .flat_map(|input| {
+            let path = input
+                .tree
+                .get(&artifact)
+                .map(|source| source.path.to_string());
+            input
+                .entities
+                .values()
+                .filter(move |entity| {
+                    path.as_deref()
+                        .is_some_and(|path| entity_path(entity) == Some(path))
+                })
+                .map(|entity| entity.id)
+        })
+        .collect()
+}
+
 fn file_coverage(
     record: &MergeTransactionRecord,
     inputs: &MergeInputs,
     artifact: kin_model::ArtifactId,
 ) -> BTreeSet<MergeConflictSubject> {
-    let paths: BTreeSet<String> = inputs
-        .iter()
-        .filter_map(|input| input.tree.get(&artifact))
-        .map(|entry| entry.path.to_string())
-        .collect();
-    let entities: BTreeSet<kin_model::EntityId> = inputs
-        .iter()
-        .flat_map(|input| input.entities.values())
-        .filter(|entity| entity_path(entity).is_some_and(|path| paths.contains(path)))
-        .map(|entity| entity.id)
-        .collect();
+    let entities = authored_entity_ids(inputs, artifact);
     record
         .entries
         .iter()
@@ -930,20 +943,12 @@ fn settle_authored_files(
             }
         }
     }
-    seed_authored_identities(&mut snapshot, &inputs, record, &files);
-    let parsed = reparse_authored_files(state, snapshot, &files)?;
-    let paths: BTreeSet<_> = files
-        .values()
-        .map(|(located, _)| located.path.to_string())
-        .collect();
-    let removed_entities: BTreeSet<_> = inputs
-        .iter()
-        .flat_map(|input| input.entities.values())
-        .filter(|entity| {
-            entity_path(entity).is_some_and(|path| paths.contains(path))
-                && !parsed.entities.contains_key(&entity.id)
-        })
-        .map(|entity| entity.id)
+    seed_authored_identities(&mut snapshot, &inputs, record, &files)?;
+    let parsed = reparse_authored_files(state, authority, snapshot, &files, &inputs)?;
+    let removed_entities: BTreeSet<_> = files
+        .keys()
+        .flat_map(|artifact| authored_entity_ids(&inputs, *artifact))
+        .filter(|id| !parsed.entities.contains_key(id))
         .collect();
     for entry in &record.entries {
         if let MergeConflictSubject::Relation { relation } = entry.subject {
@@ -1011,17 +1016,18 @@ fn settle_authored_files(
 /// This is an ingestion boundary over immutable bytes, with no workspace read.
 fn reparse_authored_files(
     state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
     mut snapshot: kin_db::GraphSnapshot,
     files: &BTreeMap<kin_model::ArtifactId, (kin_model::LocatedEntry, Vec<u8>)>,
+    inputs: &MergeInputs,
 ) -> Result<kin_db::GraphSnapshot> {
+    retire_mixed_external_anchors(state, authority, &mut snapshot, files, inputs)?;
     snapshot.repository_authority = None;
     snapshot.outgoing.clear();
     snapshot.incoming.clear();
     let external_references = snapshot.external_references.clone();
     let prospective = kin_db::InMemoryGraph::from_snapshot(snapshot)?;
-    let pipeline = kin_index::IndexPipeline::new();
-    let mut reconciler = kin_reconcile::Reconciler::new(std::path::PathBuf::new());
-    reconciler.seed_cross_file_linker_from_graph(&prospective);
+    let mut source_files = Vec::new();
     let mut ordered: Vec<_> = files.iter().collect();
     ordered.sort_by(|left, right| left.1 .0.path.cmp(&right.1 .0.path));
     for (artifact, (located, body)) in ordered {
@@ -1057,58 +1063,122 @@ fn reparse_authored_files(
                 ..TransactionDelta::default()
             })?;
         }
-        match pipeline
-            .index_any_content(&file, body, digest)
-            .with_context(|| format!("parse authored merge body for {file}"))?
-        {
-            kin_index::IndexedAny::EntitySource(indexed) => {
-                if !matches!(indexed.parse_state, kin_model::ParseState::Valid) {
-                    return Err(merge_bad_request(format!("the authored body for {file} has syntax errors; correct it before settling")));
-                }
-                let result = reconciler
-                    .reconcile_indexed_content(&indexed, state.blobs.as_ref(), &prospective)
-                    .with_context(|| format!("derive complete merge semantics for {file}"))?;
-                prospective.apply_transaction_delta(&result.delta)?;
-            }
-            _ => {
-                let before = prospective.to_snapshot();
-                let retired: BTreeSet<_> = before
-                    .entities
-                    .values()
-                    .filter(|entity| entity_path(entity) == Some(file.0.as_str()))
-                    .map(|entity| entity.id)
-                    .collect();
-                let delta = TransactionDelta {
-                    entity_deltas: retired
-                        .iter()
-                        .map(|id| kin_model::EntityDelta::Removed {
-                            old: before.entities[id].clone(),
-                        })
-                        .collect(),
-                    relation_deltas: before
-                        .relations
-                        .values()
-                        .filter(|relation| {
-                            [relation.src, relation.dst].iter().any(|node| {
-                                node.as_entity().is_some_and(|id| retired.contains(&id))
-                            }) || (relation.src == kin_model::GraphNodeId::Artifact(*artifact)
-                                && matches!(
-                                    relation.origin,
-                                    kin_model::RelationOrigin::Parsed
-                                        | kin_model::RelationOrigin::Inferred
-                                ))
-                        })
-                        .map(|relation| kin_model::RelationDelta::Removed {
-                            old: relation.clone(),
-                        })
-                        .collect(),
-                    ..TransactionDelta::default()
-                };
-                prospective.apply_transaction_delta(&delta)?;
+        source_files.push(file);
+    }
+    // The composed candidate can select a non-authored file from either merge
+    // parent. Its bytes live in repository CAS even when this daemon has never
+    // observed them. Materialize the complete admitted source universe before
+    // dependency restoration; never consult workspace files for missing bytes.
+    let prepared = prospective.to_snapshot();
+    let source_paths: BTreeSet<_> = prepared.entities.values().filter_map(entity_path).collect();
+    for artifact in prepared.resolved_tree.artifacts() {
+        if !source_paths.contains(artifact.path.to_string().as_str()) {
+            continue;
+        }
+        let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        if !state.blobs.exists(&digest)? {
+            let body = authority.manager.load_source_blob(hash)?.ok_or_else(|| {
+                merge_conflict(format!(
+                    "source body {hash} for {} is missing from repository CAS",
+                    artifact.path
+                ))
+            })?;
+            if state.blobs.write(&body)? != digest {
+                return Err(merge_conflict("repository source body digest differs"));
             }
         }
     }
-    let parsed = prospective.to_snapshot();
+    // A retired declaration's callers may come from either immutable parent.
+    // Their original bodies are needed to prove whether the authored successor
+    // removed the old occurrence or must retain an unresolved obligation.
+    let mut prior_bodies = BTreeSet::new();
+    for input in inputs {
+        for relation in input.relations.values() {
+            let (Some(source), Some(target)) = (relation.src.as_entity(), relation.dst.as_entity())
+            else {
+                continue;
+            };
+            let Some(target_file) = input
+                .entities
+                .get(&target)
+                .and_then(|entity| entity.file_origin.as_ref())
+            else {
+                continue;
+            };
+            let target_path = kin_model::RepoPath::from_utf8(target_file.0.clone())?;
+            if !input
+                .tree
+                .artifact_id_at_path(&target_path)
+                .is_some_and(|id| files.contains_key(&id))
+            {
+                continue;
+            }
+            let Some(source_file) = input
+                .entities
+                .get(&source)
+                .and_then(|entity| entity.file_origin.as_ref())
+            else {
+                continue;
+            };
+            let source_path = kin_model::RepoPath::from_utf8(source_file.0.clone())?;
+            if let Some(kin_model::ResolvedArtifact {
+                entry: kin_model::TreeEntry::Blob { hash, .. },
+                ..
+            }) = input.tree.artifact_at_path(&source_path)
+            {
+                prior_bodies.insert(*hash);
+            }
+        }
+    }
+    for relation in prepared
+        .relations
+        .values()
+        .filter(|relation| kin_index::binding_debt::claims_local_binding_debt(relation))
+    {
+        let kin_model::GraphNodeId::Artifact(artifact) = relation.src else {
+            return Err(merge_conflict("binding debt source is not an artifact"));
+        };
+        let source = prepared
+            .resolved_tree
+            .get(&artifact)
+            .ok_or_else(|| merge_conflict("binding debt source is absent"))?;
+        if let Some(debt) = kin_index::binding_debt::decode_local_binding_debt(
+            &kin_model::FilePathId::new(source.path.to_string()),
+            artifact,
+            relation,
+        )
+        .map_err(merge_conflict)?
+        {
+            prior_bodies.extend(
+                debt.obligations
+                    .iter()
+                    .map(|obligation| obligation.source_digest),
+            );
+        }
+    }
+    for hash in prior_bodies {
+        let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        if !state.blobs.exists(&digest)? {
+            let body = authority.manager.load_source_blob(hash)?.ok_or_else(|| {
+                merge_conflict(format!(
+                    "prior source body {hash} is missing from repository CAS"
+                ))
+            })?;
+            if state.blobs.write(&body)? != digest {
+                return Err(merge_conflict("prior source body digest differs"));
+            }
+        }
+    }
+    let parsed = kin_reconcile::Reconciler::reconcile_admitted_source_batch(
+        prepared,
+        &source_files,
+        state.blobs.as_ref(),
+        inputs,
+    )
+    .context("derive complete authored merge batch semantics")?;
     if parsed.external_references != external_references {
         return Err(merge_conflict(
             "authored merge input changes external-reference records; this merge cannot publish those records safely",
@@ -1117,36 +1187,351 @@ fn reparse_authored_files(
     Ok(parsed)
 }
 
+/// Withdraw only parser-owned external edges whose immutable source body is
+/// different from the declaration selected as the authored identity anchor.
+/// Their original parent proves retirement; the complete authored batch below
+/// derives any external bindings belonging to the newly supplied body.
+fn retire_mixed_external_anchors(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    snapshot: &mut kin_db::GraphSnapshot,
+    files: &BTreeMap<kin_model::ArtifactId, (kin_model::LocatedEntry, Vec<u8>)>,
+    inputs: &MergeInputs,
+) -> Result<()> {
+    let mut retired = Vec::new();
+    for relation in snapshot.relations.values() {
+        if !kin_index::is_external_import_placeholder(relation) {
+            continue;
+        }
+        let Some(source) = relation.src.as_entity() else {
+            continue;
+        };
+        let Some(anchor) = snapshot.entities.get(&source) else {
+            continue;
+        };
+        let parents: Vec<_> = inputs
+            .iter()
+            .filter(|input| input.relations.get(&relation.id) == Some(relation))
+            .filter_map(|input| {
+                let original = input.entities.get(&source)?;
+                let path = kin_model::RepoPath::from_utf8(original.file_origin.as_ref()?.0.clone())
+                    .ok()?;
+                let artifact = input.tree.artifact_id_at_path(&path)?;
+                files.contains_key(&artifact).then_some((input, original))
+            })
+            .collect();
+        if parents.is_empty() || parents.iter().any(|(_, original)| *original == anchor) {
+            continue;
+        }
+        let (parent, original) = parents[0];
+        let hash = original
+            .metadata
+            .extra
+            .get("blob_hash")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| merge_conflict("prior external source has no recorded body"))?;
+        let content = kin_model::Hash256::from_hex(hash)?;
+        let digest = kin_blobs::Hash256::from_bytes(*content.as_bytes());
+        if !state.blobs.exists(&digest)? {
+            let body = authority
+                .manager
+                .load_source_blob(content)?
+                .ok_or_else(|| {
+                    merge_conflict("prior external source body is absent from repository CAS")
+                })?;
+            if state.blobs.write(&body)? != digest {
+                return Err(merge_conflict("prior external source body digest differs"));
+            }
+        }
+        kin_reconcile::verify_external_import_predecessor(parent, relation, state.blobs.as_ref())
+            .context("verify authored external binding against its immutable parent")?;
+        let target_id = relation.dst.as_entity().expect("verified external target");
+        let target = snapshot
+            .entities
+            .get(&target_id)
+            .ok_or_else(|| merge_conflict("composed external target is absent"))?;
+        let mut expected_target = parent.entities[&target_id].clone();
+        // Shared placeholders may retain another language/creation attribution;
+        // their actual identity and payload may not change during retirement.
+        expected_target.language = target.language;
+        expected_target.created_in = target.created_in;
+        if expected_target != *target {
+            return Err(merge_conflict("composed external target identity differs"));
+        }
+        retired.push(relation.id);
+    }
+    for relation in retired {
+        snapshot.relations.remove(&relation);
+    }
+    Ok(())
+}
+
+/// Read every claimed record as well as the exact reserved identity. Neither a
+/// malformed secondary row nor a foreign occupant may disappear during a merge.
+fn parent_binding_debt(
+    input: &kin_model::graph::ResolvedGraphState,
+    artifact: kin_model::ArtifactId,
+) -> Result<Option<kin_index::binding_debt::LocalBindingDebt>> {
+    use kin_index::binding_debt::{decode_local_binding_debt, local_binding_debt_id};
+    let reserved = local_binding_debt_id(artifact);
+    let mut debt = None;
+    for relation in input.relations.values().filter(|relation| {
+        relation.id == reserved || relation.src == kin_model::GraphNodeId::Artifact(artifact)
+    }) {
+        let Some(source) = input.tree.get(&artifact) else {
+            return Err(merge_conflict(
+                "prior binding evidence has no source artifact",
+            ));
+        };
+        let file = kin_model::FilePathId::new(source.path.to_string());
+        if let Some(found) =
+            decode_local_binding_debt(&file, artifact, relation).map_err(merge_conflict)?
+        {
+            if debt.is_some() || source.entry.blob_identity() != Some(found.observed_source_digest)
+            {
+                return Err(merge_conflict(
+                    "prior binding evidence is duplicated or stale",
+                ));
+            }
+            debt = Some(found);
+        }
+    }
+    Ok(debt)
+}
+
+fn union_binding_debt(
+    debts: &mut BTreeMap<kin_model::ArtifactId, kin_index::binding_debt::LocalBindingDebt>,
+    artifact: kin_model::ArtifactId,
+    current_file: kin_model::FilePathId,
+    mut prior: kin_index::binding_debt::LocalBindingDebt,
+) -> Result<()> {
+    let old_file = prior.source_file.clone();
+    if prior.source_file != current_file {
+        for obligation in &mut prior.obligations {
+            obligation
+                .prior_source_file
+                .get_or_insert_with(|| old_file.clone());
+        }
+        prior.source_file = current_file;
+    }
+    let held = debts.entry(artifact).or_insert_with(|| {
+        let mut empty = prior.clone();
+        empty.obligations.clear();
+        empty
+    });
+    for obligation in prior.obligations {
+        if let Some(existing) = held
+            .obligations
+            .iter()
+            .find(|existing| existing.retired_relation.id == obligation.retired_relation.id)
+        {
+            // V1 and V2 may name the same original location. No other part of
+            // the immutable source/import/target/occurrence proof is discarded.
+            let mut left = existing.clone();
+            left.prior_source_file
+                .get_or_insert_with(|| held.source_file.clone());
+            let mut right = obligation.clone();
+            right
+                .prior_source_file
+                .get_or_insert_with(|| prior.source_file.clone());
+            if left != right {
+                return Err(merge_conflict(
+                    "prior binding obligation identity collision",
+                ));
+            }
+        } else {
+            held.obligations.push(obligation);
+        }
+    }
+    Ok(())
+}
+
 fn seed_authored_identities(
     snapshot: &mut kin_db::GraphSnapshot,
     inputs: &MergeInputs,
     record: &MergeTransactionRecord,
     files: &BTreeMap<kin_model::ArtifactId, (kin_model::LocatedEntry, Vec<u8>)>,
-) {
-    // Original first-parent identities are stable anchors even when a
-    // conflict payload removes an old declaration before this full reparse.
-    let paths: BTreeSet<_> = files
-        .values()
-        .map(|(located, _)| located.path.to_string())
-        .collect();
-    snapshot
-        .entities
-        .retain(|_, entity| !entity_path(entity).is_some_and(|path| paths.contains(path)));
-    for input in inputs {
-        for entity in input
-            .entities
-            .values()
-            .filter(|entity| entity_path(entity).is_some_and(|path| paths.contains(path)))
-        {
-            snapshot
+) -> Result<()> {
+    use kin_index::binding_debt::{
+        build_local_binding_debt, decode_local_binding_debt, local_binding_debt_id,
+    };
+    use kin_model::{GraphNodeId, RelationDelta};
+
+    let mut owned = BTreeSet::new();
+    let mut anchors = BTreeMap::new();
+    let mut debts = BTreeMap::new();
+    for artifact in files.keys() {
+        let mut anchored = false;
+        for input in inputs {
+            let Some(source) = input.tree.get(artifact) else {
+                continue;
+            };
+            let path = source.path.to_string();
+            let declarations = input
                 .entities
-                .entry(entity.id)
-                .or_insert_with(|| entity.clone());
+                .values()
+                .filter(|entity| entity_path(entity) == Some(path.as_str()));
+            for entity in declarations {
+                owned.insert(entity.id);
+                if !anchored {
+                    // The selected authored path is the first available parent's.
+                    // Do not manufacture spans at that path for another body.
+                    anchors.insert(entity.id, entity.clone());
+                }
+            }
+            anchored = true;
+        }
+        // A previous payload can introduce identities absent from the inputs.
+        // Only declarations owned by this exact current artifact are replaced.
+        if let Some(current) = snapshot.resolved_tree.get(artifact) {
+            owned.extend(
+                snapshot
+                    .entities
+                    .values()
+                    .filter(|e| entity_path(e) == Some(current.path.to_string().as_str()))
+                    .map(|e| e.id),
+            );
         }
     }
-    // Derived relation payloads can name declarations absent from the original
-    // conflict set. Recreate those relations only after their declarations have
-    // been parsed, using recorded input identities as matching anchors.
+    let excluded: std::collections::HashSet<_> = owned
+        .iter()
+        .filter(|id| !anchors.contains_key(id))
+        .copied()
+        .collect();
+    // Theirs-only declarations at an old path must leave the candidate, but
+    // their incoming callers still own evidence of the binding being removed.
+    // Plan from each exact immutable parent BEFORE discarding those anchors.
+    for input in inputs {
+        let incident: Vec<_> = input
+            .relations
+            .values()
+            .filter(|relation| {
+                matches!(
+                    relation.origin,
+                    kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred
+                ) && relation
+                    .dst
+                    .as_entity()
+                    .is_some_and(|id| excluded.contains(&id))
+                    && relation
+                        .src
+                        .as_entity()
+                        .and_then(|id| input.entities.get(&id))
+                        .and_then(entity_path)
+                        .and_then(|path| kin_model::RepoPath::from_utf8(path).ok())
+                        .and_then(|path| input.tree.artifact_id_at_path(&path))
+                        .is_some_and(|id| snapshot.resolved_tree.get(&id).is_some())
+            })
+            .cloned()
+            .collect();
+        if incident.is_empty() {
+            continue;
+        }
+        let mut planned = Vec::new();
+        for relation in &incident {
+            planned.extend(kin_reconcile::plan_local_binding_obligations(
+                &std::collections::HashSet::from([relation.dst.as_entity().unwrap()]),
+                std::slice::from_ref(relation),
+                |id| Ok(input.entities.get(&id).cloned()),
+                |file| {
+                    let path = kin_model::RepoPath::from_utf8(file.0.clone())
+                        .map_err(|e| kin_reconcile::ReconcileError::Graph(e.to_string()))?;
+                    Ok(input.tree.artifact_at_path(&path).and_then(|entry| {
+                        entry
+                            .entry
+                            .blob_identity()
+                            .map(|hash| (entry.artifact_id, hash))
+                    }))
+                },
+                |artifact| {
+                    Ok(input
+                        .relations
+                        .values()
+                        .filter(|r| r.src == GraphNodeId::Artifact(artifact))
+                        .cloned()
+                        .collect())
+                },
+                |id| Ok(input.relations.get(&id).cloned()),
+            )?);
+        }
+        for change in planned {
+            let relation = match change {
+                RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => new,
+                _ => continue,
+            };
+            let GraphNodeId::Artifact(artifact) = relation.src else {
+                unreachable!()
+            };
+            let source = input.tree.get(&artifact).unwrap();
+            let prior = decode_local_binding_debt(
+                &kin_model::FilePathId::new(source.path.to_string()),
+                artifact,
+                &relation,
+            )
+            .map_err(merge_conflict)?
+            .unwrap();
+            let current = snapshot
+                .resolved_tree
+                .get(&artifact)
+                .ok_or_else(|| merge_conflict("prior binding source did not survive"))?;
+            union_binding_debt(
+                &mut debts,
+                artifact,
+                kin_model::FilePathId::new(current.path.to_string()),
+                prior,
+            )?;
+        }
+    }
+    let source_artifacts: BTreeSet<_> = files.keys().chain(debts.keys()).copied().collect();
+    for artifact in source_artifacts {
+        let current = files
+            .get(&artifact)
+            .map(|(located, _)| located.path.to_string())
+            .or_else(|| {
+                snapshot
+                    .resolved_tree
+                    .get(&artifact)
+                    .map(|entry| entry.path.to_string())
+            })
+            .ok_or_else(|| merge_conflict("binding source has no composed artifact"))?;
+        for input in inputs {
+            if let Some(prior) = parent_binding_debt(input, artifact)? {
+                union_binding_debt(
+                    &mut debts,
+                    artifact,
+                    kin_model::FilePathId::new(&current),
+                    prior,
+                )?;
+            }
+        }
+        let reserved = local_binding_debt_id(artifact);
+        for relation in snapshot
+            .relations
+            .values()
+            .filter(|r| r.id == reserved || r.src == GraphNodeId::Artifact(artifact))
+        {
+            let valid = std::iter::once(kin_model::FilePathId::new(&current))
+                .chain(
+                    inputs
+                        .iter()
+                        .filter_map(|input| input.tree.get(&artifact))
+                        .map(|entry| kin_model::FilePathId::new(entry.path.to_string())),
+                )
+                .any(|file| decode_local_binding_debt(&file, artifact, relation).is_ok());
+            if !valid {
+                return Err(merge_conflict(
+                    "composed binding evidence is malformed or its identity is occupied",
+                ));
+            }
+        }
+    }
+    snapshot.entities.retain(|id, _| !owned.contains(id));
+    snapshot.entities.extend(anchors);
+    snapshot.relations.retain(|_, relation| {
+        ![relation.src, relation.dst]
+            .iter()
+            .any(|node| node.as_entity().is_some_and(|id| excluded.contains(&id)))
+    });
     let covered: BTreeSet<_> = files
         .keys()
         .flat_map(|artifact| file_coverage(record, inputs, *artifact))
@@ -1161,10 +1546,8 @@ fn seed_authored_identities(
             .find_map(|input| input.relations.get(relation))
         {
             let valid = [original.src, original.dst].iter().all(|node| match node {
-                kin_model::GraphNodeId::Entity(entity) => snapshot.entities.contains_key(entity),
-                kin_model::GraphNodeId::Artifact(artifact) => {
-                    snapshot.resolved_tree.get(artifact).is_some()
-                }
+                GraphNodeId::Entity(entity) => snapshot.entities.contains_key(entity),
+                GraphNodeId::Artifact(artifact) => snapshot.resolved_tree.get(artifact).is_some(),
                 _ => true,
             });
             if valid {
@@ -1172,6 +1555,16 @@ fn seed_authored_identities(
             }
         }
     }
+    for (artifact, debt) in debts {
+        let reserved = local_binding_debt_id(artifact);
+        let mut relation = build_local_binding_debt(artifact, debt).map_err(merge_conflict)?;
+        relation.created_in = snapshot
+            .relations
+            .get(&reserved)
+            .and_then(|old| old.created_in);
+        snapshot.relations.insert(reserved, relation);
+    }
+    Ok(())
 }
 
 /// Load only durable authored bodies, then rederive their complete semantics
@@ -1203,8 +1596,8 @@ pub(crate) fn replay_authored_files(
         return Ok(snapshot);
     }
     let (_, inputs) = merge_inputs(authority, record)?;
-    seed_authored_identities(&mut snapshot, &inputs, record, &files);
-    reparse_authored_files(state, snapshot, &files)
+    seed_authored_identities(&mut snapshot, &inputs, record, &files)?;
+    reparse_authored_files(state, authority, snapshot, &files, &inputs)
 }
 
 /// Abandon the merge, whatever the workspace has done since it opened.
@@ -1488,4 +1881,140 @@ pub(crate) fn describe_unresolved(record: &MergeTransactionRecord) -> String {
         .map(render_entry)
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod authored_parent_tests {
+    use super::*;
+    use kin_index::binding_debt::{
+        build_local_binding_debt, LocalBindingDebt, LocalBindingObligation,
+    };
+    use kin_model::{
+        ArtifactId, EntityId, FilePathId, GraphNodeId, Hash256, Relation, RelationId, RelationKind,
+        RelationOrigin,
+    };
+
+    // Canonical representation controls. Real source/merge custody is exercised
+    // by repository_merge_resolution's native admission and restart tests.
+    fn debt() -> (ArtifactId, LocalBindingDebt) {
+        let artifact = ArtifactId::new();
+        (
+            artifact,
+            LocalBindingDebt {
+                source_file: FilePathId::new("caller.py"),
+                observed_source_digest: Hash256::from_bytes([1; 32]),
+                obligations: vec![LocalBindingObligation {
+                    retired_relation: Relation {
+                        id: RelationId::new(),
+                        kind: RelationKind::Calls,
+                        src: GraphNodeId::Entity(EntityId::new()),
+                        dst: GraphNodeId::Entity(EntityId::new()),
+                        confidence: 0.95,
+                        origin: RelationOrigin::Inferred,
+                        created_in: None,
+                        import_source: Some("local".into()),
+                        evidence: vec![],
+                    },
+                    source_name: "run".into(),
+                    source_digest: Hash256::from_bytes([2; 32]),
+                    prior_source_file: None,
+                    target_artifact: ArtifactId::new(),
+                    target_file: FilePathId::new("local.py"),
+                    target_name: "work".into(),
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn authored_parent_union_is_order_independent_and_normalizes_only_explicit_location() {
+        let (artifact, first) = debt();
+        let mut second = first.clone();
+        second.obligations[0].retired_relation.id = RelationId::new();
+        second.obligations[0].target_name = "other".into();
+        let mut duplicate_v2 = first.clone();
+        duplicate_v2.obligations[0].prior_source_file = Some(first.source_file.clone());
+        let mut results = Vec::new();
+        for values in [
+            [&first, &second, &duplicate_v2],
+            [&second, &duplicate_v2, &first],
+        ] {
+            let mut merged = BTreeMap::new();
+            for value in values {
+                union_binding_debt(
+                    &mut merged,
+                    artifact,
+                    FilePathId::new("moved/caller.py"),
+                    value.clone(),
+                )
+                .unwrap();
+            }
+            let union = merged.remove(&artifact).unwrap();
+            assert_eq!(union.obligations.len(), 2);
+            assert!(union
+                .obligations
+                .iter()
+                .all(|o| o.prior_source_file.as_ref() == Some(&first.source_file)));
+            results.push(build_local_binding_debt(artifact, union).unwrap());
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn authored_parent_union_rejects_conflicting_immutable_provenance() {
+        let (artifact, first) = debt();
+        for mutation in 0..5 {
+            let mut conflict = first.clone();
+            let obligation = &mut conflict.obligations[0];
+            match mutation {
+                0 => obligation.source_digest = Hash256::from_bytes([9; 32]),
+                1 => obligation.retired_relation.import_source = Some("unrelated".into()),
+                2 => obligation.retired_relation.dst = GraphNodeId::Entity(EntityId::new()),
+                3 => obligation.target_artifact = ArtifactId::new(),
+                _ => obligation.prior_source_file = Some(FilePathId::new("different.py")),
+            }
+            let mut merged = BTreeMap::new();
+            union_binding_debt(
+                &mut merged,
+                artifact,
+                first.source_file.clone(),
+                first.clone(),
+            )
+            .unwrap();
+            let before = merged.clone();
+            assert!(
+                union_binding_debt(&mut merged, artifact, first.source_file.clone(), conflict)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("identity collision")
+            );
+            assert_eq!(merged, before);
+        }
+    }
+
+    #[test]
+    fn authored_parent_reader_refuses_foreign_reserved_and_malformed_secondary_claims() {
+        let (artifact, debt) = debt();
+        let canonical = build_local_binding_debt(artifact, debt.clone()).unwrap();
+        let mut parent = kin_model::graph::ResolvedGraphState::default();
+        parent.tree = kin_model::ResolvedTree::from_artifacts([kin_model::ResolvedArtifact {
+            artifact_id: artifact,
+            path: kin_model::RepoPath::from_utf8("caller.py").unwrap(),
+            entry: kin_model::TreeEntry::blob(debt.observed_source_digest, false),
+        }])
+        .unwrap();
+        parent.relations.insert(canonical.id, canonical.clone());
+        assert_eq!(parent_binding_debt(&parent, artifact).unwrap(), Some(debt));
+        let mut foreign = canonical.clone();
+        foreign.src = GraphNodeId::Artifact(ArtifactId::new());
+        foreign.dst = foreign.src;
+        parent.relations.insert(foreign.id, foreign);
+        assert!(parent_binding_debt(&parent, artifact).is_err());
+        parent.relations.insert(canonical.id, canonical.clone());
+        let mut malformed = canonical;
+        malformed.id = RelationId::new();
+        malformed.kind = RelationKind::References;
+        parent.relations.insert(malformed.id, malformed);
+        assert!(parent_binding_debt(&parent, artifact).is_err());
+    }
 }

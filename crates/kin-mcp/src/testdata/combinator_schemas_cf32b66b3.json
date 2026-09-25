@@ -1,0 +1,201 @@
+{
+ "get_context_pack": {
+  "anyOf": [
+   {
+    "required": [
+     "entity_id"
+    ]
+   },
+   {
+    "required": [
+     "entities"
+    ]
+   },
+   {
+    "required": [
+     "question"
+    ]
+   }
+  ],
+  "properties": {
+   "entities": {
+    "type": "array"
+   },
+   "entity_id": {
+    "type": "string"
+   },
+   "question": {
+    "type": "string"
+   }
+  },
+  "type": "object"
+ },
+ "kin_mutate": {
+  "allOf": [
+   {
+    "if": {
+     "required": [
+      "request_id"
+     ]
+    },
+    "then": {
+     "properties": {
+      "scope": {
+       "const": "repository"
+      }
+     },
+     "propertyNames": {
+      "enum": [
+       "operations",
+       "session_id",
+       "scope",
+       "request_id",
+       "summary"
+      ]
+     },
+     "required": [
+      "session_id"
+     ]
+    }
+   }
+  ],
+  "properties": {
+   "operations": {
+    "type": "array"
+   },
+   "request_id": {
+    "type": "string"
+   },
+   "scope": {
+    "type": "string"
+   },
+   "session_id": {
+    "type": "string"
+   },
+   "summary": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "operations"
+  ],
+  "type": "object"
+ },
+ "kin_review_assign": {
+  "anyOf": [
+   {
+    "required": [
+     "reviewer"
+    ]
+   },
+   {
+    "required": [
+     "reviewers"
+    ]
+   }
+  ],
+  "properties": {
+   "review_id": {
+    "type": "string"
+   },
+   "reviewer": {
+    "type": "string"
+   },
+   "reviewers": {
+    "type": "array"
+   }
+  },
+  "required": [
+   "review_id"
+  ],
+  "type": "object"
+ },
+ "kin_review_create": {
+  "anyOf": [
+   {
+    "required": [
+     "base",
+     "head"
+    ]
+   },
+   {
+    "required": [
+     "scope_type",
+     "entity_ids"
+    ]
+   },
+   {
+    "required": [
+     "scopes"
+    ]
+   }
+  ],
+  "properties": {
+   "base": {
+    "type": "string"
+   },
+   "entity_ids": {
+    "type": "array"
+   },
+   "head": {
+    "type": "string"
+   },
+   "scope_type": {
+    "type": "string"
+   },
+   "scopes": {
+    "type": "array"
+   }
+  },
+  "required": [
+   "title"
+  ],
+  "type": "object"
+ },
+ "lexical_lookup": {
+  "anyOf": [
+   {
+    "required": [
+     "literal"
+    ]
+   },
+   {
+    "required": [
+     "cursor"
+    ]
+   }
+  ],
+  "properties": {
+   "cursor": {
+    "type": "string"
+   },
+   "literal": {
+    "type": "string"
+   }
+  },
+  "type": "object"
+ },
+ "semantic_locate": {
+  "anyOf": [
+   {
+    "required": [
+     "query"
+    ]
+   },
+   {
+    "required": [
+     "cursor"
+    ]
+   }
+  ],
+  "properties": {
+   "cursor": {
+    "type": "string"
+   },
+   "query": {
+    "type": "string"
+   }
+  },
+  "type": "object"
+ }
+}

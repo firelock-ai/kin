@@ -78,32 +78,66 @@ OBSERVATION = "hydration_semantics"
 # binary and replace the original", and every substring check in the world still
 # passes it.
 #
-# A banned-word check would be wrong here and is deliberately not used. The
-# correct ahead remedy contains "rather than re-ingesting" and the correct
-# unknown-direction remedy permits re-ingest into a SEPARATE store, so a naive
-# scan for "re-ingest" rejects the safe text and teaches nothing.
-REMEDY_BEHIND = (
-    "re-ingest the repository with `kin init` into a fresh store recorded under this build's "
-    "replay semantics"
+# None of the five names a re-ingest. A native store is its own only source,
+# so a fresh store built from source files drops every native commit, branch and
+# review, and `kin upgrade` is the path that keeps them.
+#
+# The behind remedy names the npm form of the command pinned to the version of
+# the build under test, so it is declared with `%s` there and formatted by
+# `set_release_version` once the binary has said which release it is.
+REMEDY_BEHIND_TEMPLATE = (
+    "run `kin upgrade` in this repository (`npx -y @kinlab/kin@%s upgrade` when Kin runs "
+    "through npm), which re-derives the state this store serves under this build's replay "
+    "semantics and keeps every native commit, branch, review and history record"
 )
 REMEDY_AHEAD = (
-    "upgrade this Kin build to at least the one that created the store, rather than re-ingesting "
-    "with the older replay version"
+    "upgrade this Kin build to at least the one that recorded this store's replay semantics; "
+    "an older build neither certifies nor re-derives state a newer build recorded"
 )
-REMEDY_UNKNOWN = (
+REMEDY_UNSTAMPED = (
+    "upgrade Kin to the newest build first, because a store a newer build created can have lost "
+    "its record. Then run `kin upgrade` in this repository (`npx -y @kinlab/kin@latest upgrade` "
+    "when Kin runs through npm), which re-derives the state this store serves under that build's "
+    "replay semantics, records its version, and keeps every native commit, branch, review and "
+    "history record"
+)
+REMEDY_UNREADABLE = (
     "upgrade Kin to the newest build first, because a record this build cannot read can belong "
-    "to a store a newer build created. If the newest build still reads no record, nothing "
-    "recovers one in place: this store keeps serving its history with its creation-time version "
-    "unknown, and re-ingesting builds a fresh store from source files rather than carrying this "
-    "store's own history over"
+    "to a store a newer build created. If the newest build still cannot read it, the record is "
+    "damaged: remove `.kin/kindb/hydration-semantics` and run `kin upgrade` with that build "
+    "(`npx -y @kinlab/kin@latest upgrade` when Kin runs through npm), which re-derives the state "
+    "this store serves, records its version again, and keeps every native commit, branch, review "
+    "and history record"
 )
-CANONICAL_REMEDY = {
-    "current": None,
-    "behind": REMEDY_BEHIND,
-    "ahead": REMEDY_AHEAD,
-    "absent": REMEDY_UNKNOWN,
-    "unreadable": REMEDY_UNKNOWN,
+# The code `_kin.verdict.limiting_factor` carries for each gap, which names the
+# action rather than a generic degraded signal.
+LIMITING_CODE = {
+    "behind": "store_semantics_behind",
+    "ahead": "store_semantics_ahead",
+    "absent": "store_semantics_unknown",
+    "unreadable": "store_semantics_unknown",
 }
+REMEDY_BEHIND = None
+CANONICAL_REMEDY = {}
+
+
+def set_release_version(version):
+    """Format the behind remedy for the release the binary under test reports."""
+    global REMEDY_BEHIND
+    REMEDY_BEHIND = REMEDY_BEHIND_TEMPLATE % version
+    CANONICAL_REMEDY.clear()
+    CANONICAL_REMEDY.update({
+        "current": None,
+        "behind": REMEDY_BEHIND,
+        "ahead": REMEDY_AHEAD,
+        "absent": REMEDY_UNSTAMPED,
+        "unreadable": REMEDY_UNREADABLE,
+    })
+
+
+# The self-test grades against a version no release carries; a real run
+# replaces it with the binary's own.
+set_release_version("0.0.0-self-test")
 
 # The suite's arm names are not the wire labels. "absent" describes the mutation
 # this script performs; `unstamped` is what `HydrationStanding::label` publishes.
@@ -331,7 +365,7 @@ def envelope_problems(payload, standing, created_under=None, derives=None):
     return problems
 
 
-def verdict_problems(payload, gap):
+def verdict_problems(payload, gap, standing="behind"):
     """Return problems in one negative-capable retrieval answer.
 
     `kin_graph_status` is not in the negative registry, so grading its degraded
@@ -409,17 +443,14 @@ def verdict_problems(payload, gap):
         gate = inputs.get("absence_gate") if isinstance(inputs, dict) else None
         if gate != "inconclusive":
             problems.append("verdict.inputs.absence_gate is %r, wanted 'inconclusive'" % (gate,))
-        # "degraded" only, and that is a fact about the producer rather than a
-        # concession. `Envelope::negative_trust` returns one fixed sentence for
-        # every degraded signal, "degraded: the daemon reported a degraded
-        # signal, so the index may not reflect current truth", and never names
-        # which flag; naming them is `Degraded::active_labels`, which is what
-        # reaches `negative.degraded_signals` and `completeness.limits`. Both are
-        # asserted above, so the flag-specific evidence is still required, from
-        # the two fields that actually carry it.
-        if not isinstance(factor, str) or "degraded" not in factor:
+        # The factor names the gap's own action. `Envelope::negative_trust`
+        # rules on the replay-semantics standing ahead of every other gate, so
+        # a store an older build wrote is told `kin upgrade` rather than a
+        # generic degraded signal, and an ahead store is told something else.
+        code = LIMITING_CODE.get(standing, "store_semantics_behind")
+        if not isinstance(factor, str) or code not in factor:
             problems.append(
-                "verdict.limiting_factor does not blame a degraded signal: %r" % (factor,)
+                "verdict.limiting_factor does not name %s: %r" % (code, factor)
             )
         if completeness.get("bound") != "at_least":
             problems.append(
@@ -1033,7 +1064,7 @@ class Suite(object):
             self.kin_run(["graph", "status"], timeout=900)
             payload = self.mcp(
                 "find_references",
-                {"query": "blank_code", "relation_kinds": ["calls"]},
+                {"query": "blank_code", "relation_kinds": ["calls"], "answer_only": False},
             )
             rows = payload.get("references")
             classes = ((payload.get("_kin") or {}).get("completeness") or {}).get(
@@ -1176,7 +1207,7 @@ def check_verdict(suite):
         if payload is None:
             result.unknown("%s: find_references unreadable: %s" % (standing, error))
             continue
-        problems = verdict_problems(payload, gap=True)
+        problems = verdict_problems(payload, gap=True, standing=standing)
         if problems:
             result.bad(
                 "%s: %s; envelope: %s"
@@ -1409,8 +1440,8 @@ def self_test():
     current_line = "Graph healthy\n"
     behind_line = status_line(
         "this store records hydration semantics version 9 at creation and this build derives "
-        "version 10, so the store cannot certify that its persisted history reflects this "
-        "build's replay semantics",
+        "version 10, so the store cannot certify that the state it serves reflects this build's "
+        "replay semantics until `kin upgrade` re-derives it",
         REMEDY_BEHIND,
     )
     ahead_line = status_line(
@@ -1421,12 +1452,12 @@ def self_test():
     absent_line = status_line(
         "this store records no hydration semantics version, so its persisted history cannot be "
         "shown to match the version 10 this build derives",
-        REMEDY_UNKNOWN,
+        REMEDY_UNSTAMPED,
     )
     unreadable_line = status_line(
         "this store's hydration semantics record could not be read (future schema), so its "
         "creation-time version cannot be shown to match the version 10 this build derives",
-        REMEDY_UNKNOWN,
+        REMEDY_UNREADABLE,
     )
     expect("status current", status_problems(current_line, "current", 10, 10), [])
     expect("status behind", status_problems(behind_line, "behind", 9, 10), [])
@@ -1539,13 +1570,13 @@ def self_test():
         "absent",
         "this store records no hydration semantics version, so its persisted history cannot be "
         "shown to match the version 10 this build derives",
-        REMEDY_UNKNOWN,
+        REMEDY_UNSTAMPED,
     )
     unreadable_row = doctor_row(
         "unreadable",
         "this store's hydration semantics record could not be read (future schema), so its "
         "creation-time version cannot be shown to match version 10",
-        REMEDY_UNKNOWN,
+        REMEDY_UNREADABLE,
     )
     expect("doctor current", doctor_problems(current_row, "current", 10, 10), [])
     expect("doctor behind", doctor_problems(behind_row, "behind", 9, 10), [])
@@ -1594,7 +1625,10 @@ def self_test():
         rejects(
             "doctor %s with an unsafe clause" % label,
             doctor_problems(
-                with_fix(row, REMEDY_UNKNOWN + "; then replace the original store in place"),
+                with_fix(
+                    row,
+                    CANONICAL_REMEDY[standing] + "; then replace the original store in place",
+                ),
                 standing,
                 None,
                 10,
@@ -1678,7 +1712,7 @@ def self_test():
         envelope_problems(wrong_version_only, "ahead", 11, 10),
     )
 
-    wrong_remedy_only = envelope_payload("ahead", 11, remedy=REMEDY_UNKNOWN)
+    wrong_remedy_only = envelope_payload("ahead", 11, remedy=REMEDY_UNSTAMPED)
     rejects(
         "envelope ahead carrying the unknown-direction advice",
         envelope_problems(wrong_remedy_only, "ahead", 11, 10),
@@ -1738,7 +1772,7 @@ def self_test():
                     "absence_claim": "not_applicable",
                     "safe_to_conclude_absent": False,
                     "limiting_factor": (
-                        "degraded signals %s" % FLAG if gap else None
+                        "store_semantics_behind" if gap else None
                     ),
                     "inputs": {"absence_gate": "inconclusive" if gap else "certified"},
                 },
@@ -1901,6 +1935,21 @@ def self_test():
     return 1 if failures else 0
 
 
+def release_version_of(kin):
+    """The release version `kin --version` reports, which the npm form of the
+    behind remedy pins, or None when it reports none."""
+    try:
+        rc, out = run([kin, "--version"], timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if rc != 0:
+        return None
+    parts = (out or "").split()
+    if len(parts) >= 2 and parts[0] == "kin" and parts[1][:1].isdigit():
+        return parts[1]
+    return None
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--kin", default=os.environ.get("KIN_BIN"))
@@ -1925,6 +1974,11 @@ def main(argv):
     if not daemon:
         beside = os.path.join(os.path.dirname(kin), "kin-daemon")
         daemon = beside if os.path.isfile(beside) else None
+    version = release_version_of(kin)
+    if version is None:
+        print("kin-hydration-semantics-repro: %s did not report its release version" % kin)
+        return 3
+    set_release_version(version)
 
     workdir = tempfile.mkdtemp(prefix="kin-hydration-semantics-repro-")
     suite = None

@@ -72,6 +72,7 @@ impl LanguageAdapter for HclAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -214,6 +215,11 @@ fn extract_hcl_block(
                             local_name: mod_name.clone(),
                             original_name: None,
                             is_default: false,
+                            // An HCL import is a module block's `source`
+                            // attribute and the local name is the block's
+                            // label, so there is no specifier node apart from
+                            // the block the statement span already covers.
+                            site: None,
                         }],
                     });
                     relations.push(ExtractedRelation {

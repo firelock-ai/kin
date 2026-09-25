@@ -43,8 +43,8 @@ pub fn generate_claude_hooks() -> Vec<HookTemplate> {
         HookTemplate {
             event: "PreToolUse".into(),
             matcher: Some("Edit|Write".into()),
-            command: "echo '⚠ This repo uses Kin. Before editing, run `kin review` to check semantic impact and `kin context <entity>` to understand the entity you are modifying.'".into(),
-            description: "Reminds the agent to run `kin review` and `kin context <entity>` before editing files.".into(),
+            command: "echo '⚠ This repo uses Kin: change code through Kin by entity, not by editing files. Read the entity with get_entity_source for its source_base, then kin_mutate it by id; check impact with `kin review`.'".into(),
+            description: "Redirects a file edit to Kin's entity edit through kin_mutate.".into(),
         },
         HookTemplate {
             event: "PostToolUse".into(),

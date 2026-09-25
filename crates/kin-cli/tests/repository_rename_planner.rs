@@ -760,10 +760,18 @@ fn real_linker_spanless_relations_are_exact_or_refused_across_eight_languages() 
         for relation in &linked {
             graph.upsert_relation(relation).unwrap();
         }
+        // By kind as well as by name. A file's module surface takes the file's
+        // own coordinate where the language declares no package, so `caller.rs`
+        // and `Caller.java` each carry a module of that name beside the
+        // declaration of that name. A lookup by name alone reads the surface,
+        // which sources no call edge, and the case fails on the fixture rather
+        // than on the planner.
         let target = indexed_files[0]
             .entities
             .iter()
-            .find(|entity| entity_leaf(&entity.name) == "target")
+            .find(|entity| {
+                entity_leaf(&entity.name) == "target" && entity.kind != EntityKind::Module
+            })
             .unwrap_or_else(|| {
                 panic!(
                     "{} target entity; found {:?}",
@@ -778,7 +786,9 @@ fn real_linker_spanless_relations_are_exact_or_refused_across_eight_languages() 
         let caller = indexed_files[1]
             .entities
             .iter()
-            .find(|entity| entity_leaf(&entity.name) == "caller")
+            .find(|entity| {
+                entity_leaf(&entity.name) == "caller" && entity.kind != EntityKind::Module
+            })
             .unwrap_or_else(|| panic!("{} caller entity", fixture.name));
         let call = linked
             .iter()

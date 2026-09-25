@@ -7,15 +7,17 @@ pub mod builder;
 pub mod error;
 pub mod multi;
 pub mod tokens;
+mod traffic;
+pub use traffic::ScopedTrafficIntent;
 
 pub use builder::{
     build_context_pack, build_context_pack_from_plan, build_context_pack_with_provenance,
-    build_context_pack_with_provider, build_context_pack_with_traffic,
-    build_context_pack_with_traffic_and_provenance, focal_dependency_edges, focal_edge_rank, group,
-    AssistantHint, BodyCandidate, ContextOptions, ContextProjectionProvider, DependencyRelation,
-    DependencySelection, DependencySource, FocalEdge, FocalEdgeDirection, ProjectionLimits,
-    ProjectionReport, FULL_BODY_PROJECTION_NAME, NO_FOCAL_EDGE_RANK, SAME_FILE_FALLBACK_MAX,
-    SERVED_BODY_PROJECTION_NAME,
+    build_context_pack_with_provider, build_context_pack_with_scoped_traffic_and_provenance,
+    build_context_pack_with_traffic, build_context_pack_with_traffic_and_provenance,
+    focal_dependency_edges, focal_edge_rank, group, AssistantHint, BodyCandidate, ContextOptions,
+    ContextProjectionProvider, DependencyRelation, DependencySelection, DependencySource,
+    FocalEdge, FocalEdgeDirection, ProjectionLimits, ProjectionReport, FULL_BODY_PROJECTION_NAME,
+    NO_FOCAL_EDGE_RANK, SAME_FILE_FALLBACK_MAX, SERVED_BODY_PROJECTION_NAME,
 };
 pub use error::{ContextError, Result};
 pub use multi::{

@@ -226,6 +226,40 @@ where
     }
 }
 
+/// How every [`InstallFailure::Download`] reason opens: `could not download
+/// <url>: <what went wrong>`.
+const DOWNLOAD_FAILURE: &str = "could not download ";
+
+/// What the HTTP client says when a request got no answer at all: a refused or
+/// unrouted connection, a lookup that failed, a TLS handshake or a timeout
+/// before any response. reqwest names the URL on every one of those. Only the
+/// send arm of `download_to_temp` reports the client's own error, so only a
+/// request that never reached a server puts these words straight after the
+/// URL.
+const UNANSWERED_REQUEST: &str = "error sending request for url (";
+
+/// Whether `reason` is this downloader's report of a request the network never
+/// answered.
+///
+/// Every download failure opens with the same words, so they say nothing about
+/// the cause: a server that answered 404, a disk that refused the write and a
+/// response past the size ceiling all carry them. What follows the URL does.
+/// The send arm reports the client's error, which opens with
+/// [`UNANSWERED_REQUEST`], and every other arm reports a status, an IO error or
+/// a size in Kin's own words.
+pub(crate) fn is_unanswered_request(reason: &str) -> bool {
+    let lowered = reason.to_lowercase();
+    lowered.match_indices(DOWNLOAD_FAILURE).any(|(at, _)| {
+        lowered[at + DOWNLOAD_FAILURE.len()..]
+            .split_once(": ")
+            .is_some_and(|(url, cause)| {
+                !url.is_empty()
+                    && !url.contains(char::is_whitespace)
+                    && cause.starts_with(UNANSWERED_REQUEST)
+            })
+    })
+}
+
 /// Why a release install could not happen, in the operator's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InstallFailure {
@@ -256,7 +290,7 @@ impl InstallFailure {
                 RUST_ANALYZER_RELEASE.binary
             ),
             Self::Download { url, reason } => {
-                format!("could not download {url}: {reason}")
+                format!("{DOWNLOAD_FAILURE}{url}: {reason}")
             }
             Self::ChecksumMismatch {
                 url,
@@ -925,6 +959,100 @@ mod tests {
         }
     }
 
+    /// Exercise the same async provisioning boundary setup and doctor use,
+    /// with the real synchronous downloader and an isolated loopback asset.
+    /// A current-thread runtime also rules out relying on `block_in_place`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_provisioning_installs_a_verified_loopback_release() {
+        async_provisioning_fixture(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_provisioning_preserves_checksum_refusal() {
+        async_provisioning_fixture(true).await;
+    }
+
+    async fn async_provisioning_fixture(refuse_checksum: bool) {
+        use crate::commands::language_servers::{
+            provision_async, InstallConsent, InstallOutcome, InstallProblem, InstallRoute,
+        };
+
+        let target = host_target().expect("this fleet builds on a pinned host");
+        let release = fixture_release(target);
+        let payload = b"#!/bin/sh\necho rust-analyzer async-fixture\n";
+        let archive = gzipped(payload);
+        let digest = sha256_of(&archive);
+        let expected = if refuse_checksum {
+            "0".repeat(64)
+        } else {
+            digest.clone()
+        };
+        let server = FixtureServer::serving("HTTP/1.1 200 OK", archive);
+        let base = server.base().to_string();
+        let home = tempfile::tempdir().expect("a scratch tool root");
+        let bin_dir = home.path().join("bin");
+        let destination = bin_dir.join("rust-analyzer");
+        let installed_destination = destination.clone();
+
+        let reports = provision_async(
+            vec![kin_model::LanguageId::Rust],
+            InstallConsent::Granted,
+            move |_| installed_destination.is_file(),
+            |_| Some(InstallRoute::PinnedRelease),
+            |_, _| panic!("explicit consent must not prompt"),
+            move |_, route| {
+                assert_eq!(route, InstallRoute::PinnedRelease);
+                match install_pinned_release(&release, Some(target), &bin_dir, &base, &expected) {
+                    Ok(install) => Ok(install.evidence_lines()),
+                    Err(failure @ InstallFailure::ChecksumMismatch { .. }) => {
+                        Err(InstallProblem::ChecksumMismatch {
+                            reason: failure.reason(),
+                        })
+                    }
+                    Err(failure) => Err(InstallProblem::Failed {
+                        reason: failure.reason(),
+                    }),
+                }
+            },
+        )
+        .await
+        .expect("the blocking installation worker must finish");
+        assert_eq!(server.stop(), 1, "one real archive request was served");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].language, kin_model::LanguageId::Rust);
+        if refuse_checksum {
+            assert!(matches!(
+                &reports[0].outcome,
+                InstallOutcome::ChecksumRefused { .. }
+            ));
+            assert!(!destination.exists(), "refused bytes must not be installed");
+        } else {
+            let InstallOutcome::Installed { evidence, .. } = &reports[0].outcome else {
+                panic!("the verified release was not installed: {reports:?}");
+            };
+            assert!(evidence.iter().any(|line| line.contains(&digest)));
+            assert_eq!(std::fs::read(&destination).unwrap(), payload);
+            assert!(
+                which::which_in(
+                    "rust-analyzer",
+                    Some(destination.parent().unwrap()),
+                    home.path()
+                )
+                .is_ok(),
+                "the installed release must be executable and discoverable"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(home.path().join("bin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "rust-analyzer")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary downloads must be removed: {leftovers:?}"
+        );
+    }
+
     /// The whole standalone route: fetch, verify, unpack, install, and be found
     /// by the same `which` lookup enrichment discovery performs.
     ///
@@ -1098,6 +1226,68 @@ mod tests {
             }
             other => panic!("a 404 must read as a download failure, got {other:?}"),
         }
+    }
+
+    /// The network classifier reads what this downloader really says.
+    ///
+    /// Two real requests over loopback: one to a port nothing listens on, one
+    /// to a server that answers 404. Both reasons come from
+    /// `install_pinned_release` itself, so a change to the downloader's wording
+    /// or to the HTTP client's that broke the rule fails here rather than in
+    /// front of an operator, who would be told to fix a proxy for a missing
+    /// file.
+    ///
+    /// Falsify by restoring the bare `could not download` signature in
+    /// `language_servers::network_shape`: the 404 then reads as the network.
+    #[test]
+    fn the_network_classifier_reads_the_downloaders_own_refusals() {
+        use crate::commands::language_servers::network_shape;
+
+        let target = host_target().expect("this fleet builds on a pinned host");
+        let release = fixture_release(target);
+        let home = tempfile::tempdir().expect("a scratch tool root");
+        let bin_dir = home.path().join("tools").join("bin");
+
+        // Bound and released, so the connection is refused rather than answered.
+        let closed = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+            let port = listener.local_addr().expect("read the bound port").port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}")
+        };
+        let unanswered =
+            install_pinned_release(&release, Some(target), &bin_dir, &closed, &"e".repeat(64))
+                .expect_err("nothing listens, so nothing installs");
+        assert!(
+            matches!(unanswered, InstallFailure::Download { .. }),
+            "{unanswered:?}"
+        );
+        let reason = unanswered.reason();
+        assert!(is_unanswered_request(&reason), "{reason}");
+        assert!(
+            network_shape(&reason).is_some_and(|shape| shape.contains("never completed")),
+            "a refused connection is the network: {reason}"
+        );
+
+        let server = FixtureServer::serving("HTTP/1.1 404 Not Found", Vec::new());
+        let answered = install_pinned_release(
+            &release,
+            Some(target),
+            &bin_dir,
+            server.base(),
+            &"e".repeat(64),
+        )
+        .expect_err("a 404 must not install");
+        server.stop();
+        let reason = answered.reason();
+        assert!(reason.contains("404"), "{reason}");
+        assert!(!is_unanswered_request(&reason), "{reason}");
+        assert_eq!(
+            network_shape(&reason),
+            None,
+            "a server that answered 404 is not the network: {reason}"
+        );
     }
 
     /// A host with no pinned asset is refused before any request is made.

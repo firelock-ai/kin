@@ -30,17 +30,37 @@ cannot drift apart.
 | TypeScript | ✓ | calls, contains, extends, implements, references | ✓ (jest) | ✓ | ✓ typescript-language-server |
 | JavaScript | ✓ | calls, contains, extends, references | ✓ | ✓ | ✓ typescript-language-server |
 | Python | ✓ | calls, contains, extends, references | ✓ (pytest) | ✓ | ✓ pyright / pylsp |
-| Go | ✓ | calls, contains, extends, implements, references, sends-message, spawns | ✓ | ✓ | ✓ gopls |
-| Java | ✓ | calls, contains, extends, implements, references | ✓ (junit) | ✓ | not wired (jdtls adapter exists) |
-| Rust | ✓ | calls, contains, implements, references | ✓ (cargo) | ✓ | ✓ rust-analyzer |
+| Go | ✓ | calls, contains, extends, implements, imports, references, sends-message, spawns | ✓ | ✓ | ✓ gopls |
+| Java | ✓ | calls, contains, extends, implements, imports, references | ✓ (junit) | ✓ | not wired (jdtls adapter exists) |
+| Rust | ✓ | calls, contains, implements, imports, references | ✓ (cargo) | ✓ | ✓ rust-analyzer |
 | C++ | ✓ | calls, contains, extends, imports, references, uses-macro | ✓ | ✓ | not wired (clangd adapter exists) |
 | C | ✓ | calls, imports, references, uses-macro | ✗ | ✓ | not wired (clangd adapter exists) |
-| Kotlin | ✓ | calls, contains, extends, implements, references | ✓ | ✓ | ✗ |
+| Kotlin | ✓ | calls, contains, extends, implements, imports, references | ✓ | ✓ | ✗ |
 | C# | ✓ | calls, contains, extends, references | ✗ | ✓ | ✗ |
 | Ruby | ✓ | calls, contains, extends, references | ✗ | ✓ | ✗ |
-| Swift | ✓ | calls, contains, implements, references | ✓ (xctest) | ✓ | ✗ |
-| PHP | ✓ | calls, contains, extends, implements, references | ✓ (phpunit) | ✓ | ✗ |
+| Swift | ✓ | calls, contains, implements, imports, references | ✓ (xctest) | ✓ | ✗ |
+| PHP | ✓ | calls, contains, extends, implements, imports, references | ✓ (phpunit) | ✓ | ✗ |
 | HCL / Terraform | ✓ | imports, references | ✗ | ✓ | ✗ |
+
+An `imports` relation in this table is an entity-rooted one, the class that
+answers "who imports this". Go, Java, Kotlin, PHP, Rust and Swift reach it at the
+`import_scoped` tier, because the destination is a module a coordinate settled
+rather than an export a specifier proved: a Go or Swift import names a package
+directory whose representative file this build chooses, and a Java, Kotlin or PHP
+one names a type through a source root the repository never writes down.
+TypeScript, JavaScript and Python bind a named specifier to the export it names
+and reach `type_resolved`. C's `#include` directives are `Includes` edges and its
+adapter emits no module entity, so C mints no entity-rooted `Imports` edge and
+the coverage envelope names it. An import of a module the repository does not
+hold mints no edge in any language and is disclosed by the per-file
+import-resolution certificate instead.
+
+The module entity an import edge is sourced at is minted for a file that
+produced a declaration or an import, and not for one that produced neither. A
+comment-only file, an empty file and a file its adapter could not read therefore
+hold no entity at all, and the parse-coverage census counts and names them
+rather than reading a full row over them. This does not narrow the import class:
+a file with an import has one by definition.
 
 C# and Ruby currently use dedicated semantic adapters for entities, relations,
 imports, and documentation, but those adapters do not yet implement

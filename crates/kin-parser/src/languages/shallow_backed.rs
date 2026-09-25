@@ -91,6 +91,7 @@ fn extract_csharp_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pa
     annotate_import_sources(&mut relations, &imports);
 
     ParseOutput {
+        derived_members: Vec::new(),
         entities,
         relations,
         imports,
@@ -362,17 +363,15 @@ fn extract_csharp_node(
 }
 
 fn extract_csharp_import(node: &Node, source: &[u8]) -> Option<FileImport> {
-    let module_path = child_field_text(node, "name", source).or_else(|| {
+    // The coordinate's NODE, not just its text: the specifier's own span is
+    // read off it, so a `using\n    System;` anchors the name on its own line
+    // rather than on the `using` keyword's.
+    let name_node = node.child_by_field_name("name").or_else(|| {
         let mut cursor = node.walk();
-        let fallback = node.children(&mut cursor).find_map(|child| {
-            if child.is_named() {
-                child.utf8_text(source).ok().map(|text| text.to_string())
-            } else {
-                None
-            }
-        });
-        fallback
+        let first_named = node.children(&mut cursor).find(|child| child.is_named());
+        first_named
     })?;
+    let module_path = name_node.utf8_text(source).ok()?.to_string();
     let module_path = normalize_scoped_name(&module_path);
     let local_name = module_path
         .rsplit('.')
@@ -386,6 +385,7 @@ fn extract_csharp_import(node: &Node, source: &[u8]) -> Option<FileImport> {
             local_name,
             original_name: None,
             is_default: false,
+            site: Some(crate::adapter::site_from_node(&name_node)),
         }],
     })
 }
@@ -538,6 +538,7 @@ fn extract_ruby_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pars
     annotate_import_sources(&mut relations, &imports);
 
     ParseOutput {
+        derived_members: Vec::new(),
         entities,
         relations,
         imports,
@@ -832,6 +833,9 @@ fn extract_ruby_require(node: &Node, source: &[u8]) -> Option<FileImport> {
             local_name,
             original_name: None,
             is_default: false,
+            // `require 'json'` names the module through a string literal, not
+            // an identifier the file binds, so the call's span answers.
+            site: None,
         }],
     })
 }

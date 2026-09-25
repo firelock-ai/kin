@@ -2,7 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use kin_model::{
-    FilePathId, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan,
+    EntityKind, FilePathId, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
+    SourceSpan, Visibility,
 };
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
@@ -350,4 +351,127 @@ fn collect_errors_recursive(node: &Node, errors: &mut Vec<(usize, usize)>) {
     for child in node.children(&mut cursor) {
         collect_errors_recursive(&child, errors);
     }
+}
+
+/// The module-surface entity a source file contributes.
+///
+/// An entity-level `Imports` edge is sourced at the importing file's module
+/// entity, because a file-level dependency is owned by the file surface and not
+/// by whichever declaration happens to sit first in it. A language whose
+/// adapter emits no such entity therefore mints no entity-level import edge at
+/// all, however exactly its specifiers resolve, and "who imports this" has no
+/// answer in it. Python fixed that for itself by emitting one per source file;
+/// this is the same entity, shared, so go, java, kotlin, php, swift and rust
+/// cannot drift apart on what it looks like.
+///
+/// The span is the whole file and the fingerprint is the whole tree, so the
+/// entity moves when the file's content moves and not when a declaration inside
+/// it is edited.
+pub fn file_module_surface_entity(
+    name: String,
+    signature: String,
+    root: &Node,
+    source: &[u8],
+    file_id: &FilePathId,
+) -> crate::extract::ExtractedEntity {
+    crate::extract::ExtractedEntity {
+        kind: EntityKind::Module,
+        name,
+        signature,
+        visibility: Visibility::Public,
+        doc_summary: None,
+        fingerprint: compute_fingerprint(root, source),
+        span: span_from_node(root, file_id),
+        declaration_line: None,
+    }
+}
+
+/// The name a file's module surface carries.
+///
+/// `declared` is the package, namespace or module coordinate the file writes
+/// for itself, where the language has one. Only its last segment is kept:
+/// `com.example.storage` names the module `storage`, and a dotted name would
+/// read as the receiver expression of a method call, which is the exact shape
+/// this vocabulary had a class of fabricated module entities removed for.
+///
+/// With nothing declared the file's own stem answers, which is the coordinate
+/// Rust, Swift and an unnamespaced PHP file use. A Rust `mod.rs` is its
+/// directory's module and a Rust crate root is `crate`, because neither is
+/// named by its stem.
+pub fn file_module_surface_name(declared: Option<&str>, file_id: &FilePathId) -> Option<String> {
+    if let Some(declared) = declared {
+        let leaf = declared
+            .rsplit(|c| c == '.' || c == '\\' || c == ':' || c == '/')
+            .next()
+            .unwrap_or(declared)
+            .trim();
+        if !leaf.is_empty() {
+            return Some(leaf.to_string());
+        }
+    }
+
+    let path = file_id.0.as_str();
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    if stem.is_empty() {
+        return None;
+    }
+    if path.ends_with(".rs") {
+        let parent = path
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.rsplit('/').next().unwrap_or(dir));
+        return match stem {
+            "mod" => parent.filter(|dir| !dir.is_empty()).map(str::to_string),
+            "lib" | "main" => Some("crate".to_string()),
+            _ => Some(stem.to_string()),
+        };
+    }
+    Some(stem.to_string())
+}
+
+/// The package or namespace coordinate a file declares for itself.
+///
+/// The Go, Java, Kotlin and PHP grammars spell this node differently
+/// (`package_clause`, `package_declaration`, `package_header`,
+/// `namespace_definition`), so the match is on a kind that NAMES a package or a
+/// namespace rather than on a list of spellings one grammar upgrade would
+/// invalidate. A language with no such declaration returns `None` and its
+/// module surface falls back to the file's own coordinate.
+///
+/// The coordinate is read from the node's `name` field where the grammar
+/// carries one, and otherwise from its own text with the keyword stripped and
+/// the text cut at the statement terminator or the opening brace, because
+/// `namespace App { ... }` puts the whole namespace body inside the node.
+pub fn declared_package_coordinate(root: &Node, source: &[u8]) -> Option<String> {
+    let mut cursor = root.walk();
+    let declaration = root.children(&mut cursor).find(|child| {
+        let kind = child.kind();
+        // `_use` and not `use`: Go's node is `package_clause`, and "clause"
+        // contains "use", so the looser test excluded the one grammar this was
+        // written for and every Go file fell back to its file stem.
+        (kind.starts_with("package_") || kind.starts_with("namespace_"))
+            && !kind.contains("use_")
+            && !kind.contains("import")
+    })?;
+
+    if let Some(name) = declaration.child_by_field_name("name") {
+        let text = name.utf8_text(source).unwrap_or("").trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    let text = declaration.utf8_text(source).unwrap_or("");
+    let cut = text
+        .find(['{', ';'])
+        .map_or(text, |position| &text[..position]);
+    let coordinate = cut
+        .trim()
+        .strip_prefix("package")
+        .or_else(|| cut.trim().strip_prefix("namespace"))
+        .unwrap_or("")
+        .trim();
+    (!coordinate.is_empty()).then(|| coordinate.to_string())
 }

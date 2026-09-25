@@ -223,8 +223,13 @@ impl TextIndex {
 
     /// Document frequency of a term (its rarest token's posting count) — the
     /// same value BM25 uses for IDF, exposed for term-discrimination weighting.
-    pub fn doc_frequency(&self, term: &str) -> usize {
-        self.inner.doc_frequency(term)
+    ///
+    /// Refuses while the committed image is unmapped rather than count an empty
+    /// heap; see [`Self::remap_if_unmapped`].
+    pub fn doc_frequency(&self, term: &str) -> Result<usize, KinDbError> {
+        self.inner
+            .doc_frequency(term)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
     /// Search across entity names, signatures, and file paths.
@@ -252,12 +257,18 @@ impl TextIndex {
     }
 
     /// Read the stored root hash from an on-disk text index without keeping
-    /// the index open.  Returns `None` if the index does not exist or has no
-    /// stored hash.  This is used by daemon-bootstrap paths to discover the
-    /// correct root hash before constructing the graph, avoiding an expensive
-    /// Merkle recomputation.
+    /// the index open.  Returns `None` if the index does not exist, has no
+    /// stored hash, or cannot be read.
+    ///
+    /// The open is read-only, and that is the contract rather than a detail. A
+    /// peek runs in a process that does not own the index, such as a CLI
+    /// command beside a live daemon, and a writing open archives what it
+    /// cannot read: a segment the daemon had just reclaimed was enough to
+    /// rename the daemon's manifest out from under it. A peek never archives,
+    /// renames or writes anything.
     pub fn peek_root_hash(path: &std::path::Path) -> Option<[u8; 32]> {
-        let idx = kin_search::TextIndex::<RetrievalKey>::open(Some(&path.to_path_buf())).ok()?;
+        let idx = kin_search::TextIndex::<RetrievalKey>::open_read_only(Some(&path.to_path_buf()))
+            .ok()?;
         idx.graph_root_hash()
     }
 
@@ -265,14 +276,34 @@ impl TextIndex {
         self.inner.set_graph_root_hash(graph_root_hash);
     }
 
-    /// Number of committed documents currently visible to search.
+    /// Number of committed documents.
+    ///
+    /// While the committed image is unmapped this is still the count that
+    /// image was published with, although its documents cannot be read until
+    /// it maps again; [`Self::remap_if_unmapped`] says whether they can.
     pub fn live_document_count(&self) -> usize {
         self.inner.live_document_count()
     }
 
     /// Whether a committed retrieval document is currently visible to search.
-    pub fn contains_retrievable(&self, key: &RetrievalKey) -> bool {
-        self.inner.contains(key)
+    ///
+    /// Refuses while the committed image is unmapped rather than answer `false`
+    /// for every key.
+    pub fn contains_retrievable(&self, key: &RetrievalKey) -> Result<bool, KinDbError> {
+        self.inner
+            .contains(key)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+
+    /// Map the committed image again if a failed commit read-back left it
+    /// unmapped and its files are readable now, and say whether the committed
+    /// documents can be read.
+    ///
+    /// Cheap enough to ask on every read: one atomic load while nothing is
+    /// unmapped, and a manifest read with no mapping while a file the image
+    /// names is still missing. It writes nothing.
+    pub fn remap_if_unmapped(&self) -> bool {
+        self.inner.remap_if_unmapped()
     }
 
     /// Index or re-index a retrievable with temporal provenance.
@@ -735,6 +766,63 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].0, RetrievalKey::Entity(e1.id));
         assert_eq!(reopened.graph_root_hash(), Some([9; 32]));
+    }
+
+    /// The peek a CLI makes beside a live daemon only reads. With a segment
+    /// missing it answers `None` and leaves every file where it is, where the
+    /// writing open it used to make archived the daemon's manifest.
+    #[test]
+    fn peek_root_hash_reads_only_and_moves_nothing() {
+        fn files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("text_index");
+        let idx = TextIndex::open(Some(&path)).unwrap();
+        for n in 0..8 {
+            idx.upsert(&make_entity(
+                &format!("peekTarget{n}"),
+                "src/peek.rs",
+                EntityKind::Function,
+            ))
+            .unwrap();
+        }
+        idx.set_graph_root_hash([7; 32]);
+        idx.commit().unwrap();
+        drop(idx);
+        assert_eq!(
+            TextIndex::peek_root_hash(&path),
+            Some([7; 32]),
+            "the control: a whole image answers"
+        );
+
+        let segment = files(&path)
+            .into_keys()
+            .find(|name| name.contains(".kinseg-") && !name.ends_with(".kinseg-manifest"))
+            .expect("a persisted index is segmented");
+        std::fs::remove_file(path.join(&segment)).unwrap();
+        let before = files(&path);
+        assert!(before.keys().any(|name| name.ends_with(".kinseg-manifest")));
+
+        assert_eq!(TextIndex::peek_root_hash(&path), None);
+        let after = files(&path);
+        assert!(
+            after == before,
+            "a peek must not archive, rename or write: before {:?}, after {:?}",
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

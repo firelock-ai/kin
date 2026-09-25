@@ -212,7 +212,8 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_MEMORY_PRESSURE_CRITICAL_FRACTION", kind: Kind::NonNegF32, default: "0.90", sensitivity: Sensitivity::Operational, summary: "fraction of the memory ceiling at or above which heavy work refuses to start; must be within 0..=1, anything else keeps 0.90, and a value below the elevated fraction is raised to it" },
     EnvVarSpec { name: "KIN_DAEMON_MEMORY_BUDGET_BYTES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "the most one repository daemon and the processes it starts may hold before heavy work backs off, in bytes. Unset derives it as half this machine's total memory, held between 1 GiB and a cap that follows the machine: 8 GiB below 32 GiB of RAM, then 16, 24 and 32 GiB at the 32, 64 and 96 GiB tiers the inference resource plan grades a host on, because a repository daemon holding more than that is pathological for the size of machine it is running on. An operator value wins outright and is not clamped; zero or an unparseable value is ignored, since a budget of zero would refuse every background pass forever" },
     EnvVarSpec { name: "KIN_MEMORY_PRESSURE_SWAP_FRACTION", kind: Kind::NonNegF32, default: "0.50", sensitivity: Sensitivity::Operational, summary: "fraction of configured swap in use at or above which an already-elevated host is treated as critical; must be within 0..=1, and anything else keeps 0.50. Swap standing never raises a host that has room" },
-    EnvVarSpec { name: "KIN_INIT_MEMORY_CEILING_BYTES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "the memory ceiling `kin init` judges a conversion's forecast peak against, in bytes, in place of the container cap or host memory it would otherwise measure. Two audiences share one lever: a machine whose real ceiling Kin reads wrongly can state it, and an operator who has judged the forecast wrong for their repository can get past the refusal without editing anything. An operator value wins outright and is not clamped; zero or an unparseable value is refused rather than ignored, because silently converting under a ceiling nobody set is how a conversion gets killed with no warning. It moves only the up-front refusal and changes nothing about what a conversion holds" },
+    EnvVarSpec { name: "KIN_INIT_MEMORY_CEILING_BYTES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "the memory ceiling `kin init` judges a conversion's forecast peak against, in bytes, in place of the container cap or host memory it would otherwise measure. Two audiences share one lever: a machine whose real ceiling Kin reads wrongly can state it, and an operator who has judged the forecast wrong for their repository can get past the refusal without editing anything. An operator value wins outright and is not clamped; zero or an unparseable value is refused rather than ignored, because silently converting under a ceiling nobody set is how a conversion gets killed with no warning. It moves both memory refusals: the forecast taken before capture is judged against it, and the projection taken after planning against it less the memory already in use. It changes nothing about what a conversion holds" },
+    EnvVarSpec { name: "KIN_INIT_DISK_FREE_BYTES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "the free disk space `kin init` judges a conversion against, in bytes, in place of what the filesystem holding the repository's parent reports. A conversion holds every reachable file version twice, uncompressed, while it copies its capture into the store, so it refuses before any work when free space is under that, and says so in one line when free space is under the store size measured repositories reached. Set it for a filesystem that compresses or deduplicates, where the uncompressed figures overstate what it will use. An operator value wins outright, and zero or an unparseable value is refused rather than ignored. It moves only the up-front check and changes nothing about what a conversion writes" },
     // ---- daemon lifecycle / networking ---------------------------------------
     EnvVarSpec { name: "KIN_DAEMON_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "explicit daemon endpoint URL (skip local discovery)" },
     EnvVarSpec { name: "KIN_DAEMON_BIN", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "override path to the kin-daemon binary" },
@@ -223,6 +224,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_DAEMON_REQUIRE_TOKEN", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "require a bearer token for all daemon requests; set falsy to opt out" },
     EnvVarSpec { name: "KIN_DAEMON_WATCH_PID", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "pid the daemon watches; it exits when that process dies" },
     EnvVarSpec { name: "KIN_DAEMON_EMBED_BATCH_SIZE", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "embedding batch size for daemon-side embed passes" },
+    EnvVarSpec { name: "KIN_LANGUAGE_TOOL_SEARCH", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "look for language servers and the programs they run on beyond the PATH a process inherited: in the directories `kin setup` and `kin doctor --fix` recorded from the shell they ran in, then in the usual per-user install places (rustup's and Go's bin directories, npm's global prefix, nvm, volta, fnm, pyenv, asdf, mise, ~/.local/bin, Homebrew). Each goes behind the inherited entries and ahead of Kin's own tool directories, so a server the operator installed wins. Set falsy to search only the inherited PATH and Kin's own tool directories. Read at process start, so a daemon keeps the value it started with" },
     EnvVarSpec { name: "KIN_DAEMON_AUTO_EMBED", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged" },
     EnvVarSpec { name: "KIN_DAEMON_BOOTSTRAP_EXPORT_CONCURRENCY", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "concurrency for the daemon bootstrap export" },
     EnvVarSpec { name: "KIN_DAEMON_EXACT_SOURCE_EXPORT_WAIT_MS", kind: Kind::Usize, default: "3000", sensitivity: Sensitivity::Operational, summary: "how long one exact-source archive export waits in milliseconds for the daemon's single in-memory export slot before it is refused with a Retry-After. The wait is spent inside the caller's own read bound, so raising it past what one export costs turns a queued clone into a caller timeout instead of an answer. Zero means do not wait, which restores the outright refusal this queue replaced; it is a real value here rather than the unbounded-means-zero convention the millisecond bound knobs use" },
@@ -235,10 +237,16 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_DAEMON_BOOTSTRAP_TIMEOUT_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "timeout for daemon bootstrap-as-admin" },
     EnvVarSpec { name: "KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "timeout for a daemon-side scope graph build" },
     EnvVarSpec { name: "KIN_DAEMON_HOSTED_HYDRATION_TIMEOUT_SECS", kind: Kind::Secs, default: "300", sensitivity: Sensitivity::Operational, summary: "budget for one cold hosted-repository hydration before its admission slot is reclaimed" },
+    EnvVarSpec { name: "KIN_DAEMON_HOSTED_VIEW_PREWARM", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "warm hosted repository views in the background at startup and after each publication; set falsy to turn it off" },
+    EnvVarSpec { name: "KIN_DAEMON_HOSTED_VIEW_PREWARM_MIN_AVAILABLE_MB", kind: Kind::Usize, default: "4096", sensitivity: Sensitivity::Operational, summary: "available memory, in MiB, below which a hosted view pre-warm is deferred" },
     EnvVarSpec { name: "KIN_DAEMON_IDLE_FLUSH_SECS", kind: Kind::Secs, default: "2", sensitivity: Sensitivity::Operational, summary: "idle debounce before a full-graph persistence flush" },
     EnvVarSpec { name: "KIN_DAEMON_PERIODIC_FLUSH_SECS", kind: Kind::Secs, default: "30", sensitivity: Sensitivity::Operational, summary: "maximum interval before dirty graph state is flushed" },
     EnvVarSpec { name: "KIN_DAEMON_SHUTDOWN_GRACE_SECS", kind: Kind::Secs, default: "25", sensitivity: Sensitivity::Operational, summary: "grace before the shutdown watchdog force-exits; 0 escalates immediately" },
     EnvVarSpec { name: "KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS", kind: Kind::Secs, default: "8", sensitivity: Sensitivity::Operational, summary: "bound on tokio runtime teardown waiting for blocking tasks" },
+    EnvVarSpec { name: "KIN_DAEMON_SHUTDOWN_FLUSH_SECS", kind: Kind::Secs, default: "300", sensitivity: Sensitivity::Operational, summary: "how long shutdown waits for the final persistence flush before giving up on it" },
+    EnvVarSpec { name: "KIN_DAEMON_LSP_FILE_BUDGET_SECS", kind: Kind::Secs, default: "120", sensitivity: Sensitivity::Operational, summary: "wall-clock budget for one file's language-server definitions pass; an overrun is counted and the file gets no definitions from that pass" },
+    EnvVarSpec { name: "KIN_DAEMON_PASS_STALL_SECS", kind: Kind::Secs, default: "600", sensitivity: Sensitivity::Operational, summary: "how long a background pass may run without recording durable progress before the daemon stops it; 0 disables stopping" },
+    EnvVarSpec { name: "KIN_DAEMON_PASS_RETRY_BUDGET_SECS", kind: Kind::Secs, default: "1800", sensitivity: Sensitivity::Operational, summary: "cumulative retry delay a failing background pass may spend before it is parked with an announced reason; 0 disables parking" },
     EnvVarSpec { name: "KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the CLI to bootstrap an admin-scoped daemon" },
     EnvVarSpec { name: "KIN_STRICT_BEHAVIOR_ENV", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "escalate a CLI/daemon behavior-env divergence from a warning to a hard error" },
 
@@ -314,13 +322,16 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_ALLOW_PARENT_STORE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow discovering a store in a parent directory" },
     EnvVarSpec { name: "KIN_BINARY_PATH", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "override the kin binary path for bench dispatch" },
     EnvVarSpec { name: "KIN_BUILD_GRAPH_TIMEOUT_SECS", kind: Kind::Secs, default: "60", sensitivity: Sensitivity::Operational, summary: "timeout for building a historical ref-view graph" },
-    EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE", kind: Kind::Str, default: "agent-default", sensitivity: Sensitivity::Operational, summary: "MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), full (every tool), benchmark, context-bench" },
+    EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE", kind: Kind::Str, default: "agent-default", sensitivity: Sensitivity::Operational, summary: "MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), agent-routed (one kin tool whose commands reach the agent belt, writes included, and every other tool through describe and call, for clients that send every tool with every request), agent-routed-query (that tool without a write path), full (every tool), benchmark, context-bench" },
+    EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE_PINNED", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "written by `kin setup` beside KIN_MCP_TOOL_PROFILE in a client's MCP entry when the profile was chosen, with `--tool-profile` or by hand: later `kin setup` and `kin update` runs keep it rather than moving it to the client's default" },
     EnvVarSpec { name: "KIN_MCP_REPO", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "bind `kin mcp start` to this repository instead of the launch directory" },
     EnvVarSpec { name: "KIN_MCP_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "cache directory override for the npm MCP wrapper's managed Kin binary" },
     EnvVarSpec { name: "KIN_MCP_KIN_BINARY", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "explicit native Kin binary used by the @kinlab/kin-mcp wrapper" },
     EnvVarSpec { name: "KIN_MCP_RELEASE_BASE_URL", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "release mirror base URL used by the @kinlab/kin-mcp wrapper" },
     EnvVarSpec { name: "KIN_MCP_AUTO_INIT", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup" },
-    EnvVarSpec { name: "KIN_AGENT_PURE_KIN", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "keep `kin agent run` on Kin tools only, the default: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes; false adds the two file tools back" },
+    EnvVarSpec { name: "KIN_MCP_DAEMON_TIMEOUT_SECS", kind: Kind::Secs, default: "60", sensitivity: Sensitivity::Operational, summary: "how long one forwarded MCP call waits before asking whether the daemon is alive" },
+    EnvVarSpec { name: "KIN_MCP_DAEMON_PATIENCE_SECS", kind: Kind::Secs, default: "300", sensitivity: Sensitivity::Operational, summary: "total wait for one forwarded MCP call once the daemon has shown it is alive but still starting" },
+    EnvVarSpec { name: "KIN_AGENT_PURE_KIN", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "retired switch: `kin agent run` always runs on Kin tools only, and its one write tool is kin_mutate, which names the entity it changes; a false value refuses to start, because the local edit_file and write_file tools are retired" },
     EnvVarSpec { name: "KIN_AGENT_BELT", kind: Kind::Str, default: "default", sensitivity: Sensitivity::Operational, summary: "how much of the server's tool surface `kin agent run` puts on the model: default (the tools an agent needs to answer, edit and publish) or wide (everything the profile serves that the harness does not own)" },
     EnvVarSpec { name: "KIN_AGENT_CONTEXT_ACCOUNTING", kind: Kind::OneOf(&["heuristic", "llama_cpp"]), default: "heuristic", sensitivity: Sensitivity::Correctness, summary: "agent request accounting: heuristic estimates the prepared request; llama_cpp uses the selected server's rendered prompt and tokenizer" },
     EnvVarSpec { name: "KIN_AGENT_OUTPUT_RESERVE_TOKENS", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Correctness, summary: "override the agent's output token reserve; must be positive and below the context window, and unset uses the configured context's answer reserve" },
@@ -1994,37 +2005,104 @@ mod tests {
 
     // ---- workspace env-read completeness ----------------------------------
 
-    /// Extract every `KIN_*` name read through the direct `env::var` / `env::var_os`
-    /// shape in `text`. Env *writes* (`set_var`, `remove_var`), helper-wrapped
-    /// reads, and dynamic reads (a non-literal name) are intentionally excluded.
+    /// Every `KIN_*` name kin's own source reads, directly or through a helper.
+    ///
+    /// A direct read is `env::var` or `env::var_os` with the name as its first
+    /// argument. A helper read is any call whose function name says it reads
+    /// the environment (`locate_env_bool`, `rank_env_f32`, `env_flag`,
+    /// `duration_from_env_secs`) with the name as its first argument. The
+    /// helpers are most of the surface: the locate and ranking pipeline alone
+    /// reads a few hundred knobs through them. A scan that saw only direct reads
+    /// let four locate knobs and six daemon and MCP knobs ship unregistered, and
+    /// the startup audit called every one of them a typo. Setting a child
+    /// process's environment (`Command::env`, `env_remove`) and `set_var` or
+    /// `remove_var` write the name rather than read it, so they are not counted.
+    /// The argument may sit on the next line, which is where rustfmt puts it
+    /// when the call is long. A dynamic read, whose name is not a literal,
+    /// cannot be seen and is not counted.
     fn scan_kin_env_reads(text: &str) -> Vec<String> {
-        // Assemble the read-shape needles from a bare quote char so this scanner's
-        // own source never contains the literal pattern it searches for.
+        const WRITERS: &[&str] = &[
+            "env",
+            "envs",
+            "env_remove",
+            "env_clear",
+            "set_var",
+            "remove_var",
+        ];
+        // Assemble the needle from a bare quote char so this scanner's own
+        // source never contains the literal pattern it searches for.
         let q = '"';
-        let needles = [format!("env::var({q}KIN_"), format!("env::var_os({q}KIN_")];
+        let needle = format!("{q}KIN_");
         let bytes = text.as_bytes();
         let mut found = Vec::new();
-        for needle in &needles {
-            let mut from = 0;
-            while let Some(rel) = text[from..].find(needle.as_str()) {
-                // `start` points at the 'K' of the KIN_ name.
-                let start = from + rel + needle.len() - "KIN_".len();
-                let mut end = start;
-                while end < bytes.len() {
-                    let c = bytes[end];
-                    if c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_' {
-                        end += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if end - start > "KIN_".len() {
-                    found.push(text[start..end].to_string());
-                }
-                from += rel + needle.len();
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(needle.as_str()) {
+            let quote = from + rel;
+            from = quote + needle.len();
+            let start = quote + 1;
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            if end - start <= "KIN_".len() {
+                continue;
+            }
+            // The call this literal is the first argument of.
+            let mut at = quote;
+            while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+                at -= 1;
+            }
+            if at == 0 || bytes[at - 1] != b'(' {
+                continue;
+            }
+            at -= 1;
+            let ident_end = at;
+            while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+                at -= 1;
+            }
+            let ident = &text[at..ident_end];
+            let direct = (ident == "var" || ident == "var_os") && text[..at].ends_with("env::");
+            let helper = ident.contains("env") && !WRITERS.contains(&ident);
+            if direct || helper {
+                found.push(text[start..end].to_string());
             }
         }
         found
+    }
+
+    /// The scan sees a helper read and a read whose argument rustfmt moved to
+    /// the next line, and it does not count writes. Every probe is assembled at
+    /// run time so this file's own source never holds a read it would scan.
+    #[test]
+    fn the_env_read_scan_counts_helper_reads_and_not_writes() {
+        let q = '"';
+        let read = |call: &str, name: &str| format!("let x = {call}({q}{name}{q}, true);");
+        assert_eq!(
+            scan_kin_env_reads(&read("locate_env_bool", "KIN_PROBE_HELPER")),
+            vec!["KIN_PROBE_HELPER".to_string()]
+        );
+        assert_eq!(
+            scan_kin_env_reads(&format!("std::env::var(\n    {q}KIN_PROBE_DIRECT{q})")),
+            vec!["KIN_PROBE_DIRECT".to_string()]
+        );
+        assert_eq!(
+            scan_kin_env_reads(&read("duration_from_env_secs", "KIN_PROBE_SECS")),
+            vec!["KIN_PROBE_SECS".to_string()]
+        );
+        for writer in ["env", "env_remove", "set_var"] {
+            assert!(
+                scan_kin_env_reads(&read(writer, "KIN_PROBE_WRITE")).is_empty(),
+                "{writer} sets the name, it does not read it"
+            );
+        }
+        assert!(
+            scan_kin_env_reads(&read("describe", "KIN_PROBE_TEXT")).is_empty(),
+            "a string passed to a function that does not read the environment is not a read"
+        );
     }
 
     /// Load an intentional-exception allowlist (one `KIN_*` name per line, `#`
@@ -2061,9 +2139,10 @@ mod tests {
         // without a registry entry would make the startup audit lie ("unrecognized
         // … no effect") about a live knob. Cross-repo consumers (kin-db, kin-infer,
         // kin-vfs) cannot be scanned from here — their levers are hand-tracked in
-        // DOWNSTREAM; see that table's note. Helper-wrapped locate/ranking knobs are
-        // extracted into GENERATED_KNOBS by scripts/gen_env_registry.py and are
-        // covered by is_known() the same way.
+        // DOWNSTREAM; see that table's note. Reads through helpers count the same
+        // as direct reads (`scan_kin_env_reads`). Helper-wrapped locate/ranking
+        // knobs are extracted into GENERATED_KNOBS by scripts/gen_env_registry.py;
+        // every other helper-read knob is registered by hand in this file.
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = manifest.join("../..");
         // Skip in a packaged/published single-crate context (mirrors the doc test):

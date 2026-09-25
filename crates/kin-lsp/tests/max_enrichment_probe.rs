@@ -54,6 +54,7 @@ fn main() {
         &[],
         &workspace,
         adapter.initialization_options(&workspace),
+        None,
     )
     .await
     .unwrap();

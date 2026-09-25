@@ -120,6 +120,23 @@ const FAMILY_FILE_CAP: usize = 200;
 /// The block says when it truncated, so a short list is never read as a whole one.
 const EVIDENCE_ROW_CAP: usize = 10;
 
+/// What this reading counts and what it cannot see, published as the block's
+/// `scope` and recited by a verdict that certifies over it.
+///
+/// Both limits follow from how the reading is built, and an absence certified
+/// on it inherits both, so they are stated rather than left for a reader to
+/// derive. A call site counts as arrived when the graph holds any `Calls` edge
+/// from it, wherever that edge lands, so a call the linker bound to a
+/// same-named definition in the caller's own file counts even when the source
+/// meant the focal. And the family is the files holding an import edge into the
+/// focal's file, so a caller that reaches the focal with no such edge, a
+/// same-package caller in a language that needs no import for one, is never
+/// read.
+pub const ARRIVAL_READING_SCOPE: &str = "this reading counts a call site as arrived when the \
+     graph holds any call edge from it, including a call the linker bound to a same-named \
+     definition in the caller's own file, and it reads only the files that hold an import edge \
+     into the focal's file, so a caller that reaches the focal without one is not read";
+
 /// How completely this reading could account for the ways a caller reaches the
 /// focal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +230,15 @@ impl CallerArrival {
     /// reads back. Published on every answer, populated or empty, so a reader
     /// never has to tell "checked and fine" from "not reported".
     pub fn to_json(&self) -> serde_json::Value {
+        let mut block = self.fields_json();
+        block["scope"] = json!(ARRIVAL_READING_SCOPE);
+        block
+    }
+
+    /// The reading's own fields, without the `scope` every block states once.
+    /// An impact answer carries one of these per entity and its scope beside
+    /// them, so the sentence is not repeated on every row.
+    fn fields_json(&self) -> serde_json::Value {
         json!({
             "state": self.state.wire(),
             "family_files": self.family_files,
@@ -848,12 +874,26 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
                 .get("family_files")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            // The count the verdict rests on is `unaccounted_file_count`, which
+            // is never truncated. The rows are capped and five of them are named
+            // here, so counting the named ones reported five files where twelve
+            // held the gap.
+            let unaccounted = block
+                .get("unaccounted_file_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(files.len() as u64)
+                .max(files.len() as u64);
+            let more = unaccounted.saturating_sub(files.len() as u64);
+            let tail = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
             Some(format!(
                 "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: of the {family} file(s) that import the \
-                 focal's file, {} hold call sites the linker recorded no edge for, so a caller of \
-                 this focal may be among them and an empty reference list here is a floor rather \
-                 than proof of disuse: {}",
-                files.len(),
+                 focal's file, {unaccounted} hold call sites the linker recorded no edge for, so a \
+                 caller of this focal may be among them and an empty reference list here is a \
+                 floor rather than proof of disuse: {}{tail}",
                 files.join(", ")
             ))
         }
@@ -1034,6 +1074,330 @@ impl AbsenceGapMemo {
         self.gap(store, focal)
             .map(|(factor, reason)| format!("{factor}: {reason}"))
     }
+}
+
+/// What an `impact_analysis` block reports as its state when no row of the
+/// answer claims an absence, so there was nothing for the reading to qualify.
+pub const IMPACT_ARRIVAL_NOT_APPLICABLE: &str = "not_applicable";
+
+/// The caller-arrival reading an `impact_analysis` answer publishes under
+/// [`CALLER_ARRIVAL_KEY`], taken for every changed entity its answer reports
+/// with no consumers.
+///
+/// A `consumer_count: 0` row is the same claim an empty `find_references` is:
+/// nothing reaches this entity. It is read off the same `Calls` edges, so it has
+/// the same hole, and until this reading existed it was certified over that
+/// hole. An export whose caller sits in a file that imports it, where the
+/// linker recorded no edge for the call, came back `consumer_count: 0` under a
+/// certified verdict while `find_references` refused the same absence on the
+/// same graph.
+///
+/// So each such entity gets [`observe_caller_arrival`], the reading
+/// `find_references` publishes, and its entry carries exactly that reading's
+/// fields beside the entity's id, name and file. The two surfaces then reach
+/// one verdict on one reading. Rows that report consumers claim no absence and
+/// are not read, which is the same scope `find_references` gives the gate: a
+/// shortfall in the arrival paths bounds what "nothing calls this" can mean and
+/// says nothing about the consumers a row did find.
+///
+/// The counts are never truncated; the verdict rests on them. The entries are
+/// evidence a reader audits them with, capped at [`EVIDENCE_ROW_CAP`] with the
+/// refusing ones first, and the block says when it truncated.
+///
+/// Readings are taken once per file, because a reading consults its focal only
+/// through the focal's file and language.
+pub fn observe_impact_arrival<G: GraphStore>(
+    store: &G,
+    entities_without_consumers: &[EntityId],
+) -> serde_json::Value {
+    let mut by_file: std::collections::HashMap<(FilePathId, kin_model::LanguageId), CallerArrival> =
+        std::collections::HashMap::new();
+    let mut entries: Vec<(EntityId, Option<String>, Option<String>, CallerArrival)> = Vec::new();
+    for id in entities_without_consumers {
+        let (name, file, arrival) = match store.get_entity(id) {
+            Ok(Some(entity)) => {
+                let arrival = match entity.file_origin.clone() {
+                    Some(file) => by_file
+                        .entry((file, entity.language))
+                        .or_insert_with(|| observe_caller_arrival(store, &entity))
+                        .clone(),
+                    None => observe_caller_arrival(store, &entity),
+                };
+                (
+                    Some(entity.name),
+                    entity.file_origin.map(|file| file.0),
+                    arrival,
+                )
+            }
+            Ok(None) => (
+                None,
+                None,
+                CallerArrival::unmeasured(
+                    "the changed entity is not in the graph, so the files that can reach it could \
+                     not be established",
+                ),
+            ),
+            Err(_) => (
+                None,
+                None,
+                CallerArrival::unmeasured(
+                    "the entity index could not be read for the changed entity",
+                ),
+            ),
+        };
+        entries.push((*id, name, file, arrival));
+    }
+
+    let count = |state: ArrivalState| {
+        entries
+            .iter()
+            .filter(|(_, _, _, arrival)| arrival.state == state)
+            .count()
+    };
+    let unaccounted = count(ArrivalState::Unaccounted);
+    let unmeasured = count(ArrivalState::Unmeasured);
+    let state = if entries.is_empty() {
+        IMPACT_ARRIVAL_NOT_APPLICABLE
+    } else if unaccounted > 0 {
+        ArrivalState::Unaccounted.wire()
+    } else if unmeasured > 0 {
+        ArrivalState::Unmeasured.wire()
+    } else {
+        ArrivalState::Accounted.wire()
+    };
+
+    // Refusing entries lead, so a capped list still names what limits the
+    // answer. The sort is stable, which keeps the answer's own row order inside
+    // each group.
+    entries.sort_by_key(|(_, _, _, arrival)| arrival.state.certifies_absence());
+    let rows: Vec<serde_json::Value> = entries
+        .iter()
+        .take(EVIDENCE_ROW_CAP)
+        .map(|(id, name, file, arrival)| {
+            let mut row = arrival.fields_json();
+            row["entity_id"] = json!(id.to_string());
+            row["name"] = json!(name);
+            row["file"] = json!(file);
+            row
+        })
+        .collect();
+
+    json!({
+        "state": state,
+        "entities_examined": entries.len(),
+        "unaccounted_entity_count": unaccounted,
+        "unmeasured_entity_count": unmeasured,
+        "entities": rows,
+        "entities_truncated": entries.len() > EVIDENCE_ROW_CAP,
+        "scope": ARRIVAL_READING_SCOPE,
+    })
+}
+
+/// What a certified absence says about this reading when the reading is one of
+/// the inputs it certified over, or `None` when the answer holds no reading
+/// that certified.
+///
+/// A certification on this reading inherits its [`ARRIVAL_READING_SCOPE`], so
+/// the reason a reader acts on names the reading and recites the scope, rather
+/// than leaving the two limits in a block the reason never mentions. Read off
+/// the published block, the way [`arrival_gap`] and [`impact_arrival_gaps`]
+/// read it, so the certified reason and the gaps cannot come apart.
+pub fn arrival_certification_clause(tool: &str, payload: &serde_json::Value) -> Option<String> {
+    let block = payload.get(CALLER_ARRIVAL_KEY)?;
+    if block.get("state").and_then(serde_json::Value::as_str)
+        != Some(ArrivalState::Accounted.wire())
+    {
+        return None;
+    }
+    let count = |key: &str| {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let read = match tool {
+        "find_references" | "get_context_pack" => format!(
+            "the {CALLER_ARRIVAL_KEY} reading found every call site accounted for in the {} \
+             file(s) that import the focal's file",
+            count("family_files")
+        ),
+        "impact_analysis" => format!(
+            "the {CALLER_ARRIVAL_KEY} reading found every call site accounted for in the files \
+             that import each of the {} entities reported with no consumers",
+            count("entities_examined")
+        ),
+        _ => return None,
+    };
+    Some(format!("{read} ({ARRIVAL_READING_SCOPE})"))
+}
+
+/// The gaps an `impact_analysis` answer's own caller-arrival block reports, one
+/// clause per kind of gap, or none when every entity it read was accounted for.
+///
+/// The per-entity arithmetic is [`observe_caller_arrival`]'s and the codes are
+/// the ones [`arrival_gap`] gives `find_references`. What differs is only that
+/// an impact answer can claim several absences at once, so each clause says
+/// how many of the entities it read carry that gap and names them, rather than
+/// speaking of one focal. Two entities sharing a gap therefore make one clause,
+/// which is what the verdict's per-code dedupe would have left anyway, and none
+/// of them is dropped from it.
+///
+/// A payload with no block is not gated here, exactly as [`arrival_gap`] leaves
+/// a reference answer with none. The handler publishes one on every answer.
+pub fn impact_arrival_gaps(payload: &serde_json::Value) -> Vec<String> {
+    let Some(block) = payload.get(CALLER_ARRIVAL_KEY) else {
+        return Vec::new();
+    };
+    let state = block.get("state").and_then(serde_json::Value::as_str);
+    if matches!(
+        state,
+        Some("accounted") | Some(IMPACT_ARRIVAL_NOT_APPLICABLE)
+    ) {
+        return Vec::new();
+    }
+    let reported = state.map_or_else(|| "absent".to_string(), |state| format!("{state:?}"));
+    if !matches!(state, Some("unaccounted") | Some("unmeasured")) {
+        return vec![format!(
+            "caller_arrival_state_unknown: this answer reported the arrival state of the entities \
+             it found no consumers for as {reported}, which is not a state that licenses reading a \
+             zero consumer count as whole"
+        )];
+    }
+
+    let examined = block
+        .get("entities_examined")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let count_of = |key: &str| {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let entities: &[serde_json::Value] = block
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let named = |wire: &str, describe: &dyn Fn(&serde_json::Value) -> String| -> Vec<String> {
+        entities
+            .iter()
+            .filter(|entry| entry.get("state").and_then(serde_json::Value::as_str) == Some(wire))
+            .take(5)
+            .map(|entry| {
+                let name = entry
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| entry.get("entity_id").and_then(serde_json::Value::as_str))
+                    .unwrap_or("an entity with no recorded name");
+                format!("{name} [{}]", describe(entry))
+            })
+            .collect()
+    };
+    // The entities a clause names, and how many more it counts than it names.
+    // The listed rows are capped and the refusing ones lead, so when one kind of
+    // gap fills the cap the other can name none of its entities, and the clause
+    // says so rather than ending on an empty list.
+    let naming = |listed: &[String], total: u64| {
+        let more = total.saturating_sub(listed.len() as u64);
+        match (listed.is_empty(), more) {
+            (true, _) => format!("{total} not among the listed entities"),
+            (false, 0) => listed.join(", "),
+            (false, more) => format!("{} and {more} more", listed.join(", ")),
+        }
+    };
+    // Who a clause is about. One entity is named as the one the answer reported,
+    // and several are counted against the rows the reading examined.
+    let subject = |count: u64| {
+        if examined == 1 {
+            "the entity this answer reports with no consumers".to_string()
+        } else {
+            format!("{count} of the {examined} entities this answer reports with no consumers")
+        }
+    };
+    let pronoun = |count: u64| if count == 1 { "it" } else { "them" };
+
+    // Joined with ", " throughout, never with "; ", which is
+    // `crate::verdict::CLAUSE_SEPARATOR`: a clause carrying it reaches a reader
+    // as a labelled clause and an unlabelled fragment.
+    let mut gaps = Vec::new();
+    let unaccounted = count_of("unaccounted_entity_count");
+    if unaccounted > 0 {
+        let listed = named(ArrivalState::Unaccounted.wire(), &|entry| {
+            let files: Vec<String> = entry
+                .get("unaccounted_files")
+                .and_then(serde_json::Value::as_array)
+                .map(|files| {
+                    files
+                        .iter()
+                        .take(3)
+                        .filter_map(|file| {
+                            let path = file.get("file").and_then(serde_json::Value::as_str)?;
+                            Some(
+                                match file
+                                    .get("unaccounted_call_sites")
+                                    .and_then(serde_json::Value::as_u64)
+                                {
+                                    Some(missing) => format!("{path} {missing} unaccounted"),
+                                    None => format!("{path} no parse-side count in store"),
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Three files are named per entity, out of a count that is never
+            // truncated, so an entity whose gap spans more says how many more
+            // rather than reading as a whole list.
+            let more = entry
+                .get("unaccounted_file_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .saturating_sub(files.len() as u64);
+            if more > 0 {
+                format!("{} and {more} more", files.join(", "))
+            } else {
+                files.join(", ")
+            }
+        });
+        gaps.push(format!(
+            "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: {} can be reached from files that hold call \
+             sites the linker recorded no edge for, so a consumer may be among them and a zero \
+             consumer count there is a floor rather than proof of disuse: {}",
+            subject(unaccounted),
+            naming(&listed, unaccounted),
+        ));
+    }
+    let unmeasured = count_of("unmeasured_entity_count");
+    if unmeasured > 0 {
+        let listed = named(ArrivalState::Unmeasured.wire(), &|entry| {
+            entry
+                .get("unmeasured_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason recorded")
+                .to_string()
+        });
+        gaps.push(format!(
+            "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: for {} the files that can reach {} could not \
+             be established, so a zero consumer count there is not evidence that nothing uses {}: \
+             {}",
+            subject(unmeasured),
+            pronoun(unmeasured),
+            pronoun(unmeasured),
+            naming(&listed, unmeasured),
+        ));
+    }
+    if gaps.is_empty() {
+        // The block named a refusing state and counted nothing under it. That
+        // is a block this function did not write, and a state that refuses is
+        // never read as clearance because its counts are missing.
+        gaps.push(format!(
+            "caller_arrival_state_unknown: this answer reported the arrival state of the entities \
+             it found no consumers for as {reported} and counted no entity under it, so a zero \
+             consumer count cannot be read as whole"
+        ));
+    }
+    gaps
 }
 
 #[cfg(test)]
@@ -1550,9 +1914,29 @@ mod tests {
             "a capped list must say so, or a short list reads as a whole one"
         );
         // And the gate still fires off the capped block, because it keys on the
-        // state and not on the row count.
-        assert!(arrival_gap(&json!({ CALLER_ARRIVAL_KEY: block }))
-            .is_some_and(|gap| gap.starts_with(UNRESOLVED_ARRIVAL_LIMITING_FACTOR)));
+        // state and not on the row count. Its clause counts every file that
+        // holds the gap, not the five it names, and says how many it left out.
+        let gap = arrival_gap(&json!({ CALLER_ARRIVAL_KEY: block }))
+            .expect("an unaccounted block is a gap");
+        assert!(gap.starts_with(UNRESOLVED_ARRIVAL_LIMITING_FACTOR), "{gap}");
+        assert!(
+            gap.contains(&format!(
+                "of the {importers} file(s) that import the focal's file, {importers} hold"
+            )),
+            "the clause counts every unaccounted file: {gap}"
+        );
+        assert!(
+            gap.ends_with(&format!(" and {} more", importers - 5)),
+            "five are named and the rest are counted: {gap}"
+        );
+
+        // An impact answer names three files per entity out of the same count.
+        let impact = observe_impact_arrival(&store, &[focal.id]);
+        let gaps = impact_arrival_gaps(&json!({ CALLER_ARRIVAL_KEY: impact }));
+        assert!(
+            gaps[0].contains(&format!(" and {} more]", importers - 3)),
+            "the entity's own list says how many more files it holds: {gaps:?}"
+        );
 
         // The control: a family under the cap publishes every row and says it
         // did not truncate, so the flag cannot become decoration.
@@ -2228,5 +2612,197 @@ mod tests {
         let gap = arrival_gap(&json!({ CALLER_ARRIVAL_KEY: { "state": "probably_fine" } }))
             .expect("an unrecognized state cannot license an absence");
         assert!(gap.starts_with("caller_arrival_state_unknown"), "{gap}");
+    }
+
+    /// The impact reading is the reference reading, taken per entity. On one
+    /// store and one focal both surfaces have to refuse together or certify
+    /// together, under the same code, or an agent learns which tool to ask
+    /// rather than what is true.
+    #[test]
+    fn impact_and_references_reach_one_verdict_on_one_reading() {
+        for (parsed, resolved, refuses) in [(Some(3), 2, true), (Some(2), 2, false)] {
+            let (store, focal) = store_with(parsed, resolved, true);
+            let references = json!({
+                CALLER_ARRIVAL_KEY: observe_caller_arrival(&store, &focal).to_json(),
+            });
+            let impact = json!({
+                CALLER_ARRIVAL_KEY: observe_impact_arrival(&store, &[focal.id]),
+            });
+            let from_references = arrival_gap(&references);
+            let from_impact = impact_arrival_gaps(&impact);
+            assert_eq!(
+                from_references.is_some(),
+                refuses,
+                "the reference reading: {from_references:?}"
+            );
+            assert_eq!(
+                !from_impact.is_empty(),
+                refuses,
+                "the impact reading disagreed with the reference reading on one store: \
+                 {from_impact:?}"
+            );
+            if refuses {
+                assert!(
+                    from_impact[0].starts_with(UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+                    "the same code, so the verdict names the same gap: {from_impact:?}"
+                );
+                assert!(
+                    from_impact[0].contains(CALLER_FILE) && from_impact[0].contains("note_body"),
+                    "the clause names the entity and the file its caller may be in: \
+                     {from_impact:?}"
+                );
+            }
+        }
+    }
+
+    /// Several zeros at once, with every kind of gap and a clean one. Each kind
+    /// makes one clause naming its entities, the clean entity makes none, and no
+    /// clause carries the separator a reader splits the factor on.
+    #[test]
+    fn an_impact_answer_with_several_zeros_names_each_gap_once() {
+        let (store, focal) = store_with(Some(3), 2, true);
+        // Shares the focal's file, so it shares the reading and is counted
+        // under the same gap without a second walk.
+        let sibling = entity_in("find_note", FOCAL_FILE, Some(2));
+        // An id the graph does not hold, which is how a removed entity arrives.
+        let removed = EntityId::from_content("src/gone.py", "gone", "Function", 0);
+
+        let block = observe_impact_arrival(&store, &[focal.id, sibling.id, removed]);
+        assert_eq!(block["state"], json!("unaccounted"), "{block}");
+        assert_eq!(block["entities_examined"], json!(3));
+        assert_eq!(block["unaccounted_entity_count"], json!(2));
+        assert_eq!(block["unmeasured_entity_count"], json!(1));
+        assert_eq!(block["entities"].as_array().map(Vec::len), Some(3));
+        assert_eq!(block["entities_truncated"], json!(false));
+
+        let gaps = impact_arrival_gaps(&json!({ CALLER_ARRIVAL_KEY: block }));
+        assert_eq!(gaps.len(), 2, "one clause per kind of gap: {gaps:?}");
+        assert!(
+            gaps[0].starts_with(UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "{gaps:?}"
+        );
+        assert!(gaps[0].contains("2 of the 3 entities"), "{gaps:?}");
+        assert!(
+            gaps[0].contains("note_body") && gaps[0].contains("find_note"),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps[1].starts_with(UNMEASURED_ARRIVAL_LIMITING_FACTOR),
+            "{gaps:?}"
+        );
+        assert!(gaps[1].contains("not in the graph"), "{gaps:?}");
+        for gap in &gaps {
+            assert!(
+                !gap.contains(crate::verdict::CLAUSE_SEPARATOR),
+                "a clause carrying the separator reaches a reader as a labelled clause and an \
+                 unlabelled fragment: {gap}"
+            );
+        }
+    }
+
+    /// More refusing entities than the block lists. The count still carries
+    /// every one, and a kind of gap the capped rows leave out says it names none
+    /// of its entities rather than ending on an empty list.
+    #[test]
+    fn a_gap_the_capped_rows_leave_out_is_still_counted_and_worded() {
+        let (store, focal) = store_with(Some(3), 2, true);
+        let mut ids = vec![focal.id];
+        for index in 0..EVIDENCE_ROW_CAP {
+            let sibling = entity_in(&format!("sibling_{index}"), FOCAL_FILE, Some(2));
+            store.upsert_entity(&sibling).unwrap();
+            ids.push(sibling.id);
+        }
+        ids.push(EntityId::from_content("src/gone.py", "gone", "Function", 0));
+
+        let block = observe_impact_arrival(&store, &ids);
+        assert_eq!(
+            block["unaccounted_entity_count"],
+            json!(EVIDENCE_ROW_CAP + 1)
+        );
+        assert_eq!(block["unmeasured_entity_count"], json!(1));
+        assert_eq!(block["entities_truncated"], json!(true));
+
+        let gaps = impact_arrival_gaps(&json!({ CALLER_ARRIVAL_KEY: block }));
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(gaps[0].contains("and 6 more"), "{gaps:?}");
+        assert!(
+            gaps[1].ends_with("1 not among the listed entities"),
+            "{gaps:?}"
+        );
+    }
+
+    /// Each published block states what the reading counts and what it cannot
+    /// read. A reference block carries it beside its fields; an impact block
+    /// carries it once beside its rows rather than once per row, because the
+    /// rows are capped so the block cannot crowd out the answer.
+    #[test]
+    fn every_published_block_states_the_reading_s_scope_once() {
+        let (store, focal) = store_with(Some(2), 2, true);
+        let block = observe_caller_arrival(&store, &focal).to_json();
+        assert_eq!(block["scope"], json!(ARRIVAL_READING_SCOPE));
+
+        let (store, focal) = store_with(Some(3), 2, true);
+        let impact = observe_impact_arrival(&store, &[focal.id]);
+        assert_eq!(impact["scope"], json!(ARRIVAL_READING_SCOPE));
+        let rows = impact["entities"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|row| row.get("scope").is_none()),
+            "the rows do not repeat it: {impact}"
+        );
+        for limit in [
+            "a same-named definition in the caller's own file",
+            "an import edge into the focal's file",
+        ] {
+            assert!(ARRIVAL_READING_SCOPE.contains(limit), "{limit}");
+        }
+    }
+
+    /// A certified absence recites the reading and its scope only where the
+    /// reading certified. A refusing or inapplicable block is not a
+    /// certification, and a tool that never reads the block has none to recite.
+    #[test]
+    fn only_a_reading_that_certified_is_recited_as_one() {
+        let (store, focal) = store_with(Some(2), 2, true);
+        let accounted =
+            json!({ CALLER_ARRIVAL_KEY: observe_caller_arrival(&store, &focal).to_json() });
+        let clause = arrival_certification_clause("find_references", &accounted)
+            .expect("an accounted reading is recited");
+        assert!(clause.contains(ARRIVAL_READING_SCOPE), "{clause}");
+        assert!(arrival_certification_clause("get_context_pack", &accounted).is_some());
+        assert!(arrival_certification_clause("graph_neighborhood", &accounted).is_none());
+
+        let (store, focal) = store_with(Some(3), 2, true);
+        let unaccounted =
+            json!({ CALLER_ARRIVAL_KEY: observe_caller_arrival(&store, &focal).to_json() });
+        assert!(arrival_certification_clause("find_references", &unaccounted).is_none());
+
+        let none = json!({ CALLER_ARRIVAL_KEY: observe_impact_arrival(&store, &[]) });
+        assert!(arrival_certification_clause("impact_analysis", &none).is_none());
+        assert!(arrival_certification_clause("find_references", &json!({})).is_none());
+    }
+
+    /// The controls. An answer that reports no zero has nothing for the reading
+    /// to qualify, and one whose zeros are all accounted for certifies, so the
+    /// gate cannot pass by refusing everything.
+    #[test]
+    fn an_impact_answer_with_no_unaccounted_zero_is_not_gated() {
+        let (store, focal) = store_with(Some(2), 2, true);
+
+        let none = observe_impact_arrival(&store, &[]);
+        assert_eq!(none["state"], json!(IMPACT_ARRIVAL_NOT_APPLICABLE));
+        assert!(impact_arrival_gaps(&json!({ CALLER_ARRIVAL_KEY: none })).is_empty());
+
+        let accounted = observe_impact_arrival(&store, &[focal.id]);
+        assert_eq!(accounted["state"], json!("accounted"), "{accounted}");
+        assert!(impact_arrival_gaps(&json!({ CALLER_ARRIVAL_KEY: accounted })).is_empty());
+
+        // And a block this reader did not write is refused, never read as clear.
+        let gaps = impact_arrival_gaps(&json!({ CALLER_ARRIVAL_KEY: { "state": "fine" } }));
+        assert_eq!(gaps.len(), 1);
+        assert!(
+            gaps[0].starts_with("caller_arrival_state_unknown"),
+            "{gaps:?}"
+        );
     }
 }

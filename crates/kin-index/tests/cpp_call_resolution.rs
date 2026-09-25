@@ -77,9 +77,13 @@ fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
 }
 
 /// Link `files` through both the batch and incremental linkers, assert the two
-/// agree on every `Calls` edge, and return the batch edges. Receiver-scoped
-/// resolution has a batch tier and an incremental twin, so every scenario is
-/// proved on both paths at once.
+/// agree on every `Calls` and entity-rooted `Imports` edge, and return the
+/// batch edges. Receiver-scoped resolution has a batch tier and an incremental
+/// twin, so every scenario is proved on both paths at once.
+///
+/// `Imports` is compared here as well as `Calls`, because this helper compared
+/// calls alone and an import disagreement between the two linkers was ungraded
+/// by every scenario that ran through it.
 fn link_both(files: &[FileParseData]) -> Vec<Relation> {
     let batch = link_cross_file(files);
 
@@ -100,6 +104,17 @@ fn link_both(files: &[FileParseData]) -> Vec<Relation> {
         call_set(&batch),
         call_set(&incremental),
         "batch and incremental linkers must resolve the same C++ call edges"
+    );
+    let import_set = |rels: &[Relation]| -> std::collections::HashSet<(EntityId, EntityId)> {
+        rels.iter()
+            .filter(|r| r.kind == RelationKind::Imports)
+            .filter_map(|r| Some((r.src.as_entity()?, r.dst.as_entity()?)))
+            .collect()
+    };
+    assert_eq!(
+        import_set(&batch),
+        import_set(&incremental),
+        "batch and incremental linkers must resolve the same entity-level import edges"
     );
     batch
 }

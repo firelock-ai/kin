@@ -514,6 +514,52 @@ impl LocalRepositoryAuthorityBinding {
         )
         .map(|(manager, payload_stats)| (manager, Some(payload_stats)))
     }
+
+    /// Read the persisted authority envelope through the retained storage
+    /// capability, without decoding the change history and without writing.
+    ///
+    /// The snapshot and its acknowledged journal are read and digest-checked
+    /// under the repository lock, the journal is replayed onto the envelope,
+    /// and the owed derivation ledger checks a full open runs are run, so it
+    /// hands back nothing a full open would refuse. Unlike an open, it cleans
+    /// nothing up and records nothing. It waits at most `wait` for a lock
+    /// another process holds, then refuses. `Ok(None)` means this cheap read
+    /// cannot answer the store; [`Self::freeze_existing_read_only`] validates
+    /// it in full, still without writing.
+    pub fn read_authority_metadata_read_only(
+        &self,
+        wait: std::time::Duration,
+    ) -> std::result::Result<
+        Option<kin_db::RepositoryAuthorityMetadata<LocalFileBackend>>,
+        kin_db::KinDbError,
+    > {
+        kin_db::RepositoryAuthorityMetadata::open_local_read_only(
+            self.repository_id.clone(),
+            Arc::clone(&self.backend),
+            wait,
+        )
+    }
+
+    /// Validate the persisted authority in full through the retained storage
+    /// capability, and write nothing.
+    ///
+    /// The checks a full open runs: recovery of the head from the snapshot
+    /// and its frames, storage admission, the whole-history replay and every
+    /// persisted body against its content address. It records no history
+    /// validation, cleans nothing up and creates nothing, and a namespace with
+    /// no authority refuses. It waits at most `wait` for a lock another
+    /// process holds, then refuses; once taken, the lock is held until the
+    /// returned freeze is dropped.
+    pub fn freeze_existing_read_only(
+        &self,
+        wait: std::time::Duration,
+    ) -> std::result::Result<kin_db::LocalRepositoryAuthorityFreeze, kin_db::KinDbError> {
+        kin_db::LocalRepositoryAuthorityFreeze::open_existing_read_only_within(
+            self.repository_id.clone(),
+            &self.backend,
+            wait,
+        )
+    }
 }
 
 // Whole-store repository-authority opens this THREAD has performed.

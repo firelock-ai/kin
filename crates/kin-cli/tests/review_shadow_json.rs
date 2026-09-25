@@ -62,6 +62,18 @@ fn git_head(repo: &Path) -> String {
 /// third commit touches only an unparsed artifact (YAML).
 fn setup_fixture_repo(repo: &Path) -> (String, String, String) {
     std::fs::create_dir_all(repo.join("src")).expect("create src");
+    // Rust cross-file imports resolve through proven Cargo project authority,
+    // which discovers its targets from admitted `Cargo.toml` entries and grants
+    // no fallback to the repository-wide name bucket. Without a manifest the
+    // `use crate::billing::compute_total;` below binds to nothing, so the blast
+    // radius this fixture asserts on would be empty for a reason that has
+    // nothing to do with the review gate under test. Edition 2021 auto-infers
+    // the lib target at `src/lib.rs`, which this fixture already writes.
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"shadow-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
     std::fs::write(
         repo.join("src/billing.rs"),
         "pub fn compute_total(amount: u64) -> u64 {\n    amount + fee()\n}\n\nfn fee() -> u64 {\n    3\n}\n",
@@ -69,7 +81,7 @@ fn setup_fixture_repo(repo: &Path) -> (String, String, String) {
     .expect("write billing.rs");
     std::fs::write(
         repo.join("src/invoice.rs"),
-        "use crate::billing::compute_total;\n\npub fn render_invoice(amount: u64) -> String {\n    format!(\"total: {}\", compute_total(amount))\n}\n",
+        "use crate::billing::compute_total;\n\npub fn render_invoice(amount: u64) -> String {\n    compute_total(amount).to_string()\n}\n",
     )
     .expect("write invoice.rs");
     std::fs::write(

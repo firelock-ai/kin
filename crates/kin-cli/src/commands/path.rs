@@ -206,6 +206,7 @@ mod tests {
             resolution: relation.map(|_| "type_resolved".to_string()),
             site_lines: relation.map(|_| vec![line + 1]).unwrap_or_default(),
             site_lines_absent_reason: None,
+            site_lines_partial_reason: None,
         }
     }
 

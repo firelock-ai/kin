@@ -308,3 +308,62 @@ fn an_annotation_naming_a_class_this_file_never_imported_emits_no_edge_at_all() 
         "an annotation naming a class this file never imported must emit no edge"
     );
 }
+
+/// A consumer whose only use of a type imported from outside the repository is
+/// a class field's declared type.
+const EXTERNAL_FIELD_PY: &str =
+    "from requests import Session\n\n\nclass Client:\n    session: Session\n";
+
+#[test]
+fn a_field_annotation_naming_an_externally_imported_type_keeps_its_external_reference() {
+    // The parser keeps the field in the edge's `receiver` and names the imported
+    // type in `dst_name`. That receiver is the holder the reference hangs off,
+    // not an object the name is read from, so the edge still names the import.
+    // A rule that treated every receiver as a member access dropped this edge,
+    // and the class lost its only link to the type it declares.
+    let files = vec![parse_py("client.py", EXTERNAL_FIELD_PY)];
+    assert!(
+        files[0].relations.iter().any(|raw| {
+            raw.kind == RelationKind::References
+                && raw.dst_name == "Session"
+                && raw.receiver.as_deref() == Some("session")
+                && raw.import_source.as_deref() == Some("requests")
+        }),
+        "the fixture must carry the receiver-bearing, import-pinned reference under test: {:#?}",
+        files[0].relations
+    );
+    let client = entity_id_in(&files, "client.py", "Client");
+    let mut incremental = kin_index::IncrementalLinker::new();
+    for file in &files {
+        incremental.add_file(&file.file_path, ArtifactId::new(), &file.entities);
+    }
+    for (linker, relations) in [
+        ("batch", link(&files)),
+        (
+            "incremental",
+            kin_index::link_cross_file_incremental(&files, &incremental)
+                .expect("the incremental index holds every fixture file"),
+        ),
+    ] {
+        let external: Vec<_> = relations
+            .iter()
+            .filter(|rel| {
+                rel.src == GraphNodeId::Entity(client)
+                    && kin_index::is_external_import_placeholder(rel)
+            })
+            .collect();
+        assert_eq!(external.len(), 1, "{linker}: {relations:#?}");
+        assert_eq!(external[0].kind, RelationKind::References, "{linker}");
+        assert_eq!(
+            external[0].import_source.as_deref(),
+            Some("requests"),
+            "{linker}"
+        );
+        assert_eq!(
+            external[0].evidence[0].token.as_deref(),
+            Some("Session"),
+            "{linker}"
+        );
+        assert_eq!(external[0].evidence[0].occurrence_count, 1, "{linker}");
+    }
+}

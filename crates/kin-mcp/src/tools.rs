@@ -3,25 +3,36 @@
 
 use crate::types::{ToolAnnotations, ToolDefinition, ToolsListResult};
 
-/// The `max_chars` property every retrieval tool advertises, built from the
-/// budget's own constants.
+/// The `max_chars` property every retrieval tool the shared budget ladder
+/// answers advertises, built from the budget's own constants.
 ///
 /// Nine tools carried a byte-identical copy of this block with the numbers
 /// written out, so moving the ceiling meant editing ten homes and a release read
 /// whichever one was missed. The stranger who asked for 120,000 characters was
 /// reading one of those copies, which advertised 400,000 while a real client
 /// refused 117,313. There is one home now, and it is the constant.
+///
+/// The words say target, not ceiling. The ladder keeps at least one entry in
+/// every list it cuts, so a reply whose kept entries still do not fit ships
+/// over the budget and says so under `response_over_budget`, and "may occupy"
+/// told a caller about a limit the reply does not keep. The unit is UTF-8 bytes,
+/// because both passes measure the length of the JSON text. The two context
+/// tools refuse a pack that cannot fit instead, so they advertise
+/// [`context_max_chars_property`].
 fn max_chars_property() -> serde_json::Value {
     serde_json::json!({
         "type": "integer",
         "description": format!(
-            "Serialized characters this response may occupy (default {default}, clamped \
-             {min}..{max}). The ceiling is what a real MCP client accepts, not what this server \
-             could build. The tool enforces the budget itself: it sheds ranking explanation, then \
-             duplicated hit shapes, then inline source, and only then withholds entries, and it \
-             never empties a list it cut. A list the budget cut keeps at least one entry and is \
-             reported under `elisions` with what it kept, what it lost, and why, so an empty array \
-             always means the walk found none. Any cut is also reported in `degradations` and in \
+            "UTF-8 bytes of JSON text, the `_kin` envelope included and JSON-RPC escaping \
+             excluded, that the tool cuts this response toward (default {default}, clamped \
+             {min}..{max}). It is a target, not a hard ceiling. The tool enforces it itself: it \
+             sheds ranking explanation, then duplicated hit shapes, then inline source, and only \
+             then withholds entries, and it never empties a list it cut. A list the budget cut \
+             keeps at least one entry and is reported under `elisions` with what it kept, what it \
+             lost, and why, so an empty array always means the walk found none. When the entries \
+             it keeps still do not fit, the response ships over the budget and says so under \
+             `response_over_budget`. The {max} maximum is what a real MCP client accepts, not \
+             what this server could build. Any cut is also reported in `degradations` and in \
              `_kin.response`, which carries the size the response had before the budget.",
             default = crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
             min = crate::budget::RESPONSE_MIN_MAX_CHARS,
@@ -33,17 +44,61 @@ fn max_chars_property() -> serde_json::Value {
     })
 }
 
+/// The same budget on `get_context_pack` and `trace_computation`, which keep it
+/// as a hard limit.
+///
+/// These two answer under their own token budget as well. The pack is cut to
+/// fit both, one section can be cut until it is empty, with `elisions`
+/// recording `kept: 0`, and a pack whose remaining metadata still cannot fit
+/// both is refused rather than shipped over, on the daemon route and in the
+/// stdio envelope pass alike. So neither the soft-cap words nor the promise
+/// that a cut list keeps an entry would be true of them.
+fn context_max_chars_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": format!(
+            "UTF-8 bytes of JSON text, the `_kin` envelope included and JSON-RPC escaping \
+             excluded, this response may occupy (default {default}, clamped {min}..{max}). It is \
+             a hard limit here: the pack is cut to fit both this and its `token_budget`, \
+             rendered `lines` first, then inline source, then rows one at a time from the end of \
+             each section in turn, and a pack whose remaining metadata still cannot fit both is \
+             refused with an error rather than shipped over. A section the budget cut can be \
+             left empty, so read `elisions`: it names each cut section with what it kept, what it \
+             lost, and why, and `kept: 0` there means the budget emptied that section rather \
+             than the graph holding nothing for it. Any cut is also reported in `degradations` \
+             and in `_kin.response`, which carries the size the response had before the budget. \
+             The {max} maximum is what a real MCP client accepts, not what this server could \
+             build.",
+            default = crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+            min = crate::budget::RESPONSE_MIN_MAX_CHARS,
+            max = crate::budget::RESPONSE_MAX_MAX_CHARS,
+        ),
+        "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+        "minimum": crate::budget::RESPONSE_MIN_MAX_CHARS,
+        "maximum": crate::budget::RESPONSE_MAX_MAX_CHARS,
+    })
+}
+
 /// `trace_data_flow`'s own spelling of the same budget.
+///
+/// The words say target, not ceiling, because the route does not refuse: below
+/// the size of its smallest retained walk it ships that walk over the budget and
+/// discloses the overrun, and a caller who read "may occupy" as a hard cap was
+/// told a number the response does not keep.
 fn trace_max_chars_property() -> serde_json::Value {
     serde_json::json!({
         "type": "integer",
         "description": format!(
-            "Serialized characters this response may occupy (default {default}, clamped \
-             {min}..{max}, the same budget every retrieval tool answers under). The tool enforces \
-             it itself, dropping bodies before edges, and it never returns an empty chain for a \
-             walk that found steps: a cut chain keeps at least one step and reports the rest under \
-             `elisions.chain` and `steps_omitted`. `max_chars` is the same parameter under the \
-             name the other retrieval tools use.",
+            "UTF-8 bytes of JSON text, the `_kin` envelope included, that the walk cuts this \
+             response toward (default {default}, clamped {min}..{max}, the same budget every \
+             retrieval tool answers under). It is a target, not a hard ceiling. The tool drops \
+             bodies before edges and never returns an empty chain for a walk that found steps: a \
+             cut chain keeps at least one step, and `elisions.chain` accounts for every step the \
+             walk reached. When even that smallest walk, with its identity, its required \
+             disclosures and the `_kin` envelope, does not fit, the tool answers with it anyway \
+             and says so under `response_over_budget`. A focal or `target` several owners share \
+             is held to the budget instead and refused when it cannot fit. `max_chars` is the \
+             same parameter under the name the other retrieval tools use.",
             default = crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
             min = crate::budget::RESPONSE_MIN_MAX_CHARS,
             max = crate::budget::RESPONSE_MAX_MAX_CHARS,
@@ -119,159 +174,39 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 
 /// Honest JSON Schema for one transaction operation.
 ///
-/// The product daemon accepts seven materially different shapes. A source-body
-/// edit, a new source file, a rewritten source file, a retirement, and a rename
-/// are all intentionally payload-less; guarded body edits and structured
-/// entity/relation mutations require `payload`. Disjoint `oneOf` branches prevent MCP
-/// clients from being told that the preferred source-edit form is invalid.
-///
-/// No two branches can match one operation: the five payload-less branches
-/// carry disjoint verb enums, and the structured branch requires `payload`,
-/// which none of the others accepts. The rewrite has a verb of its own rather
-/// than a path reading of `update` for that reason: an entity name and a
-/// repository path are both bare strings, so one verb covering both would make
-/// an operation's meaning depend on how its target happened to resolve.
+/// Source edits address one entity and bind to the exact source revision the
+/// caller read: an anchored patch, or a whole body with its `EntitySourceBase`.
+/// There is no unguarded body edit, and a structured `Entity` payload carries
+/// no body. Structured mutations address entities or edges. Conversion-shaped
+/// file operations are not part of this agent schema.
 fn transaction_operation_schema() -> serde_json::Value {
     serde_json::json!({
         "oneOf": [
             {
-                "title": "Retired source file",
+                "title": "Anchored entity source patch",
                 "type": "object",
                 "properties": {
-                    "verb": {
-                        "type": "string",
-                        "enum": ["delete", "remove"],
-                        "description": "Retire a tracked file. This is the only operation that removes a file, along with every entity derived from it and every edge incident to those entities."
-                    },
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Repository-relative path of the file to retire, such as \"src/parser.py\". It must be a path repository authority already tracks; a path the graph has never seen is refused."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Human-readable explanation of this change."
+                    "verb": { "type": "string", "enum": ["patch"] },
+                    "target": { "type": "string", "format": "uuid", "description": "The exact entity UUID in source_base." },
+                    "description": { "type": "string" },
+                    "payload": {
+                        "type": "object",
+                        "properties": { "EntitySourcePatch": crate::source_base::entity_source_patch_schema() },
+                        "required": ["EntitySourcePatch"],
+                        "additionalProperties": false
                     }
                 },
-                "required": ["verb", "target", "description"],
-                "additionalProperties": false
-            },
-            {
-                "title": "Renamed source file",
-                "type": "object",
-                "properties": {
-                    "verb": {
-                        "type": "string",
-                        "enum": ["rename", "move"],
-                        "description": "Relocate a tracked file. Entity identity, history, and incoming edges survive the move, which is what separates this from a delete followed by a create."
-                    },
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Repository-relative path the file lives at now. It must be a path repository authority already tracks."
-                    },
-                    "destination": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Repository-relative path the file moves to. It must not be tracked already, and it follows the same path rules as `target`: no leading slash, no \"..\", and no Kin or Git control component."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Human-readable explanation of this change."
-                    }
-                },
-                "required": ["verb", "target", "destination", "description"],
-                "additionalProperties": false
-            },
-            {
-                "title": "New source file",
-                "type": "object",
-                "properties": {
-                    "verb": {
-                        "type": "string",
-                        "enum": ["create", "add", "insert"],
-                        "description": "Admit a source file the graph has never seen. This is the only operation that introduces a new file."
-                    },
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Repository-relative path of the new file, such as \"src/parser.py\". No leading slash, no \"..\", and no Kin or Git control component. A path the graph already tracks is refused; rewrite that one with verb 'replace' instead."
-                    },
-                    "body": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "The file's complete UTF-8 source text. Kin parses it with the same extractor the ingest path uses, so every entity in it enters the graph, and writes the file into the working directory when the transaction commits. You do not need to write the file yourself first."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Human-readable explanation of this change."
-                    }
-                },
-                "required": ["verb", "target", "body", "description"],
-                "additionalProperties": false
-            },
-            {
-                "title": "Replaced source file",
-                "type": "object",
-                "properties": {
-                    "verb": {
-                        "type": "string",
-                        "enum": ["replace", "overwrite"],
-                        "description": "Rewrite a tracked file from its complete new text. This is the operation to use when you hold a path and the file's new contents, which is what a local edit or write leaves you holding."
-                    },
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Repository-relative path of the file to rewrite, such as \"src/parser.py\". It must be a path repository authority already tracks; a path the graph has never seen is refused, and 'create' is the verb for it."
-                    },
-                    "body": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "The file's complete new UTF-8 source text, never a fragment or a diff. Kin reparses it with the same extractor the ingest path uses, so entities the new text adds enter the graph, entities it drops leave it, and the rest keep their identity. A body identical to the tracked contents is refused as an empty change."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Human-readable explanation of this change."
-                    }
-                },
-                "required": ["verb", "target", "body", "description"],
-                "additionalProperties": false
-            },
-            {
-                "title": "Entity source body edit",
-                "type": "object",
-                "properties": {
-                    "verb": {
-                        "type": "string",
-                        "enum": ["update", "modify"],
-                        "description": "Update an existing source entity."
-                    },
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Exact repository entity UUID or unambiguous exact entity name."
-                    },
-                    "body": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "The entity's complete new UTF-8 source text, including its own leading indentation. Do not submit a truncated retrieval body."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Human-readable explanation of this change."
-                    }
-                },
-                "required": ["verb", "target", "body", "description"],
+                "required": ["verb", "target", "payload", "description"],
                 "additionalProperties": false
             },
             {
                 "title": "Guarded entity source body edit",
                 "type": "object",
                 "properties": {
-                    "verb": { "type": "string", "enum": ["update", "modify"] },
+                    "verb": { "type": "string", "enum": ["update", "modify"], "description": "Update an existing source entity." },
                     "target": { "type": "string", "format": "uuid", "description": "The exact entity UUID in source_base." },
-                    "body": { "type": "string", "minLength": 1 },
-                    "description": { "type": "string" },
+                    "body": { "type": "string", "minLength": 1, "description": "The entity's complete new UTF-8 source text, including its own leading indentation. Do not submit a truncated retrieval body." },
+                    "description": { "type": "string", "description": "Human-readable explanation of this change." },
                     "payload": {
                         "type": "object",
                         "properties": { "EntitySourceBase": crate::source_base::source_base_schema() },
@@ -304,11 +239,7 @@ fn transaction_operation_schema() -> serde_json::Value {
                             { "required": ["Entity"], "properties": { "Entity": { "type": "object" } }, "additionalProperties": false },
                             { "required": ["Relation"], "properties": { "Relation": { "type": "object" } }, "additionalProperties": false }
                         ],
-                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}."
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Full new UTF-8 source text for a source-bound Entity update. Omit for Relation operations."
+                        "description": "Exact mutation payload: {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}, or {\"Entity\": { ...an existing entity's full internal record... }}. Neither creates source: create a declaration with EntityCreate, and replace one with the guarded body edit carrying EntitySourceBase."
                     },
                     "description": {
                         "type": "string",
@@ -317,6 +248,42 @@ fn transaction_operation_schema() -> serde_json::Value {
                 },
                 "required": ["verb", "target", "payload", "description"],
                 "additionalProperties": false
+            },
+            {
+                "title": "EntityCreate",
+                "type":"object",
+                "properties": {
+                    "verb":{"type":"string","enum":["create"]},
+                    "target":{"type":"string","minLength":1,"description":"The declared name for a unit-addressed creation; the source_base anchor UUID for an anchored one."},
+                    "description":{"type":"string"},
+                    "payload":{"type":"object","properties":{"EntityCreate":crate::entity_lifecycle::entity_create_schema()},"required":["EntityCreate"],"additionalProperties":false}
+                },
+                "required":["verb","target","payload","description"],
+                "additionalProperties":false
+            },
+            {
+                "title": "UnitImports",
+                "type":"object",
+                "properties": {
+                    "verb":{"type":"string","enum":["update"]},
+                    "target":{"type":"string","minLength":1,"description":"The unit's package name."},
+                    "description":{"type":"string"},
+                    "payload":{"type":"object","properties":{"UnitImports":crate::source_unit::unit_imports_schema()},"required":["UnitImports"],"additionalProperties":false}
+                },
+                "required":["verb","target","payload","description"],
+                "additionalProperties":false
+            },
+            {
+                "title": "EntityRemove",
+                "type":"object",
+                "properties": {
+                    "verb":{"type":"string","enum":["remove"]},
+                    "target":{"type":"string","format":"uuid","description":"Exact source_base anchor/entity UUID."},
+                    "description":{"type":"string"},
+                    "payload":{"type":"object","properties":{"EntityRemove":crate::entity_lifecycle::entity_remove_schema()},"required":["EntityRemove"],"additionalProperties":false}
+                },
+                "required":["verb","target","payload","description"],
+                "additionalProperties":false
             }
         ]
     })
@@ -423,8 +390,15 @@ pub fn annotate_unserved_cross_references(
     for tool in &mut list.tools {
         let named = unserved_tools_named_in(&tool.description, registered, served);
         if !named.is_empty() {
-            tool.description
-                .push_str(&unserved_cross_reference_note(&named, search_is_served));
+            if served.contains(crate::tool_invocation::TOOL_NAME) {
+                tool.description.push_str(&format!(
+                    " These tools are named above but not served by this tool profile: {}. Call kin_tool_search for schemas; kin_tool_call invokes read-only matches. Mutating operations require a profile that serves them directly.",
+                    named.join(", ")
+                ));
+            } else {
+                tool.description
+                    .push_str(&unserved_cross_reference_note(&named, search_is_served));
+            }
         }
     }
 }
@@ -482,9 +456,39 @@ pub fn served_tools_list(
     tools
 }
 
+/// Whether a connection serving `allowed` can write through Kin: the full
+/// surface, or any profile that serves a tool the registry does not annotate
+/// read-only.
+///
+/// A write connection restates entity bodies byte for byte, so it is served
+/// them exactly as the graph holds them; see [`crate::entity_lines`].
+pub fn serves_a_write_tool(allowed: Option<&std::collections::HashSet<String>>) -> bool {
+    let Some(allowed) = allowed else {
+        return true;
+    };
+    tool_definitions()
+        .tools
+        .iter()
+        .any(|tool| allowed.contains(&tool.name) && !tool.annotations.read_only_hint)
+}
+
 /// The name set for one profile, in the shape [`served_tools_list`] takes.
 pub fn name_set(names: &[&str]) -> std::collections::HashSet<String> {
     names.iter().map(|name| (*name).to_string()).collect()
+}
+
+/// Retired file operations refuse before transport forwarding or graph admission.
+/// Conversion and materialization use their explicit internal boundaries.
+pub fn retired_file_operation(name: &str) -> Option<&'static str> {
+    match name {
+        "kin_artifact_read" => Some(
+            "Whole-artifact reading is unavailable; select get_entity_source or bounded get_context_pack for a semantic entity",
+        ),
+        "kin_artifact_list" | "list_file_entities" => Some(
+            "File catalogs are unavailable on agent surfaces; find entities with semantic_search or semantic_locate, then follow graph_neighborhood or find_references",
+        ),
+        _ => None,
+    }
 }
 
 /// Build the list of all MCP tools that Kin exposes, in name order.
@@ -496,6 +500,8 @@ pub fn name_set(names: &[&str]) -> std::collections::HashSet<String> {
 pub fn tool_definitions() -> ToolsListResult {
     let mut list = registered_tools();
     list.tools.extend(crate::entity_drafts::tool_definitions());
+    list.tools.push(crate::repository_init::tool_definition());
+    list.tools.push(crate::session_exec::tool_definition());
     list.tools.sort_by(|left, right| left.name.cmp(&right.name));
     list
 }
@@ -503,67 +509,6 @@ pub fn tool_definitions() -> ToolsListResult {
 fn registered_tools() -> ToolsListResult {
     ToolsListResult {
         tools: vec![
-            ToolDefinition {
-                name: "kin_artifact_list".into(),
-                description: crate::handlers::artifacts::ARTIFACT_LIST_DESC.into(),
-                annotations: read_only("List artifacts"),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "source_change_id": {
-                            "type": "string",
-                            "pattern": "^[0-9a-f]{64}$",
-                            "description": "Exact semantic change ID. Defaults to the current branch head."
-                        },
-                        "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 }
-                    },
-                    "additionalProperties": false
-                }),
-            },
-            ToolDefinition {
-                name: "kin_artifact_read".into(),
-                description: crate::handlers::artifacts::ARTIFACT_READ_DESC.into(),
-                annotations: read_only("Read artifact"),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "artifact_id": { "type": "string", "format": "uuid" },
-                        "path": {
-                            "description": "Repo-relative path as in path_label (a leading / is fine), or {bytes_hex} for non-UTF-8",
-                            "anyOf": [
-                                { "type": "string", "minLength": 1 },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "bytes_hex": {
-                                            "type": "string",
-                                            "pattern": "^(?:[0-9a-f]{2})+$"
-                                        }
-                                    },
-                                    "required": ["bytes_hex"],
-                                    "additionalProperties": false
-                                }
-                            ]
-                        },
-                        "source_change_id": {
-                            "type": "string",
-                            "pattern": "^[0-9a-f]{64}$",
-                            "description": "Exact semantic change ID. Defaults to the current branch head."
-                        },
-                        "include_bytes": {
-                            "type": "boolean",
-                            "default": false,
-                            "description": "Also return content_base64 for a UTF-8 body. Non-UTF-8 bytes always come as base64."
-                        }
-                    },
-                    "anyOf": [
-                        { "required": ["artifact_id"] },
-                        { "required": ["path"] }
-                    ],
-                    "additionalProperties": false
-                }),
-            },
             ToolDefinition {
                 name: "semantic_search".into(),
                 description: crate::handlers::entities::SEMANTIC_SEARCH_DESC.into(),
@@ -573,7 +518,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "max_chars": max_chars_property(),
                         "query": { "type": "string", "description": "Name pattern to search for" },
-                        "kind": { "type": "string", "description": "Entity kind filter (function, class, etc.). `command` is a CLI command: it narrows to callable declarations and ranks the command's own run function and its constructor -- `apiRun` and `NewCmdApi` under `pkg/cmd/api/` -- above declarations that merely share a word with the command's name." },
+                        "kind": { "type": "string", "description": format!("{} `command` is a CLI command: it narrows to callable declarations and ranks the command's own run function and its constructor -- `apiRun` and `NewCmdApi` under `pkg/cmd/api/` -- above declarations that merely share a word with the command's name.", crate::handlers::common::SEMANTIC_SEARCH_KIND_GUIDANCE) },
                         "language": { "type": "string", "description": "Language filter (rust, typescript, etc.)" },
                         "limit": { "type": "integer", "description": "Max results to return", "default": 20 },
                         "compact": { "type": "boolean", "description": "If true (default), return only id/name/kind/language/file_path/start_line/end_line/signature. If false, also include doc_summary.", "default": true }
@@ -596,18 +541,18 @@ fn registered_tools() -> ToolsListResult {
                             "items": { "type": "string" },
                             "description": "Optional additional query variants for multi-query fan-out. When present, `query` plus each variant are retrieved independently and their rankings RRF-fused into one deduped result. The response echoes the fan-out once under `queries`, and each hit's `matched_variant_indexes` gives the positions in that list of the variants that surfaced it. Diverse variants (identifiers, behavior, subsystem) recover more relevant hits than any single phrasing. Requires the fused pipeline (automatic when set)."
                         },
-                        "limit": { "type": "integer", "minimum": 1, "description": "Max ranked primary rows per page: entities at entity granularity, files at file granularity. Default 20.", "default": 20 },
+                        "limit": { "type": "integer", "minimum": 1, "description": "Max ranked semantic entities per page. Default 20.", "default": 20 },
                         "page_size": { "type": "integer", "minimum": 1, "description": "Primary rows per page; overrides `limit` for paging when set." },
-                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`: returns the NEXT absolute page of the same ranked entity or file collection from cache with no re-search. Omit for a fresh query." },
+                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`: returns the NEXT absolute page of the same ranked entity collection from cache with no re-search. Omit for a fresh query." },
                         "granularity": {
                             "type": "string",
-                            "enum": ["file", "entity"],
-                            "description": "Rank entities ('entity', default) or roll up to files ('file')",
+                            "enum": ["entity"],
+                            "description": "Rank semantic entities; file granularity is unavailable",
                             "default": "entity"
                         },
                         "include_snippet": {
                             "type": "boolean",
-                            "description": "Attach a bounded inline source excerpt to each entity hit, projected from graph-owned content. Read it from `body` on the fused pipeline (routing `fused-v1`, the default) and from `snippet` on the cosine pipeline (routing `cosine-v0`); `routing` on the response says which answered. Each hit carries the text once. Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no excerpt rather than a placeholder.",
+                            "description": "Attach a bounded inline source excerpt to each entity hit, projected from graph-owned content. Read it from `body` on the fused pipeline (routing `fused-v1`, the default) and from `snippet` on the cosine pipeline (routing `cosine-v0`); `routing` on the response says which answered. Each hit carries the text once. A hit with no graph-owned body carries no excerpt rather than a placeholder.",
                             "default": true
                         },
                         "snippet_alias": {
@@ -630,11 +575,7 @@ fn registered_tools() -> ToolsListResult {
                             "description": "Include the fused pipeline's debug object (per-stage scores and the prune ledger). Fused pipeline only.",
                             "default": false
                         }
-                    },
-                    "anyOf": [
-                        { "required": ["query"] },
-                        { "required": ["cursor"] }
-                    ]
+                    }
                 }),
             },
             ToolDefinition {
@@ -656,7 +597,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "entity_id": { "type": "string", "description": "Entity UUID" }
+                        "entity_id": { "type": "string", "description": "Entity UUID, or a name: one exact name or lone member answers, others list candidates." }
                     },
                     "required": ["entity_id"]
                 }),
@@ -668,7 +609,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "entity_id": { "type": "string", "description": "Entity UUID" }
+                        "entity_id": { "type": "string", "description": "Entity UUID, or a name: one exact name or lone member answers, others list candidates." }
                     },
                     "required": ["entity_id"]
                 }),
@@ -715,7 +656,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": max_chars_property(),
+                        "max_chars": context_max_chars_property(),
                         "entity_id": { "type": "string", "description": "Focal entity UUID" },
                         "entities": {
                             "type": "array",
@@ -728,16 +669,13 @@ fn registered_tools() -> ToolsListResult {
                             "type": "string",
                             "description": "Resolve the focals from this question through Kin's own ranking, instead of naming them. Needs the repo daemon, which is where the ranking runs."
                         },
-                        "token_budget": { "type": "integer", "description": "Token budget (8000, 16000, or 32000)", "default": 16000 },
+                        "token_budget": { "type": "integer", "description": "Exact positive token budget for the rendered pack; 0 uses 8000", "default": 16000 },
                         "depth": { "type": "integer", "description": "Dependency traversal depth", "default": 2 },
                         "include_traffic": { "type": "boolean", "description": "Include active nearby agent traffic in response", "default": true },
-                        "compact": { "type": "boolean", "description": "If true, all entities returned as SignatureOnly (~2-5KB). If false (default), focal gets FullBody, deps get SignatureOnly, transitive get NameAndKind.", "default": false }
-                    },
-                    "anyOf": [
-                        { "required": ["entity_id"] },
-                        { "required": ["entities"] },
-                        { "required": ["question"] }
-                    ]
+                        "compact": { "type": "boolean", "description": "If true, neighbours carry no projection and the transitive, tests and contracts sections are dropped; the focal body is still served unless focal_body is false. If false (default), the focal gets its body, dependencies and dependents get SignatureOnly unless neighbor_bodies is true, and transitive rows get NameAndKind.", "default": false },
+                        "neighbor_bodies": { "type": "boolean", "description": "Also serve the exact bodies of dependencies and dependents within the budget. Default false: neighbours are signatures. Single entity_id packs only.", "default": false },
+                        "focal_body": { "type": "boolean", "description": "Serve the focal's exact body. False returns the neighbourhood with the focal as its signature, for a caller that already holds the body. Single entity_id packs only.", "default": true }
+                    }
                 }),
             },
             ToolDefinition {
@@ -747,7 +685,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "max_chars": max_chars_property(),
+                        "max_chars": context_max_chars_property(),
                         "entity_id": { "type": "string", "description": "Focal entity UUID. Required if `query` is not given." },
                         "query": { "type": "string", "description": "Exact entity name to resolve to a focal entity. Required if `entity_id` is not given." },
                         "depth": { "type": "integer", "description": "Dependency traversal depth across the trace neighborhood", "default": 3 },
@@ -826,10 +764,11 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "answer_only": { "type": "boolean", "description": "Return reference rows and trust limits. False restores detailed coverage and candidates.", "default": false },
                         "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query is provided." },
-                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided. Alone it is ranked, not exact. When several declarations share the name, the ranking prefers the most referenced one, and `focal_resolution` reports the rest. An owner-qualified name (`Receiver.method` in Go, `Owner.member` in TypeScript, and the same shape in other languages where the graph names members that way) is exact. An `entity_id` from semantic_locate or list_file_entities is exact too." },
+                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided. Alone it is ranked, not exact. When several declarations share the name, the ranking prefers the most referenced one, and `focal_resolution` reports the rest. An owner-qualified name (`Receiver.method` in Go, `Owner.member` in TypeScript, and the same shape in other languages where the graph names members that way) is exact. An exact whole name answers first. With none, a bare member name (`get` for the method `Scaffold.get`, a field, or an enum variant) reaches the owners' members: one answers directly, and several are each answered in their own section under `candidates_by_owner`. An `entity_id` from semantic_locate or semantic_search is exact too." },
                         "relation_kinds": {
                             "type": "array",
                             "description": "Filter relation kinds. Supported values: calls, imports, references. Defaults to all three.",
@@ -993,7 +932,16 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "entity_id": { "type": "string", "description": "Entity UUID" }
+                        "entity_id": { "type": "string", "description": "Entity UUID" },
+                        "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Maximum serialized JSON text UTF-8 bytes, including the MCP envelope but excluding JSON-RPC escaping. Details are explicitly summarized and pages retain next_offset; irreducible oversized metadata returns an error.",
+                            "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+                            "minimum": crate::budget::RESPONSE_MIN_MAX_CHARS,
+                            "maximum": crate::budget::RESPONSE_MAX_MAX_CHARS
+                        }
                     },
                     "required": ["entity_id"]
                 }),
@@ -1016,15 +964,17 @@ fn registered_tools() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
-                name: crate::handlers::file_entities::TOOL_NAME.into(),
-                description: crate::handlers::file_entities::LIST_FILE_ENTITIES_DESC.into(),
-                annotations: read_only("List file entities"),
+                name: crate::handlers::lexical::TOOL_NAME.into(),
+                description: crate::handlers::lexical::LEXICAL_LOOKUP_DESC.into(),
+                annotations: read_only("Lexical lookup"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Repository-relative path of the file to enumerate, such as \"lib/express.js\". No leading slash, no \"..\", and no Kin or Git control component. A leading \"./\" is dropped and backslashes are read as separators; nothing else is rewritten, because a path resolved by suffix resolves to whichever file happened to end that way. Optional only when `cursor` is given, which already names the file." },
-                        "page_size": { "type": "integer", "description": "Entities per page (default 200, clamped 1..1000). `total_in_file` is the whole-file count on every page, so a page smaller than it is a page, never the file.", "default": 200, "minimum": 1, "maximum": 1000 },
-                        "cursor": { "type": "string", "description": "Opaque token from a prior result's `next_cursor`, returning the next page of the same enumeration. Pass it back unedited; it carries the path and the count the page was cut from, so a file that changed under the walk is reported as `enumeration_shifted` rather than paged silently against a different list." }
+                        "max_chars": max_chars_property(),
+                        "literal": { "type": "string", "description": "The exact token, call/member fragment, string, or short phrase to find. A bare literal, not a sentence describing it: 'fetchCodespaces', not 'where is fetchCodespaces called from'. Optional only when `cursor` is given, which already carries it. ASCII case-insensitive, including punctuation; max 4096 bytes." },
+                        "kind": { "type": "string", "description": "Entity kind (function, class, etc.); test selects test role. Unknown kinds refuse." },
+                        "limit": { "type": "integer", "description": "Max hits per page (default 20, clamped 1..100).", "default": 20, "minimum": 1, "maximum": 100 },
+                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`, returning the next page of the same lookup. Carries `literal`, `kind`, and a digest of matching entity contents. Supplied filters must agree; changed contents require restarting without the cursor." }
                     }
                 }),
             },
@@ -1157,13 +1107,13 @@ fn registered_tools() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_begin".into(),
-                description: "Begin an exact repository mutation transaction. Product commits currently support full-body edits of existing source entities and relation add/upsert/remove operations; unsupported source insertion/deletion fails before repository mutation. Returns a unique transaction_id.".into(),
+                description: "Begin an exact repository mutation transaction. Product commits support guarded edits of existing source entities (an anchored patch, or a full body carrying its EntitySourceBase), declaration creation addressed to a unit or anchored beside a function, import management on a unit, function removal, and relation add/upsert/remove operations; other source insertion/deletion fails before repository mutation. Returns a unique transaction_id.".into(),
                 annotations: mutates("Begin transaction"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string", "description": "Session UUID owning the transaction" },
-                        "scope": { "type": "string", "description": "Target scope (e.g. filename, module, etc.)" }
+                        "scope": { "type": "string", "description": "A short label for the change, such as \"repository\" or \"add the store package\". It is recorded with the transaction and never addresses a file." }
                     },
                     "required": ["session_id", "scope"]
                 }),
@@ -1248,27 +1198,19 @@ fn registered_tools() -> ToolsListResult {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": 256,
-                            "description": "Optional opaque nonblank UTF-8 key (at most 256 bytes). A supporting authenticated daemon durably binds the complete request in this repository and session. Identical retries return the original kin.mutate.receipt.v1 receipt and original authority roots; different arguments refuse. Preserve session_id across retries and MCP restart. Offline and older daemons refuse keyed calls. Without this key calls remain non-idempotent."
+                            "description": "Optional opaque nonblank UTF-8 key (at most 256 bytes). A supporting authenticated daemon durably binds the complete request in this repository and session. Identical retries return the original kin.mutate.receipt.v1 receipt and original authority roots; different arguments refuse. Preserve session_id across retries and MCP restart. A keyed call must carry session_id, takes scope repository only, and accepts no field but operations, session_id, scope, request_id and summary. Offline and older daemons refuse keyed calls. Without this key calls remain non-idempotent."
                         },
                         "summary": {
                             "type": "string",
                             "description": "Optional change message: one sentence in your own words saying what this change does, which becomes the subject a human reads in history. Omit it and the change records only the transaction id, which names the call and not the work."
                         }
                     },
-                    "required": ["operations"],
-                    "allOf": [{
-                        "if": { "required": ["request_id"] },
-                        "then": {
-                            "required": ["session_id"],
-                            "properties": { "scope": { "const": "repository" } },
-                            "propertyNames": { "enum": ["operations", "session_id", "scope", "request_id", "summary"] }
-                        }
-                    }]
+                    "required": ["operations"]
                 }),
             },
             ToolDefinition {
                 name: "kin_transaction_abort".into(),
-                description: "Abort an active or validated transaction and discard all staged mutations. Once kin_transaction_commit has fenced the transaction for publication this is refused, because repository authority may already have moved; re-send the commit instead, which resumes the fenced payload idempotently and reports whether it landed. You do not need abort to recover from a refused commit: a commit refused before publication already clears its staged operations and names them, so corrected ones go on the same transaction.".into(),
+                description: "Abort an active or validated transaction and discard all staged mutations. Once kin_transaction_commit has fenced the transaction for publication this is refused, because repository authority may already have moved; re-send the commit instead, which resumes the fenced payload idempotently and reports whether it landed. Planning refusals may name cleared operations; authority, semantic-boundary and source-base refusals retain staged work. Abort only to discard it.".into(),
                 annotations: destructive_idempotent("Abort transaction"),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1549,12 +1491,7 @@ fn registered_tools() -> ToolsListResult {
                         "created_by_kind": { "type": "string", "description": "Optional creator kind: human, assistant, agent, or system" },
                         "requested_reviewers": { "type": "array", "items": { "type": "string" }, "description": "Optional initial reviewer assignments" }
                     },
-                    "required": ["title"],
-                    "anyOf": [
-                        { "required": ["base", "head"] },
-                        { "required": ["scope_type", "entity_ids"] },
-                        { "required": ["scopes"] }
-                    ]
+                    "required": ["title"]
                 }),
             },
             ToolDefinition {
@@ -1654,11 +1591,7 @@ fn registered_tools() -> ToolsListResult {
                         "assigned_by": { "type": "string", "description": "Optional assigner identity" },
                         "assigned_by_kind": { "type": "string", "description": "Optional assigner kind: human, assistant, agent, or system" }
                     },
-                    "required": ["review_id"],
-                    "anyOf": [
-                        { "required": ["reviewer"] },
-                        { "required": ["reviewers"] }
-                    ]
+                    "required": ["review_id"]
                 }),
             },
             ToolDefinition {
@@ -1708,6 +1641,20 @@ fn registered_tools() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: crate::tool_invocation::TOOL_NAME.into(),
+                description: crate::tool_invocation::DESCRIPTION.into(),
+                annotations: read_only("Invoke discovered read tool"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "description": "Exact registered tool name returned by kin_tool_search."},
+                        "arguments": {"type": "object", "description": "Input object matching the discovered tool schema."}
+                    },
+                    "required": ["tool", "arguments"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDefinition {
                 name: crate::handlers::tool_search::TOOL_NAME.into(),
                 description: crate::handlers::tool_search::TOOL_SEARCH_DESC.into(),
                 annotations: read_only("Tool search"),
@@ -1716,7 +1663,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "need": {
                             "type": "string",
-                            "description": "What you are trying to do, in plain language, such as \"what breaks if I change this\" or \"read one file's exact bytes\". Omit it to enumerate the whole registry."
+                            "description": "What you are trying to do, in plain language, such as \"what breaks if I change this\" or \"read one entity's exact source\". Omit it to enumerate the whole registry."
                         },
                         "limit": {
                             "type": "integer",
@@ -1753,8 +1700,6 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
 /// Tool names for the small default agent profile.
 pub fn agent_default_tool_names() -> &'static [&'static str] {
     &[
-        "kin_artifact_list",
-        "kin_artifact_read",
         "kin_graph_status",
         "semantic_locate",
         "semantic_search",
@@ -1776,6 +1721,11 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         // one call where the locate-then-trace loop cost five.
         crate::handlers::path::TOOL_NAME,
         "find_references",
+        // The literal-lookup complement to `find_references`: a lexical hit
+        // over indexed text, for a literal-shaped question or for
+        // corroboration when a structural tool's own verdict came back
+        // inconclusive (see `kin-agent`'s system prompt for the routing rule).
+        crate::handlers::lexical::TOOL_NAME,
         "graph_neighborhood",
         // The enumeration half of discovery. Every other retrieval tool in this
         // profile ranks, filters, or walks, and none of them can say what it
@@ -1783,7 +1733,6 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         // answers and the first one a file-first user asks -- had to be answered
         // by scavenging ids out of a locate ranking and hoping it was whole
         // (FIR-2546).
-        crate::handlers::file_entities::TOOL_NAME,
         "kin_session_start",
         "kin_session_heartbeat",
         "kin_session_end",
@@ -1797,6 +1746,20 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         // that cannot abandon a transaction cannot honor "nothing half-applies".
         "kin_transaction_abort",
         "kin_provenance_query",
+        // The first call a new user's agent makes answers "not a Kin
+        // repository", and on a registry install there is no `kin` on the
+        // user's PATH to run `kin init` with. This profile already writes, so
+        // it carries the setup itself. It is a write: it creates a store and
+        // the repository's canonical state, so the profiles that only read
+        // never carry it, and their refusal names the command to run instead.
+        crate::repository_init::TOOL_NAME,
+        // The other half of writing code through this belt: building, testing
+        // and running what `kin_mutate` wrote. `kin setup` serves this profile
+        // to Claude Code, and `kin with --semantic-only` launches it with no
+        // shell at all, so without it an agent Kin itself configured could
+        // create code and never run it. It writes the manifests a toolchain
+        // run hands back, so the read-only profiles never carry it.
+        crate::session_exec::TOOL_NAME,
     ]
 }
 
@@ -1833,8 +1796,6 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
 /// that door as much as a writing one does.
 pub fn agent_query_tool_names() -> &'static [&'static str] {
     &[
-        "kin_artifact_list",
-        "kin_artifact_read",
         "kin_graph_status",
         "semantic_locate",
         "semantic_search",
@@ -1844,11 +1805,30 @@ pub fn agent_query_tool_names() -> &'static [&'static str] {
         "trace_data_flow",
         crate::handlers::path::TOOL_NAME,
         "find_references",
+        crate::handlers::lexical::TOOL_NAME,
         "graph_neighborhood",
-        crate::handlers::file_entities::TOOL_NAME,
         "kin_provenance_query",
     ]
 }
+
+/// Tool names for the routed profiles: the one routed tool.
+///
+/// For a client that loads every tool it is handed and re-sends them all with
+/// every request. `agent-routed` and `agent-routed-query` both serve only this
+/// name; their commands reach the belt's tools through [`crate::routed`], with
+/// the same belt defaults, dispatch and `_kin` envelope the named profiles give
+/// them, and `describe` and `call` reach every other tool the surface may run.
+/// Which surface a connection serves is `McpServerConfig::routed`.
+pub fn agent_routed_tool_names() -> &'static [&'static str] {
+    &[crate::routed::TOOL_NAME]
+}
+
+/// The most bytes `agent-query`'s served `tools/list` may cost.
+///
+/// 14,610 at 97c719c8d, measured on 2026-09-22 before its descriptions were
+/// halved, and 11,079 after. A ceiling, so a description edit that saves bytes
+/// passes and one that grows the list back fails.
+pub const AGENT_QUERY_LIST_CEILING_BYTES: usize = 11_079;
 
 /// The most bytes the tool-search profile's `tools/list` may cost, measured on
 /// the profile AS SERVED.
@@ -1883,10 +1863,9 @@ pub const AGENT_SEARCH_LIST_CEILING_BYTES: usize = 8_000;
 /// at all, and nothing in it reproduces the outside claims that a smaller tool
 /// surface raises accuracy.
 ///
-/// Everything else is reached through [`crate::handlers::tool_search`], which is
-/// what makes this a smaller list rather than a smaller product: an agent on
-/// this profile can still reach all 67 registered tools, one lookup away, with
-/// their full schemas.
+/// Hidden operations are discovered through [`crate::handlers::tool_search`]
+/// and read-only operations are invoked through `kin_tool_call`. Mutations
+/// still require a direct call on a profile that serves the operation.
 ///
 /// ## Why `kin_graph_status` stays
 ///
@@ -1908,6 +1887,7 @@ pub fn agent_search_tool_names() -> &'static [&'static str] {
         "get_context_pack",
         "kin_graph_status",
         crate::handlers::tool_search::TOOL_NAME,
+        crate::tool_invocation::TOOL_NAME,
     ]
 }
 
@@ -1923,8 +1903,6 @@ pub fn agent_search_tool_names() -> &'static [&'static str] {
 /// `get_entity_source`/`get_context_pack`, all without ever touching a file.
 pub fn context_bench_tool_names() -> &'static [&'static str] {
     &[
-        "kin_artifact_list",
-        "kin_artifact_read",
         "kin_graph_status",
         "semantic_locate",
         "semantic_search",
@@ -2221,8 +2199,11 @@ mod tests {
             }
         }
 
+        // Two since 2026-09-22: the halved `get_context_pack` short form no
+        // longer names `get_entity_source`, so `agent-search` carries two notes,
+        // for `semantic_locate` and `trace_data_flow`, where it carried three.
         assert!(
-            annotated_total >= 3,
+            annotated_total >= 2,
             "the sweep annotated {annotated_total} served descriptions across three profiles, \
              so it is not reaching the surface it grades"
         );
@@ -2319,14 +2300,15 @@ mod tests {
             schema.get("required").is_none(),
             "query cannot remain unconditionally required when cursor-only paging is documented: {schema}"
         );
-        let alternatives = schema["anyOf"]
-            .as_array()
-            .expect("semantic_locate declares query-or-cursor alternatives");
-        let required = alternatives
+        // The rule lives in the server, not the schema: a provider tool API
+        // drops a tool whose schema opens with a combinator.
+        assert!(
+            crate::input_contract::top_level_combinators(schema).is_empty(),
+            "{schema}"
+        );
+        let required = crate::input_contract::alternatives("semantic_locate")
             .iter()
-            .filter_map(|alternative| alternative["required"].as_array())
-            .filter_map(|items| items.first())
-            .filter_map(serde_json::Value::as_str)
+            .flat_map(|set| set.iter().copied())
             .collect::<BTreeSet<_>>();
         assert_eq!(required, BTreeSet::from(["cursor", "query"]));
         for field in ["limit", "page_size"] {
@@ -2349,6 +2331,7 @@ mod tests {
         "kin_draft_save",
         "kin_annotation_add",
         "kin_annotation_mark_resolved",
+        "kin_init",
         "kin_mutate",
         "kin_register_intent",
         "kin_release_intent",
@@ -2361,6 +2344,7 @@ mod tests {
         "kin_review_note_add",
         "kin_review_unassign",
         "kin_session_end",
+        "kin_session_exec",
         "kin_session_heartbeat",
         "kin_session_start",
         "kin_todo_import",
@@ -2384,11 +2368,14 @@ mod tests {
     /// and republishes the ref; `kin_transaction_abort` clears the staged
     /// operations outright; `kin_work_status` and `kin_review_discuss_resolve`
     /// replace a state field in place; `kin_annotation_mark_resolved` deletes
-    /// the annotation; `kin_review_unassign` removes the assignment.
+    /// the annotation; `kin_review_unassign` removes the assignment;
+    /// `kin_session_exec` records the manifests and lockfiles a toolchain
+    /// rewrote over the ones the repository held.
     const DESTRUCTIVE_TOOLS: &[&str] = &[
         "kin_draft_apply",
         "kin_annotation_mark_resolved",
         "kin_mutate",
+        "kin_session_exec",
         "kin_review_discuss_resolve",
         "kin_review_unassign",
         "kin_transaction_abort",
@@ -2424,9 +2411,12 @@ mod tests {
                 tool.name,
                 tool.name.len()
             );
-            assert!(
-                !annotations.open_world_hint,
-                "{} claims an open world; the whole surface answers from the local graph",
+            // One exception, and it is the honest hint: a toolchain run may
+            // fetch from a package registry, which is outside the graph.
+            assert_eq!(
+                annotations.open_world_hint,
+                tool.name == crate::session_exec::TOOL_NAME,
+                "{} claims the wrong world; the rest of the surface answers from the local graph",
                 tool.name
             );
             if annotations.read_only_hint {
@@ -2590,14 +2580,12 @@ mod tests {
                 .find(|tool| tool["name"] == tool_name)
                 .unwrap_or_else(|| panic!("{tool_name} must be exposed by tools/list"));
             assert_eq!(tool["description"], expected_description);
-            assert!(
-                tool["description"]
-                    .as_str()
-                    .is_some_and(|description| description.contains("payload-less")),
-                "{tool_name} must advertise the preferred payload-less source-edit form"
-            );
             if tool_name == "kin_transaction_stage" {
                 let description = tool["description"].as_str().unwrap();
+                assert!(
+                    description.contains("guarded entity patch"),
+                    "{description}"
+                );
                 assert!(description.contains("indentation"), "{description}");
                 assert!(description.contains("[truncated]"), "{description}");
             }
@@ -2612,113 +2600,91 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 7, "{tool_name}");
-
-            let retirement = variants
+            assert_eq!(variants.len(), 6, "{tool_name}");
+            let imports = variants
                 .iter()
-                .find(|variant| variant["title"] == "Retired source file")
-                .expect("payload-less retirement branch");
+                .find(|variant| variant["title"] == "UnitImports")
+                .expect("unit import management branch");
             assert_eq!(
-                required_set(retirement),
-                ["description", "target", "verb"]
+                imports["properties"]["payload"]["properties"]["UnitImports"],
+                crate::source_unit::unit_imports_schema()
+            );
+            let create = variants
+                .iter()
+                .find(|variant| variant["title"] == "EntityCreate")
+                .expect("creation branch");
+            let forms = create["properties"]["payload"]["properties"]["EntityCreate"]["oneOf"]
+                .as_array()
+                .expect("creation takes one of two forms");
+            assert_eq!(forms.len(), 2, "{tool_name}");
+
+            let patch = variants
+                .iter()
+                .find(|variant| variant["title"] == "Anchored entity source patch")
+                .expect("guarded patch branch");
+            assert_eq!(
+                required_set(patch),
+                ["description", "payload", "target", "verb"]
                     .into_iter()
                     .map(String::from)
                     .collect()
             );
-            assert!(
-                retirement["properties"].get("payload").is_none(),
-                "payload-less retirement branch must reject payload"
-            );
-            assert!(
-                retirement["properties"].get("body").is_none(),
-                "a retirement carries no body; accepting one would let a delete read as an edit"
+            assert!(patch["properties"].get("body").is_none());
+            assert_eq!(
+                patch["properties"]["payload"]["properties"]["EntitySourcePatch"],
+                crate::source_base::entity_source_patch_schema()
             );
 
-            let rename = variants
-                .iter()
-                .find(|variant| variant["title"] == "Renamed source file")
-                .expect("payload-less rename branch");
-            assert_eq!(
-                required_set(rename),
-                ["description", "destination", "target", "verb"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect()
-            );
-            assert!(
-                rename["properties"].get("payload").is_none(),
-                "payload-less rename branch must reject payload"
-            );
-
-            let new_source_file = variants
-                .iter()
-                .find(|variant| variant["title"] == "New source file")
-                .expect("payload-less new-source-file branch");
-            assert_eq!(
-                required_set(new_source_file),
-                ["body", "description", "target", "verb"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect()
-            );
-            assert!(
-                new_source_file["properties"].get("payload").is_none(),
-                "payload-less new-source-file branch must reject payload"
-            );
-
-            let replaced_source_file = variants
-                .iter()
-                .find(|variant| variant["title"] == "Replaced source file")
-                .expect("payload-less replaced-source-file branch");
-            assert_eq!(
-                required_set(replaced_source_file),
-                ["body", "description", "target", "verb"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect()
-            );
-            assert!(
-                replaced_source_file["properties"].get("payload").is_none(),
-                "payload-less replaced-source-file branch must reject payload"
-            );
-            // The rewrite is only decidable from the operation itself while its
-            // verbs belong to it alone among the payload-less branches. Sharing
-            // one with the entity edit would make the shape depend on how a
-            // bare target string happened to resolve. The structured branch is
-            // exempt because `payload` already separates it from all five.
-            let verbs = |variant: &serde_json::Value| {
-                variant["properties"]["verb"]["enum"]
-                    .as_array()
-                    .expect("every branch pins its verbs")
-                    .iter()
-                    .map(|verb| verb.as_str().expect("a verb is a string").to_string())
-                    .collect::<std::collections::BTreeSet<String>>()
-            };
-            for other in variants.iter().filter(|variant| {
-                variant["title"] != "Replaced source file"
-                    && variant["title"] != "Structured entity or relation mutation"
-            }) {
-                assert!(
-                    verbs(replaced_source_file).is_disjoint(&verbs(other)),
-                    "the rewrite branch shares a verb with {}",
-                    other["title"]
-                );
+            for variant in variants {
+                let title = variant["title"].as_str().unwrap();
+                assert!(!title.contains("source file"), "{tool_name}: {title}");
+                assert!(variant["properties"].get("destination").is_none());
+                let verbs = variant["properties"]["verb"]["enum"].as_array().unwrap();
+                for forbidden in ["replace", "overwrite", "rename", "move"] {
+                    assert!(
+                        !verbs.iter().any(|verb| verb == forbidden),
+                        "{tool_name}: {forbidden}"
+                    );
+                }
+                if variant["properties"].get("payload").is_none() {
+                    assert_eq!(
+                        verbs,
+                        &vec![serde_json::json!("update"), serde_json::json!("modify")]
+                    );
+                }
             }
 
-            let body_edit = variants
+            // There is no unguarded body edit: every variant that carries a body
+            // also requires the payload that binds it to the revision read.
+            assert!(
+                !variants
+                    .iter()
+                    .any(|variant| variant["title"] == "Entity source body edit"),
+                "{tool_name}: the unguarded body-edit branch is retired"
+            );
+            for variant in variants {
+                if variant["properties"].get("body").is_some() {
+                    assert!(
+                        required_set(variant).contains("payload"),
+                        "{tool_name}: {} carries a body without a required payload",
+                        variant["title"]
+                    );
+                }
+            }
+            let guarded = variants
                 .iter()
-                .find(|variant| variant["title"] == "Entity source body edit")
-                .expect("payload-less body-edit branch");
+                .find(|variant| variant["title"] == "Guarded entity source body edit")
+                .expect("guarded body-edit branch");
             assert_eq!(
-                required_set(body_edit),
-                ["body", "description", "target", "verb"]
+                required_set(guarded),
+                ["body", "description", "payload", "target", "verb"]
                     .into_iter()
                     .map(String::from)
                     .collect()
             );
-            assert!(
-                body_edit["properties"].get("payload").is_none(),
-                "payload-less body-edit branch must reject payload"
+            assert_eq!(
+                guarded["properties"]["payload"]["required"],
+                serde_json::json!(["EntitySourceBase"])
             );
 
             let structured = variants
@@ -2732,6 +2698,10 @@ mod tests {
                     .map(String::from)
                     .collect()
             );
+            assert!(
+                structured["properties"].get("body").is_none(),
+                "{tool_name}: a structured Entity payload carries no source text"
+            );
         }
     }
 
@@ -2739,10 +2709,10 @@ mod tests {
     fn expected_tool_count() {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
-        // + 1 get_entity_sources + 2 exact artifact tools
-        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search + 1 kin_mutate
-        // + 6 durable entity draft tools = 74
-        assert_eq!(list.tools.len(), 74);
+        // + 1 get_entity_sources + 1 trace_path + 1 kin_tool_search + 1 kin_mutate
+        // + 6 durable entity draft tools + 1 lexical_lookup + 1 kin_tool_call
+        // + 1 kin_init + 1 kin_session_exec = 75
+        assert_eq!(list.tools.len(), 75);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -2971,9 +2941,14 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         let profile = agent_default_tool_names();
 
         // 22 since kin_mutate joined: atomic one-shot mutation lets agents commit
-        // graph edits without multi-step transaction ceremonies.
+        // graph edits without multi-step transaction ceremonies. 23 since
+        // lexical_lookup joined: a literal-shaped question, or a structural
+        // tool's own inconclusive verdict, needs a lexical-index answer the rest
+        // of this profile has no way to give. 24 since kin_init joined: on a
+        // registry install the first answer says the folder is not a Kin
+        // repository, and no `kin` is on the user's PATH to fix that with.
         assert!(
-            profile.len() >= 10 && profile.len() <= 22,
+            profile.len() >= 10 && profile.len() <= 24,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -3085,11 +3060,9 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
                 "get_entity_source",
                 "graph_neighborhood",
                 "impact_analysis",
-                "kin_artifact_list",
-                "kin_artifact_read",
                 "kin_graph_status",
                 "kin_provenance_query",
-                "list_file_entities",
+                "lexical_lookup",
                 "semantic_locate",
                 "semantic_search",
                 "trace_data_flow",
@@ -3128,8 +3101,10 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         assert_eq!(
             removed,
             vec![
+                "kin_init",
                 "kin_mutate",
                 "kin_session_end",
+                "kin_session_exec",
                 "kin_session_heartbeat",
                 "kin_session_start",
                 "kin_transaction_abort",
@@ -3217,6 +3192,71 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         );
     }
 
+    /// `agent-query`'s served list cannot grow back past what it cost once its
+    /// descriptions were halved.
+    ///
+    /// An eager client re-sends this list with every request, and at 14,610
+    /// bytes it was about 3,500 tokens a request in the corrected rerun pilot.
+    /// The number is printed as well as asserted, because it is the artifact:
+    /// the next person to edit a description should be able to read its cost.
+    #[test]
+    fn the_query_listing_stays_under_its_measured_ceiling() {
+        // Measured as the server serves it, source tool numbering included.
+        let config = crate::server::McpServerConfig {
+            allowed_tools: Some(name_set(agent_query_tool_names())),
+            agent_belt: true,
+            number_entity_lines: true,
+            ..crate::server::McpServerConfig::default()
+        };
+        let query = crate::server::served_tools_for(&config);
+        assert_eq!(query.tools.len(), agent_query_tool_names().len());
+        assert!(
+            query
+                .tools
+                .iter()
+                .any(|tool| tool.name == "get_entity_source"
+                    && tool.description == crate::entity_lines::NUMBERED_SOURCE_DESCRIPTION),
+            "the measured listing is not the numbered one agent-query serves"
+        );
+        let bytes = serde_json::to_string(&query)
+            .expect("a tool listing serializes")
+            .len();
+        println!(
+            "tools/list bytes: agent-query {bytes}, about {} tokens at four bytes a token, \
+             ceiling {AGENT_QUERY_LIST_CEILING_BYTES}, 14,610 at 97c719c8d",
+            bytes / 4
+        );
+        assert!(
+            bytes <= AGENT_QUERY_LIST_CEILING_BYTES,
+            "agent-query's tools/list is {bytes} bytes, over its {AGENT_QUERY_LIST_CEILING_BYTES}\
+             -byte ceiling; a description grew back"
+        );
+        // The control: a real surface, not an empty one under a ceiling.
+        assert!(bytes > 5_000, "the query listing is {bytes} bytes");
+    }
+
+    /// A named write connection is told apart from a read-only one by the
+    /// registry's own annotations, so a profile that gains a write tool changes
+    /// answer. A routed connection's writes are its surface's, not its name
+    /// set's, which is the one routed tool on both routed profiles.
+    #[test]
+    fn write_connections_are_the_ones_serving_a_write_tool() {
+        assert!(serves_a_write_tool(None));
+        assert!(serves_a_write_tool(Some(&name_set(
+            agent_default_tool_names()
+        ))));
+        for read_only in [
+            agent_query_tool_names(),
+            agent_search_tool_names(),
+            context_bench_tool_names(),
+        ] {
+            assert!(
+                !serves_a_write_tool(Some(&name_set(read_only))),
+                "{read_only:?}"
+            );
+        }
+    }
+
     /// The always-on set is static, so grade it exactly: these names, this many,
     /// each one registered and read-only, and the listing under its ceiling.
     ///
@@ -3238,6 +3278,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
                 "get_context_pack",
                 "kin_graph_status",
                 crate::handlers::tool_search::TOOL_NAME,
+                crate::tool_invocation::TOOL_NAME,
                 "semantic_locate",
                 "trace_data_flow",
             ]),
@@ -3256,7 +3297,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
                 });
             assert!(
                 tool.annotations.read_only_hint,
-                "agent-search serves '{name}', which the registry does not annotate read-only"
+                "{name} must remain read-only"
             );
         }
 
@@ -3292,10 +3333,12 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         ))
         .expect("a tool listing serializes")
         .len();
+        // The absolute measured byte ceiling above guards growth. A fixed
+        // half-of-query ratio penalizes removing tools from the query profile
+        // even when this listing gets no larger.
         assert!(
-            bytes * 2 < query_bytes,
-            "agent-search is {bytes} bytes against agent-query's {query_bytes}, which is not the \
-             order-of-magnitude cut this profile exists to buy"
+            bytes < query_bytes,
+            "agent-search is {bytes} bytes and must remain smaller than agent-query's {query_bytes}"
         );
         let serialized = serde_json::to_string(&served).expect("a tool listing serializes");
         for withheld in ["impact_analysis", "find_references", "get_entity_source"] {

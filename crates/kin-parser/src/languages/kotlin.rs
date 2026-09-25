@@ -59,6 +59,30 @@ impl LanguageAdapter for KotlinAdapter {
             }
         }
 
+        // The file module owns entity-level import edges, and it has to sit
+        // first so `module_entity_by_file` reads it rather than a declaration
+        // that happens to sit above the rest. A file that declared nothing and
+        // imported nothing contributes no entity: minting the synthetic module
+        // there reported the file as parsed, which is what kept a comment-only
+        // or unreadable file out of the parse-coverage census.
+        if !entities.is_empty() || !imports.is_empty() {
+            if let Some(module_name) = crate::adapter::file_module_surface_name(
+                crate::adapter::declared_package_coordinate(&root, source).as_deref(),
+                file_id,
+            ) {
+                entities.insert(
+                    0,
+                    crate::adapter::file_module_surface_entity(
+                        module_name,
+                        format!("package {}", file_id.0),
+                        &root,
+                        source,
+                        file_id,
+                    ),
+                );
+            }
+        }
+
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
             .iter()
@@ -86,6 +110,7 @@ impl LanguageAdapter for KotlinAdapter {
         extract_kotlin_tests(&root, source, &mut tests);
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -725,6 +750,19 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
         return None;
     }
 
+    // The last identifier in the qualified name is the type this import binds,
+    // and it is the specifier a reader is looking for. Anchoring there means a
+    // wrapped `import a.b.\n    C` reports `C`'s line rather than the `import`
+    // keyword's. A qualified name with no identifier child falls back to the
+    // whole path, which is still inside the statement.
+    let name_site = crate::adapter::site_from_node(
+        &qi_node
+            .children(&mut qi_node.walk())
+            .filter(|child| child.kind() == "identifier")
+            .last()
+            .unwrap_or(qi_node),
+    );
+
     // Check for wildcard: source text of the import node ends with `.*`
     let node_text = node.utf8_text(source).unwrap_or("");
     let is_wildcard = node_text.trim().ends_with(".*");
@@ -752,14 +790,23 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
                 local_name: "*".to_string(),
                 original_name: None,
                 is_default: false,
+                // `import a.b.*` writes no type name down; the statement's
+                // span is all there is to cite.
+                site: None,
             }],
         });
     }
 
     // Split qualified path into module_path and imported name
+    // Both halves are trimmed, for the reason the Java adapter trims its own:
+    // a qualified name may be written across lines, and an untrimmed split
+    // records a type name carrying the indentation in front of it.
     if let Some(dot_pos) = full_path.rfind('.') {
-        let module_path = full_path[..dot_pos].to_string();
-        let original_name = full_path[dot_pos + 1..].to_string();
+        let module_path = full_path[..dot_pos].trim().to_string();
+        let original_name = full_path[dot_pos + 1..].trim().to_string();
+        if original_name.is_empty() {
+            return None;
+        }
         let has_alias = alias.is_some();
         let local_name = alias.unwrap_or_else(|| original_name.clone());
         Some(FileImport {
@@ -769,6 +816,7 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
                 local_name,
                 original_name: if has_alias { Some(original_name) } else { None },
                 is_default: false,
+                site: Some(name_site),
             }],
         })
     } else {
@@ -780,6 +828,7 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
                 local_name,
                 original_name: None,
                 is_default: false,
+                site: Some(name_site),
             }],
         })
     }
@@ -988,5 +1037,90 @@ mod tests {
         // Kotlin default visibility is public
         let default_fn = funcs.iter().find(|f| f.name == "defaultFunc").unwrap();
         assert_eq!(default_fn.visibility, Visibility::Public);
+    }
+
+    /// A file whose bytes declare nothing mints no module surface.
+    ///
+    /// The surface is synthetic: it stands for the file, not for anything the
+    /// file wrote. Minting it unconditionally made a comment-only or unreadable
+    /// file count as parsed, so the parse-coverage census read a clean row for a
+    /// repository holding a hole and could not name the file. Rust carried this
+    /// rule already; these adapters did not.
+    #[test]
+    fn comment_only_kotlin_file_mints_no_module_surface() {
+        let adapter = KotlinAdapter;
+        let source = b"// nothing is declared here\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/Silent.kt");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        // A comment is valid source, not a broken file. The census separates
+        // the two, and only a file that parses clean and declares nothing is
+        // the case this rule is about.
+        assert!(matches!(output.parse_state, ParseState::Valid));
+        assert!(
+            output.entities.is_empty(),
+            "expected no entity, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn kotlin_file_with_one_declaration_mints_the_module_surface() {
+        let adapter = KotlinAdapter;
+        let source = b"package com.example.storage\n\nclass Dog { fun bark() {} }\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/Dog.kt");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let modules: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "storage");
+        assert_eq!(output.entities[0].kind, EntityKind::Module);
+    }
+
+    /// An import alone is a surface too, and the edge is sourced at the module.
+    #[test]
+    fn kotlin_file_with_only_an_import_mints_the_module_surface() {
+        let adapter = KotlinAdapter;
+        let source = b"import kotlin.collections.List\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/Dog.kt");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(!output.imports.is_empty());
+        assert_eq!(output.entities[0].kind, EntityKind::Module);
+    }
+
+    /// A file holding only its package coordinate mints no module surface
+    /// either, and that is deliberate.
+    ///
+    /// The coordinate names the module; it does not declare anything inside it.
+    /// A file that writes only the coordinate produced no declaration and no
+    /// import, so it reaches the parse-coverage census as a file holding no
+    /// entity, which is what it is. Rust reads the same way for a file holding
+    /// only `//! docs`.
+    #[test]
+    fn package_declaration_only_kotlin_file_mints_no_module_surface() {
+        let adapter = KotlinAdapter;
+        let source = b"package com.example.storage\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/Dog.kt");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(matches!(output.parse_state, ParseState::Valid));
+        assert!(
+            output.entities.is_empty(),
+            "expected no entity, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
     }
 }

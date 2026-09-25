@@ -52,10 +52,10 @@ use kin_mcp::budget::Elision;
 /// neither the chain nor a way to ask for less, which is why the number exists at
 /// all — see the definition for what it was measured against.
 pub use kin_mcp::handlers::common::TRACE_DEFAULT_MAX_RESPONSE_CHARS as DEFAULT_MAX_RESPONSE_CHARS;
-use kin_mcp::handlers::common::{
-    relation_reference_lines, trace_response_budget, ReferenceLinesAbsent,
-    TRACE_DISCLOSURE_RESERVE_CHARS,
-};
+#[cfg(test)]
+use kin_mcp::handlers::common::TRACE_DISCLOSURE_RESERVE_CHARS;
+use kin_mcp::handlers::common::{trace_response_budget, ReferenceLinesAbsent};
+use kin_mcp::remediation::counted;
 
 /// Wall-clock ceiling for one trace walk.
 ///
@@ -316,7 +316,7 @@ pub struct TraceDataFlowRequest {
     /// the size, which is what a caller asking "what does this reach" wants.
     #[serde(default)]
     pub include_body: Option<bool>,
-    /// Serialized characters this response may occupy (default
+    /// Serialized UTF-8 bytes this response may occupy (default
     /// [`DEFAULT_MAX_RESPONSE_CHARS`]). The tool cuts bodies, and only then
     /// steps, to stay inside it, and says so in `degradations`.
     #[serde(default)]
@@ -454,6 +454,9 @@ pub struct TraceStep {
     /// parser span and an unusable cross-file span never collapse together.
     #[serde(default = "legacy_trace_reference_lines_absent_reason")]
     pub reference_lines_absent_reason: Option<String>,
+    /// Some retained occurrence sites could not be proven for this hop.
+    #[serde(default)]
+    pub reference_lines_partial_reason: Option<String>,
     /// This step's identity, location, and (when served) body.
     #[serde(flatten)]
     pub entity: TraceEntityRecord,
@@ -494,6 +497,7 @@ pub struct TraceFanoutClip {
     pub dropped_callees: usize,
     pub dropped_callers: usize,
     /// How many of the dropped neighbors lived outside this node's own file.
+    /// Zero, and omitted, when every neighbor this node dropped lived in it.
     ///
     /// The class of hop, not just the count. A node that dropped eleven
     /// same-file callees lost breadth; a node that dropped the only hops that
@@ -501,8 +505,11 @@ pub struct TraceFanoutClip {
     /// and a single `dropped` number cannot tell those apart.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub dropped_crossing_file: usize,
-    /// Whether the walk went on beneath this node, so the chain reads as a
-    /// path that continues while a sibling branch was discarded.
+    /// Whether the chain this reply carries goes on beneath this node, so it
+    /// reads as a path that continues while a sibling branch was discarded. A
+    /// response budget that cuts every step beneath the node sets it false,
+    /// because the reply then carries no route through the node; `truncated`,
+    /// `steps_omitted` and `elisions.chain` say what that cut withheld.
     ///
     /// This is the shape that produced a wrong answer: a clip at a leaf costs
     /// breadth the caller can see is missing, while a clip on the spine hands
@@ -570,22 +577,35 @@ pub struct TraceDataFlowResponse {
     /// that was named resolved to nothing, which the degradations say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_name: Option<String>,
+    /// Exact candidates and omitted count for an unresolved shared target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ambiguity: Option<serde_json::Value>,
     /// Every node whose fan-out the per-step cap clipped, with the count it
     /// dropped. Empty — and omitted — for a walk that expanded every neighbor it
     /// reached.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clipped_steps: Vec<TraceFanoutClip>,
-    /// How many clipped nodes the walk went on beneath, so a reader has the
-    /// one number that decides whether an absence in this chain means anything.
+    /// How many clipped nodes the chain this reply carries goes on beneath, so
+    /// a reader has the one number that decides whether an absence in this
+    /// chain means anything.
     ///
-    /// Zero — and omitted — when no clip sits on the surviving chain's spine,
-    /// which is the only case where a hop this chain does not contain is a hop
-    /// the walk actually looked for and did not find.
+    /// Zero, and omitted, when the chain it carries goes on beneath no clipped
+    /// node, so no route in it reads as complete while the cap discarded a
+    /// sibling. That is not a claim that every hop missing from the chain was
+    /// looked for: a chain the response budget cut says so in `truncated` and
+    /// `steps_omitted`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spine_clipped_steps: usize,
     /// How many neighbors the spine clips dropped that lived outside their
     /// node's own file: the count of module-crossing hops this chain was never
-    /// offered. Zero — and omitted — when clipping cost only same-file breadth.
+    /// offered. Zero, and omitted, when the clipped nodes the chain goes on
+    /// beneath dropped only neighbors in their own files, and also when it goes
+    /// on beneath none, which an omitted `spine_clipped_steps` says. After the
+    /// response budget cuts the chain, it counts only the clipped nodes the
+    /// chain still goes on beneath, each as its clip record measured it,
+    /// including a node whose record the cut withheld. When a node's record
+    /// never reached the pass that restated it, the reply also carries
+    /// `spine_dropped_crossing_file_is_floor: true`, and the count is a floor.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spine_dropped_crossing_file: usize,
     /// Step bodies the response budget dropped, and steps it dropped after that.
@@ -698,6 +718,16 @@ pub struct TraceDataFlowResponse {
     /// changes it, so the number would be wrong by however many digits it took to
     /// say. A caller measuring the payload it received is measuring the truth.
     pub max_response_chars: usize,
+    /// What this walk measured, in the same UTF-8 bytes as `max_response_chars`,
+    /// before the response budget cut it. Absent when the budget cut nothing.
+    ///
+    /// Unlike the response's own size this does not move when it is written: it
+    /// describes the walk before the cut. It is here because a pass that bounds
+    /// the reply after the walk can measure only what the walk handed it, and
+    /// without it an MCP reply the walk cut reported the size of its cut form as
+    /// the size it was built at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chars_before_budget: Option<usize>,
     /// Every work bound that cut this walk short, in the same machine-readable
     /// shape `semantic_locate` reports retrieval degradation in. Empty — and
     /// omitted from the payload — for a walk that finished inside every bound,
@@ -738,7 +768,7 @@ pub async fn run_seeded(
     };
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_trace_data_flow(&layout, &request).await?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    println!("{}", render_response_json(&response)?);
     Ok(())
 }
 
@@ -801,6 +831,16 @@ pub fn build_trace_data_flow_response_within(
     let bodies_included = request.bodies_included();
     let include_type_edges = request.type_edges_included();
 
+    // A member name several owners share names none of them, so the walk is
+    // refused with every candidate rather than run from one of them.
+    let shared = shared_member_candidates(graph, trimmed)?;
+    if shared.len() > 1 {
+        return Err(anyhow::Error::new(SharedMemberFocal {
+            lines: bounded_trace_candidate_lines(trimmed, &shared, request.budget_chars()),
+            query: trimmed.to_string(),
+            candidates: shared,
+        }));
+    }
     let focal_entity = match resolve_trace_focal(graph, trimmed)? {
         Some(entity) => entity,
         None => return Err(focal_not_found_error(trimmed)),
@@ -877,6 +917,7 @@ pub fn build_trace_data_flow_response_within(
     // chain the caller asked for is still the chain, and failing the call would
     // turn a typo in an optional hint into no answer at all.
     let mut target_name: Option<String> = None;
+    let mut target_ambiguity = None;
     let mut callee_reach: Option<HashSet<EntityId>> = None;
     let mut caller_reach: Option<HashSet<EntityId>> = None;
     if let Some(target) = request
@@ -885,7 +926,34 @@ pub fn build_trace_data_flow_response_within(
         .map(str::trim)
         .filter(|target| !target.is_empty())
     {
-        match resolve_trace_focal(graph, target)? {
+        let shared = shared_member_candidates(graph, target)?;
+        if shared.len() > 1 {
+            // Ranking toward one owner's member would be a silent pick of the
+            // question itself; the walk ranks by relevance and says why, in the
+            // words the in-process walker uses.
+            let entry = kin_mcp::handlers::entities::target_ambiguous_degradation(
+                target,
+                kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                &shared,
+            );
+            target_ambiguity = Some(kin_mcp::handlers::entities::trace_target_listing(&entry));
+            let field = |key: &str| entry[key].as_str().unwrap_or_default().to_string();
+            record_degradation(
+                &mut degradations,
+                RetrievalDegradation {
+                    component: field("component"),
+                    reason: field("reason"),
+                    detail: field("detail"),
+                    remediation: field("remediation"),
+                },
+            );
+        }
+        let resolved = if shared.len() > 1 {
+            None
+        } else {
+            resolve_trace_focal(graph, target)?
+        };
+        match resolved {
             Some(entity) => {
                 let mut complete = true;
                 if matches!(direction, TraceDirection::Calls | TraceDirection::Both) {
@@ -916,31 +984,36 @@ pub fn build_trace_data_flow_response_within(
                     record_degradation(
                         &mut degradations,
                         RetrievalDegradation {
-                            component: "target_reachability".to_string(),
+                            component: TARGET_REACHABILITY_COMPONENT.to_string(),
                             reason: "reachability_bounded".to_string(),
                             detail: format!(
-                                "the reverse walk from '{}' hit a work ceiling before it finished,                                  so some neighbors that do reach it were not recognized and                                  ranked as though they do not",
+                                "the reverse walk from '{}' hit a work ceiling before it \
+                                 finished, so some neighbors that do reach it were not \
+                                 recognized and ranked as though they do not",
                                 entity.name
                             ),
-                            remediation: "narrow the walk with a smaller depth, or name a target                                           closer to the focal"
+                            remediation: "narrow the walk with a smaller depth, or name a \
+                                          target closer to the focal"
                                 .to_string(),
                         },
                     );
                 }
                 target_name = Some(entity.name.clone());
             }
-            None => record_degradation(
-                &mut degradations,
-                RetrievalDegradation {
-                    component: "target_reachability".to_string(),
-                    reason: "target_not_resolved".to_string(),
-                    detail: format!(
-                        "no entity matches target '{target}', so this walk ranked its fan-out by                          relevance alone and the question had no vote in what the cap kept"
-                    ),
-                    remediation: "check the target's spelling, or find it first with                                   semantic_locate"
-                        .to_string(),
-                },
-            ),
+            None if shared.len() > 1 => {}
+            None => {
+                // Worded by the producer the in-process walk uses too.
+                let (detail, remediation) = kin_mcp::remediation::trace_target_not_resolved(target);
+                record_degradation(
+                    &mut degradations,
+                    RetrievalDegradation {
+                        component: TARGET_REACHABILITY_COMPONENT.to_string(),
+                        reason: TARGET_NOT_RESOLVED_REASON.to_string(),
+                        detail,
+                        remediation,
+                    },
+                );
+            }
         }
     }
 
@@ -1001,8 +1074,7 @@ pub fn build_trace_data_flow_response_within(
                 break 'walk;
             }
 
-            let relations = graph
-                .get_all_relations_for_entity(&node.id)
+            let relations = kin_index::relation_read::relations_for_read(graph, &node.id)
                 .context("read relations for trace step")?;
 
             // Expand outgoing edges (parent calls these) when direction allows.
@@ -1140,6 +1212,7 @@ pub fn build_trace_data_flow_response_within(
                             crossing,
                             reference_lines: Vec::new(),
                             reference_spans_outside_caller_file: 0,
+                            reference_sites_withheld: false,
                         });
                         candidates.len() - 1
                     }
@@ -1168,7 +1241,12 @@ pub fn build_trace_data_flow_response_within(
                     } else {
                         candidates[candidate_at].entity.file_origin.as_ref()
                     };
-                    let tally = relation_reference_lines(rel, caller_file);
+                    let (tally, withheld) =
+                        kin_mcp::handlers::common::proven_relation_reference_lines(
+                            rel,
+                            caller_file,
+                        );
+                    candidates[candidate_at].reference_sites_withheld |= withheld;
                     candidates[candidate_at].reference_lines.extend(tally.lines);
                     candidates[candidate_at].reference_spans_outside_caller_file +=
                         tally.outside_caller_file;
@@ -1323,6 +1401,9 @@ pub fn build_trace_data_flow_response_within(
                     depth: next_depth,
                     reference_lines: candidate.reference_lines,
                     reference_lines_absent_reason,
+                    reference_lines_partial_reason: candidate
+                        .reference_sites_withheld
+                        .then(|| "unconfirmed_sites_withheld".into()),
                     entity: entity_record(
                         &candidate.entity,
                         source.as_ref(),
@@ -1377,6 +1458,7 @@ pub fn build_trace_data_flow_response_within(
         chain,
         truncated,
         target_name,
+        target_ambiguity,
         clipped_steps,
         spine_clipped_steps: 0,
         spine_dropped_crossing_file: 0,
@@ -1394,6 +1476,7 @@ pub fn build_trace_data_flow_response_within(
         focal_terminal: None,
         edge_coverage: None,
         max_response_chars: request.budget_chars(),
+        chars_before_budget: None,
         degradations,
     };
     // Before the budget, because it reads facts the walk recorded per node and
@@ -1406,13 +1489,7 @@ pub fn build_trace_data_flow_response_within(
         &step_language,
         &mut response,
     );
-    enforce_response_budget(&mut response);
-    record_unproven_steps(&mut response);
-    record_terminal_steps(&mut response);
-    // After the budget, because a clip is on the spine only if the walk beneath
-    // it is in the response the caller receives. A branch the budget removed
-    // took its own evidence of continuation with it.
-    record_spine_clipping(&mut response);
+    enforce_response_budget(&mut response)?;
     Ok(response)
 }
 
@@ -1425,59 +1502,36 @@ pub fn build_trace_data_flow_response_within(
 /// contain X" mean nothing at all.
 fn record_spine_clipping(response: &mut TraceDataFlowResponse) {
     let parents: HashSet<usize> = response.chain.iter().map(|step| step.parent_step).collect();
-    let mut spine_steps = 0usize;
+    let mut nodes: Vec<kin_mcp::remediation::SpineNode> = Vec::new();
     let mut spine_crossing = 0usize;
     for clip in &mut response.clipped_steps {
         clip.continued_below = parents.contains(&clip.step);
         if clip.continued_below {
-            spine_steps += 1;
             spine_crossing += clip.dropped_crossing_file;
+            nodes.push(kin_mcp::remediation::SpineNode {
+                entity_id: clip.entity_id.clone(),
+                entity_name: clip.entity_name.clone(),
+                dropped: clip.dropped_callees + clip.dropped_callers,
+                dropped_crossing_file: Some(clip.dropped_crossing_file),
+                limit_per_step: clip.limit_per_step,
+            });
         }
     }
-    response.spine_clipped_steps = spine_steps;
+    response.spine_clipped_steps = nodes.len();
     response.spine_dropped_crossing_file = spine_crossing;
-    if spine_steps == 0 {
+    // One producer for both walks and for the response-budget pass that
+    // restates this disclosure after it cuts the chain further, so the three
+    // word one fact one way.
+    let Some((detail, remediation)) = kin_mcp::remediation::spine_clipped_disclosure(&nodes) else {
         return;
-    }
-    let widest = response
-        .clipped_steps
-        .iter()
-        .filter(|clip| clip.continued_below)
-        .max_by_key(|clip| clip.dropped_callees + clip.dropped_callers);
-    let Some(widest) = widest else {
-        return;
-    };
-    let dropped = widest.dropped_callees + widest.dropped_callers;
-    let crossing = if spine_crossing > 0 {
-        format!(", {spine_crossing} of which lived outside the file of the node that offered them")
-    } else {
-        String::new()
     };
     record_degradation(
         &mut response.degradations,
         RetrievalDegradation {
             component: "fanout_cap".to_string(),
             reason: "spine_clipped".to_string(),
-            detail: format!(
-                "the walk continued beneath {spine_steps} node(s) whose fan-out limit_per_step                  {} had already cut, dropping {} neighbor(s) that were never followed{crossing};                  the widest was '{}', which offered {} more than the cap kept. This chain is one                  route among the ones the cap left, so a hop it does not contain was not looked                  for and its absence proves nothing",
-                widest.limit_per_step,
-                response
-                    .clipped_steps
-                    .iter()
-                    .filter(|clip| clip.continued_below)
-                    .map(|clip| clip.dropped_callees + clip.dropped_callers)
-                    .sum::<usize>(),
-                widest.entity_name,
-                dropped,
-            ),
-            // One producer for both arms, and it reads the ceiling the schema
-            // declares, so a clip at the cap is never told to go above it.
-            remediation: kin_mcp::remediation::spine_clipped(
-                &widest.entity_name,
-                &widest.entity_id,
-                widest.limit_per_step,
-                dropped,
-            ),
+            detail,
+            remediation,
         },
     );
 }
@@ -1518,8 +1572,7 @@ fn reach_set_toward(
             if meter.should_stop().is_some() {
                 return Ok((seen, false));
             }
-            let relations = graph
-                .get_all_relations_for_entity(&node)
+            let relations = kin_index::relation_read::relations_for_read(graph, &node)
                 .context("read relations for target reachability")?;
             for rel in &relations {
                 if meter.charge_edge().is_some() {
@@ -1864,6 +1917,7 @@ struct FanoutCandidate {
     /// other than the caller's. Counted so an empty list can say whether the
     /// parser recorded no span or recorded an unusable one.
     reference_spans_outside_caller_file: usize,
+    reference_sites_withheld: bool,
 }
 
 impl FanoutCandidate {
@@ -1898,6 +1952,12 @@ impl FanoutCandidate {
     fn reference_lines_absent_reason(&self) -> Option<String> {
         if !self.reference_lines.is_empty() {
             None
+        } else if self.reference_sites_withheld {
+            Some(
+                ReferenceLinesAbsent::UnconfirmedSitesWithheld
+                    .as_str()
+                    .to_string(),
+            )
         } else if self.reference_spans_outside_caller_file > 0 {
             Some(
                 ReferenceLinesAbsent::SpanOutsideCallerFile
@@ -1981,13 +2041,23 @@ fn entity_record(
     }
 }
 
-/// Serialized size of a response, measured the way it will be sent.
-///
-/// Both surfaces that return this — the CLI's `println!` and the daemon's MCP
-/// text result — serialize it pretty-printed, so the budget is charged for the
-/// indentation the caller receives rather than for a compact form nobody sends.
+/// Render body-free chain shapes compactly while preserving every JSON field.
+/// The CLI, MCP producer and its budget must share this format decision so
+/// indentation cannot cause the producer to discard edges before emission.
+pub fn render_response_json(response: &TraceDataFlowResponse) -> serde_json::Result<String> {
+    let carries_source = response.focal.is_some()
+        || response.focal_entity.body.is_some()
+        || response.chain.iter().any(|step| step.entity.body.is_some());
+    if carries_source {
+        serde_json::to_string_pretty(response)
+    } else {
+        serde_json::to_string(response)
+    }
+}
+
+/// Serialized size in the exact format used by both trace emitters.
 fn measure_response(response: &TraceDataFlowResponse) -> usize {
-    serde_json::to_string_pretty(response).map_or(usize::MAX, |json| json.len())
+    render_response_json(response).map_or(usize::MAX, |json| json.len())
 }
 
 /// Bound the response the tool is about to return, cutting BODIES before EDGES.
@@ -2026,15 +2096,152 @@ fn measure_response(response: &TraceDataFlowResponse) -> usize {
 ///
 /// So the cut now gives up whole branches, least relevant first, and only falls
 /// back to the suffix when nothing is left to narrow, so a pathological walk is
-/// still answered rather than refused. The rule itself is
+/// still answered whenever its required identity and disclosures fit. The rule itself is
 /// [`kin_mcp::budget::narrow_fanout_to_fit`], shared with the MCP arm so the
 /// two surfaces cannot drift.
-fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
-    let ceiling = response.max_response_chars;
-    if measure_response(response) <= ceiling {
+fn enforce_response_budget(response: &mut TraceDataFlowResponse) -> Result<()> {
+    let original = response.clone();
+    let ceiling = original.max_response_chars;
+    let mut target = ceiling;
+    let mut smallest = None;
+    // Each trial starts from the same walk: omission counts must describe the
+    // original answer, not the last shortened trial. The cut's disclosure and
+    // the counters/disclosures that depend on surviving steps are included in
+    // the measured payload, rather than assigned a fixed reserve.
+    for attempt in 0..=16 {
+        if attempt == 16 {
+            target = 0;
+        }
+        let mut candidate = original.clone();
+        cut_response_to_target(&mut candidate, target);
+        record_unproven_steps(&mut candidate);
+        record_terminal_steps(&mut candidate);
+        record_spine_clipping(&mut candidate);
+        while measure_response(&candidate) > ceiling {
+            let Some(ambiguity) = candidate.target_ambiguity.as_mut() else {
+                break;
+            };
+            if !kin_mcp::handlers::entities::compact_trace_target(ambiguity) {
+                break;
+            }
+            for entry in &mut candidate.degradations {
+                if entry.reason == "target_ambiguous" {
+                    entry.detail = kin_mcp::handlers::entities::trace_target_detail(ambiguity);
+                }
+            }
+        }
+        let measured = measure_response(&candidate);
+        if measured <= ceiling {
+            record_walk_size(&mut candidate, &original, Some(ceiling));
+            *response = candidate;
+            return Ok(());
+        }
+        smallest = Some(candidate);
+        if target == 0 {
+            break;
+        }
+        target = target.saturating_sub(measured.saturating_sub(ceiling).max(1));
+    }
+    // Identity and an honest account of a nonempty walk cannot be discarded
+    // merely to emit success. The error is bounded and carries no source data;
+    // the walk it could not fit rides beside it for the one route that answers
+    // with it, see [`TraceBelowFloor`].
+    let maximum = kin_mcp::handlers::common::TRACE_MAX_MAX_RESPONSE_CHARS;
+    let advice = if original.target_ambiguity.is_some() {
+        format!(
+            "target has {} candidates; name it by its owner-qualified name or entity id",
+            original.target_ambiguity.as_ref().unwrap()["candidate_count"]
+        )
+    } else if ceiling < maximum {
+        format!("increase max_response_chars (maximum {maximum} UTF-8 bytes)")
+    } else {
+        format!("max_response_chars is already at its {maximum}-byte maximum")
+    };
+    let message = format!(
+        "trace response metadata and required disclosures exceed the {ceiling}-byte UTF-8 budget \
+         even at the smallest retained walk; {advice}"
+    );
+    match smallest {
+        Some(mut smallest) => {
+            // Over its ceiling already, so the record is kept whatever it costs.
+            record_walk_size(&mut smallest, &original, None);
+            Err(anyhow::Error::new(TraceBelowFloor {
+                smallest: Box::new(smallest),
+                message,
+            }))
+        }
+        None => Err(anyhow::anyhow!(message)),
+    }
+}
+
+/// Record, on a response the budget cut, the size the whole walk would have
+/// shipped at, as `chars_before_budget`.
+///
+/// Measured on the uncut walk with the counts every candidate carries written
+/// into it, because those are written only after a cut: the walk as built is
+/// smaller than the same walk shipped whole.
+///
+/// Written after the cut has settled rather than while it is made, so the cut
+/// is byte for byte the one the walk made before this field existed. The walk
+/// retries its cut against a shrinking target, and a few more bytes inside
+/// that loop change which attempt settles, so on this repository's own fixture
+/// they changed how many steps a 12,000-byte walk kept. Under a `ceiling` the
+/// record is left out when it would not fit, because the CLI keeps that
+/// ceiling as a hard limit. An MCP pass reading such a reply falls back to the
+/// size it measures itself.
+fn record_walk_size(
+    response: &mut TraceDataFlowResponse,
+    original: &TraceDataFlowResponse,
+    ceiling: Option<usize>,
+) {
+    let cut = response.degradations.iter().any(|entry| {
+        entry.component == "response_budget"
+            && matches!(entry.reason.as_str(), "steps_omitted" | "bodies_omitted")
+    });
+    if !cut {
         return;
     }
-    let target = ceiling.saturating_sub(TRACE_DISCLOSURE_RESERVE_CHARS);
+    let mut whole = original.clone();
+    record_unproven_steps(&mut whole);
+    record_terminal_steps(&mut whole);
+    record_spine_clipping(&mut whole);
+    response.chars_before_budget = Some(measure_response(&whole));
+    if ceiling.is_some_and(|ceiling| measure_response(response) > ceiling) {
+        response.chars_before_budget = None;
+    }
+}
+
+/// The smallest walk the response budget can retain, with every disclosure the
+/// cut requires, still measured above the ceiling.
+///
+/// The text route refuses with this message: what the CLI prints is exactly
+/// what its caller reads, so a bound it cannot keep is a refusal rather than an
+/// overrun. The daemon's MCP route answers with [`TraceBelowFloor::smallest`]
+/// instead. Every MCP reply carries an envelope this budget never counts, so a
+/// refusal there ships over the ceiling too, only without the walk; that
+/// surface keeps one entry per list it cuts and discloses the overrun, the way
+/// every other MCP list tool answers below its floor.
+#[derive(Debug)]
+pub struct TraceBelowFloor {
+    /// The smallest retained walk, cut and disclosed exactly as a walk that
+    /// fit would have been.
+    pub smallest: Box<TraceDataFlowResponse>,
+    message: String,
+}
+
+impl std::fmt::Display for TraceBelowFloor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TraceBelowFloor {}
+
+fn cut_response_to_target(response: &mut TraceDataFlowResponse, target: usize) {
+    let ceiling = response.max_response_chars;
+    if measure_response(response) <= target {
+        return;
+    }
 
     let mut bodies_omitted = 0usize;
     for step in &mut response.chain {
@@ -2166,15 +2373,17 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
     } else {
         "from the end of the chain"
     };
-    let cut = match (
-        bodies_omitted + usize::from(focal_body_omitted),
-        steps_omitted,
-    ) {
-        (bodies, 0) => format!("{bodies} inlined bodies were dropped"),
-        (0, steps) => format!("{steps} steps were dropped {how}"),
+    // The walk's own cut, counted for this pass alone. An envelope pass that
+    // cuts the reply again discloses its share under `response_bounded`, and
+    // `steps_omitted` adds the two, so this sentence says whose cut it counts.
+    let bodies = bodies_omitted + usize::from(focal_body_omitted);
+    let cut = match (bodies, steps_omitted) {
+        (bodies, 0) => counted(bodies, "inlined body", "inlined bodies"),
+        (0, steps) => format!("{} {how}", counted(steps, "step", "steps")),
         (bodies, steps) => format!(
-            "{bodies} inlined bodies were dropped, and {steps} steps after that were dropped \
-             {how}"
+            "{}, and then {} {how}",
+            counted(bodies, "inlined body", "inlined bodies"),
+            counted(steps, "step", "steps")
         ),
     };
     record_degradation(
@@ -2183,8 +2392,8 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
             component: "response_budget".to_string(),
             reason: reason.to_string(),
             detail: format!(
-                "the response exceeded its {ceiling}-character budget, so {cut}; bodies are cut \
-                 before edges, so the chain's shape survives a cut that its source cannot"
+                "the walk exceeded its {ceiling}-byte UTF-8 budget, so it dropped {cut}; bodies \
+                 are cut before edges, so the chain's shape survives a cut that its source cannot"
             ),
             remediation: format!(
                 "ask for the shape directly with include_body: false, or narrow the walk with a \
@@ -2205,6 +2414,96 @@ pub fn focal_not_found_error(focal: &str) -> anyhow::Error {
     anyhow::anyhow!("no entity found matching '{}'", focal.trim())
 }
 
+/// The `degradations[]` component a walk's named target is disclosed under.
+const TARGET_REACHABILITY_COMPONENT: &str = "target_reachability";
+
+/// The reason a walk carries when the target it was asked to rank toward
+/// resolved to no entity.
+const TARGET_NOT_RESOLVED_REASON: &str = "target_not_resolved";
+
+/// Whether this walk's named target resolved to no entity.
+///
+/// Read off the one producer of that disclosure, the way
+/// [`focal_not_found_error`] is, so a caller that treats the answer as a claim
+/// that the target is absent cannot drift from what the walk says.
+pub fn target_not_resolved(response: &TraceDataFlowResponse) -> bool {
+    response.degradations.iter().any(|entry| {
+        entry.component == TARGET_REACHABILITY_COMPONENT
+            && entry.reason == TARGET_NOT_RESOLVED_REASON
+    })
+}
+
+/// A trace focal that is a member name several owners share: the walk has no
+/// one entity to start from, so it answers with the candidates instead.
+///
+/// Typed so the daemon's MCP route can answer with the structured reply every
+/// single-answer tool gives for such a name, while the text route prints
+/// [`SharedMemberFocal::lines`].
+#[derive(Debug)]
+pub struct SharedMemberFocal {
+    pub query: String,
+    pub candidates: Vec<Entity>,
+    pub lines: Vec<String>,
+}
+
+fn bounded_trace_candidate_lines(
+    query: &str,
+    candidates: &[Entity],
+    max_bytes: usize,
+) -> Vec<String> {
+    use kin_mcp::handlers::entities::{
+        name_candidates_situation, CandidateReason, NAME_CANDIDATES_LISTED_MAX,
+    };
+    let total = candidates.len();
+    for listed in (0..=total.min(NAME_CANDIDATES_LISTED_MAX)).rev() {
+        let mut lines = crate::entity_identity::name_candidate_lines(
+            query,
+            CandidateReason::SharedMemberName,
+            &candidates[..listed],
+        );
+        lines[0] = format!(
+            "{}, so no candidate was selected:",
+            name_candidates_situation(query, CandidateReason::SharedMemberName, total)
+        );
+        if listed < total {
+            lines.push(format!(
+                "{} candidates omitted; name the focal by its owner-qualified name or entity id",
+                total - listed
+            ));
+        }
+        if lines.iter().map(String::len).sum::<usize>() + lines.len().saturating_sub(1) <= max_bytes
+        {
+            return lines;
+        }
+    }
+    vec![format!("The focal has {total} candidates; all {total} are omitted because its ambiguity metadata exceeds the UTF-8 byte budget. Name the focal by its owner-qualified name or entity id.")]
+}
+
+impl std::fmt::Display for SharedMemberFocal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.lines.join("\n"))
+    }
+}
+
+impl std::error::Error for SharedMemberFocal {}
+
+/// The owners' members a bare `query` names when several of them share it and
+/// nothing is named it exactly, by the rule every surface shares; empty for
+/// any other query. An id names one entity and reaches none here.
+fn shared_member_candidates(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Vec<Entity>> {
+    if uuid::Uuid::parse_str(query.trim()).is_ok() {
+        return Ok(Vec::new());
+    }
+    Ok(
+        match kin_ranking::entity_ranking::reach_by_name(graph, query.trim())? {
+            kin_ranking::entity_ranking::NameReach::Members(members) if members.len() > 1 => {
+                members
+            }
+            _ => Vec::new(),
+        },
+    )
+}
+
 /// Resolve a trace focal by UUID, exact name, or the entity-ranking fallback.
 ///
 /// Mirrors `resolve_source_entity` in graph.rs so trace_data_flow and
@@ -2214,8 +2513,13 @@ fn resolve_trace_focal(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Opt
     if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
         return Ok(graph.get_entity(&EntityId(uuid))?);
     }
-    if let Some(entity) = kin_ranking::entity_ranking::select_best_entity(graph, trimmed)? {
-        return Ok(Some(entity));
+    // The name rule every surface shares. The caller refuses a shared member
+    // name before it gets here, so a shared name resolves to nothing rather
+    // than to one of its owners.
+    match kin_ranking::entity_ranking::resolve_name(graph, trimmed)? {
+        kin_ranking::entity_ranking::NameResolution::One(entity) => return Ok(Some(entity)),
+        kin_ranking::entity_ranking::NameResolution::SharedMemberName(_) => return Ok(None),
+        kin_ranking::entity_ranking::NameResolution::Missing => {}
     }
     let matches = kin_core::query_trace_matches(graph, trimmed)?;
     Ok(matches.into_iter().next())
@@ -3343,6 +3647,61 @@ mod tests {
         );
     }
 
+    /// Each target disclosure reads as one sentence. Their format strings had
+    /// lost their line continuations, so the detail and the remediation both
+    /// carried a run of spaces where each line break had been, the way the
+    /// spine disclosure did.
+    #[test]
+    fn the_target_disclosures_read_as_one_sentence_each() {
+        let (_t, binding) = empty_binding();
+        let (graph, focal_id) = requests_send_graph();
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 4);
+        request.target = Some("HTTPAdapter.sendd".to_string());
+        let unresolved = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+        // The reverse walk toward a callee reaches the hub, whose two hundred
+        // edges exhaust a ten-edge meter before the walk can finish.
+        let (graph, focal_id) = hub_graph(200);
+        let mut request = hub_request(focal_id);
+        request.target = Some("callee_3".to_string());
+        let bounded = build_trace_data_flow_response_within(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+            TraceBudget {
+                max_edges_scanned: 10,
+                ..TraceBudget::default()
+            },
+        )
+        .unwrap();
+
+        for (response, reason) in [
+            (&unresolved, "target_not_resolved"),
+            (&bounded, "reachability_bounded"),
+        ] {
+            let entry = response
+                .degradations
+                .iter()
+                .find(|degradation| degradation.reason == reason)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the walk must disclose {reason}: {:?}",
+                        response.degradations
+                    )
+                });
+            for text in [&entry.detail, &entry.remediation] {
+                assert!(
+                    !text.contains("  "),
+                    "{reason} carries a run of spaces: {text:?}"
+                );
+            }
+        }
+    }
+
     /// The acceptance, second arm: when nothing was named, say so loudly.
     ///
     /// The failure this exists for is not a missing hop, it is a chain that
@@ -3393,6 +3752,44 @@ mod tests {
             disclosure.remediation.contains("target"),
             "and names the lever that fixes it: {}",
             disclosure.remediation
+        );
+    }
+
+    /// The spine disclosure is one sentence, worded the way the in-process walk
+    /// and the response-budget pass word it, because all three take it from
+    /// one producer. It used to be assembled here from a format string whose
+    /// line breaks had lost their continuations, so it read "limit_per_step"
+    /// followed by eighteen spaces, then the cap.
+    #[test]
+    fn the_spine_disclosure_reads_as_one_sentence_from_the_shared_producer() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+
+        let disclosure = response
+            .degradations
+            .iter()
+            .find(|degradation| degradation.reason == "spine_clipped")
+            .expect("a spine clip must be disclosed");
+        assert!(
+            !disclosure.detail.contains("  "),
+            "the disclosure carries a run of spaces: {:?}",
+            disclosure.detail
+        );
+        assert!(
+            disclosure.detail.starts_with(
+                "the walk continued beneath 1 node(s) whose fan-out limit_per_step 4 had already \
+                 cut, dropping 11 neighbor(s) that were never followed, 2 of which lived outside \
+                 the file of the node that offered them; the widest was 'Session.send'"
+            ),
+            "{}",
+            disclosure.detail
         );
     }
 
@@ -3801,7 +4198,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.total_steps, 25, "the fixture must produce a chain");
-        let json = serde_json::to_string_pretty(&response).unwrap();
+        let json = render_response_json(&response).unwrap();
+        assert!(
+            !json.contains('\n'),
+            "a body-free trace is emitted compact, which is the length the caller pays for"
+        );
         assert!(
             json.len() <= response.max_response_chars,
             "a response must fit the budget it reports: {} chars against {}",
@@ -3809,7 +4210,7 @@ mod tests {
             response.max_response_chars
         );
         assert!(
-            !json.contains("\"body\": \""),
+            !json.contains("\"body\": \"") && !json.contains("\"body\":\""),
             "a shape query must carry no inlined body"
         );
         // Keep the original compact-shape tripwire load-bearing rather than
@@ -3824,7 +4225,7 @@ mod tests {
             row.remove("reference_lines");
             row.remove("reference_lines_absent_reason");
         }
-        let compact_shape = serde_json::to_string_pretty(&without_site_contract).unwrap();
+        let compact_shape = serde_json::to_string(&without_site_contract).unwrap();
         assert!(
             compact_shape.len() < 20_000,
             "25 steps without the site contract are small; {} chars means bodies or unrelated \
@@ -3855,6 +4256,7 @@ mod tests {
                 resolution: RelationResolution::TypeResolved.as_str().to_string(),
                 parent_step: index.saturating_sub(1),
                 depth: 1,
+                reference_lines_partial_reason: None,
                 reference_lines: Vec::new(),
                 reference_lines_absent_reason: Some(
                     ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string(),
@@ -3881,6 +4283,7 @@ mod tests {
             chain,
             truncated: false,
             target_name: None,
+            target_ambiguity: None,
             clipped_steps: Vec::new(),
             spine_clipped_steps: 0,
             spine_dropped_crossing_file: 0,
@@ -3898,6 +4301,7 @@ mod tests {
             focal_terminal: None,
             edge_coverage: None,
             max_response_chars: DEFAULT_MAX_RESPONSE_CHARS,
+            chars_before_budget: None,
             degradations: Vec::new(),
         }
     }
@@ -3906,11 +4310,11 @@ mod tests {
     fn the_response_budget_cuts_bodies_before_it_cuts_edges() {
         let mut response = fat_response(40, 4_000);
         assert!(
-            serde_json::to_string_pretty(&response).unwrap().len() > response.max_response_chars,
+            render_response_json(&response).unwrap().len() > response.max_response_chars,
             "the fixture must start over budget or this proves nothing"
         );
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         assert_eq!(
             response.total_steps, 40,
@@ -3935,7 +4339,7 @@ mod tests {
         assert!(cut.detail.contains("40"), "the cut states its own numbers");
         assert!(!cut.remediation.is_empty());
         assert!(
-            serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
+            render_response_json(&response).unwrap().len() <= response.max_response_chars,
             "the payload must end up inside the budget it reports"
         );
     }
@@ -3955,7 +4359,7 @@ mod tests {
             limit_per_step: 25,
         });
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         assert_eq!(response.bodies_omitted, 200, "bodies go first, all of them");
         assert!(
@@ -3986,7 +4390,7 @@ mod tests {
             .expect("the cut must be disclosed");
         assert_eq!(cut.reason, "steps_omitted");
         assert!(
-            serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
+            render_response_json(&response).unwrap().len() <= response.max_response_chars,
             "the payload must end up inside the budget it reports"
         );
     }
@@ -4015,6 +4419,7 @@ mod tests {
                 resolution: RelationResolution::TypeResolved.as_str().to_string(),
                 parent_step: parent,
                 depth,
+                reference_lines_partial_reason: None,
                 reference_lines: Vec::new(),
                 reference_lines_absent_reason: Some(
                     ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string(),
@@ -4053,7 +4458,7 @@ mod tests {
             .collect();
         floor.chain.retain(|step| survivors.contains(&step.step));
         floor.total_steps = floor.chain.len();
-        serde_json::to_string_pretty(&floor).map_or(usize::MAX, |json| json.len())
+        render_response_json(&floor).map_or(usize::MAX, |json| json.len())
             + TRACE_DISCLOSURE_RESERVE_CHARS
     }
 
@@ -4077,11 +4482,11 @@ mod tests {
             .entity_name
             .clone();
         assert!(
-            serde_json::to_string_pretty(&response).unwrap().len() > response.max_response_chars,
+            render_response_json(&response).unwrap().len() > response.max_response_chars,
             "the fixture must start over budget or this proves nothing"
         );
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         assert!(
             step_names(&response).contains(&deepest),
@@ -4117,8 +4522,46 @@ mod tests {
             cut.detail
         );
         assert!(
-            serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
+            render_response_json(&response).unwrap().len() <= response.max_response_chars,
             "the payload must end up inside the budget it reports"
+        );
+    }
+
+    /// The text route refuses below the floor, and the refusal carries the
+    /// smallest retained walk for the MCP route: one step or more, the focal's
+    /// identity, and the cut recorded exactly as a walk that fit would record it.
+    #[test]
+    fn a_refusal_below_the_floor_carries_the_smallest_retained_walk() {
+        let fixture = wide_then_deep_response(12, 2, 900);
+        let mut below_floor = fixture.clone();
+        below_floor.max_response_chars = kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS;
+        let error = enforce_response_budget(&mut below_floor).unwrap_err();
+        let below = error
+            .downcast_ref::<TraceBelowFloor>()
+            .expect("a refusal below the floor carries the walk it could not fit");
+        assert_eq!(error.to_string(), below.to_string());
+
+        let smallest = &below.smallest;
+        assert_eq!(smallest.focal_id, fixture.focal_id);
+        assert!(
+            !smallest.chain.is_empty(),
+            "the smallest walk keeps a step rather than emptying the chain"
+        );
+        assert!(smallest.steps_omitted > 0);
+        let chain = smallest
+            .elisions
+            .get("chain")
+            .expect("the cut records its chain elision");
+        assert_eq!(chain.kept, smallest.chain.len());
+        assert_eq!(chain.elided, smallest.steps_omitted);
+        assert_eq!(chain.total, fixture.chain.len());
+        assert!(smallest
+            .degradations
+            .iter()
+            .any(|d| d.component == "response_budget" && d.reason == "steps_omitted"));
+        assert!(
+            measure_response(smallest) > smallest.max_response_chars,
+            "only a walk that could not fit is carried"
         );
     }
 
@@ -4130,18 +4573,29 @@ mod tests {
     fn a_named_target_survives_the_cli_response_budget_that_drops_it_unnamed() {
         let fixture = wide_then_deep_response(12, 2, 900);
         let target = "neighbour_12";
+        let mut below_floor = fixture.clone();
+        below_floor.max_response_chars = kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS;
+        let original = render_response_json(&below_floor).unwrap();
+        let error = enforce_response_budget(&mut below_floor).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("metadata and required disclosures exceed"));
+        assert_eq!(render_response_json(&below_floor).unwrap(), original);
         let found = (kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS
             ..=kin_mcp::handlers::common::TRACE_MAX_MAX_RESPONSE_CHARS)
             .step_by(250)
             .find_map(|budget| {
                 let mut unnamed = fixture.clone();
                 unnamed.max_response_chars = budget;
-                enforce_response_budget(&mut unnamed);
+                // A budget below the identity/disclosure floor is an explicit
+                // refusal, not a candidate answer. Compare only budgets both
+                // arms can honor, while still requiring a distinguishing case.
+                enforce_response_budget(&mut unnamed).ok()?;
 
                 let mut targeted = fixture.clone();
                 targeted.target_name = Some(target.to_string());
                 targeted.max_response_chars = budget;
-                enforce_response_budget(&mut targeted);
+                enforce_response_budget(&mut targeted).ok()?;
 
                 let unnamed_names = step_names(&unnamed);
                 let targeted_names = step_names(&targeted);
@@ -4159,6 +4613,8 @@ mod tests {
             );
 
         let (budget, unnamed, targeted) = found;
+        assert!(render_response_json(&unnamed).unwrap().len() <= budget);
+        assert!(render_response_json(&targeted).unwrap().len() <= budget);
         assert!(
             unnamed.fanout_narrowed > 0 && targeted.fanout_narrowed > 0,
             "both arms must exercise branch narrowing at budget {budget}"
@@ -4193,7 +4649,7 @@ mod tests {
         }
         response.max_response_chars = 8_000;
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         assert!(response.steps_omitted > 0, "the fixture must reach the cut");
         assert_eq!(
@@ -4236,9 +4692,9 @@ mod tests {
         floor.chain.retain(|step| [1, 13, 14].contains(&step.step));
         floor.total_steps = floor.chain.len();
         response.max_response_chars =
-            serde_json::to_string_pretty(&floor).unwrap().len() + TRACE_DISCLOSURE_RESERVE_CHARS;
+            render_response_json(&floor).unwrap().len() + TRACE_DISCLOSURE_RESERVE_CHARS;
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         let present: BTreeSet<usize> = response.chain.iter().map(|step| step.step).collect();
         assert!(
@@ -4271,12 +4727,12 @@ mod tests {
         // to make room for the note explaining that it had.
         response.max_response_chars = kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS;
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         assert!(
             !response.chain.is_empty(),
             "the budget emptied a chain of 200 steps: {}",
-            serde_json::to_string_pretty(&response).unwrap()
+            render_response_json(&response).unwrap()
         );
         let kept = response.chain.len();
         assert_eq!(kept + response.steps_omitted, 200);
@@ -4301,7 +4757,7 @@ mod tests {
         let mut response = fat_response(0, 0);
         response.max_response_chars = kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS;
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         assert!(
             response.chain.is_empty(),
@@ -4313,7 +4769,7 @@ mod tests {
             response.elisions.is_empty(),
             "nothing was withheld, so nothing may be claimed"
         );
-        let rendered = serde_json::to_string_pretty(&response).unwrap();
+        let rendered = render_response_json(&response).unwrap();
         assert!(
             !rendered.contains("elisions"),
             "an untouched response must not grow a key: {rendered}"
@@ -4323,18 +4779,354 @@ mod tests {
     #[test]
     fn a_response_that_fits_is_left_exactly_as_built() {
         let mut response = fat_response(2, 100);
-        let before = serde_json::to_string_pretty(&response).unwrap();
+        let before = render_response_json(&response).unwrap();
 
-        enforce_response_budget(&mut response);
+        enforce_response_budget(&mut response).unwrap();
 
         assert_eq!(
-            serde_json::to_string_pretty(&response).unwrap(),
+            render_response_json(&response).unwrap(),
             before,
             "a response inside its budget must be byte-identical after enforcement"
         );
         assert!(response.bodies_included);
         assert_eq!(response.bodies_omitted, 0);
         assert_eq!(response.steps_omitted, 0);
+    }
+
+    #[test]
+    fn post_cut_disclosures_fit_the_final_serialized_response() {
+        let mut response = fat_response(40, 0);
+        response.bodies_included = false;
+        for step in &mut response.chain {
+            step.entity.body = None;
+            step.entity.span_coherence = None;
+            step.resolution = RelationResolution::NameOnly.as_str().to_string();
+        }
+        response.chain.last_mut().unwrap().terminal = Some("coverage_gap".to_string());
+        // The same long graph identity appears in the clip's detail and
+        // remediation. Its UTF-8 and JSON escapes exceed any fixed 1,500-byte
+        // allowance, even though the answer before these disclosures fits.
+        let name = "境界\"\\\n".repeat(256);
+        response.focal_name = name.clone();
+        response.focal_entity.entity_name = name.clone();
+        response.clipped_steps.push(TraceFanoutClip {
+            step: 0,
+            entity_id: response.focal_id.clone(),
+            entity_name: name,
+            dropped_callees: 9,
+            dropped_callers: 0,
+            dropped_crossing_file: 2,
+            continued_below: false,
+            limit_per_step: 25,
+        });
+        response.max_response_chars = render_response_json(&response).unwrap().len();
+        let before = render_response_json(&response).unwrap();
+        assert!(before.len() <= response.max_response_chars);
+        assert!(
+            response.max_response_chars <= kin_mcp::handlers::common::TRACE_MAX_MAX_RESPONSE_CHARS
+        );
+
+        let mut unbudgeted = response.clone();
+        record_unproven_steps(&mut unbudgeted);
+        record_terminal_steps(&mut unbudgeted);
+        record_spine_clipping(&mut unbudgeted);
+        assert_eq!(unbudgeted.terminal_coverage_gap_steps, 1);
+        assert!(
+            render_response_json(&unbudgeted).unwrap().len()
+                > response.max_response_chars + TRACE_DISCLOSURE_RESERVE_CHARS,
+            "this must reproduce an oversize answer caused by post-cut disclosures"
+        );
+
+        enforce_response_budget(&mut response).unwrap();
+
+        let payload = render_response_json(&response).unwrap();
+        assert!(payload.len() <= response.max_response_chars);
+        assert!(
+            payload.len() > payload.chars().count(),
+            "UTF-8 bytes must be charged"
+        );
+        assert!(
+            !payload.contains('\n'),
+            "body-free answers retain compact serialization"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            parsed["chain"].as_array().unwrap().len(),
+            response.chain.len()
+        );
+        assert!(response.steps_omitted > 0);
+        assert_eq!(response.steps_omitted + response.total_steps, 40);
+        assert_eq!(response.unproven_steps, response.chain.len());
+        assert_eq!(
+            response.terminal_coverage_gap_steps, 0,
+            "a dropped terminal must not remain in the count"
+        );
+        assert_eq!(response.spine_clipped_steps, 1);
+        assert_eq!(response.spine_dropped_crossing_file, 2);
+        assert!(response.clipped_steps[0].continued_below);
+        assert!(response.truncated);
+        let present: BTreeSet<_> = response.chain.iter().map(|step| step.step).collect();
+        assert!(response
+            .chain
+            .iter()
+            .all(|step| step.parent_step == 0 || present.contains(&step.parent_step)));
+        for (component, reason) in [
+            ("call_resolution", "name_only_steps"),
+            ("fanout_cap", "spine_clipped"),
+            ("response_budget", "steps_omitted"),
+        ] {
+            assert_eq!(
+                response
+                    .degradations
+                    .iter()
+                    .filter(|event| event.component == component && event.reason == reason)
+                    .count(),
+                1,
+                "retries must neither omit nor duplicate {component}/{reason}"
+            );
+        }
+        let resolution = response
+            .degradations
+            .iter()
+            .find(|event| event.component == "call_resolution")
+            .unwrap();
+        assert!(resolution.detail.starts_with(&format!(
+            "{} of {} steps",
+            response.chain.len(),
+            response.chain.len()
+        )));
+    }
+
+    #[test]
+    fn trace_ambiguity_shared_target_fits_8000_bytes_without_losing_candidates() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("start", "src/focal.rs");
+        let end = make_entity("finish", "src/end.rs");
+        for entity in [&focal, &end] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&make_relation(focal.id, end.id, RelationKind::Calls))
+            .unwrap();
+        for n in 0..200 {
+            let mut member = make_entity(
+                &format!("Owner界{n:03}::new"),
+                &format!("src/owner_{n:03}.rs"),
+            );
+            member.kind = EntityKind::Method;
+            graph.upsert_entity(&member).unwrap();
+        }
+        let mut request = trace_request(&focal.id, 2, TraceDirection::Calls, 25);
+        request.include_body = Some(false);
+        request.target = Some("new".into());
+        request.max_response_chars = Some(8_000);
+        let response = traced(&graph, &request);
+        let rendered = render_response_json(&response).unwrap();
+        assert!(rendered.len() <= 8_000, "{} bytes", rendered.len());
+        assert_eq!(response.chain.len(), 1);
+        assert!(response.target_name.is_none());
+        let target = response.target_ambiguity.as_ref().unwrap();
+        let rows = target["candidates"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert_eq!(
+            rows.len() + target["omitted_candidates"].as_u64().unwrap() as usize,
+            200
+        );
+        assert_eq!(target["candidate_count"], 200);
+        assert_eq!(target["resolution"], "shared_member_name");
+        let note = response
+            .degradations
+            .iter()
+            .find(|d| d.reason == "target_ambiguous")
+            .unwrap();
+        assert_eq!(
+            note.detail,
+            kin_mcp::handlers::entities::trace_target_detail(target)
+        );
+        for row in rows {
+            assert!(note.detail.contains(row["entity_id"].as_str().unwrap()));
+        }
+        request.focal = "new".into();
+        request.target = None;
+        let (_temp, binding) = empty_binding();
+        let error = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &request,
+        )
+        .unwrap_err();
+        let shared = error.downcast_ref::<SharedMemberFocal>().unwrap();
+        assert_eq!(shared.candidates.len(), 200);
+        assert!(shared.to_string().len() <= 8_000);
+        assert!(shared.to_string().contains("candidates omitted"));
+        assert!(shared.to_string().contains("no candidate was selected"));
+    }
+
+    #[test]
+    fn final_payload_exactly_at_the_byte_budget_is_preserved() {
+        for include_body in [false, true] {
+            let mut response = fat_response(2, 64);
+            response.bodies_included = include_body;
+            for step in &mut response.chain {
+                step.entity.body = include_body.then(|| "界🙂\"\\\n".repeat(8));
+                if !include_body {
+                    step.entity.span_coherence = None;
+                }
+                step.resolution = RelationResolution::NameOnly.as_str().to_string();
+            }
+            response.chain[1].terminal = Some("coverage_gap".to_string());
+            record_unproven_steps(&mut response);
+            record_terminal_steps(&mut response);
+            record_spine_clipping(&mut response);
+            // The budget is itself serialized. Find its fixed point so the
+            // complete final payload is exactly, not merely below, the limit.
+            for _ in 0..8 {
+                let bytes = render_response_json(&response).unwrap().len();
+                if bytes == response.max_response_chars {
+                    break;
+                }
+                response.max_response_chars = bytes;
+            }
+            let before = render_response_json(&response).unwrap();
+            assert_eq!(before.len(), response.max_response_chars);
+            assert_eq!(before.contains('\n'), include_body);
+            assert_eq!(response.unproven_steps, 2);
+            assert_eq!(response.terminal_coverage_gap_steps, 1);
+
+            enforce_response_budget(&mut response).unwrap();
+
+            assert_eq!(render_response_json(&response).unwrap(), before);
+            assert_eq!(response.bodies_omitted, 0);
+            assert_eq!(response.steps_omitted, 0);
+        }
+    }
+
+    #[test]
+    fn utf8_bodies_are_budgeted_in_serialized_bytes_before_edges() {
+        let mut response = fat_response(4, 0);
+        for step in &mut response.chain {
+            step.entity.body = Some("界🙂\"\\\n".repeat(256));
+        }
+        let initial = render_response_json(&response).unwrap();
+        response.max_response_chars = initial.chars().count();
+        let before = render_response_json(&response).unwrap();
+        assert!(
+            before.contains('\n'),
+            "bodies exercise the pretty serializer"
+        );
+        assert!(before.chars().count() <= response.max_response_chars);
+        assert!(before.len() > response.max_response_chars);
+
+        enforce_response_budget(&mut response).unwrap();
+
+        let payload = render_response_json(&response).unwrap();
+        assert!(payload.len() <= response.max_response_chars);
+        assert_eq!(response.bodies_omitted, 4);
+        assert_eq!(response.steps_omitted, 0);
+        assert_eq!(response.chain.len(), 4);
+        assert!(!response.truncated);
+        assert!(response.chain.iter().all(|step| step.entity.body.is_none()));
+        assert!(serde_json::from_str::<serde_json::Value>(&payload).is_ok());
+        let cut = response
+            .degradations
+            .iter()
+            .find(|event| event.component == "response_budget")
+            .unwrap();
+        assert!(cut.detail.contains("-byte UTF-8 budget"));
+        assert!(!cut.detail.contains("character budget"));
+    }
+
+    #[test]
+    fn required_post_cut_disclosures_that_cannot_fit_return_an_explicit_error() {
+        let mut response = fat_response(1, 0);
+        response.bodies_included = false;
+        response.chain[0].entity.body = None;
+        response.chain[0].entity.span_coherence = None;
+        let name = "長い識別子".repeat(128);
+        response.focal_name = name.clone();
+        response.focal_entity.entity_name = name.clone();
+        response.clipped_steps.push(TraceFanoutClip {
+            step: 0,
+            entity_id: response.focal_id.clone(),
+            entity_name: name.clone(),
+            dropped_callees: 1,
+            dropped_callers: 0,
+            dropped_crossing_file: 1,
+            continued_below: false,
+            limit_per_step: 25,
+        });
+        response.max_response_chars = render_response_json(&response).unwrap().len() + 128;
+        let before = render_response_json(&response).unwrap();
+        assert!(before.len() <= response.max_response_chars);
+        let mut floor = response.clone();
+        record_spine_clipping(&mut floor);
+        assert!(render_response_json(&floor).unwrap().len() > response.max_response_chars);
+
+        let error = enforce_response_budget(&mut response)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("metadata and required disclosures exceed"));
+        assert!(error.contains(&format!(
+            "{}-byte UTF-8 budget",
+            response.max_response_chars
+        )));
+        assert!(error.contains("increase max_response_chars"));
+        assert!(!error.contains("depth") && !error.contains("limit_per_step"));
+        assert!(error.len() < 256 && !error.contains(&name));
+        assert_eq!(
+            render_response_json(&response).unwrap(),
+            before,
+            "a refused trial must not replace the walk with an empty or partial answer"
+        );
+    }
+
+    #[test]
+    fn required_metadata_above_the_maximum_does_not_suggest_an_unavailable_budget() {
+        let mut response = fat_response(1, 0);
+        response.bodies_included = false;
+        response.chain[0].entity.body = None;
+        response.chain[0].entity.span_coherence = None;
+        let name = "識別子".repeat(10_000);
+        response.focal_name = name.clone();
+        response.focal_entity.entity_name = name.clone();
+        response.max_response_chars = kin_mcp::handlers::common::TRACE_MAX_MAX_RESPONSE_CHARS;
+        let before = render_response_json(&response).unwrap();
+
+        let error = enforce_response_budget(&mut response)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("already at its 60000-byte maximum"));
+        assert!(!error.contains("increase"));
+        assert!(!error.contains("depth") && !error.contains("limit_per_step"));
+        assert!(error.len() < 256 && !error.contains(&name));
+        assert_eq!(render_response_json(&response).unwrap(), before);
+    }
+
+    #[test]
+    fn trace_builder_propagates_required_metadata_budget_error() {
+        let graph = InMemoryGraph::new();
+        let (_temp, binding) = empty_binding();
+        let focal = make_entity(&"識別子".repeat(2_000), "src/focal.rs");
+        graph.upsert_entity(&focal).unwrap();
+        let mut request = trace_request(&focal.id, 1, TraceDirection::Calls, 25);
+        request.include_body = Some(false);
+        request.max_response_chars = Some(kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS);
+
+        let error = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &request,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("metadata and required disclosures exceed"),
+            "{error}"
+        );
+        assert!(error.len() < 256 && !error.contains(&focal.name));
     }
 
     /// One symbol, two entities: the located definition and a file-less alias of

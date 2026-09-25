@@ -10,13 +10,11 @@
 //! `trace_data_flow`, `graph_neighborhood` and dead-code all consumed guesses as
 //! facts.
 //!
-//! The marker is derived from what the graph already persists rather than added
-//! as a new stored field, so every store that already exists classifies without
-//! a migration and no relation schema changes. The derivation is exact rather
-//! than a heuristic: each linker resolution tier stamps its own distinct
-//! `confidence`, that value is persisted and merkle-bound, and
-//! [`RelationResolution::of`] inverts the tier ladder. `resolution_tier_ladder`
-//! in this module's tests asserts the two stay in step.
+//! Semantic readers first apply [`crate::relation_read`] against the graph's
+//! entity endpoints. This prevents legacy unmarked edges from upgrading derived
+//! members before re-admission, without rewriting stored evidence or history.
+//! For ordinary declarations the marker inverts the linker's persisted tier
+//! ladder; `resolution_tier_ladder` tests keep the constants in step.
 
 use kin_model::{Relation, RelationOrigin};
 
@@ -68,7 +66,9 @@ impl RelationResolution {
         self >= Self::ImportScoped
     }
 
-    /// Classify a stored relation.
+    /// Classify a relation after endpoint authority has been applied.
+    /// Graph readers must use [`crate::relation_read`] first: an old unmarked
+    /// edge alone cannot disclose that an endpoint was a derived member.
     ///
     /// Exact tier constants are matched first so the classification cannot
     /// drift with a threshold. A confidence from outside the ladder (a
@@ -76,6 +76,9 @@ impl RelationResolution {
     /// monotone reading of the same scale, which is conservative: an unknown
     /// value never classifies stronger than the tier band it lands in.
     pub fn of(relation: &Relation) -> Self {
+        if is_derived_member_candidate(relation) {
+            return Self::NameOnly;
+        }
         if matches!(
             relation.origin,
             RelationOrigin::Lsp | RelationOrigin::Manual
@@ -115,6 +118,22 @@ impl RelationResolution {
 /// the number is how the two would come apart.
 pub const RECEIVER_NAME_FANOUT_CONFIDENCE: f32 = 0.3;
 
+/// Confidence for a `self`/`cls` receiver-method call whose destination —
+/// found by the same-file exact-name tier or by the Extends-chain walk to a
+/// defining ancestor — is itself named as a base by at least one `Overrides`
+/// edge in the graph.
+///
+/// The definition named is real: it is either the enclosing class's own
+/// method or the ancestor the walk found. What is not proven is that its body
+/// is the one that runs. A subclass elsewhere overrides it, so the receiver's
+/// RUNTIME class decides which body executes, and the graph has evidence of
+/// more than one candidate. That is exactly what `import_scoped` means
+/// elsewhere on this ladder — the symbol is real and the scope is settled, but
+/// the destination is not singular — so this tier borrows that classification
+/// rather than adding a new one. Named here, like the fan-out tier above,
+/// because the linker recovers it from the value at more than one call site.
+pub const DISPATCH_CANDIDATE_CONFIDENCE: f32 = 0.86;
+
 /// Whether this edge is a receiver-method call the linker matched on the bare
 /// leaf name alone.
 ///
@@ -123,16 +142,37 @@ pub const RECEIVER_NAME_FANOUT_CONFIDENCE: f32 = 0.3;
 /// stamped `name_only` too, and demoting it would take ordinary cross-file
 /// calls out of every count that reads this. What FIR-1552 is about is
 /// narrower: the tier that answered `find_references(HTTPAdapter.send)` with 33
-/// rows for a method two lines call. This predicate names that tier and nothing
-/// else.
+/// rows for a method two lines call. This predicate names that tier and explicit
+/// derived-member candidates; other ordinary name-only tiers keep their meaning.
 ///
-/// A language server or a hand-authored edge is proven whatever its confidence,
-/// matching [`RelationResolution::of`], so neither can be read as a guess here.
+/// Language-server and manual edges remain proven for ordinary declarations.
+/// Explicit derived-member candidate evidence always wins, including when the
+/// effective confidence is below the receiver-name tier.
 pub fn is_receiver_name_guess(relation: &Relation) -> bool {
-    !matches!(
-        relation.origin,
-        RelationOrigin::Lsp | RelationOrigin::Manual
-    ) && relation.confidence.to_bits() == RECEIVER_NAME_FANOUT_CONFIDENCE.to_bits()
+    is_derived_member_candidate(relation)
+        || !matches!(
+            relation.origin,
+            RelationOrigin::Lsp | RelationOrigin::Manual
+        ) && relation.confidence.to_bits() == RECEIVER_NAME_FANOUT_CONFIDENCE.to_bits()
+}
+
+/// A candidate member is not a proven runtime destination, regardless of origin.
+pub fn is_derived_member_candidate(relation: &Relation) -> bool {
+    relation.evidence.iter().any(|e| {
+        e.parser_rule.as_deref() == Some(kin_model::derivation::DERIVED_MEMBER_CANDIDATE_RULE)
+    })
+}
+
+/// The same effective confidence and marker are used by linking and read views.
+pub(crate) fn limit_derived_relation(relation: &mut Relation) {
+    relation.confidence = relation.confidence.min(RECEIVER_NAME_FANOUT_CONFIDENCE);
+    relation.origin = RelationOrigin::Inferred;
+    if !is_derived_member_candidate(relation) {
+        relation.evidence.push(kin_model::RelationEvidence {
+            parser_rule: Some(kin_model::derivation::DERIVED_MEMBER_CANDIDATE_RULE.into()),
+            ..Default::default()
+        });
+    }
 }
 
 /// The linker's resolution tiers, as (persisted confidence, what that tier
@@ -147,6 +187,12 @@ pub const RESOLUTION_TIER_LADDER: &[(f32, RelationResolution)] = &[
     // A pinned dispatch class walked its Extends chain to the defining
     // ancestor: the receiver type is known, so the destination is proven.
     (0.85, RelationResolution::TypeResolved),
+    // A self/cls call whose resolved definition is itself an `Overrides` base:
+    // real symbol, unsettled destination.
+    (
+        DISPATCH_CANDIDATE_CONFIDENCE,
+        RelationResolution::ImportScoped,
+    ),
     // Module known, symbol selected inside it.
     (0.9, RelationResolution::ImportScoped),
     // Ambiguous same-name bucket settled by the caller's own directory,
@@ -263,6 +309,22 @@ mod tests {
                 origin
             )));
         }
+    }
+
+    #[test]
+    fn a_dispatch_candidate_edge_is_import_scoped_not_type_resolved() {
+        // A self/cls call that reached a real definition, but one an
+        // `Overrides` edge names as a replaced base, must not carry kin's
+        // highest confidence tag: the destination named is not the one that
+        // necessarily runs.
+        assert_eq!(
+            RelationResolution::of(&relation(
+                DISPATCH_CANDIDATE_CONFIDENCE,
+                RelationOrigin::Inferred
+            )),
+            RelationResolution::ImportScoped
+        );
+        assert!(RelationResolution::ImportScoped.is_proven());
     }
 
     #[test]

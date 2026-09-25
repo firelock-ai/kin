@@ -46,9 +46,12 @@ name: RC Build
 #     material only after a real tag builds it. The Linux archives carry no
 #     signature in a release either, so they are unaffected.
 #   - not a release, and its provenance manifest carries no release_tag.
-#   - not built for windows-x86_64 or macos-x86_64. Neither host tool consumes
-#     those, so a candidate says nothing about either archive; the matrix rows
-#     stay in release.yml alone until something reads them here.
+#   - not public delivery proof. Each native archive is installed from this run
+#     and checked against its exact source and component identities. Signing,
+#     notarization, public URLs and the full first-contact contract remain separate.
+#
+# Dispatch a held candidate on an ordinary branch. A release/v* branch is the
+# separate Release Cut automation entry point; this workflow changes none of it.
 
 on:
   # No ref input. `gh workflow run --ref <branch>` already names the ref, and the
@@ -82,11 +85,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # These rows are copied from release.yml's build matrix. The
-          # windows-x86_64 and macos-x86_64 rows are deliberately absent: see
-          # the header. Keeping the row shape identical is what lets a missing
-          # row be added here by copying one line.
-          #
+          # Native rows mirror release.yml, including Intel macOS and Windows.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: kin-linux-x86_64
@@ -95,9 +94,17 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact: kin-linux-aarch64
             cross: false
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: kin-macos-x86_64
+            cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
+            cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: kin-windows-x86_64
             cross: false
 
     steps:
@@ -813,17 +820,25 @@ jobs:
           # adding a build row without enabling its probe fails here rather than
           # leaving the platform silently unproven, and a probe claiming an
           # archive that is not built fails instead of reporting a vacuous pass.
+          - os: ubuntu-latest
+            artifact: kin-linux-x86_64
+            covered: true
+            setup-shell: bash
+          - os: ubuntu-24.04-arm
+            artifact: kin-linux-aarch64
+            covered: true
+            setup-shell: bash
+          - os: macos-15-intel
+            artifact: kin-macos-x86_64
+            covered: true
+            setup-shell: zsh
           - os: macos-latest
             artifact: kin-macos-aarch64
             covered: true
             setup-shell: zsh
-          # release.yml publishes kin-windows-x86_64; this workflow deliberately
-          # does not build it (see the header). A Windows candidate therefore
-          # has nothing to install, and this row exists to say so out loud in
-          # the run that would otherwise look like it covered every platform.
           - os: windows-latest
             artifact: kin-windows-x86_64
-            covered: false
+            covered: true
             setup-shell: powershell
 
     steps:
@@ -966,47 +981,23 @@ jobs:
         env:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
-          set -euo pipefail
-          staged="$RUNNER_TEMP/kin-candidate"
-          # The sidecar is checked before anything runs the bytes. A candidate
-          # travels through an artifact store, and an archive whose digest no
-          # longer matches its sidecar must refuse rather than be probed.
-          want="$(cut -d' ' -f1 < "$staged/${ARTIFACT}.tar.gz.sha256")"
-          have="$(shasum -a 256 "$staged/${ARTIFACT}.tar.gz" | cut -d' ' -f1)"
-          if [ "$want" != "$have" ]; then
-            echo "::error::${ARTIFACT}.tar.gz sidecar says $want, bytes are $have"
-            exit 1
-          fi
-          # The version the candidate stamped into its own binaries. Reading it
-          # from the manifest the build wrote keeps this job from re-deriving a
-          # version the archive might disagree with.
-          version="$(node -e '
-            const fs = require("fs");
-            const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-            const version = manifest.release_candidate?.version;
-            if (!version) throw new Error("candidate manifest carries no release_candidate.version");
-            process.stdout.write(version);
-          ' "$staged/${ARTIFACT}.provenance.json")"
-          served="$RUNNER_TEMP/kin-candidate-served"
-          mkdir -p "$served/download/v$version"
-          cp "$staged/${ARTIFACT}.tar.gz" "$staged/${ARTIFACT}.tar.gz.sha256" \
-            "$served/download/v$version/"
-          # KIN_BASE_URL is the installer's own offline path, so the archive is
-          # resolved, verified and unpacked by the same code a stranger runs.
-          # KIN_NO_SETUP defers setup to the probe below, which needs to run it
-          # explicitly to capture what it recorded.
-          KIN_NO_SETUP=1 KIN_VERSION="$version" KIN_BASE_URL="file://$served" \
-            sh ./scripts/install.sh
-          echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
-          # The installer resolves the archive name from the host, so a name
-          # this matrix row and the installer disagree about would otherwise
-          # surface as a confusing later failure.
-          test -x "$HOME/.kin/bin/kin"
-          test -x "$HOME/.kin/bin/kin-daemon"
-          echo "installed candidate $version from $ARTIFACT"
+          node --test scripts/prove-candidate-install.test.mjs
+          node scripts/prove-candidate-install.mjs
 
+      - name: Preserve exact candidate install evidence
+        if: ${{ always() && matrix.covered }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: candidate-install-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/kin-candidate-install
+          if-no-files-found: error
+          retention-days: 7
+
+      # The existing health subset is macOS-specific. Every platform above
+      # proves native packaging/install/provenance; this is additional evidence,
+      # not a claim that Windows or Linux received the full install-proof suite.
       - name: Capture the first-install doctor and setup health surface
-        if: ${{ matrix.covered }}
+        if: ${{ matrix.covered && runner.os == 'macOS' }}
         shell: bash
         env:
           PROBE_SHELL: ${{ matrix.setup-shell }}
@@ -1043,7 +1034,7 @@ jobs:
           printf 'kin setup status exit %s, kin doctor exit %s\n' "$health_status" "$doctor_status"
 
       - name: Judge the candidate health surface
-        if: ${{ matrix.covered }}
+        if: ${{ matrix.covered && runner.os == 'macOS' }}
         shell: bash
         env:
           PROBE_OS: ${{ matrix.os }}

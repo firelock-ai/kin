@@ -1,44 +1,30 @@
-# AGENTS.md
+# kin
 
-This repository (`kin`) is part of the Kin ecosystem. The canonical source of truth for cross-repo
-thesis, boundaries, shared resources and commit hygiene is the umbrella workspace's
-**`kin-ecosystem/AGENTS.md`** (also symlinked as `kin-ecosystem/CLAUDE.md`), and it is loaded
-automatically when you work inside the umbrella. Consult the relevant sections when needed. `CLAUDE.md` at this repo's root is a regular file that imports this one, because Claude Code reads
-that filename and this repository's source is archived into kin-infra's promotion bundle, whose
-validator refuses any non-regular entry; a symlink there failed production image promotion of
-v0.6.4 after the release was already public. Edit this file, never that one, and keep every
-tracked path in this repository a regular file.
-
-## This repo's role
-
-`kin` is the semantic system of record: repo format, CLI, daemon, MCP server, projections,
-reconcile, review, provenance, execution, and the bundled seam packages and crates under `crates/`
-and `packages/`. Work belongs here when it changes local semantic repo truth, projections or
+`kin` is the semantic system of record: repository format, CLI, daemon, MCP server, projections,
+reconcile, review, provenance, execution, and the bundled crates and packages under `crates/` and
+`packages/`. Work belongs here when it changes local semantic repository truth, projections or
 reconcile, CLI, daemon or MCP behaviour, or provenance, review and execution semantics. Graph
-internals belong in the bundled `crates/kin-db`; hosted collaboration belongs in `kinlab`.
+storage and retrieval live in the bundled `crates/kin-db`. Hosted collaboration lives in `kinlab`.
 
-The graph is the authority. Runtime query paths must not answer by grepping, walking or ranking raw
-filesystem contents, and `scripts/zero_file_search_guard.sh` is the gate that enforces it. When a
-graph-backed answer cannot be produced, fail loud or report the gap rather than hiding it behind
-raw file search.
+## The graph is the authority
 
-## The inner loop
+Runtime query paths answer from the graph. They never grep, walk or rank raw filesystem contents,
+and `scripts/zero_file_search_guard.sh` enforces that. When the graph cannot produce an answer,
+return an error or report the gap rather than falling back to raw file search. Ingestion, import,
+reconcile, migration, projection, config and test IO may read files as explicit boundaries.
 
-The main task implements and integrates changes. Native subagents may handle independent research,
-implementation or review with clear file ownership. A worktree isolates a change without requiring
-a separate execution session.
+When the Kin MCP server is available, use it to read this repository. Find an entity with
+`semantic_search` when you know its name or `semantic_locate` when you know only the behaviour,
+then take `get_context_pack` on the best hit, and `find_references` or `impact_analysis` before
+changing shared code. Read the `_kin` envelope on every answer, since an empty result is
+trustworthy only when its `negative.safe_to_conclude_absent` says so.
+[docs/gemini-extension-context.md](docs/gemini-extension-context.md) is the full tool guide, and
+the Gemini CLI extension loads it as context.
 
-Run checks appropriate to the affected behavior. The umbrella helpers `bin/kin-parity` and
-`bin/kin-precheck kin` support acceptance and lint/policy checks. Pass the checkout explicitly when
-needed and verify the printed path, revision and branch. Run targeted crate tests for behavior
-changes; hosted CI owns the full-workspace run.
+## Checks
 
-On the shared machine, heavy Rust commands go through `.kin-coord/bin/heavy-slot.sh` to respect
-builder capacity. Where the existing helpers take a `<lane>` argument, use a descriptive work
-label. It identifies the checkout or operation, not an agent session.
-
-Main CI includes the following commands. Read `.github/workflows/ci.yml` for the current flags
-and the jobs that apply to a change:
+CI runs these, and `.github/workflows/ci.yml` holds the current flags and the jobs that apply to
+a change:
 
 ```bash
 cargo fmt -- --check
@@ -49,53 +35,50 @@ python3 scripts/check-quarantine.py
 bash scripts/zero_file_search_guard.sh
 ```
 
-A nextest pass does not include the separate doctest run.
-Set `KIN_EMBED_BACKEND=cpu` for any gate; `bin/kin-lane run` does it for a heavy command. The
-default is `auto`, which batches on the host's one Metal device, and concurrent gates sharing it
-fail on host load rather than on their diff. cpu and metal differ in the last ULPs of every vector,
-so a citable release-clean result never sets it.
+Run targeted crate tests for a behaviour change, and leave the full-workspace run to CI. Set
+`KIN_EMBED_BACKEND=cpu` for any gate. The default, `auto`, batches on the host's single Metal
+device, and concurrent gates that share it fail on host load rather than on their diff. CPU and
+Metal differ in the last ULPs of every vector, so a citable release-clean result never sets it.
+
+Keep every tracked path a regular file. The release image promotion archives this source, and
+its bundle validator refuses any non-regular entry, including a symlink.
 
 ## Non-obvious behaviours
 
-**Acceptance grades main, not your pull request.** The `Product Acceptance` job carries
-`if: ${{ github.event_name != 'pull_request' }}` (`.github/workflows/acceptance.yml:106`), and kin
-has no merge_group since the flip to classic landing, so it reports `skipped` on every PR. Main's
-own push run is the only grader, and a red one stops any release cut.
+**Acceptance grades main, not your pull request.** The `Product Acceptance` job in
+`.github/workflows/acceptance.yml` carries `if: ${{ github.event_name != 'pull_request' }}`, so
+it reports `skipped` on every PR. Main's own push run is the only grader, and a red one stops any
+release cut.
 
-**The daemon's default port is 4219** (`crates/kin-daemon/src/bin/kin-daemon.rs:64`, and the usage
-text beside it), and a running daemon records the port it actually took in `<kin_root>/daemon.port`.
-A test that binds 4219 fails exactly like a real regression when a container or a stray daemon
-already holds it, so read `lsof -nP -iTCP:4219 -sTCP:LISTEN` before believing a bind failure.
+**The daemon's default port is 4219** (`crates/kin-daemon/src/bin/kin-daemon.rs`), and a running
+daemon records the port it actually took in `<kin_root>/daemon.port`. A test that binds 4219
+fails exactly like a real regression when a container or a stray daemon already holds the port,
+so read `lsof -nP -iTCP:4219 -sTCP:LISTEN` before believing a bind failure.
 
-**`kin init` exits 7 on a store that is fine.** `EXIT_ENRICHMENT_UNATTESTED = 7`
-(`crates/kin-cli/src/commands/init.rs:204`) says the store is real, publishable and answering
-questions, and only that nobody can attest its enrichment finished, because a daemon was killed on
-the way. `exit_code_for` returns it whenever a daemon kill record exists for the store. 8 is the
-same shape for a reopen-acceleration section that did not persist. Neither is a failed conversion,
-and neither is 1.
+**`kin init` exits 7 on a store that is fine.** `EXIT_ENRICHMENT_UNATTESTED` in
+`crates/kin-cli/src/commands/init.rs` says the store is real, publishable and answering, and
+only that nobody can attest its enrichment finished, because a daemon was killed on the way.
+`exit_code_for` returns it whenever a daemon kill record exists for the store. Exit 8 is the same
+shape for a reopen-acceleration section that did not persist. Neither is a failed conversion, and
+neither is 1.
 
 **Register the MCP server by absolute path, never as a bare `kin`.** The command is
 `kin mcp start [--repo <path>]`, and the repository also resolves from `KIN_MCP_REPO`, then the
 working directory, then the client's workspace roots. A bare `kin` resolves against the caller's
-PATH, which inside a container carries neither `~/.kin/bin` nor an npm prefix, and which in this
-fleet's login shell hits a VFS wrapper function that shadows the product binary.
+PATH, which inside a container carries neither `~/.kin/bin` nor an npm prefix.
 
-**The release version lives in several files at once,** and `scripts/release-intent.mjs` with
-`scripts/check-release-version.mjs` are what hold them in lockstep; the `Release version gate` job
-runs them on pull requests from `automation/release-next` or labelled `release:automated`, and an
+**The release version lives in several files at once.** `scripts/release-intent.mjs` and
+`scripts/check-release-version.mjs` keep them in lockstep. The `Release version gate` job runs
+them on pull requests from `automation/release-next` or labelled `release:automated`, and an
 ordinary pull request is not graded by it. Its `classifyPath` treats `.github/`, `docs/`,
-`AGENTS.md`, `CLAUDE.md`, any markdown, and anything under a test or fixture directory as
-non-release, so a docs-only change needs no bump.
+`AGENTS.md`, any markdown, and anything under a test or fixture directory as non-release, so a
+docs-only change needs no version bump.
 
 ## Landing
 
-kin is a classic direct-merge repo. Its merge-queue ruleset was disabled on 2026-08-27 under
-FIR-2815 and preserved only for a one-step rollback. Seven required contexts on main, read from
+kin is a classic direct-merge repository. Its merge-queue ruleset was disabled on 2026-08-27 and
+kept only for a one-step rollback. Seven required contexts on main, read from
 `/repos/firelock-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, `cargo-deny`,
 `gitleaks (full history)`, `Fast gate lint and policy`, `Fast gate build and tests` and
 `MCP surface contract`. Commit with `git commit -s`, and keep assistant-session traces out of the
-PR title and body, which
-`PR text hygiene` refuses. From the umbrella root, `bin/kin-lane merge enqueue kin <lane> <pr>`
-records the row and can arm auto-merge. `bin/kin-lane merge land kin <lane> <pr>` checks the complete
-check set before landing. The main task reviews and integrates the result; no separate worker
-session or handoff is required.
+PR title and body, which `PR text hygiene` refuses.

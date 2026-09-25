@@ -878,28 +878,72 @@ fn validate_private_security(
     if unsafe { GetAce(dacl, 0, &mut ace) } == 0 {
         return Err(win32_error("failed to read private updater ACL entry"));
     }
-    // SAFETY: GetAce returned a valid ACCESS_ALLOWED_ACE-sized entry after we
-    // verify its type. SidStart is the variable-length SID prefix.
-    let allowed = unsafe { &*(ace as *const windows_sys::Win32::Security::ACCESS_ALLOWED_ACE) };
+    if ace.is_null() {
+        anyhow::bail!("private updater DACL returned a null ACE");
+    }
+    let acl_start = dacl as usize;
+    let entries_start = acl_start
+        .checked_add(size_of::<ACL>())
+        .context("private updater ACL header address overflow")?;
+    let acl_end = acl_start
+        .checked_add(info.AclBytesInUse as usize)
+        .context("private updater ACL byte length overflow")?;
+    let ace_start = ace as usize;
+    if ace_start < entries_start || ace_start >= acl_end {
+        anyhow::bail!("private updater ACE lies outside its ACL");
+    }
+    // SAFETY: GetAce succeeded for the live GetSecurityInfo-owned ACL. The
+    // returned entry is bounded above by that ACL's reported used bytes. Parse
+    // its header and SID extent before forming any typed ACE or SID reference.
+    let ace_bytes = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), acl_end - ace_start) };
+    let sid = bounded_private_ace_sid(ace_bytes, expect_directory)?;
+    let ace_sid = sid.as_ptr().cast_mut().cast();
+    // SAFETY: the SID header and every declared subauthority fit in the ACE;
+    // the descriptor and current-user SID remain live for both calls.
+    if unsafe { IsValidSid(ace_sid) } == 0 || unsafe { EqualSid(ace_sid, user.sid()) } == 0 {
+        anyhow::bail!("private updater DACL ACE does not name the current user");
+    }
+    Ok(())
+}
+
+/// Bound the fixed fields and variable SID before passing it to Windows.
+/// `bytes` starts at an ACE and ends no later than its containing ACL.
+fn bounded_private_ace_sid(bytes: &[u8], expect_directory: bool) -> Result<&[u8]> {
+    const ACE_FIXED_BYTES: usize = 8;
+    const SID_HEADER_BYTES: usize = 8;
+
+    if bytes.len() < size_of::<ACE_HEADER>() {
+        anyhow::bail!("private updater ACE header is truncated");
+    }
+    let ace_size = usize::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+    if bytes[0] != ACCESS_ALLOWED_ACE_TYPE
+        || ace_size < ACE_FIXED_BYTES + SID_HEADER_BYTES
+        || ace_size > bytes.len()
+        || ace_size % size_of::<u32>() != 0
+    {
+        anyhow::bail!("private updater ACE has an unsupported type or invalid byte length");
+    }
     let expected_flags = if expect_directory {
         OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
     } else {
         0
     };
-    if allowed.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
-        || u32::from(allowed.Header.AceFlags) != expected_flags
-        || allowed.Mask != FILE_ALL_ACCESS
-    {
+    let mask = u32::from_le_bytes(
+        bytes[4..ACE_FIXED_BYTES]
+            .try_into()
+            .expect("four-byte ACE mask"),
+    );
+    if u32::from(bytes[1]) != expected_flags || mask != FILE_ALL_ACCESS {
         anyhow::bail!(
             "private updater DACL grants access outside its current-user full-control ACE"
         );
     }
-    let ace_sid = (&allowed.SidStart as *const u32).cast_mut().cast();
-    // SAFETY: ace_sid is the SID embedded in the validated ACE.
-    if unsafe { IsValidSid(ace_sid) } == 0 || unsafe { EqualSid(ace_sid, user.sid()) } == 0 {
-        anyhow::bail!("private updater DACL ACE does not name the current user");
+    let sid = &bytes[ACE_FIXED_BYTES..ace_size];
+    let sid_len = SID_HEADER_BYTES + usize::from(sid[1]) * size_of::<u32>();
+    if sid_len > sid.len() {
+        anyhow::bail!("private updater ACE SID escapes its declared byte length");
     }
-    Ok(())
+    Ok(&sid[..sid_len])
 }
 
 /// Validate a private managed file using its already-open, no-reparse handle.
@@ -2251,12 +2295,26 @@ pub(crate) struct WindowsParentGuard {
 }
 
 impl WindowsParentGuard {
+    /// Retain a managed config's parent directory for one transaction.
+    ///
+    /// The handle is read for its identity and never written or renamed
+    /// through, so it asks for read access only. What retains the directory is
+    /// the share mode: read access makes the handle take part in Windows'
+    /// sharing checks, and withholding `FILE_SHARE_DELETE` then refuses any
+    /// later open that asks for `DELETE`, which renaming or removing the
+    /// directory needs. Asking for `DELETE` here as well added no retention
+    /// and cost the open itself: Windows holds a process's current directory
+    /// with a share mode that withholds `FILE_SHARE_DELETE`, so a `DELETE`
+    /// open of any directory a shell is sitting in is refused with a sharing
+    /// violation. A new shell sits in the profile root, which is the parent of
+    /// `~/.claude.json`, so the guard could not be taken there and `kin setup`
+    /// could not write Claude Code's config.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let path_wide = wide_null(path.as_os_str())?;
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
@@ -2920,6 +2978,51 @@ mod tests {
     use super::*;
     use windows_sys::Win32::Security::AddMandatoryAce;
 
+    #[test]
+    fn windows_private_ace_bounds_precede_sid_validation() {
+        let mut ace = vec![0_u8; 20];
+        ace[0] = ACCESS_ALLOWED_ACE_TYPE;
+        ace[2..4].copy_from_slice(&20_u16.to_le_bytes());
+        ace[4..8].copy_from_slice(&FILE_ALL_ACCESS.to_le_bytes());
+        ace[8] = 1; // SID revision.
+        ace[9] = 1; // One subauthority.
+        ace[15] = 5; // NT authority.
+        ace[16..20].copy_from_slice(&18_u32.to_le_bytes());
+        assert_eq!(bounded_private_ace_sid(&ace, false).unwrap(), &ace[8..]);
+        assert!(bounded_private_ace_sid(&ace, true).is_err());
+
+        let mut directory = ace.clone();
+        directory[1] = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        assert_eq!(
+            bounded_private_ace_sid(&directory, true).unwrap(),
+            &directory[8..]
+        );
+        assert!(bounded_private_ace_sid(&directory, false).is_err());
+
+        for len in 0..ace.len() {
+            assert!(bounded_private_ace_sid(&ace[..len], false).is_err());
+            if len >= 4 {
+                let mut shortened = ace[..len].to_vec();
+                shortened[2..4].copy_from_slice(&(len as u16).to_le_bytes());
+                assert!(bounded_private_ace_sid(&shortened, false).is_err());
+            }
+        }
+        for size in [0_u16, 4, 8, 12, 16, 19, 21, u16::MAX] {
+            let mut malformed = ace.clone();
+            malformed[2..4].copy_from_slice(&size.to_le_bytes());
+            assert!(bounded_private_ace_sid(&malformed, false).is_err());
+        }
+        let mut wrong_type = ace.clone();
+        wrong_type[0] = 1; // ACCESS_DENIED_ACE.
+        assert!(bounded_private_ace_sid(&wrong_type, false).is_err());
+        let mut wrong_mask = ace.clone();
+        wrong_mask[4..8].copy_from_slice(&GENERIC_READ.to_le_bytes());
+        assert!(bounded_private_ace_sid(&wrong_mask, false).is_err());
+        let mut oversized_sid = ace;
+        oversized_sid[9] = u8::MAX;
+        assert!(bounded_private_ace_sid(&oversized_sid, false).is_err());
+    }
+
     fn test_acl(revision: u8, aces: &[Vec<u8>]) -> Vec<u8> {
         let size = 8 + aces.iter().map(Vec::len).sum::<usize>();
         let mut acl = vec![0_u8; size];
@@ -3301,5 +3404,92 @@ mod tests {
         drop(guard);
         drop(root);
         std::fs::remove_dir(container).unwrap();
+    }
+
+    /// Open a directory the way Windows holds a process's current directory:
+    /// traverse access, with a share mode that withholds `FILE_SHARE_DELETE`.
+    fn hold_as_current_directory(path: &Path) -> OwnedHandle {
+        let wide = wide_null(path.as_os_str()).unwrap();
+        // SAFETY: wide is a live NUL-terminated path for this call.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE
+                    | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        };
+        OwnedHandle::new(raw, "failed to hold the directory as a current directory").unwrap()
+    }
+
+    /// Open a directory for `DELETE`, the access renaming or removing it needs,
+    /// sharing everything, so only another handle's share mode can refuse it.
+    fn open_directory_for_delete(path: &Path) -> Result<OwnedHandle> {
+        let wide = wide_null(path.as_os_str())?;
+        // SAFETY: wide is a live NUL-terminated path for this call.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        OwnedHandle::new(raw, "failed to open the directory for DELETE")
+    }
+
+    /// The parent guard opens a directory a shell is sitting in, and still
+    /// retains it.
+    ///
+    /// `~/.claude.json` is the one client config whose parent is the profile
+    /// root, and a new shell starts there. The guard used to ask for `DELETE`,
+    /// which a current-directory handle refuses, so `kin setup` could not write
+    /// Claude Code's config on an interactive machine.
+    #[test]
+    fn windows_parent_guard_opens_a_directory_a_shell_holds_as_its_current_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+
+        let shell = hold_as_current_directory(&path);
+        // Control: the held directory refuses a DELETE open, which is exactly
+        // what the guard used to ask for. Without this the case below would
+        // pass on a host whose handle did not reproduce the refusal.
+        let refused = match open_directory_for_delete(&path) {
+            Ok(_) => panic!("a current-directory handle must refuse a DELETE open"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            windows_error_code(&refused),
+            Some(ERROR_SHARING_VIOLATION as i32),
+            "{refused:#}"
+        );
+
+        let guard = WindowsParentGuard::open(&path)
+            .expect("the parent guard must open a directory a shell is sitting in");
+        drop(shell);
+
+        // What the guard is for: while it is held, nothing may rename or remove
+        // the directory, and once it is dropped, that is allowed again.
+        let refused = match open_directory_for_delete(&path) {
+            Ok(_) => panic!("a held parent guard must refuse a DELETE open of its directory"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            windows_error_code(&refused),
+            Some(ERROR_SHARING_VIOLATION as i32),
+            "{refused:#}"
+        );
+        drop(guard);
+        drop(
+            open_directory_for_delete(&path)
+                .expect("a DELETE open must be granted once the guard is dropped"),
+        );
     }
 }

@@ -19,20 +19,21 @@ kin-db = { workspace = true }
 notify = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 rustix = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 kin-spine = { workspace = true }
 kin-git = { workspace = true, features = ["test-support"] }
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
-serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 kin-daemon-spawn = { workspace = true }

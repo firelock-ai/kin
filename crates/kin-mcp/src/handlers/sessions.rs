@@ -72,11 +72,12 @@ it on the same cadence rather than reading a boundary off the response. The capa
 in the response are what this session may actually do on this store, not an echo of what \
 you sent: declaring nothing gets you what the store permits, and declaring less than that \
 keeps your own restriction. capability_policy names what decided each bit, so you can tell \
-a store permission (`store`) from your own self-limit (`client_declared`) from a bit Kin \
-checks nowhere today (`ungated`). Read can_write and can_commit before deciding a write is \
+a store permission (`store`) from your own self-limit (`client_declared`) from a bit only a \
+declaration grants (`client_opt_in`: can_execute, which kin_session_exec requires) from a bit \
+Kin checks nowhere today (`ungated`). Read can_write and can_commit before deciding a write is \
 forbidden; they now report false only when this store really refuses it. Supply the original \
-session_id UUID to re-register an absent daemon session before resuming an unpublished keyed \
-mutation after restart; an already registered UUID refuses and offline registration is unsupported.";
+session_id UUID to re-register an absent daemon session before resuming a retained transaction \
+or unpublished keyed mutation after restart; an already registered UUID refuses and offline registration is unsupported.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -559,6 +560,13 @@ pub fn resolve_target_entity<G: GraphStore>(
         })
         .map_err(|error| format!("target lookup for '{target}' failed: {error}"))?;
     matches.retain(|entity| entity.name == target);
+    // A file named `mutable.rs` contributes a module surface whose name is the
+    // file stem, beside the function the author actually declared. The agent
+    // names that function. The surface is not a second declaration, so it does
+    // not make the name ambiguous when the declared entity is in the same file.
+    // Two declared entities, or two file surfaces in different files, stay
+    // ambiguous and the refusal still names them.
+    matches = without_colocated_file_module_surfaces(matches);
     match matches.len() {
         0 => Err(format!("target entity '{target}' not found in the graph")),
         1 => Ok(matches.remove(0)),
@@ -591,6 +599,41 @@ pub fn resolve_target_entity<G: GraphStore>(
             ))
         }
     }
+}
+
+/// The synthetic module a source file contributes for its own path.
+///
+/// Adapters mint it with the signature `module {path}` and the file stem as
+/// its name. A `mod` item the author wrote has the module's own declaration
+/// as its signature, so this predicate does not treat that item as a surface.
+fn is_file_module_surface(entity: &kin_model::Entity) -> bool {
+    let Some(file) = entity.file_origin.as_ref() else {
+        return false;
+    };
+    entity.kind == kin_model::EntityKind::Module && entity.signature == format!("module {}", file.0)
+}
+
+/// Drop a file-module surface that only repeats a declared entity in the same
+/// file. Surfaces with no colocated declaration stay, so a name that is only
+/// a file stem is still that file, and two of them stay ambiguous.
+fn without_colocated_file_module_surfaces(
+    mut matches: Vec<kin_model::Entity>,
+) -> Vec<kin_model::Entity> {
+    let hidden: Vec<_> = matches
+        .iter()
+        .filter(|entity| is_file_module_surface(entity))
+        .filter(|surface| {
+            matches.iter().any(|other| {
+                !is_file_module_surface(other) && other.file_origin == surface.file_origin
+            })
+        })
+        .map(|entity| entity.id)
+        .collect();
+    if hidden.is_empty() {
+        return matches;
+    }
+    matches.retain(|entity| !hidden.contains(&entity.id));
+    matches
 }
 
 /// `file:line` for an ambiguity candidate, or a stable placeholder when the
@@ -678,81 +721,37 @@ pub async fn handle_transaction_begin(
 }
 
 pub const TRANSACTION_STAGE_DESC: &str = "\
-Stage one or more mutation operations onto an active transaction. Four verbs move source, \
-and which one you want depends on what is happening to the file. Use 'create' to admit one \
-the graph has never seen, 'update' to change an entity inside one it holds, 'delete' to \
-retire one outright, and 'rename' to move one. \
-Use verb 'delete' (or 'remove') with `target` set to a repository-relative path to retire a \
-tracked file: {verb: \"delete\", target: \"<repository-relative path>\", description: \"...\"}. \
-It takes the file, every entity derived from it, and every edge incident to those entities \
-out of the graph in one change, and the commit removes the working file. Send no body; a \
-delete carrying text is refused rather than guessed at. Removing the file with some other \
-tool is not the same thing: the daemon retires a delete it observes, but whether it \
-observes one depends on the working copy delivering a notification, and a mount or a \
-projection may deliver none. Only this operation publishes the retirement as a change you \
-can review. \
-Use verb 'rename' (or 'move') with `target` and `destination` to relocate a tracked file: \
-{verb: \"rename\", target: \"<current path>\", destination: \"<new path>\", description: \"...\"}. \
-Entity ids, history, and every incoming reference survive the move, which is what you lose \
-if you delete and re-create instead. The destination must not be tracked already. \
-Use verb 'create' (or 'add'/'insert') to admit a file the graph has never seen: \
-{verb: \"create\", target: \"<repository-relative path, e.g. src/parser.py>\", \
-body: \"<the file's complete source text>\", description: \"...\"}. This is the ONLY \
-operation that introduces a new file, so it is what you use after writing a new module. \
-You do not have to write the file to disk first and you should not: Kin parses the body \
-with the same extractor the ingest path uses, every entity in it enters the graph, and the \
-commit writes the file into the working directory for you. Writing a file with some other \
-tool does NOT put it in the graph; nothing ambient admits it, and only this operation will. \
-Create several files in one transaction to have them reference each other, and edit an \
-existing file with 'update' in that same transaction if you need to. A path the graph \
-already tracks is refused by name rather than quietly overwritten. \
-Use verb 'replace' (or 'overwrite') to rewrite a file the graph already tracks from its \
-complete new text: {verb: \"replace\", target: \"<repository-relative path>\", \
-body: \"<the file's complete new source text>\", description: \"...\"}. This is the shape \
-for what a local edit or write leaves you holding, a path and the file's new contents, and \
-it needs no entity: Kin reparses the body with the same extractor the ingest path uses, so \
-entities the new text adds enter the graph, entities it drops leave it, and the commit \
-writes the new contents into the working file. Send the WHOLE file, never a fragment or a \
-diff. A path the graph does not track is refused by name ('create' is the verb for that \
-one), and a body byte-identical to the tracked contents is refused as an empty change. \
-Prefer 'update' when you are changing one function or class and you know which: it names \
-what you meant, and it cannot lose the rest of the file to a truncated body. \
-Use verb 'update' (or 'modify') to change an entity the graph already holds. That is a \
-payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
-body: \"<the entity's full new source text>\", description: \"...\"}. Prefer the entity \
-id that semantic_locate, find_references, or get_context_pack already handed you: a bare \
-name resolves only when it is unique, and an ambiguous one is refused (with the candidate \
-ids, so the retry is mechanical). The body is the entity exactly as its file renders it; \
-its first line's indentation is read as the entity's own line indentation, not as extra \
-indentation on top of it, so a nested method or function goes back unchanged. That read \
-is a byte-exact prefix match against the file's own indentation run, so copy the file's \
-whitespace rather than re-indenting; a body opening with spaces where the file uses tabs \
-(or with a different width) is spliced verbatim and lands on top of the file's \
-indentation. Note also that source rendered inside search results, context packs and \
-trace steps is capped at 40 lines or 2400 characters and marks the cut with \
-\"... [truncated]\": a body that came back truncated is not the entity's full source, \
-and staging one is refused rather than committed. get_entity_source serves an entity's \
-complete span and applies no line or character cap of its own, so read the body there \
-before you send it. The entity is \
-resolved fail-closed server-side and on \
-commit the graph-to-file projection writes the body into the entity's working-directory \
-file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
-operation is validated at stage time: anything the commit path would silently drop (a \
-missing or unknown verb, a missing payload outside the payload-less source forms, a \
-nameless entity, a relation update/modify, a blob payload, a file path that is \
-absolute, escapes the repository, or names Kin or Git control metadata, a 'create' \
-naming a path repository authority already tracks, or a 'replace' naming one it does not \
-track or carrying the text it already holds) is rejected immediately with an \
-actionable error instead of vanishing at commit. The tracked-path checks read a \
-snapshot of the graph this call is authoritative over: they catch the ordinary case, but \
-a path another transaction creates or rewrites between this stage call and your commit is \
-still only caught at commit, which stays the final authority. This rejection is identical in daemon \
-and in-process modes. Accepted operations are queued and can be validated or committed \
-together.";
+Stage targeted entity and relationship mutations onto an active transaction. \
+Prefer a guarded entity patch: verb 'patch', the exact entity UUID as target, and \
+payload.EntitySourcePatch with the unchanged source_base from get_entity_source and \
+edits containing unique old_text/new_text anchors. Each anchor applies within that \
+original entity body. A stale, ambiguous, missing or overlapping anchor is refused. \
+An 'update' or 'modify' operation replaces one entity's whole body: target its UUID and \
+carry payload.EntitySourceBase with the unchanged source_base from get_entity_source, which \
+binds the edit to the exact revision read. Without it the operation is refused as \
+source_base_required; one fresh get_entity_source read and a resend is the fix. Preserve its \
+own source indentation and use complete entity source from get_entity_source; a retrieval \
+excerpt marked [truncated] is refused. \
+Create a declaration with verb 'create' and payload.EntityCreate. Addressed to a unit, \
+which is the form for an empty repository and for every Go declaration kind, it carries \
+the repository_base from session, status or the last mutate, the unit by language \
+identity (Go: package relative to the module root, package name, role source or test), \
+name, kind, body and the imports it needs, and its target is the declared name; Kin \
+derives the unit's file and owns its package clause and import block. Anchored beside a \
+function, it carries that anchor's source_base and placement, with the anchor's UUID as \
+target. Add or remove imports with verb 'update', the package name as target and \
+payload.UnitImports. Remove a function with verb 'remove', its UUID and \
+payload.EntityRemove carrying its source_base. These operations require a supporting \
+daemon; their schemas state language, kind and placement limits. Relation payloads \
+change edges; a structured Entity payload is Kin's internal record and never creates \
+source. File-level \
+create, replace, delete and rename operations are refused. Source-tree conversion \
+and materialization are separate from semantic agent work. Every operation requires \
+verb, target and description; unknown fields are refused.";
 
 pub async fn handle_transaction_stage<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
-    store: &G,
+    _store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
@@ -769,7 +768,7 @@ pub async fn handle_transaction_stage<G: GraphStore>(
     // an actionable message, rather than letting the commit path silently drop
     // them. Runs before forwarding so the agent gets the same fast failure in
     // both daemon and in-process modes.
-    crate::session::validate_staged_operations(&operations)
+    crate::session::validate_semantic_operations(&operations)
         .map_err(crate::error::McpError::InvalidParams)?;
 
     // A body Kin cut short is not the entity's source, and the paragraph above
@@ -778,111 +777,6 @@ pub async fn handle_transaction_stage<G: GraphStore>(
     // forward so the daemon and in-process modes answer identically.
     if let Err(error) = reject_truncated_bodies(&operations) {
         return Ok(ToolCallResult::error(error));
-    }
-
-    // A new-source-file path is shape-valid at this point but may already be
-    // tracked; only the graph knows that, so it is checked here rather than in
-    // `validate_staged_operations`, which is deliberately graph-free so it
-    // behaves identically offline. Checking it now, against whichever graph
-    // this call is authoritative over, turns a failure `record_new_source_file`
-    // would otherwise raise only at commit into an immediate one, so an agent
-    // staging a path collision finds out before it has staged anything else on
-    // top of it. This is a snapshot check: another transaction can still land a
-    // conflicting create between stage and commit, and commit remains the
-    // authority that catches that race.
-    for (idx, operation) in operations.iter().enumerate() {
-        if crate::session::is_new_source_file(operation) {
-            let target = operation.target.trim();
-            let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
-                continue;
-            };
-            if store.artifact_id_at_path(&path).is_some() {
-                return Err(crate::error::McpError::InvalidParams(format!(
-                    "operation #{idx} ('create'): {target:?} is already tracked by repository \
-                     authority, so it cannot be created; 'create' admits only source the graph \
-                     has never seen. Rewrite it with verb 'replace' carrying its complete new \
-                     text, edit one entity inside it with verb 'update', or create a path that \
-                     does not exist yet"
-                )));
-            }
-            continue;
-        }
-        // A rewrite is the create's mirror: it names a path the graph must
-        // already hold, and it is refused when the text it carries is the text
-        // authority already has. Both answers come from the same snapshot this
-        // call is authoritative over, and neither reads the working copy. The
-        // tracked contents are identified by the artifact's own content hash,
-        // so comparing it against the hash of the submitted body settles the
-        // empty-change question without loading a single byte of source.
-        if crate::session::is_replaced_source_file(operation) {
-            let verb = operation.verb.trim().to_lowercase();
-            let target = operation.target.trim();
-            let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
-                continue;
-            };
-            if store.artifact_id_at_path(&path).is_none() {
-                return Err(crate::error::McpError::InvalidParams(format!(
-                    "operation #{idx} ('{verb}'): {target:?} is not tracked by repository \
-                     authority, so there is nothing to replace; '{verb}' rewrites source the \
-                     graph already holds. Admit a path the graph has never seen with verb \
-                     'create' instead, carrying the same body"
-                )));
-            }
-            let body = operation
-                .body
-                .as_deref()
-                .expect("a replaced source file always carries a body");
-            let tracked = store
-                .get_tree_entry(&kin_model::FilePathId::new(target))
-                .ok()
-                .flatten();
-            if let Some(kin_model::TreeEntry::Blob { hash, .. }) = tracked {
-                if hash == kin_blobs::digest(body.as_bytes()) {
-                    return Err(crate::error::McpError::InvalidParams(format!(
-                        "operation #{idx} ('{verb}'): the body sent for {target:?} is byte-identical \
-                         to the contents repository authority already tracks, so this operation \
-                         changes nothing. Send the file's new text, or drop the operation"
-                    )));
-                }
-            }
-            continue;
-        }
-        // A retirement and a rename are the mirror image: they name a path the
-        // graph must already hold, and the same snapshot answers both. A
-        // retirement of a path nothing tracks is not a harmless no-op, because
-        // the caller believes a file left the graph and it never did.
-        if crate::session::is_retired_source_file(operation)
-            || crate::session::is_renamed_source_file(operation)
-        {
-            let verb = operation.verb.trim().to_lowercase();
-            let target = operation.target.trim();
-            let Ok(path) = kin_model::RepoPath::from_utf8(target.to_string()) else {
-                continue;
-            };
-            if store.artifact_id_at_path(&path).is_none() {
-                return Err(crate::error::McpError::InvalidParams(format!(
-                    "operation #{idx} ('{verb}'): {target:?} is not tracked by repository \
-                     authority, so there is nothing to {verb}. Name a repository-relative path \
-                     the graph already holds; kin_graph_status and semantic_locate report what \
-                     it holds"
-                )));
-            }
-            let Some(destination) = operation.destination.as_deref().map(str::trim) else {
-                continue;
-            };
-            let Ok(destination_path) = kin_model::RepoPath::from_utf8(destination.to_string())
-            else {
-                continue;
-            };
-            if store.artifact_id_at_path(&destination_path).is_some() {
-                return Err(crate::error::McpError::InvalidParams(format!(
-                    "operation #{idx} ('{verb}'): {destination:?} is already tracked by \
-                     repository authority, so {target:?} cannot move onto it; a rename may not \
-                     overwrite a file. Retire the destination first, or pick a path that does \
-                     not exist yet"
-                )));
-            }
-        }
     }
 
     if session_authority_mode.uses_daemon() {
@@ -935,6 +829,11 @@ pub async fn handle_transaction_validate(
     }
 
     let _coordination_apply = sessions.lock_coordination_apply();
+    if let Some(tx) = sessions.get_transaction(&transaction_id) {
+        if let Err(error) = crate::session::validate_semantic_operations(&tx.staged_operations) {
+            return Ok(ToolCallResult::error(error));
+        }
+    }
     match sessions.validate_transaction(&transaction_id) {
         Ok(tx) => {
             let result = serde_json::json!({
@@ -954,11 +853,11 @@ pub const TRANSACTION_COMMIT_DESC: &str = "\
 Publish all staged mutations atomically through exact repository authority. The daemon loads \
 source from repository CAS, splices existing entity \
 body edits in memory, reparses the final bytes, and journals semantic change, exact workspace \
-tree, and ref publication together. A staged 'create' operation is admitted in the same \
-transaction: its body is written to the blob store, the file enters the exact tree, and its \
-entities and cross-file relations are derived by the same extractor and reconciler the ingest \
-path runs, so files created together can reference each other. Relation-only transactions are \
-supported. Adding or removing an entity inside an EXISTING file, metadata-only source edits, \
+tree, and ref publication together. Only targeted entity and relationship operations are \
+admitted; whole-file creation, replacement, deletion and relocation are refused. Prefer a \
+guarded entity patch for a source change. Relation-only transactions, EntityCreate addressed \
+to a unit or anchored, UnitImports and EntityRemove are admitted. Unsupported \
+lifecycle forms, metadata-only source edits, \
 ambiguous or overlapping spans, non-UTF-8 source, \
 gitlinks, and mismatched authority fail before mutation. On success the result names \
 status, ops_applied, empty, change_id, repository_generation, new_root_hash, and modified_files. \
@@ -966,21 +865,27 @@ A workspace holding working-tree content its base change does not carry does not
 commit and is not reverted by it: that content is published beside the staged operations and the \
 fold is declared rather than silent. The reply then adds staged_operation_files and \
 carried_pending_files beside modified_files, and the change message names the count and a sample \
-of what was carried. Neither key appears when nothing was carried. Carried files move bytes only: \
-their semantics are not re-derived by this commit, so the entities inside them keep the \
-authorship they already had. \
-Before graph application, exact entity/artifact intent conflicts and session write/commit \
-capabilities are attested; enforce mode rejects before graph truth changes. Contract-scope \
+of what was carried. Neither key appears when nothing was carried. The daemon derives \
+the semantic state of carried source from its exact admitted content before publication. \
+The carried split describes prior pending workspace content, not authorship by this request. \
+New publication requires a live session in every coordination mode. After daemon restart, \
+re-register the original session_id with kin_session_start before resuming retained staged work. \
+Owner expiry preserves a recent staged payload; it does not clear it. Already-published receipts \
+remain recoverable without re-registration. A transaction whose owning session started without \
+can_write or can_commit is refused in every coordination mode. Before graph application, exact \
+entity/artifact intent conflicts are attested; enforce mode rejects them before graph truth \
+changes. Contract-scope \
 coverage remains explicitly false until touched contracts can be derived from the semantic \
-delta. A commit refused before anything is published leaves the transaction usable: its staged \
-operations are cleared and named in the refusal, so re-stage corrected ones on the SAME \
-transaction and commit again; kin_transaction_abort is the clean exit if you would rather \
-abandon it. An optional operations array may stage and commit in one call and uses the same \
-payload-less source-edit or structured payload operation shapes as kin_transaction_stage; it \
+delta. An invalid or unplannable operation may be cleared and named in a refusal; re-stage only \
+the rejected operations named by that response on the SAME transaction and commit again. \
+Owner, coordination and source-base refusals preserve the staged payload. \
+kin_transaction_abort is the clean exit if you would rather abandon it. An optional operations array may stage and commit in one call and uses the same \
+operation shapes as kin_transaction_stage; it \
 commits with identical durability, so a success naming modified_files means the body reached the \
 file, and re-sending the same array after an interrupted commit resumes it rather than staging it \
-twice. A created file appears in modified_files exactly as an edited one does. New source text is carried ONLY by `body`: an operation naming it anything else is refused \
-with the unknown field named, never accepted with the source dropped. A refusal ends with a \
+twice. An entity replacement carries `body` with EntitySourceBase; an anchored patch carries \
+EntitySourcePatch, and creation carries EntityCreate.body. Unknown fields are refused \
+by name, never accepted with the source dropped. A refusal ends with a \
 one-line JSON object carrying schema, code, and the operations it names, so you can branch on the \
 code instead of reading the sentence. On success the change is attributed to the calling session: \
 its vendor and client name become the change author and a queryable audit record, so \
@@ -999,6 +904,24 @@ decide whether a retry double-applied, because every other field is identical ac
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {
         scopes.push(scope);
+    }
+}
+
+/// The artifact a unit-addressed operation writes, when the store can say
+/// where the unit's module root is. A store without a tree inventory claims no
+/// artifact rather than guessing one.
+fn push_unit_scope<G: GraphStore>(
+    store: &G,
+    scopes: &mut Vec<kin_model::IntentScope>,
+    unit: &crate::source_unit::SourceUnit,
+) {
+    if let Ok(Some(tree)) = store.resolved_tree_snapshot() {
+        if let Ok(path) = crate::source_unit::unit_projection_path(unit, &tree) {
+            push_scope_once(
+                scopes,
+                kin_model::IntentScope::Artifact(kin_model::FilePathId::new(path.to_string())),
+            );
+        }
     }
 }
 
@@ -1042,25 +965,62 @@ fn transaction_touched_scopes<G: GraphStore>(
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*from));
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*to));
             }
-            Some(McpMutationPayload::EntitySourceBase(base)) => {
+            Some(McpMutationPayload::EntityCreate(
+                create @ crate::entity_lifecycle::EntityCreate {
+                    source_base: None, ..
+                },
+            )) => {
+                if let Some((_, unit)) = create.unit_target() {
+                    push_unit_scope(store, &mut scopes, unit);
+                }
+            }
+            Some(McpMutationPayload::UnitImports(imports)) => {
+                push_unit_scope(store, &mut scopes, &imports.unit);
+            }
+            Some(McpMutationPayload::EntitySourceBase(base))
+            | Some(McpMutationPayload::EntitySourcePatch(
+                crate::source_base::EntitySourcePatch {
+                    source_base: base, ..
+                },
+            ))
+            | Some(McpMutationPayload::EntityCreate(crate::entity_lifecycle::EntityCreate {
+                source_base: Some(base),
+                ..
+            }))
+            | Some(McpMutationPayload::EntityRemove(crate::entity_lifecycle::EntityRemove {
+                source_base: base,
+            })) => {
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(base.entity_id));
                 if let Ok(Some(entity)) = store.get_entity(&base.entity_id) {
                     if let Some(file) = entity.file_origin {
+                        if let Some(McpMutationPayload::EntityCreate(create)) =
+                            operation.payload.as_ref()
+                        {
+                            if create.placement
+                                == Some(crate::entity_lifecycle::EntityPlacement::NewSourceUnit)
+                            {
+                                if let Ok(path) = crate::entity_lifecycle::generated_source_path(
+                                    &file,
+                                    entity.language,
+                                    &create.name,
+                                ) {
+                                    push_scope_once(
+                                        &mut scopes,
+                                        kin_model::IntentScope::Artifact(
+                                            kin_model::FilePathId::new(path.to_string()),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+
                         push_scope_once(&mut scopes, kin_model::IntentScope::Artifact(file));
                     }
                 }
             }
-            Some(McpMutationPayload::Blob(_)) => {}
-            None => {
-                if crate::session::is_target_body_update(operation) {
-                    if let Ok(existing) = resolve_target_entity(store, &operation.target) {
-                        push_scope_once(&mut scopes, kin_model::IntentScope::Entity(existing.id));
-                        if let Some(file) = existing.file_origin {
-                            push_scope_once(&mut scopes, kin_model::IntentScope::Artifact(file));
-                        }
-                    }
-                }
-            }
+            // A payload-less entity update is refused before it can commit
+            // (`crate::session::source_base_required`), so it claims no scope.
+            Some(McpMutationPayload::Blob(_)) | None => {}
         }
     }
     scopes
@@ -1093,6 +1053,7 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
         .enumerate()
         .filter(|(_, op)| {
             crate::session::carries_source_body(op)
+                || matches!(op.payload, Some(McpMutationPayload::EntityRemove(_)))
                 || crate::session::is_retired_source_file(op)
                 || crate::session::is_renamed_source_file(op)
         })
@@ -1105,7 +1066,16 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
             // body edit does. A tree transition has to reach repository
             // authority and the working copy has to be projected to match, and
             // this path can do neither.
-            let shape = if crate::session::is_retired_source_file(op) {
+            let shape = if matches!(
+                op.payload,
+                Some(
+                    McpMutationPayload::EntityCreate(_)
+                        | McpMutationPayload::EntityRemove(_)
+                        | McpMutationPayload::UnitImports(_)
+                )
+            ) {
+                "a source-bound entity lifecycle operation"
+            } else if crate::session::is_retired_source_file(op) {
                 "a payload-less retirement (target naming a tracked path)"
             } else if crate::session::is_renamed_source_file(op) {
                 "a payload-less rename (target plus destination)"
@@ -1153,6 +1123,9 @@ pub async fn handle_transaction_commit<G: GraphStore>(
             .map_err(crate::error::McpError::InvalidParams)?;
         crate::session::validate_staged_operations(&parsed)
             .map_err(crate::error::McpError::InvalidParams)?;
+        if let Err(error) = reject_truncated_bodies(&parsed) {
+            return Ok(ToolCallResult::error(error));
+        }
         inline_ops = Some(parsed);
     }
 
@@ -1167,11 +1140,34 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         }
     }
 
+    if let Some(ref operations) = inline_ops {
+        crate::session::validate_semantic_operations(operations)
+            .map_err(crate::error::McpError::InvalidParams)?;
+    }
+
     // Serialize the entire local/offline transaction transition, final
     // preflight, graph apply, and terminal state change with intent mutation
     // and the other transaction lifecycle handlers.
     let _coordination_apply = sessions.lock_coordination_apply();
 
+    // Refused before any inline operation is staged, so a read-only session's
+    // commit leaves the transaction exactly as the caller last saw it.
+    if let Some(owner) = sessions
+        .get_transaction(&transaction_id)
+        .map(|tx| tx.session_id)
+    {
+        if let Err(error) =
+            sessions.require_write_capability(&owner, crate::session::WriteDoor::Commit)
+        {
+            return Ok(ToolCallResult::error(error));
+        }
+    }
+
+    if let Some(tx) = sessions.get_transaction(&transaction_id) {
+        if let Err(error) = crate::session::validate_semantic_operations(&tx.staged_operations) {
+            return Ok(ToolCallResult::error(error));
+        }
+    }
     if let Some(ops) = inline_ops {
         match sessions.stage_transaction(&transaction_id, ops) {
             Ok(_) => {}
@@ -1189,11 +1185,19 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         }
     };
 
+    if let Err(error) = sessions.require_live_session(&tx.session_id) {
+        return Ok(ToolCallResult::error(error));
+    }
+
     if tx.state != "active" && tx.state != "validated" {
         return Ok(ToolCallResult::error(format!(
             "Cannot commit transaction {} in state: {}",
             transaction_id, tx.state
         )));
+    }
+
+    if let Err(error) = crate::session::validate_semantic_operations(&tx.staged_operations) {
+        return Ok(ToolCallResult::error(error));
     }
 
     // Fail loud on operations the commit path cannot turn into a delta (relation
@@ -1354,9 +1358,13 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                         }
                     }
                 }
-                McpMutationPayload::EntitySourceBase(_) => {
+                McpMutationPayload::EntitySourceBase(_)
+                | McpMutationPayload::EntitySourcePatch(_)
+                | McpMutationPayload::EntityCreate(_)
+                | McpMutationPayload::EntityRemove(_)
+                | McpMutationPayload::UnitImports(_) => {
                     return Ok(ToolCallResult::error(
-                        "EntitySourceBase requires the exact daemon commit path",
+                        "Guarded entity source edits require the exact daemon commit path",
                     ));
                 }
                 McpMutationPayload::Blob(_) => {}
@@ -1426,16 +1434,22 @@ const TRUNCATION_MARKER: &str = "[truncated]";
 ///
 /// The stage tool description has said such a body "must not be staged as-is"
 /// since the shape shipped. That is instruction. This is construction, and it
-/// runs on both write surfaces (`kin_transaction_stage` and `kin_mutate`) so
-/// neither can be the one that lets it through.
+/// runs before staging or forwarding on `kin_transaction_stage`, `kin_mutate`,
+/// and the inline operations of `kin_transaction_commit`. The daemon's direct
+/// commit route uses the same guard before accepting inline operations.
 ///
 /// Matched on a body whose trailing text IS the marker, never on one that
 /// merely contains it. Kin's own source carries the literal token (the CLI's
 /// trace renderer writes it), and refusing to edit those entities would be a
 /// false positive with no way around it.
-fn reject_truncated_bodies(operations: &[McpMutationOperation]) -> std::result::Result<(), String> {
+pub fn reject_truncated_bodies(
+    operations: &[McpMutationOperation],
+) -> std::result::Result<(), String> {
     for (idx, op) in operations.iter().enumerate() {
-        let Some(body) = op.body.as_deref() else {
+        let Some(body) = op.body.as_deref().or(match op.payload.as_ref() {
+            Some(McpMutationPayload::EntityCreate(create)) => Some(create.body.as_str()),
+            _ => None,
+        }) else {
             continue;
         };
         if !body.trim_end().ends_with(TRUNCATION_MARKER) {
@@ -1480,13 +1494,14 @@ pub const MUTATE_DESC: &str = "\
 Atomically validate and commit a batch of graph mutations in a single call. Automatically \
 manages transaction lifecycle (begin, validation, commit, and abort-on-refusal) so an agent \
 does not need multi-step transaction ceremonies. Provide an operations array with mutation \
-verbs ('create', 'update', 'delete') and payloads, and an optional `summary` that becomes the \
+verbs ('patch', 'create', 'update', 'delete') and payloads, and an optional `summary` that becomes the \
 recorded change message instead of the bare transaction line. On success returns a compact \
 receipt with status, ops_applied, change_id, and modified_files. Every refusal comes back as a \
 tool error you can read and retry from, never as a protocol fault: a malformed operations array, \
 a body Kin cut short, a failed validation and a refused commit all return the structured reason. \
 Without request_id, a refused commit is aborted unless it reports source_base_conflict, which \
-retains the attempted operations. If abort cannot run, the answer names the transaction left open. \
+retains the attempted operations; a repository_base_conflict is aborted too and says so, since \
+you still hold the operations. If abort cannot run, the answer names the transaction left open. \
 With request_id, an authenticated supporting daemon durably binds the \
 complete request to one transaction before execution. Retry with the same session_id, request_id \
 and arguments to recover the original receipt after a lost response or restart; changed arguments \
@@ -1494,9 +1509,18 @@ refuse. Keyed success uses schema kin.mutate.receipt.v1 and original authoritati
 and roots_after instead of the legacy live-graph new_root_hash. An expired session can recover \
 published work but cannot resume unpublished work. Keyed offline or older-daemon calls refuse. \
 Keyed requests accept only session_id, request_id, operations, scope and summary; unknown fields \
-and unsupported freshness constraints refuse before execution. For caller-read freshness, carry \
-the source_base returned by a current get_entity_source read in an EntitySourceBase operation \
-payload. A new stale request refuses without discarding its operations; an already-published \
+and unsupported freshness constraints refuse before execution. Every source change is guarded. \
+An edit of an existing entity carries the source_base returned by a current get_entity_source \
+read in the matching EntitySourceBase, EntitySourcePatch or EntityRemove payload; a \
+whole-entity update without EntitySourceBase is refused as source_base_required, and one fresh \
+read and a resend is the fix. An EntityCreate or UnitImports addressed to a unit carries the \
+repository_base from session, status or the last mutate's reply, and a stale one is refused as \
+repository_base_conflict carrying current_repository_base and a next_step: resend with that \
+base, first re-reading with get_entity_source each entity its source_reads_required lists; \
+anchored creation uses the anchor's \
+source_base. An unkeyed success also carries the next repository_base and created_entities; \
+a keyed receipt keeps its fixed shape, so a keyed caller reads the next base with status. \
+A new stale request refuses without discarding its operations; an already-published \
 key still recovers its original receipt. Keys are retained within configurable daemon quotas.";
 
 /// Decode and check the operations a `kin_mutate` call carries.
@@ -1517,7 +1541,7 @@ pub fn checked_mutate_operations(
         ));
     };
     let parsed = crate::session::parse_staged_operations(ops_val).map_err(ToolCallResult::error)?;
-    crate::session::validate_staged_operations(&parsed).map_err(ToolCallResult::error)?;
+    crate::session::validate_semantic_operations(&parsed).map_err(ToolCallResult::error)?;
     reject_truncated_bodies(&parsed).map_err(ToolCallResult::error)?;
     Ok(ops_val)
 }
@@ -1654,12 +1678,28 @@ where
         ("session_id".to_string(), serde_json::json!(session_id)),
         ("scope".to_string(), serde_json::json!(scope)),
     ]);
-    let begin_res = match forward("kin_transaction_begin", begin_args).await {
+    let mut begin_res = match forward("kin_transaction_begin", begin_args).await {
         Ok(Some(res)) => res,
         Ok(None) => return Ok(daemon_required_unavailable("transaction begin")),
         Err(err) => return Ok(ToolCallResult::error(err)),
     };
     if begin_res.is_error == Some(true) {
+        name_the_mutate_door(&mut begin_res);
+        // A begin refused because this call's session is gone started nothing:
+        // no transaction exists and no operation was sent. That is the one
+        // refusal a caller may answer by opening a new session and resending, so
+        // it alone gets a machine-readable first line. Nothing after the begin
+        // (the commit, the abort, the open-transaction note) ever writes one.
+        if let Some(crate::types::ContentBlock::Text { text }) = begin_res.content.first_mut() {
+            if text.starts_with(&format!("Session not found: {session_id}.")) {
+                let marker = serde_json::json!({
+                    "stage": "begin",
+                    "refusal": "session_not_found",
+                    "session_id": session_id,
+                });
+                *text = format!("kin_mutate_not_started: {marker}\n{text}");
+            }
+        }
         return Ok(begin_res);
     }
 
@@ -1709,9 +1749,16 @@ where
         Ok(None) => daemon_required_unavailable("transaction commit"),
         Err(err) => ToolCallResult::error(err),
     };
-    if crate::source_base::is_source_base_conflict(&tool_text(&refusal)) {
+    name_the_mutate_door(&mut refusal);
+    let refused = tool_text(&refusal);
+    if crate::source_base::is_source_base_conflict(&refused) {
         return Ok(refusal);
     }
+    // A one-shot caller still holds the operations it just sent, and the
+    // refusal hands it the current repository base, so the retry is a resend.
+    // Retaining the transaction would only spend the session's transaction
+    // budget, so it is aborted and the refusal says so.
+    let repository_conflict = crate::source_unit::is_repository_base_conflict(&refused);
     let abort_args = HashMap::from([
         ("transaction_id".to_string(), serde_json::json!(tx_id)),
         ("session_id".to_string(), serde_json::json!(session_id)),
@@ -1722,10 +1769,57 @@ where
         Ok(None) => Some("the daemon could not be reached to abort it".to_string()),
         Err(err) => Some(err),
     };
-    if let Some(why) = left_open {
-        note_open_transaction(&mut refusal, &tx_id, &why);
+    match left_open {
+        Some(why) => note_open_transaction(&mut refusal, &tx_id, &why),
+        None if repository_conflict => mark_conflict_transaction_aborted(&mut refusal),
+        None => {}
     }
     Ok(refusal)
+}
+
+/// Say on a repository-base conflict that the one-shot aborted its transaction.
+fn mark_conflict_transaction_aborted(result: &mut ToolCallResult) {
+    let Some(crate::types::ContentBlock::Text { text }) = result.content.first_mut() else {
+        return;
+    };
+    let Ok(mut refusal) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    refusal["staged_operations_retained"] = serde_json::json!(false);
+    refusal["transaction_aborted"] = serde_json::json!(true);
+    refusal["remedy"] = serde_json::json!(
+        "Repository authority moved after you read the repository_base you sent. Follow \
+         next_step; nothing was applied and this call's transaction was aborted, so there is \
+         nothing to clean up. A name taken since is refused again, and every declaration \
+         already in the unit keeps its exact bytes."
+    );
+    if let Ok(rewritten) = serde_json::to_string(&refusal) {
+        *text = rewritten;
+    }
+}
+
+/// Name `kin_mutate` in a read-only refusal a forwarded begin or commit gave.
+///
+/// An unkeyed one-shot reaches the daemon as a begin and a commit, so the
+/// daemon's refusal names whichever of the two refused it, and a caller that
+/// sent `kin_mutate` would read about a tool it never called. Only the door is
+/// renamed; the session, the missing bits and the remedy stay as the daemon
+/// wrote them.
+fn name_the_mutate_door(result: &mut ToolCallResult) {
+    use crate::session::WriteDoor;
+    let Some(crate::types::ContentBlock::Text { text }) = result.content.first_mut() else {
+        return;
+    };
+    for door in [WriteDoor::Begin, WriteDoor::Commit] {
+        let forwarded = format!("read_only_session: {} writes", door.name());
+        if let Some(rest) = text.strip_prefix(&forwarded) {
+            *text = format!(
+                "read_only_session: {} writes{rest}",
+                WriteDoor::Mutate.name()
+            );
+            return;
+        }
+    }
 }
 
 /// Every text block of a tool result, joined, for quoting inside another.
@@ -1827,6 +1921,12 @@ pub async fn handle_mutate<G: GraphStore>(
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
 
+    // Named for the tool the caller used rather than the begin it expands to.
+    if let Err(error) =
+        sessions.require_write_capability(&session_id, crate::session::WriteDoor::Mutate)
+    {
+        return Ok(ToolCallResult::error(error));
+    }
     let tx = match sessions.begin_transaction(&session_id, &scope) {
         Ok(tx) => tx,
         Err(err) => return Ok(ToolCallResult::error(err)),
@@ -1877,9 +1977,9 @@ when you decide against work you already staged, so the transaction ends instead
 sitting open holding operations you no longer intend. Once kin_transaction_commit has \
 fenced the transaction for publication this is refused, because repository authority may \
 already have moved; re-send the commit instead, which resumes the fenced payload \
-idempotently and reports whether it landed. You do not need abort to recover from a \
-refused commit either: a commit refused before publication already clears its staged \
-operations and names them, so you can re-stage corrected ones on the same transaction.";
+idempotently and reports whether it landed. Read a refusal before retrying: planning errors \
+may name cleared operations; authority, semantic-boundary and source-base refusals preserve \
+staged work. Abort only when you intend to discard that retained work.";
 
 pub async fn handle_transaction_abort(
     args: &HashMap<String, serde_json::Value>,

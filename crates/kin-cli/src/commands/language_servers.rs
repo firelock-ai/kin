@@ -454,6 +454,129 @@ pub(crate) fn missing_enrichable_languages() -> Vec<LanguageId> {
         .collect()
 }
 
+/// Programs the language servers run on, beside the servers themselves: node
+/// for every server npm installs, cargo for the `cargo metadata` rust-analyzer
+/// loads a workspace through, go for the packages gopls loads, and python for
+/// the environment pyright resolves imports against.
+const SERVER_RUNTIMES: &[&str] = &["node", "cargo", "go", "python3", "python"];
+
+/// Where this process finds each language server and the programs it runs on.
+pub(crate) fn language_tool_dirs_on_this_path() -> Vec<PathBuf> {
+    language_tool_dirs_on(std::env::var_os("PATH").as_deref())
+}
+
+/// Where each language server and the programs it runs on resolve on `path`.
+///
+/// The directory each name resolved in, not where a symbolic link points,
+/// because the directory is what a `PATH` lookup needs.
+pub(crate) fn language_tool_dirs_on(path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let names = LANGUAGE_SERVERS
+        .iter()
+        .flat_map(|recipe| recipe.binaries.iter().copied())
+        .chain(SERVER_RUNTIMES.iter().copied());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for name in names {
+        let Ok(found) = which::which_in(name, Some(path), &cwd) else {
+            continue;
+        };
+        if let Some(dir) = found.parent().map(Path::to_path_buf) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// Record where this shell finds language servers and the programs they run
+/// on, so a daemon started with an AI client's `PATH` searches there too.
+///
+/// Returns the directories this call added; directories the daemon already
+/// searches are not recorded again.
+pub(crate) fn record_language_tool_dirs() -> std::io::Result<Vec<PathBuf>> {
+    kin_core::tool_prefix::record_tool_dirs(&language_tool_dirs_on_this_path())
+}
+
+/// The sentence both `kin setup` and `kin doctor --fix` print after recording.
+pub(crate) fn recorded_tool_dirs_line(added: &[PathBuf]) -> String {
+    format!(
+        "recorded where this shell finds language servers and the programs they run on, so a \
+         daemon an AI client starts looks there too: {}",
+        added
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Languages the daemon found no server for while this shell finds a usable
+/// one, each with where this shell finds it.
+///
+/// Only languages the daemon found NO server for. One it found and could not
+/// start is not a gap in its `PATH`, and naming it here would send an operator
+/// to record a directory the daemon already searches.
+///
+/// `shell` is this process's own probe and `locate` names where it resolves
+/// the server the daemon starts, both taken as arguments so the comparison is
+/// testable without the servers a test machine happens to have.
+pub(crate) fn servers_only_this_shell_finds(
+    coverage: &kin_core::reference_coverage::ReferenceEdgeCoverage,
+    shell: &kin_core::reference_coverage::LanguageServerReadinessMap,
+    locate: impl Fn(LanguageId) -> Option<PathBuf>,
+) -> Vec<(String, PathBuf)> {
+    use kin_core::reference_coverage::{
+        LanguageServerReadiness, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
+    };
+
+    coverage
+        .languages
+        .iter()
+        .filter(|measured| {
+            matches!(
+                measured.reference_enrichment,
+                ReferenceEnrichment::NoLanguageServer
+            )
+        })
+        .filter_map(|measured| {
+            let language = ENRICHABLE_LANGUAGES
+                .iter()
+                .copied()
+                .find(|candidate| candidate.to_string() == measured.language)?;
+            if !matches!(shell.get(&language), Some(LanguageServerReadiness::Usable)) {
+                return None;
+            }
+            Some((measured.language.clone(), locate(language)?))
+        })
+        .collect()
+}
+
+/// Where this process resolves the server the daemon starts for `language`.
+pub(crate) fn server_path_on_this_path(language: LanguageId) -> Option<PathBuf> {
+    server_path_on(language, std::env::var_os("PATH").as_deref())
+}
+
+/// Where `path` resolves the server the daemon starts for `language`.
+///
+/// Only the recipe's first binary, the one the daemon's adapter runs. The
+/// alternatives after it, pylsp and vtsls, satisfy discovery and this shell's
+/// readiness probe, and the daemon never starts them. A shell that finds only
+/// an alternative has no directory to record that would change what a
+/// restarted daemon finds, and treating it as one sent an operator round a
+/// record and restart that brought the same gap back.
+pub(crate) fn server_path_on(
+    language: LanguageId,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let binary = recipe_for(language)?.binaries.first()?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    which::which_in(binary, path, &cwd).ok()
+}
+
 /// Every language this build enriches with, whether or not its server is here.
 ///
 /// The set [`missing_enrichable_languages`] is a subset of. A run that installed
@@ -661,6 +784,26 @@ pub(crate) enum InstallOutcome {
 pub(crate) struct InstallReport {
     pub(crate) language: LanguageId,
     pub(crate) outcome: InstallOutcome,
+}
+
+/// Run provisioning from an async setup or doctor context.
+///
+/// The probes, prompt and installer are synchronous. In particular, the pinned
+/// downloader owns a blocking HTTP client whose runtime must be created and
+/// dropped outside the async executor. Keep that entire lifetime on a blocking
+/// worker, including failures, and await its result before probing readiness.
+pub(crate) async fn provision_async(
+    missing: Vec<LanguageId>,
+    consent: InstallConsent,
+    installed: impl FnMut(&LanguageServerRecipe) -> bool + Send + 'static,
+    route: impl FnMut(&LanguageServerRecipe) -> Option<InstallRoute> + Send + 'static,
+    ask: impl FnMut(&LanguageServerRecipe, InstallRoute) -> bool + Send + 'static,
+    run: impl FnMut(&LanguageServerRecipe, InstallRoute) -> Result<Vec<String>, InstallProblem>
+        + Send
+        + 'static,
+) -> Result<Vec<InstallReport>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || provision(&missing, consent, installed, route, ask, run))
+        .await
 }
 
 /// Provision the servers for `missing`, honouring `consent`.
@@ -968,12 +1111,18 @@ pub(crate) fn is_permission_failure(reason: &str) -> bool {
 /// verify is a proxy re-signing TLS, and a 403 or 407 from a registry that
 /// answered is an allowlist or proxy credentials.
 ///
+/// A download wrapper is never proof on its own. Kin's pinned-release download
+/// and rustup each open every failed download the same way, a 404 or a full
+/// disk included, so each is read by the cause that follows its wrapper: see
+/// `language_server_release::is_unanswered_request` and
+/// `rustup_unanswered_download`.
+///
 /// Deliberately checked AFTER `is_permission_failure`: an EACCES that also
 /// mentions a registry URL is still a permission failure, and its remedy is the
 /// one that moves the prefix. `None` when nothing in the reason looks like the
 /// network.
 pub(crate) fn network_shape(reason: &str) -> Option<&'static str> {
-    const UNREACHABLE: [&str; 12] = [
+    const UNREACHABLE: [&str; 11] = [
         "etimedout",
         "esockettimedout",
         "econnrefused",
@@ -985,7 +1134,6 @@ pub(crate) fn network_shape(reason: &str) -> Option<&'static str> {
         "socket hang up",
         "network request to",
         "error network",
-        "could not download",
     ];
     const TLS: [&str; 7] = [
         "self signed certificate",
@@ -1022,13 +1170,35 @@ pub(crate) fn network_shape(reason: &str) -> Option<&'static str> {
                      allowlist looks like",
         );
     }
-    if has(&UNREACHABLE) {
+    if has(&UNREACHABLE)
+        || language_server_release::is_unanswered_request(reason)
+        || rustup_unanswered_download(&lowered)
+    {
         return Some(
             "a connection that never completed, which is what a blocked or unrouted \
                      network looks like",
         );
     }
     None
+}
+
+/// Whether a lowercased reason holds rustup's report of a download whose
+/// request got no answer.
+///
+/// rustup wraps every failed download as `could not download file from
+/// '<url>' to '<path>': <cause>`. Its 404 reads `...: http request returned an
+/// unsuccessful status code: 404` under that same wrapper, so the wrapper is
+/// no proof. A refused, unrouted or timed-out request names the HTTP client's
+/// send error as the cause: `...: error downloading file: error sending request
+/// for url (...)`, as rustup 1.29 prints it.
+fn rustup_unanswered_download(lowered: &str) -> bool {
+    const WRAPPER: &str = "could not download file from '";
+    const UNANSWERED: &str = "error downloading file: error sending request for url (";
+    lowered.match_indices(WRAPPER).any(|(at, _)| {
+        lowered[at..]
+            .split_once("': ")
+            .is_some_and(|(_, cause)| cause.starts_with(UNANSWERED))
+    })
 }
 
 /// What Kin still does when a language server is not installed.
@@ -1429,6 +1599,21 @@ pub(crate) const RESTART_AFTER_INSTALL: &str =
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_provisioning_worker_failure_is_not_an_install_report() {
+        let error = provision_async(
+            vec![LanguageId::Rust],
+            InstallConsent::Granted,
+            |_| false,
+            |_| Some(InstallRoute::PinnedRelease),
+            |_, _| panic!("explicit consent must not prompt"),
+            |_, _| panic!("installer worker fixture failed"),
+        )
+        .await
+        .expect_err("a failed worker must not return an installed report");
+        assert!(error.is_panic());
+    }
+
     /// The advice and the runtime must name the same binaries.
     ///
     /// The advice and the runtime must name the same binaries, asserted against
@@ -1465,6 +1650,75 @@ mod tests {
                 recipe.language
             );
         }
+    }
+
+    /// Each recipe leads with the binary the daemon's adapter starts.
+    ///
+    /// `kin doctor` compares this shell against the daemon by looking up only
+    /// that binary, because the daemon runs it and nothing else; the
+    /// alternatives after it satisfy discovery and never the daemon. The
+    /// adapters are the ones the daemon's `lsp_adapter_for` constructs, with
+    /// JavaScript served by the TypeScript adapter as it is there.
+    #[test]
+    fn each_recipe_leads_with_the_binary_the_daemon_starts() {
+        use kin_lsp::adapters::LspAdapter;
+
+        let adapters: [&dyn LspAdapter; 4] = [
+            &kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter,
+            &kin_lsp::adapters::python::PyrightAdapter,
+            &kin_lsp::adapters::typescript::TypeScriptAdapter,
+            &kin_lsp::adapters::go::GoplsAdapter,
+        ];
+        for recipe in LANGUAGE_SERVERS {
+            let served_as = match recipe.language {
+                LanguageId::JavaScript => LanguageId::TypeScript,
+                language => language,
+            };
+            let adapter = adapters
+                .iter()
+                .find(|adapter| adapter.language_id() == served_as)
+                .unwrap_or_else(|| panic!("{}: no adapter starts a server", recipe.language));
+            assert_eq!(
+                recipe.binaries.first().copied(),
+                Some(adapter.server_command()),
+                "{}: doctor would look up a binary the daemon never starts",
+                recipe.language
+            );
+        }
+    }
+
+    /// The server names an MCP answer leads with, when one is missing, are the
+    /// names the daemon starts.
+    ///
+    /// `kin_mcp::first_contact` names the missing server in the one sentence a
+    /// reader acts on, and it cannot see kin-lsp. Held here, against the same
+    /// runtime list the recipes are held to.
+    #[test]
+    fn the_mcp_advice_names_the_binaries_the_daemon_starts() {
+        let runtime: std::collections::HashMap<LanguageId, Vec<String>> =
+            kin_lsp::registry::ProviderRegistry::with_defaults()
+                .known_binaries()
+                .into_iter()
+                .collect();
+        for (language, binaries) in &runtime {
+            let named = format!("{language:?}");
+            let advised = kin_mcp::first_contact::LANGUAGE_SERVER_BINARIES
+                .iter()
+                .find(|(name, _)| *name == named)
+                .map(|(_, binaries)| {
+                    binaries
+                        .iter()
+                        .map(|b| (*b).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| panic!("{named}: the MCP advice names no server for it"));
+            assert_eq!(&advised, binaries, "{named}");
+        }
+        assert_eq!(
+            kin_mcp::first_contact::LANGUAGE_SERVER_BINARIES.len(),
+            runtime.len(),
+            "the MCP advice names a server for a language the daemon starts none for"
+        );
     }
 
     /// Every language the coverage report calls enrichable must be installable.
@@ -1761,6 +2015,167 @@ mod tests {
             network_shape("error: could not compile `pyright`"),
             None,
             "an unrelated failure must not be dressed as a proxy problem"
+        );
+    }
+
+    /// Kin's own pinned-release download is the network only when its request
+    /// got no answer.
+    ///
+    /// Every failure it reports opens `could not download <url>:`, and the
+    /// bare phrase once read all of them as an unrouted network: a server that
+    /// answered 404, a disk that refused the write, a response past the size
+    /// ceiling. Each reason below is built by the downloader's own
+    /// `InstallFailure::reason` around the cause its arm reports. The refused
+    /// connection is what `kin setup` printed against a closed loopback port;
+    /// the failed lookup is the same chain with hyper-util's `dns error` cause.
+    ///
+    /// Falsify by restoring the bare `could not download` signature in
+    /// `network_shape`: every answered download below then reads as the
+    /// network.
+    #[test]
+    fn a_pinned_release_download_is_the_network_only_when_its_request_went_unanswered() {
+        use language_server_release::InstallFailure;
+
+        let url = "http://127.0.0.1:52918/2026-08-24/rust-analyzer-aarch64-apple-darwin.gz";
+        let download = |cause: String| {
+            InstallFailure::Download {
+                url: url.to_string(),
+                reason: cause,
+            }
+            .reason()
+        };
+
+        for cause in [
+            format!(
+                "error sending request for url ({url}): client error (Connect): tcp connect \
+                 error: Connection refused (os error 61)"
+            ),
+            format!(
+                "error sending request for url ({url}): client error (Connect): dns error: \
+                 failed to lookup address information: Temporary failure in name resolution"
+            ),
+        ] {
+            let reason = download(cause);
+            let shape = network_shape(&reason)
+                .unwrap_or_else(|| panic!("an unanswered request is the network: {reason}"));
+            assert!(shape.contains("never completed"), "{shape}");
+        }
+
+        // A server that answered and refused keeps its own shape.
+        let reason = download("the server answered 403 Forbidden".to_string());
+        let refused = network_shape(&reason).expect("a refusing middlebox must classify");
+        assert!(refused.contains("answered and refused"), "{refused}");
+
+        for cause in [
+            "the server answered 404 Not Found".to_string(),
+            "No space left on device (os error 28)".to_string(),
+            "could not open /home/u/.kin/tools/bin/.kin-download-7: Permission denied (os \
+             error 13)"
+                .to_string(),
+            format!(
+                "the response passed {} bytes and was abandoned",
+                256u64 * 1024 * 1024
+            ),
+        ] {
+            let reason = download(cause);
+            assert_eq!(
+                network_shape(&reason),
+                None,
+                "a download that got an answer, or failed on this host, is not the network: \
+                 {reason}"
+            );
+        }
+
+        let mismatch = InstallFailure::ChecksumMismatch {
+            url: url.to_string(),
+            expected: "a".repeat(64),
+            actual: "b".repeat(64),
+            bytes: 12,
+        }
+        .reason();
+        assert_eq!(network_shape(&mismatch), None, "{mismatch}");
+    }
+
+    /// The installers' own refusals read as the network, and rustup's own 404
+    /// does not.
+    ///
+    /// Every line below is what npm 10.9.8 or rustup 1.29.0 wrote to stderr
+    /// against loopback, with only ports and rustup's download paths rewritten:
+    /// npm and rustup's channel sync against a port nothing listened on, and a
+    /// rustup component download from a local server whose package URL either
+    /// refused the connection or answered 404. The 404 and the refusal share
+    /// rustup's `could not download file from` wrapper and differ only in the
+    /// cause after it. Each reason is built by `installer_failure_reason`, which
+    /// is how a failed installer's stderr reaches `network_shape` in a real run.
+    ///
+    /// Falsify by restoring a wrapper-only signature, `could not download` or
+    /// `could not download file from`, in `network_shape`: rustup's 404 then
+    /// reads as the network.
+    #[test]
+    fn the_installers_own_refusals_read_as_the_network_and_a_rustup_404_does_not() {
+        fn lines(said: &[&str]) -> Vec<String> {
+            said.iter().map(|line| line.to_string()).collect()
+        }
+        let npm_refused = lines(&[
+            "npm error code ECONNREFUSED",
+            "npm error syscall connect",
+            "npm error errno ECONNREFUSED",
+            "npm error FetchError: request to http://127.0.0.1:9/pyright failed, reason: \
+             connect ECONNREFUSED 127.0.0.1:9",
+        ]);
+        let rustup_channel_refused = lines(&[
+            "info: syncing channel updates for stable-aarch64-apple-darwin",
+            "error: could not download file from \
+             'http://127.0.0.1:9/dist/channel-rust-stable.toml.sha256' to \
+             '/home/u/.rustup/tmp/rl4r3ongiux48w1t_file': error downloading file: error sending \
+             request for url (http://127.0.0.1:9/dist/channel-rust-stable.toml.sha256): client \
+             error (Connect): tcp connect error: Connection refused (os error 61)",
+        ]);
+        let rustup_component_refused = lines(&[
+            "info: downloading component rustc",
+            "info: rolling back changes",
+            "error: component download failed for rustc-aarch64-apple-darwin: partially \
+             downloaded file was kept for resumption, please try again: could not download file \
+             from 'http://127.0.0.1:9/dist/rustc-1.99.0-aarch64-apple-darwin.tar.gz' to \
+             '/home/u/.rustup/downloads/0000.partial': error downloading file: error sending \
+             request for url (http://127.0.0.1:9/dist/rustc-1.99.0-aarch64-apple-darwin.tar.gz): \
+             client error (Connect): tcp connect error: Connection refused (os error 61)",
+        ]);
+        let rustup_component_404 = lines(&[
+            "info: downloading component rustc",
+            "info: rolling back changes",
+            "error: component download failed for rustc-aarch64-apple-darwin: could not download \
+             file from 'http://127.0.0.1:9/dist/rustc-1.99.0-aarch64-apple-darwin.tar.gz' to \
+             '/home/u/.rustup/downloads/0000.partial': http request returned an unsuccessful \
+             status code: 404",
+        ]);
+
+        for (command, stderr) in [
+            ("npm install -g pyright", &npm_refused),
+            (
+                "rustup component add rust-analyzer",
+                &rustup_channel_refused,
+            ),
+            (
+                "rustup component add rust-analyzer",
+                &rustup_component_refused,
+            ),
+        ] {
+            let reason = installer_failure_reason(command, Some(1), stderr);
+            let shape = network_shape(&reason)
+                .unwrap_or_else(|| panic!("{command} was refused by the network: {reason}"));
+            assert!(shape.contains("never completed"), "{shape}");
+        }
+
+        let reason = installer_failure_reason(
+            "rustup component add rust-analyzer",
+            Some(1),
+            &rustup_component_404,
+        );
+        assert_eq!(
+            network_shape(&reason),
+            None,
+            "a server that answered 404 is not the network: {reason}"
         );
     }
 
@@ -2553,6 +2968,39 @@ mod tests {
             !RESTART_AFTER_INSTALL.contains("no restart"),
             "the advice must not promise a pickup the startup gate cannot deliver"
         );
+    }
+
+    /// Recording reads where the servers and their runtimes resolve, one entry
+    /// per directory, and skips names that resolve nowhere.
+    #[cfg(unix)]
+    #[test]
+    fn the_directories_recorded_are_where_servers_and_runtimes_resolve() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let node_bin = root.path().join("nvm/versions/node/v20.11.1/bin");
+        let go_bin = root.path().join("work/go/bin");
+        for (dir, name) in [
+            (&node_bin, "pyright-langserver"),
+            (&node_bin, "typescript-language-server"),
+            (&node_bin, "node"),
+            (&go_bin, "gopls"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            let file = dir.join(name);
+            std::fs::write(&file, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let empty = root.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let path = std::env::join_paths([&empty, &node_bin, &go_bin]).unwrap();
+
+        assert_eq!(
+            language_tool_dirs_on(Some(&path)),
+            vec![node_bin.clone(), go_bin.clone()],
+            "each directory once, in the order its first name resolved"
+        );
+        assert!(language_tool_dirs_on(None).is_empty());
     }
 }
 

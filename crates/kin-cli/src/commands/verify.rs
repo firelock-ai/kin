@@ -195,7 +195,7 @@ fn build_entity_verify_response(
 
     if entities.is_empty() {
         return Ok(VerifyCommandResponse {
-            lines: vec![format!("No entity matching '{}' found.", entity)],
+            lines: vec![entity_not_found_line(entity)],
         });
     }
 
@@ -803,7 +803,46 @@ fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
     ))
 }
 
-fn resolve_entity<G>(graph: &G, entity_query: &str) -> Result<Entity>
+/// The line `kin verify` answers with when its entity query matches nothing.
+///
+/// Public so a caller that recognises this answer compares it with the one
+/// producer rather than a copy of its wording.
+pub fn entity_not_found_line(entity_query: &str) -> String {
+    format!("No entity matching '{}' found.", entity_query)
+}
+
+/// A `kin verify` plan or run refused because its entity query named no one
+/// entity: nothing matches it, or several do.
+///
+/// Typed so the daemon can hold this refusal back while an edit admission may
+/// be adding the entity the query names, and serve every other failure as it
+/// always did.
+#[derive(Debug)]
+pub struct VerifyEntityUnresolved(String);
+
+impl std::fmt::Display for VerifyEntityUnresolved {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VerifyEntityUnresolved {}
+
+/// Whether a plan or run for `entity_query` names exactly one entity in
+/// `graph`, by the rule [`execute_verify_run`] resolves it with.
+///
+/// Public for the daemon, which asks before a run takes the coordination gate.
+/// A run holds its own writer guard while it resolves, so it cannot tell from
+/// the authority clock whether an edit admission was adding the entity.
+pub fn verify_query_names_one_entity<G>(graph: &G, entity_query: &str) -> Result<bool>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    Ok(verify_query_matches(graph, entity_query)?.len() == 1)
+}
+
+fn verify_query_matches<G>(graph: &G, entity_query: &str) -> Result<Vec<Entity>>
 where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
@@ -812,12 +851,22 @@ where
         name_pattern: Some(entity_query.to_string()),
         ..Default::default()
     };
-    let entities = graph
+    graph
         .query_entities(&filter)
-        .map_err(|err| anyhow!(err.to_string()))?;
+        .map_err(|err| anyhow!(err.to_string()))
+}
+
+fn resolve_entity<G>(graph: &G, entity_query: &str) -> Result<Entity>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let entities = verify_query_matches(graph, entity_query)?;
 
     match entities.as_slice() {
-        [] => bail!("No entity matching '{}' found.", entity_query),
+        [] => Err(anyhow::Error::new(VerifyEntityUnresolved(
+            entity_not_found_line(entity_query),
+        ))),
         [entity] => Ok(entity.clone()),
         many => {
             let preview = many
@@ -826,11 +875,10 @@ where
                 .map(|entity| entity.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!(
+            Err(anyhow::Error::new(VerifyEntityUnresolved(format!(
                 "Multiple entities match '{}': {}. Use a more exact name.",
-                entity_query,
-                preview
-            );
+                entity_query, preview
+            ))))
         }
     }
 }

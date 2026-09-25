@@ -237,6 +237,28 @@ pub enum RelationSyntacticRole {
     /// ordinary call, because demoting a real hop for its neighbour's syntax
     /// would cost exactly the recall this marker exists to protect.
     RaiseTarget,
+    /// A bounded lazy own getter returns a closure value constructed from a
+    /// uniquely bound CommonJS import. The lexical receiver remains recorded;
+    /// this licenses only an inferred external boundary, never a local target.
+    JsImportedGetterReceiver,
+}
+
+/// Specifier subset supported by the imported-getter receiver derivation.
+/// Relative, absolute, URL and builtin-protocol paths remain unresolved here.
+pub fn is_js_bare_package_specifier(module: &str) -> bool {
+    let parts: Vec<_> = module.split('/').collect();
+    !module.is_empty()
+        && !module.starts_with('.')
+        && module
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@/._-".contains(&b))
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && *part != "." && *part != "..")
+        && (!module.starts_with('@') || (parts.len() >= 2 && parts[0].len() > 1))
+        && parts.iter().enumerate().all(|(index, part)| {
+            !part.contains('@') || (index == 0 && part.starts_with('@') && !part[1..].contains('@'))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +442,47 @@ pub struct ImportedName {
     pub original_name: Option<String>,
     /// Whether this is the default import.
     pub is_default: bool,
+    /// Where THIS name is written, when the grammar gives the adapter a node
+    /// of its own for it.
+    ///
+    /// An entity-level import edge is minted per specifier, so the bytes it
+    /// cites have to be the specifier's and not the statement's. With only
+    /// `FileImport::site` to cite, every specifier of
+    ///
+    /// ```text
+    /// import {
+    ///   DEFAULT_STYLE_ID,
+    /// } from './common'
+    /// ```
+    ///
+    /// reported the line carrying the bare `import {`, which names nothing the
+    /// reader asked about. `find_references` then answered with both that line
+    /// and the specifier's, and the opening line is the one that cannot be
+    /// acted on: there is no occurrence of the name there to read, to jump to,
+    /// or to rewrite.
+    ///
+    /// `Option`, unlike the required [`FileImport::site`] beside it, because a
+    /// specifier need not exist as source at all: a bare `import './side'`, a
+    /// `use foo::*` and a header include each bind something the file never
+    /// writes down, and the adapter synthesizes the name. `None` means exactly
+    /// that, and [`FileImport::evidence_site`] falls back to the statement,
+    /// which is the behaviour every one of these had before. It is still a
+    /// plain struct field with no `Default`, so an adapter that forgets it does
+    /// not compile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<RelationSite>,
+}
+
+impl FileImport {
+    /// The bytes an edge minted from `specifier` should cite.
+    ///
+    /// The specifier's own span where the adapter recorded one, and the import
+    /// statement's otherwise. Both edge builders in the linker ask this, so a
+    /// specifier-bound edge and a module-scoped one cannot come to disagree
+    /// about which bytes a named import is evidenced by.
+    pub fn evidence_site<'a>(&'a self, specifier: &'a ImportedName) -> &'a RelationSite {
+        specifier.site.as_ref().unwrap_or(&self.site)
+    }
 }
 
 /// Attach file-level retrieval context to every entity emitted from the file.
@@ -732,8 +795,23 @@ pub enum ExtractedTestKind {
 
 /// Output of parsing a single file.
 #[derive(Debug, Clone)]
+pub struct ExtractedDerivedMember {
+    pub fingerprint: SemanticFingerprint,
+    pub owner: Option<String>,
+    pub keys: Vec<String>,
+    pub callable: bool,
+    pub signature: String,
+    pub generator: SourceSpan,
+    pub assignment: SourceSpan,
+    pub rule: String,
+    pub conditions: Vec<String>,
+}
+
+/// Physical declarations and candidate facts are separate parser outputs.
+#[derive(Debug, Clone)]
 pub struct ParseOutput {
     pub entities: Vec<ExtractedEntity>,
+    pub derived_members: Vec<ExtractedDerivedMember>,
     pub relations: Vec<ExtractedRelation>,
     /// Detailed import declarations for cross-file resolution.
     pub imports: Vec<FileImport>,
@@ -870,6 +948,7 @@ mod tests {
                 local_name: "createHydrationRenderer".into(),
                 original_name: None,
                 is_default: false,
+                site: None,
             }],
         }];
 

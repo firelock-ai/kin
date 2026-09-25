@@ -97,11 +97,13 @@ Find the Kin tools this server registers but your profile does not serve, by des
 need in plain language. Kin registers far more tools than any agent profile serves: a profile is a \
 small always-on set, chosen so the list you carry on every turn stays cheap, and everything else is \
 reached through here. Give `need` a plain-language description of the job (\"what breaks if I \
-change this\", \"who calls this function\", \"read one file's exact bytes\") and each match comes \
+change this\", \"who calls this function\", \"read one entity's exact source\") and each match comes \
 back as the complete tool definition, carrying its name, description, annotations and input schema \
 exactly as the `full` profile serves them. Discovery does not activate tools or change this \
-connection's profile. Read `invocation.profile_enabled` for each returned match; a disabled tool \
-requires a connection configured with a profile that serves it. Enabled tools still require \
+connection's profile. Read `invocation.profile_enabled` for direct calls. When \
+`invocation.callable_via_dispatcher` is true for the match, invoke it through `kin_tool_call` with \
+its name in `tool` and input object in `arguments`; otherwise a disabled tool requires a \
+connection with a profile that serves it. Invoked tools still require \
 their normal repository, session and authorization checks. `matched_names` lists every match in rank order and `matches` carries the full \
 definitions for the first `limit` of them, so a match this call had no room for is reported rather \
 than dropped. Omit `need` to enumerate the whole registry. Ranking reads tool names first, then \
@@ -238,13 +240,25 @@ fn limit_from(args: &HashMap<String, serde_json::Value>) -> Result<u64> {
 
 /// Answer one tool search from the registry this binary compiled.
 pub fn handle_tool_search(args: &HashMap<String, serde_json::Value>) -> Result<ToolCallResult> {
-    handle_tool_search_with_profile(args, None)
+    build_tool_search(args, None, false)
 }
 
 /// The profile controls dispatch eligibility independently of catalog discovery.
 pub fn handle_tool_search_with_profile(
     args: &HashMap<String, serde_json::Value>,
     allowed_tools: Option<&HashSet<String>>,
+) -> Result<ToolCallResult> {
+    build_tool_search(
+        args,
+        allowed_tools,
+        crate::tool_invocation::enabled(allowed_tools),
+    )
+}
+
+fn build_tool_search(
+    args: &HashMap<String, serde_json::Value>,
+    allowed_tools: Option<&HashSet<String>>,
+    dispatcher_available: bool,
 ) -> Result<ToolCallResult> {
     let need = match args.get("need") {
         None => String::new(),
@@ -275,7 +289,8 @@ pub fn handle_tool_search_with_profile(
         .map(|tool| {
             (
                 tool.name.as_str(),
-                allowed_tools.is_none_or(|allowed| allowed.contains(&tool.name)),
+                allowed_tools.is_none_or(|allowed| allowed.contains(&tool.name))
+                    && (tool.name != crate::tool_invocation::TOOL_NAME || dispatcher_available),
             )
         })
         .collect();
@@ -293,6 +308,10 @@ pub fn handle_tool_search_with_profile(
         "matches_withheld": withheld,
         "invocation": {
             "profile_enabled": profile_enabled,
+            "dispatcher_enabled": dispatcher_available,
+            "callable_via_dispatcher": matches.iter().map(|tool| (tool.name.as_str(), dispatcher_available && tool.annotations.read_only_hint && tool.name != crate::tool_invocation::TOOL_NAME && tool.name != TOOL_NAME)).collect::<HashMap<_, _>>(),
+            "dispatcher": crate::tool_invocation::TOOL_NAME,
+            "dispatcher_arguments": {"tool": "<matched tool name>", "arguments": "<input object matching its schema>"},
             "discovery_changes_profile": false,
             "normal_authorization_required": true,
         },
@@ -320,6 +339,56 @@ mod tests {
         let result = handle_tool_search(&map).expect("the search answers");
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         serde_json::from_str(text).expect("the payload is JSON")
+    }
+
+    #[test]
+    fn dispatcher_routes_match_the_serving_boundary_and_read_only_registry() {
+        let args = HashMap::from([
+            ("need".into(), serde_json::json!("kin_mutate")),
+            ("limit".into(), serde_json::json!(25)),
+        ]);
+        let parse = |result: ToolCallResult| {
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        };
+        let standalone = parse(handle_tool_search(&args).unwrap());
+        assert_eq!(standalone["invocation"]["dispatcher_enabled"], false);
+        let dispatcher_args = HashMap::from([(
+            "need".into(),
+            serde_json::json!(crate::tool_invocation::TOOL_NAME),
+        )]);
+        let standalone_dispatcher = parse(handle_tool_search(&dispatcher_args).unwrap());
+        assert_eq!(
+            standalone_dispatcher["invocation"]["profile_enabled"]
+                [crate::tool_invocation::TOOL_NAME],
+            false
+        );
+        let served_dispatcher =
+            parse(handle_tool_search_with_profile(&dispatcher_args, None).unwrap());
+        assert_eq!(
+            served_dispatcher["invocation"]["profile_enabled"][crate::tool_invocation::TOOL_NAME],
+            true
+        );
+        let served = parse(handle_tool_search_with_profile(&args, None).unwrap());
+        assert_eq!(served["invocation"]["dispatcher_enabled"], true);
+        assert_eq!(
+            served["invocation"]["callable_via_dispatcher"]["kin_mutate"],
+            false
+        );
+        let args = HashMap::from([("need".into(), serde_json::json!("semantic_search"))]);
+        let served = parse(
+            handle_tool_search_with_profile(
+                &args,
+                Some(&crate::tools::name_set(
+                    crate::tools::agent_search_tool_names(),
+                )),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            served["invocation"]["callable_via_dispatcher"]["semantic_search"],
+            true
+        );
     }
 
     /// Reachability and fidelity together, over the whole registry.

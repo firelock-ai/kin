@@ -55,6 +55,12 @@ impl SessionProjection {
         &self.name
     }
 
+    /// The `.kin/runs/session-<id>` directory the daemon materialized, which
+    /// a reconcile names and [`discard`] removes.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The `kin reconcile` argument that admits this projection later.
     pub fn reconcile_hint(&self) -> &str {
         self.name
@@ -359,6 +365,7 @@ pub async fn close(
         .reconcile(&ReconcileRequest {
             session_dir: projection.dir.clone(),
             confirm_mass_deletion: false,
+            write_back: crate::commands::reconcile::SessionWriteBack::ExceptBuildOutputs,
         })
         .await
         .with_context(|| {
@@ -581,9 +588,30 @@ pub fn assistant_program(assistant: &str) -> Result<&'static str> {
 }
 
 /// `kin with <assistant> [-- <task...>]`.
+/// The refusal for a semantic-only task that carries a flag, if it does.
+///
+/// A semantic-only launch passes its task to the assistant as the prompt, after
+/// the profile's own flags. A task word shaped like a flag would reach the
+/// assistant's option parser instead, where `--tools` or a second `--settings`
+/// could restore what the profile removed, so no such word is passed at all.
+fn semantic_only_task_refusal(task: &[String]) -> Option<String> {
+    task.iter().find(|word| word.starts_with('-')).map(|flag| {
+        format!(
+            "--semantic-only passes the task to the assistant as its prompt only, so '{flag}' is \
+             refused: a flag in the task could restore tools the profile removes. Write the \
+             task in words that do not start with '-'."
+        )
+    })
+}
+
 pub async fn with(assistant: String, semantic_only: bool, task: Vec<String>) -> Result<()> {
     let adapter = super::assistant_adapter::adapter_for(&assistant)?;
     let program = adapter.program();
+    if semantic_only {
+        if let Some(refusal) = semantic_only_task_refusal(&task) {
+            bail!(refusal);
+        }
+    }
 
     let layout = discover_layout()?;
     // Write the profile before materializing. Every step of it is fallible —
@@ -634,6 +662,28 @@ pub async fn with(assistant: String, semantic_only: bool, task: Vec<String>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_semantic_only_task_cannot_carry_a_flag() {
+        let words = |list: &[&str]| list.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert!(semantic_only_task_refusal(&words(&["fix the keyword quoting"])).is_none());
+        assert!(semantic_only_task_refusal(&words(&["fix", "the", "bug"])).is_none());
+        assert!(semantic_only_task_refusal(&[]).is_none());
+        for task in [
+            words(&["--tools", "Read,Bash", "fix it"]),
+            words(&["fix it", "--settings", "/tmp/open.json"]),
+            words(&["--dangerously-skip-permissions"]),
+            words(&["-p", "fix it"]),
+            words(&["--mcp-config", "other.json"]),
+        ] {
+            let refusal = semantic_only_task_refusal(&task)
+                .unwrap_or_else(|| panic!("a flag passed through: {task:?}"));
+            assert!(
+                refusal.contains("restore tools the profile removes"),
+                "{refusal}"
+            );
+        }
+    }
 
     #[test]
     fn exec_preserves_argv_boundaries_and_shell_mode_takes_one_script() {

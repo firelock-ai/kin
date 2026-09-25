@@ -44,6 +44,65 @@ pub struct IndexedFile {
     pub imports: Vec<kin_parser::FileImport>,
 }
 
+impl IndexedFile {
+    /// Give the parsed declaration `parsed` the graph identity `retained`
+    /// everywhere this file names it: the entity, the relations it is an
+    /// endpoint of, the unresolved relations it sources and its layout region.
+    ///
+    /// A semantic rename keeps the renamed declaration's identity although the
+    /// parser mints a new id from the new name. Every fresh call edge carries
+    /// occurrence certificates bound to its endpoints, so an edge moves through
+    /// [`crate::occurrence::rebind_identity`] together with its certificates.
+    /// Writing only the endpoint fields left each certificate naming the
+    /// parser's id, and admission refuses that edge as invalid occurrence
+    /// evidence. The relation id stays as parsed, since admission chooses the
+    /// stable relation identity.
+    ///
+    /// The caller chooses which declaration keeps which identity and proves
+    /// that `retained` names no other parsed entity. Invalid occurrence evidence
+    /// refuses before any field changes.
+    pub fn retain_entity_identity(
+        &mut self,
+        parsed: kin_model::EntityId,
+        retained: kin_model::EntityId,
+    ) -> std::result::Result<(), String> {
+        let retain = |node: kin_model::GraphNodeId| {
+            if node == kin_model::GraphNodeId::Entity(parsed) {
+                kin_model::GraphNodeId::Entity(retained)
+            } else {
+                node
+            }
+        };
+        let mut relations = self.relations.clone();
+        for relation in &mut relations {
+            let (src, dst) = (retain(relation.src), retain(relation.dst));
+            if (src, dst) != (relation.src, relation.dst) {
+                let id = relation.id;
+                crate::occurrence::rebind_identity(relation, id, src, dst)?;
+            }
+        }
+        self.relations = relations;
+        for entity in &mut self.entities {
+            if entity.id == parsed {
+                entity.id = retained;
+            }
+        }
+        for relation in &mut self.unresolved_relations {
+            if relation.src_entity_id == parsed {
+                relation.src_entity_id = retained;
+            }
+        }
+        for region in &mut self.file_layout.regions {
+            if let kin_model::SourceRegion::EntityRef { entity_id, .. } = region {
+                if *entity_id == parsed {
+                    *entity_id = retained;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Indexed file plus parser-emitted tests.
 ///
 /// This keeps test metadata available to ingestion callers without widening the
@@ -345,6 +404,7 @@ impl IndexPipeline {
                 placed.callee_span.clone()
             });
         }
+        crate::occurrence::rebind_verified_spans(relation, &mut updated).ok()?;
         Some(updated)
     }
 
@@ -424,6 +484,7 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, source, file_id)?;
         let kin_parser::ParseOutput {
             entities: extracted_entities,
+            derived_members,
             relations: extracted_relations,
             imports,
             tests,
@@ -453,6 +514,14 @@ impl IndexPipeline {
                 ent
             })
             .collect();
+        materialize_derived_members(
+            &mut entities,
+            derived_members,
+            language,
+            file_id,
+            role,
+            blob_hash,
+        );
         attach_span_source_digest(&mut entities, blob_hash);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
@@ -463,6 +532,7 @@ impl IndexPipeline {
         );
         attach_equivalence_class(&mut entities, &tree, source, language);
         if language == LanguageId::Go {
+            kin_parser::attach_go_package_metadata(&tree, source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
         }
 
@@ -584,6 +654,7 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, &source, file_id)?;
         let kin_parser::ParseOutput {
             entities: extracted_entities,
+            derived_members,
             relations: extracted_relations,
             imports,
             tests,
@@ -614,6 +685,14 @@ impl IndexPipeline {
                 ent
             })
             .collect();
+        materialize_derived_members(
+            &mut entities,
+            derived_members,
+            language,
+            file_id,
+            role,
+            blob_hash,
+        );
         attach_span_source_digest(&mut entities, blob_hash);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
@@ -624,6 +703,7 @@ impl IndexPipeline {
         );
         attach_equivalence_class(&mut entities, &tree, &source, language);
         if language == LanguageId::Go {
+            kin_parser::attach_go_package_metadata(&tree, &source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);
         }
 
@@ -1125,6 +1205,76 @@ pub fn classify_file_role(path: &str) -> EntityRole {
     EntityRole::Source
 }
 
+/// A generated member has identity and provenance, but no independent source span.
+fn materialize_derived_members(
+    entities: &mut Vec<Entity>,
+    sites: Vec<kin_parser::ExtractedDerivedMember>,
+    language: LanguageId,
+    file: &FilePathId,
+    role: EntityRole,
+    blob_hash: kin_blobs::Hash256,
+) {
+    use kin_model::derivation::{
+        DerivationSchema, EntityDerivation, ENTITY_DERIVATION_KEY, MEMBER_COVERAGE_KEY,
+    };
+    if sites.is_empty() {
+        return;
+    }
+    let coverage = serde_json::json!({"schema":"kin.computed.members.v1", "scope":"javascript_bracket_writes", "observed_write_sites":sites.len(),
+        "runtime_enumeration_complete":false, "sites":sites.iter().map(|site| serde_json::json!({
+            "generator":site.generator,"assignment":site.assignment,"owner":site.owner,
+            "candidate_keys":site.keys,"rule":site.rule,"conditions":site.conditions
+        })).collect::<Vec<_>>()});
+    if let Some(module) = entities
+        .iter_mut()
+        .find(|e| e.kind == kin_model::EntityKind::Module)
+    {
+        module
+            .metadata
+            .extra
+            .insert(MEMBER_COVERAGE_KEY.into(), coverage);
+    }
+    for site in sites {
+        // Noncallable writes remain typed coverage evidence until Field support is integrated.
+        if !site.callable {
+            continue;
+        }
+        let Some(owner) = site.owner else {
+            continue;
+        };
+        for key in site.keys {
+            if key.is_empty() {
+                continue;
+            }
+            let name = format!("{owner}.{key}");
+            let derivation = EntityDerivation {
+                schema: DerivationSchema::V1,
+                generator: site.generator.clone(),
+                assignment: site.assignment.clone(),
+                source_blob_hash: blob_hash.to_string(),
+                owner: owner.clone(),
+                member_key: key,
+                rule: site.rule.clone(),
+                conditions: site.conditions.clone(),
+            };
+            let mut metadata = kin_model::EntityMetadata::default();
+            metadata.extra.insert(
+                ENTITY_DERIVATION_KEY.into(),
+                serde_json::to_value(&derivation).expect("derivation serializes"),
+            );
+            entities.push(Entity {
+                id: kin_model::EntityId::from_content(&file.0, &name,
+                    &format!("derived_member_candidate:{}", site.assignment.start_byte), site.assignment.start_line),
+                kind: kin_model::EntityKind::Method,
+                name, language, fingerprint: site.fingerprint.clone(), file_origin: Some(file.clone()),
+                span: None, signature: site.signature.clone(), visibility: kin_model::Visibility::Public,
+                role, doc_summary: Some("Candidate generated member; inspect the shared generator and unresolved conditions.".into()),
+                metadata, lineage_parent: None, created_in: None, superseded_by: None,
+            });
+        }
+    }
+}
+
 /// Resolve extracted name-based relations to entity-ID-based relations.
 ///
 /// Returns both same-file resolved relations and cross-file unresolved ones.
@@ -1138,6 +1288,7 @@ fn resolve_relations(
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
     let mut unresolved = Vec::new();
+    let source_index = crate::RelationSourceIndex::new(entities);
     let call_extraction_complete = !extracted
         .iter()
         .any(kin_parser::is_call_extraction_incomplete_marker);
@@ -1146,36 +1297,46 @@ fn resolve_relations(
         if kin_parser::is_call_extraction_incomplete_marker(rel) {
             continue;
         }
-        let src = entities.iter().find(|e| e.name == rel.src_name);
-        let dst = entities.iter().find(|e| e.name == rel.dst_name);
+        let src = source_index.resolve(rel);
+        let dst = entities
+            .iter()
+            .find(|e| e.name == rel.dst_name)
+            .filter(|_| !crate::linker::requires_rust_import_authority(rel, &file_id.0))
+            .filter(|_| {
+                // Receiver-shaped fields and unproven local method calls must
+                // reach the linker instead of capturing a bare free symbol.
+                !(crate::linker::is_go_selector_reference(rel, src.map(|entity| entity.language))
+                    || (src.is_some_and(|s| s.language == kin_model::LanguageId::Go)
+                        && rel.kind == kin_model::RelationKind::Calls
+                        && rel.receiver.is_some()
+                        && !rel.dst_name.contains('.')))
+            });
 
         match (src, dst) {
             (Some(s), Some(d)) => {
                 // Same-file relation: fully resolved
-                crate::linker::accumulate_relation(
-                    &mut resolved,
-                    &mut relation_indices,
-                    Relation {
-                        id: RelationId::from_content(
-                            &s.id.0.to_string(),
-                            &d.id.0.to_string(),
-                            &format!("{:?}", rel.kind),
-                        ),
-                        kind: rel.kind,
-                        src: kin_model::GraphNodeId::Entity(s.id),
-                        dst: kin_model::GraphNodeId::Entity(d.id),
-                        confidence: 1.0,
-                        origin: RelationOrigin::Parsed,
-                        created_in: None,
-                        import_source: rel.import_source.clone(),
-                        evidence: crate::linker::relation_evidence(
-                            rel,
-                            file_id,
-                            parse_completeness,
-                            call_extraction_complete,
-                        ),
-                    },
-                );
+                let mut relation = Relation {
+                    id: RelationId::from_content(
+                        &s.id.0.to_string(),
+                        &d.id.0.to_string(),
+                        &format!("{:?}", rel.kind),
+                    ),
+                    kind: rel.kind,
+                    src: kin_model::GraphNodeId::Entity(s.id),
+                    dst: kin_model::GraphNodeId::Entity(d.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: rel.import_source.clone(),
+                    evidence: crate::linker::relation_evidence(
+                        rel,
+                        file_id,
+                        parse_completeness,
+                        call_extraction_complete,
+                    ),
+                };
+                crate::occurrence::stamp_fresh(&mut relation);
+                crate::linker::accumulate_relation(&mut resolved, &mut relation_indices, relation);
             }
             (Some(s), None) => {
                 // Partial resolution: src found, dst is cross-file
@@ -1202,6 +1363,12 @@ fn resolve_relations(
             }
         }
     }
+    let derived = entities
+        .iter()
+        .filter(|entity| kin_model::is_derived_member(entity))
+        .map(|entity| entity.id)
+        .collect();
+    crate::linker::limit_derived_relations(&mut resolved, &derived);
     (resolved, unresolved)
 }
 
@@ -1293,7 +1460,7 @@ mod tests {
                 .iter()
                 .find(|entity| entity.name == "target")
                 .expect("target entity");
-            indexed
+            let relation = indexed
                 .relations
                 .iter()
                 .find(|relation| {
@@ -1301,9 +1468,12 @@ mod tests {
                         && relation.src == kin_model::GraphNodeId::Entity(caller.id)
                         && relation.dst == kin_model::GraphNodeId::Entity(target.id)
                 })
-                .expect("one logical Calls edge")
-                .evidence
-                .clone()
+                .expect("one logical Calls edge");
+            crate::occurrence::original_evidence(relation)
+                .expect("valid occurrence metadata")
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
         };
 
         let shapes = |evidence: &[kin_model::RelationEvidence]| {
@@ -1371,12 +1541,14 @@ mod tests {
                     && relation.dst == kin_model::GraphNodeId::Entity(target.id)
             })
             .expect("surviving positional call edge");
-        assert_eq!(edge.evidence.len(), 1);
+        let evidence =
+            crate::occurrence::original_evidence(edge).expect("valid occurrence metadata");
+        assert_eq!(evidence.len(), 1);
         assert_eq!(
-            edge.evidence[0].parser_rule.as_deref(),
+            evidence[0].parser_rule.as_deref(),
             Some(crate::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
         );
-        assert!(edge.evidence[0].call_shape.is_none());
+        assert!(evidence[0].call_shape.is_none());
     }
 
     #[test]
@@ -1430,12 +1602,14 @@ mod tests {
                     && relation.dst == kin_model::GraphNodeId::Entity(target.id)
             })
             .expect("surviving same-file target edge");
-        assert_eq!(edge.evidence.len(), 1);
+        let evidence =
+            crate::occurrence::original_evidence(edge).expect("valid occurrence metadata");
+        assert_eq!(evidence.len(), 1);
         assert_eq!(
-            edge.evidence[0].parser_rule.as_deref(),
+            evidence[0].parser_rule.as_deref(),
             Some(crate::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1)
         );
-        assert!(edge.evidence[0].call_shape.is_none());
+        assert!(evidence[0].call_shape.is_none());
     }
 
     #[test]
@@ -2169,6 +2343,68 @@ mod tests {
                 .to_string()
                 .contains(&kin_blobs::digest(source).to_string()),
             "{error}"
+        );
+    }
+
+    /// Retention validates every edge it would rebind before it writes any
+    /// field. A certificate naming an endpoint its edge does not have refuses
+    /// the whole retention and leaves the parsed file exactly as it was, so a
+    /// caller never goes on with a half-remapped file.
+    #[test]
+    fn retaining_an_identity_over_a_corrupt_certificate_refuses_and_changes_nothing() {
+        let source = b"def helper():\n    return 1\n\n\ndef renamed():\n    return helper()\n";
+        let mut indexed = IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("mod.py"),
+                source,
+                kin_blobs::digest(source),
+            )
+            .unwrap()
+            .indexed_file;
+        let id_of = |indexed: &IndexedFile, name: &str| {
+            indexed
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap()
+                .id
+        };
+        let parsed = id_of(&indexed, "renamed");
+        let helper = id_of(&indexed, "helper");
+        let call = indexed
+            .relations
+            .iter_mut()
+            .find(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.src == kin_model::GraphNodeId::Entity(parsed)
+                    && relation.dst == kin_model::GraphNodeId::Entity(helper)
+            })
+            .expect("the parser resolves the same-file call");
+        let certificate = call
+            .evidence
+            .iter_mut()
+            .find(|record| crate::occurrence::is_certificate(record))
+            .expect("the fresh call carries an occurrence certificate");
+        let mut proof: serde_json::Value =
+            serde_json::from_str(certificate.token.as_deref().unwrap()).unwrap();
+        proof["src"] =
+            serde_json::to_value(kin_model::GraphNodeId::Entity(kin_model::EntityId::new()))
+                .unwrap();
+        certificate.token = Some(proof.to_string());
+        let before = format!("{indexed:?}");
+
+        let error = indexed
+            .retain_entity_identity(parsed, kin_model::EntityId::new())
+            .unwrap_err();
+
+        assert!(
+            error.contains("invalid parser occurrence evidence"),
+            "the refusal names the evidence it rejected: {error}"
+        );
+        assert_eq!(
+            format!("{indexed:?}"),
+            before,
+            "a refused retention changes nothing"
         );
     }
 }

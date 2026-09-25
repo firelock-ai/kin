@@ -348,4 +348,50 @@ if rg -n 'tokio::spawn' "$repo_root/crates/kin-mcp/src/handlers/sessions.rs" -g 
   exit 1
 fi
 
+# The re-derivation commit is the one place a binding-history lineage may start
+# part way through a store's operation log, so `kin upgrade` is its only
+# caller. An HTTP, MCP or hosted route, or any other command, reaching it would
+# let a request qualify state no re-derivation produced. kin-db defines it,
+# kin-index implements the verifier it takes, and the upgrade calls it.
+unexpected_rederivation_hits=()
+rederivation_caller_seen=0
+while IFS=: read -r file line text; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  case "$file" in
+    crates/kin-cli/src/commands/upgrade.rs)
+      # The positive control counts the commit itself, not the verifier
+      # type beside it, so renaming the commit fails this rule.
+      if [[ "$text" == *commit_rederived_repository_transaction* ]]; then
+        rederivation_caller_seen=1
+      fi
+      ;;
+    crates/kin-db/src/storage/repository.rs | \
+      crates/kin-db/src/storage/binding_history.rs | \
+      crates/kin-db/src/storage/binding_history_tests.rs | \
+      crates/kin-db/src/storage/derivation_ledger_tests.rs | \
+      crates/kin-index/src/binding_history.rs) ;;
+    # A test target, never a runtime path. The upgrade's store tests drive the
+    # commit with the real verifier to show that a certificate bound to the
+    # current bytes, with no derivation behind it, pays nothing.
+    crates/kin-cli/tests/store_upgrade.rs) ;;
+    *)
+      unexpected_rederivation_hits+=("$file:$line")
+      ;;
+  esac
+done < <(rg -n 'commit_rederived_repository_transaction|RederivationBindingHistoryVerifier|RederivationVerifier\b' "$repo_root/crates" -g '*.rs')
+
+if ((${#unexpected_rederivation_hits[@]} > 0)); then
+  echo "Unexpected use of the re-derivation commit or its verifier outside kin upgrade:" >&2
+  printf '  %s\n' "${unexpected_rederivation_hits[@]}" >&2
+  exit 1
+fi
+# The positive control: a rename that moved the caller would otherwise leave
+# this rule scanning for names nothing uses and passing on nothing.
+if ((rederivation_caller_seen == 0)); then
+  echo "kin upgrade no longer names the re-derivation commit in crates/kin-cli/src/commands/upgrade.rs:" >&2
+  echo "  update this rule when the caller or the API is renamed" >&2
+  exit 1
+fi
+
 echo "Runtime guardrails check passed."

@@ -13,24 +13,31 @@
 //! from `HiArgs::checked` listed `ParseResult::Ok` for a `Ok(..)` that is the
 //! Rust prelude's.
 //!
-//! Everything here runs through the real Rust adapter, the real cross-file
-//! linker, and a real `InMemoryGraph`, which is what `kin init` builds over an
-//! existing tree. The positive controls sit in the same fixture on purpose: a
+//! These response-builder integration controls use the real indexing pipeline,
+//! admitted Cargo/module authority, cross-file linker, and `InMemoryGraph`.
+//! They do not launch the CLI or compile the fixture as a Cargo project.
+//! The positive controls sit in the same fixture on purpose: a
 //! file that DOES import the regex builder must still reach its `multi_line`,
 //! and a file that imports the enum's variants must still reach `ParseResult::Ok`,
 //! so a gate that simply deleted those entities from the graph would fail here.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use kin_cli::commands::refs::{build_refs_response, RefsRequest};
 use kin_cli::commands::repository_authority::RequestRepositoryAuthority;
 use kin_cli::commands::trace_data_flow::{
     build_trace_data_flow_response, TraceDataFlowRequest, TraceDataFlowResponse, TraceDirection,
 };
-use kin_db::InMemoryGraph;
-use kin_index::{link_cross_file, FileParseData};
-use kin_model::{ArtifactId, Entity, EntityStore, FilePathId};
-use kin_parser::{LanguageAdapter, RustAdapter};
+use kin_db::{GraphSnapshot, InMemoryGraph};
+use kin_index::{
+    linker::{link_cross_file_with_rust_project, ArtifactIdentityMap},
+    rust_project::{RustProjectAuthority, RustProjectLimits},
+    FileParseCompletenessMap, FileParseData, IndexPipeline,
+};
+use kin_model::{
+    ArtifactId, EntityKind, EntityStore, FilePathId, RepoPath, ResolvedArtifact, ResolvedTree,
+    TreeEntry,
+};
 
 /// The crate the focal imports. `multi_line` here is the true callee.
 const SEARCHER_RS: &str = r#"
@@ -148,7 +155,7 @@ pub fn parse_width(text: &str) -> u32 {
 
 /// The positive control for the variant path. A glob import of the enum's
 /// variants binds `Ok` here, so the bare call must still resolve, and the bare
-/// call to a free function must resolve whether or not anything is imported.
+/// call to the explicitly imported free function must also resolve.
 const REPORT_RS: &str = r#"
 use crate::parser::parse_width;
 use crate::parser::ParseResult::*;
@@ -158,61 +165,111 @@ pub fn report(text: &str) -> ParseResult {
 }
 "#;
 
-fn parse_rs(file_path: &str, source: &str) -> FileParseData {
-    let adapter = RustAdapter;
-    let file_id = FilePathId::new(file_path);
-    let bytes = source.as_bytes();
-    let tree = adapter.parse(bytes).expect("fixture parses");
-    let output = adapter
-        .extract(&tree, bytes, &file_id)
-        .expect("fixture extracts");
-    let entities: Vec<Entity> = output
-        .entities
-        .into_iter()
-        .map(|entity| entity.into_entity_with_source(adapter.language_id(), &file_id, Some(bytes)))
-        .collect();
-    FileParseData {
-        file_path: file_path.to_string(),
-        entities,
-        relations: output.relations,
-        imports: output.imports,
-    }
-}
-
 fn ripgrep_shaped_workspace() -> (InMemoryGraph, Vec<FileParseData>) {
-    let files = vec![
-        parse_rs("crates/cli/src/parser.rs", PARSER_RS),
-        parse_rs("crates/cli/src/report.rs", REPORT_RS),
-        parse_rs("crates/core/src/flags/hiargs.rs", HIARGS_RS),
-        parse_rs("crates/core/src/matcher_builder.rs", MATCHER_BUILDER_RS),
-        parse_rs("crates/regex/src/matcher.rs", MATCHER_RS),
-        parse_rs("crates/searcher/src/searcher/mod.rs", SEARCHER_RS),
+    // The CLI target owns parser/report. Other files remain admitted source
+    // decoys for the existing receiver-name controls; their directory names do
+    // not establish Cargo dependency or module authority.
+    let sources = [
+        ("Cargo.toml", "[package]\nname='receiver-fixture'\nedition='2021'\n[lib]\npath='crates/cli/src/lib.rs'\n"),
+        ("crates/cli/src/lib.rs", "pub mod parser; pub mod report;\n"),
+        ("crates/cli/src/parser.rs", PARSER_RS),
+        ("crates/cli/src/report.rs", REPORT_RS),
+        ("crates/core/src/flags/hiargs.rs", HIARGS_RS),
+        ("crates/core/src/matcher_builder.rs", MATCHER_BUILDER_RS),
+        ("crates/regex/src/matcher.rs", MATCHER_RS),
+        ("crates/searcher/src/searcher/mod.rs", SEARCHER_RS),
     ];
-    let artifact_ids = files
-        .iter()
-        .map(|file| (file.file_path.clone(), ArtifactId::new()))
-        .collect();
-    let relations = link_cross_file(&files, &artifact_ids).expect("link fixture");
+    let mut artifacts = Vec::new();
+    let mut blobs = BTreeMap::new();
+    let mut files = Vec::new();
+    let mut identities = ArtifactIdentityMap::new();
+    let mut completeness = FileParseCompletenessMap::new();
+    for (path, source) in sources {
+        let bytes = source.as_bytes();
+        let hash = kin_blobs::digest(bytes);
+        let id = ArtifactId::new();
+        blobs.insert(hash, bytes.to_vec());
+        identities.insert(path.to_owned(), id);
+        artifacts.push(ResolvedArtifact::new(
+            id,
+            RepoPath::from_utf8(path).unwrap(),
+            TreeEntry::Blob {
+                hash,
+                executable: false,
+            },
+        ));
+        if path.ends_with(".rs") {
+            let indexed = IndexPipeline::new()
+                .index_file_content_with_tests(&FilePathId::new(path), bytes, hash)
+                .expect("index exact admitted fixture source")
+                .indexed_file;
+            completeness.insert(path.into(), indexed.file_layout.parse_completeness);
+            files.push(FileParseData {
+                file_path: path.into(),
+                entities: indexed.entities,
+                relations: indexed.extracted_relations,
+                imports: indexed.imports,
+            });
+        }
+    }
+    let tree = ResolvedTree::from_artifacts(artifacts).unwrap();
+    let authority =
+        RustProjectAuthority::from_admitted_tree(&tree, RustProjectLimits::default(), |hash| {
+            blobs
+                .get(&hash)
+                .cloned()
+                .ok_or("missing fixture CAS body".into())
+        })
+        .expect("derive the CLI target and its modules from admitted source");
+    let entities: Vec<_> = files.iter().flat_map(|file| &file.entities).collect();
+    let relations = link_cross_file_with_rust_project(
+        &files.iter().collect::<Vec<_>>(),
+        &entities,
+        &identities,
+        &completeness,
+        &authority,
+    )
+    .expect("link exact admitted fixture");
 
-    let graph = InMemoryGraph::new();
-    for entity in files.iter().flat_map(|file| file.entities.iter()) {
+    let graph = InMemoryGraph::from_snapshot(GraphSnapshot {
+        resolved_tree: tree,
+        ..GraphSnapshot::empty()
+    })
+    .expect("admit the same tree used by project resolution");
+    for entity in entities {
         graph.upsert_entity(entity).expect("upsert entity");
     }
     for relation in &relations {
+        // Entity-rooted relations only. This fixture upserts into a store that
+        // was never given artifact identities, and the linker mints an
+        // artifact-level import edge for every resolved specifier, so admitting
+        // those here would fail on an endpoint the fixture deliberately does
+        // not hold. Nothing under test reads an artifact edge: every case here
+        // is about which entity a receiver call resolves to.
+        if relation.src.as_entity().is_none() || relation.dst.as_entity().is_none() {
+            continue;
+        }
         graph.upsert_relation(relation).expect("upsert relation");
     }
     (graph, files)
 }
 
 fn entity_id(files: &[FileParseData], name: &str) -> String {
-    files
+    // Admitting the real root also creates `mod report`. A trace focal is the
+    // callable, never whichever same-named declaration happened to arrive first.
+    let candidates: Vec<_> = files
         .iter()
         .flat_map(|file| file.entities.iter())
-        .find(|entity| entity.name == name)
-        .unwrap_or_else(|| panic!("fixture entity `{name}` not found"))
-        .id
-        .0
-        .to_string()
+        .filter(|entity| {
+            entity.name == name && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
+        })
+        .collect();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "fixture callable `{name}` must be unique"
+    );
+    candidates[0].id.0.to_string()
 }
 
 fn absent_binding() -> kin_core::LocalRepositoryAuthorityBinding {

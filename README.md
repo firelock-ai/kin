@@ -54,8 +54,8 @@ Use a disposable copy of a small Git repository. Import includes its full reacha
 
 ### 1. Install
 
-One command, and it is the same on macOS, Linux, Windows and WSL. It installs Kin, connects
-the AI coding tools it finds, and needs Node.js 20 or newer:
+On macOS, Linux and WSL2, one command installs Kin and connects the AI coding tools it
+finds. It needs Node.js 20 or newer:
 
 ```sh
 npx -y @kinlab/kin setup
@@ -75,7 +75,13 @@ Either way, reload your shell as a separate command, because the install puts `k
 exec "$SHELL" -l
 ```
 
-For Windows PowerShell, other installers, or troubleshooting, see the [full quickstart](docs/quickstart.md#1-install).
+On native Windows x64, install from PowerShell with `irm https://get.kinlab.dev/install.ps1 | iex`.
+It installs the `kin` CLI and does not connect AI coding tools, because WSL2 remains the
+recommended path on Windows. The Windows entry under [Alpha limits](#alpha-limits)
+says what works there. No native Windows ARM64 build is published. On an ARM64 machine, run
+that line from x64 PowerShell to install the x86_64 build under emulation, or use WSL2.
+
+For other installers or troubleshooting, see the [full quickstart](docs/quickstart.md#1-install).
 
 ### 2. Initialize the repository
 
@@ -110,7 +116,8 @@ kin impact ExactEntityName
 
 ### 4. Connect your agent
 
-Prepare local embeddings, then configure detected MCP clients:
+Prepare local embeddings, then configure detected MCP clients. On Windows, do this inside
+WSL2:
 
 ```sh
 kin embed &&
@@ -148,7 +155,7 @@ Kin has its own commits, branches, merges, diffs, and history, including in repo
 
 **Preserve Kin-only state.** Deleting `.kin` and re-importing from Git does not recover commits, reviews, or other state that existed only in Kin. Read the [import, recovery, and upgrade notes](docs/readme-reference.md#what-is-real-today-and-what-is-alpha).
 
-**Windows.** Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
+**Windows.** Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
 
 ## Why I built Kin
 

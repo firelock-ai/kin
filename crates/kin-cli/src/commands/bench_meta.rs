@@ -222,7 +222,7 @@ pub(crate) fn build_meta() -> Result<BenchMeta> {
         text_index_format_version: kin_db::TEXT_INDEX_FORMAT_VERSION,
         vector_index_metadata_version: vector_index_metadata_version(),
         feature_flags: feature_flags(),
-        embeddings: embedding_meta(),
+        embeddings: embedding_meta()?,
         coordination: coordination_meta(),
         kin_commit: build.sha,
         kin_dirty: build.dirty,
@@ -324,30 +324,30 @@ fn feature_flags() -> Vec<&'static str> {
     flags
 }
 
-fn embedding_meta() -> EmbeddingMeta {
+fn embedding_meta() -> Result<EmbeddingMeta> {
     #[cfg(feature = "embeddings")]
     {
-        let runtime = kin_db::embed::configured_embedding_runtime();
-        EmbeddingMeta {
+        let runtime = kin_db::embed::resolved_embedding_runtime()?;
+        Ok(EmbeddingMeta {
             vector_enabled: cfg!(feature = "vector"),
             embeddings_enabled: true,
             metal_enabled: metal_active(),
             model_id: Some(runtime.model_id),
             model_revision: Some(runtime.revision),
             pipeline_epoch: Some(runtime.pipeline_epoch),
-        }
+        })
     }
 
     #[cfg(not(feature = "embeddings"))]
     {
-        EmbeddingMeta {
+        Ok(EmbeddingMeta {
             vector_enabled: cfg!(feature = "vector"),
             embeddings_enabled: false,
             metal_enabled: metal_active(),
             model_id: None,
             model_revision: None,
             pipeline_epoch: None,
-        }
+        })
     }
 }
 
@@ -1065,7 +1065,7 @@ wait
 
     #[test]
     fn embedding_meta_matches_feature_flags() {
-        let meta = embedding_meta();
+        let meta = embedding_meta().unwrap();
         assert_eq!(meta.vector_enabled, cfg!(feature = "vector"));
         assert_eq!(meta.embeddings_enabled, cfg!(feature = "embeddings"));
         // metal_enabled must track the ACTUAL compiled backend (macOS-only), not the

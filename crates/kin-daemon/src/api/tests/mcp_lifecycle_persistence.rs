@@ -489,13 +489,22 @@ async fn mcp_after_compound_cold_recovery_failure() -> (tempfile::TempDir, Arc<D
     let session_id = mcp_test_session(&state);
     let tx_id = mcp_lifecycle_begin(&state, &session_id).await;
     let acknowledged_body = MCP_RECOVERY_ACKNOWLEDGED_BODY;
+    source_tree_conversion_fixture(&state, serde_json::json!({
+        "verb":"create", "target":"src/acknowledged.rs", "body":"pub fn acknowledged() -> u8 { 0 }",
+        "description":"import the independent declaration fixture"
+    })).await;
+    // Read after the import above, so the staged replacement carries the base
+    // of the version it replaces and can still publish once recovery settles.
+    let current = source_base_read_named(&state, "acknowledged").await;
+    let acknowledged = source_base_replacement(
+        &current,
+        acknowledged_body,
+        "retain the exact acknowledged source body",
+    );
     let staged = mcp_call(
         router(Arc::clone(&state)),
         "kin_transaction_stage",
-        serde_json::json!({ "transaction_id": tx_id, "operations": [{
-            "verb": "create", "target": "src/acknowledged.rs", "body": acknowledged_body,
-            "description": "retain the exact acknowledged source body"
-        }] }),
+        serde_json::json!({ "transaction_id": tx_id, "operations": [acknowledged] }),
     )
     .await;
     assert_ne!(staged.is_error, Some(true), "{}", mcp_result_text(&staged));
@@ -598,6 +607,8 @@ async fn mcp_staging_ack_compound_cold_recovery_failure_preserves_acknowledged_b
 async fn mcp_staging_ack_compound_cold_recovery_failure_can_commit_acknowledged_body() {
     let (_dir, reopened, tx_id) = mcp_after_compound_cold_recovery_failure().await;
     let layout = reopened.layout.clone();
+    let owner = crate::state::load_persisted_mcp_transactions_checked(&layout).unwrap()[&tx_id].session_id.clone();
+    reregister_transaction_owner(&reopened, &owner).await;
     let committed = mcp_call(
         router(Arc::clone(&reopened)),
         "kin_transaction_commit",
@@ -790,7 +801,54 @@ async fn mcp_staging_temp_exclusive_collision_refuses_without_removing_evidence(
             reopened
                 .is_initialized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let retry = mcp_call(router(Arc::clone(&reopened)), "kin_transaction_stage", serde_json::json!({"transaction_id":tx,"operations":[mcp_lifecycle_operation("retried")]})).await;
+            let retained = retained_transaction_value(&reopened, &tx);
+            assert_eq!(retained["session_id"], session);
+            let roots = source_base_roots(&reopened);
+            let owner_id = SessionId(Uuid::parse_str(&session).unwrap());
+            assert!(reopened
+                .coordinator
+                .get_session(&owner_id)
+                .unwrap()
+                .is_none());
+            let retry_operation = mcp_lifecycle_operation("retried");
+            let missing_owner = mcp_call_as(
+                router(Arc::clone(&reopened)),
+                "kin_transaction_stage",
+                serde_json::json!({"transaction_id":tx,"operations":[retry_operation.clone()]}),
+                owner_id,
+            )
+            .await;
+            assert_eq!(
+                missing_owner.is_error,
+                Some(true),
+                "{}",
+                mcp_result_text(&missing_owner)
+            );
+            assert!(mcp_result_text(&missing_owner).contains("Session not found"));
+            assert_eq!(retained_transaction_value(&reopened, &tx), retained);
+            assert_eq!(std::fs::read(&mirror).unwrap(), acknowledged);
+            assert_eq!(source_base_roots(&reopened), roots);
+            assert_eq!(std::fs::read(&collision).unwrap(), original);
+            assert_eq!(
+                std::fs::symlink_metadata(&collision)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                symlink
+            );
+            if symlink {
+                assert_eq!(std::fs::read(&target).unwrap(), original);
+            }
+            reregister_transaction_owner(&reopened, &session).await;
+            assert_eq!(retained_transaction_value(&reopened, &tx), retained);
+            assert_eq!(std::fs::read(&mirror).unwrap(), acknowledged);
+            assert_eq!(source_base_roots(&reopened), roots);
+            let retry = mcp_call(
+                router(Arc::clone(&reopened)),
+                "kin_transaction_stage",
+                serde_json::json!({"transaction_id":tx,"operations":[retry_operation.clone()]}),
+            )
+            .await;
             assert_ne!(retry.is_error, Some(true), "{}", mcp_result_text(&retry));
             let second_open = DaemonState::open(reopened.layout.clone()).unwrap();
             assert_eq!(
@@ -799,7 +857,25 @@ async fn mcp_staging_temp_exclusive_collision_refuses_without_removing_evidence(
                     .len(),
                 2
             );
+            let second = retained_transaction_value(&second_open, &tx);
+            assert_eq!(
+                second["staged_operations"][0],
+                retained["staged_operations"][0]
+            );
+            let retried: kin_mcp::McpMutationOperation =
+                serde_json::from_value(retry_operation).unwrap();
+            assert_eq!(
+                second["staged_operations"][1],
+                serde_json::to_value(retried).unwrap()
+            );
             assert_eq!(std::fs::read(&collision).unwrap(), original);
+            assert_eq!(
+                std::fs::symlink_metadata(&collision)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                symlink
+            );
             if symlink {
                 assert_eq!(std::fs::read(&target).unwrap(), original);
             }

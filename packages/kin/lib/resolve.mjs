@@ -52,7 +52,7 @@ export function compareVersions(a, b) {
 }
 
 function splitVersion(version) {
-  const trimmed = String(version).trim().replace(/^v/, '');
+  const trimmed = String(version).trim().replace(/^v/, '').split('+', 1)[0];
   const dash = trimmed.indexOf('-');
   const core = dash === -1 ? trimmed : trimmed.slice(0, dash);
   const pre = dash === -1 ? null : trimmed.slice(dash + 1).split('.');
@@ -162,9 +162,9 @@ export function resolveManagedBinary(name = 'kin', env = process.env, platform =
 
 /**
  * Path of the launcher's version stamp: which Kin release this launcher last
- * provisioned into <kinHome>/bin. Lets the normal launch path skip a
- * `kin --version` probe; a binary installed by other means (install.sh) has no
- * stamp and is probed instead of being silently trusted or clobbered.
+ * provisioned or confirmed in <kinHome>/bin. This is a receipt, not evidence
+ * of the current executable's version: another installer may replace it
+ * without updating the stamp. Launch decisions probe the installed binary.
  */
 export function launcherStampPath(env = process.env) {
   return path.join(kinHome(env), 'bin', '.kinlab-kin-version');

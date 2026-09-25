@@ -4,7 +4,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
-use std::path::{Path as FsPath, PathBuf};
+#[cfg(test)]
+use std::path::Path as FsPath;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -25,8 +27,8 @@ use kin_db::{LocalFileBackend, RepositoryAuthorityManager, SnapshotCursor, Stora
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     ChangeStore, ContractId, EntityId, EntityStore, FilePathId, GraphNodeId, IntentId, RepoPath,
-    RepositoryId, SessionCapabilities, SessionId, SessionStore, SessionTransport, TransactionDelta,
-    TreeEntry, WorkStore, WorkspaceId, WorkspaceTreeSnapshot,
+    RepositoryId, SessionCapabilities, SessionId, SessionStore, SessionTransport, TreeEntry,
+    WorkStore, WorkspaceId, WorkspaceTreeSnapshot,
 };
 // One declared bound governs both directions: what these routes accept is what
 // the transfer client reads.
@@ -40,12 +42,20 @@ use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<ExactSourceArchiveExportQueue>> = OnceLock::new();
+#[cfg(not(test))]
 static HOSTED_REPOSITORY_HYDRATIONS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
-fn hosted_repository_hydrations() -> Arc<tokio::sync::Semaphore> {
-    Arc::clone(
-        HOSTED_REPOSITORY_HYDRATIONS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))),
-    )
+fn hosted_repository_hydrations(_state: &DaemonState) -> Arc<tokio::sync::Semaphore> {
+    #[cfg(test)]
+    {
+        Arc::clone(&_state.hosted_repository_hydration_slots_for_test)
+    }
+    #[cfg(not(test))]
+    {
+        Arc::clone(
+            HOSTED_REPOSITORY_HYDRATIONS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))),
+        )
+    }
 }
 
 fn exact_source_archive_exports() -> Arc<ExactSourceArchiveExportQueue> {
@@ -254,10 +264,29 @@ pub(crate) struct ProjectionAuthorityCache {
     /// The refs routes' envelope, keyed on the same publication identity as
     /// every slot above it.
     ref_metadata: std::sync::Mutex<Option<HeldRefMetadata>>,
+    /// This daemon's workspace's owed derivation records as of the newest
+    /// logical authority generation it has read or written, for the readers
+    /// that answer without waiting on a load.
+    ///
+    /// Keyed on the generation rather than on a publication identity, because
+    /// it is filled from two places: every admission load, and every
+    /// standalone publication this daemon makes, out of the lease its own
+    /// commit left. The second is what lets a publication that moves bytes
+    /// without their parse be disclosed from the moment it lands rather than
+    /// from the next load.
+    owed: std::sync::Mutex<Option<HeldOwed>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
     loads: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct HeldOwed {
+    /// The logical authority generation, `RootBundle::generation`, the records
+    /// were read at.
+    generation: u64,
+    records: Arc<Vec<kin_db::OwedDerivation>>,
 }
 
 #[derive(Clone)]
@@ -312,6 +341,9 @@ struct HeldAdmission {
     roots: kin_model::RootBundle,
     policy: Option<kin_index::ResolvedAdmissionMatcher>,
     open_merge: Option<crate::repository_merge_state::OpenMergeSummary>,
+    /// This daemon's workspace's owed derivation records, out of the same
+    /// lease as the roots beside them.
+    owed: Arc<Vec<kin_db::OwedDerivation>>,
 }
 
 impl ProjectionAuthorityCache {
@@ -412,7 +444,29 @@ impl ProjectionAuthorityCache {
     }
 
     fn install_admission(&self, admission: HeldAdmission) {
+        self.note_owed(admission.roots.generation, Arc::clone(&admission.owed));
         *lock_recover(&self.admission) = Some(admission);
+    }
+
+    /// Hold `records` as the workspace's owed derivations at `generation`,
+    /// unless records from a newer generation are already held.
+    pub(crate) fn note_owed(&self, generation: u64, records: Arc<Vec<kin_db::OwedDerivation>>) {
+        let mut held = lock_recover(&self.owed);
+        if held
+            .as_ref()
+            .is_none_or(|held| held.generation <= generation)
+        {
+            *held = Some(HeldOwed {
+                generation,
+                records,
+            });
+        }
+    }
+
+    fn latest_owed(&self) -> Option<Arc<Vec<kin_db::OwedDerivation>>> {
+        lock_recover(&self.owed)
+            .as_ref()
+            .map(|held| Arc::clone(&held.records))
     }
 
     fn reuse_command(
@@ -462,6 +516,10 @@ impl ProjectionAuthorityCache {
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
         *lock_recover(&self.ref_metadata) = None;
+        // Held by generation rather than by publication identity, so a
+        // namespace replaced under the daemon could otherwise keep answering
+        // with the records of the store it replaced.
+        *lock_recover(&self.owed) = None;
     }
 }
 
@@ -839,6 +897,14 @@ fn cached_authority_admission_entry(
     let lease = authority.manager.read_authority();
     let roots = lease.roots().clone();
     let open_merge = crate::repository_merge_state::open_merge_summary(&lease, workspace_id);
+    let owed = Arc::new(
+        lease
+            .metadata()
+            .owed_derivations
+            .records_for(workspace_id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     drop(lease);
     let policy = authority
         .manager
@@ -850,6 +916,7 @@ fn cached_authority_admission_entry(
         roots,
         policy,
         open_merge,
+        owed,
     };
     state
         .projection_authority
@@ -896,6 +963,25 @@ pub(crate) fn held_authority_admission(
         .projection_authority
         .reuse_admission(&published)
         .map(|admission| (admission.roots, admission.policy))
+}
+
+/// This daemon's workspace's owed derivation records, from the admission
+/// values held for the current publication, loading them when they are not.
+///
+/// Blocking on a publication change, like [`cached_authority_admission`].
+pub(crate) fn cached_owed_derivations(
+    state: &DaemonState,
+) -> Result<Arc<Vec<kin_db::OwedDerivation>>, (StatusCode, String)> {
+    Ok(cached_authority_admission_entry(state)?.owed)
+}
+
+/// This daemon's workspace's owed derivation records without waiting on a
+/// store open: the ones from the newest authority generation this daemon has
+/// loaded or published, or `None` when it has done neither.
+pub(crate) fn held_owed_derivations(
+    state: &DaemonState,
+) -> Option<Arc<Vec<kin_db::OwedDerivation>>> {
+    state.projection_authority.latest_owed()
 }
 
 pub(crate) fn cached_authority_has_open_merge(
@@ -1221,6 +1307,14 @@ pub struct HealthResponse {
     #[serde(default)]
     pub status_live_sample_failures: u64,
     pub build: BuildResponse,
+    /// What the hosted spine authority has cost this process: full passes by
+    /// trigger, passes the rate limit deferred, identity checks, cached
+    /// readiness verdicts served, and the Firestore store's own count of
+    /// billable document reads. Absent on a local daemon, which has no durable
+    /// spine store. From 2026-09-05 to 2026-09-20 the hosted spine read about
+    /// 46 million Firestore documents a day and no surface said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spine_cost: Option<crate::hosted_spine_cost::HostedSpineCostReport>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -1461,6 +1555,11 @@ struct SessionStartResponse {
     /// can keep the session past this boundary, so this is deliberately not
     /// named `expires_at`.
     idle_reap_eligible_at: kin_model::timestamp::Timestamp,
+    /// The workspace instant a unit-addressed create or import change must
+    /// carry as its `repository_base`. Absent only when repository authority
+    /// could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_base: Option<kin_mcp::source_unit::RepositoryBase>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1899,6 +1998,54 @@ async fn request_daemon_shutdown(
     }
 }
 
+/// Ask this daemon to exit as soon as nothing needs it, and say what it is
+/// waiting on.
+///
+/// The difference from `/shutdown` is the whole point: shutdown stops the
+/// daemon now, under whatever client is attached, while retirement keeps every
+/// gate an idle exit keeps (an attached client, a request in flight, a pending
+/// publication, embedding or enrichment still running, an unflushed graph) and
+/// only drops the idle wait. `kin daemon stop --when-unused` sends this, so a
+/// person clearing Kin off a machine cannot take a daemon out from under an
+/// editor that is still using it.
+///
+/// Bound to the process incarnation the caller attributed, exactly as
+/// `/shutdown` is, so a retirement meant for a daemon that has since been
+/// replaced never reaches its successor.
+async fn request_daemon_retirement(
+    State(state): State<Arc<DaemonState>>,
+    Json(expected): Json<kin_cli::daemon_client::ProcessIdentity>,
+) -> Response {
+    let current = match kin_cli::daemon_client::current_process_identity() {
+        Ok(current) => current,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("current process identity unavailable: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    if current != expected {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "daemon process incarnation changed"})),
+        )
+            .into_response();
+    }
+    state.request_retirement();
+    // This request is itself in flight, so it leaves itself out of the count.
+    let blocked_by: Vec<&'static str> = crate::daemon::retirement_blockers(&state, 1)
+        .into_iter()
+        .map(crate::daemon::ShutdownBlocker::describe)
+        .collect();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"retiring": true, "blocked_by": blocked_by})),
+    )
+        .into_response()
+}
+
 fn is_public_route(path: &str) -> bool {
     let path = path.strip_prefix("/v2").unwrap_or(path);
     matches!(path, "/health" | "/ready" | "/readiness" | "/spine/health")
@@ -2070,21 +2217,51 @@ async fn auth_rotation_status(
     }))
 }
 
+/// The header a watchdog sets on the liveness probes it sends a worker.
+///
+/// The supervisor's reaper reads every worker's `/health` every 15 seconds.
+/// That read is not a client using the daemon, and counting it as one kept
+/// every worker's idle clock under 15 seconds, so no worker idled out while a
+/// supervisor ran. A client's own `/health` read still counts: a CLI reads it
+/// right before it sends a command, and must not find the daemon gone between
+/// the two.
+pub(crate) const WATCHDOG_PROBE_HEADER: &str = "x-kin-watchdog-probe";
+
+/// Whether `request` is a watchdog's liveness or readiness probe. Only those
+/// routes qualify, so the header cannot move real work off the idle clock.
+fn is_watchdog_probe(request: &axum::http::Request<axum::body::Body>) -> bool {
+    let path = request.uri().path();
+    (is_process_liveness_route(path) || is_readiness_route(path))
+        && request.headers().contains_key(WATCHDOG_PROBE_HEADER)
+}
+
 async fn daemon_activity(
     State(state): State<Arc<DaemonState>>,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> impl IntoResponse {
-    struct RequestActivityGuard(Arc<DaemonState>);
+    struct RequestActivityGuard {
+        state: Arc<DaemonState>,
+        probe: bool,
+    }
 
     impl Drop for RequestActivityGuard {
         fn drop(&mut self) {
-            self.0.end_request();
+            if self.probe {
+                self.state.end_probe();
+            } else {
+                self.state.end_request();
+            }
         }
     }
 
-    state.begin_request();
-    let _guard = RequestActivityGuard(state);
+    let probe = is_watchdog_probe(&request);
+    if probe {
+        state.begin_probe();
+    } else {
+        state.begin_request();
+    }
+    let _guard = RequestActivityGuard { state, probe };
     next.run(request).await
 }
 
@@ -2287,6 +2464,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/health", get(health))
         .route("/idle-timeout", get(idle_timeout).post(raise_idle_timeout))
         .route("/shutdown", post(request_daemon_shutdown))
+        .route("/retire", post(request_daemon_retirement))
         .route("/readiness", get(readiness))
         .route("/auth/rotation", get(auth_rotation_status))
         .route("/ready", get(readiness))
@@ -2365,6 +2543,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         )
         .route("/reconcile", post(reconcile_session_workspace))
         .route("/commands/commit", post(command_commit))
+        .route("/commands/exec-commit", post(command_exec_commit))
         .route("/commands/push", post(command_push))
         .route("/commands/pull", post(command_pull))
         .route("/commands/transfer-plan", post(command_transfer_plan))
@@ -2867,10 +3046,15 @@ fn router_with_rotation_tokens(
     // The outer layers below (`daemon_activity`, `api_version_header`,
     // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
     let admission_state = Arc::clone(&state);
+    let prepared_state = Arc::clone(&state);
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v2", routes)
         .layer(Extension(DaemonShutdownControl(shutdown)))
+        .layer(middleware::from_fn_with_state(
+            prepared_state,
+            crate::prepared_publication::serving,
+        ))
         // The same set the guard holds, so `/auth/rotation` reports the counter
         // the guard increments rather than a second copy that reads zero.
         .layer(Extension(tokens.clone()))
@@ -3023,6 +3207,12 @@ const XREF_STABLE_READ_ATTEMPTS: usize = 3;
 /// A current answer is worth more than a correctly labelled stale one, and on
 /// this path the only thing between them is one bounded wait: 350 ms in total
 /// across the four settles, against a contended read measured at 0.21 s.
+///
+/// This is one round. A round that ends with nothing it can serve, because a
+/// writer holds graph authority through it, is followed by a wait for that
+/// writer to finish and another round, until
+/// [`crate::state::XREF_WRITER_DRAIN_CEILING`] runs out. An edit admission
+/// holds authority far longer than one round lasts.
 const XREF_CURRENCY_ATTEMPTS: usize = XREF_STABLE_READ_ATTEMPTS + 1;
 const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
@@ -3152,6 +3342,12 @@ impl GraphStatusSettledCache {
 #[derive(Default)]
 pub(crate) struct XrefSettledHead {
     last: std::sync::Mutex<Option<XrefCertifiedHead>>,
+    /// A test's stand-in for a replay snapshot that fails to rebuild. The
+    /// stores `to_snapshot` clones apart can fall out of step only under a
+    /// writer, in a race no test can schedule, and every graph writer keeps
+    /// them in step, so the failure is injected here instead.
+    #[cfg(test)]
+    replay_rebuild_fault: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -3435,17 +3631,239 @@ struct XrefGraphReadAttempt {
     root: String,
     head_version: Option<u64>,
     mutation_epoch: u64,
+    head_currency: Option<XrefHeadCurrency>,
+    /// The reconcile loop held no working-copy changes it had picked up on
+    /// either side of the epoch sample. A snapshot is certified against
+    /// writers alone, so this is only what an answer that claims an absence
+    /// is additionally held to; see [`absence_is_certified`].
+    absence_certifiable: bool,
 }
 
+/// A root covers entity/relation topology, not source, history or the proof
+/// binding those facts to repository authority. Keep their independent
+/// invalidators as well. The daemon epoch still owns writer exclusion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct XrefHeadCurrency {
+    mutation_epoch: u64,
+    version: u64,
+    generation: u64,
+    truth_epoch: u64,
+}
+
+impl XrefHeadCurrency {
+    fn sample(state: &DaemonState, graph: &kin_db::InMemoryGraph, mutation_epoch: u64) -> Self {
+        Self {
+            mutation_epoch,
+            version: state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            generation: state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            truth_epoch: graph.truth_epoch(),
+        }
+    }
+
+    fn is_current(self, state: &DaemonState, graph: &kin_db::InMemoryGraph) -> bool {
+        self == Self::sample(state, graph, self.mutation_epoch)
+            && state.graph_authority_epoch_is_current(self.mutation_epoch)
+    }
+}
+
+/// One validated query graph, never an answer or a source-authority sample.
+/// Keeping the originating Arc prevents pointer reuse from lending another
+/// graph this admission. Only the command xref, find_references and
+/// bulk_check_references readers may use this cache: separately mutable work,
+/// review, verification, provenance and session copies are not kept current.
+/// Only HEAD uses the slot; private scopes still detach for each read. Readers
+/// hold their own Arc when a new entry replaces it.
+#[derive(Default)]
+pub(crate) struct XrefHeadGraphCache {
+    entry: std::sync::Mutex<XrefHeadGraphSlot>,
+}
+
+#[derive(Default)]
+struct XrefHeadGraphSlot {
+    graph: Option<XrefHeadGraphEntry>,
+    pressure_deferred: bool,
+}
+
+struct XrefHeadGraphEntry {
+    live_graph: Arc<kin_db::InMemoryGraph>,
+    graph: Arc<kin_db::InMemoryGraph>,
+    root: String,
+    currency: XrefHeadCurrency,
+}
+
+impl XrefHeadGraphCache {
+    fn get(
+        &self,
+        live_graph: &Arc<kin_db::InMemoryGraph>,
+        root: &str,
+        currency: XrefHeadCurrency,
+    ) -> Option<Arc<kin_db::InMemoryGraph>> {
+        let mut slot = self.entry.lock().ok()?;
+        if let Some(cached) = slot.graph.as_ref() {
+            if Arc::ptr_eq(live_graph, &cached.live_graph)
+                && cached.root == root
+                && cached.currency == currency
+            {
+                return Some(Arc::clone(&cached.graph));
+            }
+        }
+        // Retire a superseded generation before constructing its replacement.
+        // In-flight readers may still own it, but this cache need not add a
+        // second retained graph to the next cold capture's peak.
+        let previous = slot.graph.take();
+        drop(slot);
+        drop(previous);
+        None
+    }
+
+    fn insert(&self, entry: XrefHeadGraphEntry) {
+        if let Ok(mut slot) = self.entry.lock() {
+            // Pressure may have been observed during cold admission. Check
+            // retention under the same lock that clears it, so a racing
+            // builder cannot refill an evicted slot.
+            let previous = if slot.pressure_deferred {
+                Some(entry)
+            } else {
+                slot.graph.replace(entry)
+            };
+            drop(slot);
+            drop(previous);
+        }
+    }
+
+    /// Use the daemon's existing pressure observation, without a new sampler,
+    /// limit or refusal. A query's own Arc remains usable after eviction.
+    pub(crate) fn observe_pressure(&self, level: kin_core::memory_pressure::PressureLevel) {
+        use kin_core::memory_pressure::PressureLevel;
+        if let Ok(mut slot) = self.entry.lock() {
+            slot.pressure_deferred =
+                matches!(level, PressureLevel::Elevated | PressureLevel::Critical);
+            let previous = if slot.pressure_deferred {
+                slot.graph.take()
+            } else {
+                None
+            };
+            drop(slot);
+            drop(previous);
+        }
+    }
+}
+
+/// Why an attempt detached no snapshot it could read.
+#[derive(Debug)]
+enum XrefUnprepared {
+    /// A writer held graph authority when the attempt sampled it, so nothing
+    /// was captured.
+    WriterHeld,
+    /// A snapshot was captured and thrown away because the graph or its
+    /// authority moved during the capture. Carries the authority epoch sampled
+    /// before it.
+    Moved(u64),
+    /// The captured snapshot could not be rebuilt into a graph to read. It held
+    /// still while it was captured, so no writer caused this and none finishing
+    /// changes it.
+    Unreadable(String),
+}
+
+/// Rebuild a detached snapshot into the graph a reference read answers from,
+/// keeping the reason when it cannot be rebuilt.
+fn rebuild_xref_query_graph(
+    snapshot: kin_db::GraphSnapshot,
+    root_hash: kin_db::MerkleHash,
+) -> Result<kin_db::InMemoryGraph, String> {
+    kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(snapshot, root_hash)
+        .map_err(|error| error.to_string())
+}
+
+/// The refusal every reference read gives when its selected session scope
+/// expired or was replaced while it read.
+///
+/// One sentence for command xref, find_references and bulk_check_references,
+/// so a caller reads the same fact the same way on each. Nothing read from that
+/// scope can be certified any more, and waiting for a writer does not bring it
+/// back, so this names the scope rather than a writer.
+fn xref_scope_replaced_message(surface: &str) -> String {
+    format!(
+        "{}{surface}: the session scope this read selected expired, was cleared or was replaced \
+         while it ran, so nothing read from it can be certified. This says nothing about whether \
+         the queried entity exists: it is a scope that changed under the read, not an absent or \
+         unresolved symbol. What changes the outcome is a new call, which reads the scope the \
+         session selects now.",
+        kin_mcp::negative::UNANSWERED_READ_PREFIX,
+    )
+}
+
+/// The refusal for a snapshot that held still but could not be rebuilt into a
+/// graph to read.
+///
+/// A fault in the graph this daemon holds, so it names the fault rather than a
+/// writer, and it does not tell the caller to wait for one. It quotes the
+/// rebuild's own error, so it starts with the marker that keeps kin-mcp from
+/// reading a quoted phrase as a resolution miss.
+fn xref_snapshot_unreadable_message(surface: &str, error: &str) -> String {
+    format!(
+        "{}{surface}: a snapshot of the selected graph held still but could not be rebuilt into \
+         a graph to read ({error}). This is a fault in the graph this daemon holds, not an \
+         in-flight write window, so a writer finishing does not change it. It says nothing about \
+         whether the queried entity exists.",
+        kin_mcp::negative::UNANSWERED_READ_PREFIX,
+    )
+}
+
+/// Detach one snapshot a reference read can answer from, certified against
+/// writers.
+///
+/// A pending admission does not stop the capture. The reconcile loop's mark
+/// says files are on their way into the graph, which bears only on an answer
+/// that claims something is absent, so whether the mark was clear around the
+/// epoch sample is recorded on the attempt for that answer to be held to, and
+/// a read that returns rows is served through the mark.
 fn prepare_xref_graph_read(
     state: &DaemonState,
     selected_graph: &Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
-) -> Option<XrefGraphReadAttempt> {
-    let mutation_epoch = state.stable_graph_authority_epoch()?;
+) -> Result<XrefGraphReadAttempt, XrefUnprepared> {
+    prepare_xref_graph_read_with_rebuild(state, selected_graph, authority, rebuild_xref_query_graph)
+}
+
+fn prepare_xref_graph_read_with_rebuild(
+    state: &DaemonState,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    rebuild: impl FnOnce(
+        kin_db::GraphSnapshot,
+        kin_db::MerkleHash,
+    ) -> Result<kin_db::InMemoryGraph, String>,
+) -> Result<XrefGraphReadAttempt, XrefUnprepared> {
+    // Checked on both sides of the epoch sample, as `settled_read_epoch`
+    // does, so a mark put up during the sample is seen by one of them.
+    let mark_clear_before = !state.pending_admission_active();
+    let mutation_epoch = state
+        .stable_graph_authority_epoch()
+        .ok_or(XrefUnprepared::WriterHeld)?;
+    let absence_certifiable = mark_clear_before && !state.pending_admission_active();
     match authority {
         RequestGraphAuthority::Head => {
-            let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            let currency = XrefHeadCurrency::sample(state, selected_graph, mutation_epoch);
+            let cacheable = Arc::ptr_eq(selected_graph, &state.graph);
+            if cacheable {
+                let root = hex::encode(selected_graph.compute_root_hash());
+                if let Some(graph) = state.xref_graph_cache.get(selected_graph, &root, currency) {
+                    if !currency.is_current(state, selected_graph) {
+                        return Err(XrefUnprepared::Moved(mutation_epoch));
+                    }
+                    return Ok(XrefGraphReadAttempt {
+                        graph,
+                        root,
+                        head_version: Some(currency.version),
+                        mutation_epoch,
+                        head_currency: Some(currency),
+                        absence_certifiable,
+                    });
+                }
+            }
             // Query a detached entity/relation domain even for HEAD. The
             // version is published at the end of a graph mutation, so merely
             // stamping the live graph would still allow several handler reads
@@ -3454,23 +3872,36 @@ fn prepare_xref_graph_read(
             let root_hash = kin_db::compute_graph_root_hash(&snapshot);
             let root = hex::encode(root_hash);
             let live_root = hex::encode(selected_graph.compute_root_hash());
-            let version_after = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-            (version_before == version_after
-                && root == live_root
-                && state.graph_authority_epoch_is_current(mutation_epoch))
-            .then(|| {
-                kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-                    snapshot, root_hash,
-                )
-                .ok()
-                .map(|graph| XrefGraphReadAttempt {
-                    graph: Arc::new(graph),
-                    root,
-                    head_version: Some(version_after),
-                    mutation_epoch,
-                })
+            if root != live_root || !currency.is_current(state, selected_graph) {
+                return Err(XrefUnprepared::Moved(mutation_epoch));
+            }
+            let rebuilt = rebuild(snapshot, root_hash);
+            // Full admission can be substantial. A writer may have begun and
+            // ended while it ran; never install that superseded graph under a
+            // newer stamp, even if the writer returned to the same root.
+            if !currency.is_current(state, selected_graph)
+                || root != hex::encode(selected_graph.compute_root_hash())
+                || !currency.is_current(state, selected_graph)
+            {
+                return Err(XrefUnprepared::Moved(mutation_epoch));
+            }
+            let graph = Arc::new(rebuilt.map_err(XrefUnprepared::Unreadable)?);
+            if cacheable {
+                state.xref_graph_cache.insert(XrefHeadGraphEntry {
+                    live_graph: Arc::clone(selected_graph),
+                    graph: Arc::clone(&graph),
+                    root: root.clone(),
+                    currency,
+                });
+            }
+            Ok(XrefGraphReadAttempt {
+                graph,
+                root,
+                head_version: Some(currency.version),
+                mutation_epoch,
+                head_currency: Some(currency),
+                absence_certifiable,
             })
-            .flatten()
         }
         RequestGraphAuthority::SessionScope => {
             // `to_snapshot` clones the entity/relation store under one graph
@@ -3481,21 +3912,18 @@ fn prepare_xref_graph_read(
             let snapshot = selected_graph.to_snapshot();
             let root_hash = kin_db::compute_graph_root_hash(&snapshot);
             let root = hex::encode(root_hash);
-            if root != hex::encode(selected_graph.compute_root_hash()) {
-                return None;
+            if root != hex::encode(selected_graph.compute_root_hash())
+                || !state.graph_authority_epoch_is_current(mutation_epoch)
+            {
+                return Err(XrefUnprepared::Moved(mutation_epoch));
             }
-            if !state.graph_authority_epoch_is_current(mutation_epoch) {
-                return None;
-            }
-            let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-                snapshot, root_hash,
-            )
-            .ok()?;
-            Some(XrefGraphReadAttempt {
-                graph: Arc::new(graph),
+            Ok(XrefGraphReadAttempt {
+                graph: Arc::new(rebuild(snapshot, root_hash).map_err(XrefUnprepared::Unreadable)?),
                 root,
                 head_version: None,
                 mutation_epoch,
+                head_currency: None,
+                absence_certifiable,
             })
         }
     }
@@ -3513,6 +3941,12 @@ async fn xref_graph_read_is_still_current(
     }
     match authority {
         RequestGraphAuthority::Head => {
+            if !attempt
+                .head_currency
+                .is_some_and(|currency| currency.is_current(state, selected_graph))
+            {
+                return false;
+            }
             let Some(expected_version) = attempt.head_version else {
                 return false;
             };
@@ -3525,6 +3959,9 @@ async fn xref_graph_read_is_still_current(
             version_after == expected_version
                 && root_after == attempt.root
                 && state.graph_authority_epoch_is_current(attempt.mutation_epoch)
+                && attempt
+                    .head_currency
+                    .is_some_and(|currency| currency.is_current(state, selected_graph))
         }
         RequestGraphAuthority::SessionScope => {
             if hex::encode(selected_graph.compute_root_hash()) != attempt.root
@@ -3536,6 +3973,31 @@ async fn xref_graph_read_is_still_current(
             }
             state.graph_authority_epoch_is_current(attempt.mutation_epoch)
         }
+    }
+}
+
+/// Whether an answer read from `attempt`, already confirmed current against
+/// writers, may be served while it claims an absence.
+///
+/// Only when the reconcile loop held no working-copy changes it had picked up,
+/// as the attempt began or at any point since. A file the loop has picked up
+/// is on its way into the graph, so a name it adds, or a caller it gives an
+/// entity, is missing from the graph as it stands, and an answer read there
+/// would report as absent something the agent just wrote. A mark that came and
+/// went during the read came down after a pass whose writer guard moved the
+/// epoch, which the check below also catches.
+fn absence_is_certified(state: &DaemonState, attempt: &XrefGraphReadAttempt) -> bool {
+    attempt.absence_certifiable && state.settled_read_epoch_is_current(attempt.mutation_epoch)
+}
+
+/// What a round waits on before the next one: writers alone, unless it
+/// withheld an answer that claimed an absence, which also waits for the
+/// reconcile loop to let go of the changes it picked up.
+fn settle_scope_after(withheld: bool) -> crate::state::SettleScope {
+    if withheld {
+        crate::state::SettleScope::WritersAndPendingAdmissions
+    } else {
+        crate::state::SettleScope::Writers
     }
 }
 
@@ -3562,18 +4024,21 @@ const GRAPH_AUTHORITY_SETTLED_REPLAY_REASON: &str = "settled_replay";
 
 /// Which writer this daemon can actually name as the one that was moving.
 ///
-/// The sweep flag is the only writer identity the daemon holds at read time.
-/// Everything else that takes graph authority (a reconcile step, an MCP tool
-/// that mutates, a commit) publishes no such flag, so naming the sweep for
-/// those would be a cause invented to make a sentence read better. An orphaned
-/// session scope reaches the same exhaustion path and is not an enrichment
-/// sweep at all.
+/// Two identities are held at read time: the sweep flag, and the reconcile
+/// loop's mark over working-copy changes it picked up and has not yet
+/// published. Everything else that takes graph authority (a reconcile step run
+/// by a commit, an MCP tool that mutates) publishes no such mark, so naming
+/// either for those would be a cause invented to make a sentence read better.
+/// An orphaned session scope reaches the same exhaustion path and is neither.
 fn graph_authority_writer_sentence(state: &DaemonState) -> &'static str {
     if state
         .lsp_sweep_running
         .load(std::sync::atomic::Ordering::SeqCst)
     {
         "a language-server enrichment sweep was installing relations while this read ran"
+    } else if state.pending_admission_active() {
+        "the reconcile loop had picked up working-copy changes and not yet published them while \
+         this read ran"
     } else {
         "a graph-authority writer was mutating the graph while this read ran"
     }
@@ -3594,17 +4059,499 @@ fn graph_authority_writer_sentence(state: &DaemonState) -> &'static str {
 /// what state blocked it, and the condition that changes the outcome. The
 /// shape is the one `GraphStatusBlocked::what_would_change_it` already uses one
 /// surface over.
-fn xref_authority_unsettled_message(state: &DaemonState, surface: &str) -> String {
+///
+/// Past its limit it says whether a writer still held authority when the limit
+/// ran out, because the two cases call for opposite next steps. A writer still
+/// holding it means another call now meets the same window. None holding it
+/// means the writers this read met had finished, and a new call does not wait
+/// on them.
+fn xref_authority_unsettled_message(
+    state: &DaemonState,
+    surface: &str,
+    attempts: usize,
+    wait: XrefWriterWait,
+) -> String {
+    // An answer that claimed an absence while the reconcile loop held changes
+    // it had picked up was read from a graph that held still, so the sentence
+    // for a graph that kept moving would misstate what the attempts found.
+    let withheld = format!(
+        "All {attempts} attempts were spent, and the answer they could read claimed that \
+         something is absent, which is not served while the reconcile loop holds working-copy \
+         changes it has picked up and not yet published."
+    );
+    let tried = if wait.ceiling_reached {
+        // Not "when the limit ran out" for the last: a writer can hold
+        // authority at the limit and finish before the read sees the timer.
+        let holder = match wait.held_at_ceiling {
+            Some(crate::state::ReadBlocker::Writer) => {
+                "a writer still held graph authority when that limit ran out"
+            }
+            Some(crate::state::ReadBlocker::PendingAdmission) => {
+                "the reconcile loop still held working-copy changes it had picked up and not yet \
+                 published when that limit ran out"
+            }
+            None => "no writer held graph authority when this read gave up",
+        };
+        let spent = if wait.absence_withheld {
+            withheld
+        } else {
+            format!(
+                "All {attempts} attempts were spent without one that could be certified against \
+                 a graph that held still."
+            )
+        };
+        format!(
+            "This read reached its {} limit for waiting out graph-authority writers, {:.1} s of \
+             it spent waiting for one to finish, and {holder}. {spent}",
+            wait_limit_text(wait.ceiling),
+            wait.waited.as_secs_f64()
+        )
+    } else if wait.absence_withheld {
+        format!(
+            "This read waited {:.1} s for graph-authority writers to finish. {withheld}",
+            wait.waited.as_secs_f64()
+        )
+    } else if !wait.waited.is_zero() {
+        format!(
+            "This read waited {:.1} s for graph-authority writers to finish, and all {attempts} \
+             attempts were spent without one that could be certified against a graph that held \
+             still.",
+            wait.waited.as_secs_f64()
+        )
+    } else {
+        format!(
+            "All {attempts} attempts were spent, each waiting longer than the last, and none \
+             could be certified against a graph that held still."
+        )
+    };
+    let outcome = if wait.ceiling_reached && wait.held_at_ceiling.is_none() {
+        "What changes the outcome is the writer draining, and the writers this read met had all \
+         finished when it gave up, so a new call does not wait on them."
+    } else if wait.held_at_ceiling == Some(crate::state::ReadBlocker::PendingAdmission) {
+        "What changes the outcome is the reconcile loop publishing the changes it picked up, not \
+         another immediate call, which is what these attempts already were."
+    } else {
+        "What changes the outcome is the writer draining, not another immediate call, which is \
+         what these attempts already were."
+    };
     format!(
-        "no settled graph authority for {surface}: {}. All {XREF_CURRENCY_ATTEMPTS} attempts \
-         were spent, each waiting longer than the last, and none could be certified against a \
-         graph that held still. This says nothing about whether the queried entity exists: it is \
-         an in-flight write window, not an absent or unresolved symbol. What changes the outcome \
-         is the writer draining, not another immediate call, which is what these attempts already \
-         were. GET /lsp/sweep/status reports whether an enrichment sweep is running and how many \
-         files it has left.",
+        "{}{surface}: {}. {tried} This says nothing about whether the queried entity exists: it \
+         is an in-flight write window, not an absent or unresolved symbol. {outcome} {}",
+        kin_mcp::negative::UNANSWERED_READ_PREFIX,
         graph_authority_writer_sentence(state),
+        graph_authority_status_pointer(state),
     )
+}
+
+/// Where a caller reads the state that decides when graph authority settles.
+///
+/// The daemon can name only one writer, the enrichment sweep, but the reconcile
+/// loop admits the working-copy edits it observes, and while one of its passes
+/// runs GET /health reports `reconciliation_status` as `processing`. An MCP
+/// answer's `_kin.graph_state` carries the same value. So this names both
+/// surfaces. Naming only the sweep sent a caller to a surface that reported
+/// nothing running while a reconcile pass was. Neither surface reports an
+/// admission that a commit or `/commands/admit` runs.
+fn graph_authority_status_pointer(state: &DaemonState) -> String {
+    let reconcile = if state.reconciliation_status_str() == "processing" {
+        "A reconcile pass was running as of this response: GET /health reports \
+         reconciliation_status processing until it ends."
+    } else {
+        "GET /health reports reconciliation_status, which reads processing while a reconcile \
+         pass is running."
+    };
+    format!(
+        "{reconcile} GET /lsp/sweep/status reports whether an enrichment sweep is running and how \
+         many files it has left."
+    )
+}
+
+/// A wait limit in the unit a reader would state it in.
+fn wait_limit_text(limit: Duration) -> String {
+    if limit < Duration::from_secs(1) {
+        format!("{} ms", limit.as_millis())
+    } else if limit.subsec_millis() == 0 {
+        format!("{} s", limit.as_secs())
+    } else {
+        format!("{:.1} s", limit.as_secs_f64())
+    }
+}
+
+/// What one reference read met from graph-authority writers: how long it
+/// waited for them, how its limit on that wait ended, and whether any attempt
+/// read a snapshot it then had to throw away.
+#[derive(Debug, Clone, Copy, Default)]
+struct XrefWriterWait {
+    /// The limit this read waits out writers under, counted from its start.
+    ceiling: Duration,
+    /// Time spent waiting for a writer to finish, across every wait.
+    waited: Duration,
+    /// No further round is admitted under the original writer-wait deadline.
+    ceiling_reached: bool,
+    /// What still kept the read from settling when the limit ran out.
+    held_at_ceiling: Option<crate::state::ReadBlocker>,
+    /// An attempt read a snapshot, or captured one, and threw it away because
+    /// the graph moved. Without one, every earlier attempt found a writer
+    /// holding authority and read nothing.
+    read_abandoned: bool,
+    /// A settled replay was read while a writer held authority and was not
+    /// served, because it could not place the focal.
+    replay_discarded: bool,
+    /// An attempt read a graph that held still and answered that something is
+    /// absent, and the answer was not served because the reconcile loop held
+    /// working-copy changes it had picked up and not yet published.
+    absence_withheld: bool,
+}
+
+impl XrefWriterWait {
+    fn within(ceiling: Duration) -> Self {
+        Self {
+            ceiling,
+            ..Self::default()
+        }
+    }
+
+    fn waited_ms(self) -> u64 {
+        u64::try_from(self.waited.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// After a round of attempts served nothing, wait out a writer that holds
+/// graph authority, up to the read's deadline. `true` means run another round.
+///
+/// This is the wait an edit admission needs. The reconcile pass holds graph
+/// authority from its walk through publication and apply, so a read that meets
+/// it spends every attempt of a round inside the window, and before this it
+/// refused after under a second while one publication was measured at 37 s.
+/// The caller releases its spine read authority first, so nothing is held
+/// while this waits.
+///
+/// `writer_seen` covers a writer that held or moved authority during the round
+/// and finished before the wait began: the round never saw the graph settle, so
+/// it is worth one more round, but only while the deadline allows.
+///
+/// `scope` is what the round is waiting on. A round that met only writers waits
+/// for writers, so a read that will return rows is never held behind the
+/// reconcile loop's mark. A round that withheld an answer claiming an absence
+/// waits for the mark as well, because that answer cannot change until the
+/// changes the loop picked up are published.
+async fn wait_out_graph_authority_writer(
+    state: &DaemonState,
+    deadline: tokio::time::Instant,
+    writer_seen: bool,
+    wait: &mut XrefWriterWait,
+    scope: crate::state::SettleScope,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    let drain = state.wait_for_graph_authority_drain(deadline, scope).await;
+    if drain != crate::state::GraphAuthorityDrain::NoWriter {
+        wait.waited += started.elapsed();
+    }
+    // Tokio polls the notified future before the timer. A drain observed after
+    // the deadline must not authorize another round, and neither may a round
+    // that ended after it.
+    let another_round = |wait: &mut XrefWriterWait| {
+        let in_time = tokio::time::Instant::now() < deadline;
+        wait.ceiling_reached |= !in_time;
+        in_time
+    };
+    match drain {
+        crate::state::GraphAuthorityDrain::Drained => another_round(wait),
+        crate::state::GraphAuthorityDrain::NoWriter => writer_seen && another_round(wait),
+        crate::state::GraphAuthorityDrain::DeadlinePassed(blocker) => {
+            wait.ceiling_reached = true;
+            wait.held_at_ceiling = Some(blocker);
+            false
+        }
+    }
+}
+
+/// Record an attempt that could not detach a snapshot it could read, or hand
+/// back the refusal that ends the read.
+///
+/// A writer holding authority at the attempt's own sample means nothing was
+/// read. A capture that moved was thrown away, and a writer that began during
+/// it moved the epoch, so it is a writer the round met even once it has
+/// finished. A snapshot that cannot be rebuilt is a fault no writer causes, so
+/// the read stops there and names it.
+fn note_unprepared_attempt(
+    state: &DaemonState,
+    unprepared: XrefUnprepared,
+    writer_seen: &mut bool,
+    wait: &mut XrefWriterWait,
+) -> Result<(), String> {
+    match unprepared {
+        XrefUnprepared::WriterHeld => *writer_seen = true,
+        XrefUnprepared::Moved(epoch) => {
+            *writer_seen |= !state.graph_authority_epoch_is_current(epoch);
+            wait.read_abandoned = true;
+        }
+        XrefUnprepared::Unreadable(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// The writer wait a name-resolving read takes between attempts.
+///
+/// These routes read the live graph rather than a certified snapshot, and none
+/// of them has a channel to disclose an answer read across a write: the
+/// command routes that resolve a name or report an absence (`/commands/refs`,
+/// `/commands/bulk-refs`, `/commands/trace-data-flow`, `/commands/graph`,
+/// `/commands/path`, `/commands/verify`, `/commands/dead-code`,
+/// `/commands/dead-code-seeded`, `/commands/security`, `/context`, `/trace`,
+/// `/impact`, `/blame`, `/history`, `/locate`, `/search`, a `/review` of files,
+/// `/verify/run`'s entity check, `/repos/{repo_id}/entities` and
+/// `/spine/resolve`), and the MCP tools the daemon serves from the live graph
+/// outside the reference reads, which keep their own stable-authority path. An
+/// answer from one that claims something is absent is served only when no
+/// writer held or moved graph authority, and the reconcile loop picked up no
+/// working-copy change, across the read that produced it. Absent means a name,
+/// id or path that served no entity, a search or lookup that found nothing, or
+/// an entity with no reference, dependent, relation, route, flow or caller
+/// where that relation is the answer. Otherwise the route waits the writer out
+/// and reads again, under the per-request limit the reference reads take, and
+/// gives their write-window refusal once the limit runs out. An edit admission
+/// adds names under graph authority, so without this an agent that added a
+/// function and asked for it while the edit was admitting was told the
+/// function did not exist.
+///
+/// Only a read of the live graph waits. A session's temporal scope is a
+/// historical graph no edit admission writes, so an absence read from it is
+/// served at once, whatever the live graph is doing.
+///
+/// An answer that claims nothing is absent is served as these routes always
+/// served it.
+struct NameReadWait {
+    wait: XrefWriterWait,
+    deadline: tokio::time::Instant,
+    attempts: usize,
+    /// Whether the read resolves against the live graph an edit admission
+    /// writes, rather than a session's historical scope.
+    live: bool,
+}
+
+impl NameReadWait {
+    /// The wait for one read of `graph`, the graph the request selected.
+    fn begin(state: &DaemonState, graph: &kin_db::InMemoryGraph) -> Self {
+        let wait = XrefWriterWait::within(state.xref_writer_drain_ceiling());
+        Self {
+            deadline: tokio::time::Instant::now() + wait.ceiling,
+            wait,
+            attempts: 0,
+            live: std::ptr::eq(graph, state.graph.as_ref()),
+        }
+    }
+
+    /// The authority epoch as an attempt begins, `None` while a writer holds
+    /// graph authority or the reconcile loop holds changes it picked up.
+    fn sample(&mut self, state: &DaemonState) -> Option<u64> {
+        self.attempts += 1;
+        state.settled_read_epoch()
+    }
+
+    /// Whether an answer read since `epoch` was sampled may claim an absence:
+    /// the read is of a historical scope no admission writes, or nothing
+    /// blocked it as it began, no writer moved authority since, and the
+    /// reconcile loop has picked up no changes since.
+    fn settled(&self, state: &DaemonState, epoch: Option<u64>) -> bool {
+        !self.live || epoch.is_some_and(|epoch| state.settled_read_epoch_is_current(epoch))
+    }
+
+    /// Wait out the writer that kept the last attempt from settling, or give
+    /// the refusal once the limit has run out.
+    ///
+    /// No further attempt is authorized once the limit has passed, including
+    /// after the short nap a read under churn takes.
+    async fn wait_out(&mut self, state: &DaemonState, surface: &str) -> Result<(), String> {
+        let waited_before = self.wait.waited;
+        if !wait_out_graph_authority_writer(
+            state,
+            self.deadline,
+            true,
+            &mut self.wait,
+            crate::state::SettleScope::WritersAndPendingAdmissions,
+        )
+        .await
+        {
+            return Err(xref_authority_unsettled_message(
+                state,
+                surface,
+                self.attempts,
+                self.wait,
+            ));
+        }
+        if self.wait.waited == waited_before {
+            // No writer was left to wait for, so one began and finished inside
+            // the attempt. A short nap keeps a read under steady churn from
+            // spinning until its limit, and it never outlasts the limit.
+            let nap_ends = tokio::time::Instant::now() + GRAPH_STATUS_WRITER_SETTLE_FLOOR;
+            tokio::time::sleep_until(nap_ends.min(self.deadline)).await;
+            if tokio::time::Instant::now() >= self.deadline {
+                self.wait.ceiling_reached = true;
+                return Err(xref_authority_unsettled_message(
+                    state,
+                    surface,
+                    self.attempts,
+                    self.wait,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a `/commands/refs` answer claims an absence: a name that resolved
+/// to nothing the caller can use, or a focal with no references.
+fn refs_response_claims_absence(response: &kin_cli::commands::refs::RefsResponse) -> bool {
+    response.error.is_some() || response.negative.is_some()
+}
+
+/// Whether a `/commands/bulk-refs` answer claims an absence for any row: an id
+/// the graph does not hold, an entity with no references, or a verdict the
+/// graph could not complete.
+fn bulk_refs_response_claims_absence(response: &kin_cli::commands::refs::BulkRefsResponse) -> bool {
+    response.without_references > 0
+        || response.incomplete_verdict_count > 0
+        || response
+            .results
+            .iter()
+            .any(|row| row["error"] == "entity not found")
+}
+
+/// Whether a `find_references` answer claims an absence: a focal that resolved
+/// to nothing, or a focal with no references. A name several owners share is
+/// answered with one reply per owner, and an owner with none claims one.
+///
+/// A handler error claims nothing, and neither does a payload of a shape this
+/// does not know: the answers a pending admission must never certify are the
+/// absent ones, and those are the shapes named here.
+fn find_references_answer_claims_absence(
+    result: &kin_mcp::Result<kin_mcp::ToolCallResult>,
+) -> bool {
+    let Ok(answer) = result else {
+        return false;
+    };
+    let Some(kin_mcp::ContentBlock::Text { text }) = answer.content.first() else {
+        return false;
+    };
+    if answer.is_error == Some(true) {
+        return text.trim() == kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS;
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let no_references = |reply: &serde_json::Value| reply["total_upstream"].as_u64() == Some(0);
+    match payload
+        .get(kin_mcp::handlers::entities::AMBIGUOUS_CANDIDATES_KEY)
+        .and_then(serde_json::Value::as_array)
+    {
+        Some(sections) => sections.iter().any(no_references),
+        None => no_references(&payload),
+    }
+}
+
+/// Whether a `bulk_check_references` answer claims an absence for any row, read
+/// off the same three signals [`bulk_refs_response_claims_absence`] holds
+/// `/commands/bulk-refs` to: an entity with no references, a verdict the graph
+/// could not complete, or an id the graph does not hold.
+fn bulk_check_answer_claims_absence(result: &kin_mcp::Result<kin_mcp::ToolCallResult>) -> bool {
+    let Ok(answer) = result else {
+        return false;
+    };
+    if answer.is_error == Some(true) {
+        return false;
+    }
+    let Some(kin_mcp::ContentBlock::Text { text }) = answer.content.first() else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    payload["without_references"]
+        .as_u64()
+        .is_some_and(|rows| rows > 0)
+        || payload["incomplete_verdict_count"]
+            .as_u64()
+            .is_some_and(|rows| rows > 0)
+        || payload["results"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["error"] == "entity not found"))
+}
+
+/// Whether a command xref answer claims an absence: a name that resolved to no
+/// local anchor, or to several owners' members and so to none of them.
+///
+/// The cross-repo edges it lists come from the spine, which no working-copy
+/// edit moves, so an empty listing is not one the reconcile loop's changes
+/// could fill and does not wait on them.
+fn xref_response_claims_absence<E>(
+    response: &std::result::Result<kin_cli::commands::xref::XrefResponse, E>,
+) -> bool {
+    response
+        .as_ref()
+        .is_ok_and(|response| response.error.is_some())
+}
+
+/// Whether a trace walk ended because its focal resolved to nothing, read off
+/// the one producer of that answer so the two cannot drift apart.
+fn trace_focal_missed<T>(walked: &anyhow::Result<T>, focal: &str) -> bool {
+    walked.as_ref().err().is_some_and(|error| {
+        error.to_string()
+            == kin_cli::commands::trace_data_flow::focal_not_found_error(focal).to_string()
+    })
+}
+
+/// Whether a trace answer claims an absence: its focal resolved to nothing,
+/// the target it was asked to rank toward did, or the focal has no flow to
+/// walk. An empty chain is the trace's "no references": an edit that adds a
+/// call can add the step.
+fn trace_claims_absence(
+    walked: &anyhow::Result<kin_cli::commands::trace_data_flow::TraceDataFlowResponse>,
+    focal: &str,
+) -> bool {
+    trace_focal_missed(walked, focal) || walked.as_ref().is_ok_and(trace_walk_claims_absence)
+}
+
+/// Whether a walk that found its focal claims an absence: a target that
+/// resolved to nothing, or a chain with no step.
+fn trace_walk_claims_absence(
+    response: &kin_cli::commands::trace_data_flow::TraceDataFlowResponse,
+) -> bool {
+    kin_cli::commands::trace_data_flow::target_not_resolved(response) || response.chain.is_empty()
+}
+
+/// [`trace_claims_absence`] for the MCP route, which answers a walk the
+/// response budget cannot fit with the smallest walk it retained, so that
+/// walk is read the same way. The command route refuses such a walk with the
+/// budget's own message, which claims nothing is absent.
+fn mcp_trace_claims_absence(
+    walked: &anyhow::Result<kin_cli::commands::trace_data_flow::TraceDataFlowResponse>,
+    focal: &str,
+) -> bool {
+    use kin_cli::commands::trace_data_flow::TraceBelowFloor;
+    trace_claims_absence(walked, focal)
+        || walked.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<TraceBelowFloor>()
+                .is_some_and(|below| trace_walk_claims_absence(&below.smallest))
+        })
+}
+
+/// Record an attempt whose answer was read and then superseded.
+///
+/// A writer that began and finished inside the attempt was never active at any
+/// sample the round takes, but it moved the authority epoch, which every writer
+/// moves when it begins and again when it finishes. That is the record that the
+/// round met one. A bare version bump or a replaced session scope moves no
+/// epoch, so neither counts as a writer and neither buys another round.
+fn note_superseded_attempt(
+    state: &DaemonState,
+    attempt: &XrefGraphReadAttempt,
+    writer_seen: &mut bool,
+    wait: &mut XrefWriterWait,
+) {
+    *writer_seen |= !state.graph_authority_epoch_is_current(attempt.mutation_epoch);
+    wait.read_abandoned = true;
 }
 
 /// Attach the mutation-in-flight disclosure to an answer that was read from a
@@ -3653,8 +4600,9 @@ fn disclose_mutation_in_flight(
              every row was really there at that instant. Currency is what is missing: the graph \
              moved afterwards, so a row may name code that has since changed and an edge written \
              since is not counted. Re-run once the writer drains for an answer this daemon can \
-             certify; GET /lsp/sweep/status reports whether an enrichment sweep is running.",
+             certify. {}",
             graph_authority_writer_sentence(state),
+            graph_authority_status_pointer(state),
         ),
     });
     match payload
@@ -3698,11 +4646,12 @@ fn disclose_mutation_in_flight(
 /// needs told rather than smoothed over.
 ///
 /// A handler error passes through unchanged, for the reason
-/// [`serve_superseded_xref_answer`] gives: it is the handler's own error, and
+/// [`servable_superseded_xref_answer`] gives: it is the handler's own error, and
 /// replacing it with an authority message would hide a real fault.
 fn disclose_graph_authority_retry(
     result: kin_mcp::Result<kin_mcp::ToolCallResult>,
     attempt_number: usize,
+    wait: XrefWriterWait,
 ) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
     if attempt_number == 0 {
         return result;
@@ -3711,7 +4660,7 @@ fn disclose_graph_authority_retry(
     if answer.is_error == Some(true) {
         return Ok(answer);
     }
-    match stamp_graph_authority_retry(&answer, attempt_number) {
+    match stamp_graph_authority_retry(&answer, attempt_number, wait) {
         Some(disclosed) => Ok(disclosed),
         None => Err(kin_mcp::McpError::Other(format!(
             "find_references settled after {} retried attempt(s) but its payload could not carry \
@@ -3727,25 +4676,96 @@ fn disclose_graph_authority_retry(
 fn stamp_graph_authority_retry(
     result: &kin_mcp::ToolCallResult,
     attempt_number: usize,
+    wait: XrefWriterWait,
 ) -> Option<kin_mcp::ToolCallResult> {
     let kin_mcp::ContentBlock::Text { text } = result.content.first()?;
     let mut payload = serde_json::from_str::<serde_json::Value>(text).ok()?;
     if !payload.is_object() {
         return None;
     }
-    let entry = serde_json::json!({
+    // Two histories reach a retried answer, and the sentence says which one
+    // this was. An attempt that read the graph and threw the answer away was
+    // abandoned. An attempt that found a writer holding authority read nothing,
+    // and a read that only waited for that writer abandoned nothing. Either
+    // one may also have read a settled replay it could not serve.
+    let replay = if wait.replay_discarded {
+        " While a writer held authority it also read the graph as last certified, and did not \
+         serve that answer, because it could not place the focal."
+    } else {
+        ""
+    };
+    let what_happened = if wait.absence_withheld {
+        // A third history: the graph held still, and what an attempt read from
+        // it claimed an absence while the reconcile loop held changes it had
+        // picked up, which is not an answer this daemon serves.
+        let abandoned = if wait.read_abandoned {
+            " A graph-authority write also landed while an attempt was being read, and that \
+             attempt was abandoned."
+        } else {
+            ""
+        };
+        let waited = if wait.waited.is_zero() {
+            String::new()
+        } else {
+            format!(
+                " The read waited {} ms for those changes and for graph-authority writers.",
+                wait.waited_ms()
+            )
+        };
+        format!(
+            "an earlier attempt read a graph that held still and answered that something is \
+             absent while the reconcile loop held working-copy changes it had picked up and not \
+             yet published, so that answer was not served.{abandoned}{replay}{waited} The answer \
+             served here is the {} attempt, read once the loop no longer held them, and was \
+             confirmed current before it was returned.",
+            ordinal_attempt(attempt_number)
+        )
+    } else if wait.read_abandoned {
+        let waited = if wait.waited.is_zero() {
+            String::new()
+        } else {
+            format!(
+                " Before the attempt that answered, it waited {} ms for a graph-authority writer \
+                 to finish.",
+                wait.waited_ms()
+            )
+        };
+        format!(
+            "a graph-authority write landed while this answer was being read, so the read was \
+             abandoned and retried; the answer served here is the {} attempt and was confirmed \
+             current before it was returned.{replay}{waited}",
+            ordinal_attempt(attempt_number)
+        )
+    } else {
+        let waited = if wait.waited.is_zero() {
+            String::new()
+        } else {
+            format!(
+                " The read waited {} ms for that writer to finish.",
+                wait.waited_ms()
+            )
+        };
+        format!(
+            "a graph-authority writer held graph authority while this read ran, so no earlier \
+             attempt could take a snapshot of the graph to read.{replay}{waited} The answer \
+             served here is the {} attempt, read once no writer held authority, and was confirmed \
+             current before it was returned.",
+            ordinal_attempt(attempt_number)
+        )
+    };
+    let mut entry = serde_json::json!({
         "component": GRAPH_AUTHORITY_COMPONENT,
         "reason": GRAPH_AUTHORITY_RETRY_REASON,
         "attempt_number": attempt_number,
         "detail": format!(
-            "a graph-authority write landed while this answer was being read, so the read was \
-             abandoned and retried; the answer served here is the {} attempt and was confirmed \
-             current before it was returned. Every row in it is settled. What it also says is \
-             that this store was being written while it was queried, so an absence measured here \
-             is an absence measured under contention.",
-            ordinal_attempt(attempt_number)
+            "{what_happened} Every row in it is settled. What it also says is that this store \
+             was being written while it was queried, so an absence measured here is an absence \
+             measured under contention."
         ),
     });
+    if !wait.waited.is_zero() {
+        entry["waited_for_writer_ms"] = serde_json::json!(wait.waited_ms());
+    }
     match payload
         .get_mut("degradations")
         .and_then(serde_json::Value::as_array_mut)
@@ -3763,11 +4783,21 @@ fn stamp_graph_authority_retry(
 /// `attempt_number` is zero-based and the disclosure is read by people, so it
 /// is rendered one-based and in words a reader does not have to decode.
 fn ordinal_attempt(attempt_number: usize) -> String {
-    match attempt_number {
-        1 => "second".to_string(),
-        2 => "third".to_string(),
-        3 => "fourth".to_string(),
-        other => format!("{}th", other + 1),
+    let position = attempt_number + 1;
+    match position {
+        2 => "second".to_string(),
+        3 => "third".to_string(),
+        4 => "fourth".to_string(),
+        _ => {
+            let suffix = match (position % 10, position % 100) {
+                (_, 11..=13) => "th",
+                (1, _) => "st",
+                (2, _) => "nd",
+                (3, _) => "rd",
+                _ => "th",
+            };
+            format!("{position}{suffix}")
+        }
     }
 }
 
@@ -3780,26 +4810,20 @@ fn ordinal_attempt(attempt_number: usize) -> String {
 ///   agent gets the rows and the one verdict reads `inconclusive`.
 /// - A superseded handler error is the handler's own error and is returned
 ///   unchanged; replacing it with an authority message would hide a real fault.
-/// - Everything else refuses with a message naming the in-flight write. That
-///   includes the case where no attempt ever detached a snapshot, and the case
-///   where the last answer was a focal miss, which must never be published as
-///   settled.
-fn serve_superseded_xref_answer(
+/// - Everything else is `None`, and nothing may be served. That includes the
+///   case where no attempt ever detached a snapshot, and the case where the
+///   last answer was a focal miss, which must never be published as settled.
+///   The caller waits out a writer that still holds authority, up to its
+///   deadline, and refuses with a message naming the in-flight write once that
+///   is spent.
+fn servable_superseded_xref_answer(
     superseded: Option<kin_mcp::Result<kin_mcp::ToolCallResult>>,
     state: &DaemonState,
-    surface: &str,
-) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+) -> Option<kin_mcp::Result<kin_mcp::ToolCallResult>> {
     match superseded {
-        Some(Err(error)) => Err(error),
-        Some(Ok(result)) => match disclose_mutation_in_flight(result, state) {
-            Some(disclosed) => Ok(disclosed),
-            None => Err(kin_mcp::McpError::Other(xref_authority_unsettled_message(
-                state, surface,
-            ))),
-        },
-        None => Err(kin_mcp::McpError::Other(xref_authority_unsettled_message(
-            state, surface,
-        ))),
+        Some(Err(error)) => Some(Err(error)),
+        Some(Ok(result)) => disclose_mutation_in_flight(result, state).map(Ok),
+        None => None,
     }
 }
 
@@ -3807,15 +4831,23 @@ fn serve_superseded_xref_answer(
 /// taken when no attempt could see graph authority stand still.
 ///
 /// A writer holding authority is not the same thing as a graph that moved. The
-/// snapshot is taken under the graph's own read lock, so it is one instant of
-/// the graph, and it is used only when its merkle root, and the HEAD version on
+/// replay is used only when its snapshot's merkle root, and the HEAD version on
 /// both sides of the capture, equal what the last certified read answered from.
 /// Equal roots are equal entities and relations, so every row answered from it
 /// is a row that certified read would have returned. What it cannot promise is
 /// currency, because the writer is still in flight, and the disclosure says so.
 ///
-/// `None` for a session scope, which has no HEAD version to compare, and
-/// whenever nothing has been certified or the graph moved since.
+/// The snapshot is not one instant of the whole graph. `to_snapshot` clones its
+/// stores under separate locks, and the root covers only the entity and
+/// relation topology, so a writer still holding authority can leave the other
+/// stores out of step with it. A snapshot like that can fail to rebuild though
+/// no fault stands, so a rebuild failure here is no replay rather than a
+/// refusal: the caller waits the writer out, and the next attempt, taken with no
+/// writer active, is where a fault that persists is proven and named.
+///
+/// `None` for a session scope, which has no HEAD version to compare, whenever
+/// nothing has been certified or the graph moved since, and when the snapshot
+/// could not be rebuilt.
 fn prepare_settled_xref_replay(
     state: &DaemonState,
     selected_graph: &Arc<kin_db::InMemoryGraph>,
@@ -3835,32 +4867,64 @@ fn prepare_settled_xref_replay(
     {
         return None;
     }
-    let graph =
-        kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(snapshot, root_hash)
-            .ok()?;
-    Some((Arc::new(graph), certified.root, certified.at.elapsed()))
+    let rebuilt = rebuild_xref_query_graph(snapshot, root_hash);
+    #[cfg(test)]
+    let rebuilt = if state
+        .xref_settled
+        .replay_rebuild_fault
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        Err("injected replay rebuild fault".to_string())
+    } else {
+        rebuilt
+    };
+    match rebuilt {
+        Ok(graph) => Some((Arc::new(graph), certified.root, certified.at.elapsed())),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "settled replay snapshot could not be rebuilt while a writer held authority; \
+                 waiting the writer out instead"
+            );
+            None
+        }
+    }
 }
 
-/// Serve a settled replay with its disclosure, or refuse.
+/// Serve a settled replay with its disclosure, refuse, or hand the read back to
+/// its caller to wait.
 ///
 /// A handler error passes through unchanged, for the reason
-/// [`serve_superseded_xref_answer`] gives. An error RESULT is refused instead:
-/// the one most likely here is a focal miss, and a miss read while a writer
-/// holds authority must never be published as though the graph had settled. A
-/// payload that cannot carry the disclosure refuses for the reason
+/// [`servable_superseded_xref_answer`] gives. An error RESULT is `None`: the
+/// one most likely here is a focal miss, and a miss read while a writer holds
+/// authority must never be published as though the graph had settled. Nor is it
+/// a reason to stop. The replay answers from the graph as it stood before the
+/// writer, and a name that writer is adding is missing from it, so the caller
+/// waits the writer out and reads again, the way it does for a superseded miss.
+/// A payload that cannot carry the disclosure refuses for the reason
 /// [`disclose_mutation_in_flight`] gives.
 fn serve_settled_replay(
     result: kin_mcp::Result<kin_mcp::ToolCallResult>,
     state: &DaemonState,
     surface: &str,
     certified_age: Duration,
-) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
-    let answer = result?;
-    let refused = || kin_mcp::McpError::Other(xref_authority_unsettled_message(state, surface));
+    attempts: usize,
+    wait: XrefWriterWait,
+) -> Option<kin_mcp::Result<kin_mcp::ToolCallResult>> {
+    let answer = match result {
+        Ok(answer) => answer,
+        Err(error) => return Some(Err(error)),
+    };
     if answer.is_error == Some(true) {
-        return Err(refused());
+        return None;
     }
-    stamp_settled_replay(&answer, state, certified_age).ok_or_else(refused)
+    Some(
+        stamp_settled_replay(&answer, state, certified_age, attempts).ok_or_else(|| {
+            kin_mcp::McpError::Other(xref_authority_unsettled_message(
+                state, surface, attempts, wait,
+            ))
+        }),
+    )
 }
 
 /// The payload half of [`serve_settled_replay`].
@@ -3868,6 +4932,7 @@ fn stamp_settled_replay(
     result: &kin_mcp::ToolCallResult,
     state: &DaemonState,
     certified_age: Duration,
+    attempts: usize,
 ) -> Option<kin_mcp::ToolCallResult> {
     let kin_mcp::ContentBlock::Text { text } = result.content.first()?;
     let mut payload = serde_json::from_str::<serde_json::Value>(text).ok()?;
@@ -3880,15 +4945,17 @@ fn stamp_settled_replay(
         "reason": GRAPH_AUTHORITY_SETTLED_REPLAY_REASON,
         "certified_age_ms": certified_age_ms,
         "detail": format!(
-            "graph authority was held through every one of the {XREF_CURRENCY_ATTEMPTS} attempts \
-             this read made ({}), so none could certify a live snapshot. This answer was read \
+            "graph authority was held through every one of the {attempts} attempts this read \
+             made ({}), so none could certify a live snapshot. This answer was read \
              from the graph as it stands, under one read lock, and is served because its merkle \
              root is still the one the last certified reference read answered from \
              {certified_age_ms} ms ago: every row here is a row that read would have returned, and \
              nothing here is a torn read. Currency is what is missing: the writer was still in \
              flight, so the graph may move after this answer and an absence measured here may not \
-             hold. Re-run once the writer drains for an answer this daemon can certify as current.",
+             hold. Re-run once the writer drains for an answer this daemon can certify as current. \
+             {}",
             graph_authority_writer_sentence(state),
+            graph_authority_status_pointer(state),
         ),
     });
     match payload
@@ -3916,57 +4983,119 @@ async fn command_xref_with_stable_authority<F>(
 where
     F: FnMut(usize),
 {
-    // Initialize once outside the stamped interval: lazy spine hydration and
-    // registration can be expensive, but it is not part of the graph read.
-    let spine_authority = state.acquire_spine_read_authority().await;
-    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            state.spine_unavailable_reason(),
-        ));
-    }
-    let spine = spine_authority
-        .as_ref()
-        .map(|authority| authority.backend());
-    for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
-        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
-            settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
-            continue;
-        };
-        after_root(attempt_number);
-        let response = kin_cli::commands::xref::build_xref_response(
-            attempt.graph.as_ref(),
-            request,
-            &state.cached_repo_id,
-            &attempt.root,
-            spine,
-        )
-        .await;
-        if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
+    // The same bounded writer wait the MCP twins take.
+    let mut wait = XrefWriterWait::within(state.xref_writer_drain_ceiling());
+    let deadline = tokio::time::Instant::now() + wait.ceiling;
+    let mut attempts_made = 0;
+    loop {
+        // Initialize once per round, outside the stamped interval: lazy spine
+        // hydration and registration can be expensive, but it is not part of
+        // the graph read.
+        let spine_authority = state.acquire_spine_read_authority().await;
+        if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                state.spine_unavailable_reason(),
+            ));
+        }
+        let spine = spine_authority
+            .as_ref()
+            .map(|authority| authority.backend());
+        let mut writer_seen = false;
+        // Set when an answer claimed an absence while the reconcile loop held
+        // working-copy changes it had picked up. The round stops there:
+        // nothing another attempt reads changes until the loop lets them go.
+        let mut withheld = false;
+        let mut attempts_in_round = 0;
+        for round_attempt in 0..XREF_CURRENCY_ATTEMPTS {
+            attempts_in_round += 1;
+            let attempt_number = attempts_made + round_attempt;
+            let attempt = match prepare_xref_graph_read(state, &selected_graph, authority) {
+                Ok(attempt) => attempt,
+                Err(unprepared) => {
+                    if let Err(error) =
+                        note_unprepared_attempt(state, unprepared, &mut writer_seen, &mut wait)
+                    {
+                        return Err(internal_error(xref_snapshot_unreadable_message(
+                            "command xref",
+                            &error,
+                        )));
+                    }
+                    settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
+                    continue;
+                }
+            };
+            after_root(attempt_number);
+            let response = kin_cli::commands::xref::build_xref_response(
+                attempt.graph.as_ref(),
+                request,
+                &state.cached_repo_id,
+                &attempt.root,
+                spine,
+            )
+            .await;
+            if xref_graph_read_is_still_current(
+                state,
+                session_id,
+                &selected_graph,
+                authority,
+                &attempt,
+            )
+            .await
+            {
+                if xref_response_claims_absence(&response) && !absence_is_certified(state, &attempt)
+                {
+                    wait.absence_withheld = true;
+                    withheld = true;
+                    break;
+                }
+                state.xref_settled.record(&attempt);
+                return response.map_err(internal_error);
+            }
+            tracing::warn!(
+                attempt = attempt_number + 1,
+                "graph authority changed during command xref; retrying"
+            );
+            note_superseded_attempt(state, &attempt, &mut writer_seen, &mut wait);
+            settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
+        }
+        attempts_made += attempts_in_round;
+        drop(spine_authority);
+        // A selected graph that is no longer current, such as a session scope
+        // that expired or was replaced, can never be certified again. No writer
+        // this round met is a reason to read it again, and no writer is the
+        // reason it failed, so the refusal names the scope instead.
+        if !state
+            .graph_authority_is_current(session_id, &selected_graph, authority)
             .await
         {
-            state.xref_settled.record(&attempt);
-            return response.map_err(internal_error);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                xref_scope_replaced_message("command xref"),
+            ));
         }
-        tracing::warn!(
-            attempt = attempt_number + 1,
-            "graph authority changed during command xref; retrying"
-        );
-        settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
+        if wait_out_graph_authority_writer(
+            state,
+            deadline,
+            writer_seen || withheld,
+            &mut wait,
+            settle_scope_after(withheld),
+        )
+        .await
+        {
+            continue;
+        }
+        // This surface refuses where the MCP twins serve. `XrefResponse` carries
+        // `lines` and a spine body and no disclosure channel, so a labelled
+        // answer here would have to be a sentence pushed into a human
+        // rendering, which the `negative`/verdict machinery the acceptance bar
+        // is written against cannot read. So it refuses, and the refusal names
+        // the write.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            xref_authority_unsettled_message(state, "command xref", attempts_made, wait),
+        ));
     }
-    // This surface refuses where the MCP twins serve. `XrefResponse` carries
-    // `lines` and a spine body and no disclosure channel, so a labelled answer
-    // here would have to be a sentence pushed into a human rendering, which the
-    // `negative`/verdict machinery the acceptance bar is written against cannot
-    // read. Deciding from out here whether the response resolved its focal
-    // would mean restating `build_xref_response`'s own resolution rule in a
-    // second place, and a proxy that can drift from the thing it stands for is
-    // how a check comes to pass while the behavior is broken. So it refuses,
-    // and the refusal names the write.
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        xref_authority_unsettled_message(state, "command xref"),
-    ))
 }
 
 async fn mcp_find_references_with_stable_authority<F>(
@@ -3985,8 +5114,9 @@ where
     // snapshot, hashes a merkle root over it, hashes the live root again to
     // compare, and rebuilds a query graph from the snapshot, all linear in store
     // size and all spent to reach a resolver that one index lookup already knew
-    // would miss.
-    if find_references_focal_is_ruled_out(selected_graph.as_ref(), arguments) {
+    // would miss. The index is the live graph's, so the miss is an answer only
+    // when no writer moved graph authority across the lookup.
+    if find_references_focal_is_settled_miss(state, selected_graph.as_ref(), arguments) {
         return Ok(kin_mcp::ToolCallResult::error(
             kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS,
         ));
@@ -3994,74 +5124,56 @@ where
     let source_scope = state
         .source_scope_for_selected_graph(session_id, &selected_graph, authority)
         .await
-        .ok_or_else(|| {
-            mcp_authority_gap("selected reference source scope expired or was replaced")
-        })?;
-    let spine_authority = state.acquire_spine_read_authority().await;
-    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
-        return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
-    }
-    let spine = spine_authority
-        .as_ref()
-        .map(|authority| authority.backend());
+        .ok_or_else(|| kin_mcp::McpError::Other(xref_scope_replaced_message("find_references")))?;
     let repository_authority = mcp_repository_authority_source(state)?;
-    let mut superseded = None;
-    for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
-        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
-            settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
-            continue;
-        };
-        after_root(attempt_number);
-        let result = kin_mcp::handlers::entities::handle_find_references_with_authority_at(
-            arguments,
-            attempt.graph.as_ref(),
-            kin_mcp::handlers::entities::FindReferencesAuthority {
-                repo_id: &state.cached_repo_id,
-                graph_root: &attempt.root,
-                spine,
-            },
-            repository_authority.as_ref(),
-            source_scope,
-        )
-        .await;
-        if state
-            .source_scope_for_selected_graph(session_id, &selected_graph, authority)
-            .await
-            != Some(source_scope)
-        {
-            return Err(mcp_authority_gap(
-                "selected reference source scope changed during reconstruction",
-            ));
+    // One deadline for every wait this read makes, so the wait is bounded
+    // however many writers come and go while it runs.
+    let mut wait = XrefWriterWait::within(state.xref_writer_drain_ceiling());
+    let deadline = tokio::time::Instant::now() + wait.ceiling;
+    let mut attempts_made = 0;
+    loop {
+        let spine_authority = state.acquire_spine_read_authority().await;
+        if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+            return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
         }
-        if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
-            .await
-        {
-            // Current, and on any attempt after the first it is current only
-            // because an earlier one was thrown away. That is the fact this
-            // return used to swallow.
-            state.xref_settled.record(&attempt);
-            return disclose_graph_authority_retry(result, attempt_number);
-        }
-        tracing::warn!(
-            attempt = attempt_number + 1,
-            "graph authority changed during MCP find_references; retrying"
+        let spine_deferral = state.spine_initialization_deferral();
+        let spine = kin_spine::DaemonSpine::from_read(
+            spine_authority
+                .as_ref()
+                .map(|authority| authority.backend()),
+            spine_deferral.as_deref(),
         );
-        superseded = Some(result);
-        settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
-    }
-    // No attempt detached a snapshot: a writer held graph authority through
-    // every one of them. That is not a graph that moved, so the graph is read
-    // once more and served if it is still the one last certified.
-    if superseded.is_none() {
-        if let Some((graph, root, certified_age)) =
-            prepare_settled_xref_replay(state, &selected_graph, authority)
-        {
+        let mut superseded = None;
+        let mut writer_seen = false;
+        // Set when an answer claimed an absence while the reconcile loop held
+        // working-copy changes it had picked up; see command xref.
+        let mut withheld = false;
+        let mut attempts_in_round = 0;
+        for round_attempt in 0..XREF_CURRENCY_ATTEMPTS {
+            attempts_in_round += 1;
+            let attempt_number = attempts_made + round_attempt;
+            let attempt = match prepare_xref_graph_read(state, &selected_graph, authority) {
+                Ok(attempt) => attempt,
+                Err(unprepared) => {
+                    if let Err(error) =
+                        note_unprepared_attempt(state, unprepared, &mut writer_seen, &mut wait)
+                    {
+                        return Err(kin_mcp::McpError::Other(xref_snapshot_unreadable_message(
+                            "find_references",
+                            &error,
+                        )));
+                    }
+                    settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
+                    continue;
+                }
+            };
+            after_root(attempt_number);
             let result = kin_mcp::handlers::entities::handle_find_references_with_authority_at(
                 arguments,
-                graph.as_ref(),
+                attempt.graph.as_ref(),
                 kin_mcp::handlers::entities::FindReferencesAuthority {
                     repo_id: &state.cached_repo_id,
-                    graph_root: &root,
+                    graph_root: &attempt.root,
                     spine,
                 },
                 repository_authority.as_ref(),
@@ -4073,14 +5185,146 @@ where
                 .await
                 != Some(source_scope)
             {
-                return Err(mcp_authority_gap(
-                    "selected reference source scope changed during reconstruction",
-                ));
+                return Err(kin_mcp::McpError::Other(xref_scope_replaced_message(
+                    "find_references",
+                )));
             }
-            return serve_settled_replay(result, state, "find_references", certified_age);
+            if xref_graph_read_is_still_current(
+                state,
+                session_id,
+                &selected_graph,
+                authority,
+                &attempt,
+            )
+            .await
+            {
+                // Rows are served through a pending admission, and an absence
+                // is not: what the loop picked up may be the name or the
+                // caller this answer found missing.
+                if find_references_answer_claims_absence(&result)
+                    && !absence_is_certified(state, &attempt)
+                {
+                    wait.absence_withheld = true;
+                    withheld = true;
+                    break;
+                }
+                // Current, and on any attempt after the first it is current
+                // only because an earlier one was thrown away. That is the fact
+                // this return used to swallow.
+                state.xref_settled.record(&attempt);
+                return disclose_graph_authority_retry(result, attempt_number, wait);
+            }
+            tracing::warn!(
+                attempt = attempt_number + 1,
+                "graph authority changed during MCP find_references; retrying"
+            );
+            note_superseded_attempt(state, &attempt, &mut writer_seen, &mut wait);
+            superseded = Some(result);
+            settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
+        }
+        attempts_made += attempts_in_round;
+        // A withheld absence skips both of these. Its graph held still, so
+        // there is no superseded answer to label and no round a writer held
+        // to replay, and the answer it did read waits for the loop instead.
+        if !withheld {
+            // No attempt detached a snapshot: a writer held graph authority through
+            // every one of them. That is not a graph that moved, so the graph is
+            // read once more and served if it is still the one last certified. A
+            // replay that cannot be served falls through to the wait below.
+            if superseded.is_none() {
+                if let Some((graph, root, certified_age)) =
+                    prepare_settled_xref_replay(state, &selected_graph, authority)
+                {
+                    let result =
+                        kin_mcp::handlers::entities::handle_find_references_with_authority_at(
+                            arguments,
+                            graph.as_ref(),
+                            kin_mcp::handlers::entities::FindReferencesAuthority {
+                                repo_id: &state.cached_repo_id,
+                                graph_root: &root,
+                                spine,
+                            },
+                            repository_authority.as_ref(),
+                            source_scope,
+                        )
+                        .await;
+                    if state
+                        .source_scope_for_selected_graph(session_id, &selected_graph, authority)
+                        .await
+                        != Some(source_scope)
+                    {
+                        return Err(kin_mcp::McpError::Other(xref_scope_replaced_message(
+                            "find_references",
+                        )));
+                    }
+                    if let Some(served) = serve_settled_replay(
+                        result,
+                        state,
+                        "find_references",
+                        certified_age,
+                        attempts_made,
+                        wait,
+                    ) {
+                        return served;
+                    }
+                    wait.replay_discarded = true;
+                }
+            }
+            if let Some(served) = servable_superseded_xref_answer(superseded, state) {
+                return served;
+            }
+        }
+        // Nothing this round can serve. Release the spine read authority, then
+        // wait out the writer, and for a withheld absence the reconcile loop's
+        // mark as well, instead of refusing inside the window.
+        drop(spine_authority);
+        if !wait_out_graph_authority_writer(
+            state,
+            deadline,
+            writer_seen || withheld,
+            &mut wait,
+            settle_scope_after(withheld),
+        )
+        .await
+        {
+            return Err(kin_mcp::McpError::Other(xref_authority_unsettled_message(
+                state,
+                "find_references",
+                attempts_made,
+                wait,
+            )));
         }
     }
-    serve_superseded_xref_answer(superseded, state, "find_references")
+}
+
+/// Whether the name index rules this request's focal out while no writer
+/// moves graph authority.
+///
+/// [`find_references_focal_is_ruled_out`] reads the live graph's index, and an
+/// edit admission adds names to that graph under graph authority. Until the
+/// admission applies its delta, a name it is adding is missing from the index,
+/// so an agent that added a function and asked for its references by name was
+/// told the function did not exist. A miss counts only when the authority epoch
+/// sampled before the lookup, with no writer active, is still current after it.
+/// Otherwise the caller takes the stable read, which waits the writer out.
+fn find_references_focal_is_settled_miss(
+    state: &DaemonState,
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> bool {
+    miss_held_through_the_lookup(state, || {
+        find_references_focal_is_ruled_out(graph, arguments)
+    })
+}
+
+/// `lookup`'s miss, counted only when no writer held graph authority and the
+/// reconcile loop held no picked-up changes as it began, and neither appeared
+/// nor moved the authority epoch before it returned.
+fn miss_held_through_the_lookup(state: &DaemonState, lookup: impl FnOnce() -> bool) -> bool {
+    let Some(epoch) = state.settled_read_epoch() else {
+        return false;
+    };
+    lookup() && state.settled_read_epoch_is_current(epoch)
 }
 
 /// Whether this `find_references` request names something the graph cannot
@@ -4236,63 +5480,156 @@ async fn mcp_bulk_check_references_with_stable_authority<F>(
 where
     F: FnMut(usize),
 {
-    let spine_authority = state.acquire_spine_read_authority().await;
-    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
-        return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
-    }
-    let spine = spine_authority
-        .as_ref()
-        .map(|authority| authority.backend());
-    let mut superseded = None;
-    for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
-        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
-            settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
-            continue;
-        };
-        after_root(attempt_number);
-        let result = kin_mcp::handlers::entities::handle_bulk_check_references_with_authority(
-            arguments,
-            attempt.graph.as_ref(),
-            kin_mcp::handlers::entities::FindReferencesAuthority {
-                repo_id: &state.cached_repo_id,
-                graph_root: &attempt.root,
-                spine,
-            },
-        );
-        if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
-            .await
-        {
-            // Current, and on any attempt after the first it is current only
-            // because an earlier one was thrown away. That is the fact this
-            // return used to swallow.
-            state.xref_settled.record(&attempt);
-            return disclose_graph_authority_retry(result, attempt_number);
+    // The same bounded writer wait `find_references` takes, for the same reason.
+    let mut wait = XrefWriterWait::within(state.xref_writer_drain_ceiling());
+    let deadline = tokio::time::Instant::now() + wait.ceiling;
+    let mut attempts_made = 0;
+    loop {
+        let spine_authority = state.acquire_spine_read_authority().await;
+        if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+            return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
         }
-        tracing::warn!(
-            attempt = attempt_number + 1,
-            "graph authority changed during MCP bulk_check_references; retrying"
+        let spine_deferral = state.spine_initialization_deferral();
+        let spine = kin_spine::DaemonSpine::from_read(
+            spine_authority
+                .as_ref()
+                .map(|authority| authority.backend()),
+            spine_deferral.as_deref(),
         );
-        superseded = Some(result);
-        settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
-    }
-    // The same replay `find_references` takes, for the same reason.
-    if superseded.is_none() {
-        if let Some((graph, root, certified_age)) =
-            prepare_settled_xref_replay(state, &selected_graph, authority)
-        {
+        let mut superseded = None;
+        let mut writer_seen = false;
+        // Set when an answer claimed an absence while the reconcile loop held
+        // working-copy changes it had picked up; see command xref.
+        let mut withheld = false;
+        let mut attempts_in_round = 0;
+        for round_attempt in 0..XREF_CURRENCY_ATTEMPTS {
+            attempts_in_round += 1;
+            let attempt_number = attempts_made + round_attempt;
+            let attempt = match prepare_xref_graph_read(state, &selected_graph, authority) {
+                Ok(attempt) => attempt,
+                Err(unprepared) => {
+                    if let Err(error) =
+                        note_unprepared_attempt(state, unprepared, &mut writer_seen, &mut wait)
+                    {
+                        return Err(kin_mcp::McpError::Other(xref_snapshot_unreadable_message(
+                            "bulk_check_references",
+                            &error,
+                        )));
+                    }
+                    settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
+                    continue;
+                }
+            };
+            after_root(attempt_number);
             let result = kin_mcp::handlers::entities::handle_bulk_check_references_with_authority(
                 arguments,
-                graph.as_ref(),
+                attempt.graph.as_ref(),
                 kin_mcp::handlers::entities::FindReferencesAuthority {
                     repo_id: &state.cached_repo_id,
-                    graph_root: &root,
+                    graph_root: &attempt.root,
                     spine,
                 },
             );
-            return serve_settled_replay(result, state, "bulk_check_references", certified_age);
+            if xref_graph_read_is_still_current(
+                state,
+                session_id,
+                &selected_graph,
+                authority,
+                &attempt,
+            )
+            .await
+            {
+                // Rows are served through a pending admission, and an absence
+                // is not: what the loop picked up may be the name or the
+                // caller this answer found missing.
+                if bulk_check_answer_claims_absence(&result)
+                    && !absence_is_certified(state, &attempt)
+                {
+                    wait.absence_withheld = true;
+                    withheld = true;
+                    break;
+                }
+                // Current, and on any attempt after the first it is current
+                // only because an earlier one was thrown away. That is the fact
+                // this return used to swallow.
+                state.xref_settled.record(&attempt);
+                return disclose_graph_authority_retry(result, attempt_number, wait);
+            }
+            tracing::warn!(
+                attempt = attempt_number + 1,
+                "graph authority changed during MCP bulk_check_references; retrying"
+            );
+            note_superseded_attempt(state, &attempt, &mut writer_seen, &mut wait);
+            superseded = Some(result);
+            settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
+        }
+        attempts_made += attempts_in_round;
+        // A selected scope that expired or was replaced is why its attempts
+        // were superseded, not a writer, so its answer is not served under a
+        // disclosure that names one. The same refusal command xref and
+        // find_references give it.
+        if !state
+            .graph_authority_is_current(session_id, &selected_graph, authority)
+            .await
+        {
+            return Err(kin_mcp::McpError::Other(xref_scope_replaced_message(
+                "bulk_check_references",
+            )));
+        }
+        // A withheld absence skips both of these. Its graph held still, so
+        // there is no superseded answer to label and no round a writer held
+        // to replay, and the answer it did read waits for the loop instead.
+        if !withheld {
+            // The same replay `find_references` takes, for the same reason.
+            if superseded.is_none() {
+                if let Some((graph, root, certified_age)) =
+                    prepare_settled_xref_replay(state, &selected_graph, authority)
+                {
+                    let result =
+                        kin_mcp::handlers::entities::handle_bulk_check_references_with_authority(
+                            arguments,
+                            graph.as_ref(),
+                            kin_mcp::handlers::entities::FindReferencesAuthority {
+                                repo_id: &state.cached_repo_id,
+                                graph_root: &root,
+                                spine,
+                            },
+                        );
+                    if let Some(served) = serve_settled_replay(
+                        result,
+                        state,
+                        "bulk_check_references",
+                        certified_age,
+                        attempts_made,
+                        wait,
+                    ) {
+                        return served;
+                    }
+                    wait.replay_discarded = true;
+                }
+            }
+            if let Some(served) = servable_superseded_xref_answer(superseded, state) {
+                return served;
+            }
+        }
+        drop(spine_authority);
+        if !wait_out_graph_authority_writer(
+            state,
+            deadline,
+            writer_seen || withheld,
+            &mut wait,
+            settle_scope_after(withheld),
+        )
+        .await
+        {
+            return Err(kin_mcp::McpError::Other(xref_authority_unsettled_message(
+                state,
+                "bulk_check_references",
+                attempts_made,
+                wait,
+            )));
         }
     }
-    serve_superseded_xref_answer(superseded, state, "bulk_check_references")
 }
 
 /// What an attached client asks this daemon to hold its idle window open for.
@@ -4439,7 +5776,7 @@ async fn health(
     let sampled_at = std::time::Instant::now();
     let background_passes = state.background_work.reports(sampled_at);
     let background_pass_stopped = state.background_work.any_stopped();
-    let reconcile = state.background_work.reconcile_report(sampled_at);
+    let reconcile = crate::loop_runner::answered_reconcile_health(&state, sampled_at);
     let reconcile_degraded = reconcile.degraded();
     // FIR-2136. The term that was missing entirely: whether this daemon can
     // still answer a live question about itself. Every other term here reports
@@ -4549,6 +5886,7 @@ async fn health(
         reconcile,
         status_live_sample_failures,
         build: current_build_response(),
+        spine_cost: state.hosted_spine_cost_report(),
     }))
 }
 
@@ -4566,19 +5904,26 @@ const READINESS_SLOW_ANSWER: Duration = Duration::from_secs(1);
 /// Local readiness remains independent of optional cross-repo warm-up. Hosted
 /// graph service is different: the exact-fleet durable spine is part of the
 /// product authority, so a hydration, migration-seal, fleet-fence, cursor, or
-/// root failure must keep the pod out of service.
+/// root failure must keep the pod out of service. The one exception is a spine
+/// switched off with `KIN_DISABLE_SPINE`, which readiness does not consult.
 async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
     let hosted = state.hosted_spine_readiness_required();
+    // A spine switched off with `KIN_DISABLE_SPINE` is not consulted at all:
+    // no durable read, no background cadence, and the pod is ready on the same
+    // terms as a daemon with no spine. The switch exists to stop the spine's
+    // cost while the pod keeps serving; a probe that refused under it would
+    // take the only replica out of service instead.
+    let spine_gated = hosted && !state.spine_disabled();
     // `None` means the authority check did not run, which is the case on the
     // initialization half and on every local daemon. Carrying the timing as an
     // Option keeps a branch that never consulted the gate from ever printing a
     // measured-looking zero for it.
     let mut authority_wait: Option<Duration> = None;
     let mut authority_refusal: Option<String> = None;
-    let hosted_spine_ready = if initialized && hosted {
+    let hosted_spine_ready = if initialized && spine_gated {
         // Start the pass that keeps the authority proof current, then read that
         // proof. Establishing it here instead is what starved the kubelet on
         // 2026-09-05; `DaemonState::hosted_readiness_spine_authority` carries
@@ -4693,6 +6038,10 @@ enum CapabilitySource {
     Store,
     /// The client restricted itself below what the store permits.
     ClientDeclared,
+    /// Kin gates a surface on this bit, and grants it only to a client that
+    /// declares it: declaring nothing leaves it false. `can_execute` is this
+    /// one, and `kin_session_exec` runs only for a session that declared it.
+    ClientOptIn,
     /// Kin gates nothing on this bit today. It carries the client's own
     /// declaration and no Kin surface checks it.
     Ungated,
@@ -4731,9 +6080,12 @@ fn capability_source(store_permits: bool, declared: Option<bool>) -> CapabilityS
 /// exact repository commits are refused while a hosted snapshot backend is
 /// attached. A client that declares less than the store permits keeps its own
 /// restriction, because a declaration is a self-limit and outranks a
-/// permission. Execution and branching gate nothing in Kin today, so they carry
-/// the declaration unchanged and the policy map labels them `ungated` rather
-/// than dressing an unchecked bit as a grant.
+/// permission. Execution is opt-in: `kin_session_exec` runs toolchain
+/// commands only for a session that declared `can_execute`, and a session that
+/// declared nothing does not get it, so the policy map labels it
+/// `client_opt_in`. Branching gates nothing in Kin today, so it carries the
+/// declaration unchanged and the policy map labels it `ungated` rather than
+/// dressing an unchecked bit as a grant.
 fn resolve_session_capabilities(
     commits_permitted: bool,
     declared: Option<&SessionCapabilities>,
@@ -4754,7 +6106,7 @@ fn resolve_session_capabilities(
             commits_permitted,
             declared.map(|declared| declared.can_write),
         ),
-        can_execute: CapabilitySource::Ungated,
+        can_execute: CapabilitySource::ClientOptIn,
         can_branch: CapabilitySource::Ungated,
         can_commit: capability_source(
             commits_permitted,
@@ -4820,6 +6172,14 @@ async fn start_session(
 
     let idle_ttl = state.coordinator.session_idle_ttl();
     let idle_reap_eligible_at = session_idle_reap_eligibility(&session.last_heartbeat, idle_ttl);
+    // Reading authority metadata can block on a publication reload.
+    let repository_base = {
+        let state = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || crate::unit_lifecycle::current_repository_base(&state))
+            .await
+            .ok()
+            .flatten()
+    };
     Ok(Json(SessionStartResponse {
         session_id: session.session_id.to_string(),
         vendor: session.vendor,
@@ -4831,6 +6191,7 @@ async fn start_session(
         status: "active".to_string(),
         idle_timeout_secs: idle_ttl.as_secs(),
         idle_reap_eligible_at,
+        repository_base,
     }))
 }
 
@@ -5070,6 +6431,12 @@ async fn graph_mutations(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<GraphMutationBatch>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordinated = state.coordination_gate.lock().await;
+    state
+        .prepared_publication
+        .ensure_serving()
+        .map_err(crate::prepared_publication::write_refusal)?;
+    let _mutation = state.begin_graph_authority_mutation();
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -5547,19 +6914,71 @@ async fn command_graph(
     // never saw.
     let census =
         kin_core::relation_census::CensusContext::for_layout(&state.layout, std::env::vars());
-    let response = kin_cli::commands::graph::execute_graph_command_for_store(
-        &repository_authority,
-        graph.as_ref(),
-        &request,
-        &state
-            .background_work
-            .reconcile_report(std::time::Instant::now()),
-        &embedding_runtime,
-        &census,
-        Some(state.layout.root()),
-    )
-    .map_err(internal_error)?;
+    // The working copy the conversion-source reading qualifies a file by: the
+    // same standing this daemon hands its MCP handlers, resolved once per
+    // request so every attempt below offers the same one. No other request
+    // reads it.
+    let host = mcp_working_copy_source(&state);
+    // An inspect or source lookup that served no entity is served only from a
+    // read no writer spanned, for the reason `NameReadWait` gives, and so is a
+    // conversion-source reading that found no entity. Every other answer is
+    // served as it always was.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let response = kin_cli::commands::graph::execute_graph_command_for_store(
+            &repository_authority,
+            graph.as_ref(),
+            &request,
+            &state
+                .background_work
+                .reconcile_report(std::time::Instant::now()),
+            &embedding_runtime,
+            &census,
+            Some(state.layout.root()),
+            host.surface(),
+        )
+        .map_err(internal_error)?;
+        if !graph_command_claims_absence(&request, &response) || settle.settled(&state, epoch) {
+            break response;
+        }
+        settle
+            .wait_out(&state, "command graph")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
+}
+
+/// Whether a `/commands/graph` answer claims an absence: an inspect or source
+/// lookup whose name served no entity, because it resolved to nothing, a pin
+/// excluded every match, or it named no one entity. The same reading
+/// [`refs_response_claims_absence`] gives `/commands/refs`. Status and validate
+/// resolve no name.
+///
+/// A conversion-source reading claims one on the terms the MCP dispatch reads
+/// the retired enumeration by: a graph-gap refusal of the path, or a file that
+/// holds no entity.
+fn graph_command_claims_absence(
+    request: &kin_cli::commands::graph::GraphCommandRequest,
+    response: &kin_cli::commands::graph::GraphCommandResponse,
+) -> bool {
+    use kin_cli::commands::graph::GraphCommandRequest;
+    match request {
+        GraphCommandRequest::Inspect { .. } | GraphCommandRequest::Source { .. } => {
+            response.error.is_some()
+        }
+        GraphCommandRequest::ConversionSource { .. } => {
+            response.error.as_deref().is_some_and(|message| {
+                message.starts_with("graph gap: ")
+                    && message.contains("is not tracked by this graph")
+            }) || response
+                .conversion_source
+                .as_ref()
+                .is_some_and(|report| report.total == 0)
+        }
+        GraphCommandRequest::Status | GraphCommandRequest::Validate => false,
+    }
 }
 
 /// POST /commands/overview — render overview from daemon-owned graph state.
@@ -5620,13 +7039,32 @@ async fn command_dead_code(
     // daemon holds it (FIR-2524). A clean "No dead code found." off a degraded
     // daemon is the one way that line can lie, and a thinner envelope is exactly
     // what would hide it.
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
-    let response = kin_cli::commands::dead_code::build_dead_code_response(
-        Some(&repository_authority),
-        graph.as_ref(),
-        &envelope,
-    )
-    .map_err(internal_error)?;
+    //
+    // Every answer this scan gives claims an absence: each row is an entity
+    // nothing references, and an empty list says no entity is unreferenced. An
+    // edit admission can add the reference that retires a row, so the scan is
+    // served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives. The envelope is taken per attempt, so an answer
+    // read after a wait carries the state it was read in.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let envelope =
+            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+        let response = kin_cli::commands::dead_code::build_dead_code_response(
+            Some(&repository_authority),
+            graph.as_ref(),
+            &envelope,
+        )
+        .map_err(internal_error)?;
+        if settle.settled(&state, epoch) {
+            break response;
+        }
+        settle
+            .wait_out(&state, "command dead-code")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
 }
 
@@ -5653,14 +7091,39 @@ async fn command_dead_code_seeded(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
-    let response = kin_cli::commands::dead_code::build_dead_code_seeded_response(
-        graph.as_ref(),
-        &request,
-        &envelope,
-    )
-    .map_err(internal_error)?;
+    // A seed that matched nothing, or a candidate with no proven reference, is
+    // served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives. The envelope is taken per attempt, so an answer
+    // read after a wait carries the state it was read in.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let envelope =
+            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+        let response = kin_cli::commands::dead_code::build_dead_code_seeded_response(
+            graph.as_ref(),
+            &request,
+            &envelope,
+        )
+        .map_err(internal_error)?;
+        if !dead_code_seeded_claims_absence(&response) || settle.settled(&state, epoch) {
+            break response;
+        }
+        settle
+            .wait_out(&state, "command dead-code-seeded")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
+}
+
+/// Whether a seeded dead-code answer claims an absence: a seed that matched no
+/// entity, or a candidate the graph holds no proven reference to, which is the
+/// row's own claim that nothing references it.
+fn dead_code_seeded_claims_absence(
+    response: &kin_cli::commands::dead_code::DeadCodeSeededResponse,
+) -> bool {
+    response.candidates.is_empty() || response.candidates.iter().any(|candidate| candidate.dead)
 }
 
 /// POST /commands/trace-data-flow — return the actual call/data-flow chain
@@ -5686,23 +7149,59 @@ async fn command_trace_data_flow(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    // Same short-circuit the MCP route takes, for the same reason: the authority
-    // resolved below verifies the whole store to project step bodies no walk
-    // will produce.
-    if kin_core::name_resolution_certainly_misses(graph.as_ref(), &request.focal).unwrap_or(false) {
-        return Err(internal_error(
-            kin_cli::commands::trace_data_flow::focal_not_found_error(&request.focal),
-        ));
-    }
-    let repository_authority = shared_command_authority(
-        state
-            .local_repository_authority_binding()
-            .map_err(repository_authority_error)?,
-        command_repository_authority(&state)?,
-    );
-    let response = run_trace_data_flow_off_runtime(repository_authority, graph, request)
-        .await
-        .map_err(internal_error)?;
+    // A focal or a target that resolved to nothing, and a walk with no step,
+    // is served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives. A walk with steps toward a resolved target is
+    // served as it always was.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        // Same short-circuit the MCP route takes, for the same reason: the
+        // authority resolved below verifies the whole store to project step
+        // bodies no walk will produce.
+        if kin_core::name_resolution_certainly_misses(graph.as_ref(), &request.focal)
+            .unwrap_or(false)
+        {
+            if settle.settled(&state, epoch) {
+                return Err(internal_error(
+                    kin_cli::commands::trace_data_flow::focal_not_found_error(&request.focal),
+                ));
+            }
+        } else {
+            let repository_authority = shared_command_authority(
+                state
+                    .local_repository_authority_binding()
+                    .map_err(repository_authority_error)?,
+                command_repository_authority(&state)?,
+            );
+            let walked = run_trace_data_flow_off_runtime(
+                repository_authority,
+                Arc::clone(&graph),
+                request.clone(),
+            )
+            .await;
+            if !trace_claims_absence(&walked, &request.focal) || settle.settled(&state, epoch) {
+                // A walk whose smallest retained form cannot fit the caller's
+                // `max_response_chars` is refused because of that parameter, so
+                // it answers 400 with the same message. Every other failure
+                // keeps its 500.
+                break walked.map_err(|error| {
+                    if error
+                        .downcast_ref::<kin_cli::commands::trace_data_flow::TraceBelowFloor>()
+                        .is_some()
+                    {
+                        (StatusCode::BAD_REQUEST, error.to_string())
+                    } else {
+                        internal_error(error)
+                    }
+                })?;
+            }
+        }
+        settle
+            .wait_out(&state, "trace_data_flow")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
 }
 
@@ -5793,22 +7292,41 @@ async fn command_path(
     }
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let cancel = kin_mcp::handlers::path::PathCancel::new();
-    let _abandon = PathCancelOnDrop(cancel.clone());
-    let budget = kin_mcp::handlers::path::PathBudget::cancellable(cancel);
-    let outcome = tokio::task::spawn_blocking(move || {
-        kin_mcp::handlers::path::build_path_response_within(graph.as_ref(), &request, budget)
-    })
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("path worker failed: {error}"),
-        )
-    })?;
-    let response = match outcome {
-        Ok(response) => response,
-        Err(error) => return Err(path_refusal(error)),
+    // An end that served no entity, or a route the walk did not find, is
+    // served only from a read no writer spanned, for the reason `NameReadWait`
+    // gives. A route that was found is served as it always was.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let cancel = kin_mcp::handlers::path::PathCancel::new();
+        let _abandon = PathCancelOnDrop(cancel.clone());
+        let budget = kin_mcp::handlers::path::PathBudget::cancellable(cancel);
+        let walk_graph = Arc::clone(&graph);
+        let walk_request = request.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            kin_mcp::handlers::path::build_path_response_within(
+                walk_graph.as_ref(),
+                &walk_request,
+                budget,
+            )
+        })
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("path worker failed: {error}"),
+            )
+        })?;
+        if !path_outcome_claims_absence(&outcome) || settle.settled(&state, epoch) {
+            break match outcome {
+                Ok(response) => response,
+                Err(error) => return Err(path_refusal(error)),
+            };
+        }
+        settle
+            .wait_out(&state, "command path")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
     };
     let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
     let text = serde_json::to_string(&response)
@@ -5832,6 +7350,21 @@ async fn command_path(
             )
         })?;
     Ok(Json(payload))
+}
+
+/// Whether a route query's answer claims an absence: an end that served no
+/// entity, or two ends the walk found no route between. The second is the
+/// route query's "no references": an edit that adds a call can add the route.
+fn path_outcome_claims_absence(
+    outcome: &std::result::Result<
+        kin_mcp::handlers::path::PathResponse,
+        kin_mcp::handlers::path::PathError,
+    >,
+) -> bool {
+    match outcome {
+        Ok(response) => !response.found,
+        Err(error) => error.is_resolution_miss(),
+    }
 }
 
 /// An end that did not resolve is the caller's to fix, and says so with 422
@@ -5876,21 +7409,50 @@ async fn command_refs(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    // The same substrate reading the MCP path gets, for the same reason the
-    // impact route builds one (FIR-2524): only the daemon holds it, and a
-    // thinner envelope is the shortcut that makes the CLI MORE confident than
-    // MCP on exactly the degraded daemon nobody exercises.
-    let census_hold = kin_core::relation_census::CensusHold::read(state.layout.root());
-    let envelope = kin_mcp::Envelope::daemon()
-        .with_health(&daemon_health_snapshot(&state).await)
-        .with_relation_census_loss(census_hold.as_ref());
-    let response = kin_cli::commands::refs::build_refs_response(
-        &state.layout,
-        graph.as_ref(),
-        &request,
-        &envelope,
-    )
-    .map_err(internal_error)?;
+    // An absence is served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        // The same substrate reading the MCP path gets, for the same reason the
+        // impact route builds one: only the daemon holds it, and a thinner
+        // envelope is the shortcut that makes the CLI MORE confident than MCP
+        // on exactly the degraded daemon nobody exercises. Taken per attempt,
+        // so an answer read after a wait carries the state it was read in.
+        let census_hold = kin_core::relation_census::CensusHold::read(state.layout.root());
+        let envelope = kin_mcp::Envelope::daemon()
+            .with_health(&daemon_health_snapshot(&state).await)
+            .with_relation_census_loss(census_hold.as_ref());
+        // The spine read the reference tools take, so an empty answer is graded
+        // on the cross-repo authority `find_references` weighs. Held for this
+        // attempt only, and let go before any wait below.
+        let spine_authority = state.acquire_spine_read_authority().await;
+        let spine_deferral = state.spine_initialization_deferral();
+        let response = kin_cli::commands::refs::build_refs_response_with_spine(
+            &state.layout,
+            graph.as_ref(),
+            &request,
+            &envelope,
+            kin_cli::commands::refs::RefsSpine {
+                repo_id: &state.cached_repo_id,
+                spine: kin_spine::DaemonSpine::from_read(
+                    spine_authority
+                        .as_ref()
+                        .map(|authority| authority.backend()),
+                    spine_deferral.as_deref(),
+                ),
+            },
+        )
+        .map_err(internal_error)?;
+        drop(spine_authority);
+        if !refs_response_claims_absence(&response) || settle.settled(&state, epoch) {
+            break response;
+        }
+        settle
+            .wait_out(&state, "command refs")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
 }
 
@@ -5914,8 +7476,21 @@ async fn command_bulk_refs(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response = kin_cli::commands::refs::build_bulk_refs_response(graph.as_ref(), &request)
-        .map_err(internal_error)?;
+    // An absence is served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let response = kin_cli::commands::refs::build_bulk_refs_response(graph.as_ref(), &request)
+            .map_err(internal_error)?;
+        if !bulk_refs_response_claims_absence(&response) || settle.settled(&state, epoch) {
+            break response;
+        }
+        settle
+            .wait_out(&state, "command bulk-refs")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
 }
 
@@ -6079,8 +7654,25 @@ async fn command_security(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response = kin_cli::commands::security::build_security_response(graph.as_ref(), &request)
-        .map_err(internal_error)?;
+    // A scan that found nothing, or that reports a public entity nothing calls,
+    // is served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives. Every other scan is served as it always was.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let response =
+            kin_cli::commands::security::build_security_response(graph.as_ref(), &request)
+                .map_err(internal_error)?;
+        if !kin_cli::commands::security::security_response_claims_absence(&response)
+            || settle.settled(&state, epoch)
+        {
+            break response;
+        }
+        settle
+            .wait_out(&state, "command security")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
 }
 
@@ -6674,13 +8266,23 @@ async fn command_session_workspace(
         ));
     }
 
+    kin_cli::commands::session_workspace::validate_session_workspace_request(
+        &state.layout,
+        &request,
+    )
+    .map_err(session_reconcile_error)?;
+    let _coordination = state.coordination_gate.lock().await;
+    let _graph_mutation = state.begin_graph_authority_mutation();
+    let captured_roots = crate::binding_history::capture_session_materialization(&state)
+        .map_err(repository_commit_error)?;
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let response = kin_cli::commands::session_workspace::materialize_session_workspace(
+    let response = kin_cli::commands::session_workspace::materialize_session_workspace_at_roots(
         &state.layout,
         &repository_authority,
         &request,
+        Some(&captured_roots),
     )
     .map_err(session_reconcile_error)?;
     Ok(Json(response))
@@ -6690,351 +8292,27 @@ async fn command_session_workspace(
 ///
 /// Filesystem reads occur only in `observe_session_workspace`. Repository
 /// authority and the primary graph-derived projection then move together
-/// through the repository-v6 projection WAL. Semantic parsing is derived,
-/// optional follow-up work and never controls exact membership.
+/// through the prepared repository transaction and projection WAL. Required
+/// source semantics are planned before acknowledgement and adopted before success.
 async fn reconcile_session_workspace(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::reconcile::ReconcileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
-        ));
+    // `kin reconcile` publishes a session workspace into the primary one, so a
+    // read-only session is refused here exactly as `kin commit` refuses it.
+    if let Some(refusal) = read_only_session_write_refusal(
+        &state,
+        &headers,
+        None,
+        kin_mcp::session::WriteDoor::CliReconcile,
+    )? {
+        return Err(refusal);
     }
-    if state.storage_backend.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            "exact local session reconciliation is unavailable for hosted snapshot authority"
-                .to_string(),
-        ));
-    }
-
-    let _coordination = state.coordination_gate.lock().await;
-    let graph_mutation = state.begin_graph_authority_mutation();
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
-    let observation = kin_cli::commands::reconcile::observe_session_workspace(
-        &state.layout,
-        &repository_authority,
-        &request.session_dir,
-        state.blobs.as_ref(),
-        request.confirm_mass_deletion,
-    )
-    .map_err(session_reconcile_error)?;
-
-    let previous_tree_hash = observation.base().source_workspace.tree_hash;
-    let desired_tree_hash = kin_model::compute_resolved_tree_hash(observation.desired_tree())
-        .map_err(repository_authority_error)?;
-    let changes = observation.changes();
-    let added = changes
-        .iter()
-        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Added)
-        .count();
-    let modified = changes
-        .iter()
-        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Modified)
-        .count();
-    let removed = changes
-        .iter()
-        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Removed)
-        .count();
-
-    if state.graph.resolved_tree() != observation.base().source_workspace.tree
-        && state.graph.resolved_tree() != *observation.desired_tree()
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "daemon query tree is not bound to the session base or its exact recovered target; \
-             reopen the daemon from repository authority"
-                .to_string(),
-        ));
-    }
-
-    let (
-        authority_generation,
-        workspace_generation,
-        idempotent_replay,
-        semantic_enriched,
-        semantic_failures,
-    ) = if observation.deltas().is_empty() {
-        (
-            observation.base().authority_roots.generation,
-            observation.base().source_workspace.generation,
-            false,
-            0,
-            Vec::new(),
-        )
-    } else {
-        let authority_context =
-            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
-                .map_err(repository_commit_error)?;
-        let plan = crate::repository_commit::plan_session_workspace_admission(
-            &state.layout,
-            state.blobs.as_ref(),
-            &authority_context,
-            &observation,
-        )
-        .map_err(repository_commit_error)?;
-        let vacated = plan.vacated.clone();
-        let module_relocations = plan.module_relocations.clone();
-        let committed = crate::repository_commit::commit_session_workspace_admission(
-            &state.layout,
-            state.blobs.as_ref(),
-            &authority_context,
-            plan,
-        )
-        .map_err(repository_commit_error)?;
-
-        let live_generation = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if committed.receipt.generation > live_generation {
-            state
-                .record_repository_authority_commit(committed.receipt.generation)
-                .map_err(repository_commit_error)?;
-        } else if committed.receipt.generation < live_generation {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "daemon generation {live_generation} is newer than recovered session \
-                         receipt {}",
-                    committed.receipt.generation
-                ),
-            ));
-        }
-
-        let graph_tree = state.graph.resolved_tree();
-        if graph_tree == observation.base().source_workspace.tree {
-            // Entities retire with the paths that owned them, in the same
-            // step as the tree moves, so the live graph never holds an entity
-            // authority just refused to carry. Read from the LIVE graph with
-            // the plan's vacated set, never copied from the plan: the plan's
-            // delta was diffed against authority, and the live graph can
-            // already hold newer payloads for these entities from an earlier
-            // session's readmission. kin-db checks a removal's old payload
-            // against the graph it lands on, so authority's payload applied
-            // here was refused after authority had already moved, leaving the
-            // two graphs holding different trees. Targeted reads rather than a
-            // snapshot of the whole store, which this path cannot afford.
-            let (mut retired_entity_deltas, retired_relation_deltas) =
-                crate::repository_commit::retire_live_semantics_on_vacated(
-                    state.graph.as_ref(),
-                    &vacated,
-                )
-                .map_err(repository_commit_error)?;
-            let moves = crate::repository_commit::session_artifact_moves(observation.deltas());
-            for (from, to) in &moves {
-                retired_entity_deltas.extend(
-                    crate::repository_commit::plan_session_entity_relocations(
-                        state.graph.as_ref(),
-                        from,
-                        to,
-                    )
-                    .map_err(repository_commit_error)?,
-                );
-            }
-            crate::repository_commit::bind_session_module_relocations(
-                &mut retired_entity_deltas,
-                &module_relocations,
-            )
-            .map_err(repository_commit_error)?;
-            state
-                .graph
-                .apply_transaction_delta(&TransactionDelta {
-                    tree_deltas: observation.deltas().to_vec(),
-                    entity_deltas: retired_entity_deltas.clone(),
-                    relation_deltas: retired_relation_deltas,
-                    ..TransactionDelta::default()
-                })
-                .map_err(internal_error)?;
-            // Destination facets are re-derived below from exact admitted
-            // bytes. Clear only departed keys; a swap's keys still belong to
-            // surviving artifacts and must not erase each other's records.
-            for (from, _) in &moves {
-                let old_path = RepoPath::from_utf8(from.0.clone()).map_err(internal_error)?;
-                if observation
-                    .desired_tree()
-                    .artifact_at_path(&old_path)
-                    .is_none()
-                {
-                    crate::loop_runner::clear_incompatible_facets_in(
-                        state.graph.as_ref(),
-                        from,
-                        crate::loop_runner::EnrichmentFacet::None,
-                    )
-                    .map_err(internal_error)?;
-                }
-            }
-            for delta in &retired_entity_deltas {
-                let kin_model::EntityDelta::Removed { old } = delta else {
-                    continue;
-                };
-                if let Some(file_id) = &old.file_origin {
-                    if let Err(error) = crate::loop_runner::clear_incompatible_facets_in(
-                        state.graph.as_ref(),
-                        file_id,
-                        crate::loop_runner::EnrichmentFacet::None,
-                    ) {
-                        warn!(
-                            file = %file_id,
-                            error = %error,
-                            "retired a vacated path's entities but could not clear every facet"
-                        );
-                    }
-                }
-                state.emit_event(DaemonEvent::EntityChanged {
-                    entity_id: old.id,
-                    node: None,
-                    change_type: crate::state::ChangeType::Deleted,
-                    file_path: old.file_origin.as_ref().map(|file| file.0.clone()),
-                    session_id: None,
-                });
-            }
-        } else if graph_tree != *observation.desired_tree() {
-            return Err((
-                StatusCode::CONFLICT,
-                "repository receipt is durable but the daemon query tree cannot be advanced \
-                     from the retained session base; restart to reload exact authority"
-                    .to_string(),
-            ));
-        }
-
-        state.mark_dirty();
-        state.bump_version();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: Some(previous_tree_hash.to_string()),
-            new_root_hash: desired_tree_hash.to_string(),
-        });
-        // The exact tree is published and nothing has parsed it. Re-derive the
-        // semantic layer for the paths this publication moved, here, under the
-        // gate that published them.
-        //
-        // Leaving it to the next commit does not work, and that is the whole
-        // defect. A commit forces one complete admission, and that admission
-        // plans its transition from the working copy this publication has
-        // already made current, so the transition is empty and it returns before
-        // its own enrichment half ever runs. The bytes moved, the parse never
-        // happened, and every read surface kept answering at the positions the
-        // previous parse recorded. On a converted `psf/requests` an edit that
-        // prepended seventeen lines left the whole file answering seventeen
-        // lines short, under an envelope with nothing to report.
-        // Record what this publication owes a parser before parsing any of it,
-        // and leave the record standing after. Re-deriving here fixes the live
-        // daemon and nothing more: entities reach durable authority only inside
-        // a semantic change, this publication deliberately writes no history,
-        // and a derived-graph mutation no change carries is gone when the next
-        // daemon replays that history. Measured, not assumed. A daemon reopened
-        // between this publication and its commit read the pre-edit span back,
-        // and a synchronous snapshot immediately after the re-derivation did not
-        // change that. The commit that publishes is what settles the record.
-        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(observation.deltas()));
-        let readmitted =
-            crate::loop_runner::readmit_semantics_for_paths(&state, &published_paths(&observation))
-                .await;
-        (
-            committed.receipt.generation,
-            observation
-                .base()
-                .source_workspace
-                .generation
-                .saturating_add(1),
-            committed.idempotent_replay,
-            readmitted.enriched,
-            readmitted.failed,
-        )
-    };
-
-    drop(graph_mutation);
-    let summary = kin_cli::commands::reconcile::ReconcileSummary {
-        schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
-        operation_id: observation.base().reconcile_operation_id,
-        repository_id: observation.base().repository_id.clone(),
-        authority_generation,
-        workspace_generation,
-        previous_tree_hash,
-        desired_tree_hash,
-        idempotent_replay,
-        changed: !observation.deltas().is_empty(),
-        added,
-        modified,
-        removed,
-        observed_materialized_artifacts: observation.observed_materialized_artifacts(),
-        preserved_graph_only_artifacts: observation.preserved_graph_only_artifacts(),
-        observed_body_bytes: observation.observed_body_bytes(),
-        semantic_files_enriched: semantic_enriched,
-        semantic_enrichment_failures: semantic_failures.len(),
-        changes,
-    };
-    if !semantic_failures.is_empty() {
-        let named = semantic_failures
-            .iter()
-            .map(|failure| failure.path.clone())
-            .collect::<Vec<_>>();
-        return Err(semantic_readmission_refused(&summary, &named));
-    }
-    Ok(Json(summary))
+    crate::session_publication::execute(state, request).await
 }
 
-/// Every repository path one session publication moved.
-///
-/// Both sides of every delta. A rename's old path leaves the tree and its new
-/// path enters it, and the readmission skips whatever the tree no longer
-/// carries, so naming both sides costs nothing and misses nothing.
-fn published_paths(
-    observation: &kin_cli::commands::reconcile::SessionReconcileObservation,
-) -> std::collections::BTreeSet<RepoPath> {
-    let mut paths = std::collections::BTreeSet::new();
-    for delta in observation.deltas() {
-        if let Some(old) = delta.old_state() {
-            paths.insert(old.path.clone());
-        }
-        if let Some(new) = delta.new_state() {
-            paths.insert(new.path.clone());
-        }
-    }
-    paths
-}
-
-/// Refuse a reconcile whose exact tree published but whose semantics did not.
-///
-/// The bytes are durable before this is reached and a parser may not retract
-/// them, so this is not a rollback and the body says so outright: the tree
-/// moved, and the graph cannot answer about these files at the positions their
-/// new bytes hold. Returning it as a refusal rather than as a degradation block
-/// inside a 200 is what makes `kin reconcile` exit non-zero, because the CLI
-/// treats any non-success status as an error and prints the body; a caller that
-/// reads a clean summary and a zero has no way to learn that the file it just
-/// edited still answers at its old spans, which is the failure this whole change
-/// exists to end.
-///
-/// The complete summary travels inside the refusal, so nothing a success would
-/// have reported is lost by refusing.
-fn semantic_readmission_refused(
-    summary: &kin_cli::commands::reconcile::ReconcileSummary,
-    failed: &[String],
-) -> (StatusCode, String) {
-    let body = serde_json::json!({
-        "error": "semantic_readmission_failed",
-        "message": format!(
-            "the exact tree published as {} but {} of the files it moved could not be \
-             re-parsed, so the graph still answers about them at the positions their previous \
-             bytes held: {}",
-            summary.desired_tree_hash,
-            failed.len(),
-            failed.join(", ")
-        ),
-        "files": failed,
-        "summary": summary,
-    });
-    (StatusCode::CONFLICT, body.to_string())
-}
-
-fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+pub(crate) fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     let message = error.to_string();
     let status = if [
         "stale",
@@ -7112,6 +8390,235 @@ struct CommandCommitResponse {
     entity_count: usize,
     relation_count: usize,
     file_count: usize,
+    /// Files this change published that the caller's own write did not make,
+    /// carried in from content the workspace had already admitted. Only a
+    /// caller that names what it wrote, `/commands/exec-commit`, can be told.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    carried_pending_files: Vec<String>,
+}
+
+/// POST /commands/exec-commit: record an agent's toolchain write-back as a
+/// change.
+///
+/// `kin_session_exec` runs an allowed toolchain command in a session workspace
+/// and hands back only the manifests and lockfiles it wrote, through the same
+/// `/reconcile` boundary every session uses. That admission advances the
+/// workspace tree and records no change, while history, `kin log` and `kin git
+/// export` read changes. This records it as one, attributed to the agent
+/// session that ran the command exactly as its `kin_mutate` commits are, under
+/// the message the run supplies.
+///
+/// Unlike `/commands/commit` it admits nothing from the working copy first:
+/// the write-back was already admitted from the session's own workspace, and
+/// the primary working copy is not the agent's to sweep. Content another
+/// writer had already admitted ahead of the workspace's base change is
+/// published with it, as an MCP commit publishes it, and the message and the
+/// reply name those files.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecCommitRequest {
+    operation_id: kin_model::OperationId,
+    timestamp: kin_model::Timestamp,
+    session_id: String,
+    message: String,
+    /// The repository paths the run's own admission changed.
+    authored_paths: Vec<String>,
+    /// The workspace generation and tree the run's `/reconcile` published.
+    /// The change records exactly that content or nothing: a workspace that
+    /// moved since, through another writer or another admission, is refused
+    /// rather than attributed to this session.
+    expected_workspace_generation: u64,
+    expected_tree_hash: kin_model::Hash256,
+}
+
+/// Refuse an exec commit when the workspace no longer holds exactly the tree
+/// the run's own admission published.
+fn refuse_a_moved_exec_workspace(
+    state: &DaemonState,
+    request: &ExecCommitRequest,
+) -> Result<(), (StatusCode, String)> {
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .map_err(repository_commit_error)?;
+    let authority = held_repository_authority(state)?;
+    let workspace =
+        crate::repository_commit::held_authority_workspace(&authority, context.workspace_id())
+            .map_err(repository_commit_error)?;
+    let live = kin_model::compute_resolved_tree_hash(&state.graph.resolved_tree())
+        .map_err(internal_error)?;
+    if workspace.generation != request.expected_workspace_generation
+        || workspace.tree_hash != request.expected_tree_hash
+        || live != request.expected_tree_hash
+    {
+        let body = json!({
+            "error": "workspace_moved",
+            "expected_workspace_generation": request.expected_workspace_generation,
+            "workspace_generation": workspace.generation,
+            "message": "the workspace moved after this run's admission, so recording it now \
+                        could attribute another writer's content to this session; nothing was \
+                        committed, the run's files stay admitted, and the next kin_mutate commit \
+                        publishes them and names them as carried",
+        });
+        return Err((StatusCode::CONFLICT, body.to_string()));
+    }
+    Ok(())
+}
+
+/// The message an exec write-back change records: the run's own subject, and
+/// when the change carried anything else in, a paragraph naming it.
+fn exec_commit_message(subject: &str, carried: &[RepoPath]) -> String {
+    const SAMPLE: usize = 10;
+    if carried.is_empty() {
+        return subject.to_string();
+    }
+    let mut named = carried
+        .iter()
+        .take(SAMPLE)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if carried.len() > SAMPLE {
+        named.push_str(&format!(", and {} more", carried.len() - SAMPLE));
+    }
+    let files = if carried.len() == 1 { "file" } else { "files" };
+    format!(
+        "{subject}\n\nAlso publishes {} {files} the workspace had already admitted ahead of its \
+         base change, which this run did not write: {named}.",
+        carried.len()
+    )
+}
+
+async fn command_exec_commit(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<ExecCommitRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if request.message.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "exec commit message must not be empty".to_string(),
+        ));
+    }
+    if request.authored_paths.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "exec commit names no path the run wrote, so it has nothing of its own to record"
+                .to_string(),
+        ));
+    }
+    let session_id = parse_session_id(request.session_id.trim())?;
+    let session = state
+        .coordinator
+        .get_session(&session_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, expired_session_message(&session_id)))?;
+    if let Some(refusal) = read_only_session_write_refusal(
+        &state,
+        &headers,
+        Some(&request.session_id),
+        kin_mcp::session::WriteDoor::SessionExec,
+    )? {
+        return Err(refusal);
+    }
+    let authored = request
+        .authored_paths
+        .iter()
+        .map(|path| {
+            RepoPath::from_utf8(path.clone()).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("exec commit path {path:?} is not a repository path: {error}"),
+                )
+            })
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+
+    let _pending_commit = state.pending_commits.announce();
+    let _transaction =
+        crate::commit_liveness::TransactionGuard::open(state.layout.root(), "commit");
+    let _coordination = crate::mcp_commit::timed_commit_phase_async(
+        "coordination_gate_wait",
+        state.coordination_gate.lock(),
+    )
+    .await;
+    refuse_commit_during_open_merge(&state)?;
+    // Under the coordination gate, which every publication takes, so nothing
+    // can move the workspace between this check and the plan.
+    refuse_a_moved_exec_workspace(&state, &request)?;
+    let commit = CommandCommitRequest {
+        operation_id: request.operation_id,
+        timestamp: request.timestamp,
+        message: Some(request.message.trim().to_string()),
+        amend: false,
+        expected_head: None,
+        author: crate::mcp_commit::session_commit_author(Some(&session), &request.session_id),
+        session_id: Some(request.session_id.clone()),
+    };
+    let attempt =
+        match command_commit_after_admission(&state, commit.clone(), None, Some(&authored)) {
+            // The same one bounded re-derivation `/commands/commit` takes when the
+            // planner finds semantics behind the bytes it would seal.
+            Err(CommitAttempt::SemanticsBehindTree(paths)) => {
+                let owed: std::collections::BTreeSet<RepoPath> = paths.into_iter().collect();
+                stage_refused_bodies_from_repository_cas(&state, &owed);
+                crate::mcp_commit::timed_commit_phase_async(
+                    "await_pending_reconcile",
+                    crate::loop_runner::readmit_semantics_for_paths(&state, &owed),
+                )
+                .await;
+                command_commit_after_admission(&state, commit, None, Some(&authored))
+            }
+            attempted => attempted,
+        };
+    match attempt {
+        Ok(Json(committed)) => {
+            // Read back under the same gate, so the head and tree named are the
+            // ones this change published and nothing has moved them since.
+            let (tree_hash, workspace_generation) = exec_workspace_after_commit(&state)?;
+            Ok(Json(ExecCommitResponse {
+                change_id: committed.change_id,
+                branch: committed.branch,
+                carried_pending_files: committed.carried_pending_files,
+                tree_hash,
+                workspace_generation,
+            }))
+        }
+        Err(CommitAttempt::SemanticsBehindTree(paths)) => Err(repository_commit_error(
+            crate::error::DaemonError::SemanticsBehindTree {
+                paths: paths.iter().map(ToString::to_string).collect(),
+            },
+        )),
+        Err(CommitAttempt::Refused(refusal)) => Err(refusal),
+    }
+}
+
+/// What `/commands/exec-commit` answers: the change, and the head tree and
+/// workspace generation it left, which the next session is materialized from.
+#[derive(Debug, Serialize)]
+struct ExecCommitResponse {
+    change_id: String,
+    branch: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    carried_pending_files: Vec<String>,
+    tree_hash: kin_model::Hash256,
+    workspace_generation: u64,
+}
+
+/// The workspace's committed tree and generation, read from authority.
+fn exec_workspace_after_commit(
+    state: &DaemonState,
+) -> Result<(kin_model::Hash256, u64), (StatusCode, String)> {
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .map_err(repository_commit_error)?;
+    let authority = held_repository_authority(state)?;
+    let workspace =
+        crate::repository_commit::held_authority_workspace(&authority, context.workspace_id())
+            .map_err(repository_commit_error)?;
+    Ok((
+        workspace.base_tree_hash.unwrap_or(workspace.tree_hash),
+        workspace.generation,
+    ))
 }
 
 /// Copy the bodies a bounded re-derivation is about to read back into ingestion
@@ -7188,6 +8695,7 @@ fn stage_refused_bodies_from_repository_cas(
 }
 
 async fn command_commit(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<CommandCommitRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -7215,6 +8723,14 @@ async fn command_commit(
             StatusCode::BAD_REQUEST,
             "native commit message must not be empty".to_string(),
         ));
+    }
+    if let Some(refusal) = read_only_session_write_refusal(
+        &state,
+        &headers,
+        request.session_id.as_deref(),
+        kin_mcp::session::WriteDoor::CliCommit,
+    )? {
+        return Err(refusal);
     }
 
     // Announce this commit before anything else, and keep announcing it until
@@ -7290,7 +8806,8 @@ async fn command_commit(
     // settle from here, and asking again until it does would hold the gate for
     // as long as the caller waits.
     let attempt =
-        match command_commit_after_admission(&state, request.clone(), deferred_tree.as_ref()) {
+        match command_commit_after_admission(&state, request.clone(), deferred_tree.as_ref(), None)
+        {
             Err(CommitAttempt::SemanticsBehindTree(paths)) => {
                 let owed: std::collections::BTreeSet<RepoPath> = paths.into_iter().collect();
                 let named = owed
@@ -7322,7 +8839,7 @@ async fn command_commit(
                     "these paths held entities their own admitted bytes do not reproduce, so this \
                      commit re-derived them before planning the change that seals those bytes"
                 );
-                command_commit_after_admission(&state, request, deferred_tree.as_ref())
+                command_commit_after_admission(&state, request, deferred_tree.as_ref(), None)
             }
             attempted => attempted,
         };
@@ -7364,13 +8881,13 @@ async fn command_commit(
                 &state.layout,
                 state.graph.resolved_tree().len() as u64,
             );
-            // This transaction reached authority, and a commit derives its
-            // change from the live graph, so every parse the admission above put
-            // back into that graph is in history now. Nothing the record named
-            // is still owed. Settled here rather than at the drain because a
-            // crash between the two would otherwise clear the record for work no
-            // change carried, which is the loss the record exists to prevent.
-            crate::semantic_debt::settle_all(&state);
+            // This transaction paid the workspace's owed derivations inside its
+            // own commit, because a commit derives its change from the live
+            // graph the admission above brought current. What an earlier
+            // build's records still owed was re-derived into that same graph at
+            // startup, so this durable commit carried it too, and those records
+            // have nothing left to say.
+            crate::semantic_debt::legacy_carried(&state);
             Ok(response)
         }
         Err(CommitAttempt::SemanticsBehindTree(paths)) => {
@@ -7399,17 +8916,34 @@ async fn command_commit(
 /// transaction to carry. It is the completed walk's own proof rather than a
 /// flag, so the collapsed path cannot be entered without one, and the tree it
 /// proved is checked against the tree the plan publishes.
+///
+/// `authored` names the paths the caller's own write changed, when it knows
+/// them. The plan then declares every other file it publishes as carried, in
+/// its message and its reply, the way an MCP commit does.
 fn command_commit_after_admission(
     state: &Arc<DaemonState>,
     request: CommandCommitRequest,
     observed: Option<&crate::repository_commit::AdmittedWorkspaceTree>,
+    authored: Option<&std::collections::BTreeSet<RepoPath>>,
 ) -> Result<Json<CommandCommitResponse>, CommitAttempt> {
     let graph = &*state.graph;
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
     let planned = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
-        if let Some(expected_head) = request.expected_head {
+        if let (Some(authored), None) = (authored, request.expected_head) {
+            let subject = request.message.clone().unwrap_or_default();
+            crate::repository_commit::plan_native_commit_declaring_carry(
+                graph,
+                state.blobs.as_ref(),
+                &authority_context,
+                request.operation_id,
+                request.timestamp,
+                request.author.clone(),
+                authored,
+                &|carried| exec_commit_message(&subject, carried),
+            )
+        } else if let Some(expected_head) = request.expected_head {
             crate::repository_commit::plan_native_amend(
                 graph,
                 state.blobs.as_ref(),
@@ -7462,6 +8996,11 @@ fn command_commit_after_admission(
     let entity_count = plan.entity_count;
     let relation_count = plan.relation_count;
     let file_count = plan.file_count;
+    let carried_pending_files = plan
+        .carried_pending_files
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
     // --- Lease enforcement gate for native repository publication ---
     {
@@ -7546,6 +9085,7 @@ fn command_commit_after_admission(
         graph.create_change(&committed.change)
     })
     .map_err(internal_error)?;
+    crate::binding_history::restore_exact_authority(state);
     // The plan above was derived from this live graph under the coordination
     // gate, and the transaction published it, so the two are level here and
     // this is the count durable authority now carries (FIR-2421). Read from the
@@ -7578,7 +9118,53 @@ fn command_commit_after_admission(
         entity_count,
         relation_count,
         file_count,
+        carried_pending_files,
     }))
+}
+
+/// Refuse a CLI write made for a read-only session.
+///
+/// A session's capabilities used to be enforced nowhere a write actually went,
+/// so a session that declared itself read-only could commit. The CLI names the
+/// session it runs in with `X-Kin-Session`, taken from `KIN_SESSION_ID`, and a
+/// commit request may name one in its body. Either one naming a registered
+/// read-only session refuses the write before anything is admitted or written.
+///
+/// Both ids are read leniently, the way the commit's lease check reads the body
+/// one: a malformed id names no session, so it holds the caller to nothing and
+/// is not a new way for this route to fail. The same goes for an id naming no
+/// registered session.
+fn read_only_session_write_refusal(
+    state: &DaemonState,
+    headers: &axum::http::HeaderMap,
+    body_session: Option<&str>,
+    door: kin_mcp::session::WriteDoor,
+) -> Result<Option<(StatusCode, String)>, (StatusCode, String)> {
+    let header_session = headers
+        .get("X-Kin-Session")
+        .and_then(|value| value.to_str().ok());
+    for named in [header_session, body_session].into_iter().flatten() {
+        let Ok(uuid) = Uuid::parse_str(named.trim()) else {
+            continue;
+        };
+        let session_id = SessionId(uuid);
+        let Some(session) = state
+            .coordinator
+            .get_session(&session_id)
+            .map_err(internal_error)?
+        else {
+            continue;
+        };
+        if let Some(message) = kin_mcp::session::read_only_session_refusal(door, &session) {
+            let body = json!({
+                "error": "read_only_session",
+                "session_id": session_id.to_string(),
+                "message": message,
+            });
+            return Ok(Some((StatusCode::FORBIDDEN, body.to_string())));
+        }
+    }
+    Ok(None)
 }
 
 /// Refuse a commit whose successor would record nothing at all.
@@ -7648,6 +9234,14 @@ fn commit_admission_error(error: crate::error::DaemonError) -> (StatusCode, Stri
         });
         return (StatusCode::CONFLICT, body.to_string());
     }
+    if matches!(
+        &error,
+        crate::error::DaemonError::Reconcile(
+            kin_reconcile::ReconcileError::CollisionBlocked { .. }
+        )
+    ) {
+        return repository_commit_error(error);
+    }
     internal_error(error)
 }
 
@@ -7681,6 +9275,9 @@ fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, Str
         return (StatusCode::CONFLICT, body.to_string());
     }
     let status = match &error {
+        crate::error::DaemonError::Reconcile(kin_reconcile::ReconcileError::CollisionBlocked {
+            ..
+        }) => StatusCode::CONFLICT,
         crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
             kin_model::ModelError::Conflict(_),
         )) => StatusCode::CONFLICT,
@@ -8405,7 +10002,7 @@ async fn locate(
 
     // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
     // so a stale cursor can never page a ranking built against different truth.
-    let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+    let mut graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
     let requested_page_size = req.page_size;
     let page_size = requested_page_size.unwrap_or_else(kin_cli::commands::locate::entity_page_size);
 
@@ -8664,33 +10261,52 @@ async fn locate(
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
         let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-        if multi_query {
-            run_multiquery_fused_locate(
-                &state,
-                session_id.as_ref(),
-                graph.as_ref(),
-                &variants,
-                auto_fanout,
-                explain,
-                req.max_files,
-                req.max_files_explicit,
-                snippet_opts,
-                scope,
-            )
-            .await
-        } else {
-            run_fused_locate_for_state(
-                &state,
-                session_id.as_ref(),
-                graph.as_ref(),
-                &req.text,
-                explain,
-                req.max_files,
-                req.max_files_explicit,
-                snippet_opts,
-                scope,
-            )
-            .await
+        // A ranking that found nothing, or that holds nothing named by a query
+        // that is one name, is served only from a read no writer spanned, for
+        // the reason `NameReadWait` gives. The cursor is stamped with the graph
+        // version the served ranking was read at.
+        let mut settle = NameReadWait::begin(&state, &graph);
+        loop {
+            let epoch = settle.sample(&state);
+            graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            let attempt = if multi_query {
+                run_multiquery_fused_locate(
+                    &state,
+                    session_id.as_ref(),
+                    graph.as_ref(),
+                    &variants,
+                    auto_fanout,
+                    explain,
+                    req.max_files,
+                    req.max_files_explicit,
+                    snippet_opts,
+                    scope,
+                )
+                .await
+            } else {
+                run_fused_locate_for_state(
+                    &state,
+                    session_id.as_ref(),
+                    graph.as_ref(),
+                    &req.text,
+                    explain,
+                    req.max_files,
+                    req.max_files_explicit,
+                    snippet_opts,
+                    scope,
+                )
+                .await
+            };
+            let claims_absence = attempt
+                .as_ref()
+                .is_ok_and(|result| locate_result_claims_absence(&req.text, result));
+            if !claims_absence || settle.settled(&state, epoch) {
+                break attempt;
+            }
+            settle
+                .wait_out(&state, "locate")
+                .await
+                .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
         }
     }
     .map_err(internal_error)?;
@@ -8741,6 +10357,45 @@ async fn locate(
     }
     kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
     Ok(Json(result))
+}
+
+/// Whether a fresh locate ranking claims an absence: it ranked nothing, or its
+/// query is one name and nothing it ranked carries that name.
+///
+/// A query of several words is a description, and a ranking of neighbours is
+/// its answer, so only an empty one claims anything is absent. One name asks
+/// for the entity that carries it, and a ranking with no name hit says there is
+/// none, which an edit adding that entity makes untrue once it is admitted.
+fn locate_result_claims_absence(
+    query: &str,
+    result: &kin_cli::commands::locate::LocateResult,
+) -> bool {
+    if result.entities.is_empty() && result.files.is_empty() {
+        return true;
+    }
+    if !locate_query_is_one_name(query) {
+        return false;
+    }
+    let name = query.trim();
+    let entity_named = !result.entities.is_empty()
+        && !kin_cli::commands::locate::locate_entities_are_all_fallback(&result.entities);
+    let symbol_named = result
+        .files
+        .iter()
+        .any(|file| file.symbols.iter().any(|symbol| symbol.name == name));
+    !(entity_named || symbol_named)
+}
+
+/// Whether a locate query is one name: a single token of identifier
+/// characters, the shape a caller uses to find a symbol by the name it knows.
+fn locate_query_is_one_name(query: &str) -> bool {
+    let mut tokens = query.split_whitespace();
+    match (tokens.next(), tokens.next()) {
+        (Some(token), None) => token
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | ':' | '$')),
+        _ => false,
+    }
 }
 
 /// Run the fused locate pipeline against daemon state for a non-ref query,
@@ -9293,19 +10948,62 @@ async fn search(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let mut result = kin_cli::commands::search::collect_daemon_search_response(
-        graph.as_ref(),
-        &req,
-        // Same substrate reading the impact and trace routes supply, from the
-        // same helper, so no CLI surface can be more confident than its MCP
-        // counterpart about one daemon at one instant (FIR-2524).
-        &kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await),
-    )
-    .map_err(internal_error)?;
+    // A search that found nothing, or matched nothing by name, is served only
+    // from a read no writer spanned, for the reason `NameReadWait` gives. A
+    // search a name matched is served as it always was.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let mut result = loop {
+        let epoch = settle.sample(&state);
+        let result = kin_cli::commands::search::collect_daemon_search_response(
+            graph.as_ref(),
+            &req,
+            // Same substrate reading the impact and trace routes supply, from
+            // the same helper, so no CLI surface can be more confident than its
+            // MCP counterpart about one daemon at one instant. Taken per
+            // attempt, so an answer read after a wait carries the state it was
+            // read in.
+            &kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await),
+        )
+        .map_err(internal_error)?;
+        // The builder's own gate for its absence qualifier: no record, or none
+        // a name matched.
+        let claims_absence = result.records.is_empty() || result.text_fallback;
+        if !claims_absence || settle.settled(&state, epoch) {
+            break result;
+        }
+        settle
+            .wait_out(&state, "search")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     if req.show_body {
         attach_search_bodies(&state, &mut result, req.body_limit.unwrap_or(10));
     }
     Ok(Json(result))
+}
+
+/// The first named focal of a `get_context_pack` call that is a member name
+/// several owners share, with those owners' members.
+fn shared_member_context_focal(
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Option<(String, Vec<kin_model::Entity>)> {
+    arguments
+        .get("entities")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find_map(|token| {
+            kin_cli::commands::context::shared_member_focal_candidates(graph, token)
+                .ok()
+                .flatten()
+                .map(|candidates| {
+                    (
+                        kin_cli::entity_ref::parse_entity_ref(token).name,
+                        candidates,
+                    )
+                })
+        })
 }
 
 /// Turn a `get_context_pack` call's names and question into focal entities
@@ -9321,11 +11019,17 @@ async fn search(
 /// over it. That is deliberate: a name the graph does not carry and a name
 /// nobody tried to resolve are different failures, and quietly dropping the
 /// field would report the first as the second.
+///
+/// Also says whether a name the call gave, or its question, resolved to
+/// nothing, and whether anything resolved at all. A pack built from the names
+/// that did resolve does not show the one that did not, so the caller holds
+/// that answer back while an edit admission may be adding the entity.
 fn resolve_context_pack_focals(
     graph: &kin_db::InMemoryGraph,
     arguments: &HashMap<String, serde_json::Value>,
-) -> HashMap<String, serde_json::Value> {
+) -> (HashMap<String, serde_json::Value>, ContextFocalMiss) {
     let mut arguments = arguments.clone();
+    let mut focal_missed = false;
     let limit = arguments
         .get("max_focals")
         .and_then(serde_json::Value::as_u64)
@@ -9345,9 +11049,13 @@ fn resolve_context_pack_focals(
         })
         .unwrap_or_default();
     for token in &named {
-        let Ok(Some(entry)) = kin_cli::commands::context::resolve_focal_for_mcp(graph, token)
-        else {
-            continue;
+        let entry = match kin_cli::commands::context::resolve_focal_for_mcp(graph, token) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                focal_missed = true;
+                continue;
+            }
+            Err(_) => continue,
         };
         let id = entry
             .get("entity_id")
@@ -9372,6 +11080,10 @@ fn resolve_context_pack_focals(
         if let Ok((ranked, coverage)) =
             kin_cli::commands::context::question_focals(graph, &question, limit)
         {
+            // A question that ranks nothing is a miss when it is all the call
+            // asked, the rule `/context` answers a question with. Beside names
+            // that resolved, the pack is theirs.
+            focal_missed |= ranked.is_empty() && focals.is_empty();
             arguments.insert("coverage".to_string(), json!(coverage));
             for hit in ranked {
                 if focals.len() >= limit || seen.contains(&hit.entity_id) {
@@ -9390,11 +11102,50 @@ fn resolve_context_pack_focals(
         }
     }
 
-    if !focals.is_empty() {
+    let resolved_any = !focals.is_empty();
+    if resolved_any {
         focals.truncate(limit);
         arguments.insert("question_focals".to_string(), json!(focals));
     }
-    arguments
+    (
+        arguments,
+        ContextFocalMiss {
+            missed: focal_missed,
+            resolved_any,
+        },
+    )
+}
+
+/// What resolving a `get_context_pack` call's names and question found
+/// missing.
+#[derive(Debug, Clone, Copy, Default)]
+struct ContextFocalMiss {
+    /// A name the call gave, or its question, resolved to nothing.
+    missed: bool,
+    /// At least one focal resolved.
+    resolved_any: bool,
+}
+
+impl ContextFocalMiss {
+    /// Whether `answer` claims an absence because a focal resolved to nothing:
+    /// a pack built without that focal, or, when nothing resolved, the refusal
+    /// that says no focal did. Any other answer is its own: a caller's
+    /// malformed argument or a fault claims nothing, and no admission changes
+    /// it, so it is served at once.
+    fn claims_absence_of(self, answer: &kin_mcp::Result<kin_mcp::ToolCallResult>) -> bool {
+        if !self.missed {
+            return false;
+        }
+        match answer {
+            Ok(result) if result.is_error != Some(true) => true,
+            Ok(_) => {
+                !self.resolved_any
+                    && mcp_answer_error_text(answer)
+                        .is_some_and(|text| text.starts_with("get_context_pack cannot resolve "))
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// POST /context — build context packs against daemon-owned graph state.
@@ -9415,14 +11166,31 @@ async fn context(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority =
-        require_mcp_command_repository_authority(&state).map_err(internal_error)?;
-    let result = kin_cli::commands::context::build_context_response_with_authority(
-        graph.as_ref(),
-        &req,
-        &repository_authority,
-    )
-    .map_err(internal_error)?;
+    // A pack that a focal the caller named resolved to nothing for, or no pack
+    // at all, is served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives. A pack built from every focal is served as it
+    // always was. Authority is resolved per attempt, so a pack read after a
+    // wait reads its bodies at the publication the graph was read at.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let result = loop {
+        let epoch = settle.sample(&state);
+        let repository_authority =
+            require_mcp_command_repository_authority(&state).map_err(internal_error)?;
+        let result = kin_cli::commands::context::build_context_response_with_authority(
+            graph.as_ref(),
+            &req,
+            &repository_authority,
+        )
+        .map_err(internal_error)?;
+        let claims_absence = result.error.is_some() || !result.unresolved.is_empty();
+        if !claims_absence || settle.settled(&state, epoch) {
+            break result;
+        }
+        settle
+            .wait_out(&state, "context")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(result))
 }
 
@@ -9447,18 +11215,34 @@ async fn trace(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    // Same substrate reading the impact route supplies, from the same helper, so
-    // `kin trace` and `get_context_pack` cannot disagree about one daemon at one
-    // instant (FIR-2524).
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
-    let result = kin_cli::commands::trace::build_trace_response(
-        &state.layout,
-        &repository_authority,
-        graph.as_ref(),
-        &req,
-        &envelope,
-    )
-    .map_err(internal_error)?;
+    // A query that resolved to no entity is served only from a read no writer
+    // spanned, for the reason `NameReadWait` gives. A trace is served as it
+    // always was.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let result = loop {
+        let epoch = settle.sample(&state);
+        // Same substrate reading the impact route supplies, from the same
+        // helper, so `kin trace` and `get_context_pack` cannot disagree about
+        // one daemon at one instant. Taken per attempt, so an answer read
+        // after a wait carries the state it was read in.
+        let envelope =
+            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+        let result = kin_cli::commands::trace::build_trace_response(
+            &state.layout,
+            &repository_authority,
+            graph.as_ref(),
+            &req,
+            &envelope,
+        )
+        .map_err(internal_error)?;
+        if result.error.is_none() || settle.settled(&state, epoch) {
+            break result;
+        }
+        settle
+            .wait_out(&state, "trace")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(result))
 }
 
@@ -9535,9 +11319,10 @@ async fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
         "mass_deletion_blocked": state
             .mass_deletion_blocked
             .load(std::sync::atomic::Ordering::Relaxed),
-        "reconcile": state
-            .background_work
-            .reconcile_report(std::time::Instant::now()),
+        "reconcile": crate::loop_runner::answered_reconcile_health(
+            state,
+            std::time::Instant::now(),
+        ),
     })
 }
 
@@ -9569,16 +11354,41 @@ async fn impact(
     // degraded signal makes the CLI MORE confident than MCP on exactly the
     // degraded daemon nobody exercises, and every test written against a healthy
     // one would pass.
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
-    let result = kin_cli::commands::impact::build_impact_response(
-        &state.layout,
-        graph.as_ref(),
-        &req,
-        &envelope,
-    )
-    .await
-    .map_err(internal_error)?;
+    //
+    // A name that resolved to no one entity, and an entity with no dependents,
+    // is served only from a read no writer spanned, for the reason
+    // `NameReadWait` gives. The envelope is taken per attempt, so an answer
+    // read after a wait carries the state it was read in.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let result = loop {
+        let epoch = settle.sample(&state);
+        let envelope =
+            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+        let result = kin_cli::commands::impact::build_impact_response(
+            &state.layout,
+            graph.as_ref(),
+            &req,
+            &envelope,
+        )
+        .await
+        .map_err(internal_error)?;
+        if !impact_response_claims_absence(&result) || settle.settled(&state, epoch) {
+            break result;
+        }
+        settle
+            .wait_out(&state, "impact")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(result))
+}
+
+/// Whether a `/impact` answer claims an absence: a name that resolved to no one
+/// entity, or an entity with no dependents, which is the answer that carries
+/// its absence verdict. The same reading [`refs_response_claims_absence`] gives
+/// `/commands/refs`.
+fn impact_response_claims_absence(response: &kin_cli::commands::impact::ImpactResponse) -> bool {
+    response.resolution != "resolved" || response.negative.is_some()
 }
 
 /// POST /review — run review reads and review-state mutations in the repo daemon.
@@ -9616,25 +11426,62 @@ async fn review(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let execution = kin_cli::commands::review::execute_review_request(
-        &repository_authority,
-        graph.as_ref(),
-        req,
-    )
-    .await
-    .map_err(|error| {
-        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
-        } else if error
-            .downcast_ref::<kin_cli::commands::review::ReviewNotFound>()
-            .is_some()
-        {
-            (StatusCode::NOT_FOUND, error.to_string())
-        } else {
-            internal_error(error)
+    // A files review whose files resolved to no entity is served only from a
+    // read no writer spanned, for the reason `NameReadWait` gives. Every other
+    // review read is served as it always was.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let execution = loop {
+        let epoch = settle.sample(&state);
+        let outcome = kin_cli::commands::review::execute_review_request(
+            &repository_authority,
+            graph.as_ref(),
+            req.clone(),
+        )
+        .await;
+        if !review_run_claims_absence(&req, &outcome) || settle.settled(&state, epoch) {
+            break outcome.map_err(|error| {
+                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+                    (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
+                } else if error
+                    .downcast_ref::<kin_cli::commands::review::ReviewNotFound>()
+                    .is_some()
+                {
+                    (StatusCode::NOT_FOUND, error.to_string())
+                } else {
+                    internal_error(error)
+                }
+            })?;
         }
-    })?;
+        settle
+            .wait_out(&state, "review")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(execution.response))
+}
+
+/// Whether a review read claims an absence: a files review whose files
+/// resolved to no entity in the live graph, which the review reports as no
+/// changes. A file an edit admission is adding has no entity until it admits.
+fn review_run_claims_absence<T>(
+    request: &kin_cli::commands::review::ReviewRequest,
+    outcome: &anyhow::Result<T>,
+) -> bool {
+    matches!(
+        request,
+        kin_cli::commands::review::ReviewRequest::Run {
+            entities: None,
+            files: Some(_),
+            ..
+        }
+    ) && outcome.as_ref().err().is_some_and(|error| {
+        error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<kin_review::ReviewError>(),
+                Some(kin_review::ReviewError::NoChanges)
+            )
+        })
+    })
 }
 
 /// Answer a refused review write with the status its cause earns: a request that
@@ -9698,6 +11545,16 @@ async fn work(
             | kin_cli::commands::work::WorkRequest::Close { .. }
             | kin_cli::commands::work::WorkRequest::TodoImport { .. }
     );
+    let _coordinated = if mutates {
+        Some(state.coordination_gate.lock().await)
+    } else {
+        None
+    };
+    state
+        .prepared_publication
+        .ensure_serving()
+        .map_err(crate::prepared_publication::write_refusal)?;
+    let _mutation = mutates.then(|| state.begin_graph_authority_mutation());
     let graph = if mutates {
         Arc::clone(&state.graph)
     } else {
@@ -9738,6 +11595,16 @@ async fn note(
         kin_cli::commands::note::NoteRequest::Add { .. }
             | kin_cli::commands::note::NoteRequest::TodoImport { .. }
     );
+    let _coordinated = if mutates {
+        Some(state.coordination_gate.lock().await)
+    } else {
+        None
+    };
+    state
+        .prepared_publication
+        .ensure_serving()
+        .map_err(crate::prepared_publication::write_refusal)?;
+    let _mutation = mutates.then(|| state.begin_graph_authority_mutation());
     let graph = if mutates {
         Arc::clone(&state.graph)
     } else {
@@ -9755,6 +11622,23 @@ async fn note(
         });
     }
     Ok(Json(execution.response))
+}
+
+/// Prepare graph-owned non-entity coverage before the foreground vector pass.
+/// Kept separate so this semantic mutation can be exercised without a model.
+#[cfg(feature = "embeddings")]
+fn prepare_foreground_embed_coverage(state: &DaemonState) -> crate::error::Result<usize> {
+    // This coverage pass can retire entities when a source became opaque. Its
+    // tree/body reads and facet cleanup therefore share the publication fence,
+    // even though the vector pass that follows is only a derived-cache writer.
+    // The blocking worker owns both guards, including after request cancellation.
+    let _coordination = state.coordination_gate.blocking_lock();
+    let _mutation = state.begin_graph_authority_mutation();
+    let created = crate::loop_runner::ensure_non_entity_enrichment_coverage(state)?;
+    if created > 0 {
+        state.bump_version();
+    }
+    Ok(created)
 }
 
 /// POST /embed — run bounded embedding work inside the repo daemon.
@@ -9802,6 +11686,20 @@ async fn embed(
             // background worker checks this flag between batches and stands down,
             // so a foreground bounded embed cannot be starved by worker re-locks.
             let _embed_pass = state_for_embed.begin_embed_pass();
+            // Finish semantic coverage before taking embedding_work. No long
+            // vector computation or persistence wait holds coordination.
+            // An explicit embed is the operator asking for full retrieval
+            // coverage, so create any enrichment records bulk admission never
+            // wrote before counting what there is to embed. Without them the
+            // artifact denominator reads zero and the pass honestly reports
+            // "+0 artifacts" on a store full of tracked files.
+            match prepare_foreground_embed_coverage(&state_for_embed) {
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "enrichment coverage reconcile failed before embed; artifact coverage may be short"
+                ),
+            }
             let _guard = state_for_embed
                 .embedding_work
                 .lock()
@@ -9817,19 +11715,6 @@ async fn embed(
             // save_snapshot() acquires persist_lock internally; the non-reentrant std
             // Mutex self-deadlocks if we hold persist_lock across this call (this was
             // the daemon embed hang — the worker wedged here before embedding started).
-            // An explicit embed is the operator asking for full retrieval
-            // coverage, so create any enrichment records bulk admission never
-            // wrote before counting what there is to embed. Without them the
-            // artifact denominator reads zero and the pass honestly reports
-            // "+0 artifacts" on a store full of tracked files.
-            match crate::loop_runner::ensure_non_entity_enrichment_coverage(&state_for_embed) {
-                Ok(created) if created > 0 => state_for_embed.bump_version(),
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "enrichment coverage reconcile failed before embed; artifact coverage may be short"
-                ),
-            }
             state_for_embed
                 .save_snapshot()
                 .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
@@ -9982,6 +11867,17 @@ fn entity_history_error(error: anyhow::Error) -> (StatusCode, String) {
     }
 }
 
+/// Whether a blame or history outcome claims an absence: a name read against
+/// the live graph that served no entity, because it resolved to nothing, a pin
+/// excluded every match, or it named several. A name read at a named ref
+/// resolves in committed history, which an edit admission does not move.
+fn entity_timeline_claims_absence<T>(reference: Option<&str>, outcome: &anyhow::Result<T>) -> bool {
+    reference.is_none()
+        && outcome.as_ref().err().is_some_and(|error| {
+            kin_cli::commands::ref_lookup::entity_query_refusal(error).is_some()
+        })
+}
+
 /// POST /blame — render entity blame from daemon-owned graph state.
 async fn blame(
     headers: axum::http::HeaderMap,
@@ -10001,12 +11897,26 @@ async fn blame(
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let repository_authority = entity_history_authority(&state)?;
-    let response = kin_cli::commands::blame::execute_blame_request_with(
-        &repository_authority,
-        graph.as_ref(),
-        &req,
-    )
-    .map_err(entity_history_error)?;
+    // A name read against the live graph that served no entity is served only
+    // from a read no writer spanned, for the reason `NameReadWait` gives.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let outcome = kin_cli::commands::blame::execute_blame_request_with(
+            &repository_authority,
+            graph.as_ref(),
+            &req,
+        );
+        if !entity_timeline_claims_absence(req.reference.as_deref(), &outcome)
+            || settle.settled(&state, epoch)
+        {
+            break outcome.map_err(entity_history_error)?;
+        }
+        settle
+            .wait_out(&state, "blame")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
 }
 
@@ -10029,12 +11939,26 @@ async fn history(
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let repository_authority = entity_history_authority(&state)?;
-    let response = kin_cli::commands::history::execute_history_request_with(
-        &repository_authority,
-        graph.as_ref(),
-        &req,
-    )
-    .map_err(entity_history_error)?;
+    // A name read against the live graph that served no entity is served only
+    // from a read no writer spanned, for the reason `NameReadWait` gives.
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let outcome = kin_cli::commands::history::execute_history_request_with(
+            &repository_authority,
+            graph.as_ref(),
+            &req,
+        );
+        if !entity_timeline_claims_absence(req.reference.as_deref(), &outcome)
+            || settle.settled(&state, epoch)
+        {
+            break outcome.map_err(entity_history_error)?;
+        }
+        settle
+            .wait_out(&state, "history")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
 }
 /// state whose generation has not yet been persisted.
@@ -10060,16 +11984,38 @@ async fn verify_run(
         ));
     }
 
-    // Release authorization reads verification coverage while holding this
-    // same gate. Keep a verification run's graph writes and durable snapshot
-    // indivisible with respect to that decision.
-    let _coordination = state.coordination_gate.lock().await;
-
+    // A run whose entity query names no one entity is refused only from a read
+    // no writer spanned, for the reason `NameReadWait` gives. Checked before
+    // the run takes the coordination gate and its own writer guard: the guard
+    // moves the authority clock itself, so a refusal read under it could never
+    // be told apart from one an admission caused. A run that resolves is run
+    // as it always was, and a query that still names no one entity once
+    // nothing is writing is refused by the run exactly as before.
+    let mut settle = NameReadWait::begin(&state, &state.graph);
+    loop {
+        let epoch = settle.sample(&state);
+        let names_one = kin_cli::commands::verify::verify_query_names_one_entity(
+            state.graph.as_ref(),
+            &req.entity,
+        )
+        .map_err(internal_error)?;
+        if names_one || settle.settled(&state, epoch) {
+            break;
+        }
+        settle
+            .wait_out(&state, "verify run")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    }
     let state_for_verify = Arc::clone(&state);
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
     let response = tokio::task::spawn_blocking(move || {
+        // A cancelled request detaches this worker; the worker must own its
+        // exclusion fence until proof relations and their snapshot are installed.
+        // Release authorization reads coverage under this same gate.
+        let _coordination = state_for_verify.coordination_gate.blocking_lock();
         with_graph_authority_mutation(state_for_verify.as_ref(), || {
             let response = kin_cli::commands::verify::execute_verify_run(
                 &state_for_verify.layout,
@@ -10110,13 +12056,47 @@ async fn command_verify(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let response = kin_cli::commands::verify::execute_verify_command(
-        &repository_authority,
-        state.graph.as_ref(),
-        &req,
-    )
-    .map_err(internal_error)?;
+    // An entity or plan query that named no one entity is served only from a
+    // read no writer spanned, for the reason `NameReadWait` gives. Every other
+    // answer is served as it always was.
+    let mut settle = NameReadWait::begin(&state, &state.graph);
+    let response = loop {
+        let epoch = settle.sample(&state);
+        let outcome = kin_cli::commands::verify::execute_verify_command(
+            &repository_authority,
+            state.graph.as_ref(),
+            &req,
+        );
+        if !verify_command_claims_absence(&req, &outcome) || settle.settled(&state, epoch) {
+            break outcome.map_err(internal_error)?;
+        }
+        settle
+            .wait_out(&state, "command verify")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     Ok(Json(response))
+}
+
+/// Whether a `/commands/verify` answer claims an absence: an entity query that
+/// matched nothing, or a plan whose query named no one entity. The summary,
+/// the missing-proof listing and a change's plan resolve no name.
+fn verify_command_claims_absence(
+    request: &kin_cli::commands::verify::VerifyCommandRequest,
+    outcome: &anyhow::Result<kin_cli::commands::verify::VerifyCommandResponse>,
+) -> bool {
+    use kin_cli::commands::verify::{
+        entity_not_found_line, VerifyCommandRequest, VerifyEntityUnresolved,
+    };
+    match (request, outcome) {
+        (VerifyCommandRequest::Entity { entity }, Ok(response)) => {
+            response.lines == [entity_not_found_line(entity)]
+        }
+        (VerifyCommandRequest::Plan { .. }, Err(error)) => error
+            .chain()
+            .any(|cause| cause.downcast_ref::<VerifyEntityUnresolved>().is_some()),
+        _ => false,
+    }
 }
 
 fn attach_search_bodies(
@@ -10477,28 +12457,62 @@ pub(crate) fn transaction_coordination_context(
                 push(IntentScope::Entity(*from));
                 push(IntentScope::Entity(*to));
             }
-            Some(kin_mcp::McpMutationPayload::EntitySourceBase(base)) => {
+            Some(kin_mcp::McpMutationPayload::EntitySourceBase(base))
+            | Some(kin_mcp::McpMutationPayload::EntitySourcePatch(
+                kin_mcp::source_base::EntitySourcePatch {
+                    source_base: base, ..
+                },
+            ))
+            | Some(kin_mcp::McpMutationPayload::EntityCreate(
+                kin_mcp::entity_lifecycle::EntityCreate {
+                    source_base: Some(base),
+                    ..
+                },
+            ))
+            | Some(kin_mcp::McpMutationPayload::EntityRemove(
+                kin_mcp::entity_lifecycle::EntityRemove { source_base: base },
+            )) => {
                 push(IntentScope::Entity(base.entity_id));
                 if let Ok(Some(entity)) = state.graph.get_entity(&base.entity_id) {
                     if let Some(file) = entity.file_origin {
+                        if let Some(kin_mcp::McpMutationPayload::EntityCreate(create)) =
+                            operation.payload.as_ref()
+                        {
+                            if create.placement
+                                == Some(kin_mcp::entity_lifecycle::EntityPlacement::NewSourceUnit)
+                            {
+                                if let Ok(path) = kin_mcp::entity_lifecycle::generated_source_path(
+                                    &file,
+                                    entity.language,
+                                    &create.name,
+                                ) {
+                                    push(IntentScope::Artifact(kin_model::FilePathId::new(
+                                        path.to_string(),
+                                    )));
+                                }
+                            }
+                        }
+
                         push(IntentScope::Artifact(file));
                     }
                 }
             }
-            Some(kin_mcp::McpMutationPayload::Blob(_)) => {}
-            None => {
-                if kin_mcp::session::is_target_body_update(operation) {
-                    if let Ok(existing) = kin_mcp::handlers::sessions::resolve_target_entity(
-                        state.graph.as_ref(),
-                        &operation.target,
-                    ) {
-                        push(IntentScope::Entity(existing.id));
-                        if let Some(file) = existing.file_origin {
-                            push(IntentScope::Artifact(file));
-                        }
-                    }
+            // A unit-addressed operation claims the unit it writes.
+            Some(
+                kin_mcp::McpMutationPayload::EntityCreate(_)
+                | kin_mcp::McpMutationPayload::UnitImports(_),
+            ) => {
+                if let Some(Ok(path)) =
+                    crate::unit_lifecycle::unit_path(&state.graph.resolved_tree(), operation)
+                {
+                    push(IntentScope::Artifact(kin_model::FilePathId::new(
+                        path.to_string(),
+                    )));
                 }
             }
+            // A payload-less entity update is refused before it can commit
+            // (`kin_mcp::session::source_base_required`), so it claims no scope.
+            Some(kin_mcp::McpMutationPayload::Blob(_)) | None => {}
         }
     }
     let labels = touched.iter().map(format_scope).collect();
@@ -11332,26 +13346,7 @@ fn locate_hit_identity(
                 signature: Some(entity.signature.clone()).filter(|sig| !sig.is_empty()),
             })
         }
-        other => {
-            let file = other.file_path().map(|path| path.0.clone());
-            let name = file
-                .as_deref()
-                .and_then(|path| {
-                    FsPath::new(path)
-                        .file_name()
-                        .and_then(|component| component.to_str())
-                })
-                .unwrap_or_default()
-                .to_string();
-            Some(LocateHitIdentity {
-                id_space: kin_cli::commands::locate::LocateIdSpace::Artifact,
-                entity_id: None,
-                name,
-                file,
-                kind: None,
-                signature: None,
-            })
-        }
+        _ => None,
     }
 }
 
@@ -11363,19 +13358,8 @@ fn locate_hit_identity(
 /// actionable handle and is refused by every tool that takes one.
 fn write_locate_hit_identity(hit: &mut serde_json::Value, identity: &LocateHitIdentity) {
     hit["id_space"] = json!(identity.id_space.as_str());
-    match &identity.entity_id {
-        Some(entity_id) => {
-            hit["entity_id"] = json!(entity_id);
-        }
-        None => {
-            hit["artifact_path"] = json!(identity.file);
-            hit["resolves_with"] = json!("kin_artifact_read");
-            hit["note"] = json!(
-                "artifact-level embedding: a tracked file with no parsed entities. It has no \
-                 entity id, so get_entity_source, get_context_pack, and graph_neighborhood \
-                 cannot take this hit; read it with kin_artifact_read."
-            );
-        }
+    if let Some(entity_id) = &identity.entity_id {
+        hit["entity_id"] = json!(entity_id);
     }
 }
 
@@ -11469,11 +13453,13 @@ fn build_semantic_locate_result(
         .map(|value| value as usize)
         .filter(|value| *value > 0);
     let page_size = requested_page_size.unwrap_or(limit);
-    let file_granularity = arguments
+    if arguments
         .get("granularity")
-        .and_then(serde_json::Value::as_str)
-        .map(|value| value.eq_ignore_ascii_case("file"))
-        .unwrap_or(false);
+        .is_some_and(|value| value.as_str() != Some("entity"))
+    {
+        return kin_mcp::ToolCallResult::error("semantic_locate accepts only entity granularity; select semantic entities, not whole files");
+    }
+    let file_granularity = false;
     let include_tests = arguments
         .get("include_tests")
         .and_then(serde_json::Value::as_bool)
@@ -11527,6 +13513,9 @@ fn build_semantic_locate_result(
                 cached_mode,
             )) = cached
             {
+                if cached_file_granularity {
+                    return kin_mcp::ToolCallResult::error("semantic_locate cannot continue a file-granularity cursor; start an entity query");
+                }
                 if let Err(error) = validate_cursor_projection(
                     arguments,
                     &cached_query,
@@ -11644,6 +13633,7 @@ fn build_semantic_locate_result(
     // the outside, and the difference is the whole diagnosis.
     let mut unresolved_keys = 0usize;
     let mut retired_entity_keys = 0usize;
+    let mut artifact_keys = 0usize;
     let projected = search_and_project_all_cosine_candidates(
         &query,
         fetch_limit,
@@ -11738,7 +13728,11 @@ fn build_semantic_locate_result(
                 _ => false,
             };
             let Some(identity) = locate_hit_identity(&item, entity_is_live) else {
-                retired_entity_keys += 1;
+                if matches!(item, kin_db::ResolvedRetrievalItem::Entity(_)) {
+                    retired_entity_keys += 1;
+                } else {
+                    artifact_keys += 1;
+                }
                 return None;
             };
             let LocateHitIdentity {
@@ -11879,6 +13873,7 @@ fn build_semantic_locate_result(
     );
 
     record_cosine_candidate_cap(fetch_limit, fetched, &mut degradations);
+    record_non_entity_locate_gap(&mut degradations, artifact_keys);
 
     // Report the sidecar/graph gap rather than serving a short page as if the
     // index had simply ranked little. A store whose graph fell behind its
@@ -12109,6 +14104,55 @@ fn compact_semantic_locate_payload(
     }
 }
 
+/// Keep conversion-only artifact candidates out of semantic MCP answers.
+/// Applied before pagination/cache and at serialization, including continuations.
+fn retain_semantic_locate_entities(result: &mut kin_cli::commands::locate::LocateResult) {
+    let mut artifacts = HashSet::new();
+    let before = result.entities.len();
+    result.entities.retain(|row| {
+        let keep = !row.entity_id.is_empty()
+            && row.id_space == kin_cli::commands::locate::LocateIdSpace::Entity;
+        if !keep {
+            if let Some(path) = row.artifact_path.as_ref().or(row.provenance.file.as_ref()) {
+                artifacts.insert(path.clone());
+            }
+        }
+        keep
+    });
+    let removed = before - result.entities.len();
+    let entity_paths: HashSet<_> = result
+        .entities
+        .iter()
+        .filter_map(|row| row.provenance.file.as_deref())
+        .collect();
+    let files_before = result.files.len();
+    result.files.retain(|file| {
+        entity_paths.contains(file.path.as_str()) && !artifacts.contains(&file.path)
+    });
+    let omitted = removed.max(files_before - result.files.len());
+    if omitted > 0 {
+        result.total_ranked = result.total_ranked.saturating_sub(removed);
+        result.all_fallback =
+            kin_cli::commands::locate::locate_entities_are_all_fallback(&result.entities);
+        record_non_entity_locate_gap(&mut result.degradations, omitted);
+    }
+}
+
+fn record_non_entity_locate_gap(
+    degradations: &mut Vec<kin_cli::commands::locate::RetrievalDegradation>,
+    count: usize,
+) {
+    if count > 0 {
+        kin_cli::commands::locate::record_degradation(degradations,
+            kin_cli::commands::locate::RetrievalDegradation {
+                component: "entity_coverage".into(),
+                reason: "non_entity_candidates_omitted".into(),
+                detail: format!("{count} ranked candidates have no semantic entity and were omitted"),
+                remediation: "select a semantic entity or repair missing conversion coverage; whole-file reads are unavailable".into(),
+            });
+    }
+}
+
 /// Serialize a fused-locate [`LocateResult`] into the `semantic_locate` tool
 /// result. The body is the SAME schema `kin locate --json` and `POST /locate`
 /// emit — the reused `LocateResult` types verbatim: `files[].symbols[]`, the
@@ -12139,6 +14183,7 @@ fn fused_semantic_locate_payload(
     snippet_alias: bool,
     surface: kin_cli::commands::locate_compact::LocateSurface,
 ) -> kin_mcp::ToolCallResult {
+    retain_semantic_locate_entities(&mut result);
     if file_granularity {
         // `all_fallback` classifies entity-name evidence. A file-granularity
         // answer intentionally asks the caller to read `files[]`, so carrying
@@ -12190,9 +14235,8 @@ fn fused_semantic_locate_payload(
             }
         }
     }
-    // Serialize the reused CLI types rather than duplicating their JSON shape:
-    // this is the single source of the locate schema, so the MCP surface can
-    // never drift from `kin locate --json`.
+    // Reuse the entity row types, then remove the operator-only file catalogs
+    // at the MCP boundary. Full entity detail is not a file-list escape hatch.
     let mut payload = match serde_json::to_value(&result) {
         Ok(serde_json::Value::Object(map)) => map,
         Ok(_) => {
@@ -12202,6 +14246,28 @@ fn fused_semantic_locate_payload(
         }
         Err(error) => return kin_mcp::ToolCallResult::error(error.to_string()),
     };
+    if !file_granularity {
+        payload.remove("files");
+        // Per-entity match evidence is retained below. Legacy pipeline file
+        // catalogs are operator diagnostics, not an alternate agent result.
+        if let Some(serde_json::Value::Object(debug)) = payload.get_mut("debug") {
+            debug.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "scoring_track"
+                        | "retrieval_profile"
+                        | "traceback_top"
+                        | "resolve_top"
+                        | "resolve_gap"
+                        | "multihop_top"
+                        | "fast_path"
+                        | "skipped_signals"
+                        | "query_terms"
+                        | "query_identifier_gate"
+                )
+            });
+        }
+    }
     payload.insert("query".to_string(), json!(query));
     payload.insert(
         "granularity".to_string(),
@@ -12430,11 +14496,13 @@ async fn build_fused_semantic_locate_result(
         .map(|value| value as usize)
         .filter(|value| *value > 0);
     let page_size = requested_page_size.unwrap_or(limit);
-    let file_granularity = arguments
+    if arguments
         .get("granularity")
-        .and_then(serde_json::Value::as_str)
-        .map(|value| value.eq_ignore_ascii_case("file"))
-        .unwrap_or(false);
+        .is_some_and(|value| value.as_str() != Some("entity"))
+    {
+        return Ok(kin_mcp::ToolCallResult::error("semantic_locate accepts only entity granularity; select semantic entities, not whole files"));
+    }
+    let file_granularity = false;
     // Rank test-role entities alongside source when the caller says so. Absent
     // means the documented default, which is the ranking this tool has always
     // served; the response says how many test paths that default withheld.
@@ -12493,7 +14561,7 @@ async fn build_fused_semantic_locate_result(
     // local route keeps its live graph mutation clock. The cache namespace also
     // carries the repository id and root, so identical queries in two hosted
     // repositories cannot address one another's ranking.
-    let graph_version = hosted_view
+    let mut graph_version = hosted_view
         .map(|view| view.snapshot_cursor.backend_generation())
         .unwrap_or_else(|| state.vfs_version.load(std::sync::atomic::Ordering::SeqCst));
     let scope_token: Option<String> = if let Some(view) = hosted_view {
@@ -12557,6 +14625,9 @@ async fn build_fused_semantic_locate_result(
                 cached_mode,
             )) = cached
             {
+                if cached_file_granularity {
+                    return Ok(kin_mcp::ToolCallResult::error("semantic_locate cannot continue a file-granularity cursor; start an entity query"));
+                }
                 if let Err(error) = validate_cursor_projection(
                     arguments,
                     &cached_query,
@@ -12585,6 +14656,7 @@ async fn build_fused_semantic_locate_result(
                     degradations,
                     ..Default::default()
                 };
+                retain_semantic_locate_entities(&mut result);
                 if !explain {
                     result.debug = None;
                 }
@@ -12751,33 +14823,54 @@ async fn build_fused_semantic_locate_result(
             Ok(run_result) => run_result,
             Err(failure) => return Err(failure),
         }
-    } else if multi_query {
-        run_multiquery_fused_locate(
-            state,
-            session_id,
-            graph,
-            &variants,
-            auto_fanout,
-            explain,
-            limit,
-            true,
-            snippet_opts,
-            scope,
-        )
-        .await
     } else {
-        run_fused_locate_for_state(
-            state,
-            session_id,
-            graph,
-            &query,
-            explain,
-            limit,
-            true,
-            snippet_opts,
-            scope,
-        )
-        .await
+        // A ranking that found nothing, or that holds nothing named by a query
+        // that is one name, is served only from a read no writer spanned, for
+        // the reason `NameReadWait` gives, the rule `POST /locate` keeps. The
+        // cursor is stamped with the graph version the served ranking was read
+        // at.
+        let mut settle = NameReadWait::begin(state, graph);
+        loop {
+            let epoch = settle.sample(state);
+            graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            let attempt = if multi_query {
+                run_multiquery_fused_locate(
+                    state,
+                    session_id,
+                    graph,
+                    &variants,
+                    auto_fanout,
+                    explain,
+                    limit,
+                    true,
+                    snippet_opts,
+                    scope,
+                )
+                .await
+            } else {
+                run_fused_locate_for_state(
+                    state,
+                    session_id,
+                    graph,
+                    &query,
+                    explain,
+                    limit,
+                    true,
+                    snippet_opts,
+                    scope,
+                )
+                .await
+            };
+            let claims_absence = attempt
+                .as_ref()
+                .is_ok_and(|result| locate_result_claims_absence(&query, result));
+            if !claims_absence || settle.settled(state, epoch) {
+                break attempt;
+            }
+            if let Err(refusal) = settle.wait_out(state, "semantic_locate").await {
+                return Ok(kin_mcp::ToolCallResult::error(refusal));
+            }
+        }
     };
     let mut locate_result = match run_result {
         Ok(result) => result,
@@ -12794,6 +14887,8 @@ async fn build_fused_semantic_locate_result(
         }
     };
 
+    retain_semantic_locate_entities(&mut locate_result);
+
     // Cache the full entity ranking and window page 0 so a follow-up cursor
     // pages it from cache without re-running retrieval — the same paging the
     // `POST /locate` endpoint and the cosine arm provide (arm-symmetric). A
@@ -12805,7 +14900,7 @@ async fn build_fused_semantic_locate_result(
         query.clone()
     };
     let key = kin_cli::commands::locate::locate_cursor_key(
-        &key_text,
+        &format!("mcp-entities-v1:{key_text}"),
         scope_token.as_deref(),
         graph_version,
         snippet_opts.projection_mode(),
@@ -12887,6 +14982,19 @@ fn entity_source_tool_result<E: std::fmt::Display>(
         Ok(EntitySourceOutcome::NotFound(message)) => kin_mcp::ToolCallResult::error(message),
         // A real entity with no attached source body — distinct from not-found.
         Ok(EntitySourceOutcome::NoSource(message)) => kin_mcp::ToolCallResult::error(message),
+        // A member name several owners share names none of them: every
+        // candidate comes back, the way `find_references` answers the name.
+        Ok(EntitySourceOutcome::NameCandidates {
+            query,
+            reason,
+            candidates,
+        }) => kin_mcp::handlers::entities::name_candidates_reply(
+            "get_entity_source",
+            &query,
+            reason,
+            &candidates,
+        )
+        .unwrap_or_else(|error| kin_mcp::ToolCallResult::error(error.to_string())),
         Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
     }
 }
@@ -12933,11 +15041,208 @@ fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
             id: id.to_string(),
             message,
         },
+        // One row per requested id, so a name that names no one entity is a row
+        // that lists its candidates, never a claim that the entity is absent.
+        Ok(EntitySourceOutcome::NameCandidates {
+            query,
+            reason,
+            candidates,
+        }) => ResolvedEntitySource::Ambiguous {
+            id: id.to_string(),
+            value: kin_mcp::handlers::entities::name_candidates_json(
+                "get_entity_sources",
+                &query,
+                reason,
+                &candidates,
+            ),
+        },
         Err(error) => ResolvedEntitySource::NoSource {
             id: id.to_string(),
             message: error.to_string(),
         },
     }
+}
+
+/// Match the source tool's existing UUID/name selection before deciding whether
+/// the result has a generator instead of an independently editable declaration.
+fn mcp_derived_source_for_query(
+    held: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
+    query: &str,
+    scope: kin_mcp::handlers::common::EntitySourceScope,
+) -> kin_mcp::Result<Option<serde_json::Value>> {
+    let entity = kin_cli::commands::graph::resolve_source_entity(held.store(), query)
+        .map_err(|error| kin_mcp::McpError::Other(error.to_string()))?;
+    match entity {
+        Some(entity) => {
+            kin_mcp::handlers::entities::derived_entity_source_at(held, &entity, scope, 1_000_000)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Whether a source read's outcome claims an absence: its query served no
+/// entity, because it resolved to nothing or named no one entity.
+///
+/// The reading `kin source` gets from [`graph_command_claims_absence`], so the
+/// CLI and MCP answer one query the same way while an edit admits. A body, and
+/// an entity that exists with no body to serve, claim nothing is absent.
+fn entity_source_outcome_claims_absence<E>(
+    outcome: &std::result::Result<kin_cli::commands::graph::EntitySourceOutcome, E>,
+) -> bool {
+    use kin_cli::commands::graph::EntitySourceOutcome;
+    matches!(
+        outcome,
+        Ok(EntitySourceOutcome::NotFound(_) | EntitySourceOutcome::NameCandidates { .. })
+    )
+}
+
+/// One `get_entity_source` or `get_entity_body` read of `entity_id` against
+/// the selected graph: the answer, and whether it claims an absence.
+async fn mcp_entity_source_attempt(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    graph_authority: RequestGraphAuthority,
+    entity_id: &str,
+) -> (kin_mcp::ToolCallResult, bool) {
+    let Some(source_scope) = state
+        .source_scope_for_selected_graph(session_id, graph, graph_authority)
+        .await
+    else {
+        return (
+            kin_mcp::ToolCallResult::error("selected source scope expired or was replaced"),
+            false,
+        );
+    };
+    let source_authority = match mcp_repository_authority_source(state) {
+        Ok(authority) => authority,
+        Err(error) => return (kin_mcp::ToolCallResult::error(error.to_string()), false),
+    };
+    let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
+        graph.as_ref(),
+        source_authority.as_ref(),
+    );
+    match mcp_derived_source_for_query(&held, entity_id, source_scope) {
+        Ok(Some(value)) => {
+            if state
+                .source_scope_for_selected_graph(session_id, graph, graph_authority)
+                .await
+                != Some(source_scope)
+            {
+                return (
+                    kin_mcp::ToolCallResult::error(
+                        "selected generator source scope changed during reconstruction",
+                    ),
+                    false,
+                );
+            }
+            return (kin_mcp::ToolCallResult::text(value.to_string()), false);
+        }
+        Err(error) => return (kin_mcp::ToolCallResult::error(error.to_string()), false),
+        Ok(None) => {}
+    }
+    let repository_authority = match require_mcp_command_repository_authority(state) {
+        Ok(authority) => authority,
+        Err(error) => return (kin_mcp::ToolCallResult::error(error.to_string()), false),
+    };
+    // Use the authority paired with this exact graph selection. A fresh
+    // scope lookup could expire or change and certify a historical body
+    // against today's workspace merely because its bytes still match.
+    let outcome = match graph_authority {
+        RequestGraphAuthority::Head => {
+            kin_cli::commands::graph::build_current_entity_source_outcome(
+                &repository_authority,
+                graph.as_ref(),
+                entity_id,
+            )
+        }
+        RequestGraphAuthority::SessionScope => {
+            kin_cli::commands::graph::build_entity_source_outcome(
+                &repository_authority,
+                graph.as_ref(),
+                entity_id,
+            )
+        }
+    };
+    let claims_absence = entity_source_outcome_claims_absence(&outcome);
+    (entity_source_tool_result(outcome), claims_absence)
+}
+
+/// One `get_entity_sources` read of every id in the batch against the selected
+/// graph: the answer, and whether any row of it claims an absence.
+async fn mcp_entity_sources_attempt(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    graph_authority: RequestGraphAuthority,
+    entity_ids: &[String],
+    opts: &kin_mcp::handlers::entities::BatchSourceOptions,
+) -> (kin_mcp::ToolCallResult, bool) {
+    // Resolved ONCE for the batch. Each entity used to resolve its own
+    // authority, so N entities cost N whole-store verifications and could
+    // straddle a publication; the batch now reads every row at one.
+    let repository_authority = match require_mcp_command_repository_authority(state) {
+        Ok(authority) => authority,
+        Err(error) => return (kin_mcp::ToolCallResult::error(error.to_string()), false),
+    };
+    let Some(source_scope) = state
+        .source_scope_for_selected_graph(session_id, graph, graph_authority)
+        .await
+    else {
+        return (
+            kin_mcp::ToolCallResult::error("selected batch source scope expired or was replaced"),
+            false,
+        );
+    };
+    let source_authority = match mcp_repository_authority_source(state) {
+        Ok(authority) => authority,
+        Err(error) => return (kin_mcp::ToolCallResult::error(error.to_string()), false),
+    };
+    let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
+        graph.as_ref(),
+        source_authority.as_ref(),
+    );
+    let mut claims_absence = false;
+    let resolved = entity_ids
+        .iter()
+        .map(|entity_id| {
+            match mcp_derived_source_for_query(&held, entity_id, source_scope) {
+                Ok(Some(value)) => {
+                    return kin_mcp::handlers::entities::ResolvedEntitySource::Derived { value }
+                }
+                Err(error) => {
+                    return kin_mcp::handlers::entities::ResolvedEntitySource::NoSource {
+                        id: entity_id.clone(),
+                        message: error.to_string(),
+                    }
+                }
+                Ok(None) => {}
+            }
+            let outcome = kin_cli::commands::graph::build_entity_source_outcome(
+                &repository_authority,
+                graph.as_ref(),
+                entity_id,
+            );
+            claims_absence |= entity_source_outcome_claims_absence(&outcome);
+            resolved_entity_source_from_outcome(entity_id, outcome)
+        })
+        .collect();
+    if state
+        .source_scope_for_selected_graph(session_id, graph, graph_authority)
+        .await
+        != Some(source_scope)
+    {
+        return (
+            kin_mcp::ToolCallResult::error(
+                "selected batch generator source scope changed during reconstruction",
+            ),
+            false,
+        );
+    }
+    (
+        kin_mcp::handlers::entities::assemble_entity_sources_response(resolved, opts),
+        claims_absence,
+    )
 }
 
 /// One coherent hosted repository authority selected for a single MCP call.
@@ -13046,12 +15351,14 @@ impl HostedSemanticRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RepoScopedMcpFailure {
     status: StatusCode,
     code: &'static str,
     message: String,
     retryable: bool,
+    /// Seconds a caller should wait before asking again, sent as `Retry-After`.
+    retry_after_secs: Option<u64>,
 }
 
 impl RepoScopedMcpFailure {
@@ -13066,7 +15373,13 @@ impl RepoScopedMcpFailure {
             code,
             message: message.into(),
             retryable,
+            retry_after_secs: None,
         }
+    }
+
+    fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_secs = Some(seconds);
+        self
     }
 }
 
@@ -13099,6 +15412,7 @@ where
 
 fn repo_scoped_mcp_error(repo_id: &str, failure: RepoScopedMcpFailure) -> Response {
     let refusal_code = failure.code;
+    let retry_after = failure.retry_after_secs;
     let mut response = (
         failure.status,
         Json(RepoScopedMcpErrorResponse {
@@ -13121,6 +15435,11 @@ fn repo_scoped_mcp_error(repo_id: &str, failure: RepoScopedMcpFailure) -> Respon
         HeaderName::from_static("x-kin-semantic-refusal"),
         HeaderValue::from_static(refusal_code),
     );
+    if let Some(seconds) = retry_after {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, HeaderValue::from(seconds));
+    }
     response
 }
 
@@ -13321,6 +15640,7 @@ fn hosted_repository_hydration_timeout() -> Duration {
     )
 }
 
+#[cfg(test)]
 async fn run_hosted_repository_hydration<T: Send + 'static>(
     slots: Arc<tokio::sync::Semaphore>,
     repo_id: &str,
@@ -13407,9 +15727,835 @@ async fn run_hosted_repository_hydration_within<T: Send + 'static>(
     })
 }
 
+/// How long a request may spend resolving a hosted view, cursor probe
+/// included, before it answers instead of waiting on.
+///
+/// Shorter than the hosted control plane's own 8 s budget for an entity-context
+/// read, so a caller that arrives while a repository is warming gets a quick,
+/// named answer it can surface and retry, rather than a budget timeout the
+/// control plane can only call a failed read. A hydration is not bounded by
+/// this: it runs on, detached and under its own admission budget, and installs
+/// its view when it ends.
+const HOSTED_VIEW_CALLER_WAIT: Duration = Duration::from_secs(4);
+
+/// The `Retry-After` a hosted view refusal carries while a view is warming or
+/// storage is slow to answer.
+const HOSTED_VIEW_WARMING_RETRY_AFTER_SECS: u64 = 5;
+
+/// One cold hydration of a hosted repository view, shared by every caller that
+/// asks for the same repository at the same published cursor while it runs.
+///
+/// Registered process-wide rather than on [`DaemonState`], like the hydration
+/// slots above. The weak handle names the state a flight belongs to without
+/// keeping it alive, and it also keeps that state's allocation from being
+/// reused, so a flight can never be mistaken for another state's.
+struct HostedViewFlight {
+    id: u64,
+    state: std::sync::Weak<DaemonState>,
+    repo_id: String,
+    cursor: SnapshotCursor,
+    started: Instant,
+    outcome: tokio::sync::watch::Receiver<Option<HostedViewOutcome>>,
+}
+
+type HostedViewOutcome = std::result::Result<Arc<HostedRepositoryMcpView>, RepoScopedMcpFailure>;
+
+static HOSTED_VIEW_FLIGHTS: OnceLock<std::sync::Mutex<Vec<HostedViewFlight>>> = OnceLock::new();
+static NEXT_HOSTED_VIEW_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn hosted_view_flights() -> &'static std::sync::Mutex<Vec<HostedViewFlight>> {
+    HOSTED_VIEW_FLIGHTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Removes a flight from the registry when its task ends, however it ends:
+/// answered, refused, timed out, panicked, or dropped with the runtime. A
+/// flight left registered would be joined by every later caller and answer
+/// none of them.
+struct HostedViewFlightRetirement(u64);
+
+impl Drop for HostedViewFlightRetirement {
+    fn drop(&mut self) {
+        lock_recover(hosted_view_flights()).retain(|flight| flight.id != self.0);
+    }
+}
+
+enum HostedViewJoin {
+    Cached(Arc<HostedRepositoryMcpView>),
+    Flight(HostedViewFlightWait),
+}
+
+struct HostedViewFlightWait {
+    cursor: SnapshotCursor,
+    started: Instant,
+    outcome: tokio::sync::watch::Receiver<Option<HostedViewOutcome>>,
+}
+
+/// Join the hydration already running for `repo_id` at `cursor`, take the view
+/// a finished one installed, or start one.
+///
+/// The hydration, its installation into `repo_semantic_views` and the answer
+/// every waiting caller reads all run on one detached task. No request owns
+/// them, so a request dropped at its caller's deadline cannot throw away a
+/// hydration that was about to finish: the next request finds it installed.
+///
+/// A new flight is registered only while this holds the registry lock and has
+/// read the cache without contention. A flight installs its view before it
+/// retires, and retiring takes the registry lock, so under that lock an absent
+/// flight means its view is already readable. A cache held by a writer is not
+/// read as a miss: the caller waits for the writer and looks again.
+async fn join_or_start_hosted_view_hydration(
+    state: &Arc<DaemonState>,
+    backend: &Arc<dyn StorageBackend>,
+    repository_id: RepositoryId,
+    repo_id: &str,
+    cursor: SnapshotCursor,
+) -> HostedViewJoin {
+    let me = Arc::downgrade(state);
+    loop {
+        {
+            let mut flights = lock_recover(hosted_view_flights());
+            flights.retain(|flight| flight.state.strong_count() > 0);
+            if let Some(flight) = flights.iter().find(|flight| {
+                flight.state.ptr_eq(&me) && flight.repo_id == repo_id && flight.cursor == cursor
+            }) {
+                info!(
+                    repo_id,
+                    cursor = cursor.backend_generation(),
+                    running_ms = flight.started.elapsed().as_millis() as u64,
+                    "hosted view hydration already running; waiting on it"
+                );
+                return HostedViewJoin::Flight(HostedViewFlightWait {
+                    cursor,
+                    started: flight.started,
+                    outcome: flight.outcome.clone(),
+                });
+            }
+            if let Ok(views) = state.repo_semantic_views.try_read() {
+                if let Some(view) = views
+                    .get(repo_id)
+                    .filter(|view| view.snapshot_cursor == cursor)
+                {
+                    view.touch();
+                    return HostedViewJoin::Cached(Arc::clone(view));
+                }
+                let id = NEXT_HOSTED_VIEW_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                let started = Instant::now();
+                flights.push(HostedViewFlight {
+                    id,
+                    state: me,
+                    repo_id: repo_id.to_string(),
+                    cursor,
+                    started,
+                    outcome: receiver.clone(),
+                });
+                spawn_hosted_view_hydration(
+                    Arc::clone(state),
+                    Arc::clone(backend),
+                    repository_id,
+                    repo_id.to_string(),
+                    cursor,
+                    HostedViewFlightRetirement(id),
+                    sender,
+                );
+                return HostedViewJoin::Flight(HostedViewFlightWait {
+                    cursor,
+                    started,
+                    outcome: receiver,
+                });
+            }
+        }
+        // A writer holds the cache. Wait it out, then look again.
+        drop(state.repo_semantic_views.read().await);
+    }
+}
+
+/// The admission budget one hosted view hydration runs under.
+fn hosted_view_hydration_budget(_repo_id: &str) -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = hosted_view_hydration_test_hooks::budget(_repo_id) {
+        return budget;
+    }
+    hosted_repository_hydration_timeout()
+}
+
+/// Run one registered flight: hydrate under the admission budget, install, and
+/// answer every caller still waiting.
+///
+/// Everything that reads storage, the cursor probes included, runs inside the
+/// supervised worker, so the admission budget bounds it all; what follows the
+/// worker is an in-memory install. The retirement guard is the task's first
+/// binding, so it drops last and on every path.
+fn spawn_hosted_view_hydration(
+    state: Arc<DaemonState>,
+    backend: Arc<dyn StorageBackend>,
+    repository_id: RepositoryId,
+    repo_id: String,
+    cursor: SnapshotCursor,
+    retirement: HostedViewFlightRetirement,
+    sender: tokio::sync::watch::Sender<Option<HostedViewOutcome>>,
+) {
+    info!(
+        repo_id = %repo_id,
+        cursor = cursor.backend_generation(),
+        "hosted view cold; hydration started"
+    );
+    tokio::spawn(async move {
+        let _retirement = retirement;
+        let started = Instant::now();
+        let worker_repo_id = repo_id.clone();
+        let hydrated = run_hosted_repository_hydration_within(
+            hosted_repository_hydrations(&state),
+            hosted_view_hydration_budget(&repo_id),
+            &repo_id,
+            move || {
+                let view = open_hosted_repository_mcp_view_blocking(
+                    Arc::clone(&backend),
+                    repository_id,
+                    worker_repo_id.clone(),
+                )?;
+                #[cfg(test)]
+                hosted_view_hydration_test_hooks::hydrated(&worker_repo_id);
+                // Keyed by the exact published cursor: read it once more,
+                // last, so a view whose publication moved while it hydrated is
+                // refused rather than installed.
+                let current = hosted_snapshot_cursor_blocking(&backend, &worker_repo_id)?;
+                if current != Some(view.snapshot_cursor) {
+                    return Err(RepoScopedMcpFailure::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "repo_semantic_unready",
+                        format!(
+                            "repository {worker_repo_id} published again while its view \
+                             hydrated; the stale view was not installed; retry"
+                        ),
+                        true,
+                    ));
+                }
+                Ok(view)
+            },
+        )
+        .await;
+        let outcome = match hydrated {
+            Ok(view) => install_hosted_repository_mcp_view(&state, &repo_id, view).await,
+            Err(failure) => Err(failure),
+        };
+        // The registry keeps one receiver until this task retires; every other
+        // receiver belongs to a caller still waiting for this answer.
+        let waiting = sender.receiver_count().saturating_sub(1);
+        #[cfg(test)]
+        hosted_view_hydration_test_hooks::completed(&repo_id, waiting);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(_) if waiting == 0 => info!(
+                repo_id = %repo_id,
+                cursor = cursor.backend_generation(),
+                elapsed_ms,
+                "hosted view hydrated after every caller stopped waiting; installed for the next request"
+            ),
+            Ok(_) => info!(
+                repo_id = %repo_id,
+                cursor = cursor.backend_generation(),
+                elapsed_ms,
+                waiting,
+                "hosted view hydrated and installed"
+            ),
+            Err(failure) => warn!(
+                repo_id = %repo_id,
+                cursor = cursor.backend_generation(),
+                elapsed_ms,
+                waiting,
+                code = failure.code,
+                message = %failure.message,
+                "hosted view hydration did not install a view"
+            ),
+        }
+        let _ = sender.send(Some(outcome));
+    });
+}
+
+/// Install a hydrated view as the answer for its exact published cursor.
+///
+/// Called by the flight's task, never by a request, so a caller that gives up
+/// cannot discard a finished hydration. The worker has already refused a view
+/// whose cursor moved; this half is in memory only.
+async fn install_hosted_repository_mcp_view(
+    state: &DaemonState,
+    repo_id: &str,
+    view: HostedRepositoryMcpView,
+) -> std::result::Result<Arc<HostedRepositoryMcpView>, RepoScopedMcpFailure> {
+    if let Some(detail) = state.derived_views_stale.read().await.clone() {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            detail,
+            true,
+        ));
+    }
+    let view = Arc::new(view);
+    let mut views = state.repo_semantic_views.write().await;
+    if let Some(existing) = views.get(repo_id) {
+        if existing.snapshot_cursor == view.snapshot_cursor {
+            if existing.graph_root != view.graph_root {
+                return Err(RepoScopedMcpFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repo_semantic_unready",
+                    format!(
+                        "repository {repo_id} produced different graph roots at authority cursor {}",
+                        view.snapshot_cursor.backend_generation()
+                    ),
+                    true,
+                ));
+            }
+            existing.touch();
+            return Ok(Arc::clone(existing));
+        }
+        // Two requests raced while opening different opaque publications.
+        // Neither cursor may be ordered to pick a winner. Drop the competing
+        // cache entry and fail this request; the next request re-probes the
+        // backend and opens whichever exact cursor is then authoritative.
+        let existing_cursor = existing.snapshot_cursor.backend_generation();
+        let loaded_cursor = view.snapshot_cursor.backend_generation();
+        views.remove(repo_id);
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            format!(
+                "repository {repo_id} produced competing authority views at opaque cursors {existing_cursor} and {loaded_cursor}; retry after a fresh authority probe"
+            ),
+            true,
+        ));
+    }
+    if views.len() >= REPO_SCOPED_VIEW_CACHE_CAP && !views.contains_key(repo_id) {
+        if let Some(oldest_repo_id) = views
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used())
+            .map(|(repo_id, _)| repo_id.clone())
+        {
+            views.remove(&oldest_repo_id);
+        }
+    }
+    views.insert(repo_id.to_string(), Arc::clone(&view));
+    Ok(view)
+}
+
+#[cfg(test)]
+mod hosted_view_hydration_test_hooks {
+    //! Per-repository counters and gates on hosted view flights, so a test can
+    //! hold a hydration open, drop or race its callers, and count how many
+    //! hydrations ran and how many callers each one answered.
+
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Hook {
+        hydrated: usize,
+        last_waiting: Option<usize>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        join_gate: Option<tokio::sync::watch::Receiver<bool>>,
+        join_opener: Option<tokio::sync::watch::Sender<bool>>,
+        join_arrivals: usize,
+        budget: Option<Duration>,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn with<T>(repo_id: &str, apply: impl FnOnce(&mut Hook) -> T) -> T {
+        apply(
+            hooks()
+                .lock()
+                .unwrap()
+                .entry(repo_id.to_string())
+                .or_default(),
+        )
+    }
+
+    /// Called by the worker once a hydration has opened its view.
+    pub(super) fn hydrated(repo_id: &str) {
+        let gate = with(repo_id, |hook| {
+            hook.hydrated += 1;
+            hook.gate.clone()
+        });
+        if let Some(gate) = gate {
+            let (open, changed) = &*gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = changed.wait(open).unwrap();
+            }
+        }
+    }
+
+    /// Called by a flight's task with the callers its answer reached.
+    pub(super) fn completed(repo_id: &str, waiting: usize) {
+        with(repo_id, |hook| hook.last_waiting = Some(waiting));
+    }
+
+    /// Called by a request just before it joins or starts a flight.
+    pub(super) async fn before_join(repo_id: &str) {
+        let gate = with(repo_id, |hook| {
+            hook.join_arrivals += 1;
+            hook.join_gate.clone()
+        });
+        if let Some(mut gate) = gate {
+            let _ = gate.wait_for(|open| *open).await;
+        }
+    }
+
+    pub(super) fn budget(repo_id: &str) -> Option<Duration> {
+        with(repo_id, |hook| hook.budget)
+    }
+
+    pub(super) fn set_budget(repo_id: &str, budget: Duration) {
+        with(repo_id, |hook| hook.budget = Some(budget));
+    }
+
+    /// Drop a budget set by [`set_budget`], so later flights of `repo_id` run
+    /// under the ordinary admission budget.
+    pub(super) fn clear_budget(repo_id: &str) {
+        with(repo_id, |hook| hook.budget = None);
+    }
+
+    pub(super) fn hydrations(repo_id: &str) -> usize {
+        with(repo_id, |hook| hook.hydrated)
+    }
+
+    pub(super) fn last_waiting(repo_id: &str) -> Option<usize> {
+        with(repo_id, |hook| hook.last_waiting)
+    }
+
+    pub(super) fn join_arrivals(repo_id: &str) -> usize {
+        with(repo_id, |hook| hook.join_arrivals)
+    }
+
+    /// Hold every hydration of `repo_id` after it opens, until [`open_gate`].
+    pub(super) fn close_gate(repo_id: &str) {
+        with(repo_id, |hook| {
+            hook.gate = Some(Arc::new((Mutex::new(false), Condvar::new())))
+        });
+    }
+
+    pub(super) fn open_gate(repo_id: &str) {
+        if let Some(gate) = with(repo_id, |hook| hook.gate.take()) {
+            let (open, changed) = &*gate;
+            *open.lock().unwrap() = true;
+            changed.notify_all();
+        }
+    }
+
+    /// Hold every request for `repo_id` just before it joins or starts a
+    /// flight, until [`open_join_gate`].
+    pub(super) fn close_join_gate(repo_id: &str) {
+        let (opener, gate) = tokio::sync::watch::channel(false);
+        with(repo_id, |hook| {
+            hook.join_gate = Some(gate);
+            hook.join_opener = Some(opener);
+        });
+    }
+
+    pub(super) fn open_join_gate(repo_id: &str) {
+        if let Some(opener) = with(repo_id, |hook| {
+            hook.join_gate = None;
+            hook.join_opener.take()
+        }) {
+            let _ = opener.send(true);
+        }
+    }
+
+    /// Whether a flight for `repo_id` on `state` is still registered.
+    pub(super) fn flight_registered(state: &Arc<super::DaemonState>, repo_id: &str) -> bool {
+        super::hosted_view_hydration_in_flight(state, repo_id)
+    }
+}
+
 async fn load_hosted_repository_mcp_view(
     state: &Arc<DaemonState>,
     repo_id: &str,
+) -> std::result::Result<Arc<HostedRepositoryMcpView>, RepoScopedMcpFailure> {
+    load_hosted_repository_mcp_view_within(state, repo_id, HOSTED_VIEW_CALLER_WAIT).await
+}
+
+/// Turns the hosted view pre-warm off when set falsy.
+const HOSTED_VIEW_PREWARM_ENV: &str = "KIN_DAEMON_HOSTED_VIEW_PREWARM";
+
+/// The available memory, in MiB, below which a pre-warm is deferred.
+const HOSTED_VIEW_PREWARM_MIN_AVAILABLE_MB_ENV: &str =
+    "KIN_DAEMON_HOSTED_VIEW_PREWARM_MIN_AVAILABLE_MB";
+
+/// A hydration holds a repository's decoded authority and a second query
+/// graph while it runs, so the floor leaves room for one hydration and the
+/// requests it serves beside it.
+const HOSTED_VIEW_PREWARM_DEFAULT_MIN_AVAILABLE_MB: u64 = 4096;
+
+/// How often the pre-warm looks for a publication it has not warmed.
+const HOSTED_VIEW_PREWARM_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the pre-warm waits on one publication probe before it moves on.
+const HOSTED_VIEW_PREWARM_PROBE_WAIT: Duration = Duration::from_secs(10);
+
+/// What the pre-warm is allowed to do, read once when the daemon starts serving.
+#[derive(Debug, Clone, Copy)]
+struct HostedViewPrewarmConfig {
+    enabled: bool,
+    min_available_bytes: u64,
+    probe_wait: Duration,
+}
+
+impl HostedViewPrewarmConfig {
+    fn from_env() -> Self {
+        let enabled = std::env::var(HOSTED_VIEW_PREWARM_ENV)
+            .map(|raw| {
+                !matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(true);
+        let min_available_mb = std::env::var(HOSTED_VIEW_PREWARM_MIN_AVAILABLE_MB_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(HOSTED_VIEW_PREWARM_DEFAULT_MIN_AVAILABLE_MB);
+        Self {
+            enabled,
+            min_available_bytes: min_available_mb.saturating_mul(1024 * 1024),
+            probe_wait: HOSTED_VIEW_PREWARM_PROBE_WAIT,
+        }
+    }
+}
+
+/// Why one repository was or was not warmed on one pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostedViewPrewarmOutcome {
+    Warmed,
+    AlreadyCurrent,
+    HydrationInFlight,
+    MemoryShort { available_bytes: u64 },
+    MemoryCritical,
+    Quarantined(&'static str),
+    NoPublication,
+    ProbeFailed,
+    Refused(&'static str),
+}
+
+/// Decide without changing an unknown reading into an invented measurement.
+fn hosted_view_prewarm_memory_deferral(
+    config: HostedViewPrewarmConfig,
+    pressure: &kin_core::memory_pressure::MemoryPressure,
+) -> Option<HostedViewPrewarmOutcome> {
+    if matches!(
+        pressure,
+        kin_core::memory_pressure::MemoryPressure::Forced {
+            level: kin_core::memory_pressure::PressureLevel::Critical
+        }
+    ) {
+        return Some(HostedViewPrewarmOutcome::MemoryCritical);
+    }
+    let reading = pressure.reading()?;
+    let available_bytes = reading.available_bytes();
+    (available_bytes < config.min_available_bytes)
+        .then_some(HostedViewPrewarmOutcome::MemoryShort { available_bytes })
+}
+
+/// Remember automatic work for this daemon lifetime. A timed-out blocking
+/// operation may still be running, so no cursor change or later poll may start
+/// another automatic attempt for that repository. Restart resets quarantine;
+/// ordinary on-demand reads keep their existing admission and recovery path.
+#[derive(Default)]
+struct HostedViewPrewarmState {
+    warmed: HashMap<String, SnapshotCursor>,
+    quarantined: HashMap<String, &'static str>,
+}
+
+/// The API owns its background scheduler, including cancellation of the API
+/// future itself. Aborting this async task does not cancel blocking storage
+/// workers it previously admitted.
+struct HostedViewPrewarmTask(tokio::task::JoinHandle<()>);
+
+impl HostedViewPrewarmTask {
+    async fn stop(&mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for HostedViewPrewarmTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Warm the hosted views of every repository this daemon serves, in the
+/// background, when it starts and whenever a repository publishes again.
+///
+/// Without it the first reads after every deploy or publication pay the cold
+/// hydration, and a caller with a short deadline sees only warming answers until
+/// it lands. The pre-warm takes the same supervised, single-flight path a read
+/// does, so a read that arrives mid-warm joins it rather than starting another.
+/// It awaits one repository at a time, skips registered hydrations and defers
+/// below its memory floor. A timeout quarantines automatic work for that repo
+/// until restart, since blocking storage workers may outlive an async timeout.
+/// These admission rules are not a hard process-memory or global worker cap.
+/// A daemon with no hosted storage does nothing here.
+fn spawn_hosted_view_prewarm(
+    state: &Arc<DaemonState>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<HostedViewPrewarmTask> {
+    if state.storage_backend.is_none() || cfg!(test) {
+        return None;
+    }
+    let config = HostedViewPrewarmConfig::from_env();
+    if !config.enabled {
+        info!("hosted view pre-warm is off ({HOSTED_VIEW_PREWARM_ENV})");
+        return None;
+    }
+    Some(HostedViewPrewarmTask(tokio::spawn(
+        hosted_view_prewarm_loop(Arc::clone(state), config, shutdown),
+    )))
+}
+
+fn hosted_view_prewarm_is_stopped(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+async fn hosted_view_prewarm_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !hosted_view_prewarm_is_stopped(shutdown) {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn hosted_view_prewarm_loop(
+    state: Arc<DaemonState>,
+    config: HostedViewPrewarmConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut warmed = HostedViewPrewarmState::default();
+    let pass_shutdown = shutdown.clone();
+    loop {
+        tokio::select! {
+            biased;
+            _ = hosted_view_prewarm_shutdown(&mut shutdown) => return,
+            _ = hosted_view_prewarm_pass(&state, config, &mut warmed, &pass_shutdown) => {}
+        }
+        tokio::select! {
+            biased;
+            _ = hosted_view_prewarm_shutdown(&mut shutdown) => return,
+            _ = tokio::time::sleep(HOSTED_VIEW_PREWARM_INTERVAL) => {}
+        }
+    }
+}
+
+/// The repositories a pre-warm pass visits, in a stable order.
+fn hosted_view_prewarm_repos(state: &DaemonState) -> Vec<String> {
+    let mut repos: Vec<String> = match &state.allowed_repo_ids {
+        Some(allowed) => allowed.iter().cloned().collect(),
+        None if !state.cached_repo_id.is_empty() => vec![state.cached_repo_id.clone()],
+        None => Vec::new(),
+    };
+    repos.sort();
+    repos
+}
+
+/// Whether a cold hydration for `repo_id` is running on this state, at any
+/// cursor.
+fn hosted_view_hydration_in_flight(state: &Arc<DaemonState>, repo_id: &str) -> bool {
+    let me = Arc::downgrade(state);
+    lock_recover(hosted_view_flights())
+        .iter()
+        .any(|flight| flight.state.ptr_eq(&me) && flight.repo_id == repo_id)
+}
+
+/// One pre-warm pass: each served repository in turn, each warm awaited before
+/// the next one starts.
+async fn hosted_view_prewarm_pass(
+    state: &Arc<DaemonState>,
+    config: HostedViewPrewarmConfig,
+    warmed: &mut HostedViewPrewarmState,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Vec<(String, HostedViewPrewarmOutcome)> {
+    let mut outcomes = Vec::new();
+    let Some(backend) = state.storage_backend.as_ref() else {
+        return outcomes;
+    };
+    for repo_id in hosted_view_prewarm_repos(state) {
+        if hosted_view_prewarm_is_stopped(shutdown) {
+            break;
+        }
+        let outcome = if let Some(&reason) = warmed.quarantined.get(&repo_id) {
+            HostedViewPrewarmOutcome::Quarantined(reason)
+        } else {
+            hosted_view_prewarm_repo(state, backend, config, warmed, &repo_id).await
+        };
+        if let HostedViewPrewarmOutcome::Quarantined(reason) = outcome {
+            if warmed.quarantined.insert(repo_id.clone(), reason).is_none() {
+                warn!(
+                    repo_id, reason,
+                    "hosted view automatic pre-warm disabled for this repository until daemon restart: timed-out storage work may still be running; on-demand reads remain available"
+                );
+            }
+        }
+        outcomes.push((repo_id, outcome));
+    }
+    outcomes
+}
+
+async fn hosted_view_prewarm_repo(
+    state: &Arc<DaemonState>,
+    backend: &Arc<dyn StorageBackend>,
+    config: HostedViewPrewarmConfig,
+    warmed: &mut HostedViewPrewarmState,
+    repo_id: &str,
+) -> HostedViewPrewarmOutcome {
+    // A hydration already running for this repository, a reader's or an
+    // earlier pass's, is left to finish; the next pass looks again.
+    if hosted_view_hydration_in_flight(state, repo_id) {
+        return HostedViewPrewarmOutcome::HydrationInFlight;
+    }
+    let cursor =
+        match tokio::time::timeout(config.probe_wait, hosted_snapshot_cursor(backend, repo_id))
+            .await
+        {
+            Ok(Ok(Some(cursor))) => cursor,
+            Ok(Ok(None)) => return HostedViewPrewarmOutcome::NoPublication,
+            Ok(Err(_)) => return HostedViewPrewarmOutcome::ProbeFailed,
+            Err(_) => return HostedViewPrewarmOutcome::Quarantined("publication_probe_timeout"),
+        };
+    let installed = state
+        .repo_semantic_views
+        .read()
+        .await
+        .get(repo_id)
+        .is_some_and(|view| view.snapshot_cursor == cursor);
+    if installed || warmed.warmed.get(repo_id) == Some(&cursor) {
+        warmed.warmed.insert(repo_id.to_string(), cursor);
+        return HostedViewPrewarmOutcome::AlreadyCurrent;
+    }
+    if let Some(deferral) =
+        hosted_view_prewarm_memory_deferral(config, &kin_core::memory_pressure::read())
+    {
+        info!(
+            repo_id,
+            ?deferral,
+            "hosted view pre-warm deferred for memory"
+        );
+        return deferral;
+    }
+    let started = Instant::now();
+    info!(
+        repo_id,
+        cursor = cursor.backend_generation(),
+        "hosted view pre-warm started"
+    );
+    // The hydration's own admission budget is the bound; this only waits for
+    // the answer, and a supervisor that ends without one is a refusal too.
+    let wait = hosted_view_hydration_budget(repo_id) + config.probe_wait;
+    let joined = std::sync::Mutex::new(None);
+    match tokio::time::timeout(
+        wait,
+        resolve_hosted_repository_mcp_view(state, repo_id, &joined),
+    )
+    .await
+    {
+        Ok(Ok(view)) => {
+            warmed
+                .warmed
+                .insert(repo_id.to_string(), view.snapshot_cursor);
+            info!(
+                repo_id,
+                cursor = view.snapshot_cursor.backend_generation(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "hosted view pre-warm installed its view"
+            );
+            HostedViewPrewarmOutcome::Warmed
+        }
+        Ok(Err(failure)) if failure.code == "repo_hydration_timeout" => {
+            HostedViewPrewarmOutcome::Quarantined("hydration_timeout")
+        }
+        Err(_) => HostedViewPrewarmOutcome::Quarantined("view_resolution_timeout"),
+        Ok(Err(failure)) => {
+            warn!(
+                repo_id,
+                code = failure.code,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "hosted view pre-warm did not install a view"
+            );
+            HostedViewPrewarmOutcome::Refused(failure.code)
+        }
+    }
+}
+
+/// [`load_hosted_repository_mcp_view`] with the whole of this caller's work,
+/// publication probe included, bounded by `wait`.
+///
+/// Past `wait` the caller is answered rather than held: `repo_view_warming`
+/// when it is waiting on a hydration, which runs on and installs its view, and
+/// a retryable `repo_authority_unavailable` when storage has not yet answered
+/// the publication probe. Both carry a `Retry-After`.
+async fn load_hosted_repository_mcp_view_within(
+    state: &Arc<DaemonState>,
+    repo_id: &str,
+    wait: Duration,
+) -> std::result::Result<Arc<HostedRepositoryMcpView>, RepoScopedMcpFailure> {
+    let joined = std::sync::Mutex::new(None);
+    let resolved = tokio::time::timeout(
+        wait,
+        resolve_hosted_repository_mcp_view(state, repo_id, &joined),
+    )
+    .await;
+    match resolved {
+        Ok(answer) => answer,
+        Err(_) => match *lock_recover(&joined) {
+            Some((cursor, started)) => {
+                let cursor: SnapshotCursor = cursor;
+                let started: Instant = started;
+                info!(
+                    repo_id,
+                    cursor = cursor.backend_generation(),
+                    running_ms = started.elapsed().as_millis() as u64,
+                    "hosted view still warming; answered repo_view_warming"
+                );
+                Err(RepoScopedMcpFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repo_view_warming",
+                    format!(
+                        "repository {repo_id} is warming its semantic view ({} s so far); the \
+                         view is installed when it finishes, so retry shortly",
+                        started.elapsed().as_secs()
+                    ),
+                    true,
+                )
+                .with_retry_after(HOSTED_VIEW_WARMING_RETRY_AFTER_SECS))
+            }
+            None => {
+                warn!(
+                    repo_id,
+                    wait_ms = wait.as_millis() as u64,
+                    "hosted repository storage did not answer the publication probe in time"
+                );
+                Err(RepoScopedMcpFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repo_authority_unavailable",
+                    format!(
+                        "repository {repo_id} storage did not answer its publication probe \
+                         within {} ms; retry shortly",
+                        wait.as_millis()
+                    ),
+                    true,
+                )
+                .with_retry_after(HOSTED_VIEW_WARMING_RETRY_AFTER_SECS))
+            }
+        },
+    }
+}
+
+async fn resolve_hosted_repository_mcp_view(
+    state: &Arc<DaemonState>,
+    repo_id: &str,
+    joined: &std::sync::Mutex<Option<(SnapshotCursor, Instant)>>,
 ) -> std::result::Result<Arc<HostedRepositoryMcpView>, RepoScopedMcpFailure> {
     let repository_id = RepositoryId::new(repo_id.to_string()).map_err(|error| {
         RepoScopedMcpFailure::new(
@@ -13489,75 +16635,30 @@ async fn load_hosted_repository_mcp_view(
         }
     }
 
-    let worker_backend = Arc::clone(backend);
-    let worker_repository_id = repository_id;
-    let worker_repo_id = repo_id.to_string();
-    let error_repo_id = worker_repo_id.clone();
-    let view = run_hosted_repository_hydration(
-        hosted_repository_hydrations(),
-        &error_repo_id,
-        move || {
-            open_hosted_repository_mcp_view_blocking(
-                worker_backend,
-                worker_repository_id,
-                worker_repo_id,
-            )
-        },
-    )
-    .await?;
-    if let Some(detail) = state.derived_views_stale.read().await.clone() {
-        return Err(RepoScopedMcpFailure::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "repo_semantic_unready",
-            detail,
-            true,
-        ));
-    }
-    let view = Arc::new(view);
-    let mut views = state.repo_semantic_views.write().await;
-    if let Some(existing) = views.get(repo_id) {
-        if existing.snapshot_cursor == view.snapshot_cursor {
-            if existing.graph_root != view.graph_root {
-                return Err(RepoScopedMcpFailure::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "repo_semantic_unready",
-                    format!(
-                        "repository {repo_id} produced different graph roots at authority cursor {}",
-                        view.snapshot_cursor.backend_generation()
-                    ),
-                    true,
-                ));
-            }
-            existing.touch();
-            return Ok(Arc::clone(existing));
-        }
-        // Two requests raced while opening different opaque publications.
-        // Neither cursor may be ordered to pick a winner. Drop the competing
-        // cache entry and fail this request; the next request re-probes the
-        // backend and opens whichever exact cursor is then authoritative.
-        let existing_cursor = existing.snapshot_cursor.backend_generation();
-        let loaded_cursor = view.snapshot_cursor.backend_generation();
-        views.remove(repo_id);
-        return Err(RepoScopedMcpFailure::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "repo_semantic_unready",
-            format!(
-                "repository {repo_id} produced competing authority views at opaque cursors {existing_cursor} and {loaded_cursor}; retry after a fresh authority probe"
-            ),
-            true,
-        ));
-    }
-    if views.len() >= REPO_SCOPED_VIEW_CACHE_CAP && !views.contains_key(repo_id) {
-        if let Some(oldest_repo_id) = views
-            .iter()
-            .min_by_key(|(_, cached)| cached.last_used())
-            .map(|(repo_id, _)| repo_id.clone())
+    #[cfg(test)]
+    hosted_view_hydration_test_hooks::before_join(repo_id).await;
+    let flight =
+        match join_or_start_hosted_view_hydration(state, backend, repository_id, repo_id, observed)
+            .await
         {
-            views.remove(&oldest_repo_id);
-        }
+            HostedViewJoin::Cached(view) => return Ok(view),
+            HostedViewJoin::Flight(flight) => flight,
+        };
+    *lock_recover(joined) = Some((flight.cursor, flight.started));
+    let mut outcome = flight.outcome;
+    match outcome
+        .wait_for(Option::is_some)
+        .await
+        .map(|answer| answer.clone())
+    {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) | Err(_) => Err(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_authority_unavailable",
+            format!("repository {repo_id} hydration ended without an answer"),
+            true,
+        )),
     }
-    views.insert(repo_id.to_string(), Arc::clone(&view));
-    Ok(view)
 }
 
 fn repo_semantic_cursor_mac(secret: &[u8; 32], payload: &[u8]) -> [u8; 32] {
@@ -14295,6 +17396,11 @@ async fn repo_mcp_tools_call(
             ),
         );
     }
+    info!(
+        repo_id = %repo_id,
+        tool = %request.name,
+        "repo-scoped semantic call started"
+    );
     if request.name != "semantic_locate" && request.arguments.contains_key("cursor") {
         return repo_scoped_mcp_error(
             &repo_id,
@@ -14872,7 +17978,8 @@ fn disclose_mcp_local_clamps(
         Some(existing) => existing.extend(entries),
         None => payload["degradations"] = serde_json::Value::Array(entries),
     }
-    match kin_mcp::budget::render(&payload) {
+    // Keep the wire format the answer already had.
+    match kin_mcp::budget::render_in_format_of(&payload, text) {
         Ok(rendered) => kin_mcp::ToolCallResult {
             content: vec![kin_mcp::ContentBlock::Text { text: rendered }],
             is_error: result.is_error,
@@ -14950,6 +18057,9 @@ async fn mcp_tools_call(
     // dispatcher, the budget shape and the negative spec all stay keyed on the
     // registered name. Every other name passes through.
     kin_mcp::agent_belt::canonicalize_tool_name(&mut request.name);
+    if let Some(message) = kin_mcp::tools::retired_file_operation(&request.name) {
+        return Ok(Json(kin_mcp::ToolCallResult::error(message)));
+    }
     if kin_mcp::entity_drafts::is_tool(&request.name) {
         // daemon_auth already classified this non-public route once. Read the
         // enforcement state without spending another token-rotation accept;
@@ -15062,8 +18172,9 @@ fn disclose_outside_graph(
                 kin_mcp::outside_graph::OUTSIDE_GRAPH_KEY.to_string(),
                 block.clone(),
             );
-            // The caller re-fits after this disclosure adds its bytes.
-            match kin_mcp::budget::render(&payload) {
+            // The caller re-fits after this disclosure adds its bytes. Keep the
+            // wire format the answer already had.
+            match kin_mcp::budget::render_in_format_of(&payload, &text) {
                 Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
                 Err(_) => kin_mcp::ContentBlock::Text { text },
             }
@@ -15109,6 +18220,12 @@ fn bound_mcp_tool_result(
             }
             if tool == "trace_data_flow" {
                 reconcile_trace_body_presence(&mut payload);
+                if !kin_mcp::handlers::entities::fit_trace_ambiguity_payload(&mut payload, budget.max_chars) {
+                    is_error = Some(true);
+                }
+            }
+            if !kin_mcp::budget::fit_history_payload(&mut payload, tool, budget) {
+                is_error = Some(true);
             }
             match kin_mcp::budget::render(&payload) {
                 Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
@@ -15119,11 +18236,92 @@ fn bound_mcp_tool_result(
     kin_mcp::ToolCallResult { content, is_error }
 }
 
+/// The raw route's success path: a history page that fits its budget comes
+/// back whole, as the paging object, with its cursor untouched.
+#[cfg(test)]
+#[test]
+fn entity_history_raw_route_returns_a_page_that_fits_as_the_paging_object() {
+    let rows: Vec<serde_json::Value> = (0..3)
+        .map(|n| {
+            serde_json::json!({
+                "id": format!("{n:064x}"),
+                "change_id": format!("{n:064x}"),
+                "parents": if n == 0 { vec![] } else { vec![format!("{:064x}", n - 1)] },
+                "timestamp": format!("2026-09-22T21:00:0{n}Z"),
+                "scope": "focal_entity",
+                "omitted_sections": {"unrelated_entity_deltas": 0},
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "result": rows,
+        "entity_id": "7c1f7b6e-0000-4000-8000-000000000001",
+        "scope": "focal_entity",
+        "ordering": "timestamp_ascending_then_change_id",
+        "change_count": 5,
+        "latest_change_id": format!("{:064x}", 4),
+        "offset": 0,
+        "limit": 3,
+        "returned": 3,
+        "next_offset": 3,
+        "truncated": true,
+    });
+    let arguments = HashMap::from([("limit".to_string(), serde_json::json!(3))]);
+    let budget =
+        kin_mcp::budget::ResponseBudget::from_arguments(&arguments).less_envelope_reserve();
+    let result = bound_mcp_tool_result(
+        kin_mcp::ToolCallResult::text(payload.to_string()),
+        "entity_history",
+        &budget,
+    );
+    assert_ne!(result.is_error, Some(true));
+    let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+    assert!(
+        text.len() <= budget.max_chars,
+        "{} > {}",
+        text.len(),
+        budget.max_chars
+    );
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["result"].as_array().map(Vec::len), Some(3));
+    assert_eq!(value["change_count"], 5);
+    assert_eq!(value["returned"], 3);
+    assert_eq!(value["next_offset"], 3);
+    assert_eq!(value["latest_change_id"], format!("{:064x}", 4));
+    assert!(value.get("error").is_none(), "{value}");
+}
+
+#[cfg(test)]
+#[test]
+fn entity_history_raw_route_refuses_irreducible_metadata_within_minimum_budget() {
+    let payload = serde_json::json!({"result": [{"id": "a".repeat(64),
+        "parents": vec!["b".repeat(64); 1000]}], "offset": 0, "change_count": 1});
+    let budget = kin_mcp::budget::ResponseBudget {
+        max_chars: 2000,
+        explicit_max_chars: true,
+        ..Default::default()
+    };
+    let result = bound_mcp_tool_result(
+        kin_mcp::ToolCallResult::text(payload.to_string()),
+        "entity_history",
+        &budget,
+    );
+    assert_eq!(result.is_error, Some(true));
+    let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+    assert!(text.len() <= 2000);
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["error"]["code"], "history_metadata_exceeds_budget");
+    assert!(value.get("result").is_none());
+}
+
 /// Keep the trace's body-presence claim aligned with what survives the common
 /// response-budget ladder. The ladder represents removed bodies as explicit
 /// nulls after the hosted trace assembled its metadata, so the pre-budget
 /// boolean cannot be trusted after that pass.
 fn reconcile_trace_body_presence(payload: &mut serde_json::Value) {
+    if payload.get("ambiguous_focal") == Some(&json!(true)) {
+        return;
+    }
     fn carries_body(record: &serde_json::Value) -> bool {
         record
             .as_object()
@@ -15203,6 +18401,9 @@ async fn mcp_tools_call_dispatch(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<McpToolCallRequest>,
 ) -> Result<Json<kin_mcp::ToolCallResult>, (StatusCode, String)> {
+    if let Some(message) = kin_mcp::tools::retired_file_operation(&request.name) {
+        return Ok(Json(kin_mcp::ToolCallResult::error(message)));
+    }
     // The same budget the wrapper will enforce, so an arm that bounds its own
     // walk bounds it to the number this call is actually served under.
     let response_budget =
@@ -15251,6 +18452,148 @@ async fn mcp_tools_call_dispatch(
             .await
     };
 
+    let observe_sources =
+        !mutates && kin_mcp::source_derivation::observes_sources(&request.name, &request.arguments);
+    let selected_scope = if observe_sources {
+        state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+    } else {
+        None
+    };
+    let result = mcp_tools_call_selected(
+        Arc::clone(&state),
+        request,
+        session_id,
+        Arc::clone(&graph),
+        graph_authority,
+        mutates,
+        response_budget,
+    )
+    .await?;
+    if !observe_sources {
+        return Ok(result);
+    }
+    use kin_mcp::handlers::common::EntitySourceScope;
+    use kin_mcp::source_derivation::{SourceDerivationObservation, SourceObservationScope};
+    let current_scope = state
+        .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+        .await;
+    let mut observation = if selected_scope != current_scope || selected_scope.is_none() {
+        SourceDerivationObservation {
+            scope: SourceObservationScope::SelectedScopeUnavailable,
+            checked_scope: "selected_authority_unavailable".into(),
+            sampled: "selected_graph_after_query".into(),
+            report: Some(
+                kin_review::source_derivation::SourceDerivationReport::unproven(
+                    "selected_authority_changed",
+                ),
+            ),
+            admission_failure: None,
+        }
+    } else if matches!(selected_scope, Some(EntitySourceScope::At(_))) {
+        SourceDerivationObservation::historical()
+    } else {
+        observe_live_head_sources_off_runtime(Arc::clone(&state), Arc::clone(&graph), None).await?
+    };
+    if state
+        .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+        .await
+        != selected_scope
+    {
+        observation = SourceDerivationObservation::unavailable("selected_authority_changed");
+    }
+    Ok(Json(kin_mcp::source_derivation::disclose(
+        result.0,
+        &observation,
+    )))
+}
+
+/// The live HEAD source observation a source-derived answer is qualified by.
+///
+/// It depends on the selected graph and the daemon's recorded admission
+/// failures, and on nothing timing can move. The graph inspection waits for a
+/// writer instead of refusing and has no clock, so a graph that did not change
+/// discloses the same observation on every call, whatever the host's load. Its
+/// only refusal is an inventory past a fixed record or byte cap, and that is a
+/// property of the graph too.
+fn observe_live_head_sources(
+    state: &DaemonState,
+    graph: &kin_db::InMemoryGraph,
+    selected_paths: Option<&[RepoPath]>,
+) -> kin_mcp::source_derivation::SourceDerivationObservation {
+    use kin_mcp::source_derivation::{
+        AdmissionFailureObservation, SourceDerivationObservation, SourceObservationScope,
+    };
+    let report = match graph.source_derivation_facts_with_reserved_relation(
+        kin_db::SourceDerivationLimits::default(),
+        selected_paths,
+        kin_index::binding_debt::local_binding_debt_id,
+    ) {
+        Ok(facts) => kin_review::source_derivation::inspect_source_derivation(&facts),
+        Err(error) => {
+            kin_review::source_derivation::SourceDerivationReport::unproven(&error.to_string())
+        }
+    };
+    let reconcile = state
+        .background_work
+        .reconcile_report(std::time::Instant::now());
+    let failure = (reconcile.admission_failure_streak > 0).then(|| AdmissionFailureObservation {
+        consecutive_failures: reconcile.admission_failure_streak,
+        last_error: reconcile
+            .last_admission_error
+            .map(|error| error.chars().take(256).collect()),
+    });
+    SourceDerivationObservation {
+        scope: SourceObservationScope::LiveHead,
+        checked_scope: if selected_paths.is_some() {
+            "selected_paths"
+        } else {
+            "admitted_inventory"
+        }
+        .into(),
+        sampled: "selected_graph_after_query".into(),
+        report: Some(report),
+        admission_failure: failure,
+    }
+}
+
+/// [`observe_live_head_sources`] on the blocking pool.
+///
+/// The inspection waits for a graph write in flight rather than refusing, and
+/// a runtime worker must not be the thread that waits: every other request,
+/// heartbeat and event stream is served from those workers. On the blocking
+/// pool a long write delays this one answer and nothing else.
+async fn observe_live_head_sources_off_runtime(
+    state: Arc<DaemonState>,
+    graph: Arc<kin_db::InMemoryGraph>,
+    selected_paths: Option<Vec<RepoPath>>,
+) -> Result<kin_mcp::source_derivation::SourceDerivationObservation, (StatusCode, String)> {
+    match tokio::task::spawn_blocking(move || {
+        observe_live_head_sources(&state, &graph, selected_paths.as_deref())
+    })
+    .await
+    {
+        Ok(observation) => Ok(observation),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("the source observation did not run: {error}"),
+        )),
+    }
+}
+
+/// Dispatch against the exact graph/authority pair chosen by the outer request.
+/// The wrapper observes that same graph after every successful return path.
+async fn mcp_tools_call_selected(
+    state: Arc<DaemonState>,
+    request: McpToolCallRequest,
+    session_id: Option<SessionId>,
+    graph: Arc<kin_db::InMemoryGraph>,
+    graph_authority: RequestGraphAuthority,
+    mutates: bool,
+    response_budget: kin_mcp::budget::ResponseBudget,
+) -> Result<Json<kin_mcp::ToolCallResult>, (StatusCode, String)> {
     if matches!(
         request.name.as_str(),
         "get_entity_source" | "get_entity_body"
@@ -15277,31 +18620,27 @@ async fn mcp_tools_call_dispatch(
                     .to_string(),
             )));
         }
-        let repository_authority = match require_mcp_command_repository_authority(&state) {
-            Ok(authority) => authority,
-            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
-        };
-        // Use the authority paired with this exact graph selection. A fresh
-        // scope lookup could expire or change and certify a historical body
-        // against today's workspace merely because its bytes still match.
-        let outcome = match graph_authority {
-            RequestGraphAuthority::Head => {
-                kin_cli::commands::graph::build_current_entity_source_outcome(
-                    &repository_authority,
-                    graph.as_ref(),
-                    entity_id,
-                )
+        // A query that served no entity is served only from a read no writer
+        // spanned, for the reason `NameReadWait` gives. A body is served as it
+        // always was.
+        let mut settle = NameReadWait::begin(&state, &graph);
+        loop {
+            let epoch = settle.sample(&state);
+            let (result, claims_absence) = mcp_entity_source_attempt(
+                &state,
+                session_id.as_ref(),
+                &graph,
+                graph_authority,
+                entity_id,
+            )
+            .await;
+            if !claims_absence || settle.settled(&state, epoch) {
+                return Ok(Json(result));
             }
-            RequestGraphAuthority::SessionScope => {
-                kin_cli::commands::graph::build_entity_source_outcome(
-                    &repository_authority,
-                    graph.as_ref(),
-                    entity_id,
-                )
+            if let Err(refusal) = settle.wait_out(&state, &request.name).await {
+                return Ok(Json(kin_mcp::ToolCallResult::error(refusal)));
             }
-        };
-        let result = entity_source_tool_result(outcome);
-        return Ok(Json(result));
+        }
     }
 
     // Batched `get_entity_source`: resolve each ID against the one already-open
@@ -15314,28 +18653,28 @@ async fn mcp_tools_call_dispatch(
             Ok(parsed) => parsed,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
-        // Resolved ONCE for the batch. Each entity used to resolve its own
-        // authority, so N entities cost N whole-store verifications and could
-        // straddle a publication; the batch now reads every row at one.
-        let repository_authority = match require_mcp_command_repository_authority(&state) {
-            Ok(authority) => authority,
-            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
-        };
-        let resolved = entity_ids
-            .iter()
-            .map(|entity_id| {
-                resolved_entity_source_from_outcome(
-                    entity_id,
-                    kin_cli::commands::graph::build_entity_source_outcome(
-                        &repository_authority,
-                        graph.as_ref(),
-                        entity_id,
-                    ),
-                )
-            })
-            .collect();
-        let result = kin_mcp::handlers::entities::assemble_entity_sources_response(resolved, &opts);
-        return Ok(Json(result));
+        // A batch with a row that served no entity is served only from a read
+        // no writer spanned, for the reason `NameReadWait` gives, and bulk-refs
+        // is held to the same rule for a row it could not classify.
+        let mut settle = NameReadWait::begin(&state, &graph);
+        loop {
+            let epoch = settle.sample(&state);
+            let (result, claims_absence) = mcp_entity_sources_attempt(
+                &state,
+                session_id.as_ref(),
+                &graph,
+                graph_authority,
+                &entity_ids,
+                &opts,
+            )
+            .await;
+            if !claims_absence || settle.settled(&state, epoch) {
+                return Ok(Json(result));
+            }
+            if let Err(refusal) = settle.wait_out(&state, &request.name).await {
+                return Ok(Json(kin_mcp::ToolCallResult::error(refusal)));
+            }
+        }
     }
 
     // Special-case `trace_data_flow` so MCP callers get the same response
@@ -15384,12 +18723,11 @@ async fn mcp_tools_call_dispatch(
         // route pass would otherwise hold two different numbers for the same
         // response, the walk would cut to the larger, and the route would cut
         // again to a smaller one that the walk's own disclosure does not name.
-        let max_response_chars = request
-            .arguments
-            .get("max_response_chars")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize)
-            .or(Some(response_budget.max_chars));
+        // Read through that budget alone, so the walk takes `max_chars` before
+        // `max_response_chars` as the envelope does: reading the older
+        // spelling first walked a call that passed both under one number and
+        // graded it against the other.
+        let max_response_chars = Some(response_budget.max_chars);
         let Some(focal) = focal else {
             return Ok(Json(kin_mcp::ToolCallResult::error(
                 "missing required parameter: focal".to_string(),
@@ -15404,16 +18742,6 @@ async fn mcp_tools_call_dispatch(
             },
             None => None,
         };
-        // Answered before the authority resolve below, which loads and verifies
-        // the whole durable authority on a publication it turns out no step will
-        // be read through. The walk itself already resolves the focal before it
-        // opens anything; this route is what put a whole-store open in front of
-        // that resolution.
-        if kin_core::name_resolution_certainly_misses(graph.as_ref(), &focal).unwrap_or(false) {
-            return Ok(Json(kin_mcp::ToolCallResult::error(
-                kin_cli::commands::trace_data_flow::focal_not_found_error(&focal).to_string(),
-            )));
-        }
         let include_type_edges = request
             .arguments
             .get("include_type_edges")
@@ -15424,7 +18752,7 @@ async fn mcp_tools_call_dispatch(
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string());
         let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
-            focal,
+            focal: focal.clone(),
             depth,
             direction: parsed_direction,
             limit_per_step,
@@ -15433,23 +18761,84 @@ async fn mcp_tools_call_dispatch(
             include_type_edges,
             target,
         };
-        let repository_authority = match require_mcp_command_repository_authority(&state) {
-            Ok(authority) => authority,
-            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        // A focal or a target that resolved to nothing, and a walk with no
+        // step, is served only from a read no writer spanned, for the reason
+        // `NameReadWait` gives.
+        let mut settle = NameReadWait::begin(&state, &graph);
+        let walked = loop {
+            let epoch = settle.sample(&state);
+            // Answered before the authority resolve below, which loads and
+            // verifies the whole durable authority on a publication it turns
+            // out no step will be read through. The walk itself already
+            // resolves the focal before it opens anything; this route is what
+            // put a whole-store open in front of that resolution.
+            if kin_core::name_resolution_certainly_misses(graph.as_ref(), &focal).unwrap_or(false) {
+                if settle.settled(&state, epoch) {
+                    return Ok(Json(kin_mcp::ToolCallResult::error(
+                        kin_cli::commands::trace_data_flow::focal_not_found_error(&focal)
+                            .to_string(),
+                    )));
+                }
+            } else {
+                let repository_authority = match require_mcp_command_repository_authority(&state) {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string())))
+                    }
+                };
+                // Same off-runtime seam as the CLI route. This is the arm the
+                // reported failure came through: the MCP client is the one whose
+                // request timeout turns a slow call into a dead-daemon verdict.
+                let walked = run_trace_data_flow_off_runtime(
+                    repository_authority,
+                    Arc::clone(&graph),
+                    req.clone(),
+                )
+                .await;
+                if !mcp_trace_claims_absence(&walked, &focal) || settle.settled(&state, epoch) {
+                    break walked;
+                }
+            }
+            if let Err(refusal) = settle.wait_out(&state, "trace_data_flow").await {
+                return Ok(Json(kin_mcp::ToolCallResult::error(refusal)));
+            }
         };
-        // Same off-runtime seam as the CLI route. This is the arm the reported
-        // failure came through: the MCP client is the one whose request timeout
-        // turns a slow call into a dead-daemon verdict.
-        let result =
-            match run_trace_data_flow_off_runtime(repository_authority, Arc::clone(&graph), req)
-                .await
-            {
-                Ok(response) => match serde_json::to_string_pretty(&response) {
+        let result = match walked {
+            Ok(response) => {
+                match kin_cli::commands::trace_data_flow::render_response_json(&response) {
                     Ok(json) => kin_mcp::ToolCallResult::text(json),
                     Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+                }
+            }
+            // A focal several owners share as their member name: the same
+            // structured reply every single-answer tool gives that name.
+            Err(error) => match error
+                .downcast_ref::<kin_cli::commands::trace_data_flow::SharedMemberFocal>()
+            {
+                Some(shared) => kin_mcp::handlers::entities::trace_name_candidates_reply(
+                    &shared.query,
+                    &shared.candidates,
+                    kin_mcp::handlers::common::trace_response_budget(max_response_chars),
+                )
+                .unwrap_or_else(|error| kin_mcp::ToolCallResult::error(error.to_string())),
+                // Below the walk's floor this surface answers with the smallest
+                // retained walk and lets the response budget disclose the overrun,
+                // as every MCP list tool does; see `TraceBelowFloor`.
+                None => match error
+                    .downcast_ref::<kin_cli::commands::trace_data_flow::TraceBelowFloor>()
+                {
+                    Some(below) => {
+                        match kin_cli::commands::trace_data_flow::render_response_json(
+                            &below.smallest,
+                        ) {
+                            Ok(json) => kin_mcp::ToolCallResult::text(json),
+                            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+                        }
+                    }
+                    None => kin_mcp::ToolCallResult::error(error.to_string()),
                 },
-                Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
-            };
+            },
+        };
         return Ok(Json(result));
     }
 
@@ -15484,15 +18873,31 @@ async fn mcp_tools_call_dispatch(
             limit,
             name_pattern,
         };
-        // Same substrate reading the CLI route gets, so this MCP path and
-        // `kin dead-code <query>` cannot reach different verdicts on one store.
-        let envelope =
-            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
-        let result = match kin_cli::commands::dead_code::build_dead_code_seeded_response(
-            graph.as_ref(),
-            &req,
-            &envelope,
-        ) {
+        // An answer that claims an absence is served only from a read no writer
+        // spanned, the rule `/commands/dead-code-seeded` keeps.
+        let mut settle = NameReadWait::begin(&state, &graph);
+        let built = loop {
+            let epoch = settle.sample(&state);
+            // Same substrate reading the CLI route gets, so this MCP path and
+            // `kin dead-code <query>` cannot reach different verdicts on one
+            // store.
+            let envelope =
+                kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+            let built = kin_cli::commands::dead_code::build_dead_code_seeded_response(
+                graph.as_ref(),
+                &req,
+                &envelope,
+            );
+            if !built.as_ref().is_ok_and(dead_code_seeded_claims_absence)
+                || settle.settled(&state, epoch)
+            {
+                break built;
+            }
+            if let Err(refusal) = settle.wait_out(&state, "find_dead_code_seeded").await {
+                return Ok(Json(kin_mcp::ToolCallResult::error(refusal)));
+            }
+        };
+        let result = match built {
             Ok(response) => match serde_json::to_string_pretty(&response) {
                 Ok(json) => kin_mcp::ToolCallResult::text(json),
                 Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
@@ -15846,59 +19251,11 @@ async fn mcp_tools_call_dispatch(
     }
 
     let graph_mutation = mutates.then(|| state.begin_graph_authority_mutation());
-    let mut result = if transaction_preflight
-        .as_ref()
-        .is_some_and(|preflight| !preflight.allowed)
-    {
-        let evidence = serde_json::to_string(
-            transaction_preflight
-                .as_ref()
-                .expect("checked preflight must exist"),
-        )
-        .map_err(internal_error)?;
-        kin_mcp::ToolCallResult::error(format!(
-            "coordination enforcement rejected transaction before repository publication: {evidence}"
-        ))
-    } else {
-        let repository_authority = mcp_repository_authority_source(&state);
-        // Resolved once for the whole dispatch, so the two `handle_tool_call`
-        // arms below cannot offer different working copies for one request.
-        let host = mcp_working_copy_source(&state);
-        let handled = if request.name == "get_context_pack"
-            && (request
-                .arguments
-                .get("question")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|question| !question.trim().is_empty())
-                || request
-                    .arguments
-                    .get("entities")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|entities| !entities.is_empty()))
-        {
-            // The identity resolver and the ranking live in kin-cli, the pack
-            // builder in kin-mcp, and this is the one layer holding all three.
-            // Names and questions are both turned into focal entities here, so
-            // the builder is handed entities rather than being asked to resolve
-            // or to rank, and so either argument reaching the builder still raw
-            // means what it means everywhere else: no daemon.
-            match repository_authority {
-                Ok(repository_authority) => {
-                    let arguments = resolve_context_pack_focals(graph.as_ref(), &request.arguments);
-                    kin_mcp::handlers::handle_tool_call(
-                        &request.name,
-                        &arguments,
-                        graph.as_ref(),
-                        &sessions,
-                        kin_mcp::SessionAuthorityMode::OfflineFallback,
-                        repository_authority.as_ref(),
-                        host.surface(),
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            }
-        } else if request.name == "find_references" {
+    // The exact writer checks this preflight before any new publication, after
+    // checking a fenced operation's durable receipt. An expired session must
+    // not turn an already-published commit into an unrecoverable failure.
+    let mut result = {
+        let handled = if request.name == "find_references" {
             mcp_find_references_with_stable_authority(
                 &state,
                 session_id.as_ref(),
@@ -15925,14 +19282,30 @@ async fn mcp_tools_call_dispatch(
                     kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
                 }
             };
-            mcp_graph_status_with_stable_authority(
+            let status = mcp_graph_status_with_stable_authority(
                 &state,
                 session_id.as_ref(),
                 &graph,
                 graph_authority,
                 scope,
             )
-            .await
+            .await;
+            if scope == kin_mcp::handlers::entities::GraphStatusScope::Head {
+                // Status is where a caller reads the base for its next
+                // unit-addressed write; a session-scoped graph is not HEAD.
+                let base = {
+                    let state = Arc::clone(&state);
+                    tokio::task::spawn_blocking(move || {
+                        crate::unit_lifecycle::current_repository_base(&state)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                };
+                status.map(|result| kin_mcp::handlers::entities::with_repository_base(result, base))
+            } else {
+                status
+            }
         } else if kin_mcp::handlers::review::is_review_mutation(&request.name) {
             // Review writes are repository authority: planned against the live
             // graph and committed by the daemon's one review writer before the
@@ -15956,22 +19329,29 @@ async fn mcp_tools_call_dispatch(
                 &request.arguments,
                 transaction_preflight.as_ref(),
             ))
-        } else {
-            match repository_authority {
-                Ok(repository_authority) => {
-                    kin_mcp::handlers::handle_tool_call(
-                        &request.name,
-                        &request.arguments,
-                        graph.as_ref(),
-                        &sessions,
-                        kin_mcp::SessionAuthorityMode::OfflineFallback,
-                        repository_authority.as_ref(),
-                        host.surface(),
-                    )
-                    .await
+        } else if !mutates && !mcp_tool_is_transaction(&request.name) {
+            // A read the kin-mcp handlers answer is served, when it claims an
+            // absence, only from a read no writer spanned, for the reason
+            // `NameReadWait` gives. Every other answer is served as it always
+            // was, on the first attempt.
+            let mut settle = NameReadWait::begin(&state, &graph);
+            loop {
+                let epoch = settle.sample(&state);
+                let (answer, focal_miss) =
+                    mcp_handler_answer(&state, &request, &graph, &sessions).await;
+                let claims_absence = focal_miss.claims_absence_of(&answer)
+                    || mcp_handler_answer_claims_absence(&request.name, &answer);
+                if !claims_absence || settle.settled(&state, epoch) {
+                    break answer;
                 }
-                Err(error) => Err(error),
+                if let Err(refusal) = settle.wait_out(&state, &request.name).await {
+                    break Ok(kin_mcp::ToolCallResult::error(refusal));
+                }
             }
+        } else {
+            mcp_handler_answer(&state, &request, &graph, &sessions)
+                .await
+                .0
         };
         match handled {
             Ok(result) => result,
@@ -16088,6 +19468,224 @@ async fn mcp_tools_call_dispatch(
 
     drop(graph_mutation);
     Ok(Json(result))
+}
+
+/// One answer from the kin-mcp handlers for a tool the dispatch serves no
+/// other way, and what a context pack call's names and question found missing
+/// before the pack was built.
+async fn mcp_handler_answer(
+    state: &Arc<DaemonState>,
+    request: &McpToolCallRequest,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    sessions: &kin_mcp::SessionRegistry,
+) -> (kin_mcp::Result<kin_mcp::ToolCallResult>, ContextFocalMiss) {
+    let repository_authority = mcp_repository_authority_source(state);
+    // Resolved once per answer, so the two `handle_tool_call` arms below cannot
+    // offer different working copies for one request.
+    let host = mcp_working_copy_source(state);
+    let repository_authority = match repository_authority {
+        Ok(repository_authority) => repository_authority,
+        Err(error) => return (Err(error), ContextFocalMiss::default()),
+    };
+    let asks_by_name_or_question = request.name == "get_context_pack"
+        && (request
+            .arguments
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|question| !question.trim().is_empty())
+            || request
+                .arguments
+                .get("entities")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entities| !entities.is_empty()));
+    if !asks_by_name_or_question {
+        let answer = kin_mcp::handlers::handle_tool_call(
+            &request.name,
+            &request.arguments,
+            graph.as_ref(),
+            sessions,
+            kin_mcp::SessionAuthorityMode::OfflineFallback,
+            repository_authority.as_ref(),
+            host.surface(),
+        )
+        .await;
+        return (answer, ContextFocalMiss::default());
+    }
+    // The identity resolver and the ranking live in kin-cli, the pack builder
+    // in kin-mcp, and this is the one layer holding all three. Names and
+    // questions are both turned into focal entities here, so the builder is
+    // handed entities rather than being asked to resolve or to rank, and so
+    // either argument reaching the builder still raw means what it means
+    // everywhere else: no daemon.
+    // A member name several owners share names none of them: the answer lists
+    // every candidate, the way `get_entity_source` and `find_references`
+    // answer the same name.
+    if let Some((token, candidates)) =
+        shared_member_context_focal(graph.as_ref(), &request.arguments)
+    {
+        let answer = kin_mcp::handlers::entities::name_candidates_reply(
+            "get_context_pack",
+            &token,
+            kin_mcp::handlers::entities::CandidateReason::SharedMemberName,
+            &candidates,
+        );
+        return (answer, ContextFocalMiss::default());
+    }
+    let (arguments, focal_miss) = resolve_context_pack_focals(graph.as_ref(), &request.arguments);
+    let answer = kin_mcp::handlers::handle_tool_call(
+        &request.name,
+        &arguments,
+        graph.as_ref(),
+        sessions,
+        kin_mcp::SessionAuthorityMode::OfflineFallback,
+        repository_authority.as_ref(),
+        host.surface(),
+    )
+    .await;
+    (answer, focal_miss)
+}
+
+/// The JSON payload of an answer that is not an error, when it has one.
+fn mcp_answer_payload(
+    answer: &kin_mcp::Result<kin_mcp::ToolCallResult>,
+) -> Option<serde_json::Value> {
+    let Ok(answer) = answer else {
+        return None;
+    };
+    if answer.is_error == Some(true) {
+        return None;
+    }
+    let Some(kin_mcp::ContentBlock::Text { text }) = answer.content.first() else {
+        return None;
+    };
+    serde_json::from_str(text).ok()
+}
+
+/// The text of an answer the handler returned as an error result.
+fn mcp_answer_error_text(answer: &kin_mcp::Result<kin_mcp::ToolCallResult>) -> Option<&str> {
+    let Ok(answer) = answer else {
+        return None;
+    };
+    if answer.is_error != Some(true) {
+        return None;
+    }
+    let Some(kin_mcp::ContentBlock::Text { text }) = answer.content.first() else {
+        return None;
+    };
+    Some(text.trim())
+}
+
+/// Whether an answer from the kin-mcp handlers claims an absence.
+///
+/// One arm per read tool whose answer can say that something the live graph
+/// could hold is not there: a name, id or path that served no entity, a
+/// search or lookup that found nothing, or an entity with no relation, route,
+/// consumer or caller where that relation is the answer. The shapes are the
+/// ones each handler produces for exactly those answers, and the held
+/// admission tests pin each one. An error that is a fault or a refused
+/// argument, and an answer with rows, claim nothing and are served as the
+/// tools always served them.
+///
+/// Tools addressed only by an entity id the caller already holds are not
+/// here: an id comes from a graph that holds the entity, and an admission
+/// removes nothing a caller can still address until it applies atomically.
+fn mcp_handler_answer_claims_absence(
+    tool: &str,
+    answer: &kin_mcp::Result<kin_mcp::ToolCallResult>,
+) -> bool {
+    let payload = || mcp_answer_payload(answer);
+    let error_text = || mcp_answer_error_text(answer);
+    // A name that named no one entity is answered with its candidates, the
+    // same reply every single-answer tool gives, and none of them was served.
+    let named_no_one = || payload().is_some_and(|payload| payload["ambiguous_focal"] == true);
+    // A files diff whose files resolved to no entity, reported as nothing to
+    // diff. A file an edit admission is adding has no entity until it admits.
+    let files_resolved_to_nothing = || {
+        matches!(
+            answer,
+            Err(kin_mcp::McpError::Review(message))
+                if message.starts_with("no entity resolved from the given files")
+        )
+    };
+    match tool {
+        "semantic_search" => {
+            payload().is_some_and(|payload| payload["total_matches"].as_u64() == Some(0))
+        }
+        // A focal the call named, or its question, that resolved to nothing is
+        // read off the resolution itself, by the caller. What is left here is
+        // a pack whose resolved focals the graph no longer holds, and a route
+        // between two focals the pack looked for and did not find.
+        "get_context_pack" => {
+            error_text()
+                .is_some_and(|text| text.starts_with("get_context_pack resolved no focal entity"))
+                || payload().is_some_and(|payload| {
+                    matches!(
+                        (
+                            payload["route_search"]["pairs_connected"].as_u64(),
+                            payload["route_search"]["pairs_examined"].as_u64(),
+                        ),
+                        (Some(connected), Some(examined)) if connected < examined
+                    )
+                })
+        }
+        "trace_computation" => {
+            error_text()
+                .is_some_and(|text| text.starts_with("trace_computation: no entity matches"))
+                || named_no_one()
+        }
+        kin_mcp::handlers::path::TOOL_NAME => {
+            error_text().is_some_and(|text| {
+                text.starts_with(&format!(
+                    "{}: no entity found for ",
+                    kin_mcp::handlers::path::TOOL_NAME
+                ))
+            }) || named_no_one()
+                || payload().is_some_and(|payload| payload["found"] == false)
+        }
+        "explore_codebase" => payload().is_some_and(|payload| {
+            payload["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("No entities found matching '"))
+        }),
+        // Every row is an entity nothing references, and an empty list says no
+        // entity is unreferenced.
+        "dead_code" => payload().is_some_and(|payload| payload.is_array()),
+        "graph_neighborhood" => {
+            payload().is_some_and(|payload| payload["relation_count"].as_u64() == Some(0))
+        }
+        "list_file_entities" => {
+            matches!(
+                answer,
+                Err(kin_mcp::McpError::Context(message))
+                    if message.starts_with("graph gap: ")
+                        && message.contains("is not tracked by this graph")
+            ) || payload().is_some_and(|payload| payload["total_in_file"].as_u64() == Some(0))
+        }
+        kin_mcp::handlers::lexical::TOOL_NAME => {
+            payload().is_some_and(|payload| payload["total_matching"].as_u64() == Some(0))
+        }
+        "semantic_diff" | "semantic_review" => files_resolved_to_nothing(),
+        "impact_analysis" => {
+            files_resolved_to_nothing()
+                || payload().is_some_and(|payload| {
+                    payload["entity_impacts"].as_array().is_some_and(|rows| {
+                        rows.iter()
+                            .any(|row| row["consumer_count"].as_u64() == Some(0))
+                    })
+                })
+        }
+        // A scan that found nothing, or a public entity it reports nothing
+        // calls, which is the row's own claim that the entity has no caller.
+        "kin_security_scan" => payload().is_some_and(|payload| {
+            payload["findings"].as_array().is_some_and(|findings| {
+                findings.is_empty()
+                    || findings
+                        .iter()
+                        .any(|finding| finding["finding_type"] == "orphaned-public")
+            })
+        }),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -17020,9 +20618,18 @@ fn transfer_command_context(
 /// POST /commands/push — negotiate and publish this replica's exact history to
 /// a remote replica.
 async fn command_push(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::transfer::CommandTransferRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(refusal) = read_only_session_write_refusal(
+        &state,
+        &headers,
+        None,
+        kin_mcp::session::WriteDoor::CliPush,
+    )? {
+        return Err(refusal);
+    }
     let context = transfer_command_context(&state, &request)?;
     let (source_ref, destination_ref) = context.publication_refs()?;
     // Read before the blocking hop, because `context` moves into it and the
@@ -17062,9 +20669,18 @@ async fn command_push(
 /// publication and the refresh of every daemon-derived view stay on the same
 /// path the inbound receive route already uses.
 async fn command_pull(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::transfer::CommandTransferRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(refusal) = read_only_session_write_refusal(
+        &state,
+        &headers,
+        None,
+        kin_mcp::session::WriteDoor::CliPull,
+    )? {
+        return Err(refusal);
+    }
     pull_into_replica(&state, &request).await.map(Json)
 }
 
@@ -17334,13 +20950,15 @@ async fn pull_workspace_follow(
     // has already happened and does not hold this, so the gate covers the
     // transition alone; the workspace compare-and-swap is still what makes the
     // outcome safe rather than this lock.
-    let _coordination = state.coordination_gate.lock().await;
     let state = Arc::clone(state);
     let destination_ref = destination_ref.clone();
     // Authority reads, projection IO, and the workspace commit all block, so
     // they must not run on the executor that also serves this daemon's own
     // transfer seam.
     match tokio::task::spawn_blocking(move || {
+        // Dropping the request's JoinHandle cannot cancel an active blocking
+        // publication. Keep its gate inside that worker's lifetime instead.
+        let _coordination = state.coordination_gate.blocking_lock();
         crate::repository_branch::follow_moved_ref(
             &state,
             &destination_ref,
@@ -17478,9 +21096,48 @@ async fn repo_entities(
     let order = RepoEntityOrder::parse(params.order.as_deref())?;
     let fields = RepoEntityFields::parse(params.include.as_deref())?;
     let window = repo_entity_window(params.limit, params.offset)?;
-    let query = params.query.clone();
-    let repo = repo_id.clone();
+    // On a local daemon this repository's graph is the live one an edit
+    // admission writes, so a name query that matched nothing is served only
+    // from a read no writer spanned, for the reason `NameReadWait` gives. A
+    // hosted daemon reads a published generation no admission moves, and the
+    // wait knows it is not the live graph.
+    let name_query = params
+        .query
+        .as_deref()
+        .is_some_and(|query| !query.trim().is_empty());
+    let mut settle = NameReadWait::begin(&state, &graph);
+    loop {
+        let epoch = settle.sample(&state);
+        let (response, matched_nothing) = repo_entities_attempt(
+            Arc::clone(&graph),
+            order,
+            fields,
+            window,
+            params.query.clone(),
+            repo_id.clone(),
+        )
+        .await?;
+        let claims_absence = name_query && matched_nothing;
+        if !claims_absence || settle.settled(&state, epoch) {
+            return Ok(Json(response));
+        }
+        settle
+            .wait_out(&state, "repo entities")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    }
+}
 
+/// One read of a repository's entity list: the response, and whether the
+/// query matched no entity at all, before any window was cut.
+async fn repo_entities_attempt(
+    graph: Arc<kin_db::InMemoryGraph>,
+    order: RepoEntityOrder,
+    fields: RepoEntityFields,
+    window: Option<(usize, usize)>,
+    query: Option<String>,
+    repo: String,
+) -> std::result::Result<(RepoEntitiesResponse, bool), (StatusCode, String)> {
     // Ranking reads every entity's relations, which is real CPU work at
     // repository scale, so it runs off the request thread for the reason the
     // graph export's projection does: one caller's ranking must not stall every
@@ -17491,6 +21148,7 @@ async fn repo_entities(
             ..Default::default()
         };
         let mut matched = graph.query_entities(&filter)?;
+        let matched_nothing = matched.is_empty();
         let ranks = if order == RepoEntityOrder::Importance || fields.ranking {
             Some(repo_entity_ranks(graph.as_ref())?)
         } else {
@@ -17537,15 +21195,17 @@ async fn repo_entities(
                 }
             })
             .collect();
-        Ok::<_, anyhow::Error>(RepoEntitiesResponse {
-            repo_id: repo,
-            entities: entries,
-            total,
-        })
+        Ok::<_, anyhow::Error>((
+            RepoEntitiesResponse {
+                repo_id: repo,
+                entities: entries,
+                total,
+            },
+            matched_nothing,
+        ))
     })
     .await
     .map_err(internal_error)?
-    .map(Json)
     .map_err(internal_error)
 }
 
@@ -17664,7 +21324,7 @@ fn repo_entity_ranks(
     let mut edges: HashSet<(EntityId, EntityId, kin_model::RelationKind)> = HashSet::new();
     let mut dependents: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
     for entity in &entities {
-        for relation in graph.get_all_relations_for_entity(&entity.id)? {
+        for relation in kin_index::relation_read::relations_for_read(graph, &entity.id)? {
             let (Some(source), Some(destination)) =
                 (relation.src.as_entity(), relation.dst.as_entity())
             else {
@@ -18945,23 +22605,41 @@ async fn spine_resolve(
     Query(params): Query<SpineResolveParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            state.spine_unavailable_reason().to_string(),
-        )
-    })?;
-    let spine = spine_authority.backend();
-
     let kind_str = params.kind.as_deref();
     let kind = kind_str.and_then(parse_entity_kind);
-    let mut results = spine.resolve(&params.name, kind, None);
-    // "test" is role-based — spine EntityEntry now carries role
-    if kind_str.is_some_and(|k| k.eq_ignore_ascii_case("test")) {
-        results.retain(|r| r.role == Some(kin_model::EntityRole::Test));
+    // A local daemon's spine captures this repository from the live graph an
+    // edit admission writes, so a name that resolved to nothing is served only
+    // from a read no writer spanned, for the reason `NameReadWait` gives. A
+    // hosted daemon's spine holds published generations no admission moves.
+    let reads_live_graph = state.storage_backend.is_none();
+    let mut settle = NameReadWait::begin(&state, &state.graph);
+    loop {
+        let epoch = settle.sample(&state);
+        // The read authority is released before any wait, so a capture the
+        // admission's next read needs is never held behind this one.
+        let results = {
+            let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    state.spine_unavailable_reason().to_string(),
+                )
+            })?;
+            let spine = spine_authority.backend();
+            let mut results = spine.resolve(&params.name, kind, None);
+            // "test" is role-based: spine EntityEntry now carries role
+            if kind_str.is_some_and(|k| k.eq_ignore_ascii_case("test")) {
+                results.retain(|r| r.role == Some(kin_model::EntityRole::Test));
+            }
+            results
+        };
+        if !(reads_live_graph && results.is_empty()) || settle.settled(&state, epoch) {
+            return Ok(Json(json!({ "results": results })));
+        }
+        settle
+            .wait_out(&state, "spine resolve")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
     }
-
-    Ok(Json(json!({ "results": results })))
 }
 
 /// GET /spine/impact?repo=A&entity=X&depth=3 — federated impact analysis.
@@ -19152,7 +22830,25 @@ async fn lsp_sweep(
     let queued_after = state
         .lsp_sweeps_completed
         .load(std::sync::atomic::Ordering::SeqCst);
+    // Asking for a sweep is asking for another try, so the pass this call
+    // queues, or the next one if a pass is already running, asks about owed
+    // files now instead of waiting out their backoff.
+    state
+        .lsp_retry_owed_now
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let queued = state.queue_lsp_sweep();
+    // A pass already running decided about owed files when it started, so the
+    // retry asked for here needs a pass after it. Asked the way a merge asks,
+    // and only when something is owed.
+    if !queued
+        && state
+            .lsp_owed_files
+            .lock()
+            .map(|owed| !owed.is_empty())
+            .unwrap_or(false)
+    {
+        crate::daemon::lsp_publication::request_fresh_sweep(&state);
+    }
     // `sweeps_completed` at the moment of queueing is what makes the wait
     // correct. A caller that polls `running` alone races the worker: it can read
     // idle before the message is picked up and conclude the sweep it just asked
@@ -19305,6 +23001,28 @@ fn enrichment_unavailable_reason(
 /// exactly that distinction, which is why it exists.
 async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
+    let now = crate::owed_enrichment::now_unix_s();
+    let owed_files: Vec<serde_json::Value> = state
+        .lsp_owed_files
+        .lock()
+        .map(|owed| {
+            owed.iter()
+                .map(|(file, entry)| {
+                    let due = entry.last_attempt_unix_s.saturating_add(
+                        crate::owed_enrichment::retry_interval(entry.attempts).as_secs(),
+                    );
+                    json!({
+                        "file": file,
+                        "reason": entry.reason,
+                        "attempts": entry.attempts,
+                        // Sooner if the file's bytes change or a sweep is
+                        // asked for.
+                        "retry_after_s": due.saturating_sub(now),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let pending = state.lsp_work.pending.load(Ordering::SeqCst);
     let total = state.lsp_sweep_files_total.load(Ordering::SeqCst);
     let done = state.lsp_sweep_files_done.load(Ordering::SeqCst);
@@ -19312,6 +23030,16 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         "running": state.lsp_sweep_running.load(Ordering::SeqCst),
         "pending_work": pending,
         "failed_work": state.lsp_work.failed.load(Ordering::SeqCst),
+        // Language-server query errors on the incremental path. Separate from
+        // `failed_work` on purpose: the pass that saw one did complete, its
+        // relations are in the graph and nothing requeues the file, so gating
+        // completion on it reports enrichment that never drained. The sweep
+        // path grades its own through `sweep_work_succeeded`; without this the
+        // incremental side had no record of the same failure anywhere.
+        "incremental_query_failures": state
+            .lsp_work
+            .incremental_query_failures
+            .load(Ordering::SeqCst),
         "merge_pending": state.lsp_sweep_pending.load(Ordering::SeqCst),
         "worker_available": state.lsp_enrichment_tx.as_ref().is_some_and(|tx| !tx.is_closed()),
         "files_done": done,
@@ -19331,6 +23059,19 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
             .map(|skipped| serde_json::to_value(&*skipped).unwrap_or(json!([])))
             .unwrap_or_else(|_| json!([])),
         "sweeps_completed": state.lsp_sweeps_completed.load(Ordering::SeqCst),
+        // Every file a sweep owes, named, with what failed and when it is
+        // asked again. A file here has no completion marker: its queries got
+        // no considered answer, so its enrichment is not durable yet.
+        "files_owed": owed_files.len(),
+        "owed_files": owed_files,
+        // Files whose accepted evidence the crash record could not keep since
+        // the last authority commit. Live, published at the next commit, and
+        // lost by a crash before it.
+        "evidence_unrecorded_files": state
+            .lsp_evidence_unrecorded
+            .lock()
+            .map(|files| files.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
         // Reported rather than left for the caller to infer from a zero total:
         // a daemon with no language server never sweeps, and a caller waiting
         // for one would otherwise wait out its whole budget for an event that
@@ -20670,6 +24411,7 @@ pub async fn serve_bound_with_shutdown(
 ) -> std::io::Result<()> {
     let publication_control_auth_token = publication_control_auth_token_from_env();
     let tokens = resolve_serve_rotation_tokens(&state.layout)?;
+    let mut prewarm = spawn_hosted_view_prewarm(&state, shutdown_rx.clone());
     let app =
         router_with_rotation_tokens(state, tokens, publication_control_auth_token, shutdown_tx);
     let port = listener
@@ -20679,7 +24421,7 @@ pub async fn serve_bound_with_shutdown(
 
     info!(port, "daemon API server listening");
 
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             while !*shutdown_rx.borrow() {
                 if shutdown_rx.changed().await.is_err() {
@@ -20687,7 +24429,11 @@ pub async fn serve_bound_with_shutdown(
                 }
             }
         })
-        .await
+        .await;
+    if let Some(task) = &mut prewarm {
+        task.stop().await;
+    }
+    result
 }
 
 /// Start the API server on the given port and stop when shutdown is signaled.
@@ -20931,11 +24677,21 @@ fn bind_std_listener(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(unix)]
+    use kin_model::TransactionDelta;
+    #[cfg(unix)]
+    mod merge_after_enrichment;
+    #[cfg(unix)]
+    mod merge_parse_coverage;
     mod outside_graph_disclosure;
     mod repo_review_routes;
+    #[cfg(unix)]
+    pub(crate) mod session_crash_prefix_test;
     mod session_identity;
     mod session_move_identity;
+    #[cfg(unix)]
+    mod session_publication_test;
     /// THE WIRING SPINE (FIR-2524, captain's rider). The envelope the impact
     /// route hands the CLI must carry the daemon's degraded signals.
     ///
@@ -22916,6 +26672,8 @@ mod tests {
                 cosine: Some(0.42),
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         };
         let ev = fused_match_evidence("parse the request", &with_explain);
         assert_eq!(ev["ranker"], json!("fused-v1"));
@@ -23067,6 +26825,8 @@ mod tests {
                 cosine: None,
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         };
         let variants = vec![
             "q".to_string(),
@@ -23146,12 +26906,17 @@ mod tests {
                             .into(),
                     ),
                     match_kind: Some(kin_cli::commands::locate::LocateMatchKind::TextFallback),
+                    // Each entity lives in the file row of the same index, as a
+                    // semantic answer's files must: a file no ranked entity lives
+                    // in is dropped before either surface is built.
                     provenance: LocateProvenance {
-                        file: Some("async.c".into()),
+                        file: Some(format!("src/async{index}.c")),
                         origin: "text".into(),
                         cosine: None,
                     },
                     matched_queries: Vec::new(),
+                    collapsed_rows: 0,
+                    name_tier: None,
                 })
                 .collect(),
             files: (0..hits)
@@ -23203,20 +26968,17 @@ mod tests {
         .unwrap()
     }
 
-    /// The size cut, stated as a ratio against the full shape of the same
+    /// The size cut, stated as a ratio against the operator shape of the same
     /// fixture rather than as a bare ceiling. A ceiling with no baseline beside
     /// it passes just as happily when the projection stops projecting.
     #[test]
     fn the_compact_surface_is_a_fraction_of_the_full_one() {
         let query = "how does the async connection callback handle a write error";
-        let full = mcp_result_text(&fused_semantic_locate_payload(
-            compact_surface_fixture(12),
-            query,
-            false,
-            false,
-            kin_cli::commands::locate_compact::LocateSurface::Full,
-        ))
-        .len();
+        // Compare with the retained operator representation. Both MCP shapes
+        // now omit its file catalog, so that catalog cannot be their baseline.
+        let full = serde_json::to_string_pretty(&compact_surface_fixture(12))
+            .unwrap()
+            .len();
         let compact = mcp_result_text(&fused_semantic_locate_payload(
             compact_surface_fixture(12),
             query,
@@ -23459,37 +27221,66 @@ mod tests {
     /// per-file explain prose.
     #[test]
     fn the_compact_payload_drops_the_back_compat_rollup() {
-        let text = mcp_result_text(&fused_semantic_locate_payload(
-            compact_surface_fixture(6),
-            "q",
-            false,
-            false,
-            kin_cli::commands::locate_compact::LocateSurface::Compact,
-        ));
-        for gone in [
-            "symbols",
-            "several lines of body",
-            "a per-file explain line",
-        ] {
-            assert!(!text.contains(gone), "compact still carries {gone}: {text}");
-        }
-        // The control: the same fixture through the full surface carries all
-        // three, so the assertions above are testing the projection and not a
-        // fixture that never had them.
-        let full = mcp_result_text(&fused_semantic_locate_payload(
-            compact_surface_fixture(6),
-            "q",
-            false,
-            false,
-            kin_cli::commands::locate_compact::LocateSurface::Full,
-        ));
+        use kin_cli::commands::locate_compact::LocateSurface;
+        let operator = serde_json::to_string(&compact_surface_fixture(6)).unwrap();
         for present in [
             "symbols",
             "several lines of body",
             "a per-file explain line",
         ] {
-            assert!(full.contains(present), "the full control lost {present}");
+            assert!(
+                operator.contains(present),
+                "the fixture must exercise {present}"
+            );
         }
+        for surface in [LocateSurface::Compact, LocateSurface::Full] {
+            let text = mcp_result_text(&fused_semantic_locate_payload(
+                compact_surface_fixture(6),
+                "q",
+                false,
+                false,
+                surface,
+            ));
+            let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(payload.get("files").is_none(), "{text}");
+            assert_eq!(payload["entities"].as_array().unwrap().len(), 6);
+            for gone in ["symbols", "a per-file explain line"] {
+                assert!(
+                    !text.contains(gone),
+                    "semantic surface carries {gone}: {text}"
+                );
+            }
+            assert_eq!(
+                text.contains("several lines of body"),
+                surface == LocateSurface::Full
+            );
+        }
+    }
+
+    #[test]
+    fn entity_explanations_do_not_restore_legacy_file_catalogs() {
+        let mut result = compact_surface_fixture(2);
+        result.debug = Some(serde_json::from_value(json!({
+            "scoring_track": "fused",
+            "resolved_files": [{"path": "hidden.rs", "score": 1.0, "direct": 1.0, "graph": 0.0}],
+            "stages": [{"name": "legacy", "files": []}]
+        })).unwrap());
+        assert!(serde_json::to_string(&result)
+            .unwrap()
+            .contains("hidden.rs"));
+        let text = mcp_result_text(&fused_semantic_locate_payload(
+            result,
+            "q",
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+        ));
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["debug"]["scoring_track"], "fused");
+        assert!(payload["debug"].get("resolved_files").is_none());
+        assert!(payload["debug"].get("stages").is_none());
+        assert!(!text.contains("hidden.rs"));
+        assert!(payload["entities"][0].get("match_evidence").is_some());
     }
 
     /// A file-granularity answer IS the file roll-up, so compact must not touch
@@ -23537,6 +27328,8 @@ mod tests {
                 cosine: None,
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         };
         let result = LocateResult {
             entities: vec![mk("a", "alpha"), mk("b", "beta")],
@@ -23627,54 +27420,42 @@ mod tests {
                 cosine: None,
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         }
     }
 
-    /// An artifact hit reads the same whichever arm answered. The fused arm
-    /// used to write a constant `id_space: "entity"`, which was true for
-    /// exactly as long as the projection could only emit graph entities;
-    /// once a ranked artifact reaches this surface the constant relabels it as a
-    /// resolvable id that every id-consuming tool refuses. Asserted on the
-    /// serialized body, because the identity is written into the JSON after the
-    /// struct is serialized and the struct cannot show it.
     #[test]
-    fn a_fused_artifact_hit_is_labelled_the_same_way_the_cosine_arm_labels_one() {
+    fn fused_artifact_rows_are_omitted_with_an_honest_entity_coverage_gap() {
         let mut artifact = fused_locate_entity("AGENTS.md");
-        artifact.entity_id = String::new();
+        artifact.entity_id.clear();
         artifact.id_space = kin_cli::commands::locate::LocateIdSpace::Artifact;
         artifact.artifact_path = Some("AGENTS.md".into());
         artifact.kind = "artifact".into();
-        let body = fused_locate_body(
-            kin_cli::commands::locate::LocateResult {
-                entities: vec![artifact, fused_locate_entity("start_daemon")],
+        artifact.body = Some("whole artifact must never escape".into());
+        for surface in [
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+            kin_cli::commands::locate_compact::LocateSurface::Compact,
+        ] {
+            let result = kin_cli::commands::locate::LocateResult {
+                entities: vec![artifact.clone(), fused_locate_entity("start_daemon")],
+                total_ranked: 2,
                 ..Default::default()
-            },
-            "checks that cannot fail",
-        );
-        let rows = body["entities"].as_array().unwrap();
-        assert_eq!(rows[0]["id_space"], json!("artifact"));
-        assert_eq!(rows[0]["artifact_path"], json!("AGENTS.md"));
-        assert_eq!(rows[0]["resolves_with"], json!("kin_artifact_read"));
-        assert!(
-            rows[0].get("entity_id").is_none(),
-            "an artifact row carries no entity id: {}",
-            rows[0]
-        );
-        // The control: an entity row on the same page is untouched, so nothing
-        // that could rank before artifacts could reads differently now.
-        assert_eq!(rows[1]["id_space"], json!("entity"));
-        assert_eq!(
-            rows[1]["entity_id"],
-            json!("00000000-0000-0000-0000-0000000000aa")
-        );
-        assert!(rows[1].get("artifact_path").is_none());
+            };
+            let text = mcp_result_text(&fused_semantic_locate_payload(
+                result, "checks", false, true, surface,
+            ));
+            assert!(!text.contains("whole artifact"));
+            assert!(!text.contains("kin_artifact_read"));
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["entities"].as_array().unwrap().len(), 1);
+            assert_eq!(body["total_ranked"], 1);
+            assert!(text.contains("non_entity_candidates_omitted"));
+        }
     }
 
-    /// Asserted against the serializer rather than a hand-written payload.
-    /// `LocateResult` skips `entities` when the vector is empty, so an empty
-    /// fused page reaches the negative machinery carrying `files` and no
-    /// `entities` key at all — the shape that has to be recognized, and the one
-    /// a fixture written from the struct definition would miss.
+    /// The MCP serializer states an empty entity collection explicitly, with
+    /// no operator file catalog. The negative contract still recognizes it.
     #[test]
     fn empty_fused_locate_body_is_qualified_by_the_negative_contract() {
         let body = fused_locate_body(
@@ -23687,7 +27468,7 @@ mod tests {
             "an empty fused page states its primary rather than omitting it: {body}"
         );
         assert_eq!(body["total_ranked"], json!(0));
-        assert_eq!(body["files"], json!([]));
+        assert!(body.get("files").is_none());
         let negative = kin_mcp::negative::negative_for(
             "semantic_locate",
             &body,
@@ -23788,6 +27569,317 @@ mod tests {
         .is_none());
     }
 
+    #[tokio::test]
+    async fn derived_member_daemon_dispatch_serves_only_generator_source() {
+        let source = "export const app = {}; for (const key of ['café','post']) { app[key] = () => 41; }\nexport function ordinary() { return 7; }\n";
+        let state = test_state_with_committed_sources(&[("members.js", source)]);
+        let candidate = state
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("app.café".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "app.café")
+            .unwrap();
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        let expected = &source[derivation.generator.start_byte..derivation.generator.end_byte];
+        let app = router(Arc::clone(&state));
+        for (tool, query) in [
+            ("get_entity_source", candidate.id.to_string()),
+            ("get_entity_body", candidate.id.to_string()),
+            ("get_entity_source", candidate.name.clone()),
+        ] {
+            let result = mcp_call(app.clone(), tool, json!({"entity_id":query})).await;
+            assert!(
+                !result.is_error.unwrap_or(false),
+                "{}",
+                mcp_result_text(&result)
+            );
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            assert!(value["body"].is_null(), "{value}");
+            assert!(value["source_base"].is_null(), "{value}");
+            assert_eq!(value["independently_editable"], false, "{value}");
+            assert_eq!(value["definition_status"], "derived_candidate", "{value}");
+            assert_eq!(value["generator_source"]["body"], expected, "{value}");
+            assert_eq!(
+                value["generator_source"]["independent_member_body"], false,
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_member_daemon_mixed_batch_keeps_budgets_and_untrusted_gaps() {
+        let source = "export const app = {}; for (const key of ['café','post']) {\n  app[key] = () => 'réponse';\n}\nexport function ordinary() { return 7; }\n";
+        let state = test_state_with_committed_sources(&[("members.js", source)]);
+        let entities = state.graph.list_all_entities().unwrap();
+        let candidate = entities
+            .iter()
+            .find(|entity| entity.name == "app.café")
+            .unwrap()
+            .clone();
+        let ordinary = entities
+            .iter()
+            .find(|entity| entity.name == "ordinary")
+            .unwrap()
+            .clone();
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        let expected = &source[derivation.generator.start_byte..derivation.generator.end_byte];
+        let mut legacy = candidate.clone();
+        legacy.id = EntityId::new();
+        legacy.name = "legacy.get".into();
+        legacy.span = Some(derivation.generator.clone());
+        legacy
+            .metadata
+            .extra
+            .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+        legacy.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        let mut malformed = legacy.clone();
+        malformed.id = EntityId::new();
+        malformed.name = "malformed.get".into();
+        malformed.metadata.extra.insert(
+            kin_model::derivation::ENTITY_DERIVATION_KEY.into(),
+            json!({"schema":"unknown"}),
+        );
+        state.graph.upsert_entity(&legacy).unwrap();
+        state.graph.upsert_entity(&malformed).unwrap();
+        let app = router(Arc::clone(&state));
+        for entity in [&legacy, &malformed] {
+            let result = mcp_call(
+                app.clone(),
+                "get_entity_source",
+                json!({"entity_id":entity.id.to_string()}),
+            )
+            .await;
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            assert_eq!(
+                value["definition_status"], "untrusted_derivation",
+                "{value}"
+            );
+            assert!(
+                value["body"].is_null()
+                    && value["source_base"].is_null()
+                    && value["span"].is_null(),
+                "{value}"
+            );
+            assert!(value["generator_source"].is_null(), "{value}");
+            assert!(value["generator_source_unavailable"].is_string(), "{value}");
+        }
+        let result = mcp_call(
+            app.clone(),
+            "get_entity_source",
+            json!({"entity_id":ordinary.id.to_string()}),
+        )
+        .await;
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "{}",
+            mcp_result_text(&result)
+        );
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert!(
+            value["body"].as_str().unwrap().contains("return 7"),
+            "{value}"
+        );
+        assert!(value["generator_source"].is_null(), "{value}");
+        let ids = vec![
+            candidate.id.to_string(),
+            ordinary.id.to_string(),
+            legacy.id.to_string(),
+            malformed.id.to_string(),
+            EntityId::new().to_string(),
+        ];
+        let result = mcp_call(
+            app.clone(),
+            "get_entity_sources",
+            json!({"entity_ids":ids,"compact":false,"max_chars":50000}),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(value["returned"], 2, "{value}");
+        assert_eq!(
+            value["results"][0]["generator_source"]["body"], expected,
+            "{value}"
+        );
+        assert!(
+            value["results"][0]["body"].is_null() && value["results"][0]["source_base"].is_null(),
+            "{value}"
+        );
+        assert!(
+            value["results"][1]["body"]
+                .as_str()
+                .unwrap()
+                .contains("return 7"),
+            "{value}"
+        );
+        for index in [2, 3] {
+            assert_eq!(value["results"][index]["reason"], "no_source", "{value}");
+            assert_eq!(
+                value["results"][index]["definition_status"], "untrusted_derivation",
+                "{value}"
+            );
+        }
+        assert_eq!(value["results"][4]["reason"], "not_found", "{value}");
+        for options in [json!({"token_budget":0}), json!({"compact":true})] {
+            let mut args = json!({"entity_ids":[candidate.id.to_string(),ordinary.id.to_string()],"compact":false});
+            args.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let result = mcp_call(app.clone(), "get_entity_sources", args).await;
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            assert!(
+                value["results"][0]["body"].is_null()
+                    && value["results"][0]["generator_source"].is_null(),
+                "{value}"
+            );
+            assert!(value["results"][1]["body"].is_null(), "{value}");
+            if options.get("token_budget").is_some() {
+                assert_eq!(value["truncated"], true, "{value}");
+                assert_eq!(value["results"][0]["reason"], "budget", "{value}");
+                assert_eq!(value["results"][1]["reason"], "budget", "{value}");
+            } else {
+                assert_eq!(value["results"][0]["omitted"], false, "{value}");
+            }
+        }
+        let result = mcp_call(app.clone(), "get_entity_sources", json!({"entity_ids":[candidate.id.to_string()],"max_bytes_per_body":13,"compact":false})).await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(
+            value["results"][0]["generator_source"]["body_complete"], false,
+            "{value}"
+        );
+        assert!(value["results"][0]["body"].is_null(), "{value}");
+        // Generator membership must be graph-bound, even when the recorded bytes exist.
+        let generator_relations = state
+            .graph
+            .traverse(
+                &GraphNodeId::Entity(candidate.id),
+                &[RelationKind::DerivedFrom],
+                1,
+            )
+            .unwrap()
+            .relations;
+        assert!(
+            !generator_relations.is_empty(),
+            "the admitted generator must have provenance"
+        );
+        for relation in generator_relations {
+            state.graph.remove_relation(&relation.id).unwrap();
+        }
+        let result = mcp_call(
+            app,
+            "get_entity_source",
+            json!({"entity_id":candidate.id.to_string()}),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert!(value["generator_source"].is_null(), "{value}");
+        assert!(
+            value["generator_source_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("provenance"),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_member_daemon_history_uses_committed_generator_and_refuses_mismatch() {
+        let old_body =
+            "export const app = {}; for (const key of ['get']) { app[key] = () => 41; }\n";
+        let new_body = "// shifted current source\nexport const app = {}; for (const key of ['get']) { app[key] = () => 99; }\n";
+        let state = test_state_with_committed_sources(&[("members.js", old_body)]);
+        let binding = state.local_repository_authority_binding().unwrap();
+        let old = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &binding,
+            Some("HEAD"),
+        )
+        .unwrap();
+        let authority = projection_repository_authority(&state).unwrap();
+        let historical = Arc::new(kin_core::build_graph_at_ref(&authority.manager, &old).unwrap());
+        let candidate = historical
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "app.get")
+            .unwrap();
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        let expected = &old_body[derivation.generator.start_byte..derivation.generator.end_byte];
+        let app = router(Arc::clone(&state));
+        install_working_copy_file(&state, "members.js", new_body.as_bytes(), false);
+        let current = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "change candidate generator",
+        )
+        .await;
+        assert_ne!(old, current);
+        let session = SessionId::new();
+        state
+            .set_session_scope(&session, old.to_string(), old, Arc::clone(&historical))
+            .await;
+        for tool in ["get_entity_source", "get_entity_body", "get_entity_sources"] {
+            let args = if tool == "get_entity_sources" {
+                json!({"entity_ids":[candidate.id.to_string()],"compact":false})
+            } else {
+                json!({"entity_id":candidate.id.to_string()})
+            };
+            let result = mcp_call_as(app.clone(), tool, args, session).await;
+            assert!(
+                !result.is_error.unwrap_or(false),
+                "{}",
+                mcp_result_text(&result)
+            );
+            let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            let row = if tool == "get_entity_sources" {
+                &value["results"][0]
+            } else {
+                &value
+            };
+            assert!(
+                row["body"].is_null() && row["source_base"].is_null(),
+                "{value}"
+            );
+            assert_eq!(row["generator_source"]["body"], expected, "{value}");
+            assert_eq!(
+                row["generator_source"]["source_state"], "committed",
+                "{value}"
+            );
+            assert_eq!(
+                row["generator_source"]["source_change_id"],
+                old.to_string(),
+                "{value}"
+            );
+        }
+        // A scope graph altered after selection must not lend today's evidence an old label.
+        let mut mismatched = candidate.clone();
+        mismatched
+            .metadata
+            .extra
+            .get_mut(kin_model::derivation::ENTITY_DERIVATION_KEY)
+            .unwrap()["source_blob_hash"] = json!("f".repeat(64));
+        historical.upsert_entity(&mismatched).unwrap();
+        let result = mcp_call_as(
+            app,
+            "get_entity_source",
+            json!({"entity_id":candidate.id.to_string()}),
+            session,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert!(value["generator_source"].is_null(), "{value}");
+        assert!(
+            value["generator_source_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("committed generator revision"),
+            "{value}"
+        );
+    }
+
     #[test]
     fn entity_source_tool_result_not_found_surfaces_error_not_missing_source() {
         use kin_cli::commands::graph::EntitySourceOutcome;
@@ -23841,6 +27933,7 @@ mod tests {
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
             span_coherence: "digest_verified".to_string(),
+            source_base_unavailable: None,
         };
         let result = entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::Found(record)));
 
@@ -23885,6 +27978,7 @@ mod tests {
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
             span_coherence: "digest_verified".to_string(),
+            source_base_unavailable: None,
         };
         let resolved = vec![
             resolved_entity_source_from_outcome(
@@ -27559,12 +31653,12 @@ mod tests {
 
     #[tokio::test]
     async fn hosted_hydration_warm_cache_bypasses_busy_cold_admission() {
-        let slots = hosted_repository_hydrations();
-        assert!(Arc::ptr_eq(&slots, &hosted_repository_hydrations()));
-        assert_eq!(slots.available_permits(), 2);
         let repo_id = format!("repo-hydration-warm-{}", Uuid::new_v4());
         let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
         let (state, _working, storage) = replica_state(&repo_id);
+        let slots = hosted_repository_hydrations(&state);
+        assert!(Arc::ptr_eq(&slots, &hosted_repository_hydrations(&state)));
+        assert_eq!(slots.available_permits(), 2);
         publish_hosted_semantic_change(
             storage.path(),
             &repository_id,
@@ -27593,6 +31687,1066 @@ mod tests {
         load_hosted_repository_mcp_view(&state, &repo_id)
             .await
             .unwrap();
+        assert_eq!(slots.available_permits(), 2);
+    }
+
+    /// Poll `condition` until it holds, failing the test after 20 s.
+    async fn until_hosted_hook(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "hydration hook not reached within 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The view installed for `repo_id`, waiting up to 10 s for it to appear.
+    async fn hosted_view_installed_within(
+        state: &DaemonState,
+        repo_id: &str,
+    ) -> Option<Arc<HostedRepositoryMcpView>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(view) = state.repo_semantic_views.read().await.get(repo_id).cloned() {
+                return Some(view);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The hosted control plane drops a context read at its 8 s deadline. The
+    /// hydration that read started must still install its view, so the next
+    /// read is a cache hit instead of a second cold hydration that is dropped
+    /// the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_view_hydration_survives_its_caller_going_away() {
+        let repo_id = format!("repo-hydration-abandoned-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8ef7,
+            "publish abandoned-caller fixture",
+            &[(
+                "abandoned_symbol",
+                "src/abandoned.rs",
+                "fn abandoned_symbol() {}\n",
+            )],
+        );
+        hosted_view_hydration_test_hooks::close_gate(&repo_id);
+        let caller = tokio::spawn({
+            let state = Arc::clone(&state);
+            let repo_id = repo_id.clone();
+            async move {
+                load_hosted_repository_mcp_view(&state, &repo_id)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::hydrations(&repo_id) == 1).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        hosted_view_hydration_test_hooks::open_gate(&repo_id);
+
+        let installed = hosted_view_installed_within(&state, &repo_id)
+            .await
+            .expect("a hydration whose caller went away must still install its view");
+        let next = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&installed, &next),
+            "the next read must be served the installed view"
+        );
+        assert_eq!(
+            hosted_view_hydration_test_hooks::hydrations(&repo_id),
+            1,
+            "the next read must not hydrate the same publication again"
+        );
+        assert_eq!(
+            hosted_view_hydration_test_hooks::last_waiting(&repo_id),
+            Some(0),
+            "the hydration must record that no caller was left to answer"
+        );
+    }
+
+    /// A view hydrated at a cursor that a newer publication has replaced is
+    /// refused as stale rather than installed, and the next read hydrates the
+    /// current publication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_view_hydrated_at_a_superseded_cursor_is_refused_not_installed() {
+        let repo_id = format!("repo-hydration-superseded-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        let (first_change, _) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8ef8,
+            "publish superseded fixture",
+            &[(
+                "superseded_symbol",
+                "src/superseded.rs",
+                "fn superseded_symbol() {}\n",
+            )],
+        );
+        hosted_view_hydration_test_hooks::close_gate(&repo_id);
+        let caller = tokio::spawn({
+            let state = Arc::clone(&state);
+            let repo_id = repo_id.clone();
+            async move { load_hosted_repository_mcp_view(&state, &repo_id).await }
+        });
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::hydrations(&repo_id) == 1).await;
+        // A publication lands while that hydration is still open.
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x8ef9,
+            "publish superseding change",
+            &[(
+                "superseding_symbol",
+                "src/superseding.rs",
+                "fn superseding_symbol() {}\n",
+            )],
+        );
+        hosted_view_hydration_test_hooks::open_gate(&repo_id);
+
+        let refused = caller
+            .await
+            .unwrap()
+            .err()
+            .expect("a view hydrated at a superseded cursor must be refused");
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.code, "repo_semantic_unready");
+        assert!(refused.retryable);
+        assert!(
+            state
+                .repo_semantic_views
+                .read()
+                .await
+                .get(&repo_id)
+                .is_none(),
+            "a stale view must not be installed"
+        );
+
+        let current = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .unwrap();
+        let published = state
+            .storage_backend
+            .as_ref()
+            .unwrap()
+            .load_snapshot_cursor(&repo_id)
+            .unwrap();
+        assert_eq!(Some(current.snapshot_cursor), published);
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 2);
+    }
+
+    /// Two cold reads of one publication share one hydration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_cold_reads_share_one_hosted_view_hydration() {
+        let repo_id = format!("repo-hydration-shared-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8efa,
+            "publish shared-hydration fixture",
+            &[("shared_symbol", "src/shared.rs", "fn shared_symbol() {}\n")],
+        );
+        hosted_view_hydration_test_hooks::close_gate(&repo_id);
+        let read = |state: &Arc<DaemonState>| {
+            let state = Arc::clone(state);
+            let repo_id = repo_id.clone();
+            tokio::spawn(async move { load_hosted_repository_mcp_view(&state, &repo_id).await })
+        };
+        let first = read(&state);
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::hydrations(&repo_id) == 1).await;
+        let second = read(&state);
+        // Long enough for the second read to reach the cold path while the
+        // first hydration is still held open.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        hosted_view_hydration_test_hooks::open_gate(&repo_id);
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            hosted_view_hydration_test_hooks::hydrations(&repo_id),
+            1,
+            "two cold reads of one publication must share one hydration"
+        );
+        assert_eq!(
+            hosted_view_hydration_test_hooks::last_waiting(&repo_id),
+            Some(2),
+            "the one hydration must answer both waiting callers"
+        );
+    }
+
+    /// A read that arrives while a repository is still warming is answered at
+    /// once with a named, retryable refusal and a `Retry-After`, rather than
+    /// being held until its caller's own deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_arriving_mid_warm_is_answered_warming_at_once() {
+        let repo_id = format!("repo-hydration-warming-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8efb,
+            "publish warming fixture",
+            &[(
+                "warming_symbol",
+                "src/warming.rs",
+                "fn warming_symbol() {}\n",
+            )],
+        );
+        hosted_view_hydration_test_hooks::close_gate(&repo_id);
+        let leader = tokio::spawn({
+            let state = Arc::clone(&state);
+            let repo_id = repo_id.clone();
+            async move {
+                load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(30))
+                    .await
+            }
+        });
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::hydrations(&repo_id) == 1).await;
+
+        let asked = Instant::now();
+        let warming =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_millis(100))
+                .await
+                .err()
+                .expect("a read during warm-up must be refused, not held");
+        assert!(asked.elapsed() < Duration::from_secs(2));
+        assert_eq!(warming.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(warming.code, "repo_view_warming");
+        assert!(warming.retryable);
+        let response = repo_scoped_mcp_error(&repo_id, warming);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            &HOSTED_VIEW_WARMING_RETRY_AFTER_SECS.to_string()
+        );
+        assert_eq!(
+            response.headers().get("x-kin-semantic-refusal").unwrap(),
+            "repo_view_warming"
+        );
+
+        hosted_view_hydration_test_hooks::open_gate(&repo_id);
+        leader.await.unwrap().unwrap();
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 1);
+        assert_eq!(
+            hosted_view_hydration_test_hooks::last_waiting(&repo_id),
+            Some(1),
+            "the answer must reach the caller still waiting, and only that one"
+        );
+    }
+
+    /// A read that missed the cache just before a hydration installed its view
+    /// must take that view, even when another writer holds the cache at the
+    /// moment it looks again, rather than hydrate the same publication twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_racing_a_finished_hydration_takes_its_view_not_a_second_hydration() {
+        let repo_id = format!("repo-hydration-race-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8efc,
+            "publish racing-read fixture",
+            &[("racing_symbol", "src/racing.rs", "fn racing_symbol() {}\n")],
+        );
+        hosted_view_hydration_test_hooks::close_gate(&repo_id);
+        let read = |state: &Arc<DaemonState>| {
+            let state = Arc::clone(state);
+            let repo_id = repo_id.clone();
+            tokio::spawn(async move {
+                load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(30))
+                    .await
+            })
+        };
+        let leader = read(&state);
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::hydrations(&repo_id) == 1).await;
+        // The second read misses the cache while the hydration is still open,
+        // then is held just before it would join.
+        hosted_view_hydration_test_hooks::close_join_gate(&repo_id);
+        let racer = read(&state);
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::join_arrivals(&repo_id) == 2).await;
+        hosted_view_hydration_test_hooks::open_gate(&repo_id);
+        let installed = leader.await.unwrap().unwrap();
+        until_hosted_hook(|| {
+            !hosted_view_hydration_test_hooks::flight_registered(&state, &repo_id)
+        })
+        .await;
+
+        // The flight has installed and retired. Another writer holds the cache
+        // at the moment the held read looks again.
+        let writer = state.repo_semantic_views.write().await;
+        hosted_view_hydration_test_hooks::open_join_gate(&repo_id);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(writer);
+
+        let raced = racer.await.unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&installed, &raced),
+            "the racing read must take the installed view"
+        );
+        assert_eq!(
+            hosted_view_hydration_test_hooks::hydrations(&repo_id),
+            1,
+            "a contended cache must not be read as a miss"
+        );
+    }
+
+    /// A storage backend whose publication probe stalls on demand, for the
+    /// bounded-work tests below.
+    struct StallingCursorBackend {
+        inner: kin_db::LocalFileBackend,
+        /// Probes still allowed through before the next one stalls.
+        allowed: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_on_call: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl crate::storage_delegate::StorageBackendDelegate for StallingCursorBackend {
+        fn delegate(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+
+        fn load_snapshot_cursor(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<SnapshotCursor>, kin_db::KinDbError> {
+            use std::sync::atomic::Ordering;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on_call.load(Ordering::SeqCst) {
+                return Err(kin_db::KinDbError::StorageError(
+                    "completed fixture failure".into(),
+                ));
+            }
+            let passed = self
+                .allowed
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    if left == usize::MAX {
+                        Some(left)
+                    } else {
+                        left.checked_sub(1)
+                    }
+                })
+                .is_ok();
+            if !passed {
+                let (released, changed) = &*self.release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            self.inner.load_snapshot_cursor(repo_id)
+        }
+    }
+
+    /// A publication probe that never answers must not hold a flight, or its
+    /// caller, past their bounds: the flight retires at its admission budget,
+    /// a caller is answered at its own wait, and a later caller proceeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_publication_probe_releases_its_flight_and_its_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        install_test_registry_override();
+        let repo_id = format!("repo-hydration-stuck-probe-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let allowed = Arc::new(AtomicUsize::new(usize::MAX));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(crate::storage_delegate::DelegatingBackend::new(
+                    StallingCursorBackend {
+                        inner: kin_db::LocalFileBackend::new(storage.path().to_path_buf()),
+                        allowed: Arc::clone(&allowed),
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_on_call: Arc::new(AtomicUsize::new(usize::MAX)),
+                        release: Arc::clone(&release),
+                    },
+                )),
+                &repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8efd,
+            "publish stuck-probe fixture",
+            &[("stuck_symbol", "src/stuck.rs", "fn stuck_symbol() {}\n")],
+        );
+        hosted_view_hydration_test_hooks::set_budget(&repo_id, Duration::from_millis(300));
+
+        // The caller's own probe answers; the flight's first probe sticks.
+        allowed.store(1, Ordering::SeqCst);
+        let asked = Instant::now();
+        let refused =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(10))
+                .await
+                .err()
+                .expect("a flight whose probe sticks must be refused at its budget");
+        assert_eq!(refused.code, "repo_hydration_timeout");
+        assert!(refused.retryable);
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        until_hosted_hook(|| {
+            !hosted_view_hydration_test_hooks::flight_registered(&state, &repo_id)
+        })
+        .await;
+
+        // The caller's own probe sticks: it is answered at its wait.
+        allowed.store(0, Ordering::SeqCst);
+        let asked = Instant::now();
+        let refused =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_millis(300))
+                .await
+                .err()
+                .expect("a caller whose probe sticks must be answered at its wait");
+        assert_eq!(refused.code, "repo_authority_unavailable");
+        assert!(refused.retryable);
+        assert_eq!(
+            refused.retry_after_secs,
+            Some(HOSTED_VIEW_WARMING_RETRY_AFTER_SECS)
+        );
+        assert!(asked.elapsed() < Duration::from_secs(2));
+        assert!(!hosted_view_hydration_test_hooks::flight_registered(
+            &state, &repo_id
+        ));
+
+        // Storage recovers and a later caller proceeds.
+        allowed.store(usize::MAX, Ordering::SeqCst);
+        {
+            let (released, changed) = &*release;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        let view =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(10))
+                .await
+                .expect("a later caller must proceed once storage answers");
+        assert!(state
+            .repo_semantic_views
+            .read()
+            .await
+            .get(&repo_id)
+            .is_some_and(|installed| Arc::ptr_eq(installed, &view)));
+    }
+
+    async fn run_prewarm_pass(
+        state: &Arc<DaemonState>,
+        config: HostedViewPrewarmConfig,
+        warmed: &mut HostedViewPrewarmState,
+    ) -> Vec<(String, HostedViewPrewarmOutcome)> {
+        let (_sender, receiver) = tokio::sync::watch::channel(false);
+        hosted_view_prewarm_pass(state, config, warmed, &receiver).await
+    }
+
+    fn unbounded_prewarm() -> HostedViewPrewarmConfig {
+        HostedViewPrewarmConfig {
+            enabled: true,
+            min_available_bytes: 0,
+            probe_wait: HOSTED_VIEW_PREWARM_PROBE_WAIT,
+        }
+    }
+
+    async fn prewarm_stops_during_a_pass(close_sender: bool) {
+        let first = format!("a-prewarm-shutdown-{}", Uuid::new_v4());
+        let second = format!("b-prewarm-shutdown-{}", Uuid::new_v4());
+        let (mut state, _working, storage) = replica_state(&first);
+        Arc::get_mut(&mut state).unwrap().allowed_repo_ids =
+            Some([first.clone(), second.clone()].into_iter().collect());
+        for (repo_id, operation) in [(&first, 0x8f05), (&second, 0x8f06)] {
+            publish_hosted_semantic_change(
+                storage.path(),
+                &RepositoryId::new(repo_id.clone()).unwrap(),
+                None,
+                operation,
+                "publish shutdown pre-warm fixture",
+                &[(
+                    "shutdown_symbol",
+                    "src/stop.rs",
+                    "fn shutdown_symbol() {}\n",
+                )],
+            );
+        }
+        hosted_view_hydration_test_hooks::close_join_gate(&first);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut worker = tokio::spawn(hosted_view_prewarm_loop(
+            Arc::clone(&state),
+            unbounded_prewarm(),
+            shutdown_rx,
+        ));
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::join_arrivals(&first) == 1).await;
+        if close_sender {
+            drop(shutdown_tx);
+        } else {
+            shutdown_tx.send(true).unwrap();
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(2), &mut worker).await;
+        // Clean up even on the red version, so a failed assertion never leaves
+        // a held fixture or detached task behind.
+        if stopped.is_err() {
+            worker.abort();
+            let _ = worker.await;
+        }
+        hosted_view_hydration_test_hooks::open_join_gate(&first);
+        assert!(
+            stopped.is_ok(),
+            "shutdown must interrupt the active pre-warm pass"
+        );
+        assert_eq!(hosted_view_hydration_test_hooks::join_arrivals(&second), 0);
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&second), 0);
+        assert_eq!(
+            Arc::strong_count(&state),
+            1,
+            "the loop must release its state handle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_shutdown_interrupts_before_the_next_repository() {
+        prewarm_stops_during_a_pass(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_sender_closure_interrupts_before_the_next_repository() {
+        prewarm_stops_during_a_pass(true).await;
+    }
+
+    #[test]
+    fn prewarm_forced_critical_defers_even_without_a_physical_reading() {
+        use kin_core::memory_pressure::{MemoryPressure, PressureLevel};
+        let pressure = MemoryPressure::Forced {
+            level: PressureLevel::Critical,
+        };
+        assert!(pressure.reading().is_none());
+        assert!(
+            hosted_view_prewarm_memory_deferral(unbounded_prewarm(), &pressure).is_some(),
+            "an explicit critical override must defer background hydration"
+        );
+    }
+
+    #[test]
+    fn prewarm_unknown_and_noncritical_overrides_do_not_invent_pressure() {
+        use kin_core::memory_pressure::{MemoryPressure, PressureLevel};
+        let config = HostedViewPrewarmConfig {
+            enabled: true,
+            min_available_bytes: u64::MAX,
+            probe_wait: HOSTED_VIEW_PREWARM_PROBE_WAIT,
+        };
+        for pressure in [
+            MemoryPressure::Unknown {
+                reason: "fixture has no accounting".to_string(),
+            },
+            MemoryPressure::Forced {
+                level: PressureLevel::Nominal,
+            },
+            MemoryPressure::Forced {
+                level: PressureLevel::Elevated,
+            },
+        ] {
+            assert_eq!(hosted_view_prewarm_memory_deferral(config, &pressure), None);
+        }
+    }
+
+    #[test]
+    fn prewarm_measured_memory_floor_preserves_exact_boundary() {
+        use kin_core::memory_pressure::{MemoryPressure, MemoryReading, PressureSource};
+        let config = HostedViewPrewarmConfig {
+            enabled: true,
+            min_available_bytes: 4096,
+            probe_wait: HOSTED_VIEW_PREWARM_PROBE_WAIT,
+        };
+        for (available, deferred) in [(4095, true), (4096, false), (4097, false)] {
+            let pressure = MemoryPressure::Known(MemoryReading {
+                source: PressureSource::Cgroup,
+                limit_bytes: 8192,
+                used_bytes: 8192 - available,
+                swap_used_bytes: None,
+                swap_total_bytes: None,
+                oom_kills: Some(0),
+                peak_bytes: None,
+            });
+            let result = hosted_view_prewarm_memory_deferral(config, &pressure);
+            assert_eq!(result.is_some(), deferred);
+            if deferred {
+                assert_eq!(
+                    result,
+                    Some(HostedViewPrewarmOutcome::MemoryShort {
+                        available_bytes: available
+                    })
+                );
+            }
+        }
+    }
+
+    struct ReleaseCursorProbeOnDrop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for ReleaseCursorProbeOnDrop {
+        fn drop(&mut self) {
+            let (released, changed) = &*self.0;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+    }
+
+    /// Time out one pre-warm, then check that automatic polls leave it alone
+    /// while an ordinary read still recovers the view. `recovery_hold`, when
+    /// set, keeps that read's own hydration open for the given time after it
+    /// opens, the way a loaded host slows it.
+    async fn prewarm_does_not_repeat_timed_out_work(
+        stall_after: usize,
+        recovery_hold: Option<Duration>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        install_test_registry_override();
+        let repo_id = format!("repo-prewarm-timeout-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let allowed = Arc::new(AtomicUsize::new(usize::MAX));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release_on_exit = ReleaseCursorProbeOnDrop(Arc::clone(&release));
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(crate::storage_delegate::DelegatingBackend::new(
+                    StallingCursorBackend {
+                        inner: kin_db::LocalFileBackend::new(storage.path().to_path_buf()),
+                        allowed: Arc::clone(&allowed),
+                        calls: Arc::clone(&calls),
+                        fail_on_call: Arc::new(AtomicUsize::new(usize::MAX)),
+                        release: Arc::clone(&release),
+                    },
+                )),
+                &repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        let (first, _) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8f07,
+            "publish timed-out pre-warm fixture",
+            &[(
+                "timeout_symbol",
+                "src/timeout.rs",
+                "fn timeout_symbol() {}\n",
+            )],
+        );
+        calls.store(0, Ordering::SeqCst);
+        allowed.store(stall_after, Ordering::SeqCst);
+        hosted_view_hydration_test_hooks::set_budget(&repo_id, Duration::from_millis(100));
+        let config = HostedViewPrewarmConfig {
+            probe_wait: Duration::from_millis(100),
+            ..unbounded_prewarm()
+        };
+        let mut warmed = HostedViewPrewarmState::default();
+        let first_outcome = run_prewarm_pass(&state, config, &mut warmed).await;
+        let calls_after_timeout = calls.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            let _ = run_prewarm_pass(&state, config, &mut warmed).await;
+        }
+        // Cursor advancement must not reset a guard for still-running work.
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first),
+            0x8f08,
+            "advance after timed-out pre-warm",
+            &[(
+                "advanced_timeout_symbol",
+                "src/after-timeout.rs",
+                "fn advanced_timeout_symbol() {}\n",
+            )],
+        );
+        let _ = run_prewarm_pass(&state, config, &mut warmed).await;
+        let calls_after_retries = calls.load(Ordering::SeqCst);
+        // Release every blocked worker before asserting the red result.
+        allowed.store(usize::MAX, Ordering::SeqCst);
+        drop(release_on_exit);
+        until_hosted_hook(|| {
+            !hosted_view_hydration_test_hooks::flight_registered(&state, &repo_id)
+        })
+        .await;
+        // The 100 ms budget exists to time out the pre-warm above. The read
+        // below is an ordinary request, so it hydrates under the ordinary
+        // admission budget, as it would in a daemon. Left in place, the short
+        // budget failed this read whenever a loaded host slowed its hydration.
+        hosted_view_hydration_test_hooks::clear_budget(&repo_id);
+        // The hold starts once the read's own flight is registered, which is
+        // before that flight's budget starts, so it covers the recovery
+        // hydration rather than the time before the read began. The abandoned
+        // pre-warm worker never registers a flight, and the timed-out one has
+        // retired, so no other flight can start the hold.
+        let held = recovery_hold.map(|hold| {
+            hosted_view_hydration_test_hooks::close_gate(&repo_id);
+            let gated_state = Arc::clone(&state);
+            let gated_repo_id = repo_id.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let anchored = loop {
+                    if hosted_view_hydration_test_hooks::flight_registered(
+                        &gated_state,
+                        &gated_repo_id,
+                    ) {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                if anchored {
+                    std::thread::sleep(hold);
+                }
+                hosted_view_hydration_test_hooks::open_gate(&gated_repo_id);
+                anchored
+            })
+        });
+        let ordinary_read =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(10)).await;
+        if let Some(held) = held {
+            assert!(
+                held.join().unwrap(),
+                "the recovery read registered a flight for the hold to cover"
+            );
+        }
+        assert_eq!(
+            calls_after_timeout,
+            stall_after + 1,
+            "one physical probe reached the stall: {first_outcome:?}"
+        );
+        assert_eq!(
+            calls_after_retries, calls_after_timeout,
+            "automatic polls must not start another worker after timeout"
+        );
+        assert!(
+            ordinary_read.is_ok(),
+            "ordinary reads retain their recovery path: {:?}",
+            ordinary_read.err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_probe_timeout_stops_automatic_retries_until_restart() {
+        prewarm_does_not_repeat_timed_out_work(0, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_hydration_timeout_stops_automatic_retries_until_restart() {
+        // Pre-warm's first probe and resolution's probe answer; the first
+        // physical hydration probe then stalls beyond its admission budget.
+        prewarm_does_not_repeat_timed_out_work(2, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_resolution_probe_timeout_stops_automatic_retries_until_restart() {
+        // The pre-warm observation answers, but resolution's own probe stalls.
+        prewarm_does_not_repeat_timed_out_work(1, None).await;
+    }
+
+    /// The recovery read after a timed-out pre-warm is an ordinary request, so
+    /// its hydration runs under the ordinary admission budget. Holding that
+    /// hydration past the 100 ms budget the pre-warm timed out under stands in
+    /// for a loaded host, where the same read otherwise fails by chance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_timeout_recovery_read_outlasts_the_timed_out_budget() {
+        for stall_after in [0, 1, 2] {
+            prewarm_does_not_repeat_timed_out_work(stall_after, Some(Duration::from_millis(300)))
+                .await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_completed_backend_failures_remain_retryable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        install_test_registry_override();
+        for failure_call in [1, 2, 3] {
+            let repo_id = format!("repo-prewarm-recover-{}", Uuid::new_v4());
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let working = tempfile::tempdir().unwrap();
+            let layout = kin_core::init(working.path()).unwrap().layout;
+            let storage = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let fail_on_call = Arc::new(AtomicUsize::new(usize::MAX));
+            let state = Arc::new(
+                DaemonState::open_with_backend(
+                    layout,
+                    Box::new(crate::storage_delegate::DelegatingBackend::new(
+                        StallingCursorBackend {
+                            inner: kin_db::LocalFileBackend::new(storage.path().to_path_buf()),
+                            allowed: Arc::new(AtomicUsize::new(usize::MAX)),
+                            calls: Arc::clone(&calls),
+                            fail_on_call: Arc::clone(&fail_on_call),
+                            release: Arc::new((
+                                std::sync::Mutex::new(true),
+                                std::sync::Condvar::new(),
+                            )),
+                        },
+                    )),
+                    &repo_id,
+                    None,
+                )
+                .unwrap(),
+            );
+            publish_hosted_semantic_change(
+                storage.path(),
+                &repository_id,
+                None,
+                0x8f09,
+                "publish recoverable pre-warm fixture",
+                &[(
+                    "recover_symbol",
+                    "src/recover.rs",
+                    "fn recover_symbol() {}\n",
+                )],
+            );
+            calls.store(0, Ordering::SeqCst);
+            fail_on_call.store(failure_call, Ordering::SeqCst);
+            let mut progress = HostedViewPrewarmState::default();
+            let failed = run_prewarm_pass(&state, unbounded_prewarm(), &mut progress).await;
+            assert!(matches!(
+                failed[0].1,
+                HostedViewPrewarmOutcome::ProbeFailed
+                    | HostedViewPrewarmOutcome::Refused("repo_authority_unavailable")
+            ));
+            assert!(
+                progress.quarantined.is_empty(),
+                "completed errors must not quarantine"
+            );
+            let recovered = run_prewarm_pass(&state, unbounded_prewarm(), &mut progress).await;
+            assert_eq!(recovered, vec![(repo_id, HostedViewPrewarmOutcome::Warmed)]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_api_owner_drop_releases_its_scheduler() {
+        let repo_id = format!("repo-prewarm-owner-{}", Uuid::new_v4());
+        let (state, _working, _storage) = replica_state(&repo_id);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task_state = Arc::clone(&state);
+        let task = HostedViewPrewarmTask(tokio::spawn(async move {
+            let _state = task_state;
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        entered_rx.await.unwrap();
+        assert_eq!(Arc::strong_count(&state), 2);
+        drop(task);
+        until_hosted_hook(|| Arc::strong_count(&state) == 1).await;
+    }
+
+    /// A pass warms each served repository once per publication, finds it
+    /// current on the next pass, and warms it again after it publishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prewarm_pass_warms_each_publication_once() {
+        let repo_id = format!("repo-prewarm-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        let (first_change, _) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8f01,
+            "publish pre-warm fixture",
+            &[(
+                "prewarm_symbol",
+                "src/prewarm.rs",
+                "fn prewarm_symbol() {}\n",
+            )],
+        );
+        let mut warmed = HostedViewPrewarmState::default();
+
+        let first = run_prewarm_pass(&state, unbounded_prewarm(), &mut warmed).await;
+        assert_eq!(
+            first,
+            vec![(repo_id.clone(), HostedViewPrewarmOutcome::Warmed)]
+        );
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 1);
+        let installed = state
+            .repo_semantic_views
+            .read()
+            .await
+            .get(&repo_id)
+            .cloned();
+        let read = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .unwrap();
+        assert!(installed.is_some_and(|view| Arc::ptr_eq(&view, &read)));
+
+        let again = run_prewarm_pass(&state, unbounded_prewarm(), &mut warmed).await;
+        assert_eq!(
+            again,
+            vec![(repo_id.clone(), HostedViewPrewarmOutcome::AlreadyCurrent)]
+        );
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 1);
+
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x8f02,
+            "publish after pre-warm",
+            &[(
+                "advanced_symbol",
+                "src/advanced.rs",
+                "fn advanced_symbol() {}\n",
+            )],
+        );
+        let advanced = run_prewarm_pass(&state, unbounded_prewarm(), &mut warmed).await;
+        assert_eq!(
+            advanced,
+            vec![(repo_id.clone(), HostedViewPrewarmOutcome::Warmed)]
+        );
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 2);
+    }
+
+    /// A pass never starts a second hydration beside one already running for
+    /// the same repository.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prewarm_pass_leaves_a_running_hydration_alone() {
+        let repo_id = format!("repo-prewarm-inflight-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8f03,
+            "publish in-flight pre-warm fixture",
+            &[(
+                "inflight_symbol",
+                "src/inflight.rs",
+                "fn inflight_symbol() {}\n",
+            )],
+        );
+        hosted_view_hydration_test_hooks::close_gate(&repo_id);
+        let reader = tokio::spawn({
+            let state = Arc::clone(&state);
+            let repo_id = repo_id.clone();
+            async move {
+                load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(30))
+                    .await
+            }
+        });
+        until_hosted_hook(|| hosted_view_hydration_test_hooks::hydrations(&repo_id) == 1).await;
+
+        let mut warmed = HostedViewPrewarmState::default();
+        let pass = run_prewarm_pass(&state, unbounded_prewarm(), &mut warmed).await;
+        assert_eq!(
+            pass,
+            vec![(repo_id.clone(), HostedViewPrewarmOutcome::HydrationInFlight)]
+        );
+
+        hosted_view_hydration_test_hooks::open_gate(&repo_id);
+        reader.await.unwrap().unwrap();
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 1);
+    }
+
+    /// A pass defers rather than hydrates when available memory is under its
+    /// floor, and an unreadable reading does not refuse it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prewarm_pass_defers_under_its_memory_floor() {
+        let repo_id = format!("repo-prewarm-memory-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8f04,
+            "publish memory-floor pre-warm fixture",
+            &[("floor_symbol", "src/floor.rs", "fn floor_symbol() {}\n")],
+        );
+        let unreachable_floor = HostedViewPrewarmConfig {
+            enabled: true,
+            min_available_bytes: u64::MAX,
+            probe_wait: HOSTED_VIEW_PREWARM_PROBE_WAIT,
+        };
+        let mut warmed = HostedViewPrewarmState::default();
+        let pass = run_prewarm_pass(&state, unreachable_floor, &mut warmed).await;
+        match kin_core::memory_pressure::read().reading() {
+            Some(_) => {
+                assert!(matches!(
+                    pass.as_slice(),
+                    [(repo, HostedViewPrewarmOutcome::MemoryShort { .. })] if repo == &repo_id
+                ));
+                assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 0);
+                assert!(state
+                    .repo_semantic_views
+                    .read()
+                    .await
+                    .get(&repo_id)
+                    .is_none());
+            }
+            None => {
+                assert_eq!(
+                    pass,
+                    vec![(repo_id.clone(), HostedViewPrewarmOutcome::Warmed)]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_hydration_saturation_is_isolated_between_test_states() {
+        let saturated_id = format!("repo-hydration-saturated-{}", Uuid::new_v4());
+        let independent_id = format!("repo-hydration-independent-{}", Uuid::new_v4());
+        let (saturated, _saturated_working, _saturated_storage) = replica_state(&saturated_id);
+        let (independent, _working, storage) = replica_state(&independent_id);
+        let repository_id = RepositoryId::new(independent_id.clone()).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8ef2,
+            "publish independent admission fixture",
+            &[(
+                "independent_symbol",
+                "src/independent.rs",
+                "fn independent_symbol() {}\n",
+            )],
+        );
+        let slots = hosted_repository_hydrations(&saturated);
+        let held = Arc::clone(&slots).try_acquire_many_owned(2).unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        assert!(independent.repo_semantic_views.read().await.is_empty());
+        load_hosted_repository_mcp_view(&independent, &independent_id)
+            .await
+            .expect("another test state's occupied slots must not refuse this cold fixture");
+        assert_eq!(slots.available_permits(), 0);
+        drop(held);
         assert_eq!(slots.available_permits(), 2);
     }
 
@@ -34126,6 +39280,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             AuthorId::new("kindb-root-swap-background-test"),
+            &[],
+            &[],
         )
         .unwrap_err();
 
@@ -39316,7 +44472,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
@@ -39349,7 +44505,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
@@ -39426,7 +44582,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
@@ -39637,6 +44793,7 @@ mod tests {
             .unwrap();
         let spanned = entities
             .iter()
+            .filter(|entity| entity.kind != kin_model::EntityKind::Module)
             .filter_map(|entity| entity.span.as_ref().map(|span| span.start_line))
             .collect::<Vec<_>>();
         assert_eq!(
@@ -39645,6 +44802,180 @@ mod tests {
             "the fixture holds exactly one spanned entity at {path}, found {spanned:?}"
         );
         spanned[0]
+    }
+
+    /// POST one JSON body and return its status and parsed answer.
+    #[cfg(unix)]
+    async fn post_json(
+        app: &axum::Router,
+        route: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(route)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"text": String::from_utf8_lossy(&bytes)}));
+        (status, value)
+    }
+
+    #[cfg(unix)]
+    fn session_base(
+        session_dir: &std::path::Path,
+    ) -> kin_cli::commands::session_workspace::SessionWorkspaceBase {
+        serde_json::from_slice(&std::fs::read(session_dir.join(".kin-session/base.json")).unwrap())
+            .unwrap()
+    }
+
+    /// An agent's toolchain write-back is admitted under its toolchain's
+    /// manifest policy and recorded as a change attributed to its session,
+    /// only while the workspace still holds exactly the tree that admission
+    /// published; and the next session workspace, the next command's
+    /// `ran_on`, is materialized from that change.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn an_exec_write_back_commits_the_tree_its_admission_published_and_nothing_else() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("main.go"),
+            b"package main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
+        let app = router(Arc::clone(&state));
+        let seeded = commit_through_api(&app, kin_model::OperationId::new(), "seed").await;
+
+        let (status, started) = post_json(
+            &app,
+            "/session",
+            json!({
+                "vendor": "exec-test",
+                "client_name": "exec write-back",
+                "transport": "mcp",
+                "cwd": state.layout.working_dir().display().to_string(),
+                "capabilities": {"can_read": true, "can_write": true, "can_execute": true,
+                                 "can_branch": false, "can_commit": true, "max_concurrent_intents": 1},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        let session_id = started["session_id"].as_str().unwrap().to_string();
+
+        // The run's workspace is materialized from the seed change.
+        let first = state.layout.root().join("runs/session-exec-first");
+        materialize_session_through_api(&app, &first).await;
+        assert_eq!(
+            session_base(&first).source_workspace.base_target,
+            Some(kin_model::RefTarget::change(seeded))
+        );
+        std::fs::write(first.join("go.mod"), b"module example.com/app\n\ngo 1.25\n").unwrap();
+        std::fs::write(first.join("extra.go"), b"package main\n").unwrap();
+        std::fs::write(first.join("package.json"), b"{}\n").unwrap();
+        let (status, summary) = post_json(
+            &app,
+            "/reconcile",
+            json!({"session_dir": first, "write_back": {"manifests_of": "go"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        let summary: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_value(summary).unwrap();
+        assert_eq!(summary.added, 1, "only go.mod is admitted: {summary:?}");
+        assert_eq!(summary.withheld.len(), 2, "{summary:?}");
+
+        let commit = |generation: u64| {
+            json!({
+                "operation_id": kin_model::OperationId::new(),
+                "timestamp": Timestamp::now(),
+                "session_id": session_id,
+                "message": "go mod init example.com/app: update go.mod",
+                "authored_paths": ["go.mod"],
+                "expected_workspace_generation": generation,
+                "expected_tree_hash": summary.desired_tree_hash,
+            })
+        };
+        // An expectation the workspace no longer matches commits nothing.
+        let (status, refused) = post_json(
+            &app,
+            "/commands/exec-commit",
+            commit(summary.workspace_generation + 1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert!(refused.to_string().contains("workspace_moved"), "{refused}");
+
+        let (status, committed) = post_json(
+            &app,
+            "/commands/exec-commit",
+            commit(summary.workspace_generation),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{committed}");
+        let change_id = SemanticChangeId::from_hash(
+            Hash256::from_hex(committed["change_id"].as_str().unwrap()).unwrap(),
+        );
+        let tree_hash: kin_model::Hash256 =
+            serde_json::from_value(committed["tree_hash"].clone()).unwrap();
+        assert_eq!(tree_hash, summary.desired_tree_hash);
+
+        // Attributed to the session, exactly as its kin_mutate commits are.
+        let authority = held_repository_authority(&state).unwrap();
+        let change = authority
+            .read_authority()
+            .snapshot()
+            .changes
+            .get(&change_id)
+            .cloned()
+            .expect("the exec change is in history");
+        assert!(
+            change
+                .author
+                .to_string()
+                .contains(&format!("mcp-agent:{session_id}")),
+            "{}",
+            change.author
+        );
+        assert_eq!(
+            change.tree_deltas.len(),
+            1,
+            "only go.mod: {:?}",
+            change.tree_deltas
+        );
+
+        // The next command's workspace is materialized from that change.
+        let second = state.layout.root().join("runs/session-exec-second");
+        materialize_session_through_api(&app, &second).await;
+        let next = session_base(&second).source_workspace;
+        assert_eq!(
+            next.base_target,
+            Some(kin_model::RefTarget::change(change_id))
+        );
+        assert_eq!(next.tree_hash, tree_hash);
+        assert_eq!(
+            next.generation,
+            committed["workspace_generation"].as_u64().unwrap()
+        );
     }
 
     /// FIR-3200 measurement. Reproduce the brownfield stranger's stale span:
@@ -39664,6 +44995,11 @@ mod tests {
         let host_path = repo.path().join("shifted.rs");
         std::fs::write(&host_path, b"pub fn shifted() -> u32 { 7 }\n").unwrap();
 
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(Arc::clone(&state));
         commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
         let before = published_start_line(&state, "shifted.rs");
@@ -39749,6 +45085,11 @@ mod tests {
         )
         .unwrap();
 
+        let singleton = session_runtime_lock(&state);
+        let runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(Arc::clone(&state));
         commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
         let before = published_start_line(&state, "shifted.rs");
@@ -39764,19 +45105,13 @@ mod tests {
         // publishes it. Whatever the readmission derived has to be on disk
         // already for the next one to load it.
         drop(app);
+        drop(runtime);
+        drop(singleton);
         drop(state);
         let reopened = Arc::new(DaemonState::open(layout).unwrap());
         reopened
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        // The seam the reconcile loop drives once per daemon life, before it
-        // answers anything. Called directly here because this test drives the
-        // daemon's HTTP surface rather than its loop, and what is being asserted
-        // is that the record carries the parse across the restart, not that a
-        // background task eventually fires.
-        crate::loop_runner::drain_semantic_debt(&reopened)
-            .await
-            .unwrap();
         assert_eq!(
             published_start_line(&reopened, "shifted.rs"),
             before + PREPENDED_LINES,
@@ -39805,9 +45140,10 @@ mod tests {
     /// standing, or the next restart before a commit reads the pre-edit span
     /// with nothing left to say otherwise.
     ///
-    /// Falsify by moving `settle_all` into `drain_semantic_debt`: the first
-    /// assertion on the record goes red, and the second reopen reads the
-    /// pre-edit span with no record to pay it from.
+    /// The record lives in the owed derivation ledger, and only a transaction
+    /// removes one from there: a commit that pays it, or one that moves its
+    /// path off the body it owes. Falsify by recording nothing in the fixture's
+    /// publication: the first reopen drains nothing and the span stays put.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(commit_phase_capture)]
@@ -39831,7 +45167,7 @@ mod tests {
         let session_dir = layout.root().join("runs/session-fir3208-standing");
         materialize_session_through_api(&app, &session_dir).await;
         prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
-        reconcile_session_through_api(&app, &session_dir).await;
+        publish_legacy_session_tree_for_debt_fixture(&state, &session_dir, true).await;
         drop(app);
         drop(state);
 
@@ -39886,8 +45222,8 @@ mod tests {
 
     /// FIR-3208. One unrelated edit must not settle a debt nothing has paid.
     ///
-    /// The commit that carries an admission clears the whole record once its
-    /// transaction reaches authority. An admission that drained only when its
+    /// The commit that carries an admission pays the workspace's whole record
+    /// inside its own transaction. An admission that drained only when its
     /// own transition was empty would therefore let a one-line edit somewhere
     /// else discard a parse another file was still owed, and the file would stay
     /// stale with the record saying it was settled.
@@ -39926,7 +45262,7 @@ mod tests {
         let session_dir = layout.root().join("runs/session-fir3208-unrelated");
         materialize_session_through_api(&app, &session_dir).await;
         prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
-        reconcile_session_through_api(&app, &session_dir).await;
+        publish_legacy_session_tree_for_debt_fixture(&state, &session_dir, true).await;
 
         // The restart is what makes the debt matter: the publication's own
         // re-derivation lives in the derived graph, and the next daemon rebuilds
@@ -40002,25 +45338,9 @@ mod tests {
         let mut broken = std::fs::read(&session_file).unwrap();
         broken.extend_from_slice(b"pub fn half_written(\n");
         std::fs::write(&session_file, &broken).unwrap();
-        // The reconcile refuses, because the caller who just published these
-        // bytes is the one who needs to know their semantics did not follow.
-        let refusal = app
-            .clone()
-            .oneshot(
-                Request::post("/reconcile")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"session_dir": session_dir, "confirm_mass_deletion": false})
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(refusal.status(), StatusCode::CONFLICT);
-
-        // The commit after it does not refuse. The caller has been told once,
-        // the bytes are durable, and blocking them buys nothing.
+        // Ordinary host admission retains broken-source/LKG behavior. The
+        // prepared session path separately refuses this before publication.
+        std::fs::write(repo.path().join("shifted.rs"), &broken).unwrap();
         drop(app);
         drop(state);
         let reopened = Arc::new(DaemonState::open(layout).unwrap());
@@ -40052,8 +45372,8 @@ mod tests {
     /// as partial, and enqueues an ordinary host event for the ambient loop,
     /// recording nothing. A commit landing before that event is serviced plans
     /// its tree half and its entity half out of a graph that does not agree with
-    /// itself, and seals the new bytes against the old spans. Removing the
-    /// record here is what leaves the planner's own check standing alone.
+    /// itself, and seals the new bytes against the old spans. Recording nothing
+    /// here is what leaves the planner's own check standing alone.
     ///
     /// Falsifies both halves of that check. Remove the barrier from
     /// `plan_native_commit_inner` and the commit succeeds with the span still
@@ -40085,25 +45405,24 @@ mod tests {
         let session_dir = layout.root().join("runs/session-unrecorded-stale-path");
         materialize_session_through_api(&app, &session_dir).await;
         prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
-        reconcile_session_through_api(&app, &session_dir).await;
+        // And this is what makes it a path nothing recorded: the publication
+        // moves the bytes and records no parse owed for them.
+        publish_legacy_session_tree_for_debt_fixture(&state, &session_dir, false).await;
 
         // The restart is what makes the graph stale: the publication's own
         // re-derivation lives in the derived graph, and the next daemon rebuilds
         // that from a history this publication deliberately did not write.
         drop(app);
         drop(state);
-        // And this is what makes it a path nothing recorded. The `expect` is the
-        // fixture's own guard: if the reconcile stopped writing the record, the
-        // removal proves nothing and this test has to say so rather than pass.
-        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
-            "the session reconcile must have recorded what it owed, or removing the record \
-             proves nothing",
-        );
 
         let reopened = Arc::new(DaemonState::open(layout).unwrap());
         reopened
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            crate::semantic_debt::outstanding(&reopened).is_empty(),
+            "no record names the path, or this grades the drain rather than the planner"
+        );
         assert_eq!(
             published_start_line(&reopened, "shifted.rs"),
             before,
@@ -40170,19 +45489,19 @@ mod tests {
         let session_dir = layout.root().join("runs/session-staging-pruned");
         materialize_session_through_api(&app, &session_dir).await;
         prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
-        reconcile_session_through_api(&app, &session_dir).await;
+        publish_legacy_session_tree_for_debt_fixture(&state, &session_dir, false).await;
 
         drop(app);
         drop(state);
-        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
-            "the session reconcile must have recorded what it owed, or removing the record \
-             proves nothing",
-        );
 
         let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
         reopened
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            crate::semantic_debt::outstanding(&reopened).is_empty(),
+            "no record names the path, or this grades the drain rather than the planner"
+        );
         assert_eq!(
             published_start_line(&reopened, "shifted.rs"),
             before,
@@ -40283,8 +45602,11 @@ mod tests {
     /// the whole class the record exists to close.
     ///
     /// The trigger is graph-owned rather than contrived: the record names a body
-    /// the exact tree still carries, and the CAS cannot produce it. That is the
-    /// shape of a store whose ingestion CAS was pruned under it.
+    /// the exact tree still carries, no parse the reopened graph holds answers
+    /// for that body, and the CAS cannot produce it. That is the shape of a
+    /// store whose ingestion CAS was pruned under it. A record for a body the
+    /// graph has already parsed is not owed at all, so the fixture publishes a
+    /// new body and restarts rather than naming the body the commit parsed.
     ///
     /// Falsify by treating every drain failure as unparseable: this commit then
     /// succeeds and settles a record nothing paid.
@@ -40294,6 +45616,7 @@ mod tests {
     async fn a_drain_failure_that_is_not_the_file_refuses_the_commit() {
         let repo = tempfile::tempdir().unwrap();
         let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
         let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
         state
             .is_initialized
@@ -40305,6 +45628,21 @@ mod tests {
         .unwrap();
         let app = router(Arc::clone(&state));
         commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let session_dir = layout.root().join("runs/session-fir3208-unpayable");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), 17);
+        publish_legacy_session_tree_for_debt_fixture(&state, &session_dir, true).await;
+
+        // The restart is what leaves the record owed: the publication's own
+        // re-derivation lived in the derived graph, and the next daemon holds no
+        // parse of the body the record names.
+        drop(app);
+        drop(state);
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(Arc::clone(&state));
 
         let repo_path = RepoPath::from_utf8("shifted.rs".to_string()).unwrap();
         let tree = state.graph.resolved_tree();
@@ -40314,15 +45652,24 @@ mod tests {
             panic!("the fixture is a regular file");
         };
         drop(tree);
-        crate::semantic_debt::record(
-            &state,
-            &[crate::semantic_debt::SemanticDebt {
-                path: "shifted.rs".to_string(),
-                body: hash.to_string(),
-            }],
+        assert!(
+            crate::semantic_debt::outstanding(&state)
+                .iter()
+                .any(|debt| debt.path == "shifted.rs" && debt.body == hash.to_string()),
+            "the record must name the body the tree carries, or this grades nothing"
         );
         let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let owed_body = state.blobs.read(&body_hash).unwrap();
         state.blobs.delete(&body_hash).unwrap();
+
+        let before_tree = state.graph.resolved_tree();
+        let before_debt = crate::semantic_debt::outstanding(&state);
+        let authority =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap()
+                .open()
+                .unwrap();
+        let before_roots = authority.read_authority().roots().clone();
 
         std::fs::write(
             repo.path().join("other.rs"),
@@ -40363,67 +45710,161 @@ mod tests {
             refusal["message"].as_str().unwrap().contains("shifted.rs"),
             "the refusal names the path it could not pay: {body}"
         );
+        assert!(refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains(&hash.to_string()));
+        assert_eq!(state.graph.resolved_tree(), before_tree);
+        assert_eq!(crate::semantic_debt::outstanding(&state), before_debt);
+        assert_eq!(
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap()
+                .open()
+                .unwrap()
+                .read_authority()
+                .roots(),
+            &before_roots,
+            "source preflight refusal must not publish even the unrelated new file"
+        );
+        assert_eq!(state.blobs.write(&owed_body).unwrap(), body_hash);
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "retry after repairing the exact owed CAS body",
+        )
+        .await;
+        assert!(crate::semantic_debt::outstanding(&state).is_empty());
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("other.rs".to_string()).unwrap())
+            .is_some());
     }
 
-    /// FIR-3200. A session that publishes a file the parser cannot parse is
-    /// refused in words, and the bytes stay published.
+    /// A record leaves the ledger the moment a transaction moves its path off
+    /// the body it owes, and the store reopens valid.
     ///
-    /// This is the arm I could not build a deterministic trigger for until
-    /// review found the defect underneath it. The daemon reconciles under
-    /// `ReconcilePolicy::FallbackToLkg`, so unparseable source comes back as
-    /// `ReconcileOutcome::BrokenAst`: last-known-good state retained, no
-    /// transaction derived, the file still answering at the positions its
-    /// previous parse recorded. Counting that as enrichment reproduced this
-    /// change's own defect one level down, on the most ordinary agent case there
-    /// is, a file caught mid-edit.
-    ///
-    /// So the trigger is the ordinary case: prepend the seventeen lines and
-    /// leave the file syntactically broken. The reconcile must name the file
-    /// rather than report a clean summary, and the tree must still carry the
-    /// bytes, because a parser never retracts membership.
-    ///
-    /// Falsify by restoring the unconditional `outcome.enriched += 1` outside
-    /// the applied-delta arm: this returns 200 with enriched 1 and failures 0
-    /// over a file whose span never moved.
+    /// Checkout is such a transaction: it restores the path to the body a
+    /// change holds. Nothing in the daemon pays or settles the record; storage
+    /// drops it while preparing the successor, because that tree no longer
+    /// names the body. Falsify by removing that drop: the checkout's commit
+    /// refuses a ledger naming a body its tree does not hold.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_checkout_off_an_owed_body_drops_its_record() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let original = b"pub fn shifted() -> u32 { 7 }\n";
+        std::fs::write(repo.path().join("shifted.rs"), original).unwrap();
+        let app = router(Arc::clone(&state));
+        let committed =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let session_dir = layout.root().join("runs/session-overtaken-record");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), 17);
+        publish_legacy_session_tree_for_debt_fixture(&state, &session_dir, true).await;
+        assert_eq!(
+            crate::semantic_debt::outstanding(&state).len(),
+            1,
+            "the publication owes the parse of the body it moved"
+        );
+
+        let checkout = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("shifted.rs".to_string()),
+            path_hex: None,
+            change_id: Some(committed.to_string()),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("overtaken-record-test"),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&checkout).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            std::fs::read(repo.path().join("shifted.rs")).unwrap(),
+            original,
+            "the checkout restored the committed body"
+        );
+        assert!(
+            crate::semantic_debt::outstanding(&state).is_empty(),
+            "the checkout moved the path off the owed body, so its record went with it"
+        );
+
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        assert!(
+            crate::semantic_debt::outstanding_checked(&reopened)
+                .unwrap()
+                .is_empty(),
+            "and the store reopens valid with nothing owed"
+        );
+    }
+
+    /// Partial source refuses before acknowledgement: durable/live state and
+    /// primary bytes stay unchanged, the session retains the edit, and fixing
+    /// that same session can publish without creating a different operation.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(commit_phase_capture)]
     async fn a_session_publishing_unparseable_source_is_refused_and_keeps_its_bytes() {
         let repo = tempfile::tempdir().unwrap();
-        let initialized = kin_core::init(repo.path()).unwrap();
-        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        std::fs::write(
-            repo.path().join("shifted.rs"),
-            b"pub fn shifted() -> u32 { 7 }\n",
-        )
-        .unwrap();
-
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
+        let original = b"pub fn shifted() -> u32 { 7 }\n";
+        std::fs::write(repo.path().join("shifted.rs"), original).unwrap();
         let app = router(Arc::clone(&state));
         commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
-        let before = published_start_line(&state, "shifted.rs");
-
-        let session_dir = state.layout.root().join("runs/session-fir3200-broken");
+        let before_line = published_start_line(&state, "shifted.rs");
+        let session_dir = state.layout.root().join("runs/session-preack-broken");
         materialize_session_through_api(&app, &session_dir).await;
         let session_file = session_dir.join("shifted.rs");
         prepend_session_lines(&session_file, 17);
-        let mut broken = std::fs::read(&session_file).unwrap();
+        let repaired = std::fs::read(&session_file).unwrap();
+        let mut broken = repaired.clone();
         broken.extend_from_slice(b"pub fn half_written(\n");
         std::fs::write(&session_file, &broken).unwrap();
-
+        let before = state.graph.to_snapshot();
+        let authority = held_repository_authority(&state).unwrap();
+        let roots = authority.read_authority().roots().clone();
+        let base: kin_cli::commands::session_workspace::SessionWorkspaceBase =
+            serde_json::from_slice(
+                &std::fs::read(session_dir.join(".kin-session/base.json")).unwrap(),
+            )
+            .unwrap();
         let response = app
             .clone()
             .oneshot(
                 Request::post("/reconcile")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({
-                            "session_dir": session_dir,
-                            "confirm_mass_deletion": false
-                        })
-                        .to_string(),
+                        json!({"session_dir": session_dir, "confirm_mass_deletion": false})
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -40433,116 +45874,195 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
             .await
             .unwrap();
-        let body = String::from_utf8_lossy(&body).to_string();
-
-        assert_eq!(
-            status,
-            StatusCode::CONFLICT,
-            "a reconcile that could not re-parse what it published must not read as a clean \
-             success: {body}"
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::CONFLICT, "{message}");
+        assert!(
+            message.contains("shifted.rs") && message.contains("no preparation acknowledged"),
+            "{message}"
         );
-        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(refusal["error"], "semantic_readmission_failed");
-        assert_eq!(refusal["files"], json!(["shifted.rs"]));
-        assert_eq!(refusal["summary"]["semantic_files_enriched"], json!(0));
-        assert_eq!(refusal["summary"]["semantic_enrichment_failures"], json!(1));
-
-        // Membership is not in doubt, and a parser may not retract it. The
-        // refusal is a report of a graph gap, never a rollback.
-        let tree = state.graph.resolved_tree();
-        let published = tree
-            .artifact_at_path(&RepoPath::from_utf8("shifted.rs".to_string()).unwrap())
-            .expect("the path stays in the exact tree");
-        let kin_model::TreeEntry::Blob { hash, .. } = published.entry else {
-            panic!("the fixture is a regular file");
-        };
+        assert_eq!(authority.read_authority().roots(), &roots);
+        assert_session_snapshot_unchanged(&before, &state.graph.to_snapshot());
         assert_eq!(
-            state
-                .blobs
-                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
-                .expect("the published body is readable"),
+            std::fs::read(repo.path().join("shifted.rs")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(&session_file).unwrap(),
             broken,
-            "the refusal reports a gap in the graph and never retracts the bytes"
+            "refused edits stay in their disposable session"
         );
+        assert!(authority
+            .load_prepared_session_publication(base.reconcile_operation_id)
+            .unwrap()
+            .is_none());
+        assert!(!state.prepared_publication.pending());
+        assert_eq!(published_start_line(&state, "shifted.rs"), before_line);
+        std::fs::write(&session_file, &repaired).unwrap();
+        let summary = reconcile_session_through_api(&app, &session_dir).await;
+        assert_eq!(summary.semantic_enrichment_failures, 0);
+        assert_eq!(published_start_line(&state, "shifted.rs"), before_line + 17);
         assert_eq!(
-            published_start_line(&state, "shifted.rs"),
-            before,
-            "an unparseable file keeps its last-known-good spans, which is what the refusal is \
-             telling the caller about"
+            std::fs::read(repo.path().join("shifted.rs")).unwrap(),
+            repaired
         );
     }
 
-    /// FIR-3200. The refusal a reconcile returns when its bytes published and
-    /// their semantics did not.
-    ///
-    /// The shape is the whole point, so the shape is what is asserted: a status
-    /// the CLI turns into a non-zero exit, every file named, and the complete
-    /// summary carried inside so refusing costs a caller nothing a success would
-    /// have told them. A 200 with a degradation block would satisfy none of
-    /// that: `daemon_client::reconcile` returns `Ok` for any success status and
-    /// the caller reads a clean summary, which is the exact failure this change
-    /// exists to end.
-    ///
-    /// Falsify by returning `StatusCode::OK` from `semantic_readmission_refused`,
-    /// or by dropping `files` from its body: the first assertion goes red on the
-    /// status, the second on the name.
-    #[test]
-    fn a_reconcile_whose_semantics_did_not_publish_refuses_and_names_the_files() {
-        let summary = kin_cli::commands::reconcile::ReconcileSummary {
-            schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
-            operation_id: kin_model::OperationId::new(),
-            repository_id: RepositoryId::new("refusal-shape".to_string()).unwrap(),
-            authority_generation: 7,
-            workspace_generation: 9,
-            previous_tree_hash: Hash256::from_bytes([0x11; 32]),
-            desired_tree_hash: Hash256::from_bytes([0x22; 32]),
-            idempotent_replay: false,
-            changed: true,
-            added: 0,
-            modified: 1,
-            removed: 0,
-            observed_materialized_artifacts: 1,
-            preserved_graph_only_artifacts: 0,
-            observed_body_bytes: 512,
-            semantic_files_enriched: 0,
-            semantic_enrichment_failures: 1,
-            changes: Vec::new(),
-        };
-
-        let (status, body) =
-            semantic_readmission_refused(&summary, &["src/shifted.rs".to_string()]);
-
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_publication_without_runtime_owner_refuses_before_acknowledgement() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("source.py"),
+            b"def value():\n    return 1\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish source").await;
+        let session = state.layout.runs_dir().join("session-unowned");
+        materialize_session_through_api(&app, &session).await;
+        std::fs::write(session.join("source.py"), b"def value():\n    return 2\n").unwrap();
+        let before = state.graph.to_snapshot();
+        let authority = held_repository_authority(&state).unwrap();
+        let roots = authority.read_authority().roots().clone();
+        let response = app
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_dir": session, "confirm_mass_deletion": false}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
-            "the CLI turns any non-success status into a non-zero exit; a 2xx here reads as a \
-             clean reconcile over a file that still answers at its old spans"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
         );
-        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert!(String::from_utf8_lossy(&body).contains("NoSupervisor"));
+        assert_eq!(authority.read_authority().roots(), &roots);
+        assert_session_snapshot_unchanged(&before, &state.graph.to_snapshot());
         assert_eq!(
-            refusal["files"],
-            json!(["src/shifted.rs"]),
-            "a reader cannot act on a count; the refusal has to name the file"
+            std::fs::read(repo.path().join("source.py")).unwrap(),
+            b"def value():\n    return 1\n"
         );
+        assert!(authority
+            .active_prepared_session_publication()
+            .unwrap()
+            .is_none());
+    }
+
+    /// Construct a valid pre-prepared-publication store through its retained
+    /// tree-only writer. These legacy debt tests must not require the current
+    /// session handler to publish stale durable semantics to set up their case.
+    ///
+    /// `owe` records the parse the publication owes in the workspace's owed
+    /// derivation ledger inside the same commit, as a standalone publication
+    /// does. Without it the bytes move and nothing records what they owe.
+    #[cfg(unix)]
+    async fn publish_legacy_session_tree_for_debt_fixture(
+        state: &Arc<DaemonState>,
+        session_dir: &std::path::Path,
+        owe: bool,
+    ) {
+        let _coordination = state.coordination_gate.lock().await;
+        let _mutation = state.begin_graph_authority_mutation();
+        let binding = state.local_repository_authority_binding().unwrap();
+        let observation = kin_cli::commands::reconcile::observe_session_workspace(
+            &state.layout,
+            &binding,
+            session_dir,
+            &state.blobs,
+            false,
+        )
+        .unwrap();
+        assert!(observation.deltas().iter().all(|delta| {
+            matches!((delta.old_state(), delta.new_state()), (Some(old), Some(new)) if old.path == new.path)
+        }), "legacy fixture changes bodies at existing paths only");
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap();
+        let plan = crate::repository_commit::plan_session_workspace_admission(
+            &state.layout,
+            &state.blobs,
+            &context,
+            &observation,
+        )
+        .unwrap();
+        let owed = owe.then(|| {
+            kin_db::OwedDerivationUpdate::owe(
+                binding.workspace_id(),
+                crate::semantic_debt::owed_by(observation.deltas()),
+                Vec::new(),
+            )
+        });
+        let committed = crate::repository_commit::commit_session_workspace_admission(
+            &state.layout,
+            &state.blobs,
+            &context,
+            plan,
+            owed.as_ref(),
+        )
+        .unwrap();
+        state
+            .record_repository_authority_commit(committed.receipt.generation)
+            .unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: observation.deltas().to_vec(),
+                ..Default::default()
+            })
+            .unwrap();
+        let paths = observation
+            .deltas()
+            .iter()
+            .filter_map(|d| d.new_state().map(|a| a.path.clone()))
+            .collect();
+        let readmitted = crate::loop_runner::readmit_semantics_for_paths(state, &paths).await;
+        assert!(readmitted.failed.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn assert_session_snapshot_unchanged(
+        before: &kin_db::GraphSnapshot,
+        after: &kin_db::GraphSnapshot,
+    ) {
+        // Snapshot encodings contain unordered maps; compare their graph domains
+        // through the structural delta, including every layout and artifact facet.
+        assert_eq!(before.version, after.version);
+        assert_eq!(
+            before.verified_binding_history,
+            after.verified_binding_history
+        );
+        assert!(before.materialized_graph.is_none() && after.materialized_graph.is_none());
+        let delta = kin_db::compute_graph_delta(before, after, 0);
         assert!(
-            refusal["message"]
-                .as_str()
-                .unwrap()
-                .contains("src/shifted.rs"),
-            "the sentence a person reads must name the file too: {body}"
+            delta.is_empty(),
+            "session changed graph snapshot: {delta:?}"
         );
-        assert_eq!(
-            refusal["summary"]["semantic_enrichment_failures"],
-            json!(1),
-            "refusing must not cost the caller what a success would have reported"
-        );
-        assert_eq!(refusal["summary"]["modified"], json!(1));
+    }
+
+    #[cfg(unix)]
+    fn session_runtime_lock(state: &DaemonState) -> crate::lifecycle::DaemonLock {
+        crate::lifecycle::acquire_singleton_lock(state.layout.root())
+            .unwrap()
+            .expect("owned session fixture runtime")
     }
 
     /// FIR-3200. Materialize a disposable session projection, the way
     /// `kin exec` does before it runs anything.
-    #[cfg(unix)]
     async fn materialize_session_through_api(app: &axum::Router, session_dir: &std::path::Path) {
         let response = app
             .clone()
@@ -40580,7 +46100,6 @@ mod tests {
     }
 
     /// FIR-3200. Admit one session's observation and return its summary.
-    #[cfg(unix)]
     async fn reconcile_session_through_api(
         app: &axum::Router,
         session_dir: &std::path::Path,
@@ -41010,6 +46529,11 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         std::fs::write(repo.path().join("keep.rs"), b"pub fn keep() -> u32 { 1 }\n").unwrap();
         std::fs::write(repo.path().join("gone.rs"), b"pub fn gone() -> u32 { 7 }\n").unwrap();
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(Arc::clone(&state));
         commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
         let entities_at = |path: &str| {
@@ -41027,8 +46551,12 @@ mod tests {
             gone_before.len(),
             entities_at("keep.rs").len()
         );
-        assert_eq!(gone_before.len(), 1, "the fixture owns exactly one entity");
-        let gone_id = gone_before[0].id;
+        assert_eq!(
+            gone_before.len(),
+            2,
+            "the fixture owns two entities (function and module)"
+        );
+        let gone_ids: Vec<_> = gone_before.iter().map(|e| e.id).collect();
 
         let session_dir = state.layout.root().join("runs/session-fir3209");
         materialize_session_through_api(&app, &session_dir).await;
@@ -41071,8 +46599,10 @@ mod tests {
             entities_at("gone.rs").is_empty(),
             "an entity must not outlive the path that owned it"
         );
-        assert_eq!(entities_at("keep.rs").len(), 1, "the sibling is untouched");
-        assert!(state.graph.get_entity(&gone_id).unwrap().is_none());
+        assert_eq!(entities_at("keep.rs").len(), 2, "the sibling is untouched");
+        for gone_id in &gone_ids {
+            assert!(state.graph.get_entity(gone_id).unwrap().is_none());
+        }
         assert!(state
             .graph
             .query_entities(&kin_db::EntityFilter {
@@ -41094,7 +46624,7 @@ mod tests {
         assert!(
             change.entity_deltas.iter().any(|delta| matches!(
                 delta,
-                kin_model::EntityDelta::Removed { old } if old.id == gone_id
+                kin_model::EntityDelta::Removed { old } if gone_ids.contains(&old.id)
             )),
             "the commit after the session must record the entity's removal: {:?}",
             change.entity_deltas
@@ -41139,6 +46669,11 @@ mod tests {
             b"import { gone } from \"./gone\";\nexport function keep(): number { return gone(); }\n",
         )
         .unwrap();
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(Arc::clone(&state));
         commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
         let gone_path = RepoPath::from_utf8("gone.ts".to_string()).unwrap();
@@ -41222,6 +46757,11 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         std::fs::write(repo.path().join("keep.rs"), b"pub fn keep() -> u32 { 1 }\n").unwrap();
         std::fs::write(repo.path().join("gone.rs"), b"pub fn gone() -> u32 { 7 }\n").unwrap();
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(Arc::clone(&state));
         commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
         let entities_at = |path: &str| {
@@ -41233,15 +46773,32 @@ mod tests {
                 })
                 .unwrap()
         };
-        assert_eq!(entities_at("gone.rs").len(), 1);
+        let function_at = |path: &str, name: &str| {
+            let mut functions = entities_at(path)
+                .into_iter()
+                .filter(|entity| {
+                    entity.kind == kin_model::EntityKind::Function && entity.name == name
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(functions.len(), 1, "one exact function at {path}");
+            functions.pop().unwrap()
+        };
+        let original = function_at("gone.rs", "gone");
 
         let first = state.layout.root().join("runs/session-fir3209-modify");
         materialize_session_through_api(&app, &first).await;
         prepend_session_lines(&first.join("gone.rs"), 17);
         let modified = reconcile_session_through_api(&app, &first).await;
-        assert_eq!(modified.semantic_files_enriched, 1);
+        // Rust support-input admission refreshes both owned sources together.
+        // The modified function below remains the focal identity of this test.
+        assert_eq!(modified.semantic_files_enriched, 2);
+        assert_eq!(modified.semantic_enrichment_failures, 0);
         assert_eq!(
-            entities_at("gone.rs")[0].span.as_ref().unwrap().start_line,
+            function_at("gone.rs", "gone")
+                .span
+                .as_ref()
+                .unwrap()
+                .start_line,
             17,
             "the live graph moved on; authority did not"
         );
@@ -41252,7 +46809,8 @@ mod tests {
         let deleted = reconcile_session_through_api(&app, &second).await;
         assert_eq!(deleted.removed, 1);
         assert!(entities_at("gone.rs").is_empty());
-        assert_eq!(entities_at("keep.rs").len(), 1);
+        assert_eq!(function_at("keep.rs", "keep").name, "keep");
+        assert!(state.graph.get_entity(&original.id).unwrap().is_none());
 
         // The two graphs must still be level: a third session materializes and
         // the next commit carries the removal into history.
@@ -42034,10 +47592,50 @@ mod tests {
         )
     }
 
+    fn rollback_expectation(
+        state: &DaemonState,
+    ) -> kin_cli::commands::rollback::RollbackExpectation {
+        let authority = ActiveApiRepositoryAuthority::open(state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        kin_cli::commands::rollback::RollbackExpectation {
+            repository_id: authority.repository_id.clone(),
+            roots: lease.roots().clone(),
+            workspace_id: workspace.workspace_id,
+            workspace_generation: workspace.generation,
+            head_change_id: lease
+                .resolve_target_change_id(workspace.base_target.as_ref().unwrap())
+                .unwrap(),
+        }
+    }
+
     async fn rollback_through_api(
+        state: &DaemonState,
         app: &axum::Router,
         operation_id: kin_model::OperationId,
         change_id: SemanticChangeId,
+    ) -> (StatusCode, String) {
+        rollback_with_expectation_through_api(
+            app,
+            operation_id,
+            change_id,
+            rollback_expectation(state),
+            true,
+        )
+        .await
+    }
+
+    async fn rollback_with_expectation_through_api(
+        app: &axum::Router,
+        operation_id: kin_model::OperationId,
+        change_id: SemanticChangeId,
+        expected: kin_cli::commands::rollback::RollbackExpectation,
+        discard_later: bool,
     ) -> (StatusCode, String) {
         let response = app
             .clone()
@@ -42048,7 +47646,9 @@ mod tests {
                         json!({
                             "change_id": change_id.to_string(),
                             "operation_id": operation_id,
-                            "actor": AuthorId::new("rollback-acceptance")
+                            "actor": AuthorId::new("rollback-acceptance"),
+                            "expected": expected,
+                            "discard_later": discard_later,
                         })
                         .to_string(),
                     ))
@@ -42155,46 +47755,15 @@ mod tests {
         );
     }
 
-    /// The reported defect, on the artifact-only store shape.
-    ///
-    /// An artifact-level embedding is a tracked file the parsers produced no
-    /// entities for. It used to be served with its own path in a field named
-    /// `entity_id`, which every id-consuming tool refuses, so an agent could
-    /// only discover the id was dead by spending a call on it.
     #[test]
-    fn an_artifact_hit_carries_no_entity_id_and_names_the_tool_that_reads_it() {
+    fn cosine_artifact_hits_are_not_semantic_entities() {
         let artifact = kin_db::ResolvedRetrievalItem::OpaqueArtifact(kin_model::OpaqueArtifact {
             file_id: kin_model::FilePathId::new("docs/design.md"),
-            content_hash: Hash256::from_bytes([0x07; 32]),
-            mime_type: Some("text/markdown".to_string()),
-            text_preview: None,
+            content_hash: Hash256::from_bytes([7; 32]),
+            mime_type: Some("text/markdown".into()),
+            text_preview: Some("whole artifact".into()),
         });
-        let identity =
-            locate_hit_identity(&artifact, false).expect("an artifact hit must still be served");
-
-        assert_eq!(
-            identity.id_space,
-            kin_cli::commands::locate::LocateIdSpace::Artifact
-        );
-        assert_eq!(
-            identity.entity_id, None,
-            "an artifact hit has no entity id, and a path in that field is the defect"
-        );
-        assert_eq!(identity.name, "design.md");
-        assert_eq!(identity.file.as_deref(), Some("docs/design.md"));
-        // It still dedupes, on its path rather than on an id it does not have.
-        assert_eq!(identity.dedupe_key(), "docs/design.md");
-
-        let mut hit = json!({ "name": identity.name });
-        write_locate_hit_identity(&mut hit, &identity);
-        assert_eq!(hit["id_space"], json!("artifact"));
-        assert!(
-            hit.get("entity_id").is_none(),
-            "the dead id must be absent, not merely labelled: {hit}"
-        );
-        assert_eq!(hit["artifact_path"], json!("docs/design.md"));
-        assert_eq!(hit["resolves_with"], json!("kin_artifact_read"));
-        assert!(hit["note"].as_str().unwrap().contains("get_entity_source"));
+        assert!(locate_hit_identity(&artifact, false).is_none());
     }
 
     /// The second dead-id path, and the one that produced the ticket's title.
@@ -43119,7 +48688,7 @@ mod tests {
         assert_eq!(branch_change(&state), regression);
 
         let (status, body) =
-            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+            rollback_through_api(&state, &app, kin_model::OperationId::new(), restored).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -43293,6 +48862,167 @@ mod tests {
             "the retained observation must admit normally after the merge closes"
         );
         assert_ne!(state.graph.resolved_tree(), expected_tree);
+    }
+
+    /// A parked merge pins the workspace it opened at, and `resolve --continue`
+    /// refuses once that workspace has moved. Ambient admission yields to an
+    /// open merge for that reason, as the test above shows. The flush that
+    /// publishes language-server relations is the workspace's other background
+    /// writer, and it did not yield: a language server answering while a merge
+    /// sat parked had its relations published into the pinned workspace, and
+    /// continue then refused a merge nobody had touched with "has moved since
+    /// this merge opened".
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_language_server_flush_does_not_move_a_workspace_an_open_merge_pinned() {
+        let (state, _layout, repository, _base_change, _feature_change) =
+            universal_branch_test_state("enrichment-open-merge");
+        let app = router(Arc::clone(&state));
+        // A real conflict on the file both sides edit, committed beside two
+        // declarations a language server can relate.
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: active-branch-after-the-split\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("enriched.py"),
+            b"def caller():\n    return 1\n\n\ndef callee():\n    return 2\n",
+        )
+        .unwrap();
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "edit the conflicted file beside two declarations",
+        )
+        .await;
+        let declared = |state: &DaemonState, name: &str| {
+            state
+                .graph
+                .query_entities(&kin_model::EntityFilter {
+                    name_pattern: Some(name.to_string()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("the fixture commit did not publish {name}"))
+        };
+        let language_server_edge = |state: &DaemonState| kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: GraphNodeId::Entity(declared(state, "caller").id),
+            dst: GraphNodeId::Entity(declared(state, "callee").id),
+            confidence: 1.0,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        let parked = crate::repository_merge::execute(
+            &state,
+            &kin_cli::commands::merge::MergeRequest {
+                source: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("enrichment-merge-test"),
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture merge refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        assert!(
+            matches!(
+                parked.report.unwrap().outcome,
+                kin_cli::commands::merge::MergeOutcome::Conflicted
+            ),
+            "the fixture merge must park, or nothing here is open"
+        );
+        crate::repository_merge_state::execute_resolve(
+            &state,
+            &kin_cli::commands::resolve::ResolveRequest {
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("enrichment-merge-test"),
+                action: kin_cli::commands::resolve::ResolveAction::Settle {
+                    directives: Vec::new(),
+                    all: Some(kin_model::MergeSide::Theirs),
+                },
+                expected_record: None,
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture settlement refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        let pinned = cached_authority_admission_entry(&state).unwrap().roots;
+
+        // What a language server that answers during the merge leaves behind,
+        // and the flush that follows it.
+        state
+            .graph
+            .upsert_relation(&language_server_edge(&state))
+            .unwrap();
+        let flushed = state.save_snapshot_reporting_enrichment().unwrap();
+        let after_flush = cached_authority_admission_entry(&state).unwrap().roots;
+        let continued = crate::repository_merge_state::execute_resolve(
+            &state,
+            &kin_cli::commands::resolve::ResolveRequest {
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("enrichment-merge-test"),
+                action: kin_cli::commands::resolve::ResolveAction::Continue,
+                expected_record: None,
+            },
+        );
+        if let Err(refusal) = continued {
+            let response = axum::response::IntoResponse::into_response(refusal);
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            panic!(
+                "resolve --continue refused ({status}) a merge nothing but a flush touched: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_eq!(
+            flushed,
+            crate::state::EnrichmentFlush::HeldForOpenMerge,
+            "the flush must say it held, so a sweep does not record these files as enriched"
+        );
+        assert_eq!(
+            after_flush, pinned,
+            "the flush moved the workspace the open merge pinned"
+        );
+
+        // The control. With no merge open the same kind of relation publishes,
+        // so the hold above belongs to the merge and not to a flush that
+        // stopped publishing.
+        state
+            .graph
+            .upsert_relation(&language_server_edge(&state))
+            .unwrap();
+        let before = cached_authority_admission_entry(&state)
+            .unwrap()
+            .roots
+            .generation;
+        assert_eq!(
+            state.save_snapshot_reporting_enrichment().unwrap(),
+            crate::state::EnrichmentFlush::Proceeded
+        );
+        assert!(
+            cached_authority_admission_entry(&state)
+                .unwrap()
+                .roots
+                .generation
+                > before,
+            "with no merge open the flush must publish the relation"
+        );
     }
 
     /// A merge published through `resolve --continue` must reach the live graph
@@ -43971,7 +49701,7 @@ mod tests {
         let loads_before = state.projection_authority.loads();
 
         let (status, body) =
-            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+            rollback_through_api(&state, &app, kin_model::OperationId::new(), restored).await;
         assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
@@ -44081,6 +49811,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn command_rollback_binds_consent_to_the_previewed_authority() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+        std::fs::write(root.join("service.txt"), b"shipped\n").unwrap();
+        let target = commit_through_api(&app, kin_model::OperationId::new(), "base").await;
+        let at_tip = rollback_expectation(&state);
+
+        // The requested target needed no consent when previewed. A real commit
+        // then makes that same target a destructive restoration.
+        std::fs::write(root.join("service.txt"), b"later work\n").unwrap();
+        let later = commit_through_api(&app, kin_model::OperationId::new(), "later work").await;
+        for discard_later in [false, true] {
+            let (status, body) = rollback_with_expectation_through_api(
+                &app,
+                kin_model::OperationId::new(),
+                target,
+                at_tip.clone(),
+                discard_later,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert!(
+                body.contains("changed since the rollback preview"),
+                "{body}"
+            );
+            assert_eq!(branch_change(&state), later);
+            assert_eq!(
+                std::fs::read(root.join("service.txt")).unwrap(),
+                b"later work\n"
+            );
+        }
+
+        // Even a current preview cannot authorize restoration without consent.
+        // This reaches the mutation owner directly, bypassing the CLI guard.
+        let current = rollback_expectation(&state);
+        let (status, body) = rollback_with_expectation_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            target,
+            current.clone(),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("--discard-later"), "{body}");
+        assert_eq!(branch_change(&state), later);
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"later work\n"
+        );
+
+        let operation = kin_model::OperationId::new();
+        let (status, body) =
+            rollback_with_expectation_through_api(&app, operation, target, current.clone(), true)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let published = branch_change(&state);
+        assert_ne!(published, target);
+        assert_ne!(published, later);
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"shipped\n"
+        );
+
+        // A lost-response replay carries the original, now-old expectation.
+        // It must return the published receipt, never perform a second restore.
+        let (status, body) =
+            rollback_with_expectation_through_api(&app, operation, target, current, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(replay["mutated"], false);
+        assert_eq!(branch_change(&state), published);
+    }
+
     /// An operation id is matched before any history validation runs, and an
     /// ordinary commit publishes the same receipt shape a rollback does. Only
     /// the restored content separates them, so reusing a commit's operation id
@@ -44110,7 +49919,7 @@ mod tests {
         // one ref mutation onto a change under a MustEqual expectation and a
         // workspace mutation, so every shape check passes; only the restored
         // content refutes it.
-        let (status, body) = rollback_through_api(&app, reused, restored).await;
+        let (status, body) = rollback_through_api(&state, &app, reused, restored).await;
         assert_eq!(
             status,
             StatusCode::CONFLICT,
@@ -44130,6 +49939,7 @@ mod tests {
         // The same reuse against a change this repository never materialized is
         // refused for the same reason: the echoed target is never trusted.
         let (status, body) = rollback_through_api(
+            &state,
             &app,
             reused,
             SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
@@ -44145,7 +49955,7 @@ mod tests {
         // with its own operation id reports what it published and commits
         // nothing further.
         let rollback_operation = kin_model::OperationId::new();
-        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        let (status, body) = rollback_through_api(&state, &app, rollback_operation, restored).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let first: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(first["mutated"], true);
@@ -44153,7 +49963,7 @@ mod tests {
         let published = branch_change(&state);
         assert_ne!(published, regression, "rollback published no change");
 
-        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        let (status, body) = rollback_through_api(&state, &app, rollback_operation, restored).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -45279,6 +51089,40 @@ mod tests {
             .is_none());
     }
 
+    /// Adding the clamp disclosure keeps the wire format the answer was built
+    /// in: a compact answer stays compact and a pretty one stays pretty, with
+    /// the same facts either way.
+    #[test]
+    fn a_clamp_disclosure_keeps_the_wire_format_it_was_given() {
+        let clamps = vec![McpLocalClamp {
+            argument: "page_size",
+            requested: 4_000_000_000,
+            clamped_to: MCP_LOCAL_LOCATE_MAX_PAGE_SIZE,
+        }];
+        let payload = json!({ "entities": [{ "id": "a", "body": "line one\nline two" }] });
+        let compact = disclose_mcp_local_clamps(
+            kin_mcp::ToolCallResult::text(payload.to_string()),
+            "semantic_locate",
+            &clamps,
+        );
+        let pretty = disclose_mcp_local_clamps(
+            kin_mcp::ToolCallResult::text(serde_json::to_string_pretty(&payload).unwrap()),
+            "semantic_locate",
+            &clamps,
+        );
+        let text = |result: &kin_mcp::ToolCallResult| {
+            let kin_mcp::ContentBlock::Text { text } = result.content.first().unwrap();
+            text.clone()
+        };
+        assert!(!text(&compact).contains('\n'), "{}", text(&compact));
+        assert!(text(&pretty).contains('\n'), "{}", text(&pretty));
+        assert_eq!(tool_result_payload(&compact), tool_result_payload(&pretty));
+        assert_eq!(
+            tool_result_payload(&compact)["entities"],
+            payload["entities"]
+        );
+    }
+
     #[test]
     fn a_clamped_answer_that_cannot_carry_its_disclosure_is_refused() {
         let clamps = vec![McpLocalClamp {
@@ -45380,6 +51224,45 @@ mod tests {
             "a committing transaction is the restart fence and is never \
              collected, or a resumed commit is stranded"
         );
+    }
+
+    #[tokio::test]
+    async fn file_catalogs_refuse_http_and_direct_dispatch_before_graph_admission() {
+        let (_repo, state) = mcp_lifecycle_fixture();
+        state
+            .is_initialized
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for name in [
+            "kin_artifact_read",
+            "kin_artifact_list",
+            "list_file_entities",
+        ] {
+            let result = mcp_call(
+                router(Arc::clone(&state)),
+                name,
+                json!({"path":"missing.py"}),
+            )
+            .await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(mcp_result_text(&result).contains("unavailable"));
+            // The inner route must also refuse before selecting graph authority,
+            // including malformed session headers and an uninitialized store.
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("X-Kin-Session", "not-a-session".parse().unwrap());
+            let result = mcp_tools_call_inner(
+                headers,
+                State(Arc::clone(&state)),
+                Json(McpToolCallRequest {
+                    name: name.into(),
+                    arguments: HashMap::new(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(result.is_error, Some(true));
+            assert!(mcp_result_text(&result).contains("unavailable"));
+        }
     }
 
     async fn mcp_call(
@@ -45524,9 +51407,32 @@ mod tests {
     }
 
     include!("api/tests/mcp_lifecycle_persistence.rs");
+    include!("api/tests/transaction_owner_revocation.rs");
+    include!("api/tests/read_only_session_writes.rs");
+    include!("api/tests/hard_index_freshness.rs");
     include!("api/tests/mcp_mutate_durability.rs");
     include!("api/tests/mcp_source_base.rs");
+    include!("api/tests/entity_source_patch.rs");
+    include!("api/tests/entity_only_reads.rs");
+    include!("api/tests/name_candidates_routes.rs");
+    include!("api/tests/mcp_truncated_body.rs");
+    include!("api/tests/external_target_edits.rs");
+    include!("api/tests/same_file_rename_sites.rs");
+    include!("api/tests/unchanged_importer_recovery.rs");
+    include!("api/tests/local_binding_disclosure.rs");
+    include!("api/tests/source_observation_determinism.rs");
+    include!("api/tests/coherent_source_batch.rs");
+    include!("api/tests/lsp_publication_admission.rs");
+    include!("api/tests/lsp_evidence_durability.rs");
+    include!("api/tests/lsp_source_spans.rs");
+    include!("api/tests/coherent_source_batch_recovery.rs");
+    #[cfg(unix)]
+    mod worker_publication_fences;
+    include!("api/tests/session_binding_capture.rs");
+    include!("api/tests/imported_getter_receiver.rs");
     include!("api/tests/mcp_mutate_source_base.rs");
+    #[cfg(unix)]
+    include!("api/tests/unchanged_session_closeout.rs");
     #[cfg(unix)]
     include!("api/tests/entity_drafts.rs");
     include!("api/tests/entity_draft_platform.rs");
@@ -45770,7 +51676,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_commit_re_sent_while_it_runs_joins_it_instead_of_running_again() {
         let state = test_state();
-        crate::mcp_commit::tests::install_exact_source(
+        let (entity, _) = crate::mcp_commit::tests::install_exact_source(
             &state,
             "src/lib.rs",
             b"pub fn value() -> u8 {\n    1\n}\n",
@@ -45788,18 +51694,14 @@ mod tests {
         .await;
         let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
         let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let source = entity_patch_read(&state, &serde_json::json!(entity.id.to_string())).await;
         let stage = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_stage",
             serde_json::json!({
                 "transaction_id": tx_id,
                 "session_id": session_id,
-                "operations": [{
-                    "verb": "replace",
-                    "target": "src/lib.rs",
-                    "body": "pub fn value() -> u8 {\n    2\n}\n",
-                    "description": "change what value returns"
-                }]
+                "operations": [entity_patch_operation(&source, &[("    1\n", "    2\n")])]
             }),
         )
         .await;
@@ -45872,12 +51774,13 @@ mod tests {
         }
     }
 
-    /// FIR-3550 through the route every agent call reaches the daemon by. The writer edits
-    /// the file first, then stages its complete new text and commits: the order `kin agent`'s
-    /// `edit_file` ran in during run 3 of the local-model demo, and the order of any agent
-    /// that edits with its own file tools. The commit used to refuse the writer's own bytes as
-    /// drift from the prior tree. It now publishes them, `get_entity_source` answers with the
-    /// new body, durability reads level, and the working copy matches what authority holds.
+    /// A change whose bytes already reached the working copy commits and reads back, through
+    /// the route every agent call reaches the daemon by. A writer's edit can be on disk before
+    /// Kin commits it, as an agent's own file edit was in run 3 of the local-model demo, and
+    /// the commit used to refuse those bytes as drift from the prior tree. Here the working
+    /// copy is written first and the same change is then staged as an anchored entity patch.
+    /// The commit publishes it, `get_entity_source` answers with the new body, durability reads
+    /// level, and the working copy matches what authority holds.
     #[tokio::test]
     async fn an_agent_edit_staged_after_it_reached_disk_commits_and_reads_back() {
         let state = test_state();
@@ -45903,6 +51806,7 @@ mod tests {
         let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
         let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
 
+        let source = entity_patch_read(&state, &serde_json::json!(entity.id.to_string())).await;
         let working = state.layout.working_dir().join("src/lib.rs");
         std::fs::write(&working, edited).unwrap();
 
@@ -45912,12 +51816,13 @@ mod tests {
             serde_json::json!({
                 "transaction_id": tx_id,
                 "session_id": session_id,
-                "operations": [{
-                    "verb": "replace",
-                    "target": "src/lib.rs",
-                    "body": edited,
-                    "description": "document value and change what it returns"
-                }]
+                "operations": [entity_patch_operation(
+                    &source,
+                    &[
+                        ("pub fn value", "/// The value this module reports.\npub fn value"),
+                        ("    1\n", "    0x2a\n"),
+                    ],
+                )]
             }),
         )
         .await;
@@ -47643,12 +53548,20 @@ mod tests {
         });
         install_working_copy_file(&state, "src/lib.py", b"graph truth\n", false);
         install_working_copy_file(&state, "bin/verify", b"#!/bin/sh\nexit 0\n", true);
+        // Fixture setup committed directly; use the real reopened authority
+        // cursor before entering the guarded session materialization route.
+        let state = waiting_cold_start(state.layout.clone()).await;
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(state.clone());
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -47791,6 +53704,7 @@ mod tests {
             .is_none());
 
         server.abort();
+        let _ = server.await;
     }
 
     /// `kin open` retains its projection, and `kin reconcile` collects it.
@@ -47857,12 +53771,20 @@ mod tests {
         let state = Arc::new(DaemonState::open(kin_core::init(&root).unwrap().layout).unwrap());
         install_repository_file(&state, "src/lib.py", b"graph truth\n");
         install_working_copy_file(&state, "src/lib.py", b"graph truth\n", false);
+        // Fixture setup committed directly; use the real reopened authority
+        // cursor before entering the guarded session materialization route.
+        let state = waiting_cold_start(state.layout.clone()).await;
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(state.clone());
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -47945,6 +53867,7 @@ mod tests {
         );
 
         server.abort();
+        let _ = server.await;
     }
 
     /// The one session projection a fixture repository is holding.
@@ -48040,12 +53963,20 @@ mod tests {
         let state = test_state();
         install_repository_file(&state, "src/lib.py", b"graph truth\n");
         install_working_copy_file(&state, "src/lib.py", b"graph truth\n", false);
+        // Fixture setup committed directly; use the real reopened authority
+        // cursor before entering the guarded session materialization route.
+        let state = waiting_cold_start(state.layout.clone()).await;
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(state.clone());
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -48116,6 +54047,7 @@ mod tests {
         );
 
         server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -48142,6 +54074,10 @@ mod tests {
             b"compose.yaml",
             TreeEntry::symlink,
         );
+
+        // The setup published directly through repository authority. Reopen
+        // those real committed bytes before exercising the live capture gate.
+        let state = waiting_cold_start(state.layout.clone()).await;
 
         std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
         std::fs::write(
@@ -48270,7 +54206,7 @@ mod tests {
             let raw_hash = state.blobs.write(raw_body).unwrap();
             state
                 .graph
-                .apply_transaction_delta(&TransactionDelta {
+                .apply_transaction_delta(&kin_model::TransactionDelta {
                     tree_deltas: vec![kin_model::TreeDelta::Added {
                         artifact_id: kin_model::ArtifactId::new(),
                         new: kin_model::LocatedEntry::new(
@@ -48278,7 +54214,7 @@ mod tests {
                             TreeEntry::blob(Hash256::from_bytes(raw_hash.0), false),
                         ),
                     }],
-                    ..TransactionDelta::default()
+                    ..kin_model::TransactionDelta::default()
                 })
                 .unwrap();
             let install_plan = crate::repository_commit::plan_native_commit(
@@ -48327,6 +54263,11 @@ mod tests {
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let singleton = session_runtime_lock(&state);
+        let runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let app = router(Arc::clone(&state));
         let session_dir = state.layout.root().join("runs/session-reconcile-api");
         let materialize = app
@@ -48553,7 +54494,17 @@ mod tests {
         assert_eq!(replay.desired_tree_hash, summary.desired_tree_hash);
         assert_eq!(replay.authority_generation, summary.authority_generation);
 
-        let restarted = Arc::new(DaemonState::open(state.layout.clone()).unwrap());
+        let layout = state.layout.clone();
+        drop(authority);
+        drop(runtime);
+        drop(singleton);
+        drop(state);
+        let restarted = Arc::new(DaemonState::open(layout).unwrap());
+        let restarted_singleton = session_runtime_lock(&restarted);
+        let _restarted_runtime = restarted
+            .prepared_publication
+            .register(&restarted_singleton, restarted.layout.root())
+            .unwrap();
         assert_eq!(
             restarted.graph.resolved_tree(),
             workspace.tree,
@@ -48562,7 +54513,7 @@ mod tests {
         restarted
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let restarted_replay = router(restarted)
+        let restarted_replay = router(Arc::clone(&restarted))
             .oneshot(
                 Request::post("/reconcile")
                     .header("content-type", "application/json")
@@ -48632,10 +54583,18 @@ mod tests {
 
         let state = test_state();
         install_repository_file(&state, "README.md", b"exact base\n");
+        // Fixture setup committed directly; use the real reopened authority
+        // cursor before entering the guarded session materialization route.
+        let state = waiting_cold_start(state.layout.clone()).await;
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
+        let singleton = session_runtime_lock(&state);
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         let symlink_session = state.layout.root().join("runs/session-control-symlink");
         materialize(&state, &symlink_session).await;
         let base_path = symlink_session.join(".kin-session/base.json");
@@ -48677,21 +54636,58 @@ mod tests {
             "special filesystem members cannot enter exact repository authority"
         );
 
-        let stale_session = state.layout.root().join("runs/session-stale-base");
-        materialize(&state, &stale_session).await;
+        // A base other writers have advanced relaxes currency only for an
+        // exactly unchanged projection, which closes as a no-op
+        // (`reconcile_closes_an_unchanged_session_after_other_writers_as_a_no_op`).
+        // Every changed projection and every scanner refusal still fails
+        // against it, keeps its projection, and moves no authority.
+        let stale_edit = state.layout.root().join("runs/session-stale-edit");
+        let stale_delete = state.layout.root().join("runs/session-stale-delete");
+        let stale_add = state.layout.root().join("runs/session-stale-add");
+        let stale_special = state.layout.root().join("runs/session-stale-special");
+        for session in [&stale_edit, &stale_delete, &stale_add, &stale_special] {
+            materialize(&state, session).await;
+        }
         install_repository_file(&state, "new-authority.txt", b"authority moved\n");
-        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
-        let generation = authority.manager.read_authority().roots().generation;
+        let moved = closeout_authority(&state);
+        std::fs::write(
+            stale_edit.join("README.md"),
+            b"edited against a stale base\n",
+        )
+        .unwrap();
+        std::fs::remove_file(stale_delete.join("README.md")).unwrap();
+        std::fs::write(stale_add.join("added.txt"), b"added against a stale base\n").unwrap();
+        let stale_socket =
+            PathBuf::from("/tmp").join(format!("kin-reconcile-{}.sock", Uuid::new_v4().simple()));
+        let _stale_listener = UnixListener::bind(&stale_socket).unwrap();
+        std::fs::rename(&stale_socket, stale_special.join("member.sock")).unwrap();
+        for (session, expected, label) in [
+            (&stale_edit, StatusCode::CONFLICT, "an edit"),
+            (&stale_delete, StatusCode::CONFLICT, "a deletion"),
+            (&stale_add, StatusCode::CONFLICT, "an addition"),
+            (&stale_special, StatusCode::BAD_REQUEST, "a special member"),
+        ] {
+            assert_eq!(
+                reconcile_status(&state, session).await,
+                expected,
+                "a stale session with {label} must never silently rebase"
+            );
+            assert_eq!(
+                closeout_authority(&state),
+                moved,
+                "rejected stale reconciliation with {label} must not mutate authority"
+            );
+            assert!(
+                session.join(".kin-session/base.json").is_file(),
+                "a refused reconcile with {label} keeps its projection"
+            );
+        }
         assert_eq!(
-            reconcile_status(&state, &stale_session).await,
-            StatusCode::CONFLICT,
-            "a stale session must never silently rebase"
+            std::fs::read(stale_edit.join("README.md")).unwrap(),
+            b"edited against a stale base\n"
         );
-        assert_eq!(
-            authority.manager.read_authority().roots().generation,
-            generation,
-            "rejected stale reconciliation must not mutate authority"
-        );
+        assert!(!stale_delete.join("README.md").exists());
+        assert!(stale_add.join("added.txt").is_file());
     }
 
     /// Serializes tests that mutate process-global env
@@ -51787,15 +57783,39 @@ mod tests {
         HostedProbeMeters,
         kin_core::test_env::EnvVarGuard,
     ) {
-        const READER: &str =
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let fleet = vec![
+        hosted_test_state_over_with(spine_store, false)
+    }
+
+    /// The same hosted fixture, with the spine switched off when
+    /// `spine_disabled` is set, as `KIN_DISABLE_SPINE=1` switches it off at
+    /// startup.
+    /// The reader image identity, storage scope and fleet every hosted fixture
+    /// state is opened with, so a test can reopen the same fleet the way a
+    /// restarted pod does.
+    const HOSTED_FIXTURE_READER: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HOSTED_FIXTURE_SCOPE: &str = "gcs://fixture-bucket/fixture-prefix";
+
+    fn hosted_fixture_fleet() -> Vec<String> {
+        vec![
             "kin".to_string(),
             "kin-db".to_string(),
             "kin-editor".to_string(),
             "kin-vfs".to_string(),
             "kinlab".to_string(),
-        ];
+        ]
+    }
+
+    fn hosted_test_state_over_with(
+        spine_store: Arc<dyn kin_spine::SpineStore>,
+        spine_disabled: bool,
+    ) -> (
+        Arc<DaemonState>,
+        std::path::PathBuf,
+        HostedProbeMeters,
+        kin_core::test_env::EnvVarGuard,
+    ) {
+        let fleet = hosted_fixture_fleet();
         assert_eq!(
             fleet.len(),
             HOSTED_FIXTURE_FLEET_SIZE,
@@ -51807,7 +57827,6 @@ mod tests {
         environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
         environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
         environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
-        let scope = "gcs://fixture-bucket/fixture-prefix";
 
         let backend_root = tempfile::tempdir().unwrap();
         for repo_id in &fleet {
@@ -51867,38 +57886,12 @@ mod tests {
         // that lives for one test does not need to reclaim it.
         let backend_root = Box::leak(Box::new(backend_root));
 
-        let repo = tempfile::tempdir().unwrap();
-        let repo = Box::leak(Box::new(repo));
-        let initialized = kin_core::init(repo.path()).unwrap();
         let control_store = Arc::new(MeasuredControlStore::new());
-        let control = Arc::new(
-            crate::publication_lease::PublicationControl::new(
-                scope,
-                READER,
-                fleet.clone(),
-                Arc::clone(&control_store)
-                    as Arc<dyn crate::publication_lease::PublicationControlStore>,
-            )
-            .unwrap(),
-        );
-        let (counting_backend, cursor_probes) = RepoFaultBackend::new(backend_root.path());
-        let state = Arc::new(
-            DaemonState::open_with_backend_and_publication_control(
-                initialized.layout,
-                Box::new(counting_backend),
-                "kin",
-                Some(fleet.iter().cloned().collect()),
-                control,
-            )
-            .unwrap(),
-        );
-        state.install_hosted_durable_spine_for_test(Arc::new(
-            kin_spine::FirestoreSpineBackend::with_store(spine_store),
-        ));
-        assert!(
-            state.hosted_spine_readiness_required(),
-            "the fixture must put readiness on the hosted half, or these tests \
-             exercise nothing FIR-3179 is about"
+        let (state, cursor_probes) = open_hosted_state_over(
+            backend_root.path(),
+            Arc::clone(&control_store),
+            spine_store,
+            spine_disabled,
         );
         (
             state,
@@ -51917,6 +57910,80 @@ mod tests {
     struct HostedProbeMeters {
         control: Arc<MeasuredControlStore>,
         cursor_probes: FaultSwitch,
+    }
+
+    /// Open a hosted daemon state over durable inputs that already exist: the
+    /// storage root holding the fleet's snapshots, the publication-control
+    /// store and the durable spine store. The first open of the fixture calls
+    /// this, and a test that restarts the fleet calls it again with the same
+    /// inputs, which is what a restarted pod sees. The caller holds the
+    /// fixture's environment guard.
+    fn open_hosted_state_over(
+        backend_root: &std::path::Path,
+        control_store: Arc<MeasuredControlStore>,
+        spine_store: Arc<dyn kin_spine::SpineStore>,
+        spine_disabled: bool,
+    ) -> (Arc<DaemonState>, FaultSwitch) {
+        open_hosted_state_as(
+            backend_root,
+            control_store,
+            spine_store,
+            spine_disabled,
+            HOSTED_FIXTURE_READER,
+        )
+    }
+
+    /// [`open_hosted_state_over`] for a daemon running the image `reader`, the
+    /// way a promoted image opens over the fleet its predecessor admitted.
+    fn open_hosted_state_as(
+        backend_root: &std::path::Path,
+        control_store: Arc<MeasuredControlStore>,
+        spine_store: Arc<dyn kin_spine::SpineStore>,
+        spine_disabled: bool,
+        reader: &str,
+    ) -> (Arc<DaemonState>, FaultSwitch) {
+        let fleet = hosted_fixture_fleet();
+        let repo = tempfile::tempdir().unwrap();
+        // The layout outlives the state through the leak; a test fixture that
+        // lives for one test does not need to reclaim it.
+        let repo = Box::leak(Box::new(repo));
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(
+                HOSTED_FIXTURE_SCOPE,
+                reader,
+                fleet.clone(),
+                control_store as Arc<dyn crate::publication_lease::PublicationControlStore>,
+            )
+            .unwrap(),
+        );
+        let (counting_backend, cursor_probes) = RepoFaultBackend::new(backend_root);
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(counting_backend),
+                "kin",
+                Some(fleet.iter().cloned().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        if spine_disabled {
+            // The state's own copy of the kill switch, not the process
+            // environment: tests share one process, and a `KIN_DISABLE_SPINE=1`
+            // held for a whole test switches the spine off in every state
+            // another test opens meanwhile.
+            state.set_spine_disabled_for_test(true);
+        }
+        state.install_hosted_durable_spine_for_test(Arc::new(
+            kin_spine::FirestoreSpineBackend::with_store(spine_store),
+        ));
+        assert!(
+            state.hosted_spine_readiness_required(),
+            "the fixture must put readiness on the hosted half, or these tests \
+             exercise nothing FIR-3179 is about"
+        );
+        (state, cursor_probes)
     }
 
     /// Publish a newer source snapshot for one repository, exactly as a sibling
@@ -51948,6 +58015,10 @@ mod tests {
     struct MeasuredSpineStore {
         inner: Arc<kin_spine::test_support::FakeSpineStore>,
         hydration_reads: std::sync::atomic::AtomicUsize,
+        /// Whole-fleet committed loads alone: a full pass's hydration, or the
+        /// legacy seal completion. `hydration_reads` also counts each
+        /// single-repository load a publication commit reconciles through.
+        full_hydrations: std::sync::atomic::AtomicUsize,
         point_reads: std::sync::atomic::AtomicUsize,
         hydration_charge_ms: std::sync::atomic::AtomicU64,
         point_charge_ms: std::sync::atomic::AtomicU64,
@@ -51959,6 +58030,9 @@ mod tests {
         /// Runs on every committed-head read, so a test can move durable state
         /// while a probe is between its two bundle observations.
         on_head_read: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Runs at the start of every durable cache hydration, so a test can
+        /// look at the daemon while a full pass is replacing its cache.
+        on_hydration: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl MeasuredSpineStore {
@@ -51966,18 +58040,27 @@ mod tests {
             Self {
                 inner: Arc::new(kin_spine::test_support::FakeSpineStore::cold()),
                 hydration_reads: std::sync::atomic::AtomicUsize::new(0),
+                full_hydrations: std::sync::atomic::AtomicUsize::new(0),
                 point_reads: std::sync::atomic::AtomicUsize::new(0),
                 hydration_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 point_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 fail_next_hydration: std::sync::atomic::AtomicBool::new(false),
                 fail_next_rollout_fence_load: std::sync::atomic::AtomicBool::new(false),
                 on_head_read: std::sync::Mutex::new(None),
+                on_hydration: std::sync::Mutex::new(None),
             }
         }
 
         /// Reads that pull every entity row: the durable cache hydration.
         fn hydration_reads(&self) -> usize {
             self.hydration_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Whole-fleet committed loads, without the single-repository loads a
+        /// publication makes.
+        fn full_hydrations(&self) -> usize {
+            self.full_hydrations
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
 
@@ -51988,6 +58071,10 @@ mod tests {
 
         fn on_head_read(&self, hook: Box<dyn Fn() + Send + Sync>) {
             *self.on_head_read.lock().unwrap() = Some(hook);
+        }
+
+        fn on_hydration(&self, hook: Box<dyn Fn() + Send + Sync>) {
+            *self.on_hydration.lock().unwrap() = Some(hook);
         }
 
         /// Fail the next durable cache hydration once, leaving every identity
@@ -52041,11 +58128,22 @@ mod tests {
     }
 
     impl kin_spine::SpineStore for MeasuredSpineStore {
+        fn read_stats(&self) -> Option<kin_spine::DurableReadStats> {
+            self.inner.read_stats()
+        }
+
         fn load_repo_publications(
             &self,
         ) -> std::result::Result<Vec<kin_spine::LoadedRepoPublication>, kin_spine::SpineError>
         {
             self.charge_hydration();
+            self.full_hydrations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let hook = self.on_hydration.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+                *self.on_hydration.lock().unwrap() = Some(hook);
+            }
             if self
                 .fail_next_hydration
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -52707,13 +58805,23 @@ mod tests {
         );
     }
 
-    /// Something has to keep the proof current once the probe stops doing it.
-    #[tokio::test]
+    /// Something has to keep the proof current once the probe stops doing it,
+    /// and keeping it current must not cost a hydration a minute.
+    ///
+    /// From 2026-09-05 to 2026-09-20 every tick of this cadence was a full
+    /// pass, about 43,000 Firestore reads on the five-repo fleet, whether or
+    /// not anything had changed, and Firestore billed about 46 million reads a
+    /// day for it. A tick now checks durable identity and hydrates only when
+    /// that identity moved and the fleet can still prove. So this asserts all
+    /// three: ticks over a fleet nobody publishes to hydrate nothing, a move
+    /// the fleet can prove costs exactly one hydration and readiness returns,
+    /// and a move it cannot prove is refused before hydrating.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readiness_starts_the_background_hosted_spine_authority_refresh() {
-        let (state, store, _backend_root, _meters, _environment) =
+        let (state, store, backend_root, _meters, _environment) =
             admitted_hosted_test_state().await;
-        // Production sleeps a minute between passes. A test cannot wait that
-        // long, and waiting would prove nothing the interval itself decides.
+        // Production ticks once a minute. A test cannot wait that long, and
+        // waiting would prove nothing the interval itself decides.
         state.set_hosted_spine_refresh_interval_for_test(Duration::from_millis(50));
         let hydrations_before = store.hydration_reads();
 
@@ -52722,16 +58830,123 @@ mod tests {
             StatusCode::OK
         );
 
+        let checks_before = spine_cost(&state).identity_checks;
+        wait_for_identity_checks(&state, checks_before + 5).await;
+        assert_eq!(
+            store.hydration_reads(),
+            hydrations_before,
+            "the background cadence hydrated a fleet whose durable identity never moved. \
+             That is the pass that read about 46 million Firestore documents a day."
+        );
+
+        // Another writer commits a head the fleet can still prove: the same
+        // publication under a new store revision.
+        bump_committed_head_revision(&store, "kin-db");
         let deadline = Instant::now() + Duration::from_secs(30);
         while store.hydration_reads() == hydrations_before && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            store.hydration_reads() > hydrations_before,
-            "no background pass re-proved the hosted spine authority. Without one, a \
-             reader that nobody queries proves its authority once, at admission, and \
-             never learns that a sibling published."
+        assert_eq!(
+            store.hydration_reads(),
+            hydrations_before + 1,
+            "no background pass re-proved the hosted spine authority after durable identity \
+             moved. Without one, a reader that nobody queries proves its authority once, at \
+             admission, and never learns that a sibling published."
         );
+        let checks_after_pass = spine_cost(&state).identity_checks;
+        wait_for_identity_checks(&state, checks_after_pass + 5).await;
+        assert_eq!(
+            store.hydration_reads(),
+            hydrations_before + 1,
+            "once the proof is current again, the ticks after it must not hydrate"
+        );
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the pass proved the moved head, so readiness returns"
+        );
+
+        // A sibling publishes a source the fleet cannot prove yet: one
+        // repository's source moves past its committed head. Past the floor
+        // that follows the pass above, the next tick asks for a pass, and the
+        // pass stops before reading a committed row.
+        state.advance_hosted_spine_clock_for_test(crate::hosted_spine_cost::FULL_PASS_FLOOR);
+        let refused_before = spine_cost(&state).refused_before_hydration;
+        advance_repo_source_publication(&backend_root, "kin-db");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while spine_cost(&state).refused_before_hydration == refused_before
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            spine_cost(&state).refused_before_hydration > refused_before,
+            "no background pass noticed the source that moved past its committed head"
+        );
+        let checks_after_refusal = spine_cost(&state).identity_checks;
+        wait_for_identity_checks(&state, checks_after_refusal + 5).await;
+        assert_eq!(
+            store.hydration_reads(),
+            hydrations_before + 1,
+            "a fleet that cannot prove must be refused before hydrating, on every retry"
+        );
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a daemon whose last pass could not prove must not report ready"
+        );
+    }
+
+    /// Advance one committed head's store revision and nothing else, which is
+    /// what another writer re-committing the same publication does: durable
+    /// identity moves, and the fleet can still prove.
+    fn bump_committed_head_revision(store: &MeasuredSpineStore, repo_id: &str) {
+        let mut state = store.inner.publication_state.lock().unwrap();
+        let (revision, _) = state
+            .heads
+            .get_mut(repo_id)
+            .expect("the fixture commits a head for every repository");
+        *revision += 1;
+    }
+
+    /// What `/health` would report as `spine_cost` for this state.
+    fn spine_cost(state: &DaemonState) -> crate::hosted_spine_cost::HostedSpineCostReport {
+        state
+            .hosted_spine_cost_report()
+            .expect("a hosted daemon reports its spine cost")
+    }
+
+    /// Wait until the background cadence has run at least `target` identity
+    /// checks, which is how a test knows ticks happened without sleeping for a
+    /// guessed number of them.
+    async fn wait_for_identity_checks(state: &DaemonState, target: u64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while spine_cost(state).identity_checks < target {
+            assert!(
+                Instant::now() < deadline,
+                "the background cadence ran {} identity checks in 30 s, short of {target}",
+                spine_cost(state).identity_checks
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Billable Firestore document reads the fixture's store has served.
+    fn firestore_document_reads(store: &MeasuredSpineStore) -> u64 {
+        kin_spine::SpineStore::read_stats(store)
+            .expect("the fake store meters its reads")
+            .document_reads
+    }
+
+    /// Age every cached readiness verdict past its TTL, so the next probe runs
+    /// the full cached-authority check.
+    ///
+    /// Inside the TTL a probe answers from the verdict the last check left,
+    /// re-reading only the GCS admission and runtime authority. That is the
+    /// contract since 2026-09-22, and the tests that call this are about what
+    /// the full check refuses once it runs.
+    fn expire_readiness_verdicts(state: &DaemonState) {
+        state.advance_hosted_spine_clock_for_test(crate::hosted_spine_cost::READY_VERDICT_TTL);
     }
 
     // ── A cheap answer is still an exact one ──────────────────────────────
@@ -52763,6 +58978,10 @@ mod tests {
         // fence and the fleet's names. Only one repository's source publication
         // moves, and its committed spine head stays at the old cursor.
         advance_repo_source_publication(&backend_root, "kin-db");
+        // Inside its TTL the verdict from the probe above would still answer;
+        // `a_ready_verdict_past_its_ttl_does_not_report_ready` pins that
+        // window. This test is about what the check does once it runs.
+        expire_readiness_verdicts(&state);
 
         assert_eq!(
             call_readiness_handler(Arc::clone(&state)).await,
@@ -52814,7 +59033,14 @@ mod tests {
 
         // Repair. One successful pass installs a proof again and readiness
         // comes back, which is what makes the refusal above a hold rather than
-        // a permanent fault.
+        // a permanent fault. The pass limiter admits a retry after a failed
+        // pass only once its retry floor has passed.
+        assert!(
+            state.ensure_spine().is_none(),
+            "a retry inside the limiter's retry floor must be refused, not run"
+        );
+        state
+            .advance_hosted_spine_clock_for_test(crate::hosted_spine_cost::FAILED_PASS_RETRY_FLOOR);
         assert!(
             state.ensure_spine().is_some(),
             "the pass must succeed once the injected failure is spent"
@@ -52855,6 +59081,8 @@ mod tests {
                 *revision += 1;
             }
         }));
+        // The bundle is read only by a probe whose verdict has expired.
+        expire_readiness_verdicts(&state);
 
         assert_eq!(
             call_readiness_handler(state).await,
@@ -52881,7 +59109,9 @@ mod tests {
 
         // The probe reads the control record twice before the bundle, for the
         // admission and the runtime authority. Serve exactly those two and
-        // refuse everything after, which is the post-bundle pair.
+        // refuse everything after, which is the post-bundle pair. The bundle
+        // is read only by a probe whose verdict has expired.
+        expire_readiness_verdicts(&state);
         meters.control.refuse_record_reads_past(2);
 
         assert_eq!(
@@ -52907,13 +59137,17 @@ mod tests {
             StatusCode::OK
         );
 
-        advance_repo_source_publication(&backend_root, "kin-db");
         // Long enough that the probe below lands inside the hydration rather
         // than after the pass has finished and cleared the proof.
         store.charge_each_hydration(Duration::from_secs(3));
         let refreshing = Arc::clone(&state);
         let pass = tokio::task::spawn_blocking(move || refreshing.ensure_spine().is_some());
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The source moves only once the pass is inside its hydration: moved
+        // before it, the pass sees the source ahead of its committed head and
+        // stops before reading a row, and the window under test never opens.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        advance_repo_source_publication(&backend_root, "kin-db");
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let probed = call_readiness_handler(Arc::clone(&state)).await;
         let proved = pass.await.expect("the authority pass must not panic");
@@ -53056,10 +59290,13 @@ mod tests {
         // one repository's source publication. An ordinary publication does not
         // move the rollout fence, so nothing but durable identity catches this.
         advance_repo_source_publication(&backend_root, "kin-db");
+        // The read above left a verdict the next read may use for the query
+        // TTL; expire it, so this read re-checks durable identity.
+        state.advance_hosted_spine_clock_for_test(crate::hosted_spine_cost::QUERY_VERDICT_TTL);
         let hydrations_before = store.hydration_reads();
+        let refused_before = spine_cost(&state).refused_before_hydration;
 
         let (status, _) = read_spine_edges(Arc::clone(&state)).await;
-        let hydrations = store.hydration_reads() - hydrations_before;
 
         assert_eq!(
             status,
@@ -53068,16 +59305,34 @@ mod tests {
              Answering from it is the one thing the cheap path may never do."
         );
         assert_eq!(
-            hydrations, 1,
-            "a superseded proof must fall through to exactly one full pass, so the query \
-             answers from what is durably there now instead of refusing on a stale reading"
+            spine_cost(&state).refused_before_hydration - refused_before,
+            1,
+            "a superseded proof must fall through to exactly one pass, so the query answers \
+             from what is durably there now instead of refusing on a stale reading"
         );
+        assert_eq!(
+            store.hydration_reads(),
+            hydrations_before,
+            "that pass saw the source ahead of its committed head and stopped before \
+             hydrating: it cannot prove, and reading every committed row would not change that"
+        );
+        // The pass above refused, so the limiter admits the next one only after
+        // its retry floor. Step past it, or the call below is refused without
+        // running and proves nothing about what the pass decides.
+        state
+            .advance_hosted_spine_clock_for_test(crate::hosted_spine_cost::FAILED_PASS_RETRY_FLOOR);
         assert!(
             state.ensure_spine().is_none(),
             "and the full pass must agree: a repository whose source cursor is ahead of its \
              committed spine head cannot be proved, so the refusal above is the cheap path \
              reaching the verdict the expensive one reaches"
         );
+        assert_eq!(
+            spine_cost(&state).refused_before_hydration - refused_before,
+            2,
+            "the second pass must actually have run to agree"
+        );
+        assert_eq!(store.hydration_reads(), hydrations_before);
     }
 
     /// A refusal that re-proving cannot fix must not pay for a pass.
@@ -53102,6 +59357,8 @@ mod tests {
 
         // The active Firestore fence is the third read the cached check makes
         // and the first that can fail while every durable identity stays put.
+        // Expire the verdict the read above left, so the check runs at all.
+        state.advance_hosted_spine_clock_for_test(crate::hosted_spine_cost::QUERY_VERDICT_TTL);
         store.fail_next_rollout_fence_load();
         let hydrations_before = store.hydration_reads();
 
@@ -53119,6 +59376,1223 @@ mod tests {
             "the blocked refusal hydrated the durable cache. Re-proving cannot fix a control \
              plane the reader cannot read, so the pass refuses a second time having taken \
              the process-wide hydration lock to do it."
+        );
+    }
+
+    // ── What the hosted spine is allowed to cost ─────────────────────────
+    //
+    // From 2026-09-05 to 2026-09-20 the hosted daemon's background authority
+    // refresh ran a full pass, a hydration of every committed spine row plus
+    // the fleet double-collect, once a minute plus the pass time, and Firestore
+    // billed about 46 million reads a day for it until the spine was switched
+    // off. These pin the limits that replace it: readiness answers from a
+    // cached verdict, callers that arrive together share one check or one
+    // pass, a full pass outside a transition runs no faster than its floor and
+    // backs off when it fails, a spine that is switched off reads nothing, and
+    // `/health` says what all of it cost. Reads are counted in Firestore's own
+    // billing unit by the fake store, which charges each call the requests
+    // `FirestoreStore` sends for it.
+
+    /// A flood of probes inside the TTL costs one identity check and no
+    /// hydration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_readiness_flood_inside_the_ttl_costs_one_identity_check_and_no_hydration() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let hydrations_before = store.hydration_reads();
+        let reads_before = firestore_document_reads(&store);
+        let before = spine_cost(&state);
+
+        for probe in 0..200 {
+            assert_eq!(
+                call_readiness_handler(Arc::clone(&state)).await,
+                StatusCode::OK,
+                "probe {probe} of an admitted reader holding a current proof must be ready"
+            );
+        }
+
+        let after = spine_cost(&state);
+        assert_eq!(
+            store.hydration_reads(),
+            hydrations_before,
+            "readiness hydrated the durable spine cache"
+        );
+        assert_eq!(
+            after.identity_checks - before.identity_checks,
+            1,
+            "200 probes inside the TTL must share the one check the first of them ran"
+        );
+        assert_eq!(after.verdict_cache_hits - before.verdict_cache_hits, 199);
+        let fleet = HOSTED_FIXTURE_FLEET_SIZE as u64;
+        assert_eq!(
+            firestore_document_reads(&store) - reads_before,
+            2 + 2 * fleet,
+            "one identity check reads the active fence before and after the bundle and \
+             lists the committed heads twice; 200 probes must cost exactly that"
+        );
+    }
+
+    /// Probes that arrive together once the verdict has expired share one
+    /// check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_probes_past_the_ttl_share_one_identity_check() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+        expire_readiness_verdicts(&state);
+        // Slow the check down so the probes below overlap it.
+        store.charge_each_point_read(Duration::from_millis(50));
+        let checks_before = spine_cost(&state).identity_checks;
+
+        let probes = (0..32)
+            .map(|_| tokio::spawn(call_readiness_handler(Arc::clone(&state))))
+            .collect::<Vec<_>>();
+        for probe in probes {
+            assert_eq!(probe.await.unwrap(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            spine_cost(&state).identity_checks - checks_before,
+            1,
+            "32 concurrent probes with an expired verdict must share one check"
+        );
+    }
+
+    /// Semantic reads that find no usable proof share one full pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_spine_reads_without_a_proof_share_one_full_pass() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        // Drop the proof the way a failed startup step does, leaving every
+        // durable identity where it is, so one pass can establish it again.
+        state.record_hosted_spine_startup_failure("injected: the cached proof is gone");
+        // Long enough that the reads below arrive while the pass runs.
+        store.charge_each_hydration(Duration::from_millis(500));
+        let hydrations_before = store.hydration_reads();
+
+        let reads = (0..16)
+            .map(|_| tokio::spawn(read_spine_edges(Arc::clone(&state))))
+            .collect::<Vec<_>>();
+        for read in reads {
+            let (status, _) = read.await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "every read must be answered from the one pass"
+            );
+        }
+
+        assert_eq!(
+            store.hydration_reads() - hydrations_before,
+            1,
+            "16 concurrent reads without a proof must share one full pass"
+        );
+        assert_eq!(spine_cost(&state).full_passes_by_trigger.request, 1);
+    }
+
+    /// A full pass outside an authority transition runs no faster than its
+    /// floor, and one that fails backs off.
+    #[tokio::test]
+    async fn full_passes_run_no_faster_than_the_floor_and_back_off_when_they_fail() {
+        use crate::hosted_spine_cost::{FAILED_PASS_RETRY_FLOOR, FULL_PASS_FLOOR};
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let hydrations_before = store.hydration_reads();
+        let passes = || store.hydration_reads() - hydrations_before;
+
+        assert!(state.ensure_spine().is_some(), "the first pass is admitted");
+        for _ in 0..50 {
+            assert!(
+                state.ensure_spine().is_none(),
+                "a full pass inside the floor must be refused"
+            );
+        }
+        assert_eq!(
+            passes(),
+            1,
+            "51 calls inside the floor ran more than one pass"
+        );
+        let cost = spine_cost(&state);
+        assert_eq!(cost.full_passes_deferred, 50);
+        assert!(cost
+            .next_full_pass_in_ms
+            .is_some_and(|wait| wait <= FULL_PASS_FLOOR.as_millis() as u64));
+        let reason = state.spine_unavailable_reason();
+        assert!(reason.contains("rate limited"), "{reason}");
+
+        // The floor is a wait, not a ban.
+        state.advance_hosted_spine_clock_for_test(FULL_PASS_FLOOR);
+        assert!(state.ensure_spine().is_some());
+        assert_eq!(passes(), 2);
+
+        // A failed pass is retried after the retry floor, and a second failure
+        // doubles the wait.
+        state.advance_hosted_spine_clock_for_test(FULL_PASS_FLOOR);
+        store.fail_next_hydration();
+        assert!(state.ensure_spine().is_none(), "the injected failure");
+        assert_eq!(passes(), 3);
+        state.advance_hosted_spine_clock_for_test(FAILED_PASS_RETRY_FLOOR);
+        store.fail_next_hydration();
+        assert!(
+            state.ensure_spine().is_none(),
+            "the second failure in a row"
+        );
+        assert_eq!(passes(), 4);
+        state.advance_hosted_spine_clock_for_test(FAILED_PASS_RETRY_FLOOR);
+        assert!(
+            state.ensure_spine().is_none(),
+            "two failures in a row must double the wait"
+        );
+        assert_eq!(passes(), 4, "a retry inside the doubled wait ran anyway");
+        assert_eq!(spine_cost(&state).consecutive_failed_passes, 2);
+        state.advance_hosted_spine_clock_for_test(FAILED_PASS_RETRY_FLOOR);
+        assert!(
+            state.ensure_spine().is_some(),
+            "the retry after the doubled wait runs, and succeeds"
+        );
+        assert_eq!(passes(), 5);
+        assert_eq!(spine_cost(&state).consecutive_failed_passes, 0);
+    }
+
+    /// A cache that loses its edge authority to a local graph mutation, with
+    /// durable identity untouched, is repaired by a full pass at most once per
+    /// `COMPLETENESS_REPAIR_FLOOR`, however often it is mutated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_that_keeps_losing_edge_authority_is_repaired_at_most_once_per_floor() {
+        use crate::hosted_spine_cost::COMPLETENESS_REPAIR_FLOOR;
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let spine = || state.spine().expect("the admitted fixture holds a spine");
+        let hydrations_before = store.hydration_reads();
+        let passes = || store.hydration_reads() - hydrations_before;
+        // What every local mutation of the primary graph does to the cache.
+        let mutate = || drop(state.begin_graph_authority_mutation());
+
+        assert!(state.run_hosted_spine_cadence_tick().await.is_none());
+        assert_eq!(passes(), 0, "a complete, current cache needs no pass");
+
+        mutate();
+        assert!(
+            !spine().authority_complete(),
+            "the mutation must dirty the edges"
+        );
+        state.run_hosted_spine_cadence_tick().await;
+        assert_eq!(passes(), 1, "the first repair runs");
+        assert!(
+            spine().authority_complete(),
+            "and restores the edge authority"
+        );
+
+        for _ in 0..20 {
+            mutate();
+            state.run_hosted_spine_cadence_tick().await;
+        }
+        assert_eq!(
+            passes(),
+            1,
+            "20 mutations and ticks inside the repair floor ran more than one pass"
+        );
+        assert_eq!(spine_cost(&state).completeness_repairs, 1);
+
+        state.advance_hosted_spine_clock_for_test(COMPLETENESS_REPAIR_FLOOR);
+        state.run_hosted_spine_cadence_tick().await;
+        assert_eq!(passes(), 2, "the floor is a wait, not a ban");
+        assert!(spine().authority_complete());
+    }
+
+    /// Inside its TTL a ready verdict answers without a Firestore read; at the
+    /// TTL the probe re-checks, and a check that refuses is not reported ready.
+    #[tokio::test]
+    async fn a_ready_verdict_past_its_ttl_does_not_report_ready() {
+        use crate::hosted_spine_cost::READY_VERDICT_TTL;
+        let (state, store, backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+
+        // Durable identity moves under the proof, somewhere this process
+        // cannot see without reading it.
+        advance_repo_source_publication(&backend_root, "kin-db");
+        let reads_before = firestore_document_reads(&store);
+        // The test clock only adds to real time, and real time passes between
+        // the probes too, so step to a few seconds short of the TTL.
+        let slack = Duration::from_secs(5);
+        state.advance_hosted_spine_clock_for_test(READY_VERDICT_TTL - slack);
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "inside its TTL the verdict answers: the TTL is how stale ready may be"
+        );
+        assert_eq!(
+            firestore_document_reads(&store),
+            reads_before,
+            "a probe answered from a fresh verdict read Firestore"
+        );
+
+        state.advance_hosted_spine_clock_for_test(slack);
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a verdict at its TTL must not report ready; the re-check finds the moved source"
+        );
+        assert!(
+            firestore_document_reads(&store) > reads_before,
+            "the expired verdict must have been re-checked against the durable store"
+        );
+    }
+
+    /// Restart the fixture's fleet the way `kin-daemon` does after the first
+    /// boot: open a new state over the same durable stores and run the real
+    /// startup entry, `start_hosted_spine_after_open`.
+    async fn restart_hosted_fleet(
+        store: &Arc<MeasuredSpineStore>,
+        backend_root: &std::path::Path,
+        meters: &HostedProbeMeters,
+        spine_disabled: bool,
+    ) -> (Arc<DaemonState>, std::result::Result<(), String>) {
+        let (state, _cursor_probes) = open_hosted_state_over(
+            backend_root,
+            Arc::clone(&meters.control),
+            Arc::clone(store) as Arc<dyn kin_spine::SpineStore>,
+            spine_disabled,
+        );
+        let control = Arc::clone(
+            state
+                .publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        let bootstrap = control
+            .bootstrap_runtime_if_absent()
+            .expect("read the publication-control record");
+        assert!(
+            bootstrap.is_none(),
+            "the fleet is past its first boot, so this is the restart path"
+        );
+        let started = state
+            .start_hosted_spine_after_open(&control, bootstrap, None)
+            .await;
+        (state, started)
+    }
+
+    /// Billable reads of one full authority pass over what the fake store
+    /// holds, in Firestore's unit, which the fake charges request for request:
+    /// the head-and-cursor check before hydrating (one head listing), the
+    /// hydration (the fence, the heads, each head's manifest, entity rows and
+    /// edge rows with at least one read per query, the heads again, the fence
+    /// again, and the legacy seal check's fence and seal), and the proof's
+    /// double collection (the fence, the heads twice, the fence).
+    fn one_full_pass_reads(store: &MeasuredSpineStore) -> u64 {
+        let state = store.inner.publication_state.lock().unwrap();
+        let heads = state.heads.len() as u64;
+        let rows: u64 = state
+            .heads
+            .values()
+            .map(|(_, head)| {
+                let entities = state
+                    .entity_rows
+                    .get(&head.publication_id)
+                    .map_or(0, Vec::len) as u64;
+                let edges = state
+                    .edge_rows
+                    .get(&head.publication_id)
+                    .map_or(0, Vec::len) as u64;
+                1 + entities.max(1) + edges.max(1)
+            })
+            .sum();
+        let precheck = heads;
+        let hydration = 1 + heads + rows + heads + 1 + 2;
+        let proof = 1 + heads + heads + 1;
+        precheck + hydration + proof
+    }
+
+    /// The reads one cached-authority check makes with a proof in hand: the
+    /// active fence before and after the identity bundle, and the committed
+    /// heads listed twice.
+    fn one_identity_check_reads() -> u64 {
+        2 + 2 * HOSTED_FIXTURE_FLEET_SIZE as u64
+    }
+
+    /// Proof 1 of the kill switch: a restart with the spine switched off,
+    /// through the real startup entry, reads nothing from Firestore, and
+    /// neither does anything the pod does after it.
+    ///
+    /// Production logged the opposite on 2026-09-22: a restart with
+    /// `KIN_DISABLE_SPINE=1` adopted anyway and read 41,496 entities and 1,489
+    /// edges, 44,241 read ops in that five-minute bucket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restart_with_the_spine_disabled_reads_nothing_from_firestore() {
+        let (running, store, backend_root, meters, _environment) =
+            admitted_hosted_test_state().await;
+        let evidence = match running
+            .publication_control
+            .as_ref()
+            .expect("the hosted fixture carries publication control")
+            .runtime_spine_authority()
+            .expect("read the completed rollout")
+        {
+            crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
+            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
+                panic!("the startup rollout must have completed: {blocking}")
+            }
+        };
+        drop(running);
+        let reads_before = kin_spine::SpineStore::read_stats(store.as_ref());
+        let hydrations_before = store.hydration_reads();
+
+        let (state, started) = restart_hosted_fleet(&store, &backend_root, &meters, true).await;
+        started.expect("a restart under the switch starts without the spine");
+        assert_eq!(
+            kin_spine::SpineStore::read_stats(store.as_ref()),
+            reads_before,
+            "the restart read Firestore with KIN_DISABLE_SPINE=1"
+        );
+        assert!(
+            state.spine().is_none() && spine_cost(&state).firestore.is_none(),
+            "the restart built the durable spine backend with the spine switched off"
+        );
+        // Adoption refuses on its own too, before any read, whoever calls it.
+        let adopted = state.adopt_hosted_spine_rollout_fence(evidence).await;
+        assert!(
+            adopted
+                .as_ref()
+                .is_err_and(|reason| reason.contains("KIN_DISABLE_SPINE")),
+            "adoption under the switch must refuse and name it: {adopted:?}"
+        );
+
+        state.set_hosted_spine_refresh_interval_for_test(Duration::from_millis(10));
+        for _ in 0..50 {
+            assert_eq!(
+                call_readiness_handler(Arc::clone(&state)).await,
+                StatusCode::OK,
+                "the kill switch must not take the pod out of service"
+            );
+        }
+        let router = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+        let health = router
+            .clone()
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (edges, _) = read_spine_edges(Arc::clone(&state)).await;
+        assert_eq!(edges, StatusCode::SERVICE_UNAVAILABLE);
+        // Long enough for a cadence at this interval to have ticked many
+        // times, had one started.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            kin_spine::SpineStore::read_stats(store.as_ref()),
+            reads_before,
+            "something read Firestore after a restart with KIN_DISABLE_SPINE=1"
+        );
+        assert_eq!(store.hydration_reads(), hydrations_before);
+        let cost = spine_cost(&state);
+        assert!(cost.spine_disabled);
+        assert_eq!(cost.full_passes, 0);
+        assert_eq!(cost.identity_checks, 0);
+        assert_eq!(cost.refused_before_hydration, 0);
+    }
+
+    /// One graph read through the hosted router, authenticated, so reader
+    /// admission runs ahead of the handler exactly as it does for a client.
+    async fn hosted_graph_read(state: Arc<DaemonState>) -> StatusCode {
+        router_with_publication_control_auth(
+            state,
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        )
+        .oneshot(
+            Request::get("/repos/kin/health")
+                .header("authorization", "Bearer daemon-test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    /// The drain proof `kin-daemon` passes a startup rollout in production.
+    fn hosted_fixture_drain_proof() -> String {
+        format!("sha256:{}", "b".repeat(64))
+    }
+
+    /// Rewrite every fleet snapshot with its own bytes at the next generation,
+    /// which is what a hosted rollout's resource fence does to the GCS objects
+    /// before it advances the Firestore fence. The fixture's control store
+    /// fences an in-memory stand-in for those objects, not the snapshots the
+    /// daemon reads, so without this a second rollout republishes the cursor
+    /// the first one committed and loses the head compare-and-swap on the
+    /// fixture rather than on anything the rollout did.
+    fn rewrite_hosted_fixture_snapshots(backend_root: &std::path::Path) {
+        let backend = kin_db::LocalFileBackend::new(backend_root);
+        for repo_id in hosted_fixture_fleet() {
+            let (bytes, generation) = kin_db::StorageBackend::load_snapshot(&backend, &repo_id)
+                .unwrap()
+                .expect("a fixture fleet repository has a snapshot");
+            let next =
+                kin_db::StorageBackend::save_snapshot(&backend, &repo_id, &bytes, generation)
+                    .unwrap();
+            assert!(
+                next > generation,
+                "a same-bytes rewrite must move {repo_id} past generation {generation}"
+            );
+        }
+    }
+
+    /// Drive a fleet's first boot through the real startup entry with the
+    /// spine on or switched off, and return the state, its store and the
+    /// Firestore reads the whole startup made.
+    async fn first_boot_hosted_fleet(
+        spine_disabled: bool,
+    ) -> (
+        Arc<DaemonState>,
+        Arc<MeasuredSpineStore>,
+        kin_spine::DurableReadStats,
+        kin_core::test_env::EnvVarGuard,
+    ) {
+        let store = Arc::new(MeasuredSpineStore::cold());
+        let (state, _backend_root, _meters, environment) = hosted_test_state_over_with(
+            Arc::clone(&store) as Arc<dyn kin_spine::SpineStore>,
+            spine_disabled,
+        );
+        let control = Arc::clone(
+            state
+                .publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        assert_eq!(
+            hosted_graph_read(Arc::clone(&state)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "nothing is served before the fleet's first reader is admitted"
+        );
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .expect("bootstrap the fleet control record")
+            .expect("an absent control record leaves one pending startup rollout");
+        let before = kin_spine::SpineStore::read_stats(store.as_ref())
+            .expect("the fake store meters its reads");
+        state
+            .start_hosted_spine_after_open(
+                &control,
+                Some(pending),
+                Some(hosted_fixture_drain_proof()),
+            )
+            .await
+            .expect("the first boot's startup rollout completes");
+        let reads = kin_spine::SpineStore::read_stats(store.as_ref())
+            .expect("the fake store meters its reads")
+            .since(before);
+        (state, store, reads, environment)
+    }
+
+    /// Assert that the reader this state runs is the one publication control
+    /// admits, with no rollout holding the fleet.
+    fn assert_reader_admitted(state: &DaemonState, reader: &str) {
+        let control = state
+            .publication_control
+            .as_ref()
+            .expect("the hosted fixture carries publication control");
+        match control
+            .runtime_spine_authority()
+            .expect("read the publication-control record")
+        {
+            crate::publication_lease::RuntimeSpineAuthority::Completed(_) => {}
+            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
+                panic!("the rollout must have been released: {blocking}")
+            }
+        }
+        let admitted = control
+            .refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .expect("the running image must be the admitted reader");
+        assert_eq!(admitted.identity, reader);
+    }
+
+    /// Nothing a running pod does reads Firestore while the switch is on:
+    /// probes, graph reads, a refused spine read, a cadence tick an hour on,
+    /// and an ordinary spine publication, which still refuses.
+    async fn assert_nothing_reads_the_switched_off_spine(
+        state: &Arc<DaemonState>,
+        store: &MeasuredSpineStore,
+    ) {
+        let settled = kin_spine::SpineStore::read_stats(store);
+        let hydrations = store.hydration_reads();
+        for _ in 0..20 {
+            assert_eq!(
+                probe_hosted_readiness(Arc::clone(state)).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                hosted_graph_read(Arc::clone(state)).await,
+                StatusCode::OK,
+                "the admitted reader must serve graph reads under the switch"
+            );
+        }
+        let (edges, _) = read_spine_edges(Arc::clone(state)).await;
+        assert_eq!(
+            edges,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a spine read must refuse under the switch"
+        );
+        state.advance_hosted_spine_clock_for_test(Duration::from_secs(3600));
+        assert!(state.run_hosted_spine_cadence_tick().await.is_none());
+        // Only the live rollout may publish under the switch.
+        let (status, body) = publication_spine_ingest(
+            router_with_publication_control_auth(
+                Arc::clone(state),
+                Some("daemon-test-token".to_string()),
+                Some("publication-test-token".to_string()),
+            ),
+            "kin",
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "an ordinary spine publication must still refuse under the switch: {body}"
+        );
+        assert!(
+            body.contains("KIN_DISABLE_SPINE"),
+            "the refusal must name the switch: {body}"
+        );
+        assert_eq!(
+            kin_spine::SpineStore::read_stats(store),
+            settled,
+            "something read Firestore while the spine was switched off"
+        );
+        assert_eq!(store.hydration_reads(), hydrations);
+    }
+
+    /// A first boot under `KIN_DISABLE_SPINE` admits its reader and serves.
+    /// Its startup rollout used to advance the fence and then refuse to
+    /// publish, stranding a rollout lease that refused every reader. Through
+    /// the real startup entry it now publishes the fleet under its live lease
+    /// and checks the fence at each step, but runs none of the full passes:
+    /// with the spine on, the same first boot reads exactly three passes more,
+    /// one each for prepare, admit and release. Afterwards nothing reads
+    /// Firestore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_boot_with_the_spine_switched_off_admits_its_reader_without_a_full_pass() {
+        let (enabled, enabled_store, enabled_reads, _enabled_environment) =
+            first_boot_hosted_fleet(false).await;
+        let enabled_cost = spine_cost(&enabled);
+        assert_eq!(
+            enabled_cost.full_passes_by_trigger.transition, 3,
+            "with the spine on, prepare, admit and release each run one full pass"
+        );
+        let one_pass = one_full_pass_reads(&enabled_store);
+
+        let (state, store, reads, _environment) = first_boot_hosted_fleet(true).await;
+        assert_reader_admitted(&state, HOSTED_FIXTURE_READER);
+        assert_eq!(
+            probe_hosted_readiness(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            hosted_graph_read(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the first boot's reader must serve under the switch"
+        );
+        let cost = spine_cost(&state);
+        assert_eq!(cost.full_passes, 0);
+        assert!(cost.spine_disabled);
+        // Both first boots seal the unsealed fixture database, which loads
+        // every committed row once; the passes are the only other whole-fleet
+        // loads.
+        assert_eq!(
+            enabled_store.full_hydrations() - store.full_hydrations(),
+            3,
+            "the switched-off first boot must hydrate exactly three times less: \
+             spine on {}, switched off {}",
+            enabled_store.full_hydrations(),
+            store.full_hydrations()
+        );
+        assert_eq!(
+            enabled_reads.document_reads - reads.document_reads,
+            3 * one_pass,
+            "the switched-off first boot must read exactly three full passes less: \
+             spine on {enabled_reads:?}, switched off {reads:?}, one pass {one_pass}"
+        );
+        eprintln!(
+            "first boot reads: spine on {enabled_reads:?} ({} whole-fleet loads), \
+             switched off {reads:?} ({} whole-fleet loads), one full pass {one_pass}",
+            enabled_store.full_hydrations(),
+            store.full_hydrations()
+        );
+
+        assert_nothing_reads_the_switched_off_spine(&state, &store).await;
+    }
+
+    /// With the spine switched off, the image the promotion authorized admits
+    /// itself at its startup and serves, without a full pass. An image nobody
+    /// authorized owns no rollout: it reads nothing and serves nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_the_switch_only_the_authorized_next_image_rolls_out_and_serves() {
+        const NEXT_READER: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const STRANGER: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let (running, store, backend_root, meters, _environment) =
+            admitted_hosted_test_state().await;
+        running
+            .publication_control
+            .as_ref()
+            .expect("the hosted fixture carries publication control")
+            .authorize_next_reader(crate::publication_lease::AuthorizeNextReaderRequest {
+                scope: HOSTED_FIXTURE_SCOPE.to_string(),
+                identity: NEXT_READER.to_string(),
+            })
+            .expect("the promotion names its successor against the running daemon");
+        drop(running);
+        let before = kin_spine::SpineStore::read_stats(store.as_ref())
+            .expect("the fake store meters its reads");
+
+        let (stranger, _probes) = open_hosted_state_as(
+            &backend_root,
+            Arc::clone(&meters.control),
+            Arc::clone(&store) as Arc<dyn kin_spine::SpineStore>,
+            true,
+            STRANGER,
+        );
+        let control = Arc::clone(
+            stranger
+                .publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        let bootstrap = control
+            .bootstrap_runtime_if_absent()
+            .expect("read the publication-control record");
+        assert!(
+            bootstrap.is_none(),
+            "an image nobody authorized must own no rollout"
+        );
+        stranger
+            .start_hosted_spine_after_open(&control, bootstrap, None)
+            .await
+            .expect("under the switch an unadmitted image starts without the spine");
+        assert_eq!(
+            probe_hosted_readiness(Arc::clone(&stranger)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            hosted_graph_read(Arc::clone(&stranger)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an image nobody authorized must serve nothing"
+        );
+        assert_eq!(
+            kin_spine::SpineStore::read_stats(store.as_ref()),
+            Some(before),
+            "an image nobody authorized read Firestore under the switch"
+        );
+        drop(stranger);
+
+        rewrite_hosted_fixture_snapshots(&backend_root);
+        let hydrations_before = store.full_hydrations();
+        let (next, _probes) = open_hosted_state_as(
+            &backend_root,
+            Arc::clone(&meters.control),
+            Arc::clone(&store) as Arc<dyn kin_spine::SpineStore>,
+            true,
+            NEXT_READER,
+        );
+        let control = Arc::clone(
+            next.publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .expect("read the publication-control record")
+            .expect("the authorized image owns exactly one startup rollout");
+        next.start_hosted_spine_after_open(
+            &control,
+            Some(pending),
+            Some(hosted_fixture_drain_proof()),
+        )
+        .await
+        .expect("the authorized image admits itself under the switch");
+        let rollout_reads = kin_spine::SpineStore::read_stats(store.as_ref())
+            .expect("the fake store meters its reads")
+            .since(before);
+        assert_reader_admitted(&next, NEXT_READER);
+        assert_eq!(
+            control
+                .status()
+                .expect("read the publication-control record")
+                .next_reader_identity,
+            None,
+            "the admission spends the promotion's authorization"
+        );
+        assert_eq!(
+            probe_hosted_readiness(Arc::clone(&next)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            hosted_graph_read(Arc::clone(&next)).await,
+            StatusCode::OK,
+            "the promoted image must serve under the switch"
+        );
+        assert_eq!(
+            store.full_hydrations(),
+            hydrations_before,
+            "the promoted image's rollout hydrated the durable cache under the switch"
+        );
+        assert_eq!(spine_cost(&next).full_passes, 0);
+        eprintln!("authorized rollout under the switch read {rollout_reads:?}");
+
+        assert_nothing_reads_the_switched_off_spine(&next, &store).await;
+    }
+
+    /// Release is how an operator clears a rollout lease a failed rollout left
+    /// behind, and it used to run a full pass under the switch. On a pod
+    /// restarted under the switch, a lease left active refuses every reader;
+    /// admitting the running reader and releasing through the authenticated
+    /// routes clears it without a full pass, and release itself reads nothing
+    /// from Firestore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_the_switch_a_left_behind_rollout_is_admitted_and_released_without_a_full_pass() {
+        let (running, store, backend_root, meters, _environment) =
+            admitted_hosted_test_state().await;
+        drop(running);
+        let (state, started) = restart_hosted_fleet(&store, &backend_root, &meters, true).await;
+        started.expect("a restart under the switch starts without the spine");
+        let app = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+        let (status, lease) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            serde_json::json!({
+                "scope": HOSTED_FIXTURE_SCOPE,
+                "repositories": hosted_fixture_fleet(),
+                "holder": "left-behind",
+                "request_id": "left-behind-1",
+                "ttl_seconds": 300
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "acquire must succeed: {lease}");
+        let token = lease["token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("acquire must return a lease token: {lease}"))
+            .to_string();
+        let fence = lease["fence"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("acquire must return a lease fence: {lease}"));
+        assert_eq!(
+            hosted_graph_read(Arc::clone(&state)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a live rollout lease refuses every reader"
+        );
+        rewrite_hosted_fixture_snapshots(&backend_root);
+        let hydrations_before = store.full_hydrations();
+
+        let (status, admitted) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/admit-reader",
+            serde_json::json!({
+                "scope": HOSTED_FIXTURE_SCOPE,
+                "token": token,
+                "fence": fence,
+                "repositories": hosted_fixture_fleet(),
+                "reader": {
+                    "identity": HOSTED_FIXTURE_READER,
+                    "min_snapshot_schema": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                    "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                    "valid_for_seconds": 3600
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admission under the switch must publish under the live lease and admit: {admitted}"
+        );
+        assert_eq!(
+            store.full_hydrations(),
+            hydrations_before,
+            "admission ran a full pass under the switch"
+        );
+
+        let before_release = kin_spine::SpineStore::read_stats(store.as_ref())
+            .expect("the fake store meters its reads");
+        let (status, released) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/release",
+            serde_json::json!({ "scope": HOSTED_FIXTURE_SCOPE, "token": token, "fence": fence }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "release must succeed: {released}");
+        assert_eq!(
+            kin_spine::SpineStore::read_stats(store.as_ref())
+                .expect("the fake store meters its reads")
+                .since(before_release),
+            kin_spine::DurableReadStats::default(),
+            "release read Firestore under the switch"
+        );
+        assert_eq!(
+            store.full_hydrations(),
+            hydrations_before,
+            "release ran a full pass under the switch"
+        );
+        assert_eq!(spine_cost(&state).full_passes, 0);
+        assert_reader_admitted(&state, HOSTED_FIXTURE_READER);
+        assert_eq!(
+            hosted_graph_read(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "clearing the lease must put the reader back in service"
+        );
+        assert_nothing_reads_the_switched_off_spine(&state, &store).await;
+    }
+
+    /// A probe that checks while a full pass is running, after the pass began
+    /// but before its hydration replaced the durable cache, vouches for rows
+    /// the cache is about to drop. Its verdict must stop answering once the
+    /// replacement starts, or reads could be served for the rest of its TTL
+    /// from rows no proof validated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verdict_taken_before_a_pass_replaced_the_cache_does_not_answer_after() {
+        use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+        const UNSEEN: u8 = 0;
+        const ANSWERS: u8 = 1;
+        const REFUSES: u8 = 2;
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let during_precheck = Arc::new(AtomicU8::new(UNSEEN));
+        let during_hydration = Arc::new(AtomicU8::new(UNSEEN));
+        {
+            // The pass lists the committed heads before it hydrates; a probe
+            // lands right then and takes a verdict the way any probe does.
+            let state = Arc::downgrade(&state);
+            let during_precheck = Arc::clone(&during_precheck);
+            store.on_head_read(Box::new(move || {
+                if during_precheck.load(AtomicOrdering::SeqCst) != UNSEEN {
+                    return;
+                }
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                if !state.hosted_spine_pass_in_flight_for_test() {
+                    return;
+                }
+                let checked = state.check_hosted_spine_verdict_now_for_test().is_ok();
+                let answers = state.hosted_spine_verdict_answers_for_test(
+                    crate::hosted_spine_cost::HostedSpineVerdictUse::Query,
+                );
+                during_precheck.store(
+                    if checked && answers { ANSWERS } else { REFUSES },
+                    AtomicOrdering::SeqCst,
+                );
+            }));
+        }
+        {
+            let state = Arc::downgrade(&state);
+            let during_hydration = Arc::clone(&during_hydration);
+            store.on_hydration(Box::new(move || {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let answers = state.hosted_spine_verdict_answers_for_test(
+                    crate::hosted_spine_cost::HostedSpineVerdictUse::Query,
+                );
+                during_hydration.store(
+                    if answers { ANSWERS } else { REFUSES },
+                    AtomicOrdering::SeqCst,
+                );
+            }));
+        }
+
+        let led = matches!(
+            state
+                .reprove_hosted_spine_authority(
+                    crate::hosted_spine_cost::HostedSpinePassTrigger::Background,
+                )
+                .await,
+            crate::state::HostedSpineReproof::Led(Some(_))
+        );
+        assert!(
+            led,
+            "the limiter must admit and run one full pass that proves"
+        );
+        assert_eq!(
+            during_precheck.load(AtomicOrdering::SeqCst),
+            ANSWERS,
+            "the probe between the pass's start and its hydration must pass its check, \
+             and its verdict must answer until the cache is replaced"
+        );
+        assert_eq!(
+            during_hydration.load(AtomicOrdering::SeqCst),
+            REFUSES,
+            "a verdict taken before the cache was replaced answered while the replacement ran"
+        );
+    }
+
+    /// A state that proved the spine before the switch was set on it still
+    /// holds that proof. It answers nothing, and nothing reads Firestore to
+    /// decide so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proof_held_with_the_spine_switched_off_answers_nothing_and_reads_nothing() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+        state.set_spine_disabled_for_test(true);
+        let reads_before = kin_spine::SpineStore::read_stats(store.as_ref());
+        let hydrations_before = store.hydration_reads();
+
+        for _ in 0..20 {
+            assert_eq!(
+                call_readiness_handler(Arc::clone(&state)).await,
+                StatusCode::OK
+            );
+        }
+        let (edges, _) = read_spine_edges(Arc::clone(&state)).await;
+        assert_eq!(
+            edges,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a spine read must refuse under the switch even with a proof in hand"
+        );
+        let health = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        )
+        .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.ensure_spine().is_none());
+        assert!(state.run_hosted_spine_cadence_tick().await.is_none());
+
+        assert_eq!(
+            kin_spine::SpineStore::read_stats(store.as_ref()),
+            reads_before,
+            "a proof held under KIN_DISABLE_SPINE=1 still drove Firestore reads"
+        );
+        assert_eq!(store.hydration_reads(), hydrations_before);
+    }
+
+    /// Proof 2, startup: a restart with the spine on costs exactly one full
+    /// pass and one active-fence read, and nothing more until something asks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_enabled_restart_reads_exactly_one_full_pass() {
+        let (running, store, backend_root, meters, _environment) =
+            admitted_hosted_test_state().await;
+        drop(running);
+        let expected = 1 + one_full_pass_reads(&store);
+        let before = firestore_document_reads(&store);
+        let hydrations_before = store.hydration_reads();
+
+        let (state, started) = restart_hosted_fleet(&store, &backend_root, &meters, false).await;
+        started.expect("a restart with the spine on adopts the completed rollout");
+
+        assert_eq!(
+            firestore_document_reads(&store) - before,
+            expected,
+            "a restart must read the adoption's active fence and one full pass, no more"
+        );
+        assert_eq!(store.hydration_reads() - hydrations_before, 1);
+        assert_eq!(spine_cost(&state).full_passes_by_trigger.transition, 1);
+    }
+
+    /// Proof 2, steady ticks: each background tick over a fleet nobody
+    /// publishes to reads one identity check and hydrates nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steady_ticks_each_read_one_identity_check_and_hydrate_nothing() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let before = firestore_document_reads(&store);
+        let hydrations_before = store.hydration_reads();
+
+        const TICKS: u64 = 60;
+        for _ in 0..TICKS {
+            assert!(state.run_hosted_spine_cadence_tick().await.is_none());
+        }
+
+        assert_eq!(
+            firestore_document_reads(&store) - before,
+            TICKS * one_identity_check_reads(),
+            "an hour of ticks must cost one identity check each"
+        );
+        assert_eq!(store.hydration_reads(), hydrations_before);
+        assert_eq!(spine_cost(&state).identity_checks, TICKS);
+    }
+
+    /// Proof 2, a failing pass: a fleet whose source ran ahead of its
+    /// committed head cannot prove, and every retry costs one fence read and
+    /// one head listing, never a hydration, at no more than one retry per
+    /// retry floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fleet_that_cannot_prove_costs_a_head_listing_per_retry() {
+        use crate::hosted_spine_cost::FAILED_PASS_RETRY_FLOOR;
+        let (state, store, backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        advance_repo_source_publication(&backend_root, "kin-db");
+        let fleet = HOSTED_FIXTURE_FLEET_SIZE as u64;
+        let hydrations_before = store.hydration_reads();
+
+        // The first tick holds a proof: its identity check reads the fence and
+        // both head listings before it finds the moved source, and the pass it
+        // asks for stops after its own head listing.
+        let before = firestore_document_reads(&store);
+        state.run_hosted_spine_cadence_tick().await;
+        assert_eq!(
+            firestore_document_reads(&store) - before,
+            (1 + 2 * fleet) + fleet
+        );
+
+        // Every retry after it: no proof is held, so the check reads the fence
+        // alone, and the pass stops after its head listing. An hour of retries
+        // at the floor.
+        const RETRIES: u64 = 240;
+        let before = firestore_document_reads(&store);
+        for _ in 0..RETRIES {
+            // Inside the floor the tick checks identity and asks for nothing.
+            state.run_hosted_spine_cadence_tick().await;
+            state.advance_hosted_spine_clock_for_test(FAILED_PASS_RETRY_FLOOR);
+            state.run_hosted_spine_cadence_tick().await;
+        }
+        assert_eq!(
+            firestore_document_reads(&store) - before,
+            RETRIES * (1 + (1 + fleet)),
+            "each 15 s window costs a fence read for the tick inside the floor, and a fence \
+             read and a head listing for the retry at it"
+        );
+        assert_eq!(
+            store.hydration_reads(),
+            hydrations_before,
+            "a fleet that cannot prove must never be hydrated to find that out"
+        );
+        let cost = spine_cost(&state);
+        assert_eq!(cost.refused_before_hydration, RETRIES + 1);
+        assert_eq!(cost.full_passes_by_trigger.background, 0);
+        assert_eq!(
+            cost.consecutive_failed_passes, 0,
+            "a refusal before hydrating must not escalate the backoff"
+        );
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// Proof 2, per-request checks: authenticated spine reads share one
+    /// identity check, and a check answers the reads that follow for the
+    /// query TTL, whatever the request rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn authenticated_reads_share_one_identity_check_per_query_ttl() {
+        use crate::hosted_spine_cost::QUERY_VERDICT_TTL;
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let checks = || spine_cost(&state).identity_checks;
+        let before = firestore_document_reads(&store);
+        let checks_before = checks();
+
+        for _ in 0..50 {
+            let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            checks() - checks_before,
+            1,
+            "50 reads inside the query TTL must share one identity check"
+        );
+        assert_eq!(
+            firestore_document_reads(&store) - before,
+            one_identity_check_reads()
+        );
+
+        state.advance_hosted_spine_clock_for_test(QUERY_VERDICT_TTL);
+        // Slow the check so the reads below overlap it.
+        store.charge_each_point_read(Duration::from_millis(50));
+        let reads = (0..16)
+            .map(|_| tokio::spawn(read_spine_edges(Arc::clone(&state))))
+            .collect::<Vec<_>>();
+        for read in reads {
+            let (status, _) = read.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            checks() - checks_before,
+            2,
+            "16 concurrent reads past the TTL must share one new check"
+        );
+        assert_eq!(
+            firestore_document_reads(&store) - before,
+            2 * one_identity_check_reads(),
+            "66 authenticated reads over two TTL windows must cost two identity checks"
+        );
+    }
+
+    /// `/health` says what the hosted spine has cost; a local daemon has no
+    /// durable spine store and says nothing.
+    #[tokio::test]
+    async fn health_reports_what_the_hosted_spine_has_cost() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+
+        let response = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        )
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+        let cost = health
+            .spine_cost
+            .expect("a hosted daemon must report what its spine costs");
+        assert!(!cost.spine_disabled);
+        assert!(
+            cost.full_passes_by_trigger.transition >= 1,
+            "the startup rollout's full passes must be counted"
+        );
+        assert_eq!(
+            cost.full_passes, cost.full_passes_by_trigger.transition,
+            "nothing but the startup rollout ran a full pass"
+        );
+        assert!(
+            cost.identity_checks >= 1,
+            "the probe's check must be counted"
+        );
+        assert_eq!(
+            cost.firestore.map(|stats| stats.document_reads),
+            Some(firestore_document_reads(&store)),
+            "the report must carry the store's own count of billable reads"
+        );
+        assert!(cost.last_full_pass.is_some());
+
+        let local = health_json(test_state()).await;
+        assert!(
+            local.spine_cost.is_none(),
+            "a local daemon has no durable spine store to report on"
         );
     }
 
@@ -53240,10 +60714,46 @@ mod tests {
             started.capability_policy.can_commit,
             CapabilitySource::Store
         );
+        assert!(
+            !started.capabilities.can_execute,
+            "execution is opt-in, so a session that declared nothing may not run commands"
+        );
         assert_eq!(
             started.capability_policy.can_execute,
+            CapabilitySource::ClientOptIn,
+            "kin_session_exec gates on can_execute, and only a declaration grants it"
+        );
+        assert_eq!(
+            started.capability_policy.can_branch,
             CapabilitySource::Ungated,
-            "Kin gates nothing on can_execute, and the report must not dress it as a grant"
+            "Kin gates nothing on can_branch, and the report must not dress it as a grant"
+        );
+    }
+
+    /// A session that declares `can_execute` gets it, and the report names the
+    /// opt-in as what decided the bit, whatever the store permits for writes.
+    #[test]
+    fn execution_is_granted_by_declaration_and_reported_as_an_opt_in() {
+        let declared = SessionCapabilities {
+            can_read: true,
+            can_write: true,
+            can_execute: true,
+            can_branch: false,
+            can_commit: true,
+            max_concurrent_intents: 1,
+        };
+        for commits_permitted in [true, false] {
+            let (granted, policy) =
+                resolve_session_capabilities(commits_permitted, Some(&declared));
+            assert!(granted.can_execute, "commits_permitted={commits_permitted}");
+            assert_eq!(policy.can_execute, CapabilitySource::ClientOptIn);
+        }
+        let (undeclared, policy) = resolve_session_capabilities(true, None);
+        assert!(!undeclared.can_execute);
+        assert_eq!(policy.can_execute, CapabilitySource::ClientOptIn);
+        assert_eq!(
+            serde_json::to_value(CapabilitySource::ClientOptIn).unwrap(),
+            serde_json::json!("client_opt_in")
         );
     }
 
@@ -55409,7 +62919,507 @@ mod tests {
             body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
             provider_root
         );
-        assert_eq!(body["negative"]["safe_to_conclude_absent"], true);
+        assert_eq!(body["negative"]["safe_to_conclude_absent"], false,
+            "complete federation does not supply the synthetic local graph's missing source proof: {body}");
+    }
+
+    #[tokio::test]
+    async fn daemon_mcp_bulk_absence_accepts_admitted_source_with_complete_federation() {
+        let state = test_state();
+        install_admitted_query_sources(&state, &[
+            ("src/target.py", "def target(value):\n    return value\n"),
+            ("src/witness_callee.py", "def witness_callee(value):\n    return value\n"),
+            ("src/witness_caller.py", "from src.witness_callee import witness_callee\n\ndef witness_caller(value):\n    callback = witness_callee\n    return witness_callee(value)\n"),
+        ]).await;
+        let targets: Vec<_> = state
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .filter(|entity| {
+                entity.kind == EntityKind::Function
+                    && entity.name == "target"
+                    && entity
+                        .file_origin
+                        .as_ref()
+                        .is_some_and(|file| file.0 == "src/target.py")
+            })
+            .collect();
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        let provider_repo_id = state.cached_repo_id.clone();
+        let provider_root = hex::encode(state.graph.compute_root_hash());
+        let spine = state.ensure_spine().unwrap();
+        assert_eq!(
+            spine.root_hash(&provider_repo_id).as_deref(),
+            Some(provider_root.as_str())
+        );
+        let result = mcp_call(
+            router(Arc::clone(&state)),
+            "bulk_check_references",
+            json!({
+                "entity_ids": [target.id.to_string()], "relation_kind": "Any"
+            }),
+        )
+        .await;
+        let result = kin_mcp::finalize_with_envelope(
+            result,
+            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await),
+            "bulk_check_references",
+        );
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(body["results"][0]["has_references"], false, "{body}");
+        assert_eq!(body["cross_repo"]["authority_complete"], true, "{body}");
+        assert_eq!(
+            body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
+            provider_root
+        );
+        assert_eq!(
+            body["source_derivation"]["report"]["body_binding"], "current",
+            "{body}"
+        );
+        assert_eq!(
+            body["source_derivation"]["report"]["parse_coverage"], "complete",
+            "{body}"
+        );
+        assert_eq!(body["negative"]["safe_to_conclude_absent"], true, "{body}");
+    }
+
+    fn xref_cache_history_record() -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("xref-test"),
+            message: "record history without changing topology".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            external_reference_deltas: Vec::new(),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    #[test]
+    fn xref_cache_reuses_one_admitted_graph_and_resamples_pending_absence() {
+        let state = test_state();
+        let target = test_entity("target", "src/lib.rs");
+        state.graph.upsert_entity(&target).unwrap();
+        let rebuilds = std::cell::Cell::new(0);
+        let capture = || {
+            prepare_xref_graph_read_with_rebuild(
+                &state,
+                &state.graph,
+                RequestGraphAuthority::Head,
+                |snapshot, root| {
+                    rebuilds.set(rebuilds.get() + 1);
+                    rebuild_xref_query_graph(snapshot, root)
+                },
+            )
+            .unwrap()
+        };
+        let cold = capture();
+        let warm = capture();
+        assert!(Arc::ptr_eq(&cold.graph, &warm.graph));
+        assert!(!Arc::ptr_eq(&warm.graph, &state.graph));
+        assert_eq!(warm.graph.get_entity(&target.id).unwrap(), Some(target));
+        assert_eq!(rebuilds.get(), 1);
+        assert!(absence_is_certified(&state, &warm));
+
+        let pending = state.begin_pending_admission();
+        let marked = capture();
+        assert!(Arc::ptr_eq(&cold.graph, &marked.graph));
+        assert!(!absence_is_certified(&state, &marked));
+        drop(pending);
+        assert!(!absence_is_certified(&state, &marked));
+        assert!(absence_is_certified(&state, &capture()));
+        assert_eq!(rebuilds.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn xref_cache_rejects_root_preserving_source_history_and_proof_changes() {
+        let state = test_state();
+        let capture =
+            || prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).unwrap();
+        let first = capture();
+        let root = state.graph.compute_root_hash();
+        let daemon_epoch = state.stable_graph_authority_epoch().unwrap();
+        let version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Source tree truth changes without adding an entity or relation, so
+        // semantic-root-only reuse would return the old tree here.
+        let path = RepoPath::from_utf8("assets/source.bin").unwrap();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x71; 32]), false);
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(path.clone(), entry),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(state.graph.compute_root_hash(), root);
+        let source = capture();
+        assert!(!Arc::ptr_eq(&first.graph, &source.graph));
+        assert_eq!(
+            source
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&path)
+                .unwrap()
+                .entry,
+            entry
+        );
+        assert!(
+            !xref_graph_read_is_still_current(
+                &state,
+                None,
+                &state.graph,
+                RequestGraphAuthority::Head,
+                &first
+            )
+            .await
+        );
+
+        let change = xref_cache_history_record();
+        state.graph.create_change(&change).unwrap();
+        assert_eq!(state.graph.compute_root_hash(), root);
+        let history = capture();
+        assert!(!Arc::ptr_eq(&source.graph, &history.graph));
+        assert!(history.graph.get_change(&change.id).unwrap().is_some());
+        assert!(
+            !xref_graph_read_is_still_current(
+                &state,
+                None,
+                &state.graph,
+                RequestGraphAuthority::Head,
+                &source
+            )
+            .await
+        );
+
+        // The proof itself can be revoked/restored without changing any row.
+        // Even revoking an absent proof is conservatively invalidating.
+        state.graph.invalidate_binding_history();
+        let revoked = capture();
+        assert!(!Arc::ptr_eq(&history.graph, &revoked.graph));
+        state.graph.restore_binding_history_from(&revoked.graph);
+        let restored = capture();
+        assert!(!Arc::ptr_eq(&revoked.graph, &restored.graph));
+        assert_eq!(state.graph.compute_root_hash(), root);
+        assert_eq!(state.stable_graph_authority_epoch(), Some(daemon_epoch));
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            version
+        );
+    }
+
+    #[test]
+    fn xref_cache_rejects_revocation_and_restoration_of_an_admitted_proof() {
+        let state = test_state();
+        let capture =
+            || prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).unwrap();
+        let admitted = capture();
+        assert!(
+            admitted
+                .graph
+                .to_snapshot()
+                .verified_binding_history
+                .is_some(),
+            "fixture must carry a real admitted proof"
+        );
+        let root = state.graph.compute_root_hash();
+        let epoch = state.stable_graph_authority_epoch();
+        let generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        state.graph.invalidate_binding_history();
+        let revoked = capture();
+        assert!(!Arc::ptr_eq(&admitted.graph, &revoked.graph));
+        assert!(revoked
+            .graph
+            .to_snapshot()
+            .verified_binding_history
+            .is_none());
+        assert!(state.graph.restore_binding_history_from(&admitted.graph));
+        let restored = capture();
+        assert!(!Arc::ptr_eq(&revoked.graph, &restored.graph));
+        assert!(restored
+            .graph
+            .to_snapshot()
+            .verified_binding_history
+            .is_some());
+        assert_eq!(state.graph.compute_root_hash(), root);
+        assert_eq!(state.stable_graph_authority_epoch(), epoch);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation
+        );
+    }
+
+    #[test]
+    fn xref_cache_rejects_active_writers_aba_and_independent_head_versions() {
+        let state = test_state();
+        let capture =
+            || prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).unwrap();
+        let first = capture();
+        let root = state.graph.compute_root_hash();
+        let writer = state.begin_graph_authority_mutation();
+        assert!(matches!(
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head),
+            Err(XrefUnprepared::WriterHeld)
+        ));
+        let transient = test_entity("transient", "src/transient.rs");
+        state.graph.upsert_entity(&transient).unwrap();
+        state.graph.remove_entity(&transient.id).unwrap();
+        drop(writer);
+        assert_eq!(state.graph.compute_root_hash(), root);
+        let after_writer = capture();
+        assert!(!Arc::ptr_eq(&first.graph, &after_writer.graph));
+
+        state.bump_version();
+        let after_version = capture();
+        assert!(!Arc::ptr_eq(&after_writer.graph, &after_version.graph));
+        // Independent durable generation movement also invalidates a cached
+        // graph when no entity, relation or daemon version changed.
+        state
+            .snapshot_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let after_generation = capture();
+        assert!(!Arc::ptr_eq(&after_version.graph, &after_generation.graph));
+        assert_eq!(state.graph.compute_root_hash(), root);
+    }
+
+    #[tokio::test]
+    async fn xref_cache_does_not_cross_foreign_graphs_or_private_scopes() {
+        let state = test_state();
+        let head =
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).unwrap();
+        let foreign = Arc::new(kin_db::InMemoryGraph::new());
+        assert_eq!(foreign.compute_root_hash(), state.graph.compute_root_hash());
+        let one = prepare_xref_graph_read(&state, &foreign, RequestGraphAuthority::Head).unwrap();
+        let two = prepare_xref_graph_read(&state, &foreign, RequestGraphAuthority::Head).unwrap();
+        assert!(!Arc::ptr_eq(&one.graph, &two.graph));
+        assert!(!Arc::ptr_eq(&head.graph, &one.graph));
+        let again =
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).unwrap();
+        assert!(Arc::ptr_eq(&head.graph, &again.graph));
+
+        let session = SessionId::new();
+        let change = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
+        state
+            .set_session_scope(
+                &session,
+                "change:test".to_string(),
+                change,
+                Arc::clone(&foreign),
+            )
+            .await;
+        assert!(state
+            .source_scope_for_selected_graph(
+                Some(&session),
+                &state.graph,
+                RequestGraphAuthority::Head
+            )
+            .await
+            .is_none());
+        let scoped =
+            prepare_xref_graph_read(&state, &foreign, RequestGraphAuthority::SessionScope).unwrap();
+        let scoped_again =
+            prepare_xref_graph_read(&state, &foreign, RequestGraphAuthority::SessionScope).unwrap();
+        assert!(!Arc::ptr_eq(&scoped.graph, &scoped_again.graph));
+        assert!(
+            xref_graph_read_is_still_current(
+                &state,
+                Some(&session),
+                &foreign,
+                RequestGraphAuthority::SessionScope,
+                &scoped
+            )
+            .await
+        );
+        state
+            .set_session_scope(
+                &session,
+                "change:replacement".to_string(),
+                change,
+                Arc::new(kin_db::InMemoryGraph::new()),
+            )
+            .await;
+        assert!(
+            !xref_graph_read_is_still_current(
+                &state,
+                Some(&session),
+                &foreign,
+                RequestGraphAuthority::SessionScope,
+                &scoped
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn xref_cache_never_installs_a_graph_superseded_during_cold_admission() {
+        let state = test_state();
+        let result = prepare_xref_graph_read_with_rebuild(
+            &state,
+            &state.graph,
+            RequestGraphAuthority::Head,
+            |snapshot, root| {
+                let graph = rebuild_xref_query_graph(snapshot, root)?;
+                // A writer with no net topology change is invisible to root-only
+                // checks, including one that begins and ends during admission.
+                drop(state.begin_graph_authority_mutation());
+                Ok(graph)
+            },
+        );
+        assert!(matches!(result, Err(XrefUnprepared::Moved(_))));
+        assert!(state.xref_graph_cache.entry.lock().unwrap().graph.is_none());
+        let rebuilt = std::cell::Cell::new(false);
+        prepare_xref_graph_read_with_rebuild(
+            &state,
+            &state.graph,
+            RequestGraphAuthority::Head,
+            |snapshot, root| {
+                rebuilt.set(true);
+                rebuild_xref_query_graph(snapshot, root)
+            },
+        )
+        .unwrap();
+        assert!(rebuilt.get());
+    }
+
+    #[tokio::test]
+    async fn xref_cache_yields_to_existing_pressure_without_invalidating_readers() {
+        use kin_core::memory_pressure::PressureLevel;
+        let state = test_state();
+        let capture =
+            || prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).unwrap();
+        let held = capture();
+        for level in [PressureLevel::Elevated, PressureLevel::Critical] {
+            // The production hook must run even when the process-tree sample
+            // is unavailable and the footprint publisher returns early.
+            crate::daemon::publish_footprint_standing(
+                &state,
+                &crate::daemon::PressureCall {
+                    level,
+                    host_level: level,
+                    budget_level: None,
+                    verdict: kin_core::memory_pressure::Verdict::Proceed,
+                    standing: None,
+                },
+            );
+            assert!(state.xref_graph_cache.entry.lock().unwrap().graph.is_none());
+            let cold = capture();
+            assert!(!Arc::ptr_eq(&held.graph, &cold.graph));
+            assert!(state.xref_graph_cache.entry.lock().unwrap().graph.is_none());
+            assert!(
+                xref_graph_read_is_still_current(
+                    &state,
+                    None,
+                    &state.graph,
+                    RequestGraphAuthority::Head,
+                    &held
+                )
+                .await
+            );
+        }
+        for level in [PressureLevel::Nominal, PressureLevel::Unknown] {
+            state.xref_graph_cache.observe_pressure(level);
+            let first = capture();
+            assert!(Arc::ptr_eq(&first.graph, &capture().graph));
+            state
+                .xref_graph_cache
+                .observe_pressure(PressureLevel::Elevated);
+        }
+    }
+
+    #[test]
+    fn xref_cache_pressure_during_cold_admission_prevents_refill() {
+        let state = test_state();
+        let attempt = prepare_xref_graph_read_with_rebuild(
+            &state,
+            &state.graph,
+            RequestGraphAuthority::Head,
+            |snapshot, root| {
+                let graph = rebuild_xref_query_graph(snapshot, root)?;
+                state
+                    .xref_graph_cache
+                    .observe_pressure(kin_core::memory_pressure::PressureLevel::Critical);
+                Ok(graph)
+            },
+        )
+        .unwrap();
+        assert_eq!(attempt.root, hex::encode(state.graph.compute_root_hash()));
+        assert!(state.xref_graph_cache.entry.lock().unwrap().graph.is_none());
+    }
+
+    #[test]
+    fn xref_cache_releases_obsolete_retention_before_building_a_replacement() {
+        let state = test_state();
+        let first =
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).unwrap();
+        let previous = Arc::downgrade(&first.graph);
+        drop(first);
+        assert!(
+            previous.upgrade().is_some(),
+            "cache owns the sole remaining copy"
+        );
+        state.bump_version();
+        prepare_xref_graph_read_with_rebuild(
+            &state,
+            &state.graph,
+            RequestGraphAuthority::Head,
+            |snapshot, root| {
+                assert!(
+                    previous.upgrade().is_none(),
+                    "old cache ownership must end before the new build"
+                );
+                rebuild_xref_query_graph(snapshot, root)
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn xref_cache_retains_full_cold_storage_admission() {
+        let state = test_state();
+        state
+            .graph
+            .create_change(&xref_cache_history_record())
+            .unwrap();
+        let result = prepare_xref_graph_read_with_rebuild(
+            &state,
+            &state.graph,
+            RequestGraphAuthority::Head,
+            |mut snapshot, root| {
+                // Corrupt an admitted history record without changing its
+                // content ID. The actual cold storage validator must refuse.
+                let mut change = snapshot
+                    .changes
+                    .values()
+                    .next()
+                    .expect("initialized history")
+                    .clone();
+                change.message.push_str(" changed without restamping");
+                snapshot.changes.insert(change.id, change);
+                rebuild_xref_query_graph(snapshot, root)
+            },
+        );
+        assert!(matches!(result, Err(XrefUnprepared::Unreadable(_))));
+        assert!(state.xref_graph_cache.entry.lock().unwrap().graph.is_none());
+        assert!(prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).is_ok());
     }
 
     #[tokio::test]
@@ -55574,14 +63584,12 @@ mod tests {
 
         head_started.wait();
         assert!(
-            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).is_none(),
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).is_err(),
             "HEAD must not detach an intermediate graph while a writer is stalled"
         );
         head_release.wait();
         head_writer.join().unwrap();
-        assert!(
-            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).is_some()
-        );
+        assert!(prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).is_ok());
 
         let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
         let scoped_target = test_entity("scoped_target", "src/scoped.rs");
@@ -55605,7 +63613,7 @@ mod tests {
         scope_started.wait();
         assert!(
             prepare_xref_graph_read(&state, &scoped_graph, RequestGraphAuthority::SessionScope,)
-                .is_none(),
+                .is_err(),
             "session scope must not detach an intermediate graph mutation"
         );
         scope_release.wait();
@@ -55615,7 +63623,7 @@ mod tests {
             &scoped_graph,
             RequestGraphAuthority::SessionScope,
         )
-        .is_some());
+        .is_ok());
     }
 
     #[tokio::test]
@@ -55745,11 +63753,10 @@ mod tests {
         )
         .await
         .expect_err("a re-bound scope cannot certify the former revision's body");
-        assert!(
-            error
-                .to_string()
-                .contains("source scope changed during reconstruction"),
-            "{error}"
+        assert_eq!(
+            error.to_string(),
+            xref_scope_replaced_message("find_references"),
+            "a re-bound scope is refused in the words every reference read uses for it"
         );
 
         state.clear_session_scope(&session).await;
@@ -55854,6 +63861,9 @@ mod tests {
     #[tokio::test]
     async fn scoped_xref_fails_closed_when_selected_scope_is_replaced_mid_read() {
         let state = test_state();
+        // A read that took another round would run into this limit instead of
+        // refusing after one round, so a regression fails fast here.
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_secs(2));
         let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
         let target = test_entity("historical_target", "src/lib.rs");
         scoped_graph.upsert_entity(&target).unwrap();
@@ -55867,6 +63877,8 @@ mod tests {
             )
             .await;
 
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&attempts);
         let hook_state = Arc::clone(&state);
         let error = command_xref_with_stable_authority(
             &state,
@@ -55877,6 +63889,7 @@ mod tests {
                 entity: target.name,
             },
             move |attempt| {
+                hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if attempt == 0 {
                     hook_state
                         .session_scopes
@@ -55889,23 +63902,35 @@ mod tests {
         .await
         .expect_err("an orphaned session graph must never be certified");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
-        // The refusal names the write and refuses to be read as an absence.
-        // An orphaned session scope is not an enrichment sweep, so the sentence
-        // must stay at "a graph-authority writer" here: naming the sweep on a
-        // path that has none is a cause invented to make the message read well.
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            XREF_CURRENCY_ATTEMPTS,
+            "a scope that is gone refuses after one round: {}",
+            error.1
+        );
+        // No writer ran here. The scope went away, so the refusal names the
+        // scope, and naming a writer, or the sweep, would be a cause invented
+        // to make the message read well.
         assert!(
-            error
-                .1
-                .contains("a graph-authority writer was mutating the graph"),
-            "refusal must name the writer it can actually name: {}",
+            error.1.contains("expired, was cleared or was replaced"),
+            "the refusal must name what actually happened: {}",
+            error.1
+        );
+        assert!(
+            !error.1.contains("writer"),
+            "no writer caused this, and waiting for one changes nothing: {}",
             error.1
         );
         assert!(
             error.1.contains("not an absent or unresolved symbol"),
-            "refusal must separate a write window from an absence: {}",
+            "refusal must separate a changed scope from an absence: {}",
             error.1
         );
-        assert_names_what_would_change_it(&error.1);
+        assert!(
+            error.1.contains("What changes the outcome is a new call"),
+            "the refusal must name what changes the outcome: {}",
+            error.1
+        );
     }
 
     /// FIR-2633's bar, applied to every refusal these surfaces can produce.
@@ -55934,6 +63959,11 @@ mod tests {
         assert!(
             message.contains("/lsp/sweep/status"),
             "the refusal must name a surface the caller can read that condition off: {message}"
+        );
+        assert!(
+            message.contains("reconciliation_status"),
+            "a reconcile pass holds authority as surely as a sweep does, so the refusal must name \
+             where its state is read, not only the sweep's: {message}"
         );
     }
 
@@ -56037,6 +64067,17 @@ mod tests {
             "this answer is CURRENT; publishing it as superseded is the thing the extra \
              attempt exists to stop: {:?}",
             labels
+        );
+        // Every earlier attempt here read the graph and threw its answer away,
+        // so this history, unlike a read that only waited, is an abandoned one.
+        let detail = body["degradations"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["reason"] == "retry"))
+            .and_then(|entry| entry["detail"].as_str())
+            .expect("the retry disclosure carries a detail");
+        assert!(
+            detail.contains("abandoned and retried"),
+            "earlier attempts were read and thrown away, and the disclosure must say so: {detail}"
         );
     }
 
@@ -56159,6 +64200,352 @@ mod tests {
         serde_json::from_str(&mcp_result_text(&enveloped)).expect("finalized payload is JSON")
     }
 
+    #[tokio::test]
+    async fn xref_writer_drain_waits_for_every_overlapping_writer() {
+        let state = test_state();
+        let first = state.begin_graph_authority_mutation();
+        let second = state.begin_graph_authority_mutation();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut wait = XrefWriterWait::default();
+        let retry = wait_out_graph_authority_writer(
+            &state,
+            deadline,
+            true,
+            &mut wait,
+            crate::state::SettleScope::Writers,
+        );
+        tokio::pin!(retry);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(retry.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(retry.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(second);
+        assert!(
+            retry.await,
+            "only the final writer's drain admits the next round"
+        );
+    }
+
+    #[tokio::test]
+    async fn xref_writer_drain_does_not_disclose_a_wait_without_a_writer() {
+        let state = test_state();
+        let mut wait = XrefWriterWait::default();
+        assert!(
+            !wait_out_graph_authority_writer(
+                &state,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                false,
+                &mut wait,
+                crate::state::SettleScope::Writers,
+            )
+            .await
+        );
+        assert!(wait.waited.is_zero());
+        assert!(!wait.ceiling_reached);
+    }
+
+    #[tokio::test]
+    async fn xref_writer_drain_does_not_retry_after_its_original_deadline() {
+        let state = test_state();
+        let writer = state.begin_graph_authority_mutation();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+        let mut wait = XrefWriterWait::default();
+        let retry = wait_out_graph_authority_writer(
+            &state,
+            deadline,
+            true,
+            &mut wait,
+            crate::state::SettleScope::Writers,
+        );
+        tokio::pin!(retry);
+        // Register the wait, then deliberately leave it unpolled until both
+        // its timer and the writer's notification are ready. Tokio polls the
+        // notified future before its timeout; a ready notification must not
+        // authorize a new round beyond this request's original deadline.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(retry.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        drop(writer);
+        assert!(!retry.await, "a late drain must not reset the retry window");
+    }
+
+    /// The reconcile loop's mark over working-copy changes it picked up holds
+    /// back an answer that claims an absence the way a writer does, until it
+    /// comes down, and holds back nothing else: a reference read still takes
+    /// its snapshot, a wait for writers alone does not wait on it, and every
+    /// other reader of the clock is unaffected.
+    #[tokio::test]
+    async fn a_pending_admission_holds_back_absence_answers_and_nothing_else() {
+        let state = test_state();
+        let before = state.settled_read_epoch().expect("nothing is pending yet");
+
+        let pending = state.begin_pending_admission();
+        assert!(
+            state.settled_read_epoch().is_none(),
+            "picked-up changes must keep an absence from being certified"
+        );
+        assert!(
+            !state.settled_read_epoch_is_current(before),
+            "an absence sampled before the loop picked its changes up is not certified while it \
+             holds them"
+        );
+        assert!(
+            state.stable_graph_authority_epoch() == Some(before)
+                && state.graph_authority_epoch_is_current(before),
+            "no writer holds authority and no epoch moved, so every other reader of the clock is \
+             unaffected"
+        );
+        let attempt = prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head)
+            .unwrap_or_else(|_| panic!("a mark must not keep a reference read from its snapshot"));
+        assert!(
+            !absence_is_certified(&state, &attempt),
+            "an absence read from that snapshot must not be certified while the mark is up"
+        );
+        let mut wait = XrefWriterWait::default();
+        assert!(
+            !wait_out_graph_authority_writer(
+                &state,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                false,
+                &mut wait,
+                crate::state::SettleScope::Writers,
+            )
+            .await,
+            "a read that waits for writers alone finds none to wait for"
+        );
+        assert!(
+            wait.waited.is_zero(),
+            "a wait for writers alone does not wait on the mark"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut wait = XrefWriterWait::default();
+        let retry = wait_out_graph_authority_writer(
+            &state,
+            deadline,
+            false,
+            &mut wait,
+            crate::state::SettleScope::WritersAndPendingAdmissions,
+        );
+        tokio::pin!(retry);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(retry.as_mut(), cx).is_pending(),
+                "a withheld absence waits for the mark the way it waits for a writer"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(pending);
+        assert!(retry.await, "the mark coming down admits the next round");
+        assert_eq!(
+            state.settled_read_epoch(),
+            Some(before),
+            "a mark that published nothing moved nothing"
+        );
+        let attempt = prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head)
+            .unwrap_or_else(|_| panic!("the graph is quiet"));
+        assert!(
+            absence_is_certified(&state, &attempt),
+            "with the mark down and no writer, an absence is certified again"
+        );
+
+        // Past the limit with only the mark still up, the refusal names the
+        // reconcile loop's picked-up changes, not a writer, and says the
+        // absence it read was held back rather than that the graph kept moving.
+        let pending = state.begin_pending_admission();
+        let mut wait = XrefWriterWait::within(Duration::from_millis(5));
+        wait.absence_withheld = true;
+        let deadline = tokio::time::Instant::now() + wait.ceiling;
+        assert!(
+            !wait_out_graph_authority_writer(
+                &state,
+                deadline,
+                true,
+                &mut wait,
+                crate::state::SettleScope::WritersAndPendingAdmissions,
+            )
+            .await
+        );
+        let message = xref_authority_unsettled_message(
+            &state,
+            "find_references",
+            XREF_CURRENCY_ATTEMPTS,
+            wait,
+        );
+        drop(pending);
+        assert!(
+            message.contains(
+                "the reconcile loop still held working-copy changes it had picked up and not yet \
+                 published when that limit ran out"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("the reconcile loop had picked up working-copy changes"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "the answer they could read claimed that something is absent, which is not served \
+                 while the reconcile loop holds working-copy changes"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("What changes the outcome is the reconcile loop publishing"),
+            "{message}"
+        );
+        assert!(!message.contains("a writer still held"), "{message}");
+        assert!(
+            !message.contains("against a graph that held still"),
+            "the graph held still, so the sentence for one that kept moving must not appear: \
+             {message}"
+        );
+    }
+
+    /// A name read under writer churn naps between attempts, and the nap never
+    /// authorizes an attempt once the read's limit has passed.
+    ///
+    /// The round here found no writer left to wait for, which is the churn
+    /// case: a writer began and finished inside the attempt. It ends 80 ms into
+    /// a 100 ms limit, less than one 50 ms nap from the end. The nap is clipped
+    /// to the limit and the read refuses there, rather than waking past the
+    /// limit and starting another attempt. Paused time makes the instants
+    /// exact.
+    #[tokio::test(start_paused = true)]
+    async fn a_name_read_wait_admits_no_attempt_after_its_limit() {
+        let state = test_state();
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_millis(100));
+        let mut settle = NameReadWait::begin(&state, state.graph.as_ref());
+        let started = tokio::time::Instant::now();
+        assert!(
+            settle.sample(&state).is_some(),
+            "nothing writes, so the attempt samples a settled epoch"
+        );
+        tokio::time::advance(Duration::from_millis(80)).await;
+
+        let outcome = settle.wait_out(&state, "a churned read").await;
+        let returned_at = tokio::time::Instant::now();
+
+        let refusal = outcome
+            .expect_err("a nap that would end past the limit must not authorize another attempt");
+        assert_eq!(
+            returned_at - started,
+            Duration::from_millis(100),
+            "the nap is clipped to the limit rather than outlasting it"
+        );
+        assert!(
+            refusal.contains("reached its 100 ms limit"),
+            "the refusal names the limit it ran into: {refusal}"
+        );
+        assert!(
+            refusal.contains("no writer held graph authority when this read gave up"),
+            "no writer held authority at the limit, and the refusal must not say one did: \
+             {refusal}"
+        );
+
+        // With room for the whole nap, the same round authorizes the next
+        // attempt, after the nap and before the limit.
+        let mut settle = NameReadWait::begin(&state, state.graph.as_ref());
+        let started = tokio::time::Instant::now();
+        settle.sample(&state);
+        settle
+            .wait_out(&state, "a churned read")
+            .await
+            .expect("a nap that ends inside the limit authorizes the next attempt");
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            GRAPH_STATUS_WRITER_SETTLE_FLOOR
+        );
+    }
+
+    /// What each reference surface counts as claiming an absence, the only
+    /// answers the reconcile loop's mark holds back. Rows are never one, and
+    /// neither is a handler fault or a payload of a shape nothing names.
+    #[test]
+    fn only_answers_that_claim_an_absence_wait_on_a_pending_admission() {
+        let text = |payload: serde_json::Value| -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+            Ok(kin_mcp::ToolCallResult::text(payload.to_string()))
+        };
+        let section = kin_mcp::handlers::entities::AMBIGUOUS_CANDIDATES_KEY;
+
+        let miss = Ok(kin_mcp::ToolCallResult::error(
+            kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS,
+        ));
+        assert!(find_references_answer_claims_absence(&miss));
+        assert!(find_references_answer_claims_absence(&text(
+            serde_json::json!({"total_upstream": 0, "references": []})
+        )));
+        assert!(!find_references_answer_claims_absence(&text(
+            serde_json::json!({"total_upstream": 2, "references": [{}, {}]})
+        )));
+        let sectioned = |counts: [u64; 2]| {
+            let mut payload = serde_json::json!({"ambiguous_focal": true});
+            payload[section] = serde_json::json!([
+                {"total_upstream": counts[0]},
+                {"total_upstream": counts[1]},
+            ]);
+            text(payload)
+        };
+        assert!(find_references_answer_claims_absence(&sectioned([3, 0])));
+        assert!(!find_references_answer_claims_absence(&sectioned([3, 1])));
+        assert!(!find_references_answer_claims_absence(&Ok(
+            kin_mcp::ToolCallResult::error("invalid parameter: relation_kinds")
+        )));
+        assert!(!find_references_answer_claims_absence(&Err(
+            kin_mcp::McpError::Other("fault".to_string())
+        )));
+        assert!(!find_references_answer_claims_absence(&text(
+            serde_json::json!({"unrelated": true})
+        )));
+
+        let quiet = serde_json::json!({
+            "without_references": 0,
+            "incomplete_verdict_count": 0,
+            "results": [{"has_references": true}],
+        });
+        assert!(!bulk_check_answer_claims_absence(&text(quiet.clone())));
+        for (field, value) in [
+            ("without_references", serde_json::json!(1)),
+            ("incomplete_verdict_count", serde_json::json!(1)),
+            (
+                "results",
+                serde_json::json!([{"error": "entity not found", "has_references": null}]),
+            ),
+        ] {
+            let mut payload = quiet.clone();
+            payload[field] = value;
+            assert!(
+                bulk_check_answer_claims_absence(&text(payload)),
+                "{field} claims an absence"
+            );
+        }
+
+        let answered = kin_cli::commands::xref::XrefResponse {
+            lines: vec!["Cross-repo references (xrefs) for 'work':".to_string()],
+            spine: None,
+            error: None,
+        };
+        assert!(!xref_response_claims_absence::<String>(&Ok(answered)));
+        let unresolved = kin_cli::commands::xref::XrefResponse {
+            lines: Vec::new(),
+            spine: None,
+            error: Some("Entity 'again' not found in this repo's graph".to_string()),
+        };
+        assert!(xref_response_claims_absence::<String>(&Ok(unresolved)));
+        assert!(!xref_response_claims_absence(&Err("fault")));
+    }
+
     /// A graph holding one target with one caller linked by every cross-file
     /// class the verdict weighs, so nothing here is degraded for a reason other
     /// than the one under test.
@@ -56263,6 +64650,10 @@ mod tests {
             "a superseded reference set can be actively wrong about code that just moved \
              (FIR-2633), so this may not promise a lower bound: {detail}"
         );
+        assert!(
+            detail.contains("reconciliation_status") && detail.contains("/lsp/sweep/status"),
+            "the disclosure must point at the reconcile state as well as the sweep: {detail}"
+        );
 
         // Through the real annotation chokepoint, that disclosure is what turns
         // the response's one verdict. A degradation nothing consumes would be
@@ -56332,6 +64723,20 @@ mod tests {
             labels.contains(&"graph_authority:settled_replay".to_string()),
             "a replay must say it is one: {labels:?}"
         );
+        let detail = body["degradations"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["reason"] == "settled_replay")
+            })
+            .and_then(|entry| entry["detail"].as_str())
+            .expect("the replay disclosure carries a detail");
+        assert!(
+            detail.contains("reconciliation_status") && detail.contains("/lsp/sweep/status"),
+            "the replay disclosure must point at the reconcile state as well as the sweep: \
+             {detail}"
+        );
         let finalized = finalized_payload(held, "find_references");
         assert_eq!(
             finalized["negative"]["trust"], "inconclusive",
@@ -56347,6 +64752,9 @@ mod tests {
     #[tokio::test]
     async fn a_replay_is_refused_once_the_graph_moved_after_the_certified_read() {
         let (state, target) = reference_fixture();
+        // The writer below never finishes during the call, so the read waits
+        // out its ceiling before it refuses. A short one keeps that quick.
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_millis(200));
         let arguments = find_references_arguments(&target);
         mcp_find_references_with_stable_authority(
             &state,
@@ -56395,6 +64803,7 @@ mod tests {
     #[tokio::test]
     async fn a_replay_needs_a_certified_read_to_answer_from() {
         let (state, target) = reference_fixture();
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_millis(200));
         let arguments = find_references_arguments(&target);
         let writer = state.begin_graph_authority_mutation();
         let refused = mcp_find_references_with_stable_authority(
@@ -56540,8 +64949,12 @@ mod tests {
         // correct here; what it may never do is read as an absence.
         let (state, target) = reference_fixture();
         let arguments = find_references_arguments(&target);
+        // The writer outlives the call, so the read waits out its ceiling first.
+        let ceiling = Duration::from_millis(200);
+        state.set_xref_writer_drain_ceiling_for_test(ceiling);
         let held = state.begin_graph_authority_mutation();
 
+        let started = std::time::Instant::now();
         let error = mcp_find_references_with_stable_authority(
             &state,
             None,
@@ -56552,7 +64965,23 @@ mod tests {
         )
         .await
         .expect_err("no snapshot was ever detached, so nothing may be served");
+        assert!(
+            started.elapsed() >= ceiling,
+            "a writer that holds authority is waited out up to the ceiling before the read \
+             refuses: {:?}",
+            started.elapsed()
+        );
         let message = error.to_string();
+        assert!(
+            message.contains("reached its 200 ms limit for waiting out graph-authority writers"),
+            "the refusal must say it waited for the writer, and state the limit on that wait: \
+             {message}"
+        );
+        assert!(
+            message.contains("a writer still held graph authority when that limit ran out"),
+            "the writer outlives the call, and the refusal must say it still holds authority: \
+             {message}"
+        );
         assert!(
             message.contains("not an absent or unresolved symbol"),
             "the refusal must separate a write window from an absence: {message}"
@@ -56599,22 +65028,37 @@ mod tests {
         // of the loop answers a ruled-out NAME before any attempt runs, so an
         // absent id is the only way to reach exhaustion holding a focal miss.
         let (state, _target) = reference_fixture();
+        // A version bump moves no authority epoch, so no writer was seen and
+        // the read refuses after one round. Taking another would run into this
+        // limit instead, so a regression fails fast here.
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_secs(2));
         let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
             "entity_id": EntityId::new().to_string(),
         }))
         .unwrap();
 
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&attempts);
+        let mut supersede = supersede_every_attempt(&state);
         let message = mcp_find_references_with_stable_authority(
             &state,
             None,
             Arc::clone(&state.graph),
             RequestGraphAuthority::Head,
             &arguments,
-            supersede_every_attempt(&state),
+            move |attempt| {
+                hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                supersede(attempt);
+            },
         )
         .await
         .expect_err("a superseded focal miss is never published as settled")
         .to_string();
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            XREF_CURRENCY_ATTEMPTS,
+            "with no writer seen, the read refuses after one round: {message}"
+        );
         assert!(
             !message.contains(kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS),
             "a write window must never be reported as an unresolved symbol: {message}"
@@ -56624,6 +65068,668 @@ mod tests {
             "the refusal must say what it is not: {message}"
         );
         assert_names_what_would_change_it(&message);
+    }
+
+    /// The `after_root` hook for a round whose every attempt a short writer
+    /// supersedes.
+    ///
+    /// Each writer begins and finishes inside its attempt, after the attempt
+    /// detached its snapshot, so no attempt ever finds one active and the drain
+    /// wait after the round finds none either. The last of them adds `added`,
+    /// after the snapshot its own attempt read, so no attempt of the round
+    /// could see it. Later attempts run no writer.
+    fn short_writers_through_the_first_round(
+        state: &Arc<DaemonState>,
+        added: &Entity,
+        attempts: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnMut(usize) {
+        let state = Arc::clone(state);
+        let added = added.clone();
+        let attempts = Arc::clone(attempts);
+        move |attempt| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt >= XREF_CURRENCY_ATTEMPTS {
+                return;
+            }
+            let writer = state.begin_graph_authority_mutation();
+            if attempt + 1 == XREF_CURRENCY_ATTEMPTS {
+                state.graph.upsert_entity(&added).unwrap();
+                state.bump_version();
+            }
+            drop(writer);
+        }
+    }
+
+    /// A round that writers superseded at every attempt is read again, even
+    /// when the last of them finished before the round ended.
+    ///
+    /// Every attempt here ends a superseded focal miss, which is never served,
+    /// and no writer holds authority once the round is over. The round used to
+    /// record a writer only when one was active at an attempt that could not
+    /// detach a snapshot, so it saw none, and the read refused at once about an
+    /// entity the graph by then held. The epoch those writers moved is the
+    /// record that they ran.
+    #[tokio::test]
+    async fn a_focal_miss_superseded_by_writers_that_finished_is_read_again() {
+        let state = test_state();
+        let added = test_entity("added_by_the_last_writer", "src/added.py");
+        let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "entity_id": added.id.to_string(),
+        }))
+        .unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let result = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            short_writers_through_the_first_round(&state, &added, &attempts),
+        )
+        .await
+        .expect("writers that have all finished leave a graph this read can certify");
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            XREF_CURRENCY_ATTEMPTS + 1,
+            "one more round, and its first attempt answers"
+        );
+        let text = mcp_result_text(&result);
+        assert_ne!(result.is_error, Some(true), "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["focal_entity"]["id"], json!(added.id.to_string()));
+        let labels = degradation_labels(&body);
+        assert!(
+            labels.contains(&"graph_authority:retry".to_string()),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"graph_authority:mutation_in_flight".to_string()),
+            "the answer was read after the writers finished, so it is current: {labels:?}"
+        );
+    }
+
+    /// Command xref has no labelled answer to fall back on, so it refuses
+    /// whenever a round ends with nothing it can serve. A round that writers
+    /// superseded at every attempt is worth another one once they finish, and
+    /// when the read's limit runs out with none of them still holding
+    /// authority, the refusal says that rather than that a writer holds it.
+    #[tokio::test]
+    async fn command_xref_reads_again_after_writers_that_finished_superseded_every_attempt() {
+        let state = test_state();
+        let added = test_entity("added_by_the_last_writer", "src/added.py");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let response = command_xref_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: added.name.clone(),
+            },
+            short_writers_through_the_first_round(&state, &added, &attempts),
+        )
+        .await
+        .expect("writers that have all finished leave a graph command xref can certify");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            XREF_CURRENCY_ATTEMPTS + 1,
+            "one more round, and its first attempt answers"
+        );
+        assert!(response.error.is_none(), "{:?}", response.lines);
+        assert_eq!(
+            response.lines.first().map(String::as_str),
+            Some("Cross-repo references (xrefs) for 'added_by_the_last_writer':"),
+            "{:?}",
+            response.lines
+        );
+
+        // Writers that never stop coming, against a limit that runs out inside
+        // the first round. Each has finished by the time the read gives up.
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_millis(1));
+        let hook_state = Arc::clone(&state);
+        let error = command_xref_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: added.name.clone(),
+            },
+            move |_| drop(hook_state.begin_graph_authority_mutation()),
+        )
+        .await
+        .expect_err("a read that never saw the graph hold still is refused");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .1
+                .contains("reached its 1 ms limit for waiting out graph-authority writers"),
+            "the refusal must state the limit it ran into: {}",
+            error.1
+        );
+        assert!(
+            error
+                .1
+                .contains("no writer held graph authority when this read gave up"),
+            "every writer had finished, and the refusal must not say one still holds authority: \
+             {}",
+            error.1
+        );
+        assert!(
+            !error.1.contains("not another immediate call"),
+            "with every writer finished, another call is exactly what can now be answered: {}",
+            error.1
+        );
+        assert_names_what_would_change_it(&error.1);
+    }
+
+    /// A capture that a writer tore is a writer the round met, even once that
+    /// writer has finished, and a capture the round threw away. One that moved
+    /// with no writer involved is only the second. An attempt that found a
+    /// writer holding authority at its own sample captured nothing, and a
+    /// snapshot that cannot be rebuilt is handed back to end the read.
+    ///
+    /// Recorded only as an active writer, a capture torn by a writer that began
+    /// and finished inside it left the round seeing none, the same blind spot
+    /// a superseded attempt had.
+    #[test]
+    fn an_unprepared_attempt_records_the_writers_that_moved_its_epoch() {
+        let state = test_state();
+
+        let epoch = state.stable_graph_authority_epoch().expect("no writer yet");
+        drop(state.begin_graph_authority_mutation());
+        let (mut writer_seen, mut wait) = (false, XrefWriterWait::default());
+        note_unprepared_attempt(
+            &state,
+            XrefUnprepared::Moved(epoch),
+            &mut writer_seen,
+            &mut wait,
+        )
+        .unwrap();
+        assert!(
+            writer_seen,
+            "a writer that began and finished during the capture moved its epoch"
+        );
+        assert!(wait.read_abandoned);
+
+        let epoch = state.stable_graph_authority_epoch().expect("no writer");
+        let (mut writer_seen, mut wait) = (false, XrefWriterWait::default());
+        note_unprepared_attempt(
+            &state,
+            XrefUnprepared::Moved(epoch),
+            &mut writer_seen,
+            &mut wait,
+        )
+        .unwrap();
+        assert!(
+            !writer_seen,
+            "nothing moved the epoch, so the round met no writer"
+        );
+        assert!(wait.read_abandoned);
+
+        // The attempt's own sample decides that nothing was captured, so a
+        // writer that begins before it is never counted as a torn capture.
+        let writer = state.begin_graph_authority_mutation();
+        let Err(unprepared) =
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head)
+        else {
+            panic!("a writer holds authority, so nothing may be captured");
+        };
+        assert!(
+            matches!(unprepared, XrefUnprepared::WriterHeld),
+            "{unprepared:?}"
+        );
+        let (mut writer_seen, mut wait) = (false, XrefWriterWait::default());
+        note_unprepared_attempt(&state, unprepared, &mut writer_seen, &mut wait).unwrap();
+        drop(writer);
+        assert!(writer_seen);
+        assert!(
+            !wait.read_abandoned,
+            "a writer held authority when the attempt sampled it, so it read nothing"
+        );
+
+        let (mut writer_seen, mut wait) = (false, XrefWriterWait::default());
+        assert_eq!(
+            note_unprepared_attempt(
+                &state,
+                XrefUnprepared::Unreadable("rebuild refused".to_string()),
+                &mut writer_seen,
+                &mut wait,
+            ),
+            Err("rebuild refused".to_string()),
+        );
+        assert!(!writer_seen && !wait.read_abandoned);
+    }
+
+    /// A session scope that is gone can never be certified again, so a writer
+    /// the round met is no reason to read it again. Without the check, a
+    /// replaced scope read while HEAD writers came and went took rounds until
+    /// its limit ran out.
+    #[tokio::test]
+    async fn scoped_xref_does_not_read_a_replaced_scope_again_for_a_writer_it_met() {
+        let state = test_state();
+        // Long enough for several rounds, so reading the dead scope again would
+        // show up as attempts past the first round.
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_secs(2));
+        let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+        let target = test_entity("historical_target", "src/lib.rs");
+        scoped_graph.upsert_entity(&target).unwrap();
+        let session_id = SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:historical".to_string(),
+                kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32])),
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&attempts);
+        let hook_state = Arc::clone(&state);
+        let error = command_xref_with_stable_authority(
+            &state,
+            Some(&session_id),
+            scoped_graph,
+            RequestGraphAuthority::SessionScope,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: target.name,
+            },
+            move |attempt| {
+                hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    hook_state
+                        .session_scopes
+                        .try_write()
+                        .expect("xref does not hold the session scope lock")
+                        .remove(&session_id);
+                }
+                // A HEAD writer that begins and finishes inside every attempt.
+                drop(hook_state.begin_graph_authority_mutation());
+            },
+        )
+        .await
+        .expect_err("an orphaned session graph must never be certified");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            XREF_CURRENCY_ATTEMPTS,
+            "no round may follow once the selected scope is gone: {}",
+            error.1
+        );
+        assert!(
+            error.1.contains("expired, was cleared or was replaced") && !error.1.contains("writer"),
+            "the scope going away is the cause, not the HEAD writers it met: {}",
+            error.1
+        );
+    }
+
+    /// The early-out's miss counts only when the authority epoch it sampled
+    /// before the lookup is still current after it.
+    ///
+    /// The admission tests hold their writer before the read starts, so they
+    /// reach only the check before the lookup. Here writers begin inside the
+    /// lookup itself.
+    #[test]
+    fn a_miss_counts_only_when_no_writer_moved_authority_across_the_lookup() {
+        let state = test_state();
+        assert!(
+            miss_held_through_the_lookup(&state, || true),
+            "with nothing writing, the index's miss is the answer"
+        );
+        assert!(
+            !miss_held_through_the_lookup(&state, || false),
+            "a lookup that does not rule the name out is never a miss"
+        );
+        assert!(
+            !miss_held_through_the_lookup(&state, || {
+                drop(state.begin_graph_authority_mutation());
+                true
+            }),
+            "a writer that began and finished during the lookup moved the epoch, so the miss \
+             may predate what it wrote"
+        );
+        let mut held = None;
+        assert!(
+            !miss_held_through_the_lookup(&state, || {
+                held = Some(state.begin_graph_authority_mutation());
+                true
+            }),
+            "a writer still holding authority after the lookup voids the miss"
+        );
+        let mut looked = false;
+        assert!(
+            !miss_held_through_the_lookup(&state, || {
+                looked = true;
+                true
+            }),
+            "a writer holding authority before the lookup voids it too"
+        );
+        assert!(
+            !looked,
+            "with a writer holding authority, the lookup is not taken at all"
+        );
+        drop(held);
+    }
+
+    /// A snapshot that held still but cannot be rebuilt into a graph to read is
+    /// a fault in the graph, and every surface names it rather than a writer.
+    ///
+    /// The fault here is a relation whose source entity the graph does not
+    /// hold, which `upsert_relation` accepts and the rebuild's storage
+    /// admission refuses.
+    #[tokio::test]
+    async fn a_snapshot_that_cannot_be_rebuilt_is_named_not_blamed_on_a_writer() {
+        let (state, target) = reference_fixture();
+        let dangling = kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(EntityId::new()),
+            dst: kin_model::GraphNodeId::Entity(target.id),
+            confidence: 0.95,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        kin_model::EntityStore::upsert_relation(state.graph.as_ref(), &dangling).unwrap();
+
+        let find = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &find_references_arguments(&target),
+            |_| {},
+        )
+        .await
+        .expect_err("a graph that cannot be rebuilt is not read")
+        .to_string();
+        let bulk = mcp_bulk_check_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &serde_json::from_value(json!({
+                "entity_ids": [target.id.to_string()],
+                "relation_kind": "Any",
+            }))
+            .unwrap(),
+            |_| {},
+        )
+        .await
+        .expect_err("a graph that cannot be rebuilt is not read")
+        .to_string();
+        let (status, command) = command_xref_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: target.name.clone(),
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("a graph that cannot be rebuilt is not read");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{command}");
+        for message in [&find, &bulk, &command] {
+            assert!(
+                message.contains("could not be rebuilt into a graph to read")
+                    && message.contains(&dangling.id.to_string()),
+                "the refusal must name the rebuild failure and its cause: {message}"
+            );
+            assert!(
+                !message.contains("graph-authority writer was mutating"),
+                "no writer caused this: {message}"
+            );
+            assert!(
+                message.starts_with(kin_mcp::negative::UNANSWERED_READ_PREFIX),
+                "the refusal quotes the rebuild's own error, so it must carry the marker that \
+                 keeps a quoted phrase from being read as a resolution miss: {message}"
+            );
+        }
+    }
+
+    /// A settled replay that cannot be rebuilt while a writer holds authority
+    /// is no replay: the read waits the writer out and reads again, and does not
+    /// refuse with a sentence that says no writer is involved.
+    ///
+    /// The replay's snapshot is not one instant of the whole graph, so under a
+    /// writer a rebuild can fail with no fault standing. The fault is injected,
+    /// because no graph writer can leave the snapshot's stores out of step on
+    /// purpose. The attempt that follows the writer rebuilds normally, which is
+    /// what shows the wait was the right call.
+    #[tokio::test]
+    async fn a_replay_that_cannot_be_rebuilt_waits_the_writer_out() {
+        let (state, target) = reference_fixture();
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_secs(60));
+        let arguments = find_references_arguments(&target);
+        mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended read is certified, so a replay has a root to match");
+        state
+            .xref_settled
+            .replay_rebuild_fault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let writer = state.begin_graph_authority_mutation();
+        let read = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                mcp_find_references_with_stable_authority(
+                    &state,
+                    None,
+                    Arc::clone(&state.graph),
+                    RequestGraphAuthority::Head,
+                    &arguments,
+                    |_| {},
+                )
+                .await
+            }
+        });
+        // One round with the writer holding every attempt takes 350 ms of naps
+        // and then reaches the replay, so a read that refused on the replay's
+        // failure is done well inside this.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let finished_under_the_writer = read.is_finished();
+        drop(writer);
+        let answer = read.await.unwrap();
+
+        assert!(
+            !finished_under_the_writer,
+            "a replay that could not be rebuilt under a writer must wait the writer out, not \
+             refuse: {answer:?}"
+        );
+        let answer = answer.expect("the attempt after the writer rebuilds and answers");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&answer)).unwrap();
+        assert_eq!(body["focal_entity"]["id"], json!(target.id.to_string()));
+        let labels = degradation_labels(&body);
+        assert!(
+            labels.contains(&"graph_authority:retry".to_string())
+                && !labels.contains(&"graph_authority:settled_replay".to_string()),
+            "the answer came from the attempt after the writer, not from the replay: {labels:?}"
+        );
+    }
+
+    /// A session scope's graph that cannot be rebuilt is named the same way a
+    /// HEAD graph is, on command xref and on find_references.
+    #[tokio::test]
+    async fn a_session_scope_that_cannot_be_rebuilt_is_named_not_blamed_on_a_writer() {
+        let state = test_state();
+        let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+        let target = test_entity("historical_target", "src/lib.rs");
+        scoped_graph.upsert_entity(&target).unwrap();
+        let dangling = kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(EntityId::new()),
+            dst: kin_model::GraphNodeId::Entity(target.id),
+            confidence: 0.95,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        kin_model::EntityStore::upsert_relation(scoped_graph.as_ref(), &dangling).unwrap();
+        let session_id = SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:historical".to_string(),
+                kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32])),
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+
+        let (status, command) = command_xref_with_stable_authority(
+            &state,
+            Some(&session_id),
+            Arc::clone(&scoped_graph),
+            RequestGraphAuthority::SessionScope,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: target.name.clone(),
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("a scope graph that cannot be rebuilt is not read");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{command}");
+        let find = mcp_find_references_with_stable_authority(
+            &state,
+            Some(&session_id),
+            Arc::clone(&scoped_graph),
+            RequestGraphAuthority::SessionScope,
+            &find_references_arguments(&target),
+            |_| {},
+        )
+        .await
+        .expect_err("a scope graph that cannot be rebuilt is not read")
+        .to_string();
+        for message in [&command, &find] {
+            assert!(
+                message.starts_with(kin_mcp::negative::UNANSWERED_READ_PREFIX)
+                    && message.contains("could not be rebuilt into a graph to read")
+                    && message.contains(&dangling.id.to_string()),
+                "the refusal must name the rebuild failure: {message}"
+            );
+            assert!(!message.contains("writer was mutating"), "{message}");
+        }
+    }
+
+    /// A session scope replaced under a read is refused in the same words, with
+    /// the same class of refusal, by all three reference reads. bulk used to
+    /// serve the stale scope's answer under a disclosure that blamed a writer.
+    #[tokio::test]
+    async fn every_reference_read_refuses_a_replaced_scope_in_the_same_words() {
+        let state = test_state();
+        let session_id = SessionId::new();
+        let scope = || {
+            let graph = Arc::new(kin_db::InMemoryGraph::new());
+            let target = test_entity("historical_target", "src/lib.rs");
+            graph.upsert_entity(&target).unwrap();
+            (graph, target)
+        };
+        let drop_scope = |state: &Arc<DaemonState>| {
+            let state = Arc::clone(state);
+            move |attempt: usize| {
+                if attempt == 0 {
+                    state
+                        .session_scopes
+                        .try_write()
+                        .expect("a reference read does not hold the session scope lock")
+                        .remove(&session_id);
+                }
+            }
+        };
+
+        let (graph, target) = scope();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:old".into(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
+                Arc::clone(&graph),
+            )
+            .await;
+        let (status, command) = command_xref_with_stable_authority(
+            &state,
+            Some(&session_id),
+            graph,
+            RequestGraphAuthority::SessionScope,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: target.name.clone(),
+            },
+            drop_scope(&state),
+        )
+        .await
+        .expect_err("a replaced scope is refused");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(command, xref_scope_replaced_message("command xref"));
+
+        let (graph, target) = scope();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:old".into(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
+                Arc::clone(&graph),
+            )
+            .await;
+        let find = mcp_find_references_with_stable_authority(
+            &state,
+            Some(&session_id),
+            graph,
+            RequestGraphAuthority::SessionScope,
+            &find_references_arguments(&target),
+            drop_scope(&state),
+        )
+        .await
+        .expect_err("a replaced scope is refused");
+        assert!(matches!(find, kin_mcp::McpError::Other(_)), "{find:?}");
+        assert_eq!(
+            find.to_string(),
+            xref_scope_replaced_message("find_references")
+        );
+
+        let (graph, target) = scope();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:old".into(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
+                Arc::clone(&graph),
+            )
+            .await;
+        let bulk = mcp_bulk_check_references_with_stable_authority(
+            &state,
+            Some(&session_id),
+            graph,
+            RequestGraphAuthority::SessionScope,
+            &serde_json::from_value(json!({
+                "entity_ids": [target.id.to_string()],
+                "relation_kind": "Any",
+            }))
+            .unwrap(),
+            drop_scope(&state),
+        )
+        .await
+        .expect_err("a replaced scope is refused, not served under a writer's disclosure");
+        assert!(matches!(bulk, kin_mcp::McpError::Other(_)), "{bulk:?}");
+        assert_eq!(
+            bulk.to_string(),
+            xref_scope_replaced_message("bulk_check_references")
+        );
     }
 
     #[tokio::test]
@@ -57835,6 +66941,152 @@ mod tests {
         );
     }
 
+    /// The supervisor's liveness probe is not a client. Before it was marked,
+    /// the probe it sends every 15 seconds reset every worker's idle clock, so
+    /// no worker idled out while a supervisor ran.
+    #[tokio::test]
+    async fn a_watchdog_probe_leaves_the_idle_clock_alone_and_a_client_read_does_not() {
+        let state = test_state();
+        let app = router(Arc::clone(&state));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let aged = state.idle_duration();
+        assert!(
+            aged >= Duration::from_millis(250),
+            "the idle clock must have aged before the probe: {aged:?}"
+        );
+
+        let probe = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header(WATCHDOG_PROBE_HEADER, "supervisor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(probe.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // The reaper reads this count to decide whether a daemon has clients,
+        // and the probe has always counted itself in it. Leaving the idle
+        // clock alone must not change that reading.
+        assert!(
+            body["active_request_count"].as_u64() >= Some(1),
+            "the probe must still count itself in flight: {body}"
+        );
+        assert!(
+            state.idle_duration() >= aged,
+            "a watchdog probe reset the idle clock"
+        );
+
+        // Control: a client's own read of the same route still counts.
+        let client = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(client.status(), StatusCode::OK);
+        assert!(
+            state.idle_duration() < aged,
+            "a client's read of /health must still count as activity"
+        );
+    }
+
+    /// Only a liveness or readiness read can be a watchdog probe, so the header
+    /// cannot move real work off the idle clock.
+    #[test]
+    fn only_a_probe_route_can_be_a_watchdog_probe() {
+        let marked = |path: &str| {
+            Request::get(path)
+                .header(WATCHDOG_PROBE_HEADER, "supervisor")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert!(is_watchdog_probe(&marked("/health")));
+        assert!(is_watchdog_probe(&marked("/v2/health")));
+        assert!(is_watchdog_probe(&marked("/readiness")));
+        assert!(!is_watchdog_probe(&marked("/session")));
+        assert!(!is_watchdog_probe(&marked("/repos/r/mcp/tools/call")));
+        assert!(!is_watchdog_probe(
+            &Request::get("/health").body(Body::empty()).unwrap()
+        ));
+    }
+
+    /// A retirement request is bound to the incarnation the caller attributed,
+    /// and its answer names what the daemon is still waiting on, leaving out
+    /// the request that asked.
+    #[tokio::test]
+    async fn retirement_is_bound_to_its_incarnation_and_names_what_it_waits_on() {
+        let identity = kin_cli::daemon_client::current_process_identity().unwrap();
+        let mut stale = serde_json::to_value(&identity).unwrap();
+        stale["birth_token"] = serde_json::Value::String("reused-pid-successor".to_string());
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router_with_auth(Arc::clone(&state), Some("retire-token".to_string()));
+        let retire = |body: String| {
+            Request::post("/retire")
+                .header("authorization", "Bearer retire-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let rejected = app
+            .clone()
+            .oneshot(retire(stale.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(
+            !state.retirement_requested(),
+            "a retirement meant for another incarnation must not land here"
+        );
+
+        state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "attached-editor",
+                kin_model::SessionTransport::Mcp,
+                Some(std::process::id()),
+                state.layout.working_dir().to_path_buf(),
+                kin_model::SessionCapabilities::default(),
+            )
+            .unwrap();
+        let accepted = app
+            .oneshot(retire(serde_json::to_string(&identity).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(accepted.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(state.retirement_requested());
+        let waiting: Vec<&str> = body["blocked_by"]
+            .as_array()
+            .expect("blocked_by is a list")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            waiting.contains(&crate::daemon::ShutdownBlocker::AttachedSession.describe()),
+            "the attached session must be named: {body}"
+        );
+        assert!(
+            !waiting.contains(&crate::daemon::ShutdownBlocker::RequestInFlight.describe()),
+            "the retirement request itself must not be named as in flight: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn spine_edges_snapshot_is_authenticated_and_read_only() {
         let state = test_state();
@@ -58963,7 +68215,7 @@ mod tests {
                             reference: None,
                             snippets: false,
                             snippet_lines: None,
-                            entity_surface: false,
+                            entity_surface: true,
                             cursor: None,
                             page_size: None,
                             snippet_override: None,
@@ -58981,18 +68233,48 @@ mod tests {
             .unwrap();
         let locate_result: kin_cli::commands::locate::LocateResult =
             serde_json::from_slice(&locate_body).unwrap();
-        let locate_files: Vec<String> = locate_result
-            .files
+        // The semantic surface answers with semantic entities only, so the endpoint's
+        // ranking is read the same way: entity rows with an entity id, in order.
+        let locate_entities: Vec<String> = locate_result
+            .entities
             .iter()
-            .map(|entry| entry.path.clone())
+            .filter(|row| {
+                !row.entity_id.is_empty()
+                    && row.id_space == kin_cli::commands::locate::LocateIdSpace::Entity
+            })
+            .map(|row| row.entity_id.clone())
             .collect();
         assert!(
-            !locate_files.is_empty(),
-            "locate endpoint should rank at least one file"
+            !locate_entities.is_empty(),
+            "locate endpoint should rank at least one entity"
         );
 
         let payload = call_semantic_locate(
+            app.clone(),
+            json!({
+                "query": "parse config",
+                "limit": 10,
+                "pipeline": "fused"
+            }),
+        )
+        .await;
+        assert_eq!(payload["routing"], "fused-v1");
+        let mcp_entities: Vec<String> = payload["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["entity_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            mcp_entities, locate_entities,
+            "fused semantic_locate must serve the same entity ranking as POST /locate"
+        );
+
+        // A whole-file ranking is not a semantic answer: the agent surface refuses
+        // file granularity rather than handing back files.
+        let files = call_mcp_tool_result(
             app,
+            "semantic_locate",
             json!({
                 "query": "parse config",
                 "granularity": "file",
@@ -59001,18 +68283,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(payload["routing"], "fused-v1");
-        // The fused arm now serves the CLI `LocateResult` schema verbatim: the
-        // file ranking lives under `files[].path`, not a bespoke flat array.
-        let mcp_files: Vec<String> = payload["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| entry["path"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            mcp_files, locate_files,
-            "fused semantic_locate must serve the same file ranking as POST /locate"
+        assert_eq!(files.is_error, Some(true), "{files:?}");
+        let kin_mcp::ContentBlock::Text { text } = files.content.first().unwrap();
+        assert!(
+            text.contains("semantic_locate accepts only entity granularity"),
+            "{text}"
         );
     }
 
@@ -59124,9 +68399,25 @@ mod tests {
         .await;
         let hits = fused["entities"].as_array().unwrap();
         assert!(!hits.is_empty(), "expected a fused hit: {fused}");
-        let body = hits[0]["body"]
+        // Indexing the file also names its module `config`, a whole-file node that
+        // ranks on the same query and is withheld: it never carries source. The body
+        // contract is read off the real function.
+        let modules: Vec<&serde_json::Value> =
+            hits.iter().filter(|hit| hit["kind"] == "module").collect();
+        assert!(
+            !modules.is_empty(),
+            "the file's module is ranked too: {fused}"
+        );
+        for module in modules {
+            assert!(
+                module.get("body").is_none() && module.get("snippet").is_none(),
+                "a whole-file module node is withheld: {module}"
+            );
+        }
+        let function = function_hit(hits);
+        let body = function["body"]
             .as_str()
-            .unwrap_or_else(|| panic!("fused hit must carry a `body` key: {}", hits[0]));
+            .unwrap_or_else(|| panic!("fused hit must carry a `body` key: {function}"));
         assert!(
             body.contains("return {\"path\": path}"),
             "the body must be the entity's graph-owned source: {body}"
@@ -59134,9 +68425,8 @@ mod tests {
         // FIR-2415: ONE text per hit. `body` is this arm's name for it, the same
         // name `kin locate --json` uses, and `snippet` no longer repeats it.
         assert!(
-            hits[0].get("snippet").is_none(),
-            "the source text must be carried once per hit: {}",
-            hits[0]
+            function.get("snippet").is_none(),
+            "the source text must be carried once per hit: {function}"
         );
 
         // The repeat is still reachable for a consumer that reads `snippet`, but
@@ -59152,12 +68442,11 @@ mod tests {
             }),
         )
         .await;
-        let aliased_hits = aliased["entities"].as_array().unwrap();
+        let aliased_function = function_hit(aliased["entities"].as_array().unwrap());
         assert_eq!(
-            aliased_hits[0]["snippet"].as_str(),
-            aliased_hits[0]["body"].as_str(),
-            "snippet_alias repeats the body verbatim: {}",
-            aliased_hits[0]
+            aliased_function["snippet"].as_str(),
+            aliased_function["body"].as_str(),
+            "snippet_alias repeats the body verbatim: {aliased_function}"
         );
 
         // Suppression is honored, not ignored: no snippet key when opted out.
@@ -59172,12 +68461,21 @@ mod tests {
         )
         .await;
         let suppressed_hits = suppressed["entities"].as_array().unwrap();
-        assert!(!suppressed_hits.is_empty());
-        assert!(
-            suppressed_hits[0].get("snippet").is_none(),
-            "include_snippet:false must suppress the snippet: {}",
-            suppressed_hits[0]
-        );
+        function_hit(suppressed_hits);
+        for hit in suppressed_hits {
+            assert!(
+                hit.get("snippet").is_none(),
+                "include_snippet:false must suppress the snippet: {hit}"
+            );
+        }
+    }
+
+    /// The `parse_config` function among fused hits, which a query can rank beside
+    /// the whole-file module node of the file it lives in.
+    fn function_hit(hits: &[serde_json::Value]) -> &serde_json::Value {
+        hits.iter()
+            .find(|hit| hit["name"] == "parse_config")
+            .unwrap_or_else(|| panic!("the function must be a hit: {hits:?}"))
     }
 
     /// Install a page of committed, body-bearing definitions in distinct files.
@@ -59439,40 +68737,91 @@ mod tests {
         mcp_result_text(&result)
     }
 
-    /// A trace fixture whose bodies are real: `steps` source entities with
-    /// projectable spans, chained focal -> next -> next, each body wide enough
-    /// that inlining it is measurable.
-    ///
-    /// The defect this supports is about size, so a fixture of one-line bodies
-    /// would make every size assertion vacuous.
-    fn install_trace_chain(state: &Arc<DaemonState>, steps: usize) -> Vec<EntityId> {
-        let ids: Vec<EntityId> = (0..steps)
-            .map(|index| {
-                let path = format!("src/hop{index}.py");
-                let filler = "    # a line of body that costs real characters\n".repeat(30);
-                let source = format!("def hop{index}(request):\n{filler}    return {index}\n");
-                install_source_entity(state, &format!("hop{index}"), &path, &source)
-            })
-            .collect();
-        for window in ids.windows(2) {
-            state
-                .graph
-                .upsert_relation(&kin_model::relation::Relation {
-                    id: kin_model::RelationId::new(),
-                    kind: RelationKind::Calls,
-                    src: GraphNodeId::Entity(window[0]),
-                    dst: GraphNodeId::Entity(window[1]),
-                    confidence: 1.0,
-                    origin: kin_model::relation::RelationOrigin::Parsed,
-                    created_in: None,
-                    import_source: None,
-                    evidence: vec![],
-                })
-                .unwrap();
+    /// Admit and publish source through the ordinary command route. The source,
+    /// declarations, relation evidence and coverage must all come from the same
+    /// observation; inserting synthetic entities beside real bytes does not
+    /// establish the source proof these served-query fixtures need.
+    async fn install_admitted_query_sources(state: &Arc<DaemonState>, files: &[(&str, &str)]) {
+        for (path, source) in files {
+            install_working_copy_file(state, path, source.as_bytes(), false);
         }
+        command_commit(
+            axum::http::HeaderMap::new(),
+            State(Arc::clone(state)),
+            Json(CommandCommitRequest {
+                operation_id: kin_model::OperationId::new(),
+                timestamp: Timestamp::now(),
+                message: Some("install admitted query fixture".into()),
+                amend: false,
+                expected_head: None,
+                author: AuthorId::new("query-fixture-test"),
+                session_id: None,
+            }),
+        )
+        .await
+        .unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A real source chain with wide bodies and parser-derived cross-file
+    /// calls, imports and value references. Keep the original body size so the
+    /// wire limits exercise the response budget rather than a larger fixture.
+    async fn install_trace_chain(state: &Arc<DaemonState>, steps: usize) -> Vec<EntityId> {
+        let files: Vec<_> = (0..steps)
+            .map(|index| {
+                let filler = "    # a line of body that costs real characters\n".repeat(30);
+                let source = if index + 1 < steps {
+                    let next = index + 1;
+                    format!("from src.hop{next} import hop{next}\n\ndef hop{index}(request):\n{filler}    callback = hop{next}\n    return hop{next}(request)\n")
+                } else {
+                    format!("def hop{index}(request):\n{filler}    return {index}\n")
+                };
+                (format!("src/hop{index}.py"), source)
+            })
+            .collect();
+        install_admitted_query_sources(
+            state,
+            &files
+                .iter()
+                .map(|(path, body)| (path.as_str(), body.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        let entities = state.graph.list_all_entities().unwrap();
+        let ids: Vec<_> = (0..steps)
+            .map(|index| {
+                let matched: Vec<_> = entities
+                    .iter()
+                    .filter(|entity| {
+                        entity.kind == EntityKind::Function
+                            && entity.name == format!("hop{index}")
+                            && entity
+                                .file_origin
+                                .as_ref()
+                                .is_some_and(|file| file.0 == format!("src/hop{index}.py"))
+                    })
+                    .collect();
+                assert_eq!(matched.len(), 1, "one admitted definition for each hop");
+                matched[0].id
+            })
+            .collect();
+        for pair in ids.windows(2) {
+            let relations = state
+                .graph
+                .get_all_relations_for_node(&GraphNodeId::Entity(pair[0]))
+                .unwrap();
+            assert!(
+                relations
+                    .iter()
+                    .any(|relation| relation.kind == RelationKind::Calls
+                        && relation.src == GraphNodeId::Entity(pair[0])
+                        && relation.dst == GraphNodeId::Entity(pair[1])
+                        && !relation.evidence.is_empty()),
+                "the trace must traverse derived calls with source evidence"
+            );
+        }
         ids
     }
 
@@ -59488,7 +68837,7 @@ mod tests {
     #[tokio::test]
     async fn a_trace_shape_query_keeps_every_edge_and_carries_no_body() {
         let state = test_state();
-        let ids = install_trace_chain(&state, 5);
+        let ids = install_trace_chain(&state, 5).await;
         let app = router(Arc::clone(&state));
 
         let with_bodies = call_mcp_tool_text(
@@ -59529,6 +68878,27 @@ mod tests {
             "asking for the shape must not change which edges are walked"
         );
         assert_eq!(shape["bodies_included"], json!(false));
+        assert_eq!(
+            compact,
+            serde_json::to_string(&shape).unwrap(),
+            "the body-free compact response must spend no bytes on JSON indentation"
+        );
+        assert_eq!(
+            shape["source_derivation"], full["source_derivation"],
+            "compact rendering must retain exactly the same source proof"
+        );
+        let mut full_chain = full["chain"].clone();
+        for step in full_chain.as_array_mut().unwrap() {
+            assert_eq!(step["span_coherence"], "digest_verified");
+            step["body"] = serde_json::Value::Null;
+            // This field describes projection of a body, which the shape
+            // request did not perform. The graph source proof remains equal.
+            step["span_coherence"] = serde_json::Value::Null;
+        }
+        assert_eq!(
+            shape["chain"], full_chain,
+            "all chain fields except body projection must survive unchanged"
+        );
         assert!(
             shape["chain"]
                 .as_array()
@@ -59545,7 +68915,7 @@ mod tests {
         );
         assert!(
             compact.len() * 3 < with_bodies.len(),
-            "a shape query must be a fraction of the size: {} vs {} chars",
+            "a shape query must be a fraction of the size: {} vs {} chars; payload={compact}",
             compact.len(),
             with_bodies.len()
         );
@@ -59558,7 +68928,7 @@ mod tests {
     #[tokio::test]
     async fn compact_is_the_same_request_as_include_body_false() {
         let state = test_state();
-        let ids = install_trace_chain(&state, 4);
+        let ids = install_trace_chain(&state, 4).await;
         let app = router(Arc::clone(&state));
 
         let by_compact = call_mcp_tool(
@@ -59602,19 +68972,9 @@ mod tests {
     async fn a_trace_over_its_budget_drops_bodies_and_keeps_every_edge() {
         const ORIGINAL_BUDGET: usize = 6_000;
         let state = test_state();
-        let ids = install_trace_chain(&state, 6);
-        // The chain links only its calls. Every requested class decides
-        // (FIR-2672), so a graph holding no import or reference edge carries the
-        // class-gap disclosure in the verdict, both notes and the absence object,
-        // and spends the budget under test on it: measured, the ladder then cut
-        // an edge where it used to cut only bodies. The witness pair, off to the
-        // side of the chain, keeps this a test of the ladder rather than of the
-        // disclosure.
-        let witness_a = test_entity("witness_a", "src/witness_a.py");
-        let witness_b = test_entity("witness_b", "src/witness_b.py");
-        state.graph.upsert_entity(&witness_a).unwrap();
-        state.graph.upsert_entity(&witness_b).unwrap();
-        link_every_class(&state, &witness_a, &witness_b);
+        let ids = install_trace_chain(&state, 6).await;
+        // The admitted chain supplies its own import/value/call evidence; no
+        // synthetic side graph is used to manufacture a complete verdict.
         let app = router(Arc::clone(&state));
 
         let unbounded = call_mcp_tool_text(
@@ -59647,15 +69007,20 @@ mod tests {
             row.remove("reference_lines");
             row.remove("reference_lines_absent_reason");
         }
-        let old_shape_chars = serde_json::to_string_pretty(&without_site_contract)
-            .unwrap()
-            .len();
+        // The shape route now emits compact JSON with every proof field kept.
+        // Measure that actual wire representation, at the original target.
+        assert_eq!(
+            compact,
+            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&compact).unwrap())
+                .unwrap()
+        );
+        let old_shape_chars = serde_json::to_string(&without_site_contract).unwrap().len();
         let original_target =
             ORIGINAL_BUDGET.saturating_sub(kin_mcp::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS);
         assert!(
             old_shape_chars <= original_target,
             "the pre-call-site shape must still fit the original ladder target: {old_shape_chars} \
-             chars against {original_target}"
+             chars against {original_target}; payload={compact}"
         );
         let site_contract_chars = compact.len().saturating_sub(old_shape_chars);
         assert!(
@@ -59690,7 +69055,7 @@ mod tests {
         );
         assert_eq!(
             cut["total_steps"], full["total_steps"],
-            "bodies are cut before edges, so the chain survives a cut its source does not"
+            "bodies are cut before edges, so the chain survives a cut its source does not: {bounded}"
         );
         assert_eq!(cut["bodies_included"], json!(false));
         assert!(cut["bodies_omitted"].as_u64().unwrap_or(0) > 0);
@@ -60158,6 +69523,174 @@ mod tests {
 
     // The legacy cosine ranking stays reachable per-call, independent of the
     // daemon's profile — the A/B lever for benchmarks and the compat escape.
+    /// A daemon whose text index is in the state a failed commit read-back
+    /// leaves: the committed image is on disk, every read of it refuses, and its
+    /// document count is still the published one.
+    ///
+    /// Reached the way a store reaches it: a segment the next commit carries is
+    /// gone, and a root change with no document delta makes that commit carry
+    /// it. Returns the removed segment and its bytes, so a test can put the file
+    /// back for its control.
+    fn unmapped_text_index_state() -> (Arc<DaemonState>, std::path::PathBuf, Vec<u8>) {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("parse_config", "src/config.py"))
+            .unwrap();
+        state.graph.flush_text_index().unwrap();
+        let segment = std::fs::read_dir(state.layout.text_index_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.contains(".kinseg-") && !name.ends_with(".kinseg-manifest")
+            })
+            .expect("the daemon's text index is segmented");
+        let bytes = std::fs::read(&segment).unwrap();
+        std::fs::remove_file(&segment).unwrap();
+        assert!(state
+            .graph
+            .persist_text_index_with_root_hash([0x5a; 32])
+            .is_err());
+        assert!(
+            state.graph.text_index_unavailable().is_some(),
+            "the fixture must leave the text index unmapped"
+        );
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        (state, segment, bytes)
+    }
+
+    #[tokio::test]
+    async fn mcp_semantic_locate_over_an_unmapped_text_index_refuses_or_is_inconclusive() {
+        let (state, _segment, _bytes) = unmapped_text_index_state();
+        let app = router(state);
+
+        // A query no stage searches the index for answers, and the gap reaches
+        // the one verdict and the completeness block an agent reads first.
+        let raw = call_mcp_tool_result(
+            app.clone(),
+            "semantic_locate",
+            json!({ "query": "how is it" }),
+        )
+        .await;
+        assert_ne!(raw.is_error, Some(true), "{raw:?}");
+        let finalized =
+            kin_mcp::envelope::finalize(raw, kin_mcp::Envelope::daemon(), "semantic_locate");
+        let value = tool_result_payload(&finalized);
+        let gap = value["degradations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["component"] == "text_index")
+            .unwrap_or_else(|| panic!("the reply carries no text-index gap: {value}"));
+        assert_eq!(gap["reason"], "unavailable", "{value}");
+        let verdict = &value["_kin"]["verdict"];
+        assert_eq!(
+            verdict["state"], "inconclusive",
+            "an answer built without lexical evidence is not conclusive: {value}"
+        );
+        assert_eq!(
+            verdict["inputs"]["degradations"], "inconclusive",
+            "the gap is what refused the verdict: {value}"
+        );
+        assert!(
+            verdict["limiting_factor"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retrieval_degraded"),
+            "the verdict names the degraded run: {value}"
+        );
+        let completeness = &value["_kin"]["completeness"];
+        assert_ne!(
+            completeness["status"], "complete",
+            "completeness cannot call this answer whole: {value}"
+        );
+        assert!(
+            completeness["limits"]
+                .as_array()
+                .is_some_and(|limits| limits.iter().any(|limit| limit == "verdict_inconclusive")),
+            "completeness carries the verdict's limit: {value}"
+        );
+
+        // A query a ranking stage has to search the index for refuses, and the
+        // refusal names the unmapped index rather than answering thin.
+        let refused =
+            call_mcp_tool_result(app, "semantic_locate", json!({ "query": "parse_config" })).await;
+        assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        let kin_mcp::ContentBlock::Text { text } = refused
+            .content
+            .first()
+            .expect("a refusal carries its reason");
+        assert!(
+            text.contains("is refused until it maps again"),
+            "the refusal names the unmapped index: {text}"
+        );
+    }
+
+    /// The locate surface `kin setup` gives agents reports the same gap.
+    ///
+    /// The `agent-default` profile asks for the compact shape on its agents'
+    /// behalf, and that shape carried no `degradations`, so on it the verdict
+    /// certified an answer built without its text index. The arguments here are
+    /// the ones the profile's belt makes of a bare query, and the reply is
+    /// finalized the way the stdio server finalizes it under that profile,
+    /// response budget included. The control puts the segment back and asks
+    /// again, and the gap is gone.
+    #[tokio::test]
+    async fn the_agent_default_locate_surface_reports_an_unmapped_text_index() {
+        let (state, segment, bytes) = unmapped_text_index_state();
+        let app = router(state);
+        let agent_default_call = |app: Router| async move {
+            let mut arguments: HashMap<String, serde_json::Value> =
+                HashMap::from([("query".to_string(), json!("how is it"))]);
+            kin_mcp::agent_belt::apply_belt_defaults("semantic_locate", &mut arguments);
+            assert_eq!(
+                arguments["surface"], "compact",
+                "the profile asks for the compact shape on its own"
+            );
+            let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments);
+            let raw = call_mcp_tool_result(app, "semantic_locate", json!(arguments)).await;
+            assert_ne!(raw.is_error, Some(true), "{raw:?}");
+            tool_result_payload(&kin_mcp::envelope::finalize_bounded(
+                raw,
+                kin_mcp::Envelope::daemon(),
+                "semantic_locate",
+                &budget,
+            ))
+        };
+
+        let value = agent_default_call(app.clone()).await;
+        assert_eq!(value["surface"], "compact", "{value}");
+        assert!(
+            degradation_labels(&value).contains(&"text_index:unavailable".to_string()),
+            "the compact reply names the text index: {value}"
+        );
+        let verdict = &value["_kin"]["verdict"];
+        assert_eq!(verdict["state"], "inconclusive", "{value}");
+        assert_eq!(
+            verdict["inputs"]["degradations"], "inconclusive",
+            "the gap is what refused the verdict: {value}"
+        );
+        assert!(
+            verdict["limiting_factor"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retrieval_degraded"),
+            "the verdict points at the degradations the reply names: {value}"
+        );
+
+        std::fs::write(&segment, &bytes).unwrap();
+        let control = agent_default_call(app).await;
+        assert!(
+            !degradation_labels(&control)
+                .iter()
+                .any(|label| label.starts_with("text_index:")),
+            "a readable index is no gap: {control}"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_semantic_locate_pipeline_cosine_override_serves_legacy() {
         let state = test_state();
@@ -61197,7 +70730,7 @@ mod tests {
                     .repeat(lines)
             )
         };
-        let make_entities = || -> Vec<LocateEntity> {
+        let make_entities = |body_lines: usize| -> Vec<LocateEntity> {
             (0..10)
                 .map(|index| LocateEntity {
                     entity_id: format!("0000{index:04}-0000-4000-8000-000000000000"),
@@ -61209,7 +70742,10 @@ mod tests {
                     score: 0.9 - (index as f32 / 100.0),
                     definition: true,
                     span: Some([100 + index as u32, 220 + index as u32]),
-                    body: Some(body(&format!("resolve_redirects_variant_{index}"), 22)),
+                    body: Some(body(
+                        &format!("resolve_redirects_variant_{index}"),
+                        body_lines,
+                    )),
                     match_kind: None,
                     provenance: LocateProvenance {
                         file: Some(format!("requests/sessions_{index}.py")),
@@ -61217,6 +70753,8 @@ mod tests {
                         cosine: Some(0.71),
                     },
                     matched_queries: variants.clone(),
+                    collapsed_rows: 0,
+                    name_tier: None,
                 })
                 .collect()
         };
@@ -61256,8 +70794,8 @@ mod tests {
                 })
                 .collect()
         };
-        let make_result = || LocateResult {
-            entities: make_entities(),
+        let make_result = |body_lines| LocateResult {
+            entities: make_entities(body_lines),
             next_cursor: Some("v2.deadbeefdeadbeef.1.10.10".to_string()),
             page: 0,
             total_ranked: 47,
@@ -61266,8 +70804,35 @@ mod tests {
             ..Default::default()
         };
 
+        // The historical fixture used to overflow through the duplicate file
+        // catalog alone. Entity-only MCP now fits it without taking any body.
+        let historical = make_result(22);
+        assert!(
+            serde_json::to_string_pretty(&historical).unwrap().len()
+                > kin_mcp::budget::RESPONSE_DEFAULT_MAX_CHARS
+        );
+        let entity_only = mcp_result_text(&fused_semantic_locate_payload(
+            historical,
+            "where HTTP redirects are actually resolved and followed",
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+        ));
+        let budget = kin_mcp::budget::ResponseBudget::default().less_envelope_reserve();
+        assert!(entity_only.len() <= budget.max_chars);
+        let historical_payload: serde_json::Value = serde_json::from_str(&entity_only).unwrap();
+        assert!(historical_payload.get("files").is_none());
+        assert_eq!(historical_payload["entities"].as_array().unwrap().len(), 10);
+        assert!(historical_payload["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["body"].is_string()));
+
+        // Larger individual entities still exercise the same response ceiling.
+        // No duplicated file catalog is needed to drive this overflow control.
         let unbounded = mcp_result_text(&fused_semantic_locate_payload(
-            make_result(),
+            make_result(80),
             "where HTTP redirects are actually resolved and followed",
             false,
             false,
@@ -61281,10 +70846,9 @@ mod tests {
 
         // The budget the route actually applies: the default less the room the
         // stdio path's envelope and negative need.
-        let budget = kin_mcp::budget::ResponseBudget::default().less_envelope_reserve();
         let bounded = mcp_result_text(&bound_mcp_tool_result(
             fused_semantic_locate_payload(
-                make_result(),
+                make_result(80),
                 "where HTTP redirects are actually resolved and followed",
                 false,
                 false,
@@ -61306,17 +70870,20 @@ mod tests {
         );
         let payload: serde_json::Value =
             serde_json::from_str(&bounded).expect("a bounded locate response is still JSON");
-        // The ranking itself is what a caller came for, so the hits survive and
-        // the cut lands on the diagnostics and the duplicated roll-up first.
+        // Every ranked entity survives; the budget withholds its inline body
+        // with a machine-readable disclosure and an entity-source remedy.
         assert_eq!(
             payload["entities"].as_array().map(Vec::len),
             Some(10),
             "every hit the caller asked for is still reported: {payload}"
         );
+        assert!(payload.get("files").is_none());
+        assert_eq!(payload["elisions"]["body"]["elided"], json!(10));
         for hit in payload["entities"].as_array().unwrap() {
+            assert_eq!(hit["body_elided"], json!(["body"]));
             assert!(
                 hit.get("match_evidence").is_none(),
-                "compact is the default: the per-signal breakdown is not shipped unasked"
+                "the per-signal breakdown is not shipped unasked"
             );
             assert!(hit["entity_id"].is_string(), "a hit keeps its handle");
         }
@@ -61345,7 +70912,7 @@ mod tests {
             cut["detail"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("symbol roll-up"),
+                .contains("inline source dropped"),
             "the disclosure names what it took: {cut}"
         );
     }
@@ -61478,12 +71045,10 @@ mod tests {
                 "a variant is serialized once per response, not once per hit: {text}"
             );
         }
-        // The file surface carries the same attribution and pays the same cost,
-        // so it is normalized the same way.
-        for file in payload["files"].as_array().unwrap() {
-            assert_eq!(file["matched_variant_indexes"], json!([0, 1, 2]), "{file}");
-            assert!(file.get("matched_queries").is_none(), "{file}");
-        }
+        assert!(
+            payload.get("files").is_none(),
+            "entity attribution has no file catalog"
+        );
     }
 
     /// A cursor page runs no retrieval, so it used to drop the fused `queries`
@@ -61556,7 +71121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fused_file_cursor_pages_the_file_ranking_without_entities_repeats_or_gaps() {
+    async fn semantic_mcp_refuses_legacy_file_cursors_while_conversion_api_keeps_shape_checks() {
         let state = test_state();
         let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
         let file = |path: &str, score: f32| {
@@ -61644,49 +71209,15 @@ mod tests {
             "POST /locate cannot reinterpret a file cursor as entity offsets"
         );
 
-        let page =
-            call_semantic_locate(app.clone(), json!({ "cursor": cursor, "page_size": 2 })).await;
-        assert_eq!(page["granularity"], "file");
-        assert!(
-            page.get("entities").is_none(),
-            "file mode has one primary: {page}"
-        );
-        assert_eq!(page["total_ranked"], 3);
-        assert_eq!(
-            page["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| entry["path"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["src/b.rs", "src/c.rs"]
-        );
-        assert!(page["next_cursor"].is_null());
-
-        let legacy =
-            call_semantic_locate(app.clone(), json!({ "cursor": format!("{key}.1") })).await;
-        assert_eq!(legacy["files"][0]["path"], "src/b.rs");
-        assert_eq!(legacy["next_cursor"].is_string(), true);
-
-        for damaged in [
-            kin_core::LocateCursor {
-                key: key.to_string(),
-                page: 2,
-                next_offset: Some(3),
-                page_size: Some(1),
-            }
-            .encode(),
-            format!("{key}.3"),
-        ] {
-            let refused =
-                call_mcp_tool_result(app.clone(), "semantic_locate", json!({ "cursor": damaged }))
-                    .await;
+        for token in [cursor, format!("{key}.1"), format!("{key}.3")] {
+            let refused = call_mcp_tool_result(
+                app.clone(),
+                "semantic_locate",
+                json!({"cursor":token,"page_size":2}),
+            )
+            .await;
             assert_eq!(refused.is_error, Some(true));
-            assert!(matches!(
-                refused.content.first(),
-                Some(kin_mcp::ContentBlock::Text { text })
-                    if text.contains("outside its held ranking")
-            ));
+            assert!(mcp_result_text(&refused).contains("file-granularity cursor"));
         }
     }
 
@@ -62353,7 +71884,12 @@ mod tests {
             "find_references",
             &roomy,
         );
-        assert_eq!(mcp_result_text(&fitting), original);
+        // A reply that fits ships compact too, which is the default wire for
+        // every tool, and it drops nothing: its bytes are exactly the compact
+        // serialization of the untouched payload.
+        let fitting_text = mcp_result_text(&fitting);
+        assert!(!fitting_text.contains('\n'), "{fitting_text}");
+        assert_eq!(fitting_text, serde_json::to_string(&payload).unwrap());
 
         let annotated = kin_mcp::envelope::finalize_bounded(
             response,
@@ -62368,7 +71904,10 @@ mod tests {
             final_payload["_kin"]["response"]["chars_after_budget"],
             emitted.len()
         );
-        assert_eq!(kin_mcp::budget::measure(&final_payload), emitted.len());
+        // The enveloped answer ships compact as well, exactly its own compact
+        // serialization. `measure` cannot be the check here: parsing drops the
+        // private format marker, so it would measure the value pretty.
+        assert_eq!(serde_json::to_string(&final_payload).unwrap(), emitted);
     }
 
     /// A tool the budget does not govern is returned exactly as built. A source

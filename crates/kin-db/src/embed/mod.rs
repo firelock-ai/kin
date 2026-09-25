@@ -10,6 +10,8 @@ pub use producer::{
 #[cfg(feature = "embeddings")]
 mod inference;
 #[cfg(feature = "embeddings")]
+mod model_identity;
+#[cfg(feature = "embeddings")]
 pub mod rerank;
 
 #[cfg(feature = "embeddings")]
@@ -687,6 +689,10 @@ pub struct CodeEmbedder {
     dimensions: usize,
     #[cfg(feature = "embeddings")]
     cache: Option<EmbeddingCache>,
+    /// Captured when the model is loaded; later saves must not describe a live
+    /// model using a newly edited environment or replacement artifact.
+    #[cfg(feature = "embeddings")]
+    runtime: Option<EmbeddingRuntimeConfig>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -713,15 +719,17 @@ struct TestLocalModel {
 #[cfg(all(test, feature = "embeddings"))]
 #[derive(Default)]
 pub(crate) struct TestLocalRuntimeStats {
-    cpu_model_calls: std::sync::atomic::AtomicUsize,
+    cpu_twin_requests: std::sync::atomic::AtomicUsize,
     primary_forward_calls: std::sync::atomic::AtomicUsize,
     cpu_forward_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(all(test, feature = "embeddings"))]
 impl TestLocalRuntimeStats {
-    pub(crate) fn cpu_model_calls(&self) -> usize {
-        self.cpu_model_calls
+    /// How many times anything asked for the CPU twin, which is what builds
+    /// one in production.
+    pub(crate) fn cpu_twin_requests(&self) -> usize {
+        self.cpu_twin_requests
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -749,10 +757,12 @@ struct TestLocalRuntime {
 struct BertEmbedder {
     model: BertModel,
     /// CPU-only BertModel, loaded lazily the first time the dispatcher
-    /// routes a batch through the CPU path. Held behind a Mutex + OnceLock
-    /// pattern because BertModel is `!Sync` for `forward` (mutable buffers
-    /// internally) and we only need one-time construction. Heap-weighted:
-    /// holding two models doubles resident weights (~260MB for BGE-small).
+    /// routes a batch through the CPU path while the primary runs on an
+    /// accelerator. A CPU primary serves that path itself, so this stays empty
+    /// there. Held behind a Mutex + OnceLock pattern because BertModel is
+    /// `!Sync` for `forward` (mutable buffers internally) and we only need
+    /// one-time construction. Heap-weighted: holding two models doubles
+    /// resident weights (~260MB for BGE-small).
     #[cfg(feature = "embeddings")]
     cpu_model: std::sync::OnceLock<BertModel>,
     /// Captured arguments needed to build `cpu_model` on demand.
@@ -881,6 +891,7 @@ enum EmbeddingInputRole {
 struct CpuModelSource {
     weights_path: PathBuf,
     config_json: String,
+    local_identity: Option<(PathBuf, String)>,
 }
 
 /// Initialize one value from retained source material with one in-flight
@@ -1026,6 +1037,7 @@ impl CodeEmbedder {
                 EmbeddingCache::new_in(cache_root, namespace.to_string(), dimensions)
                     .expect("test embedding cache should initialize"),
             ),
+            runtime: None,
         };
         (embedder, stats)
     }
@@ -1145,10 +1157,13 @@ impl CodeEmbedder {
             revision = %revision
         )
         .entered();
-        let (config_path, tokenizer_path, weights_path) = if let Some(dir) =
-            local_model_dir(model_id)
-        {
-            resolve_local_model_artifacts(&dir)?
+        let local_dir = local_model_dir(model_id);
+        let local_identity = local_dir
+            .as_deref()
+            .map(model_identity::resolve)
+            .transpose()?;
+        let (config_path, tokenizer_path, weights_path) = if let Some(dir) = local_dir.as_ref() {
+            resolve_local_model_artifacts(dir)?
         } else {
             let repo =
                 Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
@@ -1175,7 +1190,10 @@ impl CodeEmbedder {
             .map_err(|e| KinDbError::IndexError(format!("failed to parse model config: {e}")))?;
 
         let dimensions = config.hidden_size;
-        let query_prefix = local_query_prefix(model_id, config.model_type.as_deref());
+        let query_prefix = local_identity
+            .as_ref()
+            .map(|identity| identity.query_prefix.clone())
+            .unwrap_or_else(|| local_query_prefix(model_id, config.model_type.as_deref()));
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to load tokenizer: {e}")))?;
@@ -1210,12 +1228,33 @@ impl CodeEmbedder {
         let model = load_bert_model(&weights_path, config, false)
             .map_err(|e| KinDbError::IndexError(format!("failed to load BERT model: {e}")))?;
 
-        let cache_namespace = model_namespace(
-            model_id,
-            revision,
-            dimensions,
-            [&config_path, &tokenizer_path, &weights_path],
+        let runtime = local_identity.as_ref().map_or_else(
+            || EmbeddingRuntimeConfig {
+                provider: "local".into(),
+                model_id: model_id.to_string(),
+                revision: revision.to_string(),
+                dimensions: Some(dimensions),
+                pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.into(),
+            },
+            local_identity_runtime,
         );
+        let cache_namespace = if let Some(identity) = local_identity.as_ref() {
+            sanitize_component(&identity.model_id)
+        } else {
+            model_namespace(
+                model_id,
+                revision,
+                dimensions,
+                [&config_path, &tokenizer_path, &weights_path],
+            )?
+        };
+        if let Some(dir) = local_dir.as_deref() {
+            if local_identity.as_ref() != Some(&model_identity::resolve(dir)?) {
+                return Err(KinDbError::IndexError(
+                    "local model artifacts changed while the embedder was loading".into(),
+                ));
+            }
+        }
 
         let backend = BertEmbedder {
             model,
@@ -1223,6 +1262,7 @@ impl CodeEmbedder {
             cpu_model_source: std::sync::Mutex::new(Some(CpuModelSource {
                 weights_path: weights_path.clone(),
                 config_json: config_data,
+                local_identity: local_dir.zip(local_identity.map(|identity| identity.model_id)),
             })),
             tokenizer,
             query_prefix,
@@ -1232,6 +1272,7 @@ impl CodeEmbedder {
             backend: CodeEmbedderBackend::Bert(backend),
             dimensions,
             cache: EmbeddingCache::new(cache_namespace, dimensions),
+            runtime: Some(runtime),
         })
     }
 
@@ -1244,14 +1285,34 @@ impl CodeEmbedder {
     /// Create with an OpenAI-compatible embeddings endpoint.
     #[cfg(feature = "embeddings")]
     fn with_openai_compat(config: OpenAiCompatConfig) -> Result<Self, KinDbError> {
+        let mut runtime = EmbeddingRuntimeConfig {
+            provider: config.provider_identity(),
+            model_id: config.model_id.clone(),
+            revision: config.runtime_revision(),
+            dimensions: config.dimensions,
+            pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.into(),
+        };
         let embedder = OpenAiCompatEmbedder::new(config)?;
         let dimensions = embedder.dimensions;
+        runtime.dimensions = Some(dimensions);
         let cache_namespace = embedder.cache_namespace();
         Ok(Self {
             backend: CodeEmbedderBackend::OpenAiCompat(embedder),
             dimensions,
             cache: EmbeddingCache::new(cache_namespace, dimensions),
+            runtime: Some(runtime),
         })
+    }
+
+    #[cfg(feature = "embeddings")]
+    pub(crate) fn runtime_identity(&self) -> Option<&EmbeddingRuntimeConfig> {
+        self.runtime.as_ref()
+    }
+
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn with_test_runtime_identity(mut self, runtime: EmbeddingRuntimeConfig) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     /// Generate an embedding for a single entity.
@@ -1746,7 +1807,7 @@ impl BertEmbedder {
         let parallel_cpu = ranges.len() > 1
             && matches!(route_override, Some(EmbedDispatchRoute::CpuTwin { .. }))
             && resource_profile_is_throughput()
-            && self.cpu_model().is_ok();
+            && BertChunkRuntime(self).cpu_model().is_ok();
 
         if parallel_cpu {
             hybrid_metrics::record_cpu_parallel_batch();
@@ -1846,7 +1907,7 @@ impl BertEmbedder {
             // CPU-destined subset back to the GPU. There is no concurrency in this
             // branch, so deferring to the auto resolver when the twin is missing
             // is still safe.
-            let twin_available = self.cpu_model().is_ok();
+            let twin_available = BertChunkRuntime(self).cpu_model().is_ok();
             hybrid_metrics::record_single_side_batch();
             if twin_available {
                 hybrid_metrics::record_cpu_twin(cpu_entities, cpu_tokens);
@@ -1883,14 +1944,16 @@ impl BertEmbedder {
             return self.process_encoded_subset(metal_side, dimensions, budget, None);
         }
 
-        // Hybrid concurrency is only safe when the CPU arm runs on its OWN model
-        // (the CPU twin) — a different backend than the primary Metal model. If the
-        // twin is unavailable, process_encoded_subset's CPU path falls back to
+        // Hybrid concurrency is only safe when the CPU arm runs on a CPU model
+        // (the CPU twin, or a primary that is itself on the CPU, whose forwards
+        // are safe to run side by side as the parallel CPU path above already
+        // does on the twin) — never on the shared Metal model. If the twin is
+        // unavailable, process_encoded_subset's CPU path falls back to
         // &self.model, so BOTH rayon::join arms would submit to the single Metal
         // model concurrently; on unified memory that races the shared command queue
         // and buffer pool and corrupts embeddings. In that case process the whole
         // set SERIALLY on the primary model instead (slower, but correct).
-        if let Err(e) = self.cpu_model() {
+        if let Err(e) = BertChunkRuntime(self).cpu_model() {
             hybrid_metrics::record_twin_unavailable_batch();
             hybrid_metrics::record_gpu(metal_entities + cpu_entities, metal_tokens + cpu_tokens);
             tracing::warn!(
@@ -1999,9 +2062,23 @@ impl BertEmbedder {
     /// argument, so the primary (GPU) model and any concurrent load are
     /// unaffected. The twin runs the CPU arm of the throughput-profile hybrid
     /// split.
+    ///
+    /// Reached only through [`LocalChunkRuntime::cpu_model`], which answers
+    /// with the primary itself when the primary is already on the CPU.
     #[cfg(feature = "embeddings")]
-    fn cpu_model(&self) -> Result<&BertModel, KinDbError> {
+    fn cpu_twin(&self) -> Result<&BertModel, KinDbError> {
         get_or_try_init_single_flight(&self.cpu_model, &self.cpu_model_source, |source| {
+            let verify_source = || -> Result<(), KinDbError> {
+                if let Some((dir, expected)) = source.local_identity.as_ref() {
+                    if &model_identity::resolve(dir)?.model_id != expected {
+                        return Err(KinDbError::IndexError(
+                            "local model artifacts changed before CPU twin construction".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            };
+            verify_source()?;
             let config: BertConfig = parse_model_config(&source.config_json).map_err(|e| {
                 KinDbError::IndexError(format!("cpu twin config parse failed: {e}"))
             })?;
@@ -2012,6 +2089,7 @@ impl BertEmbedder {
             let cpu_model = load_bert_model(&source.weights_path, config, true).map_err(|e| {
                 KinDbError::IndexError(format!("failed to load CPU BERT twin: {e}"))
             })?;
+            verify_source()?;
             tracing::info!(
                 backend = %cpu_model.backend(),
                 "kindb.embed: CPU BertModel twin loaded for long-sequence fallback"
@@ -2429,7 +2507,11 @@ fn parse_json_object_env(
 #[cfg(feature = "embeddings")]
 pub(crate) fn local_model_dir(model_id: &str) -> Option<PathBuf> {
     let path = Path::new(model_id);
-    if path.is_dir() {
+    if path.is_dir()
+        || path.is_absolute()
+        || model_id.starts_with("./")
+        || model_id.starts_with("../")
+    {
         Some(path.to_path_buf())
     } else {
         None
@@ -2523,6 +2605,48 @@ pub fn configured_embedding_runtime() -> EmbeddingRuntimeConfig {
             }
         }
     }
+}
+
+#[cfg(feature = "embeddings")]
+fn local_identity_runtime(identity: &model_identity::LocalModelIdentity) -> EmbeddingRuntimeConfig {
+    EmbeddingRuntimeConfig {
+        provider: "local".into(),
+        model_id: identity.model_id.clone(),
+        // A local directory's caller-supplied revision is a provenance label,
+        // not evidence of its bytes. The content digest above is authoritative.
+        revision: "local-content-v1".into(),
+        dimensions: Some(identity.dimensions),
+        pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.into(),
+    }
+}
+
+/// Resolve the configured local model into a portable embedding-space identity
+/// without initializing inference or downloading any artifact. The configured
+/// form remains available separately for acquisition and diagnostics.
+#[cfg(feature = "embeddings")]
+pub fn resolved_embedding_runtime() -> Result<EmbeddingRuntimeConfig, KinDbError> {
+    let runtime = configured_embedding_runtime();
+    if runtime.provider == "local" {
+        if let Some(dir) = local_model_dir(&runtime.model_id) {
+            return model_identity::resolve(&dir).map(|identity| local_identity_runtime(&identity));
+        }
+    }
+    Ok(runtime)
+}
+
+#[cfg(feature = "embeddings")]
+pub(crate) fn is_local_content_identity(model_id: &str) -> bool {
+    model_id.starts_with(model_identity::LOCAL_CONTENT_PREFIX)
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+pub(crate) fn model_identity_hash_reads() -> usize {
+    model_identity::hash_reads()
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+pub(crate) fn write_test_local_model(dir: &Path) {
+    model_identity::write_test_model(dir);
 }
 
 #[cfg(feature = "embeddings")]
@@ -3006,8 +3130,27 @@ trait LocalChunkRuntime {
     type Model;
 
     fn primary_model(&self) -> &Self::Model;
-    fn cpu_model(&self) -> Result<&Self::Model, KinDbError>;
+    /// The dedicated CPU twin, built on first use. Nothing but
+    /// [`Self::cpu_model`] asks for it, so a primary already on the CPU never
+    /// builds one.
+    fn cpu_twin(&self) -> Result<&Self::Model, KinDbError>;
     fn backend(&self, model: &Self::Model) -> GpuBackend;
+
+    /// The model a batch routed to the CPU runs on.
+    ///
+    /// A primary that already runs on the CPU is its own CPU model. The twin
+    /// exists to give an accelerator primary a CPU beside it; built beside a
+    /// CPU primary it is the same weights on the same device, so it computes
+    /// the same vectors while holding a second full copy of the model. That
+    /// copy is what `KIN_EMBED_BACKEND=cpu` used to cost every CPU-only host,
+    /// and it is several hundred megabytes for the default model.
+    fn cpu_model(&self) -> Result<&Self::Model, KinDbError> {
+        let primary = self.primary_model();
+        if self.backend(primary) == GpuBackend::Cpu {
+            return Ok(primary);
+        }
+        self.cpu_twin()
+    }
     fn forward_batched(
         &self,
         model: &Self::Model,
@@ -3033,8 +3176,8 @@ impl LocalChunkRuntime for BertChunkRuntime<'_> {
         &self.0.model
     }
 
-    fn cpu_model(&self) -> Result<&Self::Model, KinDbError> {
-        self.0.cpu_model()
+    fn cpu_twin(&self) -> Result<&Self::Model, KinDbError> {
+        self.0.cpu_twin()
     }
 
     fn backend(&self, model: &Self::Model) -> GpuBackend {
@@ -3070,9 +3213,9 @@ impl LocalChunkRuntime for TestLocalRuntime {
         &self.primary
     }
 
-    fn cpu_model(&self) -> Result<&Self::Model, KinDbError> {
+    fn cpu_twin(&self) -> Result<&Self::Model, KinDbError> {
         self.stats
-            .cpu_model_calls
+            .cpu_twin_requests
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.cpu.as_ref().ok_or_else(|| {
             KinDbError::IndexError(
@@ -4021,6 +4164,7 @@ fn entity_kind_label(kind: EntityKind) -> &'static str {
         EntityKind::File => "file",
         EntityKind::DocumentNode => "document_node",
         EntityKind::Method => "method",
+        EntityKind::Field => "field",
         EntityKind::EnumDef => "enum",
         EntityKind::EnumVariant => "enum_variant",
         EntityKind::Constant => "constant",
@@ -4241,26 +4385,21 @@ impl EmbeddingCache {
 
 #[cfg(feature = "embeddings")]
 fn model_namespace<const N: usize>(
-    model_id: &str,
-    revision: &str,
+    _model_id: &str,
+    _revision: &str,
     dimensions: usize,
     artifact_paths: [&Path; N],
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(EMBEDDING_CACHE_PIPELINE_EPOCH.as_bytes());
-    hasher.update([0]);
-    hasher.update(model_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(revision.as_bytes());
-    hasher.update([0]);
-    hasher.update(dimensions.to_le_bytes());
-    hasher.update([0]);
-    for path in artifact_paths {
-        hasher.update(path.to_string_lossy().as_bytes());
-        hasher.update([0]);
-    }
-    let digest = hex::encode(hasher.finalize());
-    format!("{}-{}", sanitize_component(model_id), &digest[..16])
+) -> Result<String, KinDbError> {
+    // Inputs are already query/document-prefixed before their per-text cache
+    // key is computed. This namespace binds the model and processing epoch.
+    let identity = model_identity::artifact_identity(
+        artifact_paths,
+        dimensions,
+        EMBEDDING_CACHE_PIPELINE_EPOCH,
+        "",
+        EMBED_MAX_SEQ_LEN,
+    )?;
+    Ok(sanitize_component(&identity))
 }
 
 #[cfg(feature = "embeddings")]
@@ -5784,6 +5923,56 @@ mod tests {
         );
     }
 
+    /// Moving an already downloaded model is not a new embedding space.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn model_namespace_relocation_reuses_existing_vectors() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("linux-model");
+        let moved = root.path().join("mac-model");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::write(original.join(name), name.as_bytes()).unwrap();
+            std::fs::copy(original.join(name), moved.join(name)).unwrap();
+        }
+        let namespace = |dir: &Path| {
+            model_namespace(
+                dir.to_str().unwrap(),
+                "same-revision",
+                2,
+                [
+                    dir.join("config.json").as_path(),
+                    dir.join("tokenizer.json").as_path(),
+                    dir.join("model.safetensors").as_path(),
+                ],
+            )
+        };
+        let first = namespace(&original).unwrap();
+        let second = namespace(&moved).unwrap();
+        assert_eq!(first, second, "model location must not namespace vectors");
+        let writer = EmbeddingCache::new_in(root.path().join("cache"), first, 2).unwrap();
+        let key = writer.key_for_text("same semantic input");
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        writer.put_by_key(&key, &[1.0, 0.0], &producers);
+        let reader = EmbeddingCache::new_in(root.path().join("cache"), second, 2).unwrap();
+        assert_eq!(reader.get_by_key(&key).unwrap().producers, producers);
+    }
+
+    /// A caller's unchanged revision label cannot attest mutable local bytes.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn model_namespace_changed_bytes_at_same_path_invalidate() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("model.safetensors");
+        std::fs::write(&artifact, b"original weights").unwrap();
+        let before =
+            model_namespace(root.path().to_str().unwrap(), "same", 2, [&artifact]).unwrap();
+        std::fs::write(&artifact, b"modified weights").unwrap();
+        let after = model_namespace(root.path().to_str().unwrap(), "same", 2, [&artifact]).unwrap();
+        assert_ne!(before, after, "changed weights must not reuse old vectors");
+    }
+
     #[cfg(feature = "embeddings")]
     #[test]
     fn embedding_cache_digest_rejects_producer_and_vector_tampering() {
@@ -6237,7 +6426,7 @@ mod tests {
             produced.producers,
             EmbeddingProducerSet::singleton(EmbeddingProducer::Metal)
         );
-        assert_eq!(stats.cpu_model_calls(), 1);
+        assert_eq!(stats.cpu_twin_requests(), 1);
         assert_eq!(stats.primary_forward_calls(), 1);
         assert_eq!(stats.cpu_forward_calls(), 0);
     }
@@ -6258,8 +6447,123 @@ mod tests {
             EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu)
         );
         assert_eq!(stats.primary_forward_calls(), 1);
-        assert_eq!(stats.cpu_model_calls(), 1);
+        assert_eq!(stats.cpu_twin_requests(), 1);
         assert_eq!(stats.cpu_forward_calls(), 1);
+    }
+
+    /// A runtime whose twin is ready to serve, so a batch that runs on the
+    /// primary did so because nothing asked for the twin, not because the twin
+    /// was missing. The two models return different vectors, so the output
+    /// names the model that ran.
+    #[cfg(feature = "embeddings")]
+    fn runtime_with_a_ready_twin(
+        primary_backend: GpuBackend,
+    ) -> (TestLocalRuntime, std::sync::Arc<TestLocalRuntimeStats>) {
+        let stats = std::sync::Arc::new(TestLocalRuntimeStats::default());
+        let runtime = TestLocalRuntime {
+            primary: TestLocalModel {
+                backend: primary_backend,
+                forward: TestLocalForward::Success(vec![1.0, 0.0]),
+            },
+            cpu: Some(TestLocalModel {
+                backend: GpuBackend::Cpu,
+                forward: TestLocalForward::Success(vec![0.0, 1.0]),
+            }),
+            cpu_model_error: None,
+            route: EmbedDispatchRoute::CpuTwin {
+                reason: REASON_ENV_FORCED,
+            },
+            stats: std::sync::Arc::clone(&stats),
+        };
+        (runtime, stats)
+    }
+
+    /// The two ways a batch reaches the CPU route: asked for it
+    /// (`KIN_EMBED_BACKEND=cpu`), or declined by the attention-area guard.
+    /// Returns the vectors each one came back with.
+    #[cfg(feature = "embeddings")]
+    fn run_both_cpu_bound_batches(runtime: &TestLocalRuntime) -> Vec<Vec<f32>> {
+        let forced = process_chunk_with_runtime(
+            runtime,
+            EmbedDispatchRoute::CpuTwin {
+                reason: REASON_ENV_FORCED,
+            },
+            &[vec![1u32]],
+            &[vec![1u32]],
+            &[0],
+            1,
+            2,
+        )
+        .expect("a CPU-routed batch embeds");
+        // Three sequences at the embedder's longest length, which is past the
+        // area the guard admits.
+        let longest = 2048;
+        assert!(
+            metal_hard_guard_rejection(3, longest).is_some(),
+            "control: this batch must trip the attention-area guard"
+        );
+        let guarded = process_chunk_with_runtime(
+            runtime,
+            EmbedDispatchRoute::PrimaryBatched {
+                reason: REASON_AUTO_BATCHED_DEFAULT,
+            },
+            &[vec![1u32], vec![1u32], vec![1u32]],
+            &[vec![1u32], vec![1u32], vec![1u32]],
+            &[0, 1, 2],
+            longest,
+            2,
+        )
+        .expect("a guarded batch embeds");
+        forced
+            .into_iter()
+            .chain(guarded)
+            .map(|(_, vector, producer)| {
+                assert_eq!(
+                    producer,
+                    EmbeddingProducer::Cpu,
+                    "both batches ran on a CPU"
+                );
+                vector
+            })
+            .collect()
+    }
+
+    /// A primary already on the CPU runs every CPU-bound batch itself and never
+    /// builds the twin, which would be a second full copy of the model on the
+    /// same device. This is what `KIN_EMBED_BACKEND=cpu` did on every CPU-only
+    /// host, and what the attention-area guard did on any of them.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_cpu_primary_runs_cpu_bound_batches_itself_and_never_builds_a_twin() {
+        let (runtime, stats) = runtime_with_a_ready_twin(GpuBackend::Cpu);
+        let vectors = run_both_cpu_bound_batches(&runtime);
+
+        assert!(
+            vectors.iter().all(|vector| vector == &vec![1.0, 0.0]),
+            "the CPU primary must run every batch: {vectors:?}"
+        );
+        assert_eq!(stats.cpu_twin_requests(), 0, "no twin may be built");
+        assert_eq!(stats.primary_forward_calls(), 2);
+        assert_eq!(stats.cpu_forward_calls(), 0);
+    }
+
+    /// The control: an accelerator primary still hands the same two batches to
+    /// the twin, which is what the twin is for.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn an_accelerator_primary_still_hands_cpu_bound_batches_to_its_twin() {
+        for primary in [GpuBackend::Metal, GpuBackend::Cuda] {
+            let (runtime, stats) = runtime_with_a_ready_twin(primary);
+            let vectors = run_both_cpu_bound_batches(&runtime);
+
+            assert!(
+                vectors.iter().all(|vector| vector == &vec![0.0, 1.0]),
+                "the twin must run every batch beside a {primary:?} primary: {vectors:?}"
+            );
+            assert_eq!(stats.cpu_twin_requests(), 2);
+            assert_eq!(stats.primary_forward_calls(), 0);
+            assert_eq!(stats.cpu_forward_calls(), 2);
+        }
     }
 
     #[cfg(feature = "embeddings")]
@@ -6295,7 +6599,7 @@ mod tests {
             "a failed local forward must not populate disk or memory cache"
         );
         assert_eq!(stats.primary_forward_calls(), 1);
-        assert_eq!(stats.cpu_model_calls(), 0);
+        assert_eq!(stats.cpu_twin_requests(), 0);
         assert_eq!(stats.cpu_forward_calls(), 0);
     }
 
@@ -6414,7 +6718,7 @@ mod tests {
         expected.insert(EmbeddingProducer::Metal);
         assert_eq!(produced.producers, expected);
         assert_eq!(stats.primary_forward_calls(), 1);
-        assert_eq!(stats.cpu_model_calls(), 1);
+        assert_eq!(stats.cpu_twin_requests(), 1);
         assert_eq!(stats.cpu_forward_calls(), 1);
     }
 
@@ -6597,6 +6901,7 @@ mod tests {
             backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(endpoint, "", "")),
             dimensions: 2,
             cache: Some(cache),
+            runtime: None,
         };
         let texts = vec!["remote-result".to_string()];
 
@@ -6628,6 +6933,7 @@ mod tests {
             backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(endpoint, "", "")),
             dimensions: 2,
             cache: Some(cache),
+            runtime: None,
         };
 
         let error = embedder
@@ -6648,6 +6954,7 @@ mod tests {
             backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder("", "")),
             dimensions: 2,
             cache: None,
+            runtime: None,
         };
         let texts = vec!["alpha".to_string(), "beta".to_string()];
 
@@ -6668,6 +6975,7 @@ mod tests {
             )),
             dimensions: 2,
             cache: None,
+            runtime: None,
         };
         let texts = vec!["alpha".to_string(), "beta".to_string()];
 

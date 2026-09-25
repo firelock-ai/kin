@@ -4,11 +4,13 @@
 pub mod authority;
 pub mod authority_frame;
 pub mod backend;
+pub mod binding_history;
 pub(crate) mod body_walk;
 pub(crate) mod canonical_hash;
 pub mod change_map;
 pub(crate) mod change_validation;
 pub mod delta;
+pub mod derivation_ledger;
 pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
@@ -25,6 +27,11 @@ pub(crate) use mmap::open_regular_nofollow;
 #[cfg(feature = "embeddings")]
 pub(crate) use mmap::read_regular_bounded;
 pub mod repository;
+mod session_publication;
+pub use session_publication::{
+    PreparedSessionPublication, SessionPublicationBinding, SessionPublicationLocator,
+    MAX_SESSION_PUBLICATION_BYTES,
+};
 mod snapshot;
 #[cfg(feature = "sql")]
 pub mod sql;
@@ -48,6 +55,10 @@ pub use backend::{
 pub use change_map::{ChangeMap, ChangeMapInner};
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
+};
+pub use derivation_ledger::{
+    DerivationPayment, OwedDerivation, OwedDerivationCause, OwedDerivationLedger,
+    OwedDerivationUpdate, RederivationPayment,
 };
 pub use format::{
     AuthorityEnvelopeSnapshot, CompactionStats, GraphSnapshot, MaterializedGraphRefusal,

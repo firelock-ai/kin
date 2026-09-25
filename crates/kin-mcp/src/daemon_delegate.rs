@@ -186,37 +186,72 @@ impl DelegateGap {
         }
     }
 
-    /// What a caller is told, and what it can do about it.
-    fn message(&self, tool: &str) -> String {
+    /// What a caller is told, and what it can do about it. `init_served` says
+    /// whether this connection serves `kin_init`.
+    fn message(&self, tool: &str, init_served: bool) -> String {
+        self.message_spelled(tool, crate::first_contact::Spelling::here(), init_served)
+    }
+
+    /// [`DelegateGap::message`] with the reader's command spelling given.
+    ///
+    /// Every remedy names a step that works for the reader: `kin_init` where
+    /// this connection serves it, which only a profile that writes does, and a
+    /// `kin` command spelled so it runs where the reader is, as the `npx` form
+    /// of this release when no `kin` is on the server's PATH. A registry
+    /// install runs Kin through `npx`, and "run `kin init .`" named a command
+    /// that user did not have.
+    fn message_spelled(
+        &self,
+        tool: &str,
+        spelling: crate::first_contact::Spelling,
+        init_served: bool,
+    ) -> String {
+        use crate::first_contact::kin_command;
         match self {
             Self::NoRepository { working_dir } => format!(
                 "kin-mcp cannot answer '{tool}': {} is not a Kin repository, and neither is any \
-                 directory above it, so there is no graph to answer from. Run `kin init .` in the \
-                 repository you want served, or point this client's workspace roots at one. This \
+                 directory above it, so there is no graph to answer from. To set it up, {}. This \
                  server re-resolves its repository and daemon on every tool call, so the first \
-                 call after `kin init` finishes is answered; you do not need to restart the MCP \
+                 call after that finishes is answered; you do not need to restart the MCP \
                  server, and a caller could not.",
-                working_dir.display()
+                working_dir.display(),
+                if init_served {
+                    format!(
+                        "call kin_init, which sets up the client's workspace folder, or run {} in \
+                         that folder",
+                        kin_command("init .", spelling)
+                    )
+                } else {
+                    format!("run {} in that folder", kin_command("init .", spelling))
+                }
             ),
             Self::DaemonNotRunning { repo, retry_in } => format!(
                 "kin-mcp cannot answer '{tool}': {} is a Kin repository, but no daemon is serving \
                  it right now. That is the same probe `kin doctor` reports its daemon-reachability \
-                 verdict from, and it starts nothing. Run any `kin` command in that repository, \
-                 `kin status` for instance, to start a daemon. This server re-resolves its \
-                 delegate on the next tool call (at most {}s from now), so retry once a daemon is \
-                 up; restarting the MCP server is not required.",
+                 verdict from, and it starts nothing. Run {} in that repository to start a \
+                 daemon. This server re-resolves its delegate on the next tool call (at most {}s \
+                 from now), so retry once a daemon is up; restarting the MCP server is not \
+                 required.",
                 repo.display(),
+                kin_command("status", spelling),
                 retry_in.as_secs()
             ),
             Self::StartupPredatesRepository { repo, retry_in } => format!(
                 "kin-mcp cannot answer '{tool}': this server started before {} was a Kin \
                  repository, so it bound no daemon at startup, and no daemon is serving that \
                  repository yet. The binding is not one-shot: this server re-resolves it on the \
-                 next tool call (at most {}s from now), so retry once a daemon is up, which any \
-                 `kin` command in that repository starts. Do not restart the MCP server; a caller \
-                 cannot, and it is not what is wrong.",
+                 next tool call (at most {}s from now), so retry once a daemon is up; {}. Do \
+                 not restart the MCP server; a caller cannot, and it is not what is wrong.",
                 repo.display(),
-                retry_in.as_secs()
+                retry_in.as_secs(),
+                if init_served {
+                    format!(
+                        "calling kin_init on that folder starts one, and so does {} there",
+                        kin_command("status", spelling)
+                    )
+                } else {
+                    format!("{} there starts one", kin_command("status", spelling))
+                }
             ),
         }
     }
@@ -260,7 +295,7 @@ pub(crate) struct RealDelegateProbe;
 
 impl DelegateProbe for RealDelegateProbe {
     fn working_dir(&self) -> std::path::PathBuf {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        working_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
     }
 
     fn repository(&self) -> Option<std::path::PathBuf> {
@@ -976,7 +1011,48 @@ fn resolve_daemon_auth_token(env_token: Option<String>, kin_dir: Option<&Path>) 
 /// while the delegate probe said no repository was here, so one response
 /// described two repositories.
 fn discover_kin_dir() -> Option<std::path::PathBuf> {
-    discover_kin_dir_from(&std::env::current_dir().ok()?)
+    discover_kin_dir_from(&working_dir()?)
+}
+
+/// The directory this server looks for its repository from: the process
+/// working directory, or in a test the repository [`TestWorkingDir`] names.
+fn working_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_WORKING_DIR.with(|slot| slot.borrow().clone()) {
+        return Some(dir);
+    }
+    std::env::current_dir().ok()
+}
+
+// The process working directory is shared by every test thread in one binary,
+// and some tests move it into repositories of their own, so a test that needs
+// this module to find a repository names it here rather than relying on it.
+#[cfg(test)]
+thread_local! {
+    static TEST_WORKING_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes this thread's repository lookups start from `dir` until it drops.
+///
+/// Thread-scoped, so it binds a `#[tokio::test]` body, which runs on its own
+/// thread, without reaching any other test.
+#[cfg(test)]
+pub(crate) struct TestWorkingDir;
+
+#[cfg(test)]
+impl TestWorkingDir {
+    pub(crate) fn enter(dir: &Path) -> Self {
+        TEST_WORKING_DIR.with(|slot| *slot.borrow_mut() = Some(dir.to_path_buf()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestWorkingDir {
+    fn drop(&mut self) {
+        TEST_WORKING_DIR.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 /// [`discover_kin_dir`] from an explicit start, so the rule is testable without
@@ -1580,6 +1656,12 @@ async fn await_revived_daemon(
                         "MCP revival: daemon is ready but supervisor registration failed"
                     );
                 }
+                // The call that revived this daemon is about to be answered by
+                // it, and the daemon may still owe tracked files the working
+                // copy changed while no daemon watched. Its answers say so
+                // until they land; waiting the moment it takes to land them
+                // makes the first answer current instead of qualified.
+                await_revived_catch_up(&probe, &new_base, deadline).await;
                 // Route all subsequent delegate calls at the revived daemon.
                 if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
                     *guard = Some(new_base.clone());
@@ -1604,6 +1686,49 @@ async fn await_revived_daemon(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(still_starting_message(port, patience, answered_readiness));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The most a revival waits for the daemon it started to admit the tracked
+/// files the working copy changed while no daemon watched.
+///
+/// The same bound the CLI's own start waits under, for the same reason: a
+/// catch-up over a handful of edited files is one ordinary admission, and past
+/// this the call is answered anyway, qualified by what is still owed.
+const REVIVAL_CATCH_UP_PATIENCE: Duration = Duration::from_secs(30);
+
+/// Whether one `/health` body says its daemon still owes tracked files the
+/// working copy changed while no daemon watched, and is still able to take
+/// them. A daemon whose admissions are failing is not going to clear this by
+/// waiting, so it does not count as owing.
+fn revived_daemon_owes_catch_up(health: &serde_json::Value) -> bool {
+    let reconcile = &health["reconcile"];
+    let owed = reconcile["changed_path_count"].as_u64().unwrap_or(0);
+    let refusing = reconcile["admission_failure_streak"].as_u64().unwrap_or(0) > 0;
+    owed > 0 && !refusing
+}
+
+/// Wait, bounded, for a just-revived daemon to admit what it owes the working
+/// copy. Returns early on anything this wait cannot learn from, because the
+/// answer that follows states the gap either way.
+async fn await_revived_catch_up(
+    probe: &reqwest::Client,
+    base: &str,
+    deadline: tokio::time::Instant,
+) {
+    let bound = deadline.min(tokio::time::Instant::now() + REVIVAL_CATCH_UP_PATIENCE);
+    loop {
+        let owes = match probe.get(format!("{base}/health")).send().await {
+            Ok(response) => response
+                .json::<serde_json::Value>()
+                .await
+                .is_ok_and(|health| revived_daemon_owes_catch_up(&health)),
+            Err(_) => false,
+        };
+        if !owes || tokio::time::Instant::now() >= bound {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2315,10 +2440,11 @@ pub(crate) fn parse_graph_status_report(
 /// cooldown replays that verdict.
 pub async fn daemon_unavailable_tool_result(
     name: &str,
+    init_served: bool,
 ) -> (ToolCallResult, crate::envelope::Envelope) {
     match resolve_delegate().await {
         DelegateResolution::Gap(gap) => (
-            ToolCallResult::error(gap.message(name)),
+            ToolCallResult::error(gap.message(name, init_served)),
             envelope_for_gap(&gap),
         ),
         // A delegate resolved between the forwarding attempt and this message,
@@ -2587,7 +2713,16 @@ pub async fn forward_check_traffic(
         let Some(base) = resolved_daemon_base_url().await else {
             return Ok(None);
         };
-        let encoded = scope.replace(':', "%3A");
+        // A scope is one route segment, including literal slashes, percent
+        // signs and URL delimiters. Encode it independently of the endpoint
+        // so each retry still uses the base supplied by the revival wrapper.
+        let mut scope_url =
+            reqwest::Url::parse("http://localhost/").expect("static HTTP URL is valid");
+        scope_url
+            .path_segments_mut()
+            .expect("HTTP URL supports path segments")
+            .push(scope);
+        let encoded = scope_url.path().trim_start_matches('/');
         let value = daemon_json_request("check traffic", &base, |client, base| {
             with_auth(client.get(format!("{base}/traffic/{encoded}")))
         })
@@ -2603,6 +2738,23 @@ pub async fn forward_check_traffic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A revival waits only on a daemon that owes tracked files and can still
+    /// take them. One whose admissions are failing, one that owes nothing, and
+    /// a body from a daemon too old to report the count are all answered now.
+    #[test]
+    fn a_revival_waits_only_on_a_catch_up_that_can_land() {
+        let owes = serde_json::json!({ "reconcile": { "changed_path_count": 2 } });
+        assert!(revived_daemon_owes_catch_up(&owes));
+        let refusing = serde_json::json!({
+            "reconcile": { "changed_path_count": 2, "admission_failure_streak": 1 }
+        });
+        assert!(!revived_daemon_owes_catch_up(&refusing));
+        let settled = serde_json::json!({ "reconcile": { "changed_path_count": 0 } });
+        assert!(!revived_daemon_owes_catch_up(&settled));
+        let older = serde_json::json!({ "reconcile": {} });
+        assert!(!revived_daemon_owes_catch_up(&older));
+    }
 
     /// Two patiences, because one reading cannot tell a derived number from a
     /// literal that happens to match it.
@@ -3315,12 +3467,53 @@ mod tests {
     // sockets, so reqwest's own error classification is exercised rather than
     // assumed. No daemon process is ever spawned.
 
-    /// A loopback URL whose port is closed: what an exited daemon leaves behind.
-    async fn exited_daemon_url() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}")
+    /// A real refused-connection endpoint whose port stays owned for the test.
+    /// Dropping a listener and keeping only its URL would let another parallel
+    /// fixture bind that port and answer the request meant to fail.
+    struct RefusingEndpoint {
+        _socket: tokio::net::TcpSocket,
+        url: String,
+    }
+
+    impl RefusingEndpoint {
+        fn new() -> Self {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            // Do not enable address reuse or listen: binding reserves the port,
+            // while the absence of a listener makes actual connections fail.
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let url = format!("http://{}", socket.local_addr().unwrap());
+            Self {
+                _socket: socket,
+                url,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusing_endpoint_keeps_its_port_reserved() {
+        let endpoint = RefusingEndpoint::new();
+        let addr: std::net::SocketAddr = endpoint
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let replacement = tokio::net::TcpListener::bind(addr).await;
+        assert!(
+            replacement.is_err(),
+            "another fixture must not be able to answer at the refusing endpoint"
+        );
+        let err = post_session(&probe_client(), &endpoint.url, Duration::from_secs(3))
+            .await
+            .expect_err("a bound socket without a listener must refuse the request");
+        assert!(
+            matches!(err, DaemonCallError::ConnectionLost(_)),
+            "the reserved endpoint must exercise reqwest's connection-loss class, got {err:?}"
+        );
+        assert!(
+            !daemon_is_provably_alive(&endpoint.url).await,
+            "port ownership alone must not be mistaken for HTTP proof of life"
+        );
     }
 
     /// Minimal HTTP responder answering every request with `200 OK` and `body`.
@@ -3756,13 +3949,13 @@ mod tests {
     /// error and every later one did too, for the life of the agent process.
     #[tokio::test]
     async fn session_forward_survives_daemon_exit_by_reviving() {
-        let dead = exited_daemon_url().await;
+        let dead = RefusingEndpoint::new();
         let (revived, revived_handle) = stub_daemon(r#"{"session_id":"s-1"}"#).await;
         let reviver = FakeReviver::new(Ok(revived.clone()));
         let client = probe_client();
 
         let value: serde_json::Value =
-            attempt_with_revival("session start", &dead, &reviver, |base, patience| {
+            attempt_with_revival("session start", &dead.url, &reviver, |base, patience| {
                 let client = client.clone();
                 async move { post_session(&client, &base, patience).await }
             })
@@ -3801,11 +3994,11 @@ mod tests {
     /// "daemon exited" class rather than a generic delegate failure.
     #[tokio::test]
     async fn unrecoverable_respawn_surfaces_the_daemon_exited_class() {
-        let dead = exited_daemon_url().await;
+        let dead = RefusingEndpoint::new();
         let reviver = FakeReviver::new(Err("kin-daemon binary not found".to_string()));
         let client = probe_client();
 
-        let err = attempt_with_revival("session start", &dead, &reviver, |base, patience| {
+        let err = attempt_with_revival("session start", &dead.url, &reviver, |base, patience| {
             let client = client.clone();
             async move { post_session(&client, &base, patience).await }
         })
@@ -3983,8 +4176,73 @@ mod tests {
     /// Every forward now reaches revival, so a dead daemon can be observed by
     /// several calls at once. The first caller's daemon must be reused rather
     /// than each caller starting its own and losing the repo-lock race.
+    ///
+    /// The assertion runs in its own test process. It reads two pieces of
+    /// process-wide state that other tests in this binary write: `KIN_NO_DAEMON`,
+    /// which revival checks first, and the daemon URL override, which the stdio
+    /// server clears whenever workspace roots re-bind. Run beside them, a write
+    /// between this test's own set and its read refused the reuse it checks.
+    #[test]
+    fn revival_reuses_a_daemon_another_caller_already_started() {
+        use std::io::Read;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                text
+            })
+        }
+        // An empty working directory: a child that somehow missed the override
+        // would discover no repository there, so it could start nothing.
+        let cwd = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_delegate::tests::revival_reuses_a_daemon_another_caller_already_started_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .current_dir(cwd.path())
+            .env_remove("KIN_NO_DAEMON")
+            .env("REVIVAL_REUSE_TEST_CHILD", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = drain(child.stdout.take().unwrap());
+        let stderr = drain(child.stderr.take().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                // Killed and reaped, so a hung child never outlives the test.
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (stdout, stderr) = (stdout.join().unwrap(), stderr.join().unwrap());
+        let status = status.unwrap_or_else(|| {
+            panic!("the child ran past its 60 second deadline and was killed\n{stdout}\n{stderr}")
+        });
+        assert!(
+            status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{stderr}"
+        );
+    }
+
     #[tokio::test]
-    async fn revival_reuses_a_daemon_another_caller_already_started() {
+    #[ignore = "subprocess body invoked by revival_reuses_a_daemon_another_caller_already_started"]
+    async fn revival_reuses_a_daemon_another_caller_already_started_child() {
+        assert_eq!(
+            std::env::var("REVIVAL_REUSE_TEST_CHILD").as_deref(),
+            Ok("1")
+        );
         let (already_revived, handle) = stub_daemon(r#"{"status":"ok"}"#).await;
         if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
             *guard = Some(already_revived.clone());
@@ -4232,6 +4490,144 @@ mod tests {
 
     // ── Scope request-building (forwarded session/intent tools) ──────────────
 
+    const TRAFFIC_SCOPE_CASES: &[&str] = &[
+        "entity:00112233-4455-6677-8899-aabbccddeeff",
+        "contract:00112233-4455-6677-8899-aabbccddeeff",
+        "file:src/lib.rs",
+        "file:question?.rs",
+        "file:fragment#.rs",
+        "file:percent%25.rs",
+        "file:space name.rs",
+        "file:src/all ?#%25.rs",
+    ];
+
+    /// Decode once, as the daemon's single-segment route extractor does. A
+    /// literal slash or query separator has already failed route selection.
+    fn decode_traffic_scope_segment(segment: &str) -> Option<String> {
+        let mut decoded = Vec::new();
+        let bytes = segment.as_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if bytes[offset] == b'%' {
+                let encoded = bytes.get(offset + 1..offset + 3)?;
+                decoded.extend(hex::decode(encoded).ok()?);
+                offset += 3;
+            } else {
+                decoded.push(bytes[offset]);
+                offset += 1;
+            }
+        }
+        String::from_utf8(decoded).ok()
+    }
+
+    /// Run the actual delegate in its own test process: setting its daemon URL
+    /// must not redirect unrelated tests sharing this process. The parent owns
+    /// the listener until the child has finished and aborts it even on failure.
+    #[tokio::test]
+    async fn traffic_scope_forwarding_preserves_one_decoded_path_segment() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct ServerGuard(tokio::task::JoinHandle<()>);
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+        let _server = ServerGuard(tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let Ok(Ok(size)) =
+                        tokio::time::timeout(Duration::from_secs(3), socket.read(&mut chunk)).await
+                    else {
+                        return;
+                    };
+                    if size == 0 || request.len() + size > 8192 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..size]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let scope = target
+                    .strip_prefix("/traffic/")
+                    .filter(|segment| !segment.is_empty() && !segment.contains(['/', '?']))
+                    .and_then(decode_traffic_scope_segment);
+                let status = if scope.is_some() { 200 } else { 404 };
+                let body =
+                    serde_json::json!({ "scope": scope, "request_target": target }).to_string();
+                observed.send(scope).unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status} Scope\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = socket.shutdown().await;
+            }
+        }));
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon_delegate::tests::traffic_scope_forwarding_child",
+                    "--nocapture",
+                ])
+                .env("TRAFFIC_SCOPE_FORWARDING_TEST_CHILD", "1")
+                .env("KIN_DAEMON_URL", base)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("traffic delegate child exceeded its test deadline")
+        .expect("start isolated traffic delegate child");
+        assert!(
+            output.status.success(),
+            "traffic forwarding child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut decoded = Vec::new();
+        while let Ok(scope) = observations.try_recv() {
+            decoded.push(scope.expect("each request must match the single-segment route"));
+        }
+        assert_eq!(decoded, TRAFFIC_SCOPE_CASES);
+    }
+
+    /// Only the parent transport test supplies the isolated endpoint. A normal
+    /// suite invocation does nothing here and never discovers a real daemon.
+    #[tokio::test]
+    async fn traffic_scope_forwarding_child() {
+        if std::env::var("TRAFFIC_SCOPE_FORWARDING_TEST_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        for scope in TRAFFIC_SCOPE_CASES {
+            let result = forward_check_traffic(&[scope.to_string()])
+                .await
+                .unwrap_or_else(|error| panic!("scope {scope:?} failed forwarding: {error}"))
+                .expect("the test supplies a daemon endpoint");
+            assert_eq!(result["scope_count"], 1);
+            assert_eq!(result["reports"][0]["scope"], *scope, "{result}");
+        }
+    }
+
     #[test]
     fn scope_to_string_passes_a_spelled_string_through() {
         for spelled in [
@@ -4367,16 +4763,15 @@ mod tests {
         let err = validate_stage_arguments(&args).unwrap_err();
         for expected in [
             "each element of `operations` is one of",
-            "an entity source edit",
-            "`verb` (string, REQUIRED)",
-            "`target` (string, REQUIRED)",
-            "`description` (string, REQUIRED)",
-            "`body` (string, optional)",
-            "`payload` (object, optional)",
-            "`destination` (string, optional)",
-            "a rewritten source file",
-            "create/add/upsert/insert, update/modify, replace/overwrite, delete/remove, or \
-             rename/move",
+            "an anchored entity patch",
+            "EntitySourcePatch",
+            "a guarded entity source edit",
+            "EntitySourceBase",
+            "source_base_required",
+            "a structured entity or relation mutation",
+            "Every operation requires string fields `verb`, `target`, and `description`",
+            "The semantic optional fields are `payload` and `body`",
+            "`destination` is recognized only for legacy conversion decoding and is refused on agent routes",
         ] {
             assert!(err.contains(expected), "refusal omits {expected:?}: {err}");
         }
@@ -4400,7 +4795,10 @@ mod tests {
         );
         let err = validate_stage_arguments(&args).unwrap_err();
         assert!(err.contains("'new_body'"), "{err}");
-        assert!(err.contains("New source text goes in `body`"), "{err}");
+        assert!(
+            err.contains("Full replacement text goes in `body`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4948,7 +5346,56 @@ mod tests {
     // ── The three situations one string used to cover ─────────────────────
 
     fn gap_text(gap: &DelegateGap) -> String {
-        gap.message("semantic_locate")
+        gap.message("semantic_locate", false)
+    }
+
+    /// A reader with no `kin` on PATH, which is every registry install, is
+    /// handed commands that run for them: the MCP tool first where the
+    /// connection serves it, and the `npx` form of this release for the shell.
+    /// None of the three gaps names a bare `kin` command to that reader, and a
+    /// connection that does not serve `kin_init` is never told to call it.
+    #[test]
+    fn a_reader_without_kin_on_path_is_handed_commands_that_run() {
+        use crate::first_contact::Spelling;
+        let gaps = [
+            DelegateGap::NoRepository {
+                working_dir: std::path::PathBuf::from("/work/app"),
+            },
+            DelegateGap::DaemonNotRunning {
+                repo: std::path::PathBuf::from("/work/app"),
+                retry_in: Duration::from_secs(4),
+            },
+            DelegateGap::StartupPredatesRepository {
+                repo: std::path::PathBuf::from("/work/app"),
+                retry_in: Duration::from_secs(4),
+            },
+        ];
+        let npx = format!("`npx -y @kinlab/kin@{} ", env!("CARGO_PKG_VERSION"));
+        for init_served in [true, false] {
+            for gap in &gaps {
+                let text = gap.message_spelled("semantic_locate", Spelling::Npx, init_served);
+                assert!(text.contains(&npx), "{text}");
+                assert!(
+                    !text.contains("`kin init") && !text.contains("`kin status"),
+                    "{text}"
+                );
+                assert_eq!(
+                    text.contains("kin_init"),
+                    init_served && !matches!(gap, DelegateGap::DaemonNotRunning { .. }),
+                    "{text}"
+                );
+            }
+        }
+        let no_repository = gaps[0].message_spelled("semantic_locate", Spelling::Npx, true);
+        assert!(no_repository.contains("call kin_init"), "{no_repository}");
+        assert!(no_repository.contains("init .`"), "{no_repository}");
+        let read_only = gaps[0].message_spelled("semantic_locate", Spelling::Npx, false);
+        assert!(
+            read_only.contains("run `npx -y @kinlab/kin@"),
+            "{read_only}"
+        );
+        let spelled_kin = gaps[0].message_spelled("semantic_locate", Spelling::Kin, false);
+        assert!(spelled_kin.contains("`kin init .`"), "{spelled_kin}");
     }
 
     #[test]
@@ -5306,26 +5753,20 @@ mod tests {
 
     /// FALSIFICATION, "a dead daemon is still recovered" direction.
     ///
-    /// A real daemon is killed — its listener is dropped, so the port refuses
-    /// connections exactly as an exited daemon's does — and the very next
-    /// forward must revive and succeed. Patience must not have cost the client
-    /// its recovery.
+    /// A real refused connection exercises the bounded patience ladder's
+    /// recovery path. This is a transport fixture, not an OS-daemon lifecycle
+    /// test; the healthy-socket control separately verifies direct success.
     #[tokio::test]
-    async fn a_proven_dead_daemon_is_still_revived_after_the_patience_change() {
-        let (dying, dying_handle) = stub_daemon(r#"{"session_id":"s-doomed"}"#).await;
+    async fn a_refusing_endpoint_is_still_revived_after_the_patience_change() {
+        let dead = RefusingEndpoint::new();
         let client = probe_client();
-        post_session(&client, &dying, Duration::from_secs(3))
-            .await
-            .expect("the daemon must be genuinely alive before it is killed");
-        dying_handle.abort();
-        await_refused(&dying).await;
 
         let (revived, revived_handle) = stub_daemon(r#"{"session_id":"s-revived"}"#).await;
         let reviver = FakeReviver::new(Ok(revived.clone()));
 
         let value: serde_json::Value = attempt_with_revival_within(
             "session start",
-            &dying,
+            &dead.url,
             &reviver,
             |base, patience| {
                 let client = client.clone();
@@ -5335,7 +5776,7 @@ mod tests {
             Duration::from_secs(10),
         )
         .await
-        .expect("a genuinely dead daemon must still be revived");
+        .expect("a refusing endpoint without proof of life must still be revived");
 
         assert_eq!(
             value["session_id"], "s-revived",
@@ -5351,13 +5792,13 @@ mod tests {
     /// told what is actually true rather than that the daemon exited.
     #[tokio::test]
     async fn a_daemon_proven_alive_is_never_replaced_by_a_doomed_respawn() {
-        let unreachable = exited_daemon_url().await;
-        let reviver = FakeReviver::with_a_live_daemon(Ok("http://127.0.0.1:1".to_string()));
+        let unreachable = RefusingEndpoint::new();
+        let reviver = FakeReviver::with_a_live_daemon(Err("revival must not run".to_string()));
         let client = probe_client();
 
         let err = attempt_with_revival_within::<serde_json::Value, _, _>(
             "session start",
-            &unreachable,
+            &unreachable.url,
             &reviver,
             |base, patience| {
                 let client = client.clone();
@@ -5416,23 +5857,6 @@ mod tests {
             "a daemon that answered 503 daemon_opening is listening, so it is alive"
         );
         handle.abort();
-    }
-
-    /// Block until nothing is listening at `base`, so a test that killed a stub
-    /// is asserting against a genuinely closed port rather than racing the
-    /// listener's teardown.
-    async fn await_refused(base: &str) {
-        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
-        for _ in 0..200 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the killed stub daemon never stopped accepting connections on {base}");
     }
 
     /// Serves `warming` warming refusals, then `body` with 200, per connection
@@ -5560,7 +5984,8 @@ mod tests {
             "an established connection with no reply is a timeout, got {slow:?}"
         );
 
-        let closed = post_session(&client, &exited_daemon_url().await, Duration::from_secs(3))
+        let endpoint = RefusingEndpoint::new();
+        let closed = post_session(&client, &endpoint.url, Duration::from_secs(3))
             .await
             .expect_err("a closed port must not answer");
         assert!(
@@ -5582,8 +6007,9 @@ mod tests {
         );
         handle.abort();
 
+        let endpoint = RefusingEndpoint::new();
         assert!(
-            !daemon_is_provably_alive(&exited_daemon_url().await).await,
+            !daemon_is_provably_alive(&endpoint.url).await,
             "a closed port offers no proof of life"
         );
     }

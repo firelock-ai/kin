@@ -229,6 +229,13 @@
               ],
               "minimum": 0
             },
+            "upgraded_under": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
             "reason": {
               "type": [
                 "string",
@@ -314,6 +321,29 @@
             "unadmitted_paths": {
               "type": "integer",
               "minimum": 0
+            },
+            "underived_paths": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "underived_sample": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "changed_paths": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "changed_sample": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "changed_unchecked": {
+              "type": "boolean"
             },
             "measured": {
               "type": "boolean"
@@ -580,6 +610,27 @@
     },
     "verdict": {
       "description": "Opaque optional JSON in canonical Envelope; shape validation alone does not certify answer authority."
+    },
+    "advice": {
+      "type": "string"
+    },
+    "repository": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "type": "string"
+        },
+        "client_root": {
+          "type": "string"
+        },
+        "warning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "additionalProperties": true
     }
   },
   "required": [

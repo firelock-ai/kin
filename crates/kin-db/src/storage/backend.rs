@@ -8,6 +8,11 @@
 //! `backend.load_snapshot()` / `backend.save_snapshot()` without knowing
 //! the underlying storage medium.
 
+mod session_publication;
+#[cfg(test)]
+pub(in crate::storage) use session_publication::PreparationFault;
+use session_publication::{SessionPublicationAcknowledgement, LOCAL_AUTHORITY_SESSION_VERSION};
+
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -404,6 +409,28 @@ enum LocalDirectoryBindKind {
 enum LocalRepositoryLockAccess {
     Exclusive,
     Shared,
+}
+
+/// How long an existing-authority acquisition waits for a repository lock
+/// another holder has.
+#[derive(Clone, Copy, Debug)]
+enum LockWait {
+    /// Until the holder releases it, however long that takes.
+    Block,
+    /// Not at all: a held lock refuses at once.
+    Try,
+    /// Retrying for at most this long, then refusing in words that say so.
+    Within(std::time::Duration),
+}
+
+/// How often a bounded acquisition retries a held repository lock.
+const EXISTING_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The refusal for a namespace that holds no authority to freeze.
+pub(crate) fn no_existing_authority_to_freeze(repo_id: &str) -> KinDbError {
+    KinDbError::StorageError(format!(
+        "repo {repo_id} has no existing local snapshot authority to freeze"
+    ))
 }
 
 #[cfg(test)]
@@ -2394,6 +2421,21 @@ pub(crate) fn load_recovered_repository_authority_streaming<B: StorageBackend + 
     )
 }
 
+/// Reopen a failed retained history handle without waiting for a lock the
+/// caller may already hold through an authority freeze.
+pub(crate) fn try_reopen_repository_authority_streaming<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+    expected_validator_version: u32,
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
+    recover_loaded_snapshot(
+        backend.try_load_recovery_state(repo_id)?,
+        repo_id,
+        Some(expected_validator_version),
+        HistoryDecode::Streamed(&mut |_change| Ok(())),
+    )
+}
+
 /// How recovery decodes a base, independently of complete-validation reuse.
 pub(crate) enum HistoryDecode<'v> {
     /// The whole body, change map included, as every open did before
@@ -2411,7 +2453,21 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
     expected_validator_version: Option<u32>,
     history: HistoryDecode<'_>,
 ) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
-    let (loaded, raw_deltas) = backend.load_recovery_state(repo_id)?;
+    recover_loaded_snapshot(
+        backend.load_recovery_state(repo_id)?,
+        repo_id,
+        expected_validator_version,
+        history,
+    )
+}
+
+fn recover_loaded_snapshot(
+    state: SnapshotRecoveryState,
+    repo_id: &str,
+    expected_validator_version: Option<u32>,
+    history: HistoryDecode<'_>,
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
+    let (loaded, raw_deltas) = state;
 
     let Some(authority) = loaded else {
         if raw_deltas.is_empty() {
@@ -3126,6 +3182,15 @@ pub trait StorageBackend: Send + Sync {
             .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
         let deltas = self.load_deltas_since(repo_id, since)?;
         Ok((authority, deltas))
+    }
+
+    /// Read a coherent recovery view without waiting for an authority lock.
+    /// Retained-history readers may themselves hold a freeze. Backends must
+    /// opt into a nonblocking implementation rather than inherit a lock cycle.
+    fn try_load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+        Err(KinDbError::StorageError(format!(
+            "repo {repo_id}: nonblocking history recovery is unsupported by this backend"
+        )))
     }
 
     /// Load a repo's graph snapshot.
@@ -4364,16 +4429,36 @@ pub(crate) struct LocalAuthorityFreezeLock {
     /// The head these bytes are, named by digests that were checked against
     /// the bytes under this lock hold.
     identity: DurableAuthorityIdentity,
+    // Preparation acknowledgement changes this record without changing graph
+    // roots. Preserve the fact read under this exact retained backend lock.
+    active_session_publication: bool,
     lock: LocalRepositoryLock,
 }
 
 impl LocalAuthorityFreezeLock {
+    pub(crate) fn ensure_no_active_session_publication(&self) -> Result<(), KinDbError> {
+        if self.active_session_publication {
+            return Err(KinDbError::StorageError(
+                "active prepared session publication requires exact prepared recovery".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn authority(&self) -> &SnapshotAuthority {
         &self.authority
     }
 
     pub(crate) fn frames(&self) -> &[PersistedDelta] {
         &self.frames
+    }
+
+    /// The captured head and acknowledged frames, with the lock released.
+    ///
+    /// Both were digest-checked against the authority record under this hold,
+    /// so a reader that only decodes them needs the lock no longer.
+    pub(crate) fn into_captured(self) -> (SnapshotAuthority, Vec<PersistedDelta>) {
+        (self.authority, self.frames)
     }
 
     pub(crate) fn identity(&self) -> &DurableAuthorityIdentity {
@@ -4479,6 +4564,8 @@ struct LocalAuthorityRecord {
     /// field existed and on every authority that advanced through a delta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     history_validation: Option<HistoryValidationProof>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session_publications: Vec<SessionPublicationAcknowledgement>,
 }
 
 impl LocalFileBackend {
@@ -6144,6 +6231,49 @@ impl LocalFileBackend {
         })
     }
 
+    fn load_recovery_state_under_lock(
+        &self,
+        repo_id: &str,
+        lock: &LocalRepositoryLock,
+    ) -> Result<SnapshotRecoveryState, KinDbError> {
+        let authority = self.load_authority_unlocked(&lock.namespace)?;
+        let authority_record = self.read_authority_record_raw_unlocked(&lock.namespace)?;
+        match (authority.as_ref(), authority_record.as_ref()) {
+            (Some(authority), Some(record))
+                if authority.snapshot_generation == record.snapshot_generation
+                    && authority.head_generation == record.head_generation
+                    && Self::snapshot_digest(&authority.snapshot_bytes)
+                        == record.snapshot_sha256 => {}
+            (None, None) => {}
+            _ => {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} snapshot authority changed while loading recovery state"
+                )));
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.recovery_after_authority_hook.lock().take() {
+            hook();
+        }
+        if let Some(record) = authority_record.as_ref() {
+            self.finalize_retired_quarantines_unlocked(&lock.namespace, record)?;
+        }
+        let all_deltas = self.load_deltas_since_unlocked(&lock.namespace, GENERATION_INIT)?;
+        if let Some(record) = authority_record.as_ref() {
+            Self::validate_loaded_residual_deltas(repo_id, record, &all_deltas)?;
+            Self::validate_loaded_acknowledged_deltas(repo_id, record, &all_deltas)?;
+        }
+        let since = authority
+            .as_ref()
+            .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
+        let deltas = all_deltas
+            .into_iter()
+            .filter(|(_, generation)| *generation > since)
+            .collect();
+        self.confirm_repository_visible(&lock.namespace)?;
+        Ok((authority, deltas))
+    }
+
     fn acquire_existing_lock(&self, repo_id: &str) -> Result<LocalRepositoryLock, KinDbError> {
         self.acquire_existing_lock_with_access(repo_id, LocalRepositoryLockAccess::Exclusive)
     }
@@ -6166,6 +6296,15 @@ impl LocalFileBackend {
         &self,
         repo_id: &str,
         access: LocalRepositoryLockAccess,
+    ) -> Result<LocalRepositoryLock, KinDbError> {
+        self.acquire_existing_lock_with_policy(repo_id, access, LockWait::Block)
+    }
+
+    fn acquire_existing_lock_with_policy(
+        &self,
+        repo_id: &str,
+        access: LocalRepositoryLockAccess,
+        wait: LockWait,
     ) -> Result<LocalRepositoryLock, KinDbError> {
         let namespace = self
             .repository_capability(repo_id, false)?
@@ -6200,11 +6339,46 @@ impl LocalFileBackend {
         // methods that shadow this trait's, so an unqualified call would take
         // one lock through `std` and its exclusive counterpart, which `std`
         // does not provide under that name, through `fs2`.
-        let acquired = match access {
-            LocalRepositoryLockAccess::Exclusive => fs2::FileExt::lock_exclusive(&lock_target),
-            LocalRepositoryLockAccess::Shared => fs2::FileExt::lock_shared(&lock_target),
+        let try_once = || match access {
+            LocalRepositoryLockAccess::Exclusive => fs2::FileExt::try_lock_exclusive(&lock_target),
+            LocalRepositoryLockAccess::Shared => fs2::FileExt::try_lock_shared(&lock_target),
+        };
+        let contended = |error: &std::io::Error| error.kind() == fs2::lock_contended_error().kind();
+        let acquired = match wait {
+            LockWait::Block => match access {
+                LocalRepositoryLockAccess::Exclusive => fs2::FileExt::lock_exclusive(&lock_target),
+                LocalRepositoryLockAccess::Shared => fs2::FileExt::lock_shared(&lock_target),
+            },
+            LockWait::Try => try_once(),
+            LockWait::Within(limit) => {
+                let deadline = std::time::Instant::now() + limit;
+                loop {
+                    match try_once() {
+                        Err(error) if contended(&error) && std::time::Instant::now() < deadline => {
+                            std::thread::sleep(EXISTING_LOCK_RETRY_INTERVAL);
+                        }
+                        attempt => break attempt,
+                    }
+                }
+            }
         };
         acquired.map_err(|error| {
+            match wait {
+                LockWait::Try if contended(&error) => {
+                    return KinDbError::StorageError(format!(
+                        "repo {repo_id}: authority lock is busy during retained history recovery"
+                    ));
+                }
+                LockWait::Within(limit) if contended(&error) => {
+                    return KinDbError::StorageError(format!(
+                        "repo {repo_id}: another process held the repository authority lock for \
+                         the whole {} ms this read waits for it, so nothing was read. A daemon \
+                         holds that lock while it commits; try again once that work finishes",
+                        limit.as_millis()
+                    ));
+                }
+                _ => {}
+            }
             KinDbError::StorageError(format!(
                 "failed to acquire existing local repository authority lock {}: {error}",
                 lock_path.display()
@@ -6326,15 +6500,45 @@ impl LocalFileBackend {
         cleanup: bool,
     ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
         let lock = self.acquire_existing_lock(repo_id)?;
-        let (authority, record) = self
-            .load_authority_and_record_with_cleanup_unlocked(&lock.namespace, cleanup)?
-            .ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "repo {repo_id} has no existing local snapshot authority to freeze"
-                ))
-            })?;
+        self.freeze_locked_authority(repo_id, lock, cleanup)?
+            .ok_or_else(|| no_existing_authority_to_freeze(repo_id))
+    }
+
+    /// [`Self::freeze_existing_authority_read_only`], waiting at most `wait`
+    /// for a repository lock another process holds rather than until it is
+    /// free, and answering `None` for a namespace that holds no authority.
+    ///
+    /// Nothing is cleaned up or created: retired quarantined frames and
+    /// superseded snapshots stay where they are, and a candidate an
+    /// interrupted write left staged refuses rather than being confirmed.
+    pub(crate) fn freeze_existing_authority_read_only_within(
+        &self,
+        repo_id: &str,
+        wait: std::time::Duration,
+    ) -> Result<Option<LocalAuthorityFreezeLock>, KinDbError> {
+        let lock = self.acquire_existing_lock_with_policy(
+            repo_id,
+            LocalRepositoryLockAccess::Exclusive,
+            LockWait::Within(wait),
+        )?;
+        self.freeze_locked_authority(repo_id, lock, false)
+    }
+
+    /// The authority head and its acknowledged frames, read and digest-checked
+    /// under `lock`, or `None` when the namespace holds no authority.
+    fn freeze_locked_authority(
+        &self,
+        repo_id: &str,
+        lock: LocalRepositoryLock,
+        cleanup: bool,
+    ) -> Result<Option<LocalAuthorityFreezeLock>, KinDbError> {
+        let Some((authority, record)) =
+            self.load_authority_and_record_with_cleanup_unlocked(&lock.namespace, cleanup)?
+        else {
+            return Ok(None);
+        };
         let frames = if authority.snapshot_generation != authority.head_generation {
-            if record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION {
+            if !record.supports_frames() {
                 return Err(KinDbError::StorageError(format!(
                     "repo {repo_id} has incremental journal authority at generation {} above snapshot {}; repository freeze requires one complete full snapshot or an authority frame chain",
                     authority.head_generation, authority.snapshot_generation
@@ -6352,6 +6556,7 @@ impl LocalFileBackend {
         // this freeze keeps: the snapshot's by the authority load above, every
         // frame's by the capture beside it. A journal-free record acknowledges
         // no frame, which the record decoder already enforces.
+        let active_session_publication = record.active_session().is_some();
         let identity = DurableAuthorityIdentity {
             snapshot_generation: record.snapshot_generation,
             snapshot_sha256: record.snapshot_sha256,
@@ -6362,13 +6567,14 @@ impl LocalFileBackend {
                 .collect(),
         };
         self.confirm_existing_lock_visible(&lock.namespace)?;
-        Ok(LocalAuthorityFreezeLock {
+        Ok(Some(LocalAuthorityFreezeLock {
             repo_id: repo_id.to_string(),
             authority,
             frames,
             identity,
+            active_session_publication,
             lock,
-        })
+        }))
     }
 
     /// Remove the frames a full snapshot promotion retired, under a lock the
@@ -7177,9 +7383,7 @@ impl LocalFileBackend {
                 path.display()
             ))
         })?;
-        if record.version != LOCAL_AUTHORITY_VERSION
-            && record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION
-        {
+        if record.version != LOCAL_AUTHORITY_VERSION && !record.supports_frames() {
             return Err(KinDbError::StorageError(format!(
                 "unsupported local authority version {} in {}",
                 record.version,
@@ -7209,6 +7413,7 @@ impl LocalFileBackend {
             )));
         }
         Self::validate_delta_identities(&record)?;
+        record.validate_session_shape()?;
         Ok(record)
     }
 
@@ -7228,6 +7433,7 @@ impl LocalFileBackend {
         let Some(record) = record else {
             return Ok(None);
         };
+        self.validate_session_records_unlocked(namespace, &record)?;
         self.validate_acknowledged_deltas_unlocked(namespace, &record)?;
         self.validate_residual_deltas_unlocked(namespace, &record)?;
         Ok(Some(record))
@@ -7357,6 +7563,9 @@ impl LocalFileBackend {
         let repo_id = &namespace.repo_id;
         let Some(record) = self.read_authority_record_with_cleanup_unlocked(namespace, cleanup)?
         else {
+            if namespace.surface("session-publications", false)?.is_some() {
+                return Err(KinDbError::StorageError("prepared session evidence exists without required local authority; recovery is fail-closed".into()));
+            }
             let quarantines = match namespace.surface(Self::deltas_surface_name(), false)? {
                 Some(deltas) => {
                     let quarantines =
@@ -7423,6 +7632,12 @@ impl LocalFileBackend {
         let bytes = serde_json::to_vec(record).map_err(|error| {
             KinDbError::StorageError(format!("failed to encode local authority: {error}"))
         })?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(KinDbError::StorageError(
+                "local authority exceeds its existing 1 MiB record limit".into(),
+            ));
+        }
+        record.validate_session_shape()?;
         let relative = Self::authority_relative_path();
         let path = namespace.display(relative);
         match mmap::atomic_write_bytes_no_magic_outcome_at(
@@ -7528,13 +7743,36 @@ impl LocalFileBackend {
     fn save_snapshot_unlocked(
         &self,
         namespace: &LocalRepositoryCapability,
+        source: SnapshotSource<'_>,
+        expected_gen: Generation,
+        history_validator_version: Option<u32>,
+    ) -> Result<Generation, KinDbError> {
+        self.save_snapshot_with_session_unlocked(
+            namespace,
+            source,
+            expected_gen,
+            history_validator_version,
+            None,
+        )
+    }
+
+    fn save_snapshot_with_session_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
         mut source: SnapshotSource<'_>,
         expected_gen: Generation,
         history_validator_version: Option<u32>,
+        session_authorization: Option<&str>,
     ) -> Result<Generation, KinDbError> {
         let repo_id = &namespace.repo_id;
         let current = self.load_authority_unlocked(namespace)?;
         let current_record = self.read_authority_record_raw_unlocked(namespace)?;
+        self.authorize_session_snapshot(
+            namespace,
+            current_record.as_ref(),
+            session_authorization,
+            expected_gen,
+        )?;
         match (current.as_ref(), current_record.as_ref()) {
             (Some(authority), Some(record))
                 if authority.snapshot_generation == record.snapshot_generation
@@ -7602,6 +7840,9 @@ impl LocalFileBackend {
                 }
                 return Ok(record.head_generation);
             }
+        }
+        if session_authorization.is_some() && current_gen != expected_gen {
+            return Err(KinDbError::SnapshotPersistenceIndeterminate("prepared operation already has durable authority; reopen and replay its original receipt".into()));
         }
         self.discard_stale_authority_frames_unlocked(namespace, current_record.as_ref())?;
         self.reject_unbound_staged_deltas_unlocked(namespace, current_record.as_ref())?;
@@ -7686,7 +7927,19 @@ impl LocalFileBackend {
         namespace.confirm_surface_visible(&snapshots)?;
 
         let record = LocalAuthorityRecord {
-            version: LOCAL_AUTHORITY_VERSION,
+            version: if current_record
+                .as_ref()
+                .is_some_and(|record| record.version == LOCAL_AUTHORITY_SESSION_VERSION)
+            {
+                LOCAL_AUTHORITY_SESSION_VERSION
+            } else {
+                LOCAL_AUTHORITY_VERSION
+            },
+            session_publications: Self::session_records_after_snapshot(
+                current_record.as_ref(),
+                session_authorization,
+                new_gen,
+            ),
             snapshot_generation: new_gen,
             head_generation: new_gen,
             snapshot_file: Self::snapshot_file_name(new_gen),
@@ -7822,9 +8075,8 @@ impl LocalFileBackend {
                 "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before authority frames"
             )));
         };
-        if record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION
-            && !record.acknowledged_deltas.is_empty()
-        {
+        record.refuse_active_session()?;
+        if !record.supports_frames() && !record.acknowledged_deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} journal carries incremental graph deltas; authority frames cannot extend it"
             )));
@@ -7898,7 +8150,9 @@ impl LocalFileBackend {
         if let Some(hook) = self.delta_before_authority_commit_hook.lock().take() {
             hook();
         }
-        record.version = LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION;
+        if record.version != LOCAL_AUTHORITY_SESSION_VERSION {
+            record.version = LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION;
+        }
         record
             .retired_deltas
             .retain(|identity| identity.generation != new_gen);
@@ -7942,17 +8196,35 @@ impl LocalFileBackend {
         expected_cursor: SnapshotCursor,
         history_validator_version: Option<u32>,
     ) -> Result<(SnapshotCursor, LocalAuthorityFreezeLock), KinDbError> {
+        self.save_snapshot_and_freeze_inner(
+            repo_id,
+            data,
+            expected_cursor,
+            history_validator_version,
+            None,
+        )
+    }
+
+    fn save_snapshot_and_freeze_inner(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
+        session_authorization: Option<&str>,
+    ) -> Result<(SnapshotCursor, LocalAuthorityFreezeLock), KinDbError> {
         let expected_gen = expected_cursor.backend_generation();
         let lock = if expected_gen == GENERATION_INIT {
             self.acquire_lock_for_initialization(repo_id)?
         } else {
             self.acquire_existing_lock(repo_id)?
         };
-        let generation = self.save_snapshot_unlocked(
+        let generation = self.save_snapshot_with_session_unlocked(
             &lock.namespace,
             SnapshotSource::Buffered(data),
             expected_gen,
             history_validator_version,
+            session_authorization,
         )?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let snapshot_sha256 = hex::encode(Sha256::digest(data));
@@ -7978,6 +8250,9 @@ impl LocalFileBackend {
                 authority,
                 frames: Vec::new(),
                 identity: DurableAuthorityIdentity::full_snapshot(generation, snapshot_sha256),
+                // Ordinary save refuses active preparation; a prepared save
+                // atomically completes its exact acknowledged operation.
+                active_session_publication: false,
                 lock,
             },
         ))
@@ -8618,42 +8893,19 @@ impl StorageBackend for LocalFileBackend {
         // Exclusive: this finalizes retired quarantines directly as well as
         // through the authority load.
         let lock = self.acquire_existing_lock(repo_id)?;
-        let authority = self.load_authority_unlocked(&lock.namespace)?;
-        let authority_record = self.read_authority_record_raw_unlocked(&lock.namespace)?;
-        match (authority.as_ref(), authority_record.as_ref()) {
-            (Some(authority), Some(record))
-                if authority.snapshot_generation == record.snapshot_generation
-                    && authority.head_generation == record.head_generation
-                    && Self::snapshot_digest(&authority.snapshot_bytes)
-                        == record.snapshot_sha256 => {}
-            (None, None) => {}
-            _ => {
-                return Err(KinDbError::StorageError(format!(
-                    "repo {repo_id} snapshot authority changed while loading recovery state"
-                )));
-            }
+        self.load_recovery_state_under_lock(repo_id, &lock)
+    }
+
+    fn try_load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok((None, Vec::new()));
         }
-        #[cfg(test)]
-        if let Some(hook) = self.recovery_after_authority_hook.lock().take() {
-            hook();
-        }
-        if let Some(record) = authority_record.as_ref() {
-            self.finalize_retired_quarantines_unlocked(&lock.namespace, record)?;
-        }
-        let all_deltas = self.load_deltas_since_unlocked(&lock.namespace, GENERATION_INIT)?;
-        if let Some(record) = authority_record.as_ref() {
-            Self::validate_loaded_residual_deltas(repo_id, record, &all_deltas)?;
-            Self::validate_loaded_acknowledged_deltas(repo_id, record, &all_deltas)?;
-        }
-        let since = authority
-            .as_ref()
-            .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
-        let deltas = all_deltas
-            .into_iter()
-            .filter(|(_, generation)| *generation > since)
-            .collect();
-        self.confirm_repository_visible(&lock.namespace)?;
-        Ok((authority, deltas))
+        let lock = self.acquire_existing_lock_with_policy(
+            repo_id,
+            LocalRepositoryLockAccess::Exclusive,
+            LockWait::Try,
+        )?;
+        self.load_recovery_state_under_lock(repo_id, &lock)
     }
 
     fn save_snapshot(
@@ -8812,7 +9064,7 @@ impl StorageBackend for LocalFileBackend {
         };
         // Bind only to the exact durable head that was validated: the same
         // base, the same acknowledged chain, at the same head generation.
-        if record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION
+        if !record.supports_frames()
             || record.head_generation != head_generation
             || record.snapshot_sha256 != snapshot_sha256
             || Self::record_journal_sha256(&record)? != journal_sha256
@@ -8852,7 +9104,7 @@ impl StorageBackend for LocalFileBackend {
                 "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before deltas"
             )));
         };
-        if record.version == LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION {
+        if record.supports_frames() {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} journal carries repository authority frames; incremental graph deltas cannot extend it"
             )));
@@ -14408,7 +14660,7 @@ mod tests {
                 .contains("acknowledges no authority frame"),
             "{error}"
         );
-        record["version"] = serde_json::json!(LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION + 1);
+        record["version"] = serde_json::json!(LOCAL_AUTHORITY_SESSION_VERSION + 1);
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         let error = backend
             .load_snapshot_authority(repo_id)

@@ -57,6 +57,17 @@ struct InitResultPayload<'a> {
     /// Durable generation-bound enrichment committed by admission. This is
     /// carried from the bootstrap lease, not reopened after publication.
     semantic_enrichment: SemanticEnrichmentStatus,
+    /// What this run did about cross-file reference enrichment, the phase after
+    /// admission that asks a language server for the reference, override and
+    /// type-use edges a single-file parse cannot derive.
+    ///
+    /// The machine-readable half of the "Semantic enrichment" line and the
+    /// warning under it. Until it existed, a run that handed over a graph
+    /// without those edges said so only in a stderr note, and a harness that
+    /// parsed this document could not tell that run from one that finished.
+    /// Additive to this schema version: a consumer that does not read it is
+    /// unaffected.
+    cross_file_enrichment: CrossFileEnrichmentPayload<'a>,
     repo_root: String,
     kin_dir: String,
     repository_id: &'a kin_model::RepositoryId,
@@ -155,6 +166,30 @@ struct DaemonKilledPayload {
     /// inferred, so a consumer reading the payload and a consumer reading `$?`
     /// agree without either having to know the constant.
     exit_code: i32,
+}
+
+/// What one machine-readable result says about its cross-file enrichment.
+#[derive(Debug, Serialize)]
+struct CrossFileEnrichmentPayload<'a> {
+    /// `produced` when a language-server sweep finished and enriched files;
+    /// `owed` when this run handed over a graph without some or all of those
+    /// edges; `unknown` when this run could not read what its sweep did.
+    state: &'static str,
+    /// Why the edges are owed or unknown, as a stable code. Absent when
+    /// produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// The sentence the human summary prints beneath "partial": what is
+    /// missing and what supplies it. Absent when produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+    /// The error or observation behind `reason`, in the words of whatever
+    /// reported it, when there was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<&'a str>,
+    /// How long this command spent on the phase, from its start to the moment
+    /// it handed the repository over, including stopping any daemon it started.
+    elapsed_ms: u64,
 }
 
 /// The uncommitted delta initialization saw and did not admit.
@@ -317,6 +352,7 @@ pub async fn run(
     //
     // Runs before the result is printed so what a reader is told about their
     // repository is true of the repository they now have.
+    let enrichment_started = std::time::Instant::now();
     let cross_file = if !no_enrich {
         // Isolated on its own task so a panic inside it cannot decide init's
         // exit status. `kin init 2>&1 | head -1` closes both streams after one
@@ -331,16 +367,17 @@ pub async fn run(
             Ok(outcome) => outcome,
             Err(error) => {
                 note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
-                CrossFileEnrichment::unreadable()
+                CrossFileEnrichment::unreadable().with_cause(error.to_string())
             }
         }
     } else {
-        CrossFileEnrichment::Withheld {
-            pending: "`--no-enrich` skipped the language-server sweep, so cross-file reference \
-                      and override edges are not in this graph; `kin daemon sweep` runs it"
-                .to_string(),
-        }
+        CrossFileEnrichment::withheld(
+            CrossFileShortfall::NotRequested,
+            "`--no-enrich` skipped the language-server sweep, so cross-file reference and \
+             override edges are not in this graph; `kin daemon sweep` runs it",
+        )
     };
+    let enrichment_elapsed = enrichment_started.elapsed();
 
     // Read once, here, and handed to whichever surface reports it. The kill
     // happens during the enrichment phase above and leaves nothing in this
@@ -354,6 +391,7 @@ pub async fn run(
             &result,
             boundary,
             enrichment,
+            cross_file.payload(enrichment_elapsed),
             &graph_section_materialization,
             daemon_death.as_ref(),
         )?;
@@ -818,33 +856,217 @@ pub(crate) enum CrossFileEnrichment {
     /// A sweep finished having enriched files, so this run produced cross-file
     /// edges.
     Produced,
-    /// This run produced no complete cross-file graph, with what is pending and
-    /// what would finish it.
-    Withheld { pending: String },
+    /// This run produced no complete cross-file graph: why, what is pending
+    /// and what would finish it, and the error or observation behind the why
+    /// when there was one.
+    Withheld {
+        reason: CrossFileShortfall,
+        pending: String,
+        cause: Option<String>,
+    },
+}
+
+/// Why a run produced no complete cross-file graph.
+///
+/// One variant per way the enrichment phase can end short, so a script can
+/// branch on the cause without parsing the sentence that names it. The codes
+/// are what `kin init --json` reports under `cross_file_enrichment.reason`, and
+/// they are a contract: a variant may be added, and a code is never reworded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrossFileShortfall {
+    /// `--no-enrich` asked for no sweep.
+    NotRequested,
+    /// `KIN_NO_DAEMON` forbids this process to start the daemon a sweep runs in.
+    DaemonSpawnDisabled,
+    /// The operating system refuses this process every loopback connection, so
+    /// no daemon it started could be reached.
+    LoopbackBlocked,
+    /// No daemon could be started or reached for another reason.
+    DaemonUnavailable,
+    /// The store this command just wrote could not be opened as a Kin layout.
+    StoreUnreadable,
+    /// A daemon answered and would not queue the sweep.
+    SweepNotStarted,
+    /// The daemon has no usable language server for this repository.
+    LanguageServerUnavailable,
+    /// The sweep walked files and enriched none of them.
+    SweepEnrichedNothing,
+    /// The sweep enriched files and could not serve at least one language.
+    SweepLanguagesUnserved,
+    /// The sweep asked a language server about files and got no complete
+    /// answer for some of them, so they are owed.
+    SweepFilesOwed,
+    /// The sweep did not finish inside this command's budget.
+    SweepBudgetSpent,
+    /// This run could not read what its sweep did.
+    SweepOutcomeUnreadable,
+}
+
+impl CrossFileShortfall {
+    /// The stable code `kin init --json` reports.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::DaemonSpawnDisabled => "daemon_spawn_disabled",
+            Self::LoopbackBlocked => "loopback_blocked",
+            Self::DaemonUnavailable => "daemon_unavailable",
+            Self::StoreUnreadable => "store_unreadable",
+            Self::SweepNotStarted => "sweep_not_started",
+            Self::LanguageServerUnavailable => "language_server_unavailable",
+            Self::SweepEnrichedNothing => "sweep_enriched_nothing",
+            Self::SweepLanguagesUnserved => "sweep_languages_unserved",
+            Self::SweepFilesOwed => "sweep_files_owed",
+            Self::SweepBudgetSpent => "sweep_budget_spent",
+            Self::SweepOutcomeUnreadable => "sweep_outcome_unreadable",
+        }
+    }
+
+    /// `owed` when this run knows the graph it handed over lacks cross-file
+    /// edges, and `unknown` when it cannot say whether its sweep produced any.
+    fn state(self) -> &'static str {
+        match self {
+            Self::SweepOutcomeUnreadable => "unknown",
+            _ => "owed",
+        }
+    }
 }
 
 impl CrossFileEnrichment {
+    /// A run that produced no complete cross-file graph, for `reason`.
+    fn withheld(reason: CrossFileShortfall, pending: impl Into<String>) -> Self {
+        Self::Withheld {
+            reason,
+            pending: pending.into(),
+            cause: None,
+        }
+    }
+
+    /// The same outcome, carrying the error or observation behind its reason.
+    /// A produced outcome has no cause and is returned unchanged.
+    fn with_cause(self, cause: impl Into<String>) -> Self {
+        match self {
+            Self::Withheld {
+                reason, pending, ..
+            } => Self::Withheld {
+                reason,
+                pending,
+                cause: Some(cause.into()),
+            },
+            Self::Produced => Self::Produced,
+        }
+    }
+
     /// The phase reached the daemon and could not learn what the sweep did.
     ///
     /// Withheld rather than `Produced`, because the summary's word is a claim
     /// and an unread sweep supports no claim. It says so plainly instead of
     /// borrowing the confident word from a run nobody watched.
     fn unreadable() -> Self {
-        Self::Withheld {
-            pending: "this run could not read what the cross-file sweep did, so whether it \
-                      produced any cross-file edge is unknown; run `kin doctor` to read this \
-                      store's reference-edge coverage"
-                .to_string(),
-        }
+        Self::withheld(
+            CrossFileShortfall::SweepOutcomeUnreadable,
+            "this run could not read what the cross-file sweep did, so whether it produced any \
+             cross-file edge is unknown; run `kin doctor` to read this store's reference-edge \
+             coverage",
+        )
+    }
+
+    /// No daemon could be started to run the sweep, so none ran.
+    ///
+    /// This used to be [`Self::unreadable`], whose sentence says the run could
+    /// not read what its sweep did. No sweep ran at all, and the sentence a
+    /// reader gets should say so rather than leave open a sweep that never
+    /// existed.
+    fn daemon_unavailable(error: &impl std::fmt::Display) -> Self {
+        Self::withheld(
+            CrossFileShortfall::DaemonUnavailable,
+            "no daemon could be started to run the language-server sweep, so cross-file \
+             reference and override edges are not in this graph; the note above gives the \
+             cause, and the next daemon started on this repository runs the sweep",
+        )
+        .with_cause(error.to_string())
     }
 
     /// What is still owed, when something is.
     fn pending(&self) -> Option<&str> {
         match self {
-            Self::Withheld { pending } => Some(pending),
+            Self::Withheld { pending, .. } => Some(pending),
             Self::Produced => None,
         }
     }
+
+    /// The `cross_file_enrichment` object `kin init --json` carries.
+    fn payload(&self, elapsed: std::time::Duration) -> CrossFileEnrichmentPayload<'_> {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        match self {
+            Self::Produced => CrossFileEnrichmentPayload {
+                state: "produced",
+                reason: None,
+                detail: None,
+                cause: None,
+                elapsed_ms,
+            },
+            Self::Withheld {
+                reason,
+                pending,
+                cause,
+            } => CrossFileEnrichmentPayload {
+                state: reason.state(),
+                reason: Some(reason.code()),
+                detail: Some(pending),
+                cause: cause.as_deref(),
+                elapsed_ms,
+            },
+        }
+    }
+}
+
+/// Whether this process can run the cross-file sweep at all, decided before it
+/// starts anything.
+///
+/// Both refusals are facts about this process rather than about the
+/// repository, and each is settled by one reading. `KIN_NO_DAEMON` forbids the
+/// daemon the sweep runs in, and this phase called the daemon launcher anyway,
+/// which honors the variable only where it has to start a supervisor. A sandbox
+/// that refuses loopback connections lets this process start a daemon it can
+/// never reach, and that one used to cost a minute: in the proof container the
+/// Kin role runs under a seccomp filter that answers connect() with EACCES, and
+/// `kin init` started a supervisor, polled a port it was not permitted to
+/// connect to until that supervisor gave up at its own 60-second idle timeout,
+/// and only then noted that no daemon could be started.
+///
+/// Returns the note to print and the outcome to hand over, or `None` when the
+/// phase should go on and start its daemon. `loopback` is asked only when
+/// spawning is allowed, and is injected so each arm can be proved without a
+/// sandbox.
+fn cross_file_enrichment_refusal(
+    spawns_disabled: bool,
+    loopback: impl FnOnce() -> Option<crate::daemon_client::LoopbackBlocked>,
+) -> Option<(String, CrossFileEnrichment)> {
+    if spawns_disabled {
+        return Some((
+            "note: cross-file reference enrichment was skipped because KIN_NO_DAEMON is set, so \
+             this command may not start the daemon the language-server sweep runs in"
+                .to_string(),
+            CrossFileEnrichment::withheld(
+                CrossFileShortfall::DaemonSpawnDisabled,
+                "KIN_NO_DAEMON kept this run from starting the daemon the language-server sweep \
+                 runs in, so cross-file reference and override edges are not in this graph; the \
+                 next daemon started on this repository runs the sweep",
+            ),
+        ));
+    }
+    let blocked = loopback()?;
+    Some((
+        format!("note: cross-file reference enrichment was skipped because {blocked}"),
+        CrossFileEnrichment::withheld(
+            CrossFileShortfall::LoopbackBlocked,
+            "this process may not connect to loopback, so no daemon it started could run the \
+             language-server sweep, and cross-file reference and override edges are not in this \
+             graph; the next daemon started on this repository where loopback connections are \
+             allowed runs the sweep",
+        )
+        .with_cause(blocked.to_string()),
+    ))
 }
 
 /// One language a cold sweep could not serve, as `/lsp/sweep/status` reports it.
@@ -881,6 +1103,60 @@ pub(crate) fn skipped_languages_from_status(status: &serde_json::Value) -> Vec<S
             })
         })
         .collect()
+}
+
+/// What a finished sweep still owes: files a language server was asked about
+/// and gave no complete answer for, as `/lsp/sweep/status` names them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SweepOwed {
+    pub(crate) files: u64,
+    /// One owed file and why, when the status names any.
+    pub(crate) first: Option<(String, String)>,
+}
+
+/// Read what the sweep still owes from a `/lsp/sweep/status` payload.
+///
+/// A daemon too old to serve the fields owes nothing by this reading, which is
+/// what it reported before they existed.
+pub(crate) fn owed_from_status(status: &serde_json::Value) -> SweepOwed {
+    let files = status
+        .get("files_owed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let first = status
+        .get("owed_files")
+        .and_then(|v| v.as_array())
+        .and_then(|rows| {
+            rows.iter().find_map(|row| {
+                let file = row.get("file")?.as_str()?;
+                let reason = row.get("reason")?.as_str()?;
+                (!file.is_empty() && !reason.is_empty())
+                    .then(|| (file.to_string(), reason.to_string()))
+            })
+        });
+    SweepOwed { files, first }
+}
+
+/// The line naming what is owed, or nothing when nothing is.
+fn owed_detail_line(owed: &SweepOwed) -> Option<String> {
+    let head = match owed.files {
+        0 => return None,
+        1 => {
+            "    1 file is owed: its language server left questions about it unanswered".to_string()
+        }
+        n => format!(
+            "    {n} files are owed: their language server left questions about them unanswered"
+        ),
+    };
+    let first = match &owed.first {
+        Some((file, reason)) if owed.files == 1 => format!("; {file}: {reason}"),
+        Some((file, reason)) => format!("; the first, {file}: {reason}"),
+        None => String::new(),
+    };
+    Some(format!(
+        "{head}, so the next sweep after a backoff asks again, and `kin daemon sweep` asks at \
+         once{first}"
+    ))
 }
 
 /// `1 file` and `2 files`, so a count never reads `1 files`.
@@ -958,11 +1234,18 @@ fn skipped_detail_lines(blocked: u64, skipped: &[SkippedLanguage]) -> Vec<String
 /// nothing at all was blocked. `complete (6/8 files)` was measured live on a
 /// ruby fixture: its own two numbers disagree, and the two files between them
 /// were named by nothing.
+///
+/// A sweep that still owes files is never complete. A sweep of a Go
+/// repository printed "complete (546/546 files)" over a language server that
+/// had died before answering anything: every file was asked, every question
+/// failed, and every file was owed. The count cannot tell that apart
+/// from a finished sweep, and the owed files are the half that can.
 pub(crate) fn cross_file_enrichment_outcome(
     done: u64,
     total: u64,
     blocked: u64,
     skipped: &[SkippedLanguage],
+    owed: &SweepOwed,
 ) -> (String, CrossFileEnrichment) {
     let languages: Vec<&str> = skipped
         .iter()
@@ -987,6 +1270,7 @@ pub(crate) fn cross_file_enrichment_outcome(
         if !skipped.is_empty() {
             lines.extend(skipped_detail_lines(blocked, skipped));
         }
+        lines.extend(owed_detail_line(owed));
         let pending = if languages.is_empty() {
             format!(
                 "the sweep walked {total} files and enriched none of them, so cross-file \
@@ -1003,7 +1287,11 @@ pub(crate) fn cross_file_enrichment_outcome(
                 languages.join(", ")
             )
         };
-        return (lines.join("\n"), CrossFileEnrichment::Withheld { pending });
+        let line = lines.join("\n");
+        let outcome =
+            CrossFileEnrichment::withheld(CrossFileShortfall::SweepEnrichedNothing, pending)
+                .with_cause(line.trim().trim_start_matches("note: "));
+        return (line, outcome);
     }
     if !skipped.is_empty() {
         let mut lines = vec![format!(
@@ -1012,19 +1300,43 @@ pub(crate) fn cross_file_enrichment_outcome(
             plural_count(skipped.len() as u64, "language", "languages")
         )];
         lines.extend(skipped_detail_lines(blocked, skipped));
-        return (
-            lines.join("\n"),
-            CrossFileEnrichment::Withheld {
-                pending: format!(
-                    "the sweep enriched {done} of {total} files and could not serve {}, so \
-                     cross-file reference and override edges for {} are not in this graph; the \
-                     note above names what each one needs, and `kin daemon sweep` retries once \
-                     that is repaired",
-                    plural_count(skipped.len() as u64, "language", "languages"),
-                    languages.join(", ")
-                ),
-            },
-        );
+        lines.extend(owed_detail_line(owed));
+        let line = lines.join("\n");
+        let outcome = CrossFileEnrichment::withheld(
+            CrossFileShortfall::SweepLanguagesUnserved,
+            format!(
+                "the sweep enriched {done} of {total} files and could not serve {}, so \
+                 cross-file reference and override edges for {} are not in this graph; the note \
+                 above names what each one needs, and `kin daemon sweep` retries once that is \
+                 repaired",
+                plural_count(skipped.len() as u64, "language", "languages"),
+                languages.join(", ")
+            ),
+        )
+        .with_cause(line.trim());
+        return (line, outcome);
+    }
+    if let Some(detail) = owed_detail_line(owed) {
+        let mut lines = vec![format!(
+            "  cross-file enrichment reached {done} of {total} files and still owes {}:",
+            plural_count(owed.files, "file", "files")
+        )];
+        lines.push(detail);
+        if blocked > 0 {
+            lines.extend(skipped_detail_lines(blocked, skipped));
+        }
+        let line = lines.join("\n");
+        let outcome = CrossFileEnrichment::withheld(
+            CrossFileShortfall::SweepFilesOwed,
+            format!(
+                "the language server left questions about {} unanswered, so their cross-file \
+                 reference and override edges may be missing from this graph; the \
+                 next sweep after a backoff asks again, and `kin daemon sweep` asks at once",
+                plural_count(owed.files, "file", "files")
+            ),
+        )
+        .with_cause(line.trim());
+        return (line, outcome);
     }
     if blocked > 0 {
         // Blocked files the daemon could not attribute to a language. The
@@ -1058,10 +1370,39 @@ pub(crate) fn cross_file_enrichment_outcome(
 /// The phase runs on its own task and the cleanup runs after the join, so it is
 /// reached on success, on refusal, on timeout and on panic alike.
 async fn enrich_after_init(kin_root: &Path) -> CrossFileEnrichment {
+    enrich_after_init_with(
+        kin_root,
+        crate::daemon_client::daemon_spawns_are_disabled(),
+        crate::daemon_client::loopback_blocked,
+    )
+    .await
+}
+
+/// [`enrich_after_init`] with the two facts [`cross_file_enrichment_refusal`]
+/// reads taken as arguments, so a test can drive the phase entry under either
+/// refusal without setting `KIN_NO_DAEMON` for every test in the process or
+/// putting the process in a sandbox.
+async fn enrich_after_init_with(
+    kin_root: &Path,
+    spawns_disabled: bool,
+    loopback: impl FnOnce() -> Option<crate::daemon_client::LoopbackBlocked>,
+) -> CrossFileEnrichment {
     let Some(layout) = kin_core::KinLayout::discover(kin_root) else {
         note!("note: cross-file reference enrichment was skipped: no Kin layout at this path");
-        return CrossFileEnrichment::unreadable();
+        return CrossFileEnrichment::withheld(
+            CrossFileShortfall::StoreUnreadable,
+            "the store this command wrote could not be opened as a Kin layout, so no \
+             language-server sweep ran and cross-file reference and override edges are not in \
+             this graph; `kin doctor` reads what is wrong with it",
+        );
     };
+
+    // Settled before anything is started, because nothing started could help.
+    // Nothing ran, so there is nothing for the cleanup below to stop.
+    if let Some((note, outcome)) = cross_file_enrichment_refusal(spawns_disabled, loopback) {
+        note!("{note}");
+        return outcome;
+    }
 
     // Whether a daemon was already serving this repository. If not, anything
     // running afterwards is ours, and a daemon left behind by `kin init` pins a
@@ -1077,7 +1418,7 @@ async fn enrich_after_init(kin_root: &Path) -> CrossFileEnrichment {
         Ok(outcome) => outcome,
         Err(error) => {
             note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
-            CrossFileEnrichment::unreadable()
+            CrossFileEnrichment::unreadable().with_cause(error.to_string())
         }
     };
 
@@ -1171,7 +1512,7 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
                 "note: cross-file reference enrichment was skipped because no daemon could be \
                  started ({error}); run `kin doctor` to see what is missing"
             );
-            return CrossFileEnrichment::unreadable();
+            return CrossFileEnrichment::daemon_unavailable(&error);
         }
     };
     // FOR_LAYOUT, not the plain constructor. The plain one resolves the
@@ -1185,7 +1526,14 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
         Ok(client) => client,
         Err(error) => {
             note!("note: cross-file reference enrichment was skipped: {error:#}");
-            return CrossFileEnrichment::unreadable();
+            return CrossFileEnrichment::withheld(
+                CrossFileShortfall::DaemonUnavailable,
+                "this command could not open a client to the daemon it started, so no \
+                 language-server sweep ran and cross-file reference and override edges are not \
+                 in this graph; the note above gives the cause, and the next daemon started on \
+                 this repository runs the sweep",
+            )
+            .with_cause(format!("{error:#}"));
         }
     };
 
@@ -1193,7 +1541,13 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
         Ok(value) => value,
         Err(error) => {
             note!("note: cross-file reference enrichment could not be started: {error:#}");
-            return CrossFileEnrichment::unreadable();
+            return CrossFileEnrichment::withheld(
+                CrossFileShortfall::SweepNotStarted,
+                "the daemon would not queue the language-server sweep, so cross-file reference \
+                 and override edges are not in this graph; the note above gives the cause, and \
+                 `kin daemon sweep` retries it",
+            )
+            .with_cause(format!("{error:#}"));
         }
     };
     // A daemon with no language server never sweeps. Saying so, with the
@@ -1214,13 +1568,14 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
         let detail = observed
             .and_then(|value| value.get("detail"))
             .and_then(|value| value.as_str());
-        note!("{}", enrichment_unavailable_note(reason, detail));
-        return CrossFileEnrichment::Withheld {
-            pending: "no language-server sweep ran for this repository, so cross-file reference \
-                      and override edges are not in this graph; the note above names what would \
-                      let it run"
-                .to_string(),
-        };
+        let note = enrichment_unavailable_note(reason, detail);
+        note!("{note}");
+        return CrossFileEnrichment::withheld(
+            CrossFileShortfall::LanguageServerUnavailable,
+            "no language-server sweep ran for this repository, so cross-file reference and \
+             override edges are not in this graph; the note above names what would let it run",
+        )
+        .with_cause(note.trim_start_matches("note: "));
     }
     let baseline = queued
         .get("sweeps_completed")
@@ -1236,7 +1591,7 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
             Ok(status) => status,
             Err(error) => {
                 note!("note: enrichment progress could not be read: {error:#}");
-                return CrossFileEnrichment::unreadable();
+                return CrossFileEnrichment::unreadable().with_cause(format!("{error:#}"));
             }
         };
         let done = status
@@ -1272,7 +1627,9 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let skipped = skipped_languages_from_status(&status);
-            let (line, outcome) = cross_file_enrichment_outcome(done, total, blocked, &skipped);
+            let owed = owed_from_status(&status);
+            let (line, outcome) =
+                cross_file_enrichment_outcome(done, total, blocked, &skipped, &owed);
             note!("{}", line);
             return outcome;
         }
@@ -1282,14 +1639,15 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
                  resumes from where it stopped on the next daemon start",
                 ENRICH_BUDGET.as_secs()
             );
-            return CrossFileEnrichment::Withheld {
-                pending: format!(
+            return CrossFileEnrichment::withheld(
+                CrossFileShortfall::SweepBudgetSpent,
+                format!(
                     "the sweep reached {last_reported} files and did not finish within {}s, so \
                      the cross-file edges it has not got to are not in this graph; it resumes on \
                      the next daemon start",
                     ENRICH_BUDGET.as_secs()
                 ),
-            };
+            );
         }
     }
 }
@@ -1303,6 +1661,106 @@ fn ensure_directory(dir: &Path) -> Result<()> {
             Err(error).with_context(|| format!("inspect repository directory {}", dir.display()))
         }
     }
+}
+
+/// What `kin_init` on the MCP surface does for one folder: the checks an
+/// agent-driven setup needs before anything runs, then `kin init` itself.
+///
+/// The checks are the ones a person at a terminal makes without thinking. The
+/// home directory, the filesystem root and the Kin installation are not
+/// projects. A folder that already is a repository is answered as one. A folder
+/// inside another Kin repository is answered from that one already, and with no
+/// Git repository of its own `kin init` would refuse it anyway, so the refusal
+/// says what would make it a repository of its own.
+///
+/// `kin init` runs as a child of this process with `--json --no-enrich`: its
+/// report on stdout and its progress on stderr, neither of which may reach the
+/// MCP server's stdout, and enrichment left to the daemon that serves the
+/// repository next, which resumes it. The child is not killed when the server
+/// exits, so a setup a client stopped waiting for still finishes.
+pub(crate) async fn initialize_for_mcp(dir: PathBuf) -> kin_mcp::InitOutcome {
+    use kin_mcp::InitOutcome;
+    if !dir.is_dir() {
+        return InitOutcome::Refused(format!(
+            "{} is not a folder on this machine, so there is nothing to set up there. Name the \
+             project folder you want Kin to serve.",
+            dir.display()
+        ));
+    }
+    let home = super::setup::home_dir().ok();
+    if dir.parent().is_none() || home.as_deref() == Some(dir.as_path()) {
+        return InitOutcome::Refused(format!(
+            "{} is not a project folder: setting it up would read everything under it into one \
+             graph. Name the project folder you want Kin to serve.",
+            dir.display()
+        ));
+    }
+    if dir.join(".kin").is_dir() {
+        if kin_core::layout::is_managed_kin_home(&dir.join(".kin")) {
+            return InitOutcome::Refused(existing_repository_refusal(&dir));
+        }
+        return InitOutcome::AlreadyRepository;
+    }
+    if let Some(enclosing) = kin_core::KinLayout::discover(&dir) {
+        if !dir.join(".git").exists() {
+            return InitOutcome::Refused(format!(
+                "{} is inside the Kin repository at {}, which already answers for it. To have \
+                 Kin serve {} on its own, make it a Git repository first (git init, then commit \
+                 its files), and set it up again.",
+                dir.display(),
+                enclosing.working_dir().display(),
+                dir.display()
+            ));
+        }
+    }
+    let program = match std::env::current_exe() {
+        Ok(program) => program,
+        Err(error) => {
+            return InitOutcome::Failed(format!(
+                "this server cannot find its own kin binary: {error}"
+            ))
+        }
+    };
+    let output = tokio::process::Command::new(program)
+        .arg("init")
+        .arg(&dir)
+        .arg("--json")
+        .arg("--no-enrich")
+        .current_dir(&dir)
+        // A daemon this server is bound to serves another repository, and a
+        // setup of this folder must not reach it.
+        .env_remove("KIN_DAEMON_URL")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => return InitOutcome::Failed(format!("kin init could not start: {error}")),
+    };
+    let report = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+    if output.status.success() {
+        return InitOutcome::Initialized { report };
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let said = last_lines(&stderr, 6);
+    InitOutcome::Failed(if said.is_empty() {
+        format!("kin init exited with {}.", output.status)
+    } else {
+        said
+    })
+}
+
+/// The last `count` non-blank lines of `text`, joined with spaces, for an
+/// answer to quote.
+fn last_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(count)..].join(" ")
 }
 
 fn reject_existing_repository(dir: &Path) -> Result<()> {
@@ -1566,6 +2024,7 @@ fn print_json_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
     semantic_enrichment: SemanticEnrichmentStatus,
+    cross_file_enrichment: CrossFileEnrichmentPayload<'_>,
     graph_section_materialization: &InitGraphSectionMaterialization,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
@@ -1577,6 +2036,7 @@ fn print_json_result(
         source_boundary: boundary.source_boundary(),
         history: boundary.history(),
         semantic_enrichment,
+        cross_file_enrichment,
         repo_root: result.layout.working_dir().display().to_string(),
         kin_dir: result.layout.root().display().to_string(),
         repository_id: &result.repository_id,
@@ -1813,15 +2273,24 @@ fn workspace_head_line(head: &kin_model::WorkspaceHead) -> String {
 /// other first-run surface already ends this way; `kin setup` prints a Next
 /// steps block and `kin doctor` puts a fix on every row that needs one.
 ///
-/// Two commands, not a menu. `locate` is the one the README leads with, and
-/// `status` is the one that answers what just happened to this repository.
+/// Two commands, not a menu, and it ends on the first question. `status`
+/// answers what just happened to this repository. `refs` is the first question
+/// because it shows what the graph knows that a text search does not: what
+/// calls a function, which a reader can check against the source. `locate`
+/// used to hold that place, and before the first embedding pass finishes it
+/// ranks by words alone, so the product's first nudge was its weakest answer.
+/// The same question closes `kin setup` and leads an MCP client's first answer
+/// after `kin_init`.
 fn next_step_lines() -> Vec<String> {
     // Padded from the commands themselves rather than by hand. Written out, the
     // two descriptions landed a column apart, and the kind of drift nobody
     // notices in a diff is exactly the kind a reader sees straight away.
     let steps = [
-        ("kin locate \"<what you are looking for>\"", "ask the graph"),
         ("kin status", "what this repository holds now"),
+        (
+            FIRST_QUESTION_COMMAND,
+            "ask what calls a function you know; check the answer in the source",
+        ),
     ];
     let widest = steps
         .iter()
@@ -1836,6 +2305,10 @@ fn next_step_lines() -> Vec<String> {
     );
     lines
 }
+
+/// The first question Kin suggests on every surface: what calls a function the
+/// reader knows. `kin setup` closes with it too.
+pub(crate) const FIRST_QUESTION_COMMAND: &str = "kin refs YourFunctionName";
 
 /// Keep language-server and cross-file guidance before the embedding notice.
 ///
@@ -2218,12 +2691,20 @@ mod tests {
         assert_eq!(lines[1], "Next:");
         let body = lines[2..].join("\n");
         assert!(
-            body.contains("kin locate"),
-            "the next step must name the command the README leads with: {body}"
-        );
-        assert!(
             body.contains("kin status"),
             "the next step must name what answers what just happened: {body}"
+        );
+        // It ends on the first question, and the first question is one the
+        // graph answers better than a text search: what calls a function.
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.contains("kin refs YourFunctionName")),
+            "the next step must end on the first question: {body}"
+        );
+        assert!(
+            !body.contains("kin locate"),
+            "before embeddings, locate ranks by words alone: {body}"
         );
         for line in &lines {
             assert!(
@@ -2613,8 +3094,8 @@ mod tests {
     /// override edges unavailable for rust: no language server found`.
     mod a_sweep_that_skipped_a_language {
         use super::super::{
-            cross_file_enrichment_outcome, skipped_languages_from_status, CrossFileEnrichment,
-            SkippedLanguage,
+            cross_file_enrichment_outcome, owed_from_status, skipped_languages_from_status,
+            CrossFileEnrichment, CrossFileShortfall, SkippedLanguage, SweepOwed,
         };
 
         const RUST_REASON: &str = "the `rust-analyzer` language server did not start (No such \
@@ -2645,7 +3126,8 @@ mod tests {
         fn the_word_complete_is_not_used_and_the_gap_is_named() {
             let skipped = skipped_languages_from_status(&coldwalk_status());
             assert_eq!(skipped.len(), 1, "the fixture carries one skipped language");
-            let (line, outcome) = cross_file_enrichment_outcome(5, 303, 298, &skipped);
+            let (line, outcome) =
+                cross_file_enrichment_outcome(5, 303, 298, &skipped, &SweepOwed::default());
 
             assert!(
                 !line.contains("complete"),
@@ -2668,7 +3150,7 @@ mod tests {
                 "the line must say WHY, from what the daemon observed: {line}"
             );
             match outcome {
-                CrossFileEnrichment::Withheld { pending } => assert!(
+                CrossFileEnrichment::Withheld { pending, .. } => assert!(
                     pending.contains("rust"),
                     "the withheld reason must name the language still owed: {pending}"
                 ),
@@ -2695,7 +3177,8 @@ mod tests {
             let skipped = skipped_languages_from_status(&status);
             assert!(skipped.is_empty(), "no rows means nothing was skipped");
 
-            let (line, outcome) = cross_file_enrichment_outcome(303, 303, 0, &skipped);
+            let (line, outcome) =
+                cross_file_enrichment_outcome(303, 303, 0, &skipped, &SweepOwed::default());
             assert!(
                 line.contains("cross-file enrichment complete (303/303 files)"),
                 "a sweep that served every language it met still completes: {line}"
@@ -2738,7 +3221,8 @@ mod tests {
         /// moving while another could not.
         #[test]
         fn the_zero_file_case_keeps_its_own_sentence() {
-            let (line, outcome) = cross_file_enrichment_outcome(0, 66, 66, &[]);
+            let (line, outcome) =
+                cross_file_enrichment_outcome(0, 66, 66, &[], &SweepOwed::default());
             assert!(
                 line.contains("without enriching any of the 66 files"),
                 "{line}"
@@ -2774,7 +3258,8 @@ mod tests {
             let skipped = skipped_languages_from_status(&status);
             assert_eq!(skipped.len(), 1, "the row survives parsing: {skipped:?}");
 
-            let (line, outcome) = cross_file_enrichment_outcome(0, 72, 72, &skipped);
+            let (line, outcome) =
+                cross_file_enrichment_outcome(0, 72, 72, &skipped, &SweepOwed::default());
             assert!(!line.contains("complete"), "{line}");
             assert!(line.contains("rust: 72 files not enriched"), "{line}");
             assert!(line.contains("an earlier pass made durable"), "{line}");
@@ -2797,7 +3282,7 @@ mod tests {
                 files: 3,
                 reason: "the `rust-analyzer` language server did not start".to_string(),
             }];
-            let (line, _) = cross_file_enrichment_outcome(3, 8, 5, &skipped);
+            let (line, _) = cross_file_enrichment_outcome(3, 8, 5, &skipped, &SweepOwed::default());
 
             assert!(
                 line.contains("rust: 3 files not enriched"),
@@ -2823,14 +3308,14 @@ mod tests {
                 files: 3,
                 reason: "the `rust-analyzer` language server did not start".to_string(),
             }];
-            let (line, _) = cross_file_enrichment_outcome(4, 8, 4, &skipped);
+            let (line, _) = cross_file_enrichment_outcome(4, 8, 4, &skipped, &SweepOwed::default());
             assert!(line.contains("1 further file "), "{line}");
             assert!(!line.contains("1 further files"), "{line}");
         }
 
         /// A pass with blocked files and no row to name them is not complete.
         ///
-        /// `cross_file_enrichment_outcome(6, 8, 2, &[])` is the ruby fixture
+        /// `cross_file_enrichment_outcome(6, 8, 2, &[], ..)` is the ruby fixture
         /// above with both servers reachable, and it printed
         /// `cross-file enrichment complete (6/8 files)` on a real `kin init` at
         /// the parent commit. The function took `blocked` and used it only in
@@ -2843,7 +3328,8 @@ mod tests {
         /// defect pointing the other way. What is fixed is the sentence.
         #[test]
         fn blocked_files_with_no_row_still_end_the_word_complete() {
-            let (line, outcome) = cross_file_enrichment_outcome(6, 8, 2, &[]);
+            let (line, outcome) =
+                cross_file_enrichment_outcome(6, 8, 2, &[], &SweepOwed::default());
             assert!(
                 !line.contains("complete"),
                 "a pass that blocked two of eight files did not complete: {line}"
@@ -2877,7 +3363,8 @@ mod tests {
                 files: 60,
                 reason: "the `rust-analyzer` language server did not start".to_string(),
             }];
-            let (line, outcome) = cross_file_enrichment_outcome(0, 66, 66, &skipped);
+            let (line, outcome) =
+                cross_file_enrichment_outcome(0, 66, 66, &skipped, &SweepOwed::default());
 
             assert!(!line.contains("complete"), "{line}");
             assert!(
@@ -2889,7 +3376,7 @@ mod tests {
                 "and the blocked files no row names: {line}"
             );
             match outcome {
-                CrossFileEnrichment::Withheld { pending } => assert!(
+                CrossFileEnrichment::Withheld { pending, .. } => assert!(
                     pending.contains("rust"),
                     "the withheld reason must name the language still owed: {pending}"
                 ),
@@ -2897,6 +3384,127 @@ mod tests {
                     panic!("a sweep that enriched nothing did not produce cross-file edges")
                 }
             }
+        }
+
+        const DEAD_SERVER: &str =
+            "the file-level definitions pass failed: server shutdown unexpectedly";
+
+        /// The status a daemon from before the tally split served for a Go
+        /// sweep whose server died after its handshake: every file counted
+        /// done, nothing blocked, nothing skipped, and every file owed.
+        fn every_file_owed_status() -> serde_json::Value {
+            serde_json::json!({
+                "running": false,
+                "files_done": 546,
+                "files_total": 546,
+                "files_blocked": 0,
+                "languages_skipped": [],
+                "files_owed": 546,
+                "owed_files": [
+                    { "file": "internal/codespaces/codespaces.go", "reason": DEAD_SERVER,
+                      "attempts": 1, "retry_after_s": 297 }
+                ]
+            })
+        }
+
+        /// Owed files are never complete, whatever the counts beside them
+        /// say. This is the verdict `kin init` printed as
+        /// "complete (546/546 files)" and `produced`.
+        #[test]
+        fn a_sweep_that_owes_files_is_never_complete() {
+            let status = every_file_owed_status();
+            let owed = owed_from_status(&status);
+            assert_eq!(owed.files, 546);
+            let (line, outcome) = cross_file_enrichment_outcome(
+                546,
+                546,
+                0,
+                &skipped_languages_from_status(&status),
+                &owed,
+            );
+            assert!(!line.contains("complete"), "{line}");
+            assert!(line.contains("546 files are owed"), "{line}");
+            assert!(line.contains(DEAD_SERVER), "the reason travels: {line}");
+            match outcome {
+                CrossFileEnrichment::Withheld { reason, cause, .. } => {
+                    assert_eq!(reason, CrossFileShortfall::SweepFilesOwed);
+                    assert_eq!(reason.code(), "sweep_files_owed");
+                    assert!(
+                        cause
+                            .as_deref()
+                            .is_some_and(|cause| cause.contains(DEAD_SERVER)),
+                        "{cause:?}"
+                    );
+                }
+                CrossFileEnrichment::Produced => {
+                    panic!("a sweep owing every file it walked produced nothing")
+                }
+            }
+        }
+
+        /// The control for the arm above: the same counts with nothing owed
+        /// is the completion it always was.
+        #[test]
+        fn the_same_counts_owing_nothing_still_complete() {
+            let (line, outcome) =
+                cross_file_enrichment_outcome(546, 546, 0, &[], &SweepOwed::default());
+            assert!(
+                line.contains("cross-file enrichment complete (546/546 files)"),
+                "{line}"
+            );
+            assert_eq!(outcome, CrossFileEnrichment::Produced);
+        }
+
+        /// A sweep whose server died mid-question: no file done, the rest of
+        /// the language blocked under the reason the daemon saw, and the file
+        /// whose question went unanswered owed. The enriched-nothing verdict
+        /// keeps precedence and names the owed file as well.
+        #[test]
+        fn owed_files_are_named_beside_an_enriched_nothing_verdict() {
+            let skipped = vec![SkippedLanguage {
+                language: "go".to_string(),
+                files: 1,
+                reason: "the `gopls` language server stopped answering partway through this \
+                         sweep (it exited with code 3; its last stderr: fatal error), so the \
+                         rest of this language was not asked"
+                    .to_string(),
+            }];
+            let owed = SweepOwed {
+                files: 1,
+                first: Some(("greet.go".to_string(), DEAD_SERVER.to_string())),
+            };
+            let (line, outcome) = cross_file_enrichment_outcome(0, 2, 1, &skipped, &owed);
+            assert!(line.contains("exited with code 3"), "{line}");
+            assert!(
+                line.contains("1 file is owed") && line.contains("greet.go"),
+                "{line}"
+            );
+            match outcome {
+                CrossFileEnrichment::Withheld { reason, .. } => {
+                    assert_eq!(reason, CrossFileShortfall::SweepEnrichedNothing)
+                }
+                CrossFileEnrichment::Produced => panic!("nothing was enriched"),
+            }
+        }
+
+        /// A daemon too old to serve the owed fields owes nothing by this
+        /// reading, which is what it reported before they existed, and a row
+        /// missing half of itself names nothing.
+        #[test]
+        fn a_status_without_owed_fields_owes_nothing() {
+            assert_eq!(
+                owed_from_status(&serde_json::json!({ "files_done": 3 })),
+                SweepOwed::default()
+            );
+            let half = owed_from_status(&serde_json::json!({
+                "files_owed": 2,
+                "owed_files": [{ "file": "a.go" }, { "file": "b.go", "reason": "no answer" }]
+            }));
+            assert_eq!(half.files, 2);
+            assert_eq!(
+                half.first,
+                Some(("b.go".to_string(), "no answer".to_string()))
+            );
         }
     }
 
@@ -3129,14 +3737,16 @@ mod tests {
     mod cross_file_enrichment_wording {
         use super::super::{
             cross_file_pending_notice, render_semantic_enrichment, CrossFileEnrichment,
+            CrossFileShortfall,
         };
         use super::enrichment;
         use crate::commands::status::SemanticEnrichmentPresence;
 
         fn withheld() -> CrossFileEnrichment {
-            CrossFileEnrichment::Withheld {
-                pending: "no language-server sweep ran for this repository".to_string(),
-            }
+            CrossFileEnrichment::withheld(
+                CrossFileShortfall::LanguageServerUnavailable,
+                "no language-server sweep ran for this repository",
+            )
         }
 
         #[test]
@@ -4154,5 +4764,320 @@ mod tests {
              registry entries: {:?}",
             registry.repos
         );
+    }
+
+    /// `kin init` decides whether its cross-file sweep can run before it starts
+    /// anything, and reports what it decided in a field a script can read.
+    ///
+    /// The matched-pair proof run is where this came from: the Kin role's
+    /// `kin init` waited out a supervisor's 60-second idle timeout under a
+    /// seccomp filter that refused every connect, then handed over a graph
+    /// without cross-file edges and said so only in a stderr note.
+    mod cross_file_enrichment_decision {
+        use super::super::{
+            cross_file_enrichment_refusal, enrich_after_init_with, run, CrossFileEnrichment,
+            CrossFileShortfall,
+        };
+        use super::git;
+        use std::time::{Duration, Instant};
+
+        fn reason_of(outcome: &CrossFileEnrichment) -> CrossFileShortfall {
+            match outcome {
+                CrossFileEnrichment::Withheld { reason, .. } => *reason,
+                CrossFileEnrichment::Produced => {
+                    panic!("a phase that ran no sweep did not produce cross-file edges")
+                }
+            }
+        }
+
+        #[test]
+        fn kin_no_daemon_settles_the_phase_without_asking_about_loopback() {
+            let (note, outcome) = cross_file_enrichment_refusal(true, || {
+                panic!("KIN_NO_DAEMON already settled it, so loopback is not asked")
+            })
+            .expect("KIN_NO_DAEMON leaves the sweep no daemon to run in");
+            assert!(note.contains("KIN_NO_DAEMON"), "{note}");
+            assert_eq!(reason_of(&outcome), CrossFileShortfall::DaemonSpawnDisabled);
+            assert!(
+                outcome
+                    .pending()
+                    .is_some_and(|pending| pending.contains("KIN_NO_DAEMON")),
+                "the summary names what kept the sweep from running: {outcome:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_blocked_loopback_settles_the_phase_and_keeps_the_os_error() {
+            let (note, outcome) = cross_file_enrichment_refusal(false, || {
+                Some(crate::daemon_client::LoopbackBlocked::new(
+                    "loopback",
+                    std::io::Error::from_raw_os_error(libc::EACCES),
+                ))
+            })
+            .expect("a process that may not connect to loopback cannot reach a daemon");
+            assert!(
+                note.contains("refused this process a connection to loopback"),
+                "{note}"
+            );
+            assert_eq!(reason_of(&outcome), CrossFileShortfall::LoopbackBlocked);
+            let CrossFileEnrichment::Withheld { cause, .. } = &outcome else {
+                unreachable!("checked above")
+            };
+            let cause = cause
+                .as_deref()
+                .expect("the OS error travels with the reason");
+            let expected = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+            assert!(cause.contains(&expected), "{cause}");
+        }
+
+        #[test]
+        fn a_process_that_may_start_and_reach_a_daemon_goes_on_to_start_one() {
+            assert!(cross_file_enrichment_refusal(false, || None).is_none());
+        }
+
+        /// A real admitted store, and the environment a test may set around it.
+        ///
+        /// HOME and KIN_HOME point at the scratch directory so the admission
+        /// registers there and any supervisor the phase started would publish
+        /// there, where the tests below look for one.
+        struct AdmittedStore {
+            scratch: tempfile::TempDir,
+            kin_root: std::path::PathBuf,
+        }
+
+        impl AdmittedStore {
+            fn supervisor_pid_file(&self) -> std::path::PathBuf {
+                self.scratch
+                    .path()
+                    .join("kin-home")
+                    .join(".kin")
+                    .join("supervisor.pid")
+            }
+        }
+
+        /// The wiring, not only the decision: the phase entry asks before it
+        /// starts anything, so it returns at once and leaves no supervisor
+        /// behind. Driven with each refusal handed in, so neither case sets
+        /// `KIN_NO_DAEMON` for every test in this process or needs a sandbox.
+        ///
+        /// Under `KIN_NO_DAEMON` the phase used to call the daemon launcher and
+        /// read its refusal back as "no daemon could be started", and on a host
+        /// with a supervisor already running the launcher started a daemon
+        /// instead. Under a loopback that refuses connects it started a
+        /// supervisor and waited a minute for it to give up.
+        #[tokio::test]
+        async fn the_phase_entry_decides_at_once_and_starts_nothing() {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-q"]);
+            git(&repo, &["config", "user.email", "kin-test@example.invalid"]);
+            git(&repo, &["config", "user.name", "Kin Test"]);
+            std::fs::write(
+                repo.join("app.py"),
+                b"def helper():\n    return 7\n\n\ndef caller():\n    return helper() + 1\n",
+            )
+            .unwrap();
+            git(&repo, &["add", "app.py"]);
+            git(&repo, &["commit", "-qm", "seed"]);
+
+            let kin_home = scratch.path().join("kin-home");
+            let registry_path = kin_home.join("registry.toml");
+            let _home = kin_core::test_env::EnvVarGuard::set("HOME", &kin_home);
+            let _kin_home_var = kin_core::test_env::EnvVarGuard::set("KIN_HOME", &kin_home);
+            let _registry =
+                kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+
+            run(Some(repo.to_str().unwrap().to_string()), false, true, None)
+                .await
+                .expect("kin init admits the fixture");
+            let store = AdmittedStore {
+                kin_root: repo.join(".kin"),
+                scratch,
+            };
+
+            let started = Instant::now();
+            let outcome = enrich_after_init_with(&store.kin_root, true, || {
+                panic!("KIN_NO_DAEMON already settled it, so loopback is not asked")
+            })
+            .await;
+            let waited = started.elapsed();
+            assert!(
+                waited < Duration::from_secs(3),
+                "the decision is one environment read, and it took {waited:?}"
+            );
+            assert_eq!(reason_of(&outcome), CrossFileShortfall::DaemonSpawnDisabled);
+            assert!(
+                !store.supervisor_pid_file().exists(),
+                "a phase that decided not to run must not have started a supervisor"
+            );
+
+            #[cfg(unix)]
+            {
+                let started = Instant::now();
+                let outcome = enrich_after_init_with(&store.kin_root, false, || {
+                    Some(crate::daemon_client::LoopbackBlocked::new(
+                        "loopback",
+                        std::io::Error::from_raw_os_error(libc::EACCES),
+                    ))
+                })
+                .await;
+                let waited = started.elapsed();
+                assert!(
+                    waited < Duration::from_secs(3),
+                    "the decision is one refused connect, and it took {waited:?}"
+                );
+                assert_eq!(reason_of(&outcome), CrossFileShortfall::LoopbackBlocked);
+                assert!(
+                    !store.supervisor_pid_file().exists(),
+                    "no supervisor may be started where nothing could reach it"
+                );
+            }
+        }
+
+        #[test]
+        fn the_json_field_carries_state_reason_detail_and_cause() {
+            let owed = CrossFileEnrichment::withheld(
+                CrossFileShortfall::LoopbackBlocked,
+                "what is missing and what supplies it",
+            )
+            .with_cause("what the operating system said");
+            assert_eq!(
+                serde_json::to_value(owed.payload(Duration::from_millis(12))).unwrap(),
+                serde_json::json!({
+                    "state": "owed",
+                    "reason": "loopback_blocked",
+                    "detail": "what is missing and what supplies it",
+                    "cause": "what the operating system said",
+                    "elapsed_ms": 12
+                })
+            );
+
+            assert_eq!(
+                serde_json::to_value(CrossFileEnrichment::Produced.payload(Duration::from_secs(4)))
+                    .unwrap(),
+                serde_json::json!({ "state": "produced", "elapsed_ms": 4000 }),
+                "a produced run carries no reason, detail or cause to misread"
+            );
+
+            let unknown =
+                serde_json::to_value(CrossFileEnrichment::unreadable().payload(Duration::ZERO))
+                    .unwrap();
+            assert_eq!(unknown["state"], "unknown");
+            assert_eq!(unknown["reason"], "sweep_outcome_unreadable");
+            assert!(unknown.get("cause").is_none(), "{unknown}");
+        }
+
+        /// A finished sweep that fell short says which way in its reason, and
+        /// carries the line it printed as the cause, without the stderr prefix.
+        #[test]
+        fn a_finished_sweep_that_fell_short_names_its_reason_and_keeps_its_line() {
+            use super::super::{cross_file_enrichment_outcome, SkippedLanguage, SweepOwed};
+
+            let (_, nothing) = cross_file_enrichment_outcome(0, 66, 66, &[], &SweepOwed::default());
+            assert_eq!(
+                reason_of(&nothing),
+                CrossFileShortfall::SweepEnrichedNothing
+            );
+            let CrossFileEnrichment::Withheld { cause, .. } = &nothing else {
+                unreachable!("checked above")
+            };
+            let cause = cause
+                .as_deref()
+                .expect("the printed line travels as the cause");
+            assert!(
+                cause.starts_with("cross-file enrichment finished"),
+                "{cause}"
+            );
+
+            let skipped = vec![SkippedLanguage {
+                language: "rust".to_string(),
+                files: 3,
+                reason: "the `rust-analyzer` language server did not start".to_string(),
+            }];
+            let (_, unserved) =
+                cross_file_enrichment_outcome(3, 6, 3, &skipped, &SweepOwed::default());
+            assert_eq!(
+                reason_of(&unserved),
+                CrossFileShortfall::SweepLanguagesUnserved
+            );
+            let CrossFileEnrichment::Withheld { cause, .. } = &unserved else {
+                unreachable!("checked above")
+            };
+            assert!(
+                cause
+                    .as_deref()
+                    .is_some_and(|cause| cause.contains("rust-analyzer")),
+                "{cause:?}"
+            );
+        }
+
+        /// A daemon that never started is not a sweep nobody could read. The
+        /// sentence this replaced said the outcome was unknown, of a sweep that
+        /// never ran.
+        #[test]
+        fn a_daemon_that_could_not_start_is_owed_rather_than_unknown() {
+            let outcome = CrossFileEnrichment::daemon_unavailable(&"the supervisor exited");
+            let value = serde_json::to_value(outcome.payload(Duration::ZERO)).unwrap();
+            assert_eq!(value["state"], "owed");
+            assert_eq!(value["reason"], "daemon_unavailable");
+            assert_eq!(value["cause"], "the supervisor exited");
+            assert!(
+                !value["detail"].as_str().unwrap().contains("unknown"),
+                "{value}"
+            );
+        }
+
+        /// The codes are a contract a script branches on, so no two reasons
+        /// share one and none is empty. Adding a variant without listing it in
+        /// the match below fails to compile, which keeps this list whole.
+        #[test]
+        fn every_reason_has_its_own_code() {
+            use CrossFileShortfall::*;
+            let all = [
+                NotRequested,
+                DaemonSpawnDisabled,
+                LoopbackBlocked,
+                DaemonUnavailable,
+                StoreUnreadable,
+                SweepNotStarted,
+                LanguageServerUnavailable,
+                SweepEnrichedNothing,
+                SweepLanguagesUnserved,
+                SweepFilesOwed,
+                SweepBudgetSpent,
+                SweepOutcomeUnreadable,
+            ];
+            for reason in all {
+                match reason {
+                    NotRequested
+                    | DaemonSpawnDisabled
+                    | LoopbackBlocked
+                    | DaemonUnavailable
+                    | StoreUnreadable
+                    | SweepNotStarted
+                    | LanguageServerUnavailable
+                    | SweepEnrichedNothing
+                    | SweepLanguagesUnserved
+                    | SweepFilesOwed
+                    | SweepBudgetSpent
+                    | SweepOutcomeUnreadable => {}
+                }
+                let code = reason.code();
+                assert!(
+                    !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "{code}"
+                );
+                assert!(matches!(reason.state(), "owed" | "unknown"), "{reason:?}");
+            }
+            let codes: std::collections::BTreeSet<&str> =
+                all.iter().map(|reason| reason.code()).collect();
+            assert_eq!(
+                codes.len(),
+                all.len(),
+                "two reasons share a code: {codes:?}"
+            );
+        }
     }
 }

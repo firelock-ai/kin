@@ -123,13 +123,51 @@ pub struct ExecutionPolicyConfig {
     /// How Kin should handle broad external tool execution.
     #[serde(default = "default_external_tool_policy")]
     pub external_tools: ExternalToolExecutionPolicy,
+
+    /// What an agent's `kin_session_exec` may run, beyond the defaults for
+    /// the project's languages. Written as `[execution.agent]`.
+    #[serde(default, skip_serializing_if = "AgentExecConfig::is_empty")]
+    pub agent: AgentExecConfig,
 }
 
 impl Default for ExecutionPolicyConfig {
     fn default() -> Self {
         Self {
             external_tools: default_external_tool_policy(),
+            agent: AgentExecConfig::default(),
         }
+    }
+}
+
+/// The repository's own word on which toolchain commands an agent may run
+/// through `kin_session_exec`, under `[execution.agent]`:
+///
+/// ```toml
+/// [execution.agent]
+/// allow = ["make test", "just check"]
+/// languages = ["go"]
+/// ```
+///
+/// A command is allowed when its words begin with one of `allow`'s entries or
+/// match a default entry point of one of the project's languages. Shells,
+/// inline-code interpreters and file-dumping utilities stay refused whatever
+/// this says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExecConfig {
+    /// Extra command prefixes, each written as the words it starts with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// The languages whose default entry points apply, in place of the ones
+    /// Kin detects: any of `go`, `node`, `python` and `rust`. An empty list
+    /// keeps only `allow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
+}
+
+impl AgentExecConfig {
+    /// Whether nothing is configured, so the section is left out of a save.
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.languages.is_none()
     }
 }
 
@@ -1878,6 +1916,29 @@ mod tests {
         assert!(parsed.remote.refs.is_empty());
         assert!(parsed.git.remotes.is_empty());
         assert!(parsed.git.branches.is_empty());
+    }
+
+    /// `[execution.agent]` round-trips, and a config that sets nothing there
+    /// saves exactly as it did before the section existed.
+    #[test]
+    fn agent_exec_section_round_trips_and_is_absent_when_unset() {
+        let default = toml::to_string_pretty(&KinConfig::default()).unwrap();
+        assert!(!default.contains("[execution.agent]"), "{default}");
+
+        let parsed: KinConfig = toml::from_str(
+            "[execution]\nexternal_tools = \"workspace\"\n\n[execution.agent]\nallow = [\"make test\"]\nlanguages = [\"go\"]\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.execution.agent.allow, vec!["make test".to_string()]);
+        assert_eq!(
+            parsed.execution.agent.languages,
+            Some(vec!["go".to_string()])
+        );
+        let again: KinConfig = toml::from_str(&toml::to_string_pretty(&parsed).unwrap()).unwrap();
+        assert_eq!(again.execution.agent, parsed.execution.agent);
+        // An explicit empty list is kept: it means no language defaults.
+        let none: KinConfig = toml::from_str("[execution.agent]\nlanguages = []\n").unwrap();
+        assert_eq!(none.execution.agent.languages, Some(Vec::new()));
     }
 
     #[test]

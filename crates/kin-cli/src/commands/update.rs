@@ -1110,37 +1110,14 @@ async fn run_update_flow(
             "Using preflight-verified {} after matching its external byte-authority digest (release commit {}).",
             prepared.archive_name, prepared.commit_sha
         );
-        let asset = prepared.asset()?;
-        let staging = StagingDir::create(&lock)?;
-        stage_archive_locked(&lock, &staging, &prepared.archive_bytes, &asset.name, spec)?;
-        validate_staged_artifact_provenance(
-            staging.path(),
-            spec,
-            &prepared.provenance_identities,
-            true,
-        )?;
-        validate_staged_static_build_identity(staging.path(), spec, &latest, &prepared.provenance)?;
-        start_authority
-            .as_ref()
-            .context("pinned updater lost its startup authority")?
-            .verify_locked(&lock, spec)?;
-        let pending_record = restart_pending_record(
-            &kin_home,
-            &latest,
-            &prepared.provenance,
-            &prepared.provenance_identities,
-            spec,
-        )?;
-        let outcome = install_staged_bundle_locked(
+        return install_prepared_release(
             &lock,
-            &staging,
+            &prepared,
+            start_authority
+                .as_ref()
+                .context("pinned updater lost its startup authority")?,
             spec,
-            &prepared.provenance_identities,
-            &latest,
-            &pending_record,
-        )?;
-        report_successful_install(&lock, &kin_home, &latest, outcome)?;
-        return Ok(());
+        );
     }
 
     let release = resolve_release(&client, channel).await?;
@@ -1308,6 +1285,43 @@ async fn run_update_flow(
         &pending_record,
     )?;
     report_successful_install(lock, &kin_home, &latest, outcome)
+}
+
+fn install_prepared_release(
+    lock: &InstallRootLock,
+    prepared: &PreparedPinnedRelease,
+    start_authority: &UpdaterStartAuthority,
+    spec: &[ComponentSpec],
+) -> Result<()> {
+    let kin_home = lock.root();
+    let latest = prepared.version.to_string();
+    let asset = prepared.asset()?;
+    let staging = StagingDir::create(lock)?;
+    stage_archive_locked(lock, &staging, &prepared.archive_bytes, &asset.name, spec)?;
+    validate_staged_artifact_provenance(
+        staging.path(),
+        spec,
+        &prepared.provenance_identities,
+        true,
+    )?;
+    validate_staged_static_build_identity(staging.path(), spec, &latest, &prepared.provenance)?;
+    start_authority.verify_locked(lock, spec)?;
+    let pending_record = restart_pending_record(
+        kin_home,
+        &latest,
+        &prepared.provenance,
+        &prepared.provenance_identities,
+        spec,
+    )?;
+    let outcome = install_staged_bundle_locked(
+        lock,
+        &staging,
+        spec,
+        &prepared.provenance_identities,
+        &latest,
+        &pending_record,
+    )?;
+    report_successful_install(lock, kin_home, &latest, outcome)
 }
 
 /// The managed `kin` the chain re-invokes. Deliberately the installed path
@@ -1836,26 +1850,10 @@ fn probe_machine_activity(kin_home: &Path, spec: &[ComponentSpec]) -> MachineAct
     activity
 }
 
-/// Stop every managed serving executable so the unattended chain can run,
-/// instead of refusing the way the interactive preflight does.
-///
-/// Safety, in order:
-/// 1. The cooperative machine-scope sweep full uninstall already uses
-///    (workers first, supervisor last, incarnation-bound); the same
-///    reasoning applies: the update replaces the binaries every daemon on
-///    this box serves from.
-/// 2. Managed serving processes the sweep does not own (MCP stdio servers
-///    agents hold open, VFS servers) get SIGTERM. The scan matches only
-///    executables of the managed install, so nothing outside Kin's own set
-///    can be signaled, and every one of them restarts on demand (agents
-///    respawn their MCP servers, daemons autostart on next use), so the cost
-///    is a reconnect, never data: stores reopen through per-key salvage and
-///    the restart fence forces the new binary to acknowledge.
-/// 3. A bounded drain (the daemon's own shutdown escalation force-exits
-///    ~25 s after TERM, so the bound clears it), then anything still serving
-///    fails the run loudly. Updating under a live managed process is never
-///    attempted; the interactive preflight's fences all still run behind
-///    this.
+/// Stop serving executables owned by the installation being replaced. A shared
+/// supervisor may register unrelated candidate binaries, so its topology is
+/// not installation ownership. Daemon stops retain exact incarnation/image
+/// checks; an unverified or surviving daemon fails the update.
 async fn stop_managed_runtimes_for_update(
     kin_home: &Path,
     spec: &[ComponentSpec],
@@ -1881,12 +1879,8 @@ async fn stop_managed_runtimes_for_update(
             ));
         }
     }
-    match crate::commands::daemon::stop_all_quiet().await {
-        Ok(()) => actions.push("stopped managed daemons and supervisor cooperatively".to_string()),
-        // The sweep failing (no supervisor to talk to, a worker already gone)
-        // is not the verdict; the drain scan below is. Record what it said.
-        Err(error) => actions.push(format!("cooperative daemon stop reported: {error:#}")),
-    }
+    crate::commands::daemon::stop_install_owned_daemons_for_update(kin_home)?;
+    actions.push("stopped only this installation's daemon runtimes".to_string());
 
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
     let mut signaled: HashSet<u32> = HashSet::new();
@@ -1899,6 +1893,12 @@ async fn stop_managed_runtimes_for_update(
         }
         #[cfg(unix)]
         for (kind, component, pid) in &residual {
+            // Daemon shutdown requires the incarnation/image-bound path above.
+            // A newly observed daemon fails the final drain rather than gaining
+            // signal authority from a numeric PID scan.
+            if *kind == RuntimeKind::Daemon {
+                continue;
+            }
             if signaled.insert(*pid) {
                 // SAFETY: plain signal delivery to a pid this scan just
                 // matched against the managed install's own executables.
@@ -1948,25 +1948,6 @@ fn unattended_may_proceed(
             && matches!(decision, AutoDecision::Prompt(_)))
 }
 
-/// The exact chain `kin update --apply` runs, callable from the executor.
-async fn run_apply_chain() -> Result<()> {
-    run_update_flow(
-        false,
-        None,
-        None,
-        None,
-        None,
-        false,
-        false,
-        false,
-        Vec::new(),
-        true,
-        false,
-    )
-    .await?;
-    run_chain_tail()
-}
-
 /// `kin update --unattended [--force-window]`: evaluate the auto-update
 /// decision against live machine activity and act on it, reporting one
 /// machine-readable record (see [`UnattendedLedgerEntry`]).
@@ -1994,11 +1975,12 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
     let availability = async {
         let client = build_update_http_client()?;
         let release = resolve_release(&client, channel).await?;
-        parse_release_version(&release.tag_name)
+        let version = parse_release_version(&release.tag_name)?;
+        Ok::<_, anyhow::Error>((client, release, version))
     }
     .await;
-    let latest_version = match availability {
-        Ok(version) => version,
+    let (client, release, latest_version) = match availability {
+        Ok(selected) => selected,
         Err(error) => {
             // No gate ran, so there is no decision to record; the outcome is
             // the whole story.
@@ -2080,18 +2062,45 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
         entry.first_blocked_at = Some(state.first_blocked_at);
     }
 
-    match stop_managed_runtimes_for_update(&kin_home, spec).await {
-        Ok(actions) => entry.steps.extend(actions),
-        Err(error) => {
-            entry.outcome = "failed".to_string();
-            entry.error = Some(format!("{error:#}"));
-            conclude_unattended(&kin_home, &entry);
-            return Err(error);
-        }
-    }
-
     entry.to_version = update_available.then(|| latest.clone());
-    match run_apply_chain().await {
+    let applied = if update_available {
+        let preflight = async {
+            refuse_restart_marker_before_remote_preflight(&kin_home)?;
+            anyhow::ensure!(
+                transaction_dirs(&kin_home)?.is_empty(),
+                "an interrupted Kin update requires local recovery before unattended preflight"
+            );
+            let authority = UpdaterStartAuthority::capture(&kin_home, spec)?;
+            let prepared =
+                prepare_selected_release(&client, release, None, &requested_home, spec).await?;
+            Ok((authority, prepared))
+        }
+        .await;
+        apply_prepared_unattended_release(
+            &requested_home,
+            spec,
+            channel,
+            preflight,
+            &mut entry.steps,
+            || stop_managed_runtimes_for_update(&kin_home, spec),
+        )
+        .await
+        .and_then(|()| run_chain_tail())
+    } else {
+        stop_for_unattended_repair(
+            &requested_home,
+            spec,
+            UpdaterStartAuthority::capture(&kin_home, spec),
+            &mut entry.steps,
+            || stop_managed_runtimes_for_update(&kin_home, spec),
+        )
+        .await
+        // Availability already selected no new release. Repair only the
+        // retained local obligations, after dropping the parent install lock.
+        // Never discover a new candidate after services have been interrupted.
+        .and_then(|()| run_chain_tail())
+    };
+    match applied {
         Ok(()) => {
             entry.steps.extend(
                 ChainStep::ORDER
@@ -2110,6 +2119,123 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
             Err(error)
         }
     }
+}
+
+/// Repair is still a service interruption: verify the exact installed image
+/// and retained recovery authority before stopping any owned runtime.
+async fn stop_for_unattended_repair<F, Fut>(
+    requested_home: &Path,
+    spec: &[ComponentSpec],
+    authority: Result<UpdaterStartAuthority>,
+    steps: &mut Vec<String>,
+    stop: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>>>,
+{
+    let authority = authority?;
+    let lock = InstallRootLock::acquire_existing(requested_home)?;
+    authority.verify_locked(&lock, spec)?;
+    anyhow::ensure!(
+        transaction_dirs(lock.root())?.is_empty(),
+        "an interrupted Kin update requires local recovery before unattended repair; no runtime was stopped"
+    );
+    validate_unattended_pending_repair(&lock, spec, &authority)?;
+    steps.extend(stop().await?);
+    authority.verify_locked(&lock, spec)?;
+    validate_unattended_pending_repair(&lock, spec, &authority)
+}
+
+fn validate_unattended_pending_repair(
+    lock: &InstallRootLock,
+    spec: &[ComponentSpec],
+    authority: &UpdaterStartAuthority,
+) -> Result<()> {
+    if let Some(record) = read_existing_mcp_repair_record(lock)? {
+        validate_mcp_repair_targets_not_reserved(&record, lock.root())?;
+    }
+    #[cfg(unix)]
+    let record = {
+        let install = lock.install()?;
+        match install.root.stat_entry(RESTART_ACK_REQUIRED_FILE)? {
+            None => None,
+            Some(_) => {
+                let bytes = install
+                    .root
+                    .read_regular(RESTART_ACK_REQUIRED_FILE, "restart acknowledgement marker")?;
+                anyhow::ensure!(
+                    install
+                        .root
+                        .identity(RESTART_ACK_REQUIRED_FILE, "restart acknowledgement marker")?
+                        .as_ref()
+                        == Some(&bytes_identity(&bytes)),
+                    "restart acknowledgement marker changed while it was read"
+                );
+                Some(
+                    serde_json::from_slice::<RestartPending>(&bytes)
+                        .context("invalid restart acknowledgement marker")?,
+                )
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let record = LockedPrivateMarker::open(
+        &restart_pending_path(lock.root()),
+        "restart acknowledgement marker",
+    )?
+    .map(|marker| {
+        serde_json::from_slice::<RestartPending>(&marker.bytes)
+            .context("invalid restart acknowledgement marker")
+    })
+    .transpose()?;
+    if let Some(record) = record {
+        validate_restart_record_ready(&record)?;
+        let build = &authority.executing.build;
+        validate_restart_ack_identity(
+            &record,
+            &build.version,
+            &build.commit,
+            &build.dependency_provenance,
+        )?;
+        validate_runtime_commit_fence(&record, lock.root(), spec)?;
+    }
+    Ok(())
+}
+
+/// A failed complete preflight or changed installed generation cannot reach
+/// the stop callback. Retain the install lock from that check through commit.
+async fn apply_prepared_unattended_release<F, Fut>(
+    requested_home: &Path,
+    spec: &[ComponentSpec],
+    channel: Channel,
+    preflight: Result<(UpdaterStartAuthority, PreparedPinnedRelease)>,
+    steps: &mut Vec<String>,
+    stop: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>>>,
+{
+    let (authority, prepared) = preflight?;
+    let lock = InstallRootLock::acquire_existing(requested_home)?;
+    refuse_new_update_while_restart_marker_exists(&lock)?;
+    authority.verify_locked(&lock, spec)?;
+    ensure_pinned_channel_unchanged(
+        channel,
+        effective_channel(None, UpdateConfig::load_from(lock.root()).channel),
+    )?;
+    anyhow::ensure!(
+        transaction_dirs(lock.root())?.is_empty(),
+        "an interrupted Kin update appeared during unattended preflight; no runtime was stopped"
+    );
+    validate_unattended_pending_repair(&lock, spec, &authority)?;
+    steps.extend(stop().await?);
+    ensure_no_active_managed_runtimes(lock.root(), spec)?;
+    authority.verify_locked(&lock, spec)?;
+    cleanup_stale_staging_dirs(&lock)?;
+    attempt_pending_mcp_repair(&lock)?;
+    install_prepared_release(&lock, &prepared, &authority, spec)
 }
 
 fn report_successful_install(
@@ -2239,27 +2365,41 @@ async fn prepare_pinned_release(
     spec: &[ComponentSpec],
 ) -> Result<PreparedPinnedRelease> {
     let release = resolve_release(client, channel).await?;
+    prepare_selected_release(client, release, Some(expectation), requested_home, spec).await
+}
+
+async fn prepare_selected_release(
+    client: &reqwest::Client,
+    release: GithubRelease,
+    expectation: Option<&ReleaseExpectation>,
+    requested_home: &Path,
+    spec: &[ComponentSpec],
+) -> Result<PreparedPinnedRelease> {
     let version = parse_release_version(&release.tag_name)?;
     let archive_name = current_platform_asset_name()?;
     let asset = find_release_asset(&release, &archive_name)?.clone();
     let commit_sha = resolve_release_commit(client, &release.tag_name).await?;
-    expectation.validate_selected_release(&version, &commit_sha)?;
+    if let Some(expectation) = expectation {
+        expectation.validate_selected_release(&version, &commit_sha)?;
+    }
 
-    println!("Downloading {} for pinned preflight...", asset.name);
+    println!("Downloading {} for release preflight...", asset.name);
     let archive_response = client
         .get(&asset.browser_download_url)
         .send()
         .await
-        .context("failed to download pinned release archive")?;
+        .context("failed to download release archive for preflight")?;
     let archive_bytes = read_bounded_response(
         archive_response,
         MAX_RELEASE_ARCHIVE_BYTES,
-        "pinned release archive",
+        "release preflight archive",
     )
     .await?;
 
-    println!("Verifying pinned archive against its external byte-authority digest...");
-    expectation.validate_archive_bytes(&archive_bytes)?;
+    if let Some(expectation) = expectation {
+        println!("Verifying pinned archive against its external byte-authority digest...");
+        expectation.validate_archive_bytes(&archive_bytes)?;
+    }
     println!("Verifying co-published release checksum and provenance...");
     verify_archive_checksum(client, &release, &asset.name, &archive_bytes).await?;
     let provenance = fetch_artifact_provenance(client, &release, &asset).await?;
@@ -2688,6 +2828,12 @@ fn attempt_pending_mcp_repair(lock: &InstallRootLock) -> Result<bool> {
     })?;
     for path in repaired {
         eprintln!("Refreshed Kin MCP launcher: {}", path.display());
+    }
+    // A Kin-managed instruction block names the tools of the profile its
+    // client carried when it was written, and the repair above can move that
+    // profile forward, so the block follows it.
+    for line in crate::commands::setup::refresh_discovery_blocks() {
+        eprintln!("{line}");
     }
     Ok(true)
 }
@@ -19433,6 +19579,228 @@ cwd = {:?}
         refuse_restart_marker_before_remote_preflight(&absent_home).unwrap();
         assert_eq!(install_tree_snapshot(temp.path()), before);
         assert!(!absent_home.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unattended_repair_refuses_invalid_local_authority_before_shutdown() {
+        for failure in [
+            "changed-install",
+            "transaction",
+            "restart-marker",
+            "mcp-marker",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let kin_home = temp.path().join("kin-home");
+            write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+            let managed_cli = kin_home.join("bin/kin");
+            fs::copy(std::env::current_exe().unwrap(), &managed_cli).unwrap();
+            let authority =
+                UpdaterStartAuthority::capture_test_file(&kin_home, LINUX_COMPONENTS, &managed_cli)
+                    .unwrap();
+            let expected_error = match failure {
+                "changed-install" => {
+                    fs::write(kin_home.join("bin/kin-daemon"), b"concurrent replacement").unwrap();
+                    "bundle generation changed"
+                }
+                "transaction" => {
+                    fs::create_dir(
+                        kin_home.join(format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4())),
+                    )
+                    .unwrap();
+                    "requires local recovery"
+                }
+                "restart-marker" => {
+                    fs::write(
+                        restart_pending_path(&kin_home),
+                        b"invalid restart authority",
+                    )
+                    .unwrap();
+                    "invalid restart acknowledgement marker"
+                }
+                "mcp-marker" => {
+                    fs::write(
+                        mcp_repair_pending_path(&kin_home),
+                        b"invalid repair authority",
+                    )
+                    .unwrap();
+                    "invalid or unsupported MCP repair pending marker"
+                }
+                _ => unreachable!(),
+            };
+            // Acquire before the snapshot: creating the normal install lock is
+            // allowed, changing any bundle or recovery evidence is not.
+            drop(InstallRootLock::acquire_existing(&kin_home).unwrap());
+            let before = install_tree_snapshot(&kin_home);
+            let stopped = std::cell::Cell::new(false);
+            let mut steps = Vec::new();
+            let error = stop_for_unattended_repair(
+                &kin_home,
+                LINUX_COMPONENTS,
+                Ok(authority),
+                &mut steps,
+                || async {
+                    stopped.set(true);
+                    Ok(Vec::new())
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{failure}: {error:#}"
+            );
+            assert!(!stopped.get(), "{failure} reached shutdown");
+            assert!(steps.is_empty());
+            assert_eq!(install_tree_snapshot(&kin_home), before, "{failure}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unattended_repair_accepts_a_verified_retained_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let kin_home = temp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let managed_cli = kin_home.join("bin/kin");
+        fs::copy(std::env::current_exe().unwrap(), &managed_cli).unwrap();
+        let authority =
+            UpdaterStartAuthority::capture_test_file(&kin_home, LINUX_COMPONENTS, &managed_cli)
+                .unwrap();
+        let build = &authority.executing.build;
+        let mut record = test_restart_pending(&build.version);
+        record.kin_commit = build.commit.clone();
+        record.dependency_provenance = build.dependency_provenance.clone();
+        record.schema_version = RESTART_MARKER_SCHEMA_VERSION;
+        record.reason = RESTART_FENCE_REASON.into();
+        record.runtime_obligations.clear();
+        record.commit_runtime_fence = Some(Vec::new());
+        let bytes = serde_json::to_vec(&record).unwrap();
+        fs::write(restart_pending_path(&kin_home), &bytes).unwrap();
+        let stopped = std::cell::Cell::new(false);
+        let mut steps = Vec::new();
+        stop_for_unattended_repair(
+            &kin_home,
+            LINUX_COMPONENTS,
+            Ok(authority),
+            &mut steps,
+            || async {
+                stopped.set(true);
+                Ok(vec!["owned stop".into()])
+            },
+        )
+        .await
+        .unwrap();
+        assert!(stopped.get());
+        assert_eq!(steps, ["owned stop"]);
+        assert_eq!(fs::read(restart_pending_path(&kin_home)).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unattended_changed_install_never_reaches_runtime_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let kin_home = temp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let managed_cli = kin_home.join("bin/kin");
+        fs::copy(std::env::current_exe().unwrap(), &managed_cli).unwrap();
+        let authority =
+            UpdaterStartAuthority::capture_test_file(&kin_home, LINUX_COMPONENTS, &managed_cli)
+                .unwrap();
+        let identity = test_static_build_identity();
+        let (archive, provenance, identities) = pinned_probe_fixture(
+            bytes_with_static_build_identity(b"candidate cli", &identity),
+            bytes_with_static_build_identity(b"candidate daemon", &identity),
+        );
+        let archive_name = "kin-linux-x86_64.tar.gz";
+        validate_pinned_preflight_build_identity(
+            &kin_home,
+            &archive,
+            archive_name,
+            LINUX_COMPONENTS,
+            "0.2.22",
+            &provenance,
+            &identities,
+        )
+        .unwrap();
+        let prepared = PreparedPinnedRelease {
+            release: GithubRelease {
+                tag_name: "v0.2.22".into(),
+                prerelease: false,
+                assets: vec![GithubAsset {
+                    name: archive_name.into(),
+                    browser_download_url: "https://example.invalid/never-read".into(),
+                }],
+            },
+            version: Version::parse("0.2.22").unwrap(),
+            commit_sha: "a".repeat(40),
+            archive_name: archive_name.into(),
+            archive_bytes: archive,
+            provenance,
+            provenance_identities: identities,
+        };
+        fs::write(kin_home.join("bin/kin-daemon"), b"newer concurrent install").unwrap();
+        let newer = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
+        let stopped = std::cell::Cell::new(false);
+        let mut steps = Vec::new();
+        let error = apply_prepared_unattended_release(
+            &kin_home,
+            LINUX_COMPONENTS,
+            Channel::Stable,
+            Ok((authority, prepared)),
+            &mut steps,
+            || async {
+                stopped.set(true);
+                Ok(Vec::new())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("bundle generation changed"));
+        assert!(!stopped.get());
+        assert!(steps.is_empty());
+        assert_bundle_matches(&kin_home, LINUX_COMPONENTS, &newer);
+        assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unattended_incomplete_archive_never_reaches_runtime_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let kin_home = temp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let before = install_tree_snapshot(&kin_home);
+        let staging = temp.path().join("preflight");
+        fs::create_dir(&staging).unwrap();
+        let archive = make_tar_gz(&[("kin", b"candidate without daemon")]);
+        let failure = stage_archive(
+            &archive,
+            "kin-linux-x86_64.tar.gz",
+            &staging,
+            LINUX_COMPONENTS,
+        )
+        .expect_err("an incomplete archive must fail complete preflight");
+        assert!(format!("{failure:#}").contains("required component"));
+        let stopped = std::cell::Cell::new(false);
+        let mut steps = Vec::new();
+        let error = apply_prepared_unattended_release(
+            &kin_home,
+            LINUX_COMPONENTS,
+            Channel::Stable,
+            Err(failure),
+            &mut steps,
+            || async {
+                stopped.set(true);
+                Ok(Vec::new())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("required component"));
+        assert!(!stopped.get());
+        assert!(steps.is_empty());
+        assert_eq!(install_tree_snapshot(&kin_home), before);
+        assert!(!kin_home.join("update.lock").exists());
     }
 
     #[cfg(unix)]

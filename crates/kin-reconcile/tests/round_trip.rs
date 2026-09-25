@@ -74,6 +74,22 @@ fn added_entities(delta: &TransactionDelta) -> Vec<&Entity> {
         .collect()
 }
 
+/// The declarations a reconcile added, without the file's module surface.
+///
+/// A source file that produced a declaration or an import contributes one
+/// `Module` entity standing for the file itself, which is the endpoint an
+/// entity-level import edge is sourced at. A file that produced neither
+/// contributes no entity at all, surface included, so the parse-coverage
+/// census counts and names it. These cases are about the declarations inside
+/// the file, so the surface is filtered out here rather than by index, which
+/// is also what stops a test from taking `added[0]` and getting the surface.
+fn added_declarations(delta: &TransactionDelta) -> Vec<&Entity> {
+    added_entities(delta)
+        .into_iter()
+        .filter(|entity| entity.kind != kin_model::EntityKind::Module)
+        .collect()
+}
+
 fn modified_entities(delta: &TransactionDelta) -> Vec<(&Entity, &Entity)> {
     delta
         .entity_deltas
@@ -419,12 +435,12 @@ fn full_round_trip_edit_reconcile_verify() {
     let reconcile1 = reconciler
         .reconcile_file_change(&event, &blob_store, &graph)
         .expect("first reconcile should succeed");
-    let added1 = added_entities(&reconcile1.delta);
+    let added1 = added_declarations(&reconcile1.delta);
 
     assert_eq!(
         added1.len(),
         1,
-        "expected exactly 1 new entity from first reconcile"
+        "expected exactly 1 new declaration from first reconcile"
     );
     let stable_id = added1[0].id;
     let original_entity = added1[0].clone();
@@ -446,7 +462,7 @@ fn full_round_trip_edit_reconcile_verify() {
         .expect("second reconcile after edit should succeed");
 
     // Step 5: Verify the exact transaction reflects the change.
-    let added2 = added_entities(&reconcile2.delta);
+    let added2 = added_declarations(&reconcile2.delta);
     let modified2 = modified_entities(&reconcile2.delta);
     assert!(added2.is_empty(), "no new entities should be added on edit");
     assert_eq!(modified2.len(), 1, "exactly 1 entity should be modified");
@@ -520,7 +536,8 @@ fn comprehensive_round_trip_with_projection_and_verify() {
             removed,
             ..
         } => {
-            assert_eq!(added.len(), 2, "expected 2 entities from first reconcile");
+            // Two declarations plus the file's own module surface.
+            assert_eq!(added.len(), 3, "expected 3 entities from first reconcile");
             assert!(modified.is_empty(), "no modifications on first reconcile");
             assert!(removed.is_empty(), "no removals on first reconcile");
         }
@@ -528,7 +545,7 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     }
 
     // All added entities must have blob_hash in metadata.
-    let added1 = added_entities(&reconcile1.delta);
+    let added1 = added_declarations(&reconcile1.delta);
     for entity in &added1 {
         assert!(
             entity.metadata.extra.contains_key("blob_hash"),
@@ -559,8 +576,11 @@ fn comprehensive_round_trip_with_projection_and_verify() {
         .fingerprint
         .clone();
 
-    // Commit entities to the graph.
-    for entity in &added1 {
+    // Commit entities to the graph. Every added entity, the file's module
+    // surface included, or the next reconcile sees the one left out as new and
+    // the idempotence claim below fails on a commit gap rather than on a
+    // reconcile defect.
+    for entity in added_entities(&reconcile1.delta) {
         graph.upsert_entity(entity).expect("upsert must succeed");
     }
 
@@ -575,7 +595,7 @@ fn comprehensive_round_trip_with_projection_and_verify() {
 
     // alpha changed semantically. Beta's semantic fingerprint is unchanged, but
     // its source span and containing blob provenance move because alpha grew.
-    let added2 = added_entities(&reconcile2.delta);
+    let added2 = added_declarations(&reconcile2.delta);
     let modified2 = modified_entities(&reconcile2.delta);
     let removed2 = removed_entities(&reconcile2.delta);
     assert!(
@@ -676,7 +696,7 @@ fn reconcile_transaction_rollback_on_error() {
         .reconcile_file_change(&event, &blob_store, &graph)
         .expect("first reconcile should succeed");
 
-    assert_eq!(added_entities(&first.delta).len(), 1);
+    assert_eq!(added_declarations(&first.delta).len(), 1);
     let first_delta = first.delta.clone();
     let lkg_len = reconciler.lkg().len();
 
@@ -723,12 +743,13 @@ fn reconcile_then_project_uses_stable_ids() {
         .expect("first reconcile should succeed");
 
     // One entity (fn foo) should have been added.
-    let added1 = added_entities(&reconcile1.delta);
-    assert_eq!(added1.len(), 1, "expected 1 new entity");
+    let added1 = added_declarations(&reconcile1.delta);
+    assert_eq!(added1.len(), 1, "expected 1 new declaration");
     let stable_id = added1[0].id;
 
-    // Commit the entity to the graph so it is "existing" for the next reconcile.
-    for entity in added1 {
+    // Commit every added entity to the graph, the file's module surface
+    // included, so all of them are "existing" for the next reconcile.
+    for entity in added_entities(&reconcile1.delta) {
         graph.upsert_entity(entity).expect("upsert must succeed");
     }
 

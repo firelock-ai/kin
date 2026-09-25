@@ -24,8 +24,8 @@ async fn graph_only_repair_fixture() -> (tempfile::TempDir, Arc<DaemonState>, En
         b"// shifted\npub fn target() -> u32 { 11 }\n\npub fn caller() -> u32 { target() }\n"
             .to_vec();
     std::fs::write(&host, &changed).unwrap();
-    let admission = exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
-    crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(&admission.deltas));
+    // The publication records the parse it owes inside its own commit.
+    exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
     assert_eq!(
         state
             .graph

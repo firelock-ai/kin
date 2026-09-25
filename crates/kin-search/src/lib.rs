@@ -35,10 +35,10 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -731,6 +731,102 @@ pub(crate) mod segment_decode_observer {
     }
 }
 
+/// What a read-back of an image this index wrote failed on, without the
+/// corrupt-index framing.
+fn read_back_failure(error: SearchError) -> String {
+    match error {
+        SearchError::CorruptIndex { reason, .. } => reason,
+        other => other.to_string(),
+    }
+}
+
+/// Why a write fails when the image it just published cannot be mapped back.
+///
+/// A writer never archives. The image is the one this write fsynced and named
+/// a moment earlier. A segment may be temporarily unavailable or the read may
+/// have failed for a transient reason. Moving the manifest
+/// aside here would destroy the only record of what was written on the strength
+/// of one failed read, and a store whose directory is being removed would have
+/// a manifest renamed inside it. So the write fails and leaves the files as they
+/// are. A mapped store must map that image again before its next write; a
+/// converting heap store still retains its complete corpus. The next open
+/// owns recovery: it archives only what it still cannot read.
+fn written_image_unreadable(error: SearchError) -> SearchError {
+    SearchError::IndexError(format!(
+        "the text index commit published its image but could not map it back ({}); nothing \
+         was moved aside; the published files are preserved for retry or recovery",
+        read_back_failure(error)
+    ))
+}
+
+/// Why a read of the committed state refuses while its image is unmapped.
+///
+/// One sentence for every such read, so a caller can tell this refusal from any
+/// other by its words and knows it does not have to write to end it.
+fn unmapped_read_refused(what: &str) -> SearchError {
+    SearchError::IndexError(format!(
+        "the text index image the last commit published could not be mapped back, so {what} \
+         is refused until it maps again; every read retries once the image's files are readable"
+    ))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once, on the committing thread, after a mapped commit publishes its
+    /// image and before it maps that image back. A test uses it to stand in for
+    /// another writer that publishes into the same directory in that window.
+    static BEFORE_READ_BACK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_before_read_back_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_READ_BACK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Run the hook a test installed on this thread, if any. Outside tests this
+/// does nothing.
+///
+/// The hook leaves its slot before it runs, so a commit the hook makes itself
+/// finds the slot empty rather than still borrowed.
+fn run_before_read_back_hook() {
+    #[cfg(test)]
+    {
+        let hook = BEFORE_READ_BACK_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once, on the opening thread, after a mapped open has read its
+    /// manifest and before it maps the segments that manifest names. A test
+    /// uses it to stand in for a writer that publishes and reclaims segments in
+    /// that window.
+    static BEFORE_SEGMENTS_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_before_segments_open_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_SEGMENTS_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Run the segments-open hook a test installed on this thread, if any. Outside
+/// tests this does nothing. Like the read-back hook it leaves its slot first,
+/// so an open the hook causes itself finds the slot empty.
+fn run_before_segments_open_hook() {
+    #[cfg(test)]
+    {
+        let hook = BEFORE_SEGMENTS_OPEN_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 fn corrupt_index_error(storage_path: &Path, reason: String, archive: bool) -> SearchError {
     let archived = if archive {
         archive_corrupt_index(storage_path)
@@ -1228,8 +1324,9 @@ pub struct TextIndex<Id: DocId = u64> {
     ///
     /// EXACTLY ONE backend holds the committed state. When this is `Some` the
     /// heap maps above are empty and every read comes from the mapping; when it
-    /// is `None` the heap holds it, which is a store with no path at all and a
-    /// v3 or v4 store before its first commit converts it. Two live backends
+    /// is `None` the heap holds it, except for the explicit `image_unmapped`
+    /// refusal state below. Heap stores include a store with no path at all
+    /// and a v3 or v4 store before its first commit converts it. Two live backends
     /// would mean every query merging two answers, and the identity guard would
     /// then be proving something about a merge rather than about the format.
     ///
@@ -1237,6 +1334,26 @@ pub struct TextIndex<Id: DocId = u64> {
     /// pending delta never has to participate in a query. That is what keeps the
     /// dispatch a choice rather than a join.
     mapped: RwLock<Option<MappedIndex<Id>>>,
+    /// Set when a commit published its image but could not map it back.
+    ///
+    /// The committed state is then that image on disk, and neither backend
+    /// holds it: the mapping was dropped, and the heap is empty by design on a
+    /// mapped store. Every write maps the image again before it does anything
+    /// else and fails while that still fails, because the heap path would
+    /// otherwise publish the empty heap over the store. Every read of the
+    /// committed state refuses in that window rather than answer from the
+    /// empty heap, and tries to map the image again first (see
+    /// [`remap_if_unmapped`](Self::remap_if_unmapped)). A rebuild clears it,
+    /// since the heap then holds the whole corpus.
+    image_unmapped: AtomicBool,
+    /// The image a read last tried and failed to map while `image_unmapped`
+    /// was set, so an unchanged image is not mapped again on every read.
+    last_failed_remap: Mutex<Option<mapped::ImageProbe>>,
+    /// How many times a read tried to map an unmapped image. Only a test reads
+    /// it, to prove an image that failed once is not mapped again until one of
+    /// its files changes.
+    #[cfg(test)]
+    read_remap_attempts: AtomicU64,
 }
 
 impl<Id: DocId> Default for TextIndex<Id> {
@@ -1262,6 +1379,10 @@ impl<Id: DocId> TextIndex<Id> {
             index_epoch: AtomicU64::new(0),
             trigram: RwLock::new(None),
             mapped: RwLock::new(None),
+            image_unmapped: AtomicBool::new(false),
+            last_failed_remap: Mutex::new(None),
+            #[cfg(test)]
+            read_remap_attempts: AtomicU64::new(0),
         }
     }
 
@@ -1303,7 +1424,13 @@ impl<Id: DocId> TextIndex<Id> {
         *self.graph_root_hash.write() = Some(graph_root_hash);
     }
 
-    /// Return the number of committed documents currently visible to search.
+    /// Return the number of committed documents.
+    ///
+    /// While the committed image is unmapped this is still that image's count,
+    /// the one the last commit published, although every read of the documents
+    /// themselves refuses until the image maps again. A caller that needs to
+    /// know whether the documents can be read asks
+    /// [`remap_if_unmapped`](Self::remap_if_unmapped).
     pub fn live_document_count(&self) -> usize {
         if let Some(mapped) = self.mapped.read().as_ref() {
             return mapped.live_document_count();
@@ -1319,9 +1446,23 @@ impl<Id: DocId> TextIndex<Id> {
     /// `[depthwise, conv]`) is only as specific as its rarest token, so we take
     /// the minimum across tokens. Returns 0 when no token of the term is indexed
     /// (the caller treats 0 as "unknown" and falls back to its default weight).
-    pub fn doc_frequency(&self, term: &str) -> usize {
-        if let Some(mapped) = self.mapped.read().as_ref() {
-            return mapped.doc_frequency(term);
+    ///
+    /// Refuses while the committed image is unmapped, because the heap it would
+    /// otherwise count is empty by design on a mapped store and every term
+    /// would come back 0. It does not try to map the image itself: it serves
+    /// indexes whose ids cannot be serialised, and those are never mapped.
+    /// [`remap_if_unmapped`](Self::remap_if_unmapped) and every serialising
+    /// read do.
+    pub fn doc_frequency(&self, term: &str) -> Result<usize, SearchError> {
+        // The backend guard is held across the mark check for the reason
+        // `fuzzy_search` gives: the failed writer sets the mark before it drops
+        // its mapping, so a reader that finds no mapping also finds the mark.
+        let mapped_guard = self.mapped.read();
+        if let Some(mapped) = mapped_guard.as_ref() {
+            return Ok(mapped.doc_frequency(term));
+        }
+        if self.image_unmapped.load(Ordering::Acquire) {
+            return Err(unmapped_read_refused("a document frequency read"));
         }
         let index = self.index.read();
         let mut min_df: Option<usize> = None;
@@ -1331,7 +1472,7 @@ impl<Id: DocId> TextIndex<Id> {
                 min_df = Some(min_df.map_or(df, |m| m.min(df)));
             }
         }
-        min_df.unwrap_or(0)
+        Ok(min_df.unwrap_or(0))
     }
 
     fn with_path(path: Option<PathBuf>) -> Self {
@@ -1349,6 +1490,10 @@ impl<Id: DocId> TextIndex<Id> {
             index_epoch: AtomicU64::new(0),
             trigram: RwLock::new(None),
             mapped: RwLock::new(None),
+            image_unmapped: AtomicBool::new(false),
+            last_failed_remap: Mutex::new(None),
+            #[cfg(test)]
+            read_remap_attempts: AtomicU64::new(0),
         }
     }
 
@@ -1687,6 +1832,7 @@ impl<Id: DocId> TextIndex<Id> {
         // the rebuild would be silently discarded. That is the path kin-db takes
         // to rebuild the text index from the graph.
         *self.mapped.write() = None;
+        self.image_unmapped.store(false, Ordering::Release);
         self.mark_all_segments_dirty();
         drop(staged_guard);
 
@@ -1769,6 +1915,7 @@ impl<Id: DocId> TextIndex<Id> {
         // the rebuild would be silently discarded. That is the path kin-db takes
         // to rebuild the text index from the graph.
         *self.mapped.write() = None;
+        self.image_unmapped.store(false, Ordering::Release);
         self.mark_all_segments_dirty();
         drop(staged_guard);
 
@@ -1807,6 +1954,11 @@ impl<Id: DocId> TextIndex<Id> {
         let _span = tracing::info_span!("kin_search.commit", staged = self.staged.read().is_some())
             .entered();
         let mut staged_guard = self.staged.write();
+        if self.image_unmapped.load(Ordering::Acquire) {
+            // Before `take`, so a commit that still cannot map the image keeps
+            // its staged changes for the next one.
+            self.map_unmapped_image(StagedHeld::writing(&staged_guard))?;
+        }
         if self.mapped.read().is_some() {
             let state = staged_guard.take();
             return self.commit_mapped(state);
@@ -1938,28 +2090,85 @@ impl<Id: DocId> TextIndex<Id> {
             })?;
 
         drop(mapped_guard);
-        // The disk is already the new image, so the mapping in hand is stale
-        // whatever happens next. Dropping it before the reopen means a failure
-        // cannot leave a handle that folds the OLD image into the next commit
-        // and silently reverts what this one just wrote.
-        *self.mapped.write() = None;
-        let reopened = MappedIndex::open_archiving(path, true)?;
-        if reopened.live_document_count() != doc_count
-            || reopened.total_doc_length() != total_doc_length
-        {
-            return Err(SearchError::IndexError(format!(
+        run_before_read_back_hook();
+        // The disk is already the new image. Readers keep the old mapping, the
+        // committed state before this commit, until the new one is mapped. When
+        // it cannot be, the old mapping is dropped rather than kept, so no later
+        // commit folds the old image in and reverts what this one wrote, and the
+        // handle is marked unmapped so the next write maps the image again
+        // instead of publishing the empty heap over it.
+        let failure = match MappedIndex::open_archiving(path, false) {
+            Ok(reopened)
+                if reopened.live_document_count() == doc_count
+                    && reopened.total_doc_length() == total_doc_length =>
+            {
+                *self.mapped.write() = Some(reopened);
+                *self.doc_count.write() = doc_count;
+                *self.total_doc_length.write() = total_doc_length;
+                self.index_epoch.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            Ok(reopened) => SearchError::IndexError(format!(
                 "the image just written holds {} documents of {} tokens and the write reported {} \
                  of {}",
                 reopened.live_document_count(),
                 reopened.total_doc_length(),
                 doc_count,
                 total_doc_length
-            )));
-        }
-        *self.mapped.write() = Some(reopened);
+            )),
+            Err(error) => written_image_unreadable(error),
+        };
+        self.image_unmapped.store(true, Ordering::Release);
+        // A new episode: whatever a read failed to map in an earlier one says
+        // nothing about this image.
+        *self.last_failed_remap.lock() = None;
+        *self.mapped.write() = None;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
         self.index_epoch.fetch_add(1, Ordering::Relaxed);
+        Err(failure)
+    }
+
+    /// Map the image a commit published but could not read back, before this
+    /// handle writes anything else.
+    ///
+    /// Opened without archiving, like every read-back of an image this index
+    /// wrote. On failure nothing changes, the mark stays, and the caller's
+    /// staged changes are still staged.
+    fn map_unmapped_image(&self, _staged: StagedHeld<'_>) -> Result<(), SearchError>
+    where
+        Id: Serialize + DeserializeOwned,
+    {
+        let Some(path) = self.path.as_ref() else {
+            return Err(SearchError::IndexError(
+                "the published text index image has no storage path; this write changes nothing"
+                    .to_string(),
+            ));
+        };
+        let reopened = MappedIndex::open_archiving(path, false).map_err(|error| {
+            SearchError::IndexError(format!(
+                "the text index image the last commit published still cannot be mapped back \
+                 ({}); this write changes nothing and staged changes stay staged",
+                read_back_failure(error)
+            ))
+        })?;
+        let expected_docs = *self.doc_count.read();
+        let expected_length = *self.total_doc_length.read();
+        if reopened.live_document_count() != expected_docs
+            || reopened.total_doc_length() != expected_length
+        {
+            return Err(SearchError::IndexError(format!(
+                "the text index image still disagrees with the last publication: {} documents \
+                 of {} tokens, expected {expected_docs} of {expected_length}; this write changes \
+                 nothing and staged changes stay staged",
+                reopened.live_document_count(),
+                reopened.total_doc_length()
+            )));
+        }
+        *self.mapped.write() = Some(reopened);
+        self.index_epoch.fetch_add(1, Ordering::Relaxed);
+        self.image_unmapped.store(false, Ordering::Release);
+        *self.last_failed_remap.lock() = None;
         Ok(())
     }
 }
@@ -1979,12 +2188,76 @@ where
     // holding a non-serialisable id keeps every other method, including
     // `live_document_count` and `doc_frequency`, which need neither.
 
-    /// Whether a committed document with this ID is currently visible to search.
-    pub fn contains(&self, doc_id: &Id) -> bool {
-        if let Some(mapped) = self.mapped.read().as_ref() {
-            return mapped.contains(doc_id);
+    /// Map the committed image again if a failed read-back left it unmapped and
+    /// its files are readable now, and say whether the committed state can be
+    /// read.
+    ///
+    /// Only a commit used to try this, so an idle store stayed refused after
+    /// the missing file came back, until something happened to write. Every
+    /// serialising read calls it first instead, which is why it has to stay
+    /// cheap:
+    ///
+    /// - While the committed state is readable it is one atomic load.
+    /// - While a file the manifest names is still missing it reads the manifest
+    ///   and checks that each named segment exists, and maps nothing.
+    /// - It never waits behind a writer. A reader that finds `staged` taken
+    ///   leaves the attempt to that writer, and a commit maps the image before
+    ///   it writes anything anyway.
+    /// - An image it already failed to map is not mapped again until one of its
+    ///   files changes, so an intact image that still disagrees with the last
+    ///   publication costs one mapping, not one per read.
+    ///
+    /// It maps under the staged write guard, the lock every write takes first,
+    /// so it cannot interleave with a commit, a rebuild or an explicit persist
+    /// that checks the mark. It writes nothing to disk and archives nothing: the
+    /// image is opened the way every read-back opens it.
+    pub fn remap_if_unmapped(&self) -> bool {
+        if !self.image_unmapped.load(Ordering::Acquire) {
+            return true;
         }
-        self.docs.read().contains_key(doc_id)
+        let Some(path) = self.path.as_ref() else {
+            return false;
+        };
+        let Some(probe) = mapped::probe_image(path) else {
+            return false;
+        };
+        let failed_before = self.last_failed_remap.lock().as_ref() == Some(&probe);
+        if failed_before {
+            return false;
+        }
+        let Some(staged) = self.staged.try_write() else {
+            return false;
+        };
+        if !self.image_unmapped.load(Ordering::Acquire) {
+            return true;
+        }
+        #[cfg(test)]
+        self.read_remap_attempts.fetch_add(1, Ordering::Relaxed);
+        match self.map_unmapped_image(StagedHeld::writing(&staged)) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(%error, "the unmapped text index image still cannot be mapped");
+                *self.last_failed_remap.lock() = Some(probe);
+                false
+            }
+        }
+    }
+
+    /// Whether a committed document with this ID is currently visible to search.
+    ///
+    /// Refuses while the committed image is unmapped rather than answer `false`
+    /// for every id from the empty heap, after trying to map it again.
+    pub fn contains(&self, doc_id: &Id) -> Result<bool, SearchError> {
+        self.remap_if_unmapped();
+        // Held across the mark check for the reason `fuzzy_search` gives.
+        let mapped_guard = self.mapped.read();
+        if let Some(mapped) = mapped_guard.as_ref() {
+            return Ok(mapped.contains(doc_id));
+        }
+        if self.image_unmapped.load(Ordering::Acquire) {
+            return Err(unmapped_read_refused("a membership read"));
+        }
+        Ok(self.docs.read().contains_key(doc_id))
     }
 
     /// Search across indexed documents.
@@ -2002,8 +2275,18 @@ where
             limit = limit
         )
         .entered();
-        if let Some(mapped) = self.mapped.read().as_ref() {
+        // Before the backend guard, because a remap takes `staged` and then
+        // writes `mapped`, and holding `mapped` here first would invert that.
+        self.remap_if_unmapped();
+        // Keep the backend guard while deciding whether a heap read is valid.
+        // The failed writer sets the flag before dropping its mapping, so a
+        // reader must not check the flag first and then miss that transition.
+        let mapped_guard = self.mapped.read();
+        if let Some(mapped) = mapped_guard.as_ref() {
             return mapped.fuzzy_search(query_str, limit);
+        }
+        if self.image_unmapped.load(Ordering::Acquire) {
+            return Err(unmapped_read_refused("search"));
         }
         let query_tokens = tokenize(query_str);
         if query_tokens.is_empty() {
@@ -2787,6 +3070,13 @@ where
                     .to_string(),
             ));
         }
+        if self.image_unmapped.load(Ordering::Acquire) {
+            return Err(SearchError::IndexError(
+                "this index's committed image is on disk but not mapped; a commit maps it again, \
+                 and persisting the empty heap side here would publish an empty image over it"
+                    .to_string(),
+            ));
+        }
         let storage_path = storage_file_path_for(path);
         self.write_mapped_image(&storage_path, StagedHeld::reading(&staged))?;
         // The image at this path is now somebody else's, so this handle's delta
@@ -2870,7 +3160,7 @@ where
         staged: StagedHeld<'_>,
     ) -> Result<(), SearchError> {
         let (doc_count, total_doc_length) = self.write_mapped_image(path, staged)?;
-        let mapped = MappedIndex::open_archiving(path, true)?;
+        let mapped = MappedIndex::open_archiving(path, false).map_err(written_image_unreadable)?;
         if mapped.live_document_count() != doc_count
             || mapped.total_doc_length() != total_doc_length
         {
@@ -3882,7 +4172,7 @@ mod tests {
         idx.upsert(single_doc, &fields).unwrap();
         idx.commit().unwrap();
 
-        let df = idx.doc_frequency("sparseToken");
+        let df = idx.doc_frequency("sparseToken").unwrap();
         assert_eq!(
             df, 1,
             "doc_frequency must count distinct documents (1), not total occurrences (10)"
@@ -3894,7 +4184,7 @@ mod tests {
         idx.upsert(second_doc, &[("sparseToken", 1.0)]).unwrap();
         idx.commit().unwrap();
 
-        let df2 = idx.doc_frequency("sparseToken");
+        let df2 = idx.doc_frequency("sparseToken").unwrap();
         assert_eq!(
             df2, 2,
             "df must be 2 after two distinct documents contain the token"
@@ -4354,7 +4644,7 @@ mod tests {
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         for (id, _) in fixture_docs() {
             assert!(
-                reopened.contains(&id),
+                reopened.contains(&id).unwrap(),
                 "{id:?} went missing after a commit that should only have touched segment \
                  {touched}"
             );
@@ -4740,6 +5030,649 @@ mod tests {
         );
     }
 
+    /// Every file beside the index's storage file, by name, with its bytes.
+    fn index_directory(storage: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(storage.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn archived_files(storage: &Path) -> Vec<String> {
+        index_directory(storage)
+            .into_keys()
+            .filter(|name| name.contains(".corrupt-"))
+            .collect()
+    }
+
+    /// Ids outside `segment`, so a commit that writes them rewrites another
+    /// segment and carries this one.
+    fn ids_outside(
+        segment: usize,
+        segment_count: usize,
+        from: u64,
+    ) -> impl Iterator<Item = TestId> {
+        (from..)
+            .map(TestId)
+            .filter(move |id| segment_of(id, segment_count) != segment)
+    }
+
+    /// A commit that cannot map back the image it just published fails, moves
+    /// nothing aside, and nothing is written until the image maps again.
+    ///
+    /// Here a segment the commit carries forward is gone before it runs, so the
+    /// manifest it publishes names a file that is not there. The commit used to
+    /// open its own image with archiving on and rename that manifest aside, the
+    /// step a store whose directory was being removed took in the concurrent
+    /// test. The handle it left then held no committed state, so the next commit
+    /// took the heap path and published the empty heap over the store. Recovery
+    /// stays with the next open, which still archives what it cannot read.
+    #[test]
+    fn a_commit_that_cannot_map_back_its_image_fails_without_archiving_or_writing_more() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let carried = first_present_segment(&storage);
+        let gens = read_manifest_gens(&storage);
+        let gen = gens[carried].unwrap();
+        std::fs::remove_file(segment_path(&storage, carried, gen)).unwrap();
+        let mut others = ids_outside(carried, gens.len(), 1_000_000);
+
+        idx.upsert(others.next().unwrap(), &[("readBackRefusal", 5.0)])
+            .unwrap();
+        let err = idx.commit().unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SearchError::IndexError(message)
+                    if message.contains("could not map it back")
+                        && message.contains(&format!("segment {carried} gen {gen}"))
+            ),
+            "the commit fails and names what it could not read: {err:?}"
+        );
+        assert!(
+            manifest_path(&storage).exists(),
+            "the commit leaves the manifest where it is"
+        );
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+
+        // While the image is unmapped, search refuses and a commit writes nothing.
+        assert!(matches!(
+            idx.fuzzy_search("readBackRefusal", 5),
+            Err(SearchError::IndexError(message)) if message.contains("search is refused")
+        ));
+        let on_disk = index_directory(&storage);
+        assert!(idx.persist_mapped(&storage).is_err());
+        assert!(
+            index_directory(&storage) == on_disk,
+            "explicit persistence must not write the empty heap"
+        );
+        idx.upsert(others.next().unwrap(), &[("stillStaged", 5.0)])
+            .unwrap();
+        let err = idx.commit().unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SearchError::IndexError(message) if message.contains("still cannot be mapped back")
+            ),
+            "{err:?}"
+        );
+        assert!(
+            index_directory(&storage) == on_disk,
+            "a commit that cannot map the image writes nothing"
+        );
+        drop(idx);
+
+        // The next open still owns recovery and still archives what it cannot read.
+        assert!(matches!(
+            TextIndex::<TestId>::open(Some(&dir)),
+            Err(SearchError::CorruptIndex {
+                archived: Some(_),
+                ..
+            })
+        ));
+    }
+
+    /// A segment that goes missing during a commit and comes back loses no
+    /// document.
+    ///
+    /// The commit that could not map its image fails, but its document is in
+    /// the image it published. Once the file is back, the next commit maps that
+    /// image before it writes and applies its own document on top, and a reopen
+    /// from disk holds both.
+    #[test]
+    fn a_segment_that_goes_missing_during_a_commit_and_returns_loses_no_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let idx = build_into(&dir, true);
+        let before = idx.live_document_count();
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let carried = first_present_segment(&storage);
+        let gens = read_manifest_gens(&storage);
+        let file = segment_path(&storage, carried, gens[carried].unwrap());
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let mut others = ids_outside(carried, gens.len(), 3_000_000);
+        let (first, second) = (others.next().unwrap(), others.next().unwrap());
+
+        idx.upsert(first, &[("missingSegmentFirst", 5.0)]).unwrap();
+        assert!(
+            idx.commit().is_err(),
+            "the commit cannot map the image it published"
+        );
+
+        // Stage a second operation while readback is still unavailable. A
+        // failed retry must preserve that delta instead of consuming it.
+        idx.upsert(second, &[("missingSegmentSecond", 5.0)])
+            .unwrap();
+        let removed = fixture_docs()[0].0;
+        idx.remove(&removed).unwrap();
+        let published = index_directory(&storage);
+        assert!(idx.commit().is_err());
+        assert!(
+            index_directory(&storage) == published,
+            "a failed retry must not change any committed bytes"
+        );
+        std::fs::write(&file, &bytes).unwrap();
+        idx.commit()
+            .expect("the next commit maps the image again and applies its retained delta");
+        assert!(!idx.contains(&removed).unwrap());
+        assert!(idx.contains(&first).unwrap() && idx.contains(&second).unwrap());
+        assert_eq!(idx.live_document_count(), before + 1);
+        assert_eq!(
+            idx.fuzzy_search("missingSegmentFirst", 5)
+                .unwrap()
+                .first()
+                .map(|(id, _)| *id),
+            Some(first)
+        );
+        drop(idx);
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).expect("the store opens clean");
+        assert!(reopened.contains(&first).unwrap() && reopened.contains(&second).unwrap());
+        assert_eq!(reopened.live_document_count(), before + 1);
+        assert!(!reopened.contains(&removed).unwrap());
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+    }
+
+    /// A rebuild puts the whole corpus back in the heap, so it clears the
+    /// unmapped mark, and the commit after it publishes the rebuilt corpus.
+    #[test]
+    fn a_rebuild_after_an_unmapped_image_publishes_the_rebuilt_corpus() {
+        for owned in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("seg");
+            let idx = build_into(&dir, true);
+            let storage = TextIndex::<TestId>::storage_file_path(&dir);
+            let carried = first_present_segment(&storage);
+            let gens = read_manifest_gens(&storage);
+            std::fs::remove_file(segment_path(&storage, carried, gens[carried].unwrap())).unwrap();
+            let mut others = ids_outside(carried, gens.len(), 5_000_000);
+            idx.upsert(others.next().unwrap(), &[("beforeRebuild", 5.0)])
+                .unwrap();
+            assert!(idx.commit().is_err());
+
+            let rebuilt = [
+                (TestId(9_000_001), vec![("rebuiltAlpha", 5.0)]),
+                (TestId(9_000_002), vec![("rebuiltBeta", 5.0)]),
+            ];
+            if owned {
+                idx.rebuild_all_owned(rebuilt.iter().map(|(id, fields)| {
+                    (
+                        *id,
+                        fields
+                            .iter()
+                            .map(|(text, weight)| ((*text).to_owned(), *weight))
+                            .collect(),
+                    )
+                }))
+                .unwrap();
+            } else {
+                idx.rebuild_all(&rebuilt).unwrap();
+            }
+            idx.commit()
+                .expect("the rebuilt heap is the committed state, so the commit writes it");
+            assert_eq!(idx.live_document_count(), 2);
+            assert_eq!(
+                idx.fuzzy_search("rebuiltAlpha", 5)
+                    .unwrap()
+                    .first()
+                    .map(|(id, _)| *id),
+                Some(TestId(9_000_001))
+            );
+            drop(idx);
+            let reopened = TextIndex::<TestId>::open(Some(&dir)).expect("the store opens clean");
+            assert_eq!(reopened.live_document_count(), 2);
+        }
+    }
+
+    /// A read-back that maps an intact image with other counts than the commit
+    /// wrote fails the commit, and every write after it refuses until a
+    /// rebuild.
+    ///
+    /// Here another writer publishes into the directory after this commit
+    /// publishes and before it maps its image back, so the read-back maps an
+    /// image holding one document more than this commit wrote. The handle is
+    /// marked unmapped with the counts it wrote, and each retry compares that
+    /// same image to those same counts, so it refuses and writes nothing however
+    /// often it runs. A rebuild puts a whole corpus back in the heap and clears
+    /// the mark, and the commit after it publishes the rebuilt corpus.
+    #[test]
+    fn a_read_back_with_other_counts_refuses_every_write_until_a_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let written = idx.live_document_count() + 1;
+        let other_writer_doc = TestId(7_000_001);
+
+        let other_dir = dir.clone();
+        set_before_read_back_hook(move || {
+            let other = TextIndex::<TestId>::open(Some(&other_dir)).unwrap();
+            other
+                .upsert(other_writer_doc, &[("otherWriter", 5.0)])
+                .unwrap();
+            other.commit().unwrap();
+        });
+        idx.upsert(TestId(7_000_000), &[("countMismatch", 5.0)])
+            .unwrap();
+        let err = idx.commit().unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SearchError::IndexError(message)
+                    if message.contains(&format!("holds {} documents", written + 1))
+                        && message.contains(&format!("the write reported {written} of"))
+            ),
+            "the commit fails and names both counts: {err:?}"
+        );
+        assert!(
+            manifest_path(&storage).exists(),
+            "the commit leaves the manifest where it is"
+        );
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+
+        let on_disk = index_directory(&storage);
+        for attempt in 0..3u64 {
+            assert!(
+                matches!(
+                    idx.fuzzy_search("otherWriter", 5),
+                    Err(SearchError::IndexError(message)) if message.contains("search is refused")
+                ),
+                "attempt {attempt}: search refuses while the image disagrees"
+            );
+            idx.upsert(TestId(7_000_100 + attempt), &[("stillRefused", 5.0)])
+                .unwrap();
+            let err = idx.commit().unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    SearchError::IndexError(message)
+                        if message.contains("still disagrees with the last publication")
+                ),
+                "attempt {attempt}: {err:?}"
+            );
+            assert!(
+                index_directory(&storage) == on_disk,
+                "attempt {attempt}: a refused commit writes nothing"
+            );
+        }
+
+        let rebuilt = [
+            (TestId(9_100_001), vec![("rebuiltGamma", 5.0)]),
+            (TestId(9_100_002), vec![("rebuiltDelta", 5.0)]),
+            (TestId(9_100_003), vec![("rebuiltEpsilon", 5.0)]),
+        ];
+        idx.rebuild_all(&rebuilt).unwrap();
+        idx.commit()
+            .expect("the rebuild cleared the mark, so the commit writes the rebuilt corpus");
+        assert_eq!(idx.live_document_count(), rebuilt.len());
+        assert_eq!(
+            idx.fuzzy_search("rebuiltGamma", 5)
+                .unwrap()
+                .first()
+                .map(|(id, _)| *id),
+            Some(TestId(9_100_001))
+        );
+        assert!(!idx.contains(&other_writer_doc).unwrap());
+        drop(idx);
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).expect("the store opens clean");
+        assert_eq!(reopened.live_document_count(), rebuilt.len());
+        for (id, _) in &rebuilt {
+            assert!(reopened.contains(id).unwrap());
+        }
+        assert!(!reopened.contains(&other_writer_doc).unwrap());
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+    }
+
+    /// Leave `idx` unmapped the way a real store gets there: a segment its next
+    /// commit carries forward is gone, so the image that commit publishes names
+    /// a file that is not there and the read-back fails.
+    ///
+    /// Returns the removed file and its bytes, so a test can put it back.
+    fn unmap_by_a_missing_carried_segment(
+        idx: &TextIndex<TestId>,
+        storage: &Path,
+        first_new_id: u64,
+    ) -> (PathBuf, Vec<u8>, TestId) {
+        let carried = first_present_segment(storage);
+        let gens = read_manifest_gens(storage);
+        let file = segment_path(storage, carried, gens[carried].unwrap());
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let added = ids_outside(carried, gens.len(), first_new_id)
+            .next()
+            .unwrap();
+        idx.upsert(added, &[("publishedWhileUnmapped", 5.0)])
+            .unwrap();
+        assert!(
+            idx.commit().is_err(),
+            "the fixture's commit must fail its read-back, or nothing below is unmapped"
+        );
+        (file, bytes, added)
+    }
+
+    /// No read answers from the empty heap while the committed image is
+    /// unmapped, and the first read after its files are back maps it again
+    /// without waiting for a write.
+    ///
+    /// `contains` used to say false for every id and `doc_frequency` 0 for
+    /// every term in that window, answers from a heap that is empty by design
+    /// on a mapped store. Only a commit retried the mapping, so an idle store
+    /// stayed refused after the file came back until something wrote.
+    #[test]
+    fn every_read_refuses_while_the_image_is_unmapped_and_a_read_maps_it_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let published = idx.live_document_count() + 1;
+        let (file, bytes, added) = unmap_by_a_missing_carried_segment(&idx, &storage, 11_000_000);
+        let known = fixture_docs()[0].0;
+
+        assert!(
+            !idx.remap_if_unmapped(),
+            "a file the image names is missing"
+        );
+        assert!(
+            matches!(
+                idx.fuzzy_search("publishedWhileUnmapped", 5),
+                Err(SearchError::IndexError(message)) if message.contains("search is refused")
+            ),
+            "search refuses"
+        );
+        assert!(
+            matches!(
+                idx.contains(&known),
+                Err(SearchError::IndexError(message))
+                    if message.contains("a membership read is refused")
+            ),
+            "a membership read refuses rather than answering false"
+        );
+        assert!(
+            matches!(
+                idx.doc_frequency("getUserById"),
+                Err(SearchError::IndexError(message))
+                    if message.contains("a document frequency read is refused")
+            ),
+            "a frequency read refuses rather than answering 0"
+        );
+        assert_eq!(
+            idx.live_document_count(),
+            published,
+            "the count is the published image's, not the empty heap's"
+        );
+        assert_eq!(
+            idx.read_remap_attempts.load(Ordering::Relaxed),
+            0,
+            "no read maps anything while a file the image names is missing"
+        );
+
+        // A change staged while unmapped must survive a read's remap: the read
+        // maps the committed image and leaves the delta for the next commit.
+        let staged_doc = TestId(12_000_000);
+        idx.upsert(staged_doc, &[("stagedAcrossTheRemap", 5.0)])
+            .unwrap();
+
+        std::fs::write(&file, &bytes).unwrap();
+        let on_disk = index_directory(&storage);
+        let hits = idx
+            .fuzzy_search("publishedWhileUnmapped", 5)
+            .expect("a read maps the image again once its files are back");
+        assert_eq!(hits.first().map(|(id, _)| *id), Some(added));
+        assert_eq!(idx.read_remap_attempts.load(Ordering::Relaxed), 1);
+        assert!(idx.remap_if_unmapped());
+        assert!(idx.contains(&known).unwrap());
+        assert!(idx.doc_frequency("getUserById").unwrap() >= 1);
+        assert!(
+            index_directory(&storage) == on_disk,
+            "a read's remap writes nothing"
+        );
+
+        assert!(
+            !idx.contains(&staged_doc).unwrap(),
+            "a staged document stays invisible until a commit"
+        );
+        idx.commit()
+            .expect("the staged change commits onto the image the read mapped");
+        assert!(idx.contains(&staged_doc).unwrap());
+        assert_eq!(idx.live_document_count(), published + 1);
+        drop(idx);
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).expect("the store opens clean");
+        assert!(reopened.contains(&added).unwrap() && reopened.contains(&staged_doc).unwrap());
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+    }
+
+    /// An intact image a read failed to map is mapped again only after one of
+    /// its files changes, not on every read.
+    ///
+    /// Here the image is whole but holds another writer's document, so it
+    /// disagrees with what this handle published and every attempt fails. Every
+    /// read calls the retry, so without the probe each of them would map every
+    /// segment again.
+    #[test]
+    fn a_read_does_not_map_an_unchanged_image_it_failed_to_map_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let idx = build_into(&dir, true);
+        let known = fixture_docs()[0].0;
+
+        let other_dir = dir.clone();
+        set_before_read_back_hook(move || {
+            let other = TextIndex::<TestId>::open(Some(&other_dir)).unwrap();
+            other
+                .upsert(TestId(13_000_001), &[("otherWriter", 5.0)])
+                .unwrap();
+            other.commit().unwrap();
+        });
+        idx.upsert(TestId(13_000_000), &[("countMismatch", 5.0)])
+            .unwrap();
+        assert!(idx.commit().is_err(), "the read-back maps other counts");
+
+        for _ in 0..4 {
+            assert!(idx.fuzzy_search("countMismatch", 5).is_err());
+            assert!(idx.contains(&known).is_err());
+            assert!(!idx.remap_if_unmapped());
+        }
+        assert_eq!(
+            idx.read_remap_attempts.load(Ordering::Relaxed),
+            1,
+            "one mapping for an image that did not change"
+        );
+
+        // Another publication changes the files, so the next read tries again.
+        // It still refuses, because the counts still disagree.
+        let other = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        other
+            .upsert(TestId(13_000_002), &[("anotherPublication", 5.0)])
+            .unwrap();
+        other.commit().unwrap();
+        drop(other);
+        assert!(idx.fuzzy_search("countMismatch", 5).is_err());
+        assert_eq!(idx.read_remap_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    /// A read-only open of an image that names a missing segment refuses and
+    /// leaves every file where it is.
+    ///
+    /// A writing open archives what it cannot read, because the store has to
+    /// recover somehow. A read-only open is how a second process looks at a
+    /// live store, and a rename there moves the owner's manifest out from
+    /// under it. The last assertion is the control: the same bytes under a
+    /// writing open are archived, so the first half is about the mode and not
+    /// about the fixture.
+    #[test]
+    fn a_read_only_open_of_an_image_missing_a_segment_moves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        drop(build_into(&dir, true));
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let target = first_present_segment(&storage);
+        let gen = read_manifest_gens(&storage)[target].unwrap();
+        std::fs::remove_file(segment_path(&storage, target, gen)).unwrap();
+        let before = index_directory(&storage);
+
+        for attempt in 0..2 {
+            match TextIndex::<TestId>::open_read_only(Some(&dir)) {
+                Err(SearchError::CorruptIndex {
+                    archived: None,
+                    reason,
+                    ..
+                }) => assert!(
+                    reason.contains(&format!("segment {target} gen {gen}")),
+                    "attempt {attempt}: {reason}"
+                ),
+                other => panic!(
+                    "attempt {attempt}: expected a CorruptIndex that archived nothing, got {other:?}"
+                ),
+            }
+            assert!(
+                index_directory(&storage) == before,
+                "attempt {attempt}: a read-only open changed the index directory"
+            );
+        }
+        assert!(manifest_path(&storage).exists());
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+
+        assert!(
+            matches!(
+                TextIndex::<TestId>::open(Some(&dir)),
+                Err(SearchError::CorruptIndex {
+                    archived: Some(_),
+                    ..
+                })
+            ),
+            "the control: a writing open archives these same bytes"
+        );
+        assert!(!manifest_path(&storage).exists());
+    }
+
+    /// A read-only open that races a commit reclaiming the segment its manifest
+    /// named leaves the committer's image untouched.
+    ///
+    /// The reader reads the manifest, then a commit on the owning handle
+    /// publishes a new one and unlinks the generation the reader was about to
+    /// map, so the reader's segment open fails. An open with archiving on
+    /// renames the manifest by path at that point, and by then that path holds
+    /// the committer's new manifest; the CLI's root-hash peek was such an open.
+    /// Read-only, it refuses and moves nothing, and the committer carries on.
+    #[test]
+    fn a_read_only_open_racing_a_commit_that_reclaims_its_segment_moves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let writer = std::rc::Rc::new(build_into(&dir, true));
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let gens = read_manifest_gens(&storage);
+        let reclaimed = first_present_segment(&storage);
+        let reclaimed_gen = gens[reclaimed].unwrap();
+        let racing_doc = (14_000_000u64..)
+            .map(TestId)
+            .find(|id| segment_of(id, gens.len()) == reclaimed)
+            .unwrap();
+
+        let committer = std::rc::Rc::clone(&writer);
+        set_before_segments_open_hook(move || {
+            committer
+                .upsert(racing_doc, &[("racingCommit", 5.0)])
+                .unwrap();
+            committer.commit().unwrap();
+        });
+        let raced = TextIndex::<TestId>::open_read_only(Some(&dir));
+
+        // The race happened: the generation the reader read is gone and the
+        // live manifest names a newer one.
+        assert!(!segment_path(&storage, reclaimed, reclaimed_gen).exists());
+        assert_ne!(read_manifest_gens(&storage)[reclaimed], Some(reclaimed_gen));
+        assert!(
+            matches!(raced, Err(SearchError::CorruptIndex { archived: None, .. })),
+            "the raced open refuses and archives nothing: {raced:?}"
+        );
+        assert!(manifest_path(&storage).exists());
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+
+        // The committer's image is whole: it keeps committing, and a fresh
+        // read-only open maps it with the racing document in it.
+        writer
+            .upsert(TestId(14_900_000), &[("afterTheRace", 5.0)])
+            .unwrap();
+        writer.commit().expect("the committer keeps committing");
+        let reader = TextIndex::<TestId>::open_read_only(Some(&dir))
+            .expect("a read-only open after the race maps the image");
+        assert!(reader.contains(&racing_doc).unwrap());
+        assert!(reader.contains(&TestId(14_900_000)).unwrap());
+        assert_eq!(reader.live_document_count(), writer.live_document_count());
+    }
+
+    /// The same race on real threads: read-only opens run beside a committer
+    /// that rewrites and reclaims a segment on every commit. Whatever each open
+    /// returns, nothing is ever archived and the committer's image stays whole.
+    #[test]
+    fn read_only_opens_beside_a_reclaiming_committer_never_move_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let writer = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    match TextIndex::<TestId>::open_read_only(Some(&dir)) {
+                        Ok(_) | Err(SearchError::CorruptIndex { archived: None, .. }) => {}
+                        Err(other) => panic!("a read-only open failed another way: {other:?}"),
+                    }
+                }
+            });
+            for round in 0..40u64 {
+                writer
+                    .upsert(TestId(15_000_000 + round), &[("reclaimRound", 5.0)])
+                    .unwrap();
+                if round > 0 {
+                    writer.remove(&TestId(15_000_000 + round - 1)).unwrap();
+                }
+                writer.commit().unwrap();
+            }
+            stop.store(true, Ordering::Release);
+            reader.join().unwrap();
+        });
+
+        assert!(manifest_path(&storage).exists());
+        assert_eq!(archived_files(&storage), Vec::<String>::new());
+        let fresh = TextIndex::<TestId>::open_read_only(Some(&dir))
+            .expect("the committer's image opens whole");
+        assert_eq!(fresh.live_document_count(), writer.live_document_count());
+        assert!(fresh.contains(&TestId(15_000_039)).unwrap());
+    }
+
     /// A manifest with a valid version prefix but an undecodable body is corrupt
     /// and archived, just like the monolithic equivalent.
     #[test]
@@ -4879,48 +5812,163 @@ mod tests {
     // on `index.write()`) wedge into a permanent deadlock. The canonical order is
     // now `staged` first in BOTH paths, so the cycle is impossible.
     //
-    // These tests run the concurrent workload on helper threads and gate
-    // completion behind a wall-clock timeout: a regression re-introduces the
-    // deadlock, the workload never signals done, and the test FAILS LOUDLY at the
-    // timeout instead of hanging CI forever.
+    // These tests run the concurrent workload on helper threads and watch it
+    // make progress: a regression re-introduces the deadlock, the workload stops
+    // completing operations, and the test FAILS LOUDLY once it has completed none
+    // for a whole stall window, instead of hanging CI forever.
     // -----------------------------------------------------------------------
 
-    /// Run `workload` on a dedicated coordinator thread and fail if it does not
-    /// finish within `timeout`. On timeout we `panic!` (failing the test) rather
-    /// than block forever: a deadlock regression must surface as a red test, not
-    /// a hung runner. The wedged worker threads stay parked, but the test binary
-    /// still exits non-zero, so CI reports the failure.
-    fn run_with_deadlock_timeout(
+    /// How long a watched workload may go without completing a single operation
+    /// before [`run_until_stalled`] calls it deadlocked.
+    ///
+    /// A deadlock never completes another operation, so any window catches it.
+    /// What the window must not catch is a workload that is only slow. The
+    /// persisted workload below holds `staged` across every commit's fsyncs, so
+    /// all four of its threads queue behind whichever one is flushing, and its
+    /// wall time is the host's fsync latency times a few thousand flushes. A
+    /// 45 s total for it failed hosted runs on a shared host, and failed it
+    /// locally at the same rate one commit before and after the last change to
+    /// this file. Sampled 20 s into a slow local run, one thread was inside
+    /// `commit` in `fcntl` and the other three were parked on `staged` behind
+    /// it: moving, not wedged.
+    const STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How many operations a watched workload has completed, shared between its
+    /// threads and the watchdog.
+    #[derive(Clone, Default)]
+    struct Progress(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+    impl Progress {
+        /// Record one completed operation.
+        fn tick(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn completed(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Run `workload` on a dedicated coordinator thread and fail once it stops
+    /// making progress.
+    ///
+    /// The workload ticks [`Progress`] after each operation it completes, and
+    /// the test fails when `stall` passes with no tick. That is what a deadlock
+    /// looks like however loaded the host is, and it is never what a slow
+    /// workload looks like. A wall-clock total cannot tell the two apart: it
+    /// measures the host as much as the lock order.
+    ///
+    /// On a stall this panics rather than block forever: a deadlock regression
+    /// must surface as a red test, not a hung runner. The wedged worker threads
+    /// stay parked, but the test binary still exits non-zero, so CI reports the
+    /// failure.
+    ///
+    /// A workload that panics fails with its own panic. Its done signal is
+    /// dropped while it unwinds, and treating that drop like a missed deadline
+    /// would report a failed assertion as a deadlock.
+    fn run_until_stalled(
         label: &str,
-        timeout: std::time::Duration,
-        workload: impl FnOnce() + Send + 'static,
+        stall: std::time::Duration,
+        workload: impl FnOnce(Progress) + Send + 'static,
     ) {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let progress = Progress::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let coordinator = std::thread::spawn(move || {
-            workload();
-            // Ignore send errors: if the receiver already timed out and went
-            // away, the test has already failed and there is nothing to report.
-            let _ = done_tx.send(());
+        let coordinator = std::thread::spawn({
+            let progress = progress.clone();
+            move || {
+                workload(progress);
+                // Ignore send errors: if the receiver already gave up and went
+                // away, the test has already failed and there is nothing to report.
+                let _ = done_tx.send(());
+            }
         });
 
-        match done_rx.recv_timeout(timeout) {
-            Ok(()) => {
-                coordinator
-                    .join()
-                    .expect("coordinator thread panicked (a worker assertion failed)");
+        // Checked ten times a window, so a stall is reported soon after it
+        // crosses the window rather than up to a whole window late.
+        let poll = stall / 10;
+        let mut seen = progress.completed();
+        let mut moved_at = std::time::Instant::now();
+        loop {
+            match done_rx.recv_timeout(poll) {
+                Ok(()) => {
+                    coordinator
+                        .join()
+                        .expect("coordinator thread panicked (a worker assertion failed)");
+                    return;
+                }
+                // Only a panic drops the sender without sending.
+                Err(RecvTimeoutError::Disconnected) => {
+                    if let Err(panic) = coordinator.join() {
+                        std::panic::resume_unwind(panic);
+                    }
+                    return;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    let completed = progress.completed();
+                    if completed != seen {
+                        seen = completed;
+                        moved_at = std::time::Instant::now();
+                        continue;
+                    }
+                    // Named as a deadlock rather than as an inversion. Both
+                    // shapes end here and they are not the same defect: two
+                    // threads can take two locks in opposite orders, and one
+                    // thread can ask for a lock it is already holding, which
+                    // `parking_lot` never grants. This helper guards a
+                    // single-threaded caller too, and calling that an inversion
+                    // sent an earlier reader looking for a second thread.
+                    assert!(
+                        moved_at.elapsed() < stall,
+                        "{label}: no operation completed for {stall:?} after {completed} had, \
+                         so a deadlock has regressed: either an inversion between threads, or a \
+                         lock re-acquired by the thread that already holds it"
+                    );
+                }
             }
-            // Named as a deadlock rather than as an inversion. Both shapes end
-            // here and they are not the same defect: two threads can take two
-            // locks in opposite orders, and one thread can ask for a lock it is
-            // already holding, which `parking_lot` never grants. This helper
-            // now guards a single-threaded caller too, and calling that an
-            // inversion sent the last reader looking for a second thread.
-            Err(_) => panic!(
-                "{label}: workload did not complete within {timeout:?}, so a deadlock has \
-                 regressed: either an inversion between threads, or a lock re-acquired by the \
-                 thread that already holds it"
-            ),
         }
+    }
+
+    /// A workload that keeps completing operations passes however long it runs.
+    ///
+    /// This one runs for three stall windows, which is the property the wall
+    /// clock total this watchdog replaced did not have: it failed any workload
+    /// that took longer than its budget, moving or not.
+    #[test]
+    fn a_slow_workload_that_keeps_progressing_is_not_a_deadlock() {
+        let stall = std::time::Duration::from_secs(1);
+        run_until_stalled("slow_but_moving", stall, move |progress| {
+            let started = std::time::Instant::now();
+            while started.elapsed() < stall * 3 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                progress.tick();
+            }
+        });
+    }
+
+    /// A workload that stops completing operations is reported as a deadlock.
+    ///
+    /// The worker parks without ticking for ten windows, which is what a thread
+    /// waiting on a lock nobody will release looks like from outside, and then
+    /// returns so it does not outlive the binary.
+    #[test]
+    #[should_panic(expected = "no operation completed")]
+    fn a_workload_that_stops_progressing_is_reported_as_a_deadlock() {
+        let stall = std::time::Duration::from_millis(200);
+        run_until_stalled("stopped", stall, move |progress| {
+            progress.tick();
+            std::thread::sleep(stall * 10);
+        });
+    }
+
+    /// A workload that panics fails with its own message, not with a deadlock.
+    #[test]
+    #[should_panic(expected = "a worker assertion that failed")]
+    fn a_workload_that_panics_fails_with_its_own_message() {
+        run_until_stalled("panicking", STALL_WINDOW, |_progress| {
+            panic!("a worker assertion that failed");
+        });
     }
 
     /// Concurrent writers + committers against a shared in-memory index must make
@@ -4933,48 +5981,131 @@ mod tests {
     fn concurrent_upsert_and_commit_do_not_deadlock() {
         use std::sync::Arc;
 
-        run_with_deadlock_timeout(
-            "concurrent_upsert_and_commit",
-            std::time::Duration::from_secs(30),
-            || {
-                let idx = Arc::new(TextIndex::<TestId>::new());
-                let writer_threads = 4;
-                let committer_threads = 2;
-                let iters = 2_000;
+        run_until_stalled("concurrent_upsert_and_commit", STALL_WINDOW, |progress| {
+            let idx = Arc::new(TextIndex::<TestId>::new());
+            let writer_threads = 4;
+            let committer_threads = 2;
+            let iters = 2_000;
+
+            let mut handles = Vec::new();
+
+            // Writers: each owns a disjoint id range so upserts/removes never
+            // collide on document identity — the deadlock is about lock order,
+            // not data contention, and disjoint ids keep the final state
+            // exactly checkable.
+            for w in 0..writer_threads {
+                let idx = Arc::clone(&idx);
+                let progress = progress.clone();
+                handles.push(std::thread::spawn(move || {
+                    let base = (w as u64 + 1) * 1_000_000;
+                    for i in 0..iters {
+                        let id = TestId(base + (i % 64) as u64);
+                        idx.upsert(
+                            id,
+                            &[("concurrentSymbol", 5.0), ("src/concurrent/mod.rs", 2.0)],
+                        )
+                        .unwrap();
+                        // Exercise the remove writer path too (same lock order).
+                        if i % 3 == 0 {
+                            idx.remove(&id).unwrap();
+                        }
+                        progress.tick();
+                    }
+                }));
+            }
+
+            // Committers: race the writers, repeatedly publishing staged state.
+            for _ in 0..committer_threads {
+                let idx = Arc::clone(&idx);
+                let progress = progress.clone();
+                handles.push(std::thread::spawn(move || {
+                    for _ in 0..iters {
+                        idx.commit().unwrap();
+                        // Reads must keep working under contention as well.
+                        let _ = idx.fuzzy_search("concurrent", 5).unwrap();
+                        progress.tick();
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().expect("worker thread panicked");
+            }
+
+            // A final commit flushes any still-staged writes, then the index
+            // must be internally consistent: live_document_count equals the
+            // number of distinct doc ids actually present. This proves the
+            // lock-order fix did not introduce a data race that corrupts the
+            // staged/live bookkeeping — "doesn't hang" AND "stays correct".
+            idx.commit().unwrap();
+            let live = idx.live_document_count();
+            let present = (0..writer_threads)
+                .flat_map(|w| {
+                    let base = (w as u64 + 1) * 1_000_000;
+                    (0..64u64).map(move |k| TestId(base + k))
+                })
+                .filter(|id| idx.contains(id).unwrap())
+                .count();
+            assert_eq!(
+                live, present,
+                "live document count ({live}) must match the docs actually present ({present})"
+            );
+        });
+    }
+
+    /// The same concurrency guarantee through the durable persist path: a shared
+    /// persisted index under concurrent writers + committers must not deadlock
+    /// (the committer takes `staged` strictly before the live-state locks, and
+    /// holds it across the fsync-bound persist, so every commit and upsert
+    /// queues behind the one in flight) and must reload to a consistent state
+    /// afterwards.
+    #[test]
+    fn concurrent_writes_with_persistence_do_not_deadlock() {
+        use std::sync::Arc;
+
+        let tmp = Arc::new(tempfile::tempdir().unwrap());
+        let dir = tmp.path().join("concurrent");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        run_until_stalled("concurrent_writes_with_persistence", STALL_WINDOW, {
+            let dir = dir.clone();
+            // The workload holds the directory as well. When the watchdog
+            // fires, the test unwinds while the workers are still committing,
+            // and dropping the only handle then removed the directory under
+            // them: their next commit met a missing segment and the report read
+            // as corruption instead of a stall.
+            let tmp = Arc::clone(&tmp);
+            move |progress| {
+                let _directory = tmp;
+                let idx = Arc::new(TextIndex::<TestId>::open(Some(&dir)).unwrap());
+                let writer_threads = 3;
+                let iters = 500;
 
                 let mut handles = Vec::new();
-
-                // Writers: each owns a disjoint id range so upserts/removes never
-                // collide on document identity — the deadlock is about lock order,
-                // not data contention, and disjoint ids keep the final state
-                // exactly checkable.
                 for w in 0..writer_threads {
                     let idx = Arc::clone(&idx);
+                    let progress = progress.clone();
                     handles.push(std::thread::spawn(move || {
-                        let base = (w as u64 + 1) * 1_000_000;
+                        let base = (w as u64 + 1) * 100_000;
                         for i in 0..iters {
-                            let id = TestId(base + (i % 64) as u64);
-                            idx.upsert(
-                                id,
-                                &[("concurrentSymbol", 5.0), ("src/concurrent/mod.rs", 2.0)],
-                            )
-                            .unwrap();
-                            // Exercise the remove writer path too (same lock order).
-                            if i % 3 == 0 {
-                                idx.remove(&id).unwrap();
+                            let id = TestId(base + i as u64);
+                            idx.upsert(id, &[("persistedConcurrent", 5.0)]).unwrap();
+                            progress.tick();
+                            if i % 10 == 0 {
+                                idx.commit().unwrap();
+                                progress.tick();
                             }
                         }
                     }));
                 }
-
-                // Committers: race the writers, repeatedly publishing staged state.
-                for _ in 0..committer_threads {
+                // A dedicated committer that also persists on every commit.
+                {
                     let idx = Arc::clone(&idx);
+                    let progress = progress.clone();
                     handles.push(std::thread::spawn(move || {
                         for _ in 0..iters {
                             idx.commit().unwrap();
-                            // Reads must keep working under contention as well.
-                            let _ = idx.fuzzy_search("concurrent", 5).unwrap();
+                            progress.tick();
                         }
                     }));
                 }
@@ -4982,83 +6113,9 @@ mod tests {
                 for h in handles {
                     h.join().expect("worker thread panicked");
                 }
-
-                // A final commit flushes any still-staged writes, then the index
-                // must be internally consistent: live_document_count equals the
-                // number of distinct doc ids actually present. This proves the
-                // lock-order fix did not introduce a data race that corrupts the
-                // staged/live bookkeeping — "doesn't hang" AND "stays correct".
                 idx.commit().unwrap();
-                let live = idx.live_document_count();
-                let present = (0..writer_threads)
-                    .flat_map(|w| {
-                        let base = (w as u64 + 1) * 1_000_000;
-                        (0..64u64).map(move |k| TestId(base + k))
-                    })
-                    .filter(|id| idx.contains(id))
-                    .count();
-                assert_eq!(
-                    live, present,
-                    "live document count ({live}) must match the docs actually present ({present})"
-                );
-            },
-        );
-    }
-
-    /// The same concurrency guarantee through the durable persist path: a shared
-    /// persisted index under concurrent writers + committers must not deadlock
-    /// (the committer now holds `staged` strictly before the live-state locks, and
-    /// releases `staged` before the fsync-bound persist) and must reload to a
-    /// consistent state afterwards.
-    #[test]
-    fn concurrent_writes_with_persistence_do_not_deadlock() {
-        use std::sync::Arc;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("concurrent");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        run_with_deadlock_timeout(
-            "concurrent_writes_with_persistence",
-            std::time::Duration::from_secs(45),
-            {
-                let dir = dir.clone();
-                move || {
-                    let idx = Arc::new(TextIndex::<TestId>::open(Some(&dir)).unwrap());
-                    let writer_threads = 3;
-                    let iters = 500;
-
-                    let mut handles = Vec::new();
-                    for w in 0..writer_threads {
-                        let idx = Arc::clone(&idx);
-                        handles.push(std::thread::spawn(move || {
-                            let base = (w as u64 + 1) * 100_000;
-                            for i in 0..iters {
-                                let id = TestId(base + i as u64);
-                                idx.upsert(id, &[("persistedConcurrent", 5.0)]).unwrap();
-                                if i % 10 == 0 {
-                                    idx.commit().unwrap();
-                                }
-                            }
-                        }));
-                    }
-                    // A dedicated committer that also persists on every commit.
-                    {
-                        let idx = Arc::clone(&idx);
-                        handles.push(std::thread::spawn(move || {
-                            for _ in 0..iters {
-                                idx.commit().unwrap();
-                            }
-                        }));
-                    }
-
-                    for h in handles {
-                        h.join().expect("worker thread panicked");
-                    }
-                    idx.commit().unwrap();
-                }
-            },
-        );
+            }
+        });
 
         // Reopen from disk: the persisted state must load cleanly (not corrupt)
         // and expose exactly the docs every writer inserted.
@@ -5073,8 +6130,8 @@ mod tests {
         );
     }
 
-    /// A single-threaded persisted commit must return. One thread, one call, no
-    /// contention: just a stopwatch.
+    /// A single-threaded persisted commit must return. One thread, one call at a
+    /// time, no contention: just a watchdog.
     ///
     /// The class is a persist frame re-acquiring a lock its own caller already
     /// holds. `commit` holds `staged` across its whole persist, on purpose, so a
@@ -5084,12 +6141,13 @@ mod tests {
     /// the read returns. Once the default commit wrote v5, that reached every
     /// persisted commit in the crate, on every platform, at zero CPU.
     ///
-    /// It carries a timeout for the same reason it exists. A self-deadlock has
+    /// It carries a watchdog for the same reason it exists. A self-deadlock has
     /// no assertion to fail: it hangs the binary, the harness never finishes, and
     /// the only signal is a hosted job that never reports. On 2026-09-03 the
     /// three checks that run this suite sat `in_progress` for 46 minutes on an
     /// idle runner while all seven that do not run tests concluded green. The
-    /// budget is what turns that into a red line in seconds.
+    /// stall window is what turns that into a red line, because a thread parked
+    /// against itself completes nothing more.
     ///
     /// All three ways into the writer are called, because they take `staged`
     /// differently: a first commit converts the heap and is handed the
@@ -5103,32 +6161,33 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
 
-        run_with_deadlock_timeout(
-            "single_threaded_persisted_commit",
-            std::time::Duration::from_secs(30),
-            {
-                let dir = dir.clone();
-                move || {
-                    let idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
-                    idx.upsert(TestId(1), &[("selfDeadlockGuard", 5.0)])
-                        .unwrap();
-                    // The conversion, under `commit`'s own `staged` write guard.
-                    idx.commit().unwrap();
-                    idx.upsert(TestId(2), &[("selfDeadlockGuard", 5.0)])
-                        .unwrap();
-                    // And the delta onto the mapping, which is the other commit path.
-                    idx.commit().unwrap();
-                    assert_eq!(idx.live_document_count(), 2);
+        run_until_stalled("single_threaded_persisted_commit", STALL_WINDOW, {
+            let dir = dir.clone();
+            move |progress| {
+                let idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+                idx.upsert(TestId(1), &[("selfDeadlockGuard", 5.0)])
+                    .unwrap();
+                progress.tick();
+                // The conversion, under `commit`'s own `staged` write guard.
+                idx.commit().unwrap();
+                progress.tick();
+                idx.upsert(TestId(2), &[("selfDeadlockGuard", 5.0)])
+                    .unwrap();
+                progress.tick();
+                // And the delta onto the mapping, which is the other commit path.
+                idx.commit().unwrap();
+                progress.tick();
+                assert_eq!(idx.live_document_count(), 2);
 
-                    // The explicit persist, entered with no guard in hand.
-                    let heap = TextIndex::<TestId>::new();
-                    heap.upsert(TestId(3), &[("selfDeadlockGuard", 5.0)])
-                        .unwrap();
-                    heap.commit().unwrap();
-                    heap.persist_mapped(&elsewhere).unwrap();
-                }
-            },
-        );
+                // The explicit persist, entered with no guard in hand.
+                let heap = TextIndex::<TestId>::new();
+                heap.upsert(TestId(3), &[("selfDeadlockGuard", 5.0)])
+                    .unwrap();
+                heap.commit().unwrap();
+                progress.tick();
+                heap.persist_mapped(&elsewhere).unwrap();
+            }
+        });
 
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         assert_eq!(reopened.live_document_count(), 2);

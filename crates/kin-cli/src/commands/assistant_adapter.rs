@@ -90,208 +90,69 @@ struct ClaudeAdapter;
 struct CodexAdapter;
 struct GeminiAdapter;
 
-/// Native tools Claude Code must refuse in a semantic-only session.
-const CLAUDE_DENIED_TOOLS: [&str; 3] = ["Grep", "Glob", "Read"];
-
-/// File-reading commands denied outright through Claude Code's own permission
-/// engine.
+/// Native tools a semantic-only Claude session must not have.
 ///
-/// This list is not the boundary — [`semantic_only_bash_verdict`] is, and it
-/// refuses every command it cannot name. These rules are the second layer:
-/// a `PreToolUse` hook that cannot be executed is reported as a non-blocking
-/// error and the tool runs anyway, so the most common readers are also denied
-/// by a mechanism that needs no subprocess.
-const CLAUDE_DENIED_BASH_READERS: [&str; 13] = [
-    "grep", "rg", "ag", "find", "fd", "cat", "head", "tail", "less", "more", "tree", "strings",
-    "ls",
+/// The profile launches Claude Code with `--tools ""`, which removes the whole
+/// built-in set, so none of these exists in the session: no shell, no file
+/// reader and no file editor. They are also denied by name in the settings, a
+/// second layer that holds if a Claude Code build ever loaded a built-in the
+/// flag did not remove. Code is read and changed through Kin's MCP tools, by
+/// entity.
+const CLAUDE_DENIED_TOOLS: [&str; 11] = [
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Grep",
+    "Glob",
+    "WebFetch",
 ];
 
-/// Bash commands a semantic-only Claude session may run.
+/// Tool names the semantic-only `PreToolUse` hook adjudicates: all of them.
 ///
-/// This is an allowlist, and the inversion is the point. A blocklist over a
-/// shell cannot be finished: `sed`, `awk`, `perl`, `python3`, `node`, `ruby`,
-/// `git show`, `od`, `base64`, `curl file://`, and a nested `claude -p` all
-/// put file contents on stdout, and every blocked spelling has an unblocked
-/// one (`egrep`, `/bin/cat`, `env cat`). A command this session cannot name is
-/// refused, so an unlisted reader is refused by default rather than by
-/// enumeration.
-///
-/// Membership rule: the command must emit a literal, report the working
-/// directory, or mutate the filesystem in a way `Edit` and `Write` cannot
-/// express. Nothing here can put the contents of a file it did not receive
-/// onto stdout.
-const CLAUDE_ALLOWED_BASH: [&str; 11] = [
-    "echo", "printf", "pwd", "true", "false", "mkdir", "rmdir", "touch", "mv", "rm", "chmod",
-];
-
-/// Path roots an allowed command may not name.
-///
-/// `mv src/a /dev/stdout` is a file read spelled as a move, and `/proc/self/*`
-/// re-exposes the launched process's own argv and environment. Neither needs a
-/// disallowed command, so the allowlist alone does not hold them.
-const CLAUDE_REFUSED_PATH_ROOTS: [&str; 3] = ["/dev/", "/proc/", "/sys/"];
-
-/// Tool names the semantic-only `PreToolUse` hook is asked to adjudicate.
-///
-/// Written in the documented matcher style — an unanchored alternation of tool
-/// names, plus the `mcp__.*` prefix form — rather than as an anchored regex,
-/// because the matcher's exact anchoring semantics are Claude Code's to define.
-/// [`semantic_only_guard_verdict`] therefore re-decides on the tool name it is
-/// actually handed instead of trusting the matcher to have selected precisely.
-const CLAUDE_HOOK_MATCHER: &str = "Bash|Grep|Glob|Read|mcp__.*";
+/// The session is meant to hold Kin's MCP tools and nothing else, so the guard
+/// sees every call and admits only those. [`semantic_only_guard_verdict`]
+/// decides on the tool name it is actually handed rather than trusting the
+/// matcher to have selected precisely.
+const CLAUDE_HOOK_MATCHER: &str = "*";
 
 /// MCP tools that stay available: Kin's own semantic surface, which is what a
 /// semantic-only session is being pointed at.
 const CLAUDE_ALLOWED_MCP_PREFIX: &str = "mcp__kin__";
 
-/// Tools that only observe or end an already-adjudicated Bash call. The command
-/// they refer to passed [`semantic_only_bash_verdict`] before it ran, so its
-/// output cannot carry a file the session may not read.
-const CLAUDE_ALLOWED_BASH_FOLLOWUPS: [&str; 2] = ["BashOutput", "KillShell"];
-
 const CLAUDE_SETTINGS_FILE: &str = "semantic-only-settings.json";
+
+/// The MCP configuration the session loads in place of the user's own: Kin's
+/// server and no other, so another server's file tools are never available.
+const CLAUDE_MCP_CONFIG_FILE: &str = "semantic-only-mcp.json";
+
+/// The tool profile the session's Kin server serves: the agent surface, which
+/// includes the entity edits.
+const CLAUDE_KIN_TOOL_PROFILE: &str = "agent-default";
 
 /// The largest `PreToolUse` payload the guard will read before refusing.
 const MAX_GUARD_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Whether one character may appear in a semantic-only Bash command.
-///
-/// This is the second allowlist, and it exists because prefix matching alone
-/// decides nothing on a shell: `echo $(cat f)`, `printf '%s' "$(<f)"`,
-/// `while read l; do echo "$l"; done < f`, `echo *`, and `mkdir x; cat f` all
-/// begin with a command that is allowed and end in a file read. Command
-/// substitution, redirection, pipes, sequencing, globbing, and escapes are
-/// spelled with characters, so refusing the characters refuses the whole class
-/// rather than the instances of it someone thought to list.
-fn is_allowed_bash_char(character: char) -> bool {
-    character.is_ascii_alphanumeric()
-        || matches!(
-            character,
-            ' ' | '-' | '_' | '.' | '/' | '=' | ':' | ',' | '+' | '%' | '\'' | '"'
-        )
-}
-
 /// What a semantic-only session points an assistant at instead.
 fn semantic_only_redirect() -> String {
-    format!(
-        "use Kin's MCP tools (semantic_locate, semantic_search, get_context_pack, \
-         trace_data_flow, find_references) to discover and read code, and Edit/Write to \
-         change it; Bash accepts only: {}",
-        CLAUDE_ALLOWED_BASH.join(", ")
-    )
-}
-
-/// Collapse the path spellings that mean the same file.
-///
-/// `rm /opt/kin//kin` and `rm /opt/kin/./kin` name the same program as
-/// `rm /opt/kin/kin`, so a containment test run on the raw command string is
-/// evaded by typing a second slash. Folding both spellings first makes the test
-/// decide on the path rather than on how it was written.
-fn normalize_path_text(text: &str) -> String {
-    let mut normalized = text.to_string();
-    loop {
-        let collapsed = normalized.replace("//", "/").replace("/./", "/");
-        if collapsed == normalized {
-            return normalized;
-        }
-        normalized = collapsed;
-    }
-}
-
-/// Paths a semantic-only session may not name, given where its guard lives.
-///
-/// The parent directory is included because moving or removing the directory
-/// takes the guard with it, and `rm -r` and `mv` are both spellable with the
-/// allowed commands. Ancestors above the parent are not included: every
-/// absolute path contains `/`, so refusing further up refuses everything.
-fn guard_refused_paths(program: &Path) -> Vec<String> {
-    let mut refused = vec![normalize_path_text(&program.display().to_string())];
-    if let Some(parent) = program.parent() {
-        let parent = normalize_path_text(&parent.display().to_string());
-        if !parent.is_empty() && parent != "/" {
-            refused.push(parent);
-        }
-    }
-    refused
-}
-
-/// Decide whether a semantic-only session may run one Bash command.
-///
-/// `Err` carries the line the assistant is shown, so a refusal teaches the
-/// replacement rather than only naming the rule.
-///
-/// `guard_paths` is a parameter rather than a [`guard_program`] call because
-/// this predicate is a pure function of the command string, which is what lets
-/// every vector in `BYPASS_VECTORS` be decided in a unit test with no process
-/// state. The caller resolves the paths once at the impure boundary.
-pub fn semantic_only_bash_verdict(
-    command: &str,
-    guard_paths: &[String],
-) -> std::result::Result<(), String> {
-    let command = command.trim();
-    if command.is_empty() {
-        return Err(format!(
-            "semantic-only session: refusing an empty Bash command; {}",
-            semantic_only_redirect()
-        ));
-    }
-    if let Some(character) = command.chars().find(|c| !is_allowed_bash_char(*c)) {
-        return Err(format!(
-            "semantic-only session: refusing this Bash command because it contains {character:?}. \
-             Command substitution, redirection, pipes, sequencing, globbing, and escapes are \
-             refused because they turn an allowed command into a file read; {}",
-            semantic_only_redirect()
-        ));
-    }
-    let program = command.split(' ').next().unwrap_or_default();
-    if !CLAUDE_ALLOWED_BASH.contains(&program) {
-        return Err(format!(
-            "semantic-only session: refusing Bash command '{program}'. This session refuses every \
-             command it cannot name, because a list of blocked readers can always be spelled \
-             around; {}",
-            semantic_only_redirect()
-        ));
-    }
-    if let Some(root) = CLAUDE_REFUSED_PATH_ROOTS
-        .iter()
-        .find(|root| command.contains(**root))
-    {
-        return Err(format!(
-            "semantic-only session: refusing this Bash command because it names {root}, which \
-             turns an allowed command into a file read; {}",
-            semantic_only_redirect()
-        ));
-    }
-    // `rm`, `mv`, and `chmod` are allowed against the working tree and reach the
-    // guard binary just as easily. Removing or disabling it is caught by the
-    // hook's fail-closed suffix, but replacing it with a program that exits 0 is
-    // not: that guard answers, and it answers yes. Refusing to name the path is
-    // what covers the replacement, so the two halves are not alternatives.
-    let normalized = normalize_path_text(command);
-    if let Some(path) = guard_paths
-        .iter()
-        .find(|path| normalized.contains(path.as_str()))
-    {
-        return Err(format!(
-            "semantic-only session: refusing this Bash command because it names {path}, which is \
-             the guard enforcing this session; {}",
-            semantic_only_redirect()
-        ));
-    }
-    Ok(())
+    "use Kin's MCP tools (semantic_locate, semantic_search, get_context_pack, \
+     trace_data_flow, find_references) to discover and read code, kin_mutate on entity ids \
+     to change it, and kin_session_exec to build, test and run it; this session has no \
+     shell and no file tools"
+        .to_string()
 }
 
 /// Decide one Claude Code `PreToolUse` payload.
 ///
-/// Fails closed on everything it cannot read: an unparseable payload, a missing
-/// tool name, a `Bash` call with no command string, and any tool the matcher
-/// selected that this function was not written to allow all refuse. A guard
+/// Admits Kin's MCP tools and nothing else. Fails closed on everything it
+/// cannot read: an unparseable payload or a missing tool name refuses. A guard
 /// that allowed what it did not understand would be an audit of the payloads
 /// that happen to be well formed.
-pub fn semantic_only_guard_verdict(
-    payload: &[u8],
-    guard_paths: &[String],
-) -> std::result::Result<(), String> {
+pub fn semantic_only_guard_verdict(payload: &[u8]) -> std::result::Result<(), String> {
     let refuse_unreadable = |detail: &str| {
         Err(format!(
             "semantic-only session: refusing this call because its hook payload {detail}; {}",
@@ -305,19 +166,7 @@ pub fn semantic_only_guard_verdict(
     let Some(tool) = payload.get("tool_name").and_then(serde_json::Value::as_str) else {
         return refuse_unreadable("names no tool");
     };
-
-    if tool == "Bash" {
-        let Some(command) = payload
-            .get("tool_input")
-            .and_then(|input| input.get("command"))
-            .and_then(serde_json::Value::as_str)
-        else {
-            return refuse_unreadable("is a Bash call carrying no command string");
-        };
-        return semantic_only_bash_verdict(command, guard_paths);
-    }
-    if tool.starts_with(CLAUDE_ALLOWED_MCP_PREFIX) || CLAUDE_ALLOWED_BASH_FOLLOWUPS.contains(&tool)
-    {
+    if tool.starts_with(CLAUDE_ALLOWED_MCP_PREFIX) {
         return Ok(());
     }
     Err(format!(
@@ -332,20 +181,6 @@ pub fn semantic_only_guard_verdict(
 /// model, which is why the refusal text is written to name a replacement.
 pub fn run_semantic_only_guard() -> Result<()> {
     use std::io::Read as _;
-
-    // A guard that cannot locate itself cannot tell whether a command is aimed
-    // at it, and returning the error would exit 1, which lets the tool run.
-    let guard_paths = match guard_program() {
-        Ok(program) => guard_refused_paths(&program),
-        Err(error) => {
-            eprintln!(
-                "semantic-only session: refusing this call because the guard could not resolve \
-                 its own path ({error}), so it cannot tell whether the call is aimed at it; {}",
-                semantic_only_redirect()
-            );
-            std::process::exit(2);
-        }
-    };
 
     let mut payload = Vec::new();
     // Returning the IO error would exit 1, and every hook exit code except 2 is
@@ -364,7 +199,7 @@ pub fn run_semantic_only_guard() -> Result<()> {
         );
         std::process::exit(2);
     }
-    if let Err(refusal) = semantic_only_guard_verdict(&payload, &guard_paths) {
+    if let Err(refusal) = semantic_only_guard_verdict(&payload) {
         eprintln!("{refusal}");
         std::process::exit(2);
     }
@@ -394,8 +229,9 @@ fn guard_program() -> Result<PathBuf> {
 /// thought to list.
 ///
 /// It cannot cover a guard replaced by a working program that exits 0. That one
-/// answers, and it answers yes, which is why [`semantic_only_bash_verdict`] also
-/// refuses commands that name the guard's own path.
+/// answers, and it answers yes, which is why the session is given no tool that
+/// can write a file: with every built-in removed and only Kin's MCP server
+/// loaded, nothing in the session can reach the guard's path.
 ///
 /// `||` and `exit` mean the same thing to `cmd.exe` as to a POSIX shell, so one
 /// spelling serves both arms.
@@ -438,18 +274,13 @@ impl AssistantAdapter for ClaudeAdapter {
     }
 
     fn semantic_only(&self, profile_dir: &Path, windows: bool) -> Result<SemanticOnlyProfile> {
-        let mut deny: Vec<String> = CLAUDE_DENIED_TOOLS.iter().map(|t| t.to_string()).collect();
-        deny.extend(
-            CLAUDE_DENIED_BASH_READERS
-                .iter()
-                .map(|c| format!("Bash({c}:*)")),
-        );
+        let deny: Vec<String> = CLAUDE_DENIED_TOOLS.iter().map(|t| t.to_string()).collect();
 
-        // The guard is this binary, not a script inside the profile. That is
-        // what makes the profile non-disarmable: `Edit`, `Write`, and `rm` stay
-        // available by design, so a hook script the session could delete or
-        // rewrite would be enforcement the subject holds the off switch for.
-        let guard = semantic_only_hook_command(&guard_program()?, windows);
+        // The guard is this binary, not a script inside the profile, so the
+        // session holds no off switch for its own enforcement. The same binary
+        // serves the session's Kin tools.
+        let program = guard_program()?;
+        let guard = semantic_only_hook_command(&program, windows);
         let settings = serde_json::json!({
             "permissions": { "deny": deny },
             "hooks": {
@@ -459,24 +290,46 @@ impl AssistantAdapter for ClaudeAdapter {
                 }]
             }
         });
+        let mcp = serde_json::json!({
+            "mcpServers": {
+                "kin": {
+                    "command": program.display().to_string(),
+                    "args": ["mcp", "start", "--tool-profile", CLAUDE_KIN_TOOL_PROFILE]
+                }
+            }
+        });
 
         Ok(SemanticOnlyProfile {
+            // `--tools` and `--mcp-config` each take a list, so each is
+            // followed by another flag that ends it. The task words that come
+            // after `--settings` can then never be read as tool names or as MCP
+            // configurations.
             extra_args: vec![
+                OsString::from("--tools"),
+                OsString::from(""),
+                OsString::from("--mcp-config"),
+                profile_dir.join(CLAUDE_MCP_CONFIG_FILE).into_os_string(),
+                OsString::from("--strict-mcp-config"),
                 OsString::from("--settings"),
                 profile_dir.join(CLAUDE_SETTINGS_FILE).into_os_string(),
             ],
-            files: vec![ProfileFile {
-                relative_path: PathBuf::from(CLAUDE_SETTINGS_FILE),
-                contents: serde_json::to_string_pretty(&settings)?,
-            }],
+            files: vec![
+                ProfileFile {
+                    relative_path: PathBuf::from(CLAUDE_SETTINGS_FILE),
+                    contents: serde_json::to_string_pretty(&settings)?,
+                },
+                ProfileFile {
+                    relative_path: PathBuf::from(CLAUDE_MCP_CONFIG_FILE),
+                    contents: serde_json::to_string_pretty(&mcp)?,
+                },
+            ],
             tier: EnforcementTier::Enforced,
-            disclosure: format!(
-                "semantic-only [enforced]: Grep/Glob/Read are refused; Bash is refused unless the \
-                 command is one of {}, and is refused even then if it names Kin's own binary, \
-                 which the session may not disarm; MCP tools other than Kin's are refused. Kin's \
-                 MCP tools, Edit, and Write stay available.",
-                CLAUDE_ALLOWED_BASH.join(", ")
-            ),
+            disclosure: "semantic-only [enforced]: every Claude Code built-in tool is removed \
+                 (--tools \"\"), including Bash, Read, Edit and Write, and only Kin's MCP server \
+                 is loaded (--strict-mcp-config); a hook refuses any other tool call. Code is read \
+                 and changed through Kin's tools, by entity. Build and test verification runs \
+                 outside this session, for example with `kin exec -- <command>`."
+                .to_string(),
         })
     }
 }
@@ -546,16 +399,34 @@ mod tests {
     use super::*;
 
     /// Where a released `kin` sits, for the tests that ask what a session may
-    /// say about its own guard.
+    /// do about its own guard.
     const GUARD_PROGRAM: &str = "/usr/local/bin/kin";
 
-    /// The guard paths a session launched from [`GUARD_PROGRAM`] refuses.
-    fn guard_paths() -> Vec<String> {
-        guard_refused_paths(Path::new(GUARD_PROGRAM))
+    fn payload(tool: &str, command: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": command }
+        }))
+        .unwrap()
     }
 
-    /// No guard to protect, for the arms that decide on the command alone.
-    const NO_GUARD: &[String] = &[];
+    fn profile_file(profile: &SemanticOnlyProfile, name: &str) -> serde_json::Value {
+        let file = profile
+            .files
+            .iter()
+            .find(|f| f.relative_path == Path::new(name))
+            .unwrap_or_else(|| panic!("{name} present"));
+        serde_json::from_str(&file.contents).unwrap()
+    }
+
+    fn args_of(profile: &SemanticOnlyProfile) -> Vec<String> {
+        profile
+            .extra_args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
 
     /// Every way of reading a file that the adversarial review of the original
     /// blocklist enumerated, plus the blocklist's own entries.
@@ -656,162 +527,127 @@ mod tests {
         assert!(adapter_for("").is_err());
     }
 
+    /// No shell command runs in a semantic-only session, whatever it is.
+    ///
+    /// The shell is removed with every other built-in, and the guard refuses a
+    /// Bash call if one ever reached it: the file reads the adversarial review
+    /// enumerated, the commands the retired allowlist admitted (which include
+    /// every filesystem mutator), and an empty command alike.
     #[test]
     fn every_enumerated_file_read_bypass_is_refused() {
         for vector in BYPASS_VECTORS {
-            let refusal = semantic_only_bash_verdict(vector, NO_GUARD)
-                .expect_err(&format!("semantic-only admitted a file read: {vector}"));
+            let refusal = semantic_only_guard_verdict(&payload("Bash", vector))
+                .expect_err(&format!("semantic-only admitted a shell command: {vector}"));
             assert!(
                 refusal.contains("semantic-only session: refusing"),
                 "{vector}: {refusal}"
             );
         }
-        // The commands the old blocklist did name must still be refused, so
-        // inverting the list did not trade one gap for another.
-        for reader in CLAUDE_DENIED_BASH_READERS {
-            let command = format!("{reader} src/main.rs");
-            assert!(
-                semantic_only_bash_verdict(&command, NO_GUARD).is_err(),
-                "semantic-only admitted {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_allowlisted_commands_are_the_ones_that_run() {
-        for allowed in [
+        for mutator in [
             "echo starting the rename",
-            "printf ready",
             "pwd",
-            "true",
-            "false",
             "mkdir -p src/rendering",
             "rmdir src/rendering",
             "touch src/rendering/mod.rs",
             "mv src/old.rs src/new.rs",
             "rm -f target/debug/stale",
             "chmod u+x scripts/run",
-        ] {
-            semantic_only_bash_verdict(allowed, NO_GUARD).unwrap_or_else(|refusal| {
-                panic!("semantic-only refused a permitted command {allowed}: {refusal}")
-            });
-        }
-
-        // An allowed command still cannot name a path whose read is the point.
-        for disclosure in [
-            "mv src/main.rs /dev/stdout",
-            "echo /proc/self/environ",
-            "rm /sys/kernel/notes",
+            "",
         ] {
             assert!(
-                semantic_only_bash_verdict(disclosure, NO_GUARD).is_err(),
-                "semantic-only admitted {disclosure}"
+                semantic_only_guard_verdict(&payload("Bash", mutator)).is_err(),
+                "semantic-only admitted {mutator:?}"
             );
         }
-
-        assert!(semantic_only_bash_verdict("", NO_GUARD).is_err());
-        assert!(semantic_only_bash_verdict("   ", NO_GUARD).is_err());
     }
 
     #[test]
-    fn the_guard_reads_bash_commands_out_of_the_hook_payload_and_fails_closed() {
-        let payload = |tool: &str, command: &str| {
-            serde_json::to_vec(&serde_json::json!({
-                "hook_event_name": "PreToolUse",
-                "tool_name": tool,
-                "tool_input": { "command": command }
-            }))
-            .unwrap()
-        };
+    fn the_guard_admits_kin_tools_only_and_fails_closed() {
+        semantic_only_guard_verdict(&payload("mcp__kin__semantic_locate", "")).unwrap();
+        semantic_only_guard_verdict(&payload("mcp__kin__kin_mutate", "")).unwrap();
 
-        semantic_only_guard_verdict(&payload("Bash", "mkdir -p src/rendering"), NO_GUARD).unwrap();
-        assert!(
-            semantic_only_guard_verdict(&payload("Bash", "sed -n p src/main.rs"), NO_GUARD)
-                .is_err()
-        );
-
-        // The hook is also a backstop for the tools the deny rules name, so a
-        // deny rule that failed to apply is still refused here.
+        // Every built-in, including the ones that only observed a shell.
         for denied in CLAUDE_DENIED_TOOLS {
             assert!(
-                semantic_only_guard_verdict(&payload(denied, ""), NO_GUARD).is_err(),
+                semantic_only_guard_verdict(&payload(denied, "")).is_err(),
                 "guard admitted {denied}"
             );
         }
-
-        // Kin's MCP surface is what the session is pointed at; another
-        // server's file reader is not.
-        semantic_only_guard_verdict(&payload("mcp__kin__semantic_locate", ""), NO_GUARD).unwrap();
-        semantic_only_guard_verdict(&payload("BashOutput", ""), NO_GUARD).unwrap();
-        assert!(
-            semantic_only_guard_verdict(&payload("mcp__filesystem__read_file", ""), NO_GUARD)
-                .is_err()
-        );
-        assert!(semantic_only_guard_verdict(&payload("mcp__kinlab__read", ""), NO_GUARD).is_err());
+        // Another server's tools, including one whose name starts like Kin's.
+        for other in [
+            "mcp__filesystem__read_file",
+            "mcp__filesystem__write_file",
+            "mcp__kinlab__read",
+            "mcp__kin_extra__write",
+            "Task",
+            "Agent",
+        ] {
+            assert!(
+                semantic_only_guard_verdict(&payload(other, "")).is_err(),
+                "guard admitted {other}"
+            );
+        }
 
         // Anything unreadable is a refusal, not an admission.
-        assert!(semantic_only_guard_verdict(b"", NO_GUARD).is_err());
-        assert!(semantic_only_guard_verdict(b"not json", NO_GUARD).is_err());
-        assert!(
-            semantic_only_guard_verdict(br#"{"tool_input":{"command":"pwd"}}"#, NO_GUARD).is_err()
-        );
-        assert!(semantic_only_guard_verdict(br#"{"tool_name":"Bash"}"#, NO_GUARD).is_err());
-        assert!(semantic_only_guard_verdict(
-            br#"{"tool_name":"Bash","tool_input":{"command":7}}"#,
-            NO_GUARD
-        )
-        .is_err());
+        assert!(semantic_only_guard_verdict(b"").is_err());
+        assert!(semantic_only_guard_verdict(b"not json").is_err());
+        assert!(semantic_only_guard_verdict(br#"{"tool_input":{"command":"pwd"}}"#).is_err());
+        assert!(semantic_only_guard_verdict(br#"{"tool_name":7}"#).is_err());
     }
 
+    /// The session has no built-in at all and loads Kin's server alone.
     #[test]
-    fn claude_profile_denies_discovery_and_keeps_the_edit_path() {
+    fn claude_profile_removes_every_builtin_and_loads_only_kin() {
         let dir = Path::new("/tmp/profile");
         let profile = ClaudeAdapter.semantic_only(dir, false).unwrap();
         assert_eq!(profile.tier, EnforcementTier::Enforced);
 
-        let settings = profile
-            .files
-            .iter()
-            .find(|f| f.relative_path == Path::new(CLAUDE_SETTINGS_FILE))
-            .expect("settings file present");
-        let parsed: serde_json::Value = serde_json::from_str(&settings.contents).unwrap();
-        let deny: Vec<String> = parsed["permissions"]["deny"]
+        let args = args_of(&profile);
+        assert_eq!(
+            args,
+            vec![
+                "--tools".to_string(),
+                String::new(),
+                "--mcp-config".to_string(),
+                dir.join(CLAUDE_MCP_CONFIG_FILE).display().to_string(),
+                "--strict-mcp-config".to_string(),
+                "--settings".to_string(),
+                dir.join(CLAUDE_SETTINGS_FILE).display().to_string(),
+            ]
+        );
+        // Both list-valued flags are ended by the flag after their value, and
+        // the last flag takes one value, so a task word can bind to neither.
+        assert!(args[2].starts_with("--") && args[4].starts_with("--"));
+        assert_eq!(args[5], "--settings");
+
+        let settings = profile_file(&profile, CLAUDE_SETTINGS_FILE);
+        let deny: Vec<String> = settings["permissions"]["deny"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-
         for tool in CLAUDE_DENIED_TOOLS {
             assert!(deny.contains(&tool.to_string()), "missing {tool}");
         }
-        for reader in CLAUDE_DENIED_BASH_READERS {
-            assert!(
-                deny.contains(&format!("Bash({reader}:*)")),
-                "missing {reader}"
-            );
-        }
-        for kept in ["Edit", "Write", "Bash", "mcp__kin__semantic_locate"] {
-            assert!(!deny.contains(&kept.to_string()), "overdenies {kept}");
-        }
+        assert!(deny.iter().all(|rule| !rule.starts_with("mcp__kin__")));
 
-        // The hook must be aimed at Bash. Aimed at the denied tool names alone
-        // it would guard a door the deny rules already hold and cover none of
-        // the surface every bypass in `BYPASS_VECTORS` runs through.
-        let hook = &parsed["hooks"]["PreToolUse"][0];
-        assert_eq!(hook["matcher"], CLAUDE_HOOK_MATCHER);
-        assert!(
-            hook["matcher"].as_str().unwrap().contains("Bash"),
-            "the hook must see Bash"
-        );
+        let hook = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "*", "the guard must see every call");
         let command = hook["hooks"][0]["command"].as_str().unwrap();
-        assert!(
-            command.contains(" semantic-only-guard"),
-            "the hook must call the guard: {command}"
+        assert!(command.contains(" semantic-only-guard"), "{command}");
+        assert!(command.starts_with('\''), "{command}");
+
+        let mcp = profile_file(&profile, CLAUDE_MCP_CONFIG_FILE);
+        let servers = mcp["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec!["kin"]);
+        assert_eq!(
+            servers["kin"]["command"],
+            guard_program().unwrap().display().to_string()
         );
-        assert!(
-            command.starts_with('\''),
-            "the guard program must be quoted for the hook shell: {command}"
+        assert_eq!(
+            servers["kin"]["args"],
+            serde_json::json!(["mcp", "start", "--tool-profile", "agent-default"])
         );
         assert!(
             profile
@@ -820,19 +656,11 @@ mod tests {
                 .all(|f| f.relative_path != Path::new("deny-discovery.sh")),
             "the guard must not be a script the session can delete or rewrite"
         );
-
-        let args: Vec<String> = profile
-            .extra_args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args[0], "--settings");
-        assert!(args[1].ends_with(CLAUDE_SETTINGS_FILE));
     }
 
     /// The printed line is the operator's only description of what a
-    /// semantic-only launch holds, so it is asserted against the sets it
-    /// describes rather than against a copy of its own words.
+    /// semantic-only launch holds, so it is asserted against what the profile
+    /// actually does, and it must not promise work the session cannot do.
     #[test]
     fn the_disclosure_describes_exactly_what_is_enforced() {
         for windows in [false, true] {
@@ -840,48 +668,31 @@ mod tests {
                 .semantic_only(Path::new("/tmp/profile"), windows)
                 .unwrap();
             let disclosure = &profile.disclosure;
+            let args = args_of(&profile);
 
             assert!(disclosure.contains("[enforced]"), "{disclosure}");
-            for tool in CLAUDE_DENIED_TOOLS {
-                assert!(disclosure.contains(tool), "{tool} unnamed: {disclosure}");
+            assert!(
+                disclosure.contains("--tools \"\"") && args[0] == "--tools" && args[1].is_empty()
+            );
+            assert!(
+                disclosure.contains("--strict-mcp-config")
+                    && args.contains(&"--strict-mcp-config".to_string())
+            );
+            for named in ["Bash", "Read", "Edit", "Write"] {
+                assert!(disclosure.contains(named), "{named} unnamed: {disclosure}");
+                assert!(CLAUDE_DENIED_TOOLS.contains(&named));
             }
-            for allowed in CLAUDE_ALLOWED_BASH {
+            assert!(disclosure.contains("outside this session"), "{disclosure}");
+            for retired in ["Bash is refused unless", "mkdir", "rm,", "chmod"] {
                 assert!(
-                    disclosure.contains(allowed),
-                    "{allowed} unnamed: {disclosure}"
+                    !disclosure.contains(retired),
+                    "the disclosure still describes a shell: {disclosure}"
                 );
-                semantic_only_bash_verdict(allowed, NO_GUARD).unwrap_or_else(|refusal| {
-                    panic!("the disclosure names {allowed} but the guard refuses it: {refusal}")
-                });
             }
-            // The claim the review falsified: the old line said file-reading
-            // Bash was refused while thirteen prefixes were. The line must not
-            // describe the Bash boundary as anything but the allowlist.
-            assert!(
-                disclosure.contains("Bash is refused unless"),
-                "{disclosure}"
-            );
-            assert!(
-                !disclosure.contains("backstop"),
-                "the disclosure must not credit coverage to a backstop: {disclosure}"
-            );
-            // The guard-path refusal is part of the boundary, so the line
-            // describing the boundary has to name it. Listing `rm` as allowed
-            // without saying `rm <the guard>` is not understates the rule in the
-            // one direction an operator would be surprised by.
-            assert!(
-                disclosure.contains("names Kin's own binary"),
-                "the disclosure must name the guard-path refusal: {disclosure}"
-            );
-            assert!(disclosure.contains("MCP tools other than Kin's are refused"));
         }
     }
 
-    /// Both platform arms carry the guard.
-    ///
-    /// The guard is the `kin` binary, so nothing about it needs a POSIX shell
-    /// script or an executable bit — which is what previously left the Windows
-    /// arm with deny rules and no hook at all.
+    /// Both platform arms carry the guard and the same boundary.
     #[test]
     fn both_platform_arms_install_the_same_guard() {
         let unix = ClaudeAdapter
@@ -893,15 +704,15 @@ mod tests {
 
         for profile in [&unix, &windows] {
             assert_eq!(profile.tier, EnforcementTier::Enforced);
-            assert_eq!(profile.files.len(), 1);
-            let parsed: serde_json::Value =
-                serde_json::from_str(&profile.files[0].contents).unwrap();
+            assert_eq!(profile.files.len(), 2);
+            let settings = profile_file(profile, CLAUDE_SETTINGS_FILE);
             assert_eq!(
-                parsed["hooks"]["PreToolUse"][0]["matcher"],
+                settings["hooks"]["PreToolUse"][0]["matcher"],
                 CLAUDE_HOOK_MATCHER
             );
         }
         assert_eq!(unix.disclosure, windows.disclosure);
+        assert_eq!(args_of(&unix), args_of(&windows));
 
         let quoted = shell_quote_program(Path::new("/opt/kin tools/kin"), false);
         assert_eq!(quoted, "'/opt/kin tools/kin'");
@@ -919,43 +730,29 @@ mod tests {
     ///
     /// Claude Code reports a `PreToolUse` hook it cannot execute as a
     /// non-blocking error and then runs the tool, so a guard that is deleted or
-    /// made non-executable would drop the session back to the deny rules — which
-    /// `sed`, `awk`, `perl`, `python3`, `git show`, and a nested `claude -p` all
-    /// walk straight through — while the banner still says enforced. Verified
-    /// against Claude Code 2.1.222: with the bare command a dead guard let
-    /// `sed -n 1p secret.txt` run and print the file; with this suffix the same
-    /// call was blocked and recorded as a permission denial.
+    /// made non-executable must still block.
     #[test]
     fn the_hook_command_turns_an_unusable_guard_into_a_refusal() {
         // Asserted against the literal exit code Claude Code treats as blocking,
-        // never against `HOOK_FAIL_CLOSED_SUFFIX`. Comparing the built command to
-        // the same constant that built it is a check that cannot fail: emptying
-        // the constant leaves `ends_with` trivially true and the test green while
-        // the profile ships with no fail-closed behavior at all.
+        // never against `HOOK_FAIL_CLOSED_SUFFIX`, so emptying the constant
+        // cannot leave this green.
         for windows in [false, true] {
             let command = semantic_only_hook_command(Path::new(GUARD_PROGRAM), windows);
             assert!(
                 command.ends_with(" || exit 2"),
                 "a guard that cannot run must block, not warn: {command}"
             );
-            assert!(
-                command.contains(" semantic-only-guard"),
-                "the hook must still call the guard: {command}"
-            );
+            assert!(command.contains(" semantic-only-guard"), "{command}");
 
             let profile = ClaudeAdapter
                 .semantic_only(Path::new("/tmp/profile"), windows)
                 .unwrap();
-            let parsed: serde_json::Value =
-                serde_json::from_str(&profile.files[0].contents).unwrap();
-            let installed = parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            let installed = profile_file(&profile, CLAUDE_SETTINGS_FILE)["hooks"]["PreToolUse"][0]
+                ["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
                 .to_string();
-            assert!(
-                installed.ends_with(" || exit 2"),
-                "the written profile must carry the fail-closed suffix: {installed}"
-            );
+            assert!(installed.ends_with(" || exit 2"), "{installed}");
         }
     }
 
@@ -1009,60 +806,34 @@ mod tests {
 
     /// A subject may not disarm the guard adjudicating it.
     ///
-    /// The fail-closed suffix covers a guard that is gone or unrunnable, but not
-    /// one replaced by a working program that exits 0 — that guard answers, and
-    /// it answers yes. Confirmed against Claude Code 2.1.222: an empty
-    /// executable at the guard path let `sed -n 1p secret.txt` print the file
-    /// with the suffix in place and no denial recorded. `mv`, `rm`, and `chmod`
-    /// are all allowed against the working tree and reach the binary just as
-    /// easily, so naming it has to be the refusal.
+    /// A guard replaced by a program that exits 0 answers yes to everything, and
+    /// the fail-closed suffix cannot catch that. What holds it is that the
+    /// session has no tool that can touch the guard's path: no shell, no file
+    /// writer, and no MCP server but Kin's.
     #[test]
     fn a_session_cannot_reach_the_guard_that_enforces_it() {
-        let paths = guard_paths();
         for reach in [
             "rm /usr/local/bin/kin",
-            "rm -f /usr/local/bin/kin",
             "mv /usr/local/bin/kin /tmp/parked",
             "mv scratch/passthrough /usr/local/bin/kin",
             "chmod 000 /usr/local/bin/kin",
-            "chmod -x /usr/local/bin/kin",
             "rm -r /usr/local/bin",
-            "mv /usr/local/bin /tmp/parked",
-            // The same file, spelled to slip a containment test.
-            "rm /usr/local//bin/kin",
-            "rm /usr/local/./bin/kin",
-            "rm /usr/local/bin/./kin",
         ] {
-            let refusal = semantic_only_bash_verdict(reach, &paths)
-                .expect_err(&format!("semantic-only admitted a disarm: {reach}"));
             assert!(
-                refusal.contains("the guard enforcing this session"),
-                "{reach}: {refusal}"
+                semantic_only_guard_verdict(&payload("Bash", reach)).is_err(),
+                "semantic-only admitted a disarm: {reach}"
             );
-            // The falsification: without the guard paths every one of these is
-            // an ordinary allowed command, which is exactly the pre-fix state.
-            semantic_only_bash_verdict(reach, NO_GUARD).unwrap_or_else(|refusal| {
-                panic!("{reach} was refused for a reason other than the guard: {refusal}")
-            });
         }
-
-        // The refusal is about the guard, not about the commands. Work on the
-        // tree that has nothing to do with it still runs.
-        for allowed in [
-            "rm -f target/debug/stale",
-            "mv src/old.rs src/new.rs",
-            "chmod u+x scripts/run",
-            "mkdir -p src/rendering",
-        ] {
-            semantic_only_bash_verdict(allowed, &paths).unwrap_or_else(|refusal| {
-                panic!("guard-path refusal caught an unrelated command {allowed}: {refusal}")
-            });
+        for writer in ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"] {
+            assert!(CLAUDE_DENIED_TOOLS.contains(&writer), "{writer} not denied");
+            assert!(semantic_only_guard_verdict(&payload(writer, "")).is_err());
         }
-
-        // A guard installed at the root would otherwise refuse every absolute
-        // path, which is a session that can do nothing rather than a guarded one.
-        assert!(!guard_refused_paths(Path::new("/kin")).contains(&"/".to_string()));
-        assert!(guard_refused_paths(Path::new("/kin")).contains(&"/kin".to_string()));
+        let profile = ClaudeAdapter
+            .semantic_only(Path::new("/tmp/profile"), false)
+            .unwrap();
+        let args = args_of(&profile);
+        assert_eq!((args[0].as_str(), args[1].as_str()), ("--tools", ""));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
     }
 
     #[test]

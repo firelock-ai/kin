@@ -235,6 +235,7 @@ pub struct ResolvedAdmissionMatcher {
     sources: BTreeMap<PathBuf, AdmissionRuleSource>,
     case: AdmissionCase,
     generation: Hash256,
+    rule_sets: Vec<ResolvedAdmissionRuleSet>,
 }
 
 impl ResolvedAdmissionMatcher {
@@ -279,7 +280,46 @@ impl ResolvedAdmissionMatcher {
             sources,
             case,
             generation: finish_hash(generation),
+            rule_sets,
         })
+    }
+
+    /// Preview an observed replacement/removal of one existing shared source.
+    ///
+    /// All other shared sources, frozen local/command-line tiers, case rules,
+    /// and intrinsic exclusions remain intact. An absent source is not added:
+    /// this helper does not invent the canonical ordering of new policy files.
+    /// This is a matching proposal, not publication authority. Ingestion must
+    /// bind supplied bytes to its completed observation and revalidate before
+    /// publication; authority independently reconstructs its proposal from CAS
+    /// and the exact successor tree before judging any artifact.
+    pub fn with_replaced_shared_source(
+        &self,
+        source_path: &RepoPath,
+        contents: Option<&[u8]>,
+    ) -> Result<Self, AdmissionMatcherError> {
+        let mut rules = Vec::with_capacity(self.rule_sets.len());
+        for held in &self.rule_sets {
+            let matches = matches!(
+                &held.source,
+                AdmissionRuleSource::Shared { source_path: held_path } if held_path == source_path
+            );
+            let mut next = if matches {
+                let Some(contents) = contents else { continue };
+                ResolvedAdmissionRuleSet::from_bytes(
+                    held.source.clone(),
+                    held.precedence,
+                    held.base_directory.clone(),
+                    contents,
+                )
+            } else {
+                held.clone()
+            };
+            next.precedence =
+                u32::try_from(rules.len()).map_err(|_| AdmissionMatcherError::TooManyRuleSets)?;
+            rules.push(next);
+        }
+        Self::compile(self.case, rules)
     }
 
     pub fn empty(case: AdmissionCase) -> Self {
@@ -1228,5 +1268,80 @@ mod fir3527_intrinsic_control {
         assert!(is_intrinsic_repository_control_path(
             &RepoPath::from_utf8(KIN_FIXTURE).unwrap()
         ));
+    }
+}
+
+#[cfg(test)]
+mod proposed_shared_rule_tests {
+    use super::*;
+
+    fn path(value: &str) -> RepoPath {
+        RepoPath::from_utf8(value).unwrap()
+    }
+
+    #[test]
+    fn proposed_shared_replacement_preserves_other_tiers_and_held_matcher() {
+        let root = path(".kinignore");
+        let sets = [
+            (AdmissionRuleSource::GlobalExclude, "global.py"),
+            (AdmissionRuleSource::InfoExclude, "info.py"),
+            (
+                AdmissionRuleSource::Shared {
+                    source_path: path(".gitignore"),
+                },
+                "shared.py",
+            ),
+            (
+                AdmissionRuleSource::Shared {
+                    source_path: root.clone(),
+                },
+                "target.py",
+            ),
+            (AdmissionRuleSource::KinLocal { ordinal: 0 }, "local.py"),
+            (
+                AdmissionRuleSource::CommandLine { ordinal: 0 },
+                "command.py",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(precedence, (source, body))| {
+            ResolvedAdmissionRuleSet::from_bytes(source, precedence as u32, None, body.as_bytes())
+        })
+        .collect();
+        let held = ResolvedAdmissionMatcher::compile(AdmissionCase::FoldAscii, sets).unwrap();
+        for proposed in [Some(b"".as_slice()), None] {
+            let next = held.with_replaced_shared_source(&root, proposed).unwrap();
+            assert_ne!(next.generation(), held.generation());
+            assert!(!next.decide(&path("target.py"), false, false).is_ignored());
+            assert!(held.decide(&path("target.py"), false, false).is_ignored());
+            for still_excluded in [
+                "GLOBAL.PY",
+                "info.py",
+                "shared.py",
+                "local.py",
+                "command.py",
+                ".git/config",
+                ".kin/authority",
+            ] {
+                assert!(
+                    next.decide(&path(still_excluded), false, false)
+                        .is_ignored(),
+                    "{still_excluded}"
+                );
+            }
+        }
+        assert_eq!(
+            held.with_replaced_shared_source(&root, Some(b"target.py"))
+                .unwrap()
+                .generation(),
+            held.generation()
+        );
+        assert_eq!(
+            held.with_replaced_shared_source(&path("new/.kinignore"), Some(b"anything"))
+                .unwrap()
+                .generation(),
+            held.generation()
+        );
     }
 }

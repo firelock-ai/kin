@@ -425,7 +425,7 @@ jobs:
             # the train refuses the branch it just generated. The authority
             # suite cross-checks this against the generator rather than trusting
             # the two to stay in step by hand.
-            allowed='^(Cargo\.toml|Cargo\.lock|fuzz/Cargo\.lock|CHANGELOG\.md|crates/kin-cli/Cargo\.toml|packages/(kin-mcp|kin|boundary-contracts)/package\.json)$'
+            allowed='^(Cargo\.toml|Cargo\.lock|fuzz/Cargo\.lock|CHANGELOG\.md|crates/kin-cli/Cargo\.toml|packages/(kin-mcp|kin|boundary-contracts)/package\.json|server\.json)$'
             branch_paths="$(git diff \
               --name-only \
               "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}")"
@@ -471,7 +471,8 @@ jobs:
             crates/kin-cli/Cargo.toml \
             packages/kin-mcp/package.json \
             packages/kin/package.json \
-            packages/boundary-contracts/package.json
+            packages/boundary-contracts/package.json \
+            server.json
 
           output="$RUNNER_TEMP/prepare-release.outputs"
           : > "$output"
@@ -495,7 +496,8 @@ jobs:
             crates/kin-cli/Cargo.toml \
             packages/kin-mcp/package.json \
             packages/kin/package.json \
-            packages/boundary-contracts/package.json
+            packages/boundary-contracts/package.json \
+            server.json
           if ! git diff --cached --quiet; then
             git commit --signoff -m "Release Kin ${tag}"
           fi

@@ -176,8 +176,36 @@ where
             "source does not match the declared native or Git-import mode".into(),
         ));
     }
+    // Owed derivation work is this replica's own bookkeeping, and hosted
+    // storage never holds it. Publishing a workspace tree whose bodies still
+    // owe their derivation without it would leave the hosted copy serving the
+    // spans the previous bytes produced with nothing to say so, so the
+    // publication waits for the commit that records those derivations.
+    let owed = metadata.owed_derivations.records().len();
+    if owed > 0 {
+        return Err(Refused(format!(
+            "source owes the derivation of {owed} path(s) whose bytes no commit has recorded \
+             with their semantics; commit them, then publish"
+        )));
+    }
     let roots = lease.roots().clone();
-    let snapshot = Arc::new(lease.snapshot().to_bytes().map_err(NotCommitted)?);
+    // This replica-local checked lineage is not a remotely authenticated
+    // history certificate. Importing exact repository truth must not also
+    // import another writer's local derived qualification.
+    let mut exported = lease.snapshot().clone();
+    exported.verified_binding_history = None;
+    let exported_authority = exported
+        .repository_authority
+        .as_mut()
+        .expect("authority checked above");
+    exported_authority.binding_history.clear();
+    // What remains of the ledger here is payment watermarks, which record this
+    // replica's own re-derivations like the lineage above, so a hosted
+    // destination does not hold them either. Dropping them moves the snapshot
+    // version back to what its other contents declare.
+    exported_authority.owed_derivations = Default::default();
+    exported.version = exported.wire_version();
+    let snapshot = Arc::new(exported.to_bytes().map_err(NotCommitted)?);
     drop(lease);
     if destination
         .load_snapshot_cursor(expected_repository_id.as_str())

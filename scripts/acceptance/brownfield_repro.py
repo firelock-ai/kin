@@ -561,6 +561,10 @@ class Suite(object):
 
     def cached(self, repo, tool, args, key=None):
         """Probe once per run; several checks read the same payload."""
+        if tool == "find_references":
+            # These checks compare the detailed diagnostic blocks. Agent
+            # profiles omit them unless the caller explicitly requests them.
+            args = {"answer_only": False, **args}
         cache_key = key or (repo, tool, json.dumps(args, sort_keys=True))
         if cache_key not in self.payloads:
             self.payloads[cache_key] = self.mcp(repo, tool, args)
@@ -911,6 +915,28 @@ def verdict_surfaces(payload):
     # invisible to check 5. The top-level read stays as a fallback for older
     # payload shapes.
     kin_envelope = payload.get("_kin")
+    if isinstance(kin_envelope, dict) and "verdict" in kin_envelope:
+        verdict = kin_envelope["verdict"]
+        if (not isinstance(verdict, dict)
+                or verdict.get("state") not in ("certified", "inconclusive")
+                or not isinstance(verdict.get("safe_to_conclude_absent"), bool)
+                or "limiting_factor" not in verdict
+                or (verdict["limiting_factor"] is not None
+                    and not isinstance(verdict["limiting_factor"], str))):
+            raise UnknownClassState("_kin.verdict is not a readable verdict: %r" % verdict)
+        state = verdict["state"]
+        factor = verdict["limiting_factor"]
+        out["_kin.verdict"] = (
+            "certify" if state == "certified" else "refuse",
+            "state=%r limiting_factor=%r" % (state, factor))
+        if state == "inconclusive" and not (factor and factor.strip()):
+            raise UnknownClassState("_kin.verdict refuses without a limiting factor")
+        if factor is not None:
+            out["_kin.verdict.limiting_factor"] = ("refuse", "limiting_factor=%r" % factor)
+        # False is normal on a populated certified answer: it claims no
+        # absence. True, however, cannot agree with an inconclusive verdict.
+        if verdict["safe_to_conclude_absent"] is True:
+            out["_kin.verdict.absence"] = ("certify", "safe_to_conclude_absent=True")
     completeness = kin_envelope.get("completeness") if isinstance(kin_envelope, dict) else None
     if not isinstance(completeness, dict):
         completeness = payload.get("completeness")
@@ -1217,6 +1243,61 @@ def check_3(suite):
     return res
 
 
+def accounted_depth_boundary(payload, steps):
+    """Recognize a complete requested two-hop walk ending at its depth bound.
+
+    A terminal at depth two owes no depth-three rows to check 4. This does not
+    excuse a clipped fanout, a missing step, or an unexplained truncation.
+    """
+    if (payload.get("direction") != "calls" or type(payload.get("depth")) is not int
+            or payload["depth"] != 2 or type(payload.get("total_steps")) is not int
+            or payload["total_steps"] != len(steps)
+            or type(payload.get("terminal_bound_steps")) is not int
+            or payload["terminal_bound_steps"] <= 0
+            or payload.get("focal_terminal") is not None):
+        return False
+    degradations = payload.get("degradations", [])
+    if (not isinstance(degradations, list)
+            or any(not isinstance(row, dict)
+                   or row.get("component") != "call_resolution"
+                   or row.get("reason") != "name_only_steps" for row in degradations)):
+        return False
+    terminals = {"bound_reached": 0, "leaf": 0, "type_annotation": 0,
+                 "external_reference": 0}
+    for index, step in enumerate(steps, 1):
+        if (not isinstance(step, dict) or type(step.get("step")) is not int
+                or step["step"] != index or type(step.get("depth")) is not int
+                or step["depth"] not in (1, 2)
+                or type(step.get("parent_step")) is not int
+                or not 0 <= step["parent_step"] < index
+                or step.get("fanout_truncated") is not False
+                or type(step.get("fanout_dropped")) is not int
+                or step["fanout_dropped"] != 0):
+            return False
+        parent = step["parent_step"]
+        if ((parent == 0 and step["depth"] != 1)
+                or (parent > 0 and (steps[parent - 1]["depth"] != step["depth"] - 1
+                                   or steps[parent - 1].get("terminal") is not None))):
+            return False
+        terminal = step.get("terminal")
+        if terminal not in (None, "bound_reached", "leaf", "type_annotation", "external_reference"):
+            return False
+        if terminal is None and step["depth"] == payload["depth"]:
+            return False
+        if terminal == "bound_reached":
+            if step["depth"] != payload["depth"]:
+                return False
+        if terminal is not None:
+            terminals[terminal] += 1
+    counts = {"terminal_bound_steps": terminals["bound_reached"],
+              "terminal_leaf_steps": terminals["leaf"],
+              "terminal_annotation_steps": terminals["type_annotation"],
+              "terminal_external_steps": terminals["external_reference"],
+              "terminal_coverage_gap_steps": 0}
+    return all(key not in payload or (type(payload[key]) is int and payload[key] == count)
+               for key, count in counts.items())
+
+
 def complete_trace_clips(suite, repo, payload, steps):
     """Bound only depth-one fanout gaps with complete graph-owned witnesses.
 
@@ -1241,6 +1322,10 @@ def complete_trace_clips(suite, repo, payload, steps):
     if not payload.get("truncated") and not clips:
         return [], [], []
     if not clips:
+        if accounted_depth_boundary(payload, steps):
+            return [], ["no reported fanout or output row loss within the requested walk; "
+                        "%d terminal(s) stop at the declared depth bound"
+                        % payload["terminal_bound_steps"]], []
         raise ProbeError("truncated trace has no bounded fanout disclosure")
     confirmations, receipts, witnessed = [], [], []
     for clip in clips:
@@ -2177,6 +2262,61 @@ def check_10(suite):
     return res
 
 
+def express_export_reference_body(payload, export):
+    """Select the pinned export's answer, independently of its reference rows.
+
+    Bare names can produce labelled sections instead of a single focal. In the
+    pinned Express tree, `response` also names two modules, one owner-qualified.
+    Only the Constant export in lib/express.js answers this check's question.
+    Missing, duplicate or malformed identities cannot establish that answer.
+    """
+    if not isinstance(payload, dict):
+        raise ProbeError("reference payload is not an object")
+    sectioned = "candidates_by_owner" in payload or "ambiguous_focal" in payload
+    if sectioned:
+        bodies = payload.get("candidates_by_owner")
+        count = payload.get("candidate_count")
+        if (payload.get("ambiguous_focal") is not True
+                or "focal_entity" in payload
+                or payload.get("truncated") is True
+                or not isinstance(bodies, list) or not bodies
+                or type(count) is not int or count != len(bodies)):
+            raise ProbeError("malformed or incomplete sectioned reference response")
+    else:
+        bodies = [payload]
+    matches, identities = [], set()
+    for body in bodies:
+        if not isinstance(body, dict):
+            raise ProbeError("reference section is not an object")
+        focal = body.get("focal_entity")
+        if (not isinstance(focal, dict)
+                or any(not isinstance(focal.get(key), str) or not focal[key]
+                       for key in ("id", "name", "kind", "file_path"))):
+            raise ProbeError("reference response carries no valid focal identity")
+        if focal["id"] in identities:
+            raise ProbeError("duplicate reference focal identity")
+        identities.add(focal["id"])
+        if sectioned and (body.get("entity_id") != focal["id"]
+                          or body.get("owner_qualified_name") != focal["name"]):
+            raise ProbeError("reference section label disagrees with its focal identity")
+        if (focal["name"] == export and focal["file_path"] == "lib/express.js"
+                and focal["kind"].lower() == "constant"):
+            matches.append(body)
+    if len(matches) != 1:
+        raise ProbeError("expected exactly one Constant export %s in lib/express.js; got %d"
+                         % (export, len(matches)))
+    body = matches[0]
+    if (not isinstance(body.get("references"), list)
+            or any(not isinstance(row, dict) for row in body["references"])):
+        raise ProbeError("selected export carries malformed reference rows")
+    for row in body["references"]:
+        lines = row.get("reference_lines")
+        if lines is not None and (not isinstance(lines, list)
+                                  or any(type(line) is not int or line < 1 for line in lines)):
+            raise ProbeError("selected export carries malformed reference lines")
+    return body
+
+
 def check_11(suite):
     """FIR-2758: a module-sourced consumer names the line, not just the file.
 
@@ -2206,12 +2346,9 @@ def check_11(suite):
     for export, caller_file, line in EXPRESS_MODULE_SOURCED_SITES:
         try:
             payload = suite.cached(repo, "find_references", {"query": export})
+            payload = express_export_reference_body(payload, export)
         except ProbeError as exc:
             res.unknown("find_references(%s): %s" % (export, exc))
-            return res
-        if not (payload.get("focal_entity") or {}).get("id"):
-            res.unknown("find_references(%s) resolved no focal entity, so its "
-                        "reference lines cannot be judged" % export)
             return res
         counted, _withheld = upstream_rows(payload)
         row = next((r for r in counted
@@ -2573,6 +2710,15 @@ def main(argv):
     print("kin-brownfield-repro: %s" % NON_CITABLE)
     print("kin-brownfield-repro: %s" % FIXTURE_SCOPE)
 
+    # A failing recall run must retain the exact responses and converted stores
+    # needed to distinguish missing coverage from a reporting defect.
+    if failed or unread:
+        payload_path = os.path.join(workdir, "mcp-payloads.json")
+        with open(payload_path, "w") as handle:
+            json.dump([{"request": key, "payload": value}
+                       for key, value in suite.payloads.items()], handle, indent=2)
+        print("kin-brownfield-repro: failing-run MCP payloads %s" % payload_path)
+
     if opts.json_out:
         with open(opts.json_out, "w") as handle:
             json.dump({"citable": False, "lane": "DEV-LOCAL",
@@ -2588,10 +2734,10 @@ def main(argv):
                       handle, indent=2)
         print("kin-brownfield-repro: json %s" % opts.json_out)
 
-    if cleanup.status == PASS and not opts.keep and not opts.workdir:
+    if not failed and not unread and cleanup.status == PASS and not opts.keep and not opts.workdir:
         shutil.rmtree(workdir, ignore_errors=True)
-    elif cleanup.status != PASS:
-        print("kin-brownfield-repro: cleanup failed; run root kept at %s" % workdir)
+    elif failed or unread:
+        print("kin-brownfield-repro: failed or unreadable checks; run root kept at %s" % workdir)
 
     if failed:
         return 1

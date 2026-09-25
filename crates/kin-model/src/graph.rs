@@ -25,11 +25,45 @@ use std::collections::{HashMap, HashSet};
 // subset of GraphStore.
 // ===========================================================================
 
+/// Exact identity lookup availability is independent of endpoint traversal.
+/// An implementation without this read cannot certify that an ID is absent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RelationLookup {
+    Unavailable,
+    Absent,
+    Present(Relation),
+}
+
+/// Whether this exact selected graph has a checked prior-binding lineage.
+/// Unsupported stores must not infer this fact from an empty debt lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BindingHistoryObservation {
+    #[default]
+    Unproven,
+    Checked {
+        lineage: Hash256,
+        generation: u64,
+    },
+}
+
 /// Core entity, relation, and repository-tree operations.
 pub trait EntityStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    fn binding_history_observation(&self) -> BindingHistoryObservation {
+        BindingHistoryObservation::Unproven
+    }
+
     fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error>;
+
+    /// Look up a stored relation regardless of its endpoints. Unsupported
+    /// stores must return Unavailable, never invent absence from traversal.
+    fn lookup_relation_by_id(
+        &self,
+        _id: &RelationId,
+    ) -> std::result::Result<RelationLookup, Self::Error> {
+        Ok(RelationLookup::Unavailable)
+    }
     fn get_relations(
         &self,
         id: &EntityId,
@@ -103,6 +137,25 @@ pub trait EntityStore: Send + Sync {
             page,
         ))
     }
+    /// Ranked token candidates for `query` across this store's indexed text
+    /// fields. This is not exhaustive literal membership: tokenization and
+    /// `limit` can exclude literal matches. Returns up to `limit` candidates as
+    /// `(RetrievalKey, score)` pairs, higher score first.
+    ///
+    /// The default returns no candidates when an implementor has no text
+    /// index. An empty vector does not distinguish index unavailability from
+    /// zero candidates and cannot establish literal absence. This is a
+    /// best-effort, bounded derived-index read; [`Self::query_entities`] is the
+    /// graph-owned entity predicate. An implementor that keeps a text index (
+    /// `InMemoryGraph`, today, backed by `kin_search`) owes its callers an
+    /// override, not this default.
+    fn text_search(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> std::result::Result<Vec<(crate::retrieval::RetrievalKey, f32)>, Self::Error> {
+        Ok(Vec::new())
+    }
     fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
     fn upsert_entity(&self, entity: &Entity) -> std::result::Result<(), Self::Error>;
     fn upsert_relation(&self, relation: &Relation) -> std::result::Result<(), Self::Error>;
@@ -173,6 +226,12 @@ pub trait EntityStore: Send + Sync {
         &self,
         file_id: &FilePathId,
     ) -> std::result::Result<Option<TreeEntry>, Self::Error>;
+    /// The exact graph-owned current tree, including files with no derived entities.
+    /// `None` means this store cannot provide the inventory; callers must not
+    /// interpret it as an empty repository or certify complete source coverage.
+    fn resolved_tree_snapshot(&self) -> std::result::Result<Option<ResolvedTree>, Self::Error> {
+        Ok(None)
+    }
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
 
     /// Apply entity, relation, and repository-tree mutations atomically.
@@ -259,6 +318,28 @@ pub trait ChangeStore: Send + Sync {
         &self,
         id: &EntityId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    /// Read-only focal history. The page is selected before payload projection.
+    /// Stores should override this to avoid loading unrelated commit payloads;
+    /// this fallback preserves compatibility for adapters and test doubles.
+    fn get_entity_history_page(
+        &self,
+        id: &EntityId,
+        offset: usize,
+        limit: usize,
+    ) -> std::result::Result<crate::change::EntityHistoryPage, Self::Error> {
+        let mut history = self.get_entity_history(id)?;
+        history.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        Ok(crate::change::EntityHistoryPage {
+            change_count: history.len(),
+            latest_change_id: history.last().map(|change| change.id),
+            entries: history
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .filter_map(|change| crate::change::EntityHistoryEntry::for_entity(change, id))
+                .collect(),
+        })
+    }
     /// Every revision `id` has across the change DAG, oldest first.
     ///
     /// [`Self::get_entity_history`] answers with the changes that mention `id`
@@ -1833,8 +1914,18 @@ fn entities_match_for_revision(left: &Entity, right: &Entity) -> bool {
 impl<G: EntityStore> EntityStore for &G {
     type Error = G::Error;
 
+    fn binding_history_observation(&self) -> BindingHistoryObservation {
+        (**self).binding_history_observation()
+    }
+
     fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
         (**self).get_entity(id)
+    }
+    fn lookup_relation_by_id(
+        &self,
+        id: &RelationId,
+    ) -> std::result::Result<RelationLookup, Self::Error> {
+        (**self).lookup_relation_by_id(id)
     }
     fn get_relations(
         &self,
@@ -1908,6 +1999,17 @@ impl<G: EntityStore> EntityStore for &G {
         page: &EntityPage,
     ) -> std::result::Result<EntityPageResult, Self::Error> {
         (**self).query_entities_page(filter, page)
+    }
+    // Forwarded for the same reason `query_entities_page` is just above: the
+    // trait default is silently correct (it returns empty), which is exactly
+    // the regression. A reference to a store that DOES override `text_search`
+    // would lose the override and read as unindexed forever.
+    fn text_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<(crate::retrieval::RetrievalKey, f32)>, Self::Error> {
+        (**self).text_search(query, limit)
     }
     fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
         (**self).list_all_entities()
@@ -2013,6 +2115,9 @@ impl<G: EntityStore> EntityStore for &G {
     ) -> std::result::Result<Option<TreeEntry>, Self::Error> {
         (**self).get_tree_entry(file_id)
     }
+    fn resolved_tree_snapshot(&self) -> std::result::Result<Option<ResolvedTree>, Self::Error> {
+        (**self).resolved_tree_snapshot()
+    }
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
         (**self).delete_file_layout(file_id)
     }
@@ -2032,6 +2137,14 @@ impl<G: ChangeStore> ChangeStore for &G {
         id: &EntityId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
         (**self).get_entity_history(id)
+    }
+    fn get_entity_history_page(
+        &self,
+        id: &EntityId,
+        offset: usize,
+        limit: usize,
+    ) -> std::result::Result<crate::change::EntityHistoryPage, Self::Error> {
+        (**self).get_entity_history_page(id, offset, limit)
     }
     fn find_merge_bases(
         &self,
@@ -4686,6 +4799,15 @@ mod tests {
         assert!(page.entities.is_empty());
         assert_eq!(page.total_matching, 0);
         assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn exact_relation_lookup_default_is_unavailable_not_absence() {
+        let store = PagingStore::of_size(1);
+        assert_eq!(
+            store.lookup_relation_by_id(&RelationId::new()).unwrap(),
+            RelationLookup::Unavailable
+        );
     }
 
     #[test]

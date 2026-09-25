@@ -330,6 +330,23 @@ fn untracked_observation_applies(not_applicable: &bool) -> bool {
     !*not_applicable
 }
 
+/// The `: a, b, and N more` clause a path notice appends, or nothing.
+///
+/// One renderer for the two path notices below, so a reader cannot be handed
+/// two differently shaped lists of paths in one report.
+fn sample_clause(count: u64, sample: &[String]) -> String {
+    if sample.is_empty() {
+        return String::new();
+    }
+    let more = count.saturating_sub(sample.len() as u64);
+    let listed = sample.join(", ");
+    if more > 0 {
+        format!(": {listed}, and {more} more")
+    } else {
+        format!(": {listed}")
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileHealth {
     /// Reconcile events dropped after erroring. Each one leaves exactly one
@@ -409,6 +426,46 @@ pub struct ReconcileHealth {
     /// of the projection (FIR-2820).
     #[serde(default, skip_serializing_if = "untracked_observation_applies")]
     pub untracked_observation_not_applicable: bool,
+    /// Repository paths whose exact bytes reached authority and whose parse is
+    /// still owed.
+    ///
+    /// Counted apart from `untracked_path_count` because these paths are the
+    /// opposite of untracked: an admission took them, and only their semantics
+    /// are missing. Folding them into that count made every surface downstream
+    /// say they had never been admitted and send the reader to `kin admit`,
+    /// which takes an already-taken path and clears nothing. The gap is real
+    /// either way -- the entity census cannot see a file nobody has parsed, so
+    /// a stamped-empty untracked walk beside an unmoved census reads as an
+    /// all-clear over a module the working copy holds -- but the remedy is not
+    /// the same one.
+    #[serde(default)]
+    pub underived_path_count: u64,
+    /// A bounded sample of `underived_path_count`, on the same terms as the
+    /// untracked sample above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub underived_paths_sample: Vec<String>,
+    /// Tracked paths the working copy edited or removed while no daemon
+    /// watched, that no admission has taken yet.
+    ///
+    /// A third way for graph truth to sit behind the working copy, and the one
+    /// that makes a populated answer wrong rather than incomplete. The graph
+    /// still holds these paths' old bytes, so it keeps serving a renamed
+    /// function under its old name, certifies the new name absent, and ranks a
+    /// deleted file as a top hit. The daemon plans them before it publishes its
+    /// endpoint and admits them on its own; this counts what it has not taken
+    /// yet.
+    #[serde(default)]
+    pub changed_path_count: u64,
+    /// A bounded sample of `changed_path_count`, on the same terms as the
+    /// untracked sample above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_paths_sample: Vec<String>,
+    /// Why the daemon's startup check for such paths could not run, when it
+    /// could not. A check that did not run is not a working copy with nothing
+    /// to take, so it qualifies answers exactly as a count would until a
+    /// complete admission reads the whole working copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_paths_unchecked: Option<String>,
     /// Untracked host entries the effective ignore rules excluded from the most
     /// recent walk.
     ///
@@ -462,6 +519,129 @@ pub struct ReconcileHealth {
     /// and what it dropped. Absent until one has happened in this daemon's life.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_levelled: Option<AuthorityLevelled>,
+    /// The source files this daemon re-derived from the bytes the store holds
+    /// before it served. Absent on a daemon whose start owed no re-derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_rederivation: Option<StartupRederivation>,
+}
+
+/// A canonical re-derivation this daemon ran at startup, before it served.
+///
+/// Reported although it healed, because it changed what the graph answers with
+/// nobody asking. It runs when the store holds declarations the source bytes do
+/// not produce under this build: edits whose parse no commit recorded, entities
+/// a stopped daemon never published, or a store an older Kin build wrote, whose
+/// parser minted a different declaration set for the same bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupRederivation {
+    /// Source files re-derived, counted once however many causes named them.
+    #[serde(default)]
+    pub files: u64,
+    /// Files whose bytes reached authority without their parse: edits no
+    /// commit recorded.
+    #[serde(default)]
+    pub owed_parse: u64,
+    /// Files a previous daemon derived and stopped before a commit published,
+    /// so the graph held no entity for them.
+    #[serde(default)]
+    pub missing_entities: u64,
+    /// Files whose declarations a fresh parse of their bytes does not
+    /// reproduce, which is what a store written by an older build carries.
+    #[serde(default)]
+    pub stale_declarations: u64,
+    /// Cross-file bindings into declarations the re-derivation retired, dropped
+    /// without a withdrawal record because their caller's own derivation was
+    /// stale and no observation from before the start survives to ground one.
+    #[serde(default)]
+    pub withdrawn_bindings_unrecorded: u64,
+    /// Stored external-import edges the re-derivation retired because this
+    /// build's parser, re-reading the exact source bytes each was recorded
+    /// against, derives a different declaration or occurrence count from them.
+    /// Each one's factory shape, admitted target and recorded bytes were
+    /// verified before it was retired.
+    #[serde(default)]
+    pub external_edges_unreproduced: u64,
+    /// A bounded sample of the files, sorted by path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample: Vec<String>,
+    /// How long the re-derivation took.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// Seconds since it finished. Monotonic.
+    #[serde(default)]
+    pub age_seconds: u64,
+    /// Wall-clock time it finished, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
+impl StartupRederivation {
+    /// What every surface prints for it, lower-case first so a surface can
+    /// lead it with its own label.
+    pub fn clause(&self) -> String {
+        let mut causes = Vec::new();
+        if self.owed_parse > 0 {
+            causes.push(format!(
+                "{} held edits whose parse no commit had recorded",
+                self.owed_parse
+            ));
+        }
+        if self.missing_entities > 0 {
+            causes.push(format!(
+                "{} had lost their entities when a daemon stopped before a commit",
+                self.missing_entities
+            ));
+        }
+        if self.stale_declarations > 0 {
+            causes.push(format!(
+                "{} held declarations this build's parser does not derive from their bytes, \
+                 which is what a store written by an older Kin build carries",
+                self.stale_declarations
+            ));
+        }
+        let causes = if causes.is_empty() {
+            String::new()
+        } else {
+            format!(" Of those, {}.", causes.join("; "))
+        };
+        let withdrawn = if self.withdrawn_bindings_unrecorded == 0 {
+            String::new()
+        } else {
+            format!(
+                " {} cross-file binding(s) into declarations it retired were dropped without a \
+                 withdrawal record, because their callers' own derivations were stale and no \
+                 observation from before this start survives to ground one.",
+                self.withdrawn_bindings_unrecorded
+            )
+        };
+        let unreproduced = if self.external_edges_unreproduced == 0 {
+            String::new()
+        } else {
+            format!(
+                " {} stored external-import edge(s) were retired, because this build's parser \
+                 does not reproduce them from the source bytes they were recorded against.",
+                self.external_edges_unreproduced
+            )
+        };
+        let named = if self.sample.is_empty() {
+            String::new()
+        } else {
+            let more = self.files.saturating_sub(self.sample.len() as u64);
+            let listed = self.sample.join(", ");
+            if more > 0 {
+                format!(" ({listed}, and {more} more)")
+            } else {
+                format!(" ({listed})")
+            }
+        };
+        format!(
+            "this daemon re-derived {} source file(s){named} from the bytes the store holds, in \
+             {} ms, before it served ({}s ago).{causes}{withdrawn}{unreproduced} Every answer \
+             now describes their current bytes. The next commit records the re-derived \
+             semantics durably; until one does, each daemon start repeats this.",
+            self.files, self.elapsed_ms, self.age_seconds
+        )
+    }
 }
 
 /// The background-work supervisor's account of a parked reconciliation loop.
@@ -791,6 +971,36 @@ impl ReconcileHealth {
         !self.degraded_reasons().is_empty()
     }
 
+    /// Why graph truth does not describe the working copy right now, because
+    /// tracked files changed while no daemon watched them. Empty when nothing
+    /// is owed.
+    ///
+    /// Not a degraded reason: the daemon is healthy and is admitting these
+    /// paths on its own, so `/health` stays `ok` rather than warning every
+    /// client through the ordinary seconds of a catch-up. It still withholds
+    /// every all-clear, because until the paths land an answer about them
+    /// comes from bytes the host no longer holds, which is the one thing a
+    /// status surface may never call current.
+    pub fn working_copy_behind_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.changed_path_count > 0 {
+            let sample = sample_clause(self.changed_path_count, &self.changed_paths_sample);
+            reasons.push(format!(
+                "{} tracked path(s) changed or removed while no daemon was watching are not \
+                 admitted yet{sample}; answers still describe their old bytes until the daemon's \
+                 catch-up takes them, and `kin admit` takes them now",
+                self.changed_path_count
+            ));
+        }
+        if let Some(reason) = &self.changed_paths_unchecked {
+            reasons.push(format!(
+                "{reason}, so whether tracked files changed while no daemon was watching is \
+                 unknown; `kin admit` reads the whole working copy and settles it"
+            ));
+        }
+        reasons
+    }
+
     /// What the loop is deliberately not doing, stated so no surface has to
     /// leave it unexplained.
     ///
@@ -830,26 +1040,34 @@ impl ReconcileHealth {
                 levelled.age_seconds, levelled.generation, levelled.paths
             ));
         }
+        // Healed, and still said: it changed what the graph answers with
+        // nobody asking, and on a store an older build wrote it is the only
+        // account of why the first start took as long as it did.
+        if let Some(rederived) = &self.startup_rederivation {
+            notices.push(format!("At startup, {}", rederived.clause()));
+        }
         if self.untracked_path_count > 0 {
-            let sample = if self.untracked_paths_sample.is_empty() {
-                String::new()
-            } else {
-                let more = self
-                    .untracked_path_count
-                    .saturating_sub(self.untracked_paths_sample.len() as u64);
-                let listed = self.untracked_paths_sample.join(", ");
-                if more > 0 {
-                    format!(": {listed}, and {more} more")
-                } else {
-                    format!(": {listed}")
-                }
-            };
+            let sample = sample_clause(self.untracked_path_count, &self.untracked_paths_sample);
             notices.push(format!(
                 "{} host path(s) observed but not tracked{sample}. Watching a working copy admits \
                  new non-ignored files, so nothing observed these arriving and no later tick picks \
                  them up on its own; kin admit takes them now, and the next commit takes them \
                  anyway.",
                 self.untracked_path_count
+            ));
+        }
+        // Said separately from the count above, and with a different remedy,
+        // because these paths ARE admitted. Their bytes are graph authority and
+        // their entities are not, so nothing an entity count can see reports
+        // them and `kin admit` has nothing left to take.
+        if self.underived_path_count > 0 {
+            let sample = sample_clause(self.underived_path_count, &self.underived_paths_sample);
+            notices.push(format!(
+                "{} admitted path(s) are still owed their parse{sample}. Their bytes reached \
+                 repository authority without their semantics, so an entity count cannot see \
+                 them; the reconcile loop re-derives them and the next commit records that \
+                 parse. kin admit does not clear this, because these paths are already admitted.",
+                self.underived_path_count
             ));
         }
         if self.ignored_path_count > 0
@@ -1378,6 +1596,48 @@ mod tests {
             ReconcileHealth::default().notices().is_empty(),
             "a working copy with nothing untracked says nothing"
         );
+    }
+
+    /// Tracked files the daemon's catch-up still owes withhold the all-clear
+    /// without calling the loop degraded, and the round trip keeps the fields,
+    /// because an older reader that dropped them would read a level store.
+    #[test]
+    fn owed_tracked_changes_are_named_without_degrading_the_daemon() {
+        let health = ReconcileHealth {
+            changed_path_count: 6,
+            changed_paths_sample: vec!["src/doomed.rs".to_string(), "src/lib.rs".to_string()],
+            ..Default::default()
+        };
+        assert!(!health.degraded(), "{:?}", health.degraded_reasons());
+        let reasons = health.working_copy_behind_reasons();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].contains('6')
+                && reasons[0].contains("src/doomed.rs")
+                && reasons[0].contains("4 more"),
+            "{reasons:?}"
+        );
+        let wire = serde_json::to_value(&health).unwrap();
+        assert_eq!(wire["changed_path_count"], 6);
+        let back: ReconcileHealth = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, health);
+
+        let unchecked = ReconcileHealth {
+            changed_paths_unchecked: Some("the walk failed".to_string()),
+            ..Default::default()
+        };
+        assert!(unchecked.working_copy_behind_reasons()[0].contains("the walk failed"));
+        assert!(
+            ReconcileHealth::default()
+                .working_copy_behind_reasons()
+                .is_empty(),
+            "the control: nothing owed, nothing said"
+        );
+        // An older daemon's body carries none of the fields and reads as owing
+        // nothing, which is what it always said.
+        let older: ReconcileHealth =
+            serde_json::from_value(serde_json::json!({ "untracked_path_count": 0 })).unwrap();
+        assert!(older.working_copy_behind_reasons().is_empty());
     }
 
     /// A loop that has stood down between attempts says so, in the same
@@ -2321,5 +2581,58 @@ mod tests {
         assert!(!embed_pipeline_overlap_default(Some("proof")));
         assert!(!embed_pipeline_overlap_default(Some("interactive")));
         assert!(!embed_pipeline_overlap_default(Some("ci")));
+    }
+
+    /// The startup repair's account counts every binding it dropped without a
+    /// withdrawal record and every stored external-import edge it retired on a
+    /// failed recount, and says nothing about either when there were none.
+    #[test]
+    fn startup_repair_clause_counts_what_it_removed_without_a_record_or_a_recount() {
+        let quiet = StartupRederivation {
+            files: 2,
+            stale_declarations: 2,
+            sample: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            elapsed_ms: 40,
+            ..Default::default()
+        };
+        let clause = quiet.clause();
+        assert!(!clause.contains("withdrawal record"), "{clause}");
+        assert!(!clause.contains("external-import"), "{clause}");
+
+        let counted = StartupRederivation {
+            withdrawn_bindings_unrecorded: 1,
+            external_edges_unreproduced: 3,
+            ..quiet
+        };
+        let clause = counted.clause();
+        assert!(
+            clause.contains(" 1 cross-file binding(s) into declarations it retired"),
+            "{clause}"
+        );
+        assert!(
+            clause.contains(
+                " 3 stored external-import edge(s) were retired, because this build's parser \
+                 does not reproduce them from the source bytes they were recorded against."
+            ),
+            "{clause}"
+        );
+        let health = ReconcileHealth {
+            startup_rederivation: Some(counted),
+            ..Default::default()
+        };
+        let notices = health.notices();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.starts_with("At startup, ")
+                    && notice.contains("3 stored external-import edge(s)")),
+            "{notices:?}"
+        );
+
+        // A daemon that predates the count reports none rather than failing.
+        let older: StartupRederivation =
+            serde_json::from_str(r#"{"files":1,"withdrawn_bindings_unrecorded":2}"#).unwrap();
+        assert_eq!(older.external_edges_unreproduced, 0);
+        assert_eq!(older.withdrawn_bindings_unrecorded, 2);
     }
 }

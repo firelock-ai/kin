@@ -118,8 +118,10 @@ pub enum KinError {
     #[error("incompatible .kin/ version: found v{found}, this binary requires v{supported}")]
     IncompatibleVersion { found: u32, supported: u32 },
 
-    /// The conversion was turned away at phase 1 because it forecasts needing
-    /// more memory than this process can read as a ceiling.
+    /// The conversion was turned away because it needs more memory than it
+    /// has: at phase 1, when the forecast from HEAD's history exceeds the
+    /// ceiling this process can read, or at phase 4, when the plan's projection
+    /// over everything the capture took exceeds the memory still free.
     ///
     /// Carries no detail on purpose. The numbers, the ceiling and both remedies
     /// have already been written to stderr as their own lines, in the same
@@ -131,6 +133,18 @@ pub enum KinError {
          and what to do about it"
     )]
     ConversionBudgetExceeded,
+
+    /// The conversion was turned away at phase 1 because the filesystem it
+    /// stages on has less free space than the conversion cannot do without.
+    ///
+    /// Carries no detail for the same reason as [`Self::ConversionBudgetExceeded`]:
+    /// the figures and the remedies have already been written to stderr as
+    /// their own lines.
+    #[error(
+        "not enough free disk for this conversion; the lines above name what it needs, what is \
+         free and what to do about it"
+    )]
+    ConversionDiskExceeded,
 
     #[error("{0}")]
     Other(String),

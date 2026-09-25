@@ -93,6 +93,25 @@ fn stop_daemon(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
     );
 }
 
+/// Place this store's last complete admission after every edit made so far.
+///
+/// A tracked file the host changes while no daemon runs is admitted by the next
+/// daemon's startup catch-up, exactly as a watched edit is, so an edit made in
+/// that stretch is no longer divergence for drift to report. Drift is what the
+/// working copy holds that differs from graph truth although nothing changed it
+/// since the last time the working copy was observed. Recording that
+/// observation after the edit reproduces the shape deterministically, without
+/// racing a watcher that is entitled to admit the edit.
+fn record_an_admission_after_the_edits(repo: &Path) {
+    let layout = kin_core::KinLayout::discover(repo).expect("discover the store");
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    kin_core::last_admission::write(
+        &layout,
+        &kin_core::last_admission::LastAdmission::new(later, 2),
+    )
+    .expect("record an admission after the edits");
+}
+
 fn drift_paths(report: &Value) -> Vec<String> {
     report["drift"]
         .as_array()
@@ -197,13 +216,15 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
         .as_u64()
         .expect("workspace generation");
 
-    // Edit the tracked path with no daemon live to observe it. A running
-    // watcher is entitled to admit a working-copy edit into workspace
-    // authority, which would make the divergence real but transient; this test
-    // is about what drift reports while the divergence still exists, so the
-    // window is made deterministic rather than raced.
+    // Diverge the tracked path with no daemon live, then record an admission
+    // after it. A daemon, running or starting, is entitled to admit an edit it
+    // can place after the last admission, which would make the divergence real
+    // but transient; this test is about what drift reports while the
+    // divergence still exists, so the window is made deterministic rather than
+    // raced.
     stop_daemon(&runtime, &repo);
     fs::write(repo.join("README.md"), b"host edited these bytes\n").expect("edit tracked doc");
+    record_an_admission_after_the_edits(&repo);
     let dirty = drift_report(&runtime, &repo);
     assert_eq!(dirty["clean"], false);
     assert_eq!(dirty["drift_count"], 1);
@@ -237,6 +258,7 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
     // A removed tracked member is drift the report also must not repair.
     stop_daemon(&runtime, &repo);
     fs::remove_file(repo.join("src/lib.rs")).expect("remove tracked source");
+    record_an_admission_after_the_edits(&repo);
     let deleted = drift_report(&runtime, &repo);
     assert!(
         deleted["drift_count"].as_u64().expect("drift count") >= 1,
@@ -300,11 +322,13 @@ fn heal_restores_diverged_tracked_members_from_graph_truth() {
     let clean = drift_report(&runtime, &repo);
     assert_eq!(clean["clean"], true);
 
-    // Diverge with no daemon live so the window is deterministic rather than
-    // raced against a watcher entitled to admit the edit.
+    // Diverge with no daemon live and record an admission after it, so the
+    // window is deterministic rather than raced against a daemon entitled to
+    // admit an edit it can place after the last admission.
     stop_daemon(&runtime, &repo);
     fs::write(repo.join("README.md"), b"host edited these bytes\n").expect("edit tracked doc");
     fs::remove_file(repo.join("src/lib.rs")).expect("remove tracked source");
+    record_an_admission_after_the_edits(&repo);
 
     let dirty = drift_report(&runtime, &repo);
     assert_eq!(dirty["clean"], false);

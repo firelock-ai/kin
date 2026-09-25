@@ -68,7 +68,7 @@ async fn an_idle_drain_does_not_rewrite_an_unchanged_opaque_record_under_a_sourc
         "the fixture must reach the opaque facet or every assertion below is vacuous"
     );
     let recorded = crate::semantic_debt::outstanding(&state);
-    let (owed, _spent) = crate::semantic_debt::partition_against_tree(&state, &recorded);
+    let owed = crate::semantic_debt::owed_against_tree(&state, &recorded);
     assert!(
         owed.iter().any(|path| path.as_utf8() == Some("probe.py")),
         "the drain must actually be handed this path, or nothing here is being exercised: \

@@ -45,13 +45,18 @@
 //! incremental, and asserts they agree, because a rule that holds only on a cold
 //! link is a rule a warm store loses.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use kin_index::{
-    link_cross_file as link_cross_file_with_identities, link_cross_file_incremental, FileParseData,
-    IncrementalLinker,
+    link_cross_file as link_cross_file_with_identities, link_cross_file_incremental,
+    linker::{link_cross_file_with_rust_project, ArtifactIdentityMap},
+    rust_project::{RustProjectAuthority, RustProjectLimits},
+    FileParseCompletenessMap, FileParseData, IncrementalLinker, IndexPipeline,
 };
-use kin_model::{ArtifactId, Entity, EntityId, FilePathId, Relation, RelationKind, RelationOrigin};
+use kin_model::{
+    ArtifactId, Entity, EntityId, FilePathId, Relation, RelationKind, RelationOrigin, RepoPath,
+    ResolvedArtifact, ResolvedTree, TreeEntry,
+};
 use kin_parser::{
     CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter, JavaScriptAdapter, KotlinAdapter,
     LanguageAdapter, PhpAdapter, PythonAdapter, RustAdapter, SwiftAdapter, TypeScriptAdapter,
@@ -118,9 +123,14 @@ fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
         .expect("every fixture file has an explicitly assigned artifact identity")
 }
 
-/// Link through both linkers, assert they agree on every `Calls` edge, and
-/// return the batch edges. The tier has a batch site and an incremental twin;
-/// proving only one leaves a warm relink free to drop what a cold link found.
+/// Link through both linkers, assert they agree on every `Calls` and
+/// entity-rooted `Imports` edge, and return the batch edges. The tier has a
+/// batch site and an incremental twin; proving only one leaves a warm relink
+/// free to drop what a cold link found.
+///
+/// `Imports` is compared here as well as `Calls`, because this helper compared
+/// calls alone and an import disagreement between the two linkers was ungraded
+/// by every scenario that ran through it.
 fn link_both(files: &[FileParseData]) -> Vec<Relation> {
     let batch = link_cross_file(files);
 
@@ -142,7 +152,97 @@ fn link_both(files: &[FileParseData]) -> Vec<Relation> {
         call_set(&incremental),
         "the batch and incremental linkers disagree on this file's Calls edges"
     );
+    let import_set = |rels: &[Relation]| -> HashSet<(EntityId, EntityId)> {
+        rels.iter()
+            .filter(|r| r.kind == RelationKind::Imports)
+            .filter_map(|r| Some((r.src.as_entity()?, r.dst.as_entity()?)))
+            .collect()
+    };
+    assert_eq!(
+        import_set(&batch),
+        import_set(&incremental),
+        "the batch and incremental linkers disagree on this file's Imports edges"
+    );
     batch
+}
+
+/// Crate-relative Rust imports require the actual admitted Cargo/module tree,
+/// not a filename convention or metadata stamped onto adapter-only entities.
+fn link_admitted_rust(sources: &[(&str, &str)]) -> (Vec<FileParseData>, Vec<Relation>) {
+    let mut artifacts = Vec::new();
+    let mut blobs = BTreeMap::new();
+    let mut files = Vec::new();
+    let mut identities = ArtifactIdentityMap::new();
+    let mut completeness = FileParseCompletenessMap::new();
+    for &(path, source) in sources {
+        let bytes = source.as_bytes();
+        let hash = kin_blobs::digest(bytes);
+        let artifact = ArtifactId::new();
+        blobs.insert(hash, bytes.to_vec());
+        identities.insert(path.to_owned(), artifact);
+        artifacts.push(ResolvedArtifact::new(
+            artifact,
+            RepoPath::from_utf8(path).unwrap(),
+            TreeEntry::Blob {
+                hash,
+                executable: false,
+            },
+        ));
+        if path.ends_with(".rs") {
+            let indexed = IndexPipeline::new()
+                .index_file_content_with_tests(&FilePathId::new(path), bytes, hash)
+                .expect("index exact admitted Rust source")
+                .indexed_file;
+            completeness.insert(path.into(), indexed.file_layout.parse_completeness);
+            files.push(FileParseData {
+                file_path: path.into(),
+                entities: indexed.entities,
+                relations: indexed.extracted_relations,
+                imports: indexed.imports,
+            });
+        }
+    }
+    let tree = ResolvedTree::from_artifacts(artifacts).unwrap();
+    let authority =
+        RustProjectAuthority::from_admitted_tree(&tree, RustProjectLimits::default(), |hash| {
+            blobs
+                .get(&hash)
+                .cloned()
+                .ok_or("missing fixture CAS body".into())
+        })
+        .expect("Cargo and module authority from the selected tree");
+    let entities: Vec<_> = files
+        .iter()
+        .flat_map(|f| f.entities.iter().cloned())
+        .collect();
+    let batch = link_cross_file_with_rust_project(
+        &files.iter().collect::<Vec<_>>(),
+        &entities.iter().collect::<Vec<_>>(),
+        &identities,
+        &completeness,
+        &authority,
+    )
+    .expect("link admitted Rust sources");
+    let mut linker = IncrementalLinker::new();
+    for file in &files {
+        linker.add_file(&file.file_path, identities[&file.file_path], &file.entities);
+    }
+    linker.install_rust_project(authority, &entities).unwrap();
+    let incremental =
+        kin_index::link_cross_file_incremental_with_completeness(&files, &linker, &completeness)
+            .expect("incrementally link the same admitted sources");
+    let call_set = |rels: &[Relation]| -> HashSet<(EntityId, EntityId)> {
+        rels.iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .filter_map(|r| Some((r.src.as_entity()?, r.dst.as_entity()?)))
+            .collect()
+    };
+    assert_eq!(
+        call_set(&batch),
+        call_set(&incremental),
+        "the batch and incremental linkers disagree on admitted Rust Calls edges"
+    );
+    (files, batch)
 }
 
 fn calls_from(relations: &[Relation], src: EntityId) -> Vec<EntityId> {
@@ -495,12 +595,15 @@ fn a_bare_rust_call_reaches_an_owned_entity_only_through_a_use() {
 
     // Refusal: no `use` binds `width` here, and `width()` in Rust is not
     // `self.width()`.
-    let files = vec![
-        parse("rust", "shapes.rs", DEFS),
-        parse("rust", "caller.rs", "pub fn run() -> u32 { width() }\n"),
-    ];
+    const MANIFEST: &str =
+        "[package]\nname='bare-call-fixture'\nedition='2021'\n[lib]\npath='lib.rs'\n";
+    let (files, relations) = link_admitted_rust(&[
+        ("shapes.rs", DEFS),
+        ("caller.rs", "pub fn run() -> u32 { width() }\n"),
+        ("Cargo.toml", MANIFEST),
+        ("lib.rs", "pub mod shapes; pub mod caller;\n"),
+    ]);
     assert_parser_emitted_bare_call(&files[1], "run", "width");
-    let relations = link_both(&files);
     let caller = entity_id(&files, "caller.rs", "run");
     let owned = entity_id(&files, "shapes.rs", "S::width");
     assert!(
@@ -510,18 +613,22 @@ fn a_bare_rust_call_reaches_an_owned_entity_only_through_a_use() {
 
     // CONTROL: the binding Rust does allow. Without this the refusal above would
     // pass just as well on a build that had stopped resolving Rust entirely.
-    let files = vec![
-        parse("rust", "shapes.rs", DEFS),
-        parse(
-            "rust",
+    let (files, relations) = link_admitted_rust(&[
+        ("shapes.rs", DEFS),
+        (
             "user.rs",
             "use crate::shapes::Status::Ready;\npub fn run() -> u32 { Ready(1); 0 }\n",
         ),
-    ];
+        ("Cargo.toml", MANIFEST),
+        ("lib.rs", "pub mod shapes; pub mod user;\n"),
+    ]);
     assert_parser_emitted_bare_call(&files[1], "run", "Ready");
-    let relations = link_both(&files);
     let caller = entity_id(&files, "user.rs", "run");
     let variant = entity_id(&files, "shapes.rs", "Status::Ready");
+    assert!(
+        !calls_from(&link_both(&files), caller).contains(&variant),
+        "source bodies without admitted Cargo/module authority must not prove a crate-relative import"
+    );
     assert!(
         calls_from(&relations, caller).contains(&variant),
         "CONTROL: a `use` of the exact name is what Rust does bind, and it must still resolve, \

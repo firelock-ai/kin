@@ -276,7 +276,7 @@ async fn run(
             "mutation_result":result,
             "remedy":"Retry Apply to resolve this original attempt. For a stale source base, create a fresh draft from a current source read and preserve this draft's text/history. Save may preserve newer text while this attempt remains bound."}).to_string());
     }
-    let receipt = (|| -> Result<Value> {
+    let receipt = (|| -> Result<(Value, Option<Value>)> {
         let [kin_mcp::ContentBlock::Text { text }] = result.content.as_slice() else {
             return Err(refuse(
                 "draft_apply_recovery_required",
@@ -298,9 +298,15 @@ async fn run(
             .as_object_mut()
             .expect("receipt schema checked")
             .remove("already_applied");
-        Ok(receipt)
+        // Response accounting is reconstructible reporting, not part of the
+        // historical v1 receipt whose exact bytes the draft binds and replays.
+        let accounting = receipt
+            .as_object_mut()
+            .expect("receipt schema checked")
+            .remove("publication_accounting");
+        Ok((receipt, accounting))
     })();
-    let receipt = match receipt {
+    let (receipt, accounting) = match receipt {
         Ok(value) => value,
         Err(error) => return error_result(error, Some(id), Some(&attempt)),
     };
@@ -314,7 +320,7 @@ async fn run(
             json!({"schema":"kin.entity.draft.applied.v1",
             "draft_id":id,"requested_revision":attempt.requested_revision,"applied_draft_revision":attempt.draft_revision,
             "current_text_applied":draft.content_revision == attempt.draft_revision,
-            "receipt_saved":true,"receipt":receipt,"draft":draft})
+            "receipt_saved":true,"receipt":receipt,"draft":draft,"publication_accounting":accounting})
             .to_string(),
         ),
         other => {
@@ -326,6 +332,7 @@ async fn run(
             kin_mcp::ToolCallResult::error(json!({"schema":"kin.entity.draft.apply_pending.v1",
                 "code":"draft_apply_receipt_not_saved","message":error.to_string(),"draft_id":id,
                 "attempt":attempt,"repository_source_applied":true,"receipt_saved":false,"receipt":receipt,
+                "publication_accounting":accounting,
                 "remedy":"Repository publication succeeded but its draft receipt was not acknowledged. Retry Apply with this original attempt; do not create a replacement mutation."}).to_string())
         }
     }

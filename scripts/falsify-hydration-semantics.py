@@ -2,7 +2,8 @@
 """Falsify the hydration replay-semantics guard.
 
 A guard that has never been shown to fail proves nothing. This plants a probe
-in every guarded function in a throwaway copy of the tree, one at a time, and
+in every guarded function and dedicated guarded file in a throwaway copy of
+the tree, one at a time, and
 asserts the real guard catches each one and names it. It also drives the two
 non-digest failure modes: the dial drifting away from the manifest, and a
 guarded function disappearing from under the pin.
@@ -71,13 +72,14 @@ def main():
     with open(MANIFEST, "r", encoding="utf-8") as f:
         manifest = json.load(f)
     entries = manifest["guarded"]
+    file_entries = manifest.get("guarded_files", [])
 
     code, out = run_guard(root)
     if code != 0:
         print("::error::falsification cannot start — the guard already fails on the clean copy")
         print(out)
         return 1
-    print(f"clean copy passes; planting {len(entries) + 2} probes")
+    print(f"clean copy passes; planting {len(entries) + len(file_entries) + 2} probes")
 
     # 1. A probe in every guarded function, one at a time.
     for entry in entries:
@@ -97,6 +99,16 @@ def main():
             f"probe in `{entry['function']}`", root, entry["function"]
         )
         write(path, original)
+
+    # Dedicated modules include method bodies that function extraction cannot pin.
+    for entry in file_entries:
+        path = os.path.join(root, entry["file"])
+        original = read(path)
+        try:
+            write(path, original + "\n// hydration file falsification probe\n")
+            expect_failure(f"probe in file `{entry['file']}`", root, entry["file"])
+        finally:
+            write(path, original)
 
     # 2. The dial moving without the manifest following it.
     version_path = os.path.join(root, guard.VERSION_FILE)

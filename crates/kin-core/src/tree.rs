@@ -26,6 +26,25 @@ use kin_model::{
 
 use crate::{KinError, Result};
 
+#[cfg(all(test, unix))]
+#[path = "tree_prepared_publication_test.rs"]
+mod prepared_publication_tests;
+
+#[path = "tree_session_publication.rs"]
+mod session_publication;
+pub use session_publication::{publish_prepared_session_workspace, PreparedSessionWorkspaceCommit};
+
+#[path = "tree_prepared_recovery.rs"]
+mod prepared_recovery;
+pub use prepared_recovery::{
+    recover_prepared_session_workspace, recover_repository_projection_before_hydration,
+    recover_repository_projection_before_hydration_with_session_finalizer,
+    PreparedRecoveryDisposition, PreparedSessionWorkspaceRecovery,
+};
+#[cfg(all(test, unix))]
+#[path = "tree_prepared_recovery_test.rs"]
+mod prepared_recovery_tests;
+
 #[cfg(any(unix, windows))]
 use fs2::FileExt as _;
 
@@ -57,7 +76,9 @@ const MAX_EXACT_EJECT_JOURNAL_BYTES: u64 = 256 * 1024;
 /// slow, named failure instead of a hang.
 const PROJECTION_LOCK_WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(any(unix, windows))]
-const RECONCILIATION_MANIFEST_SCHEMA: u32 = 3;
+const RECONCILIATION_MANIFEST_SCHEMA: u32 = 4;
+#[cfg(any(unix, windows))]
+const LEGACY_RECONCILIATION_MANIFEST_SCHEMA: u32 = 3;
 #[cfg(any(unix, windows))]
 const RECONCILIATION_ACTION_FILE_PREFIX: &str = "action-";
 #[cfg(any(unix, windows))]
@@ -427,6 +448,10 @@ pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
 /// namespace mutation. Recovery rolls the filesystem back when that operation
 /// is absent and finalizes the target projection when the exact operation was
 /// durably committed, closing the process-crash window between the two stores.
+///
+/// `owed` is the trusted update the same commit applies to the workspace's
+/// owed derivation ledger, inside its own compare-and-swap.
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
     root: &Path,
     previous_tree: &ResolvedTree,
@@ -435,6 +460,7 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
     entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
     reconcile_source_tree_and_commit_accepting_targets(
         root,
@@ -445,6 +471,36 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         authority,
         transaction,
         None,
+        owed,
+        commit_repository_transaction_exact,
+    )
+}
+
+/// Publish an unobserved semantic transition without claiming qualified prior
+/// binding history. Projection custody, exact operation identity, retries and
+/// recovery are identical; only the optional derived certificate is withheld.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_source_tree_and_commit_unproven_repository_transaction<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    reconcile_source_tree_and_commit_accepting_targets(
+        root,
+        previous_tree,
+        target_tree,
+        previous_entries,
+        entries,
+        authority,
+        transaction,
+        None,
+        owed,
+        commit_repository_transaction_unproven,
     )
 }
 
@@ -477,6 +533,7 @@ pub fn reconcile_source_tree_and_commit_authored_repository_transaction<'a, 'b>(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
     authored_paths: &BTreeSet<RepoPath>,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
     reconcile_source_tree_and_commit_accepting_targets(
         root,
@@ -487,6 +544,8 @@ pub fn reconcile_source_tree_and_commit_authored_repository_transaction<'a, 'b>(
         authority,
         transaction,
         Some(authored_paths),
+        owed,
+        commit_repository_transaction_exact,
     )
 }
 
@@ -500,6 +559,12 @@ fn reconcile_source_tree_and_commit_accepting_targets<'a, 'b>(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
     accepted_target_paths: Option<&BTreeSet<RepoPath>>,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
+    publish: fn(
+        &RepositoryAuthorityManager<LocalFileBackend>,
+        RepositoryTransaction,
+        Option<&kin_db::OwedDerivationUpdate>,
+    ) -> ProjectionAuthorityCommit<RepositoryCommitReceipt>,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
     let entries = validated_source_entries(entries)?;
     let previous_entries = validated_source_entries(previous_entries)?;
@@ -534,7 +599,7 @@ fn reconcile_source_tree_and_commit_accepting_targets<'a, 'b>(
         || {},
         Some(marker),
         None,
-        || commit_repository_transaction_exact(authority, transaction),
+        || publish(authority, transaction, owed),
     )
     .map(|(_, receipt)| (materialized_count, receipt))
 }
@@ -1281,6 +1346,7 @@ pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
     entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
     let entries = validated_projection_proof_entries(entries)?;
     validate_repository_projection_transaction(
@@ -1303,13 +1369,14 @@ pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
             .projection
             .revalidate_frozen_entries_unchanged(&entry_refs, &identities)?;
         freeze.revalidate_namespace()?;
-        let receipt = commit_repository_transaction_exact(authority, transaction).into_result()?;
+        let receipt =
+            commit_repository_transaction_exact(authority, transaction, owed).into_result()?;
         Ok((entries.len(), receipt))
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (root, authority, transaction);
+        let _ = (root, authority, transaction, owed);
         Err(unsupported_safe_projection_error())
     }
 }
@@ -1343,6 +1410,7 @@ pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
 /// Graph-only repository members must be identical in both trees, as they must
 /// be for every exact-source projection: moving one is a dedicated graph-native
 /// operation, not something a source commit may carry.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_observed_target_tree_and_commit_repository_transaction<'a, 'b>(
     root: &Path,
     previous_tree: &ResolvedTree,
@@ -1351,6 +1419,7 @@ pub fn verify_observed_target_tree_and_commit_repository_transaction<'a, 'b>(
     entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
     let entries = validated_projection_proof_entries(entries)?;
     let previous_entries = validated_projection_proof_entries(previous_entries)?;
@@ -1374,13 +1443,14 @@ pub fn verify_observed_target_tree_and_commit_repository_transaction<'a, 'b>(
             .projection
             .revalidate_frozen_entries_unchanged(&entry_refs, &identities)?;
         freeze.revalidate_namespace()?;
-        let receipt = commit_repository_transaction_exact(authority, transaction).into_result()?;
+        let receipt =
+            commit_repository_transaction_exact(authority, transaction, owed).into_result()?;
         Ok((entries.len(), receipt))
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (root, authority, transaction);
+        let _ = (root, authority, transaction, owed);
         Err(unsupported_safe_projection_error())
     }
 }
@@ -3574,20 +3644,58 @@ fn timed_authority_publication<T>(work: impl FnOnce() -> T) -> T {
 fn commit_repository_transaction_exact(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
     timed_authority_publication(|| {
-        commit_repository_transaction_exact_inner(authority, transaction)
+        commit_repository_transaction_exact_inner(authority, transaction, owed)
     })
 }
 
 fn commit_repository_transaction_exact_inner(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
+    commit_repository_transaction_with_policy(authority, transaction, true, owed)
+}
+
+fn commit_repository_transaction_unproven(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
+) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
+    timed_authority_publication(|| {
+        commit_repository_transaction_with_policy(authority, transaction, false, owed)
+    })
+}
+
+fn commit_repository_transaction_with_policy(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    qualify: bool,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
+) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
+    // The owed update rides every attempt, the exact retry included, because
+    // it is part of what this one commit decides. A retry that finds the first
+    // attempt already committed replays its receipt, and storage applies no
+    // update to a replay.
+    let publish = |transaction| match (qualify, owed) {
+        (true, Some(owed)) => authority.commit_repository_transaction_with_binding_history_owing(
+            transaction,
+            &kin_index::binding_history::LocalBindingHistoryVerifier,
+            owed,
+        ),
+        (true, None) => authority.commit_repository_transaction_with_binding_history(
+            transaction,
+            &kin_index::binding_history::LocalBindingHistoryVerifier,
+        ),
+        (false, Some(owed)) => authority.commit_repository_transaction_owing(transaction, owed),
+        (false, None) => authority.commit_repository_transaction(transaction),
+    };
     let expected_hash = transaction
         .transaction_hash()
         .expect("projection transaction hash was validated before namespace mutation");
-    match authority.commit_repository_transaction(transaction.clone()) {
+    match publish(transaction.clone()) {
         Ok(receipt) => ProjectionAuthorityCommit::Committed(receipt),
         Err(first_error) => {
             if let Some(receipt) =
@@ -3596,7 +3704,7 @@ fn commit_repository_transaction_exact_inner(
                 return ProjectionAuthorityCommit::Committed(receipt);
             }
 
-            match authority.commit_repository_transaction(transaction.clone()) {
+            match publish(transaction.clone()) {
                 Ok(receipt) => ProjectionAuthorityCommit::Committed(receipt),
                 Err(second_error) => {
                     if let Some(receipt) = installed_repository_receipt(
@@ -3630,9 +3738,16 @@ fn commit_repository_transaction_exact_and_freeze(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
 ) -> ProjectionAuthorityCommit<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze)> {
-    match authority.commit_repository_transaction_and_freeze(transaction.clone()) {
+    match authority.commit_repository_transaction_with_binding_history_and_freeze(
+        transaction.clone(),
+        &kin_index::binding_history::LocalBindingHistoryVerifier,
+    ) {
         Ok(committed) => ProjectionAuthorityCommit::Committed(committed),
-        Err(first_error) => match authority.commit_repository_transaction_and_freeze(transaction) {
+        Err(first_error) => match authority
+            .commit_repository_transaction_with_binding_history_and_freeze(
+                transaction,
+                &kin_index::binding_history::LocalBindingHistoryVerifier,
+            ) {
             Ok(committed) => ProjectionAuthorityCommit::Committed(committed),
             Err(second_error) => {
                 let detail = format!(
@@ -3747,11 +3862,23 @@ struct ValidatedProjectionPath {
 #[cfg(test)]
 std::thread_local! {
     static INJECT_PUBLICATION_FAILURE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static INJECT_ACTION_SEAL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INJECT_MANIFEST_ERROR_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 fn inject_next_publication_failure() {
     inject_publication_failure_after(0);
+}
+
+#[cfg(test)]
+fn fail_action_seal_if_injected() -> Result<()> {
+    if INJECT_ACTION_SEAL_FAILURE.replace(false) {
+        return Err(KinError::Other(
+            "injected stop before action watermark".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4248,6 +4375,9 @@ enum ProjectionOpenMode<'a> {
     #[cfg(test)]
     ExistingFrozen,
     ExistingRepositoryFrozen(&'a RepositoryAuthorityManager<LocalFileBackend>),
+    // Private: the recovery owner retains the same projection lock throughout
+    // authenticated rollback, saved target replay and finalization.
+    ExistingRetained(&'a ExactProjectionFreeze),
 }
 
 #[derive(Clone, Copy)]
@@ -4541,10 +4671,47 @@ fn project_reconciled_source_tree_and_commit<T>(
     checkout_projection_commit: Option<CheckoutProjectionReceipt>,
     commit: impl FnOnce() -> ProjectionAuthorityCommit<T>,
 ) -> Result<(usize, T)> {
+    project_reconciled_source_tree_and_publish(
+        root,
+        previous_entries,
+        entries,
+        should_preserve,
+        options,
+        after_read_only_preflight,
+        after_identity_revalidation,
+        after_projection_mutation,
+        authority_commit,
+        checkout_projection_commit,
+        || Ok(()),
+        |()| commit(),
+        |_| Ok(()),
+    )
+}
+
+/// Internal publication lifecycle. Preparation runs only after every read-only
+/// identity check, before a WAL can exist. Finalization runs after authority
+/// commit with its returned value and projection custody still retained; an
+/// error must preserve the committed projection and WAL, never roll them back.
+#[allow(clippy::too_many_arguments)]
+fn project_reconciled_source_tree_and_publish<P, T>(
+    root: &Path,
+    previous_entries: &[ValidatedSourceEntry<'_>],
+    entries: &[ValidatedSourceEntry<'_>],
+    should_preserve: &dyn Fn(&Path) -> bool,
+    options: ReconciledProjectionOptions<'_>,
+    after_read_only_preflight: impl FnOnce(),
+    after_identity_revalidation: impl FnOnce(),
+    after_projection_mutation: impl FnOnce(),
+    authority_commit: Option<ReconciliationAuthorityCommit>,
+    checkout_projection_commit: Option<CheckoutProjectionReceipt>,
+    prepare: impl FnOnce() -> Result<P>,
+    commit: impl FnOnce(P) -> ProjectionAuthorityCommit<T>,
+    finalize: impl FnOnce(&mut T) -> Result<()>,
+) -> Result<(usize, T)> {
     #[cfg(any(unix, windows))]
     {
         let frozen = match options.open_mode {
-            ProjectionOpenMode::CreateOrOpen => None,
+            ProjectionOpenMode::CreateOrOpen | ProjectionOpenMode::ExistingRetained(_) => None,
             #[cfg(test)]
             ProjectionOpenMode::ExistingFrozen => Some(
                 ExactProjectionFreeze::acquire_existing_for_transition(root)?,
@@ -4557,10 +4724,15 @@ fn project_reconciled_source_tree_and_commit<T>(
             ProjectionOpenMode::CreateOrOpen => Some(ProjectionRoot::open(root)?),
             #[cfg(test)]
             ProjectionOpenMode::ExistingFrozen => None,
-            ProjectionOpenMode::ExistingRepositoryFrozen(_) => None,
+            ProjectionOpenMode::ExistingRepositoryFrozen(_)
+            | ProjectionOpenMode::ExistingRetained(_) => None,
         };
+        let retained = match options.open_mode {
+            ProjectionOpenMode::ExistingRetained(freeze) => Some(freeze),
+            _ => None,
+        };
+        let frozen = frozen.as_ref().or(retained);
         let projection = frozen
-            .as_ref()
             .map(|freeze| &freeze.projection)
             .or(opened.as_ref())
             .expect("one projection authority is open");
@@ -4602,7 +4774,9 @@ fn project_reconciled_source_tree_and_commit<T>(
                         expected.operation_id
                     )));
                 }
-                return commit().into_result().map(|committed| (0, committed));
+                let mut committed = commit(prepare()?).into_result()?;
+                finalize(&mut committed)?;
+                return Ok((0, committed));
             }
         }
         if checkout_scope.is_some() {
@@ -4877,6 +5051,23 @@ fn project_reconciled_source_tree_and_commit<T>(
             .map(|entry| entry.file_id)
             .collect();
 
+        // Acknowledgement belongs after all final identity checks and before
+        // even creating the authenticated projection WAL. The returned opaque
+        // value is passed directly to this operation's sole commit closure.
+        let prepared = prepare()?;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(marker) = &authority_commit {
+            crate::session_publication_test_support::notify(
+                root,
+                marker.operation_id,
+                marker.transaction_hash,
+                crate::session_publication_test_support::Point::PreparationReturnedBeforeWal,
+                0,
+                entries_to_materialize.len(),
+                None,
+            );
+        }
+
         // Stage every target object before the first destructive namespace
         // operation. The transaction directory is retained until either all
         // publications succeed or every displaced old object is restored.
@@ -4997,8 +5188,27 @@ fn project_reconciled_source_tree_and_commit<T>(
                 &mut created_directories,
                 must_create_directories,
             )?;
+            #[cfg(any(test, feature = "test-support"))]
+            let mut observer_published_entries = 0;
             for staged_entry in &staged {
                 projection.publish_staged_entry(&mut transaction, staged_entry)?;
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    observer_published_entries += 1;
+                    if observer_published_entries == 1 {
+                        if let Some(marker) = &transaction.manifest.authority_commit {
+                            crate::session_publication_test_support::notify(
+                                root,
+                                marker.operation_id,
+                                marker.transaction_hash,
+                                crate::session_publication_test_support::Point::FirstPrimaryEntryPublished,
+                                observer_published_entries,
+                                staged.len(),
+                                Some(staged_entry.entry.file_id),
+                            );
+                        }
+                    }
+                }
             }
 
             for relative in &cleanup_directories {
@@ -5046,7 +5256,7 @@ fn project_reconciled_source_tree_and_commit<T>(
             };
         }
 
-        let committed = match commit() {
+        let mut committed = match commit(prepared) {
             ProjectionAuthorityCommit::Committed(committed) => committed,
             ProjectionAuthorityCommit::DefinitelyNotCommitted(error) => {
                 let rollback = projection.rollback_reconciliation_manifest(&transaction);
@@ -5070,6 +5280,11 @@ fn project_reconciled_source_tree_and_commit<T>(
                 return Err(error);
             }
         };
+
+        // The committed result can hold the exact authority freeze. Keep it,
+        // the projection freeze and authenticated WAL alive during live-state
+        // finalization. No rollback path is legal beyond the commit boundary.
+        finalize(&mut committed)?;
 
         if let Some(receipt) = &checkout_projection_commit {
             if let Err(error) = projection.persist_checkout_projection_receipt(receipt) {
@@ -5107,7 +5322,9 @@ fn project_reconciled_source_tree_and_commit<T>(
             after_projection_mutation,
             authority_commit,
             checkout_projection_commit,
+            prepare,
             commit,
+            finalize,
         );
         Err(unsupported_safe_projection_error())
     }
@@ -5170,6 +5387,9 @@ struct ReconciliationTransaction {
     manifest: ReconciliationManifest,
     action_log_bytes: u64,
     action_tail_authentication: Vec<u8>,
+    // A failed durable append/seal must abort this in-memory writer. Otherwise
+    // a retry could produce a second intent beyond the last durable watermark.
+    action_recording_failed: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -5272,6 +5492,18 @@ struct ReconciliationManifest {
     checkout_projection_commit: Option<CheckoutProjectionReceipt>,
     state: ReconciliationTransactionState,
     actions: Vec<ReconciliationRecoveryAction>,
+    // Omission preserves the schema-3 authenticated encoding. It is never a
+    // checked zero-action watermark for a schema-4 descriptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action_watermark: Option<ReconciliationActionWatermark>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReconciliationActionWatermark {
+    count: u64,
+    tail_authentication: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -6345,11 +6577,44 @@ impl From<KinError> for ProjectionLockAttemptError {
     }
 }
 
+// A protected recovery caller may already own irreversible-publication custody.
+// Install this immediately after acquiring a lock, and carry it through every
+// fallible acquisition check. On refusal/unwind C drops before the held resource.
 #[cfg(any(unix, windows))]
-fn try_acquire_reconciliation_projection_lock(
+struct ProjectionAcquisition<'a, C, T> {
+    custody: &'a mut Option<C>,
+    resource: Option<T>,
+}
+#[cfg(any(unix, windows))]
+impl<'a, C, T> ProjectionAcquisition<'a, C, T> {
+    fn new(custody: &'a mut Option<C>, resource: T) -> Self {
+        Self {
+            custody,
+            resource: Some(resource),
+        }
+    }
+    fn held(&self) -> &T {
+        self.resource.as_ref().expect("held projection acquisition")
+    }
+    fn release(mut self) -> T {
+        self.resource.take().expect("held projection acquisition")
+    }
+}
+#[cfg(any(unix, windows))]
+impl<C, T> Drop for ProjectionAcquisition<'_, C, T> {
+    fn drop(&mut self) {
+        if self.resource.is_some() {
+            drop(self.custody.take());
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn try_acquire_reconciliation_projection_lock<C>(
     control: &cap_std::fs::Dir,
     display_control: &Path,
     create_if_missing: bool,
+    custody: &mut Option<C>,
 ) -> std::result::Result<(std::fs::File, TrackedEntryIdentity), ProjectionLockAttemptError> {
     let name = std::ffi::OsStr::new(RECONCILIATION_PROJECTION_LOCK_FILE);
     #[cfg(unix)]
@@ -6423,6 +6688,7 @@ fn try_acquire_reconciliation_projection_lock(
         ))
     })?;
 
+    let acquired = ProjectionAcquisition::new(custody, file);
     let named = open_reconciliation_control_file(control, name).map_err(|error| {
         KinError::io(
             display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
@@ -6444,7 +6710,7 @@ fn try_acquire_reconciliation_projection_lock(
         ))
         .into());
     }
-    Ok((file, identity))
+    Ok((acquired.release(), identity))
 }
 
 /// Acquire the exact-source projection lock, waiting out a live holder up to
@@ -6472,16 +6738,18 @@ fn acquire_reconciliation_projection_lock(
 }
 
 #[cfg(any(unix, windows))]
-fn acquire_existing_reconciliation_projection_lock(
+fn acquire_existing_reconciliation_projection_lock<C>(
     control: &cap_std::fs::Dir,
     display_control: &Path,
     wait_deadline: std::time::Duration,
+    custody: &mut Option<C>,
 ) -> Result<(std::fs::File, TrackedEntryIdentity)> {
-    acquire_reconciliation_projection_lock_with_creation(
+    acquire_reconciliation_projection_lock_with_custody(
         control,
         display_control,
         wait_deadline,
         false,
+        custody,
     )
 }
 
@@ -6492,6 +6760,23 @@ fn acquire_reconciliation_projection_lock_with_creation(
     wait_deadline: std::time::Duration,
     create_if_missing: bool,
 ) -> Result<(std::fs::File, TrackedEntryIdentity)> {
+    acquire_reconciliation_projection_lock_with_custody(
+        control,
+        display_control,
+        wait_deadline,
+        create_if_missing,
+        &mut None::<()>,
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn acquire_reconciliation_projection_lock_with_custody<C>(
+    control: &cap_std::fs::Dir,
+    display_control: &Path,
+    wait_deadline: std::time::Duration,
+    create_if_missing: bool,
+    custody: &mut Option<C>,
+) -> Result<(std::fs::File, TrackedEntryIdentity)> {
     let started = std::time::Instant::now();
     let mut backoff = std::time::Duration::from_millis(25);
     loop {
@@ -6499,10 +6784,12 @@ fn acquire_reconciliation_projection_lock_with_creation(
             control,
             display_control,
             create_if_missing,
+            custody,
         ) {
             Ok((file, identity)) => {
-                record_projection_lock_holder(&file);
-                return Ok((file, identity));
+                let acquired = ProjectionAcquisition::new(custody, file);
+                record_projection_lock_holder(acquired.held());
+                return Ok((acquired.release(), identity));
             }
             Err(ProjectionLockAttemptError::Failed(error)) => return Err(error),
             Err(ProjectionLockAttemptError::Contended(source)) => {
@@ -6571,6 +6858,8 @@ enum ExistingReconciliationDisposition {
     #[cfg(test)]
     Recover,
     Retain,
+    // Prepared recovery classifies all evidence before any recovery mutation.
+    RetainPrepared,
 }
 
 #[cfg(any(unix, windows))]
@@ -6708,6 +6997,15 @@ impl ProjectionRoot {
         lock_deadline: std::time::Duration,
         disposition: ExistingReconciliationDisposition,
     ) -> Result<Self> {
+        Self::open_existing_with_custody(root, lock_deadline, disposition, &mut None::<()>)
+    }
+
+    fn open_existing_with_custody<C>(
+        root: &Path,
+        lock_deadline: std::time::Duration,
+        disposition: ExistingReconciliationDisposition,
+        custody: &mut Option<C>,
+    ) -> Result<Self> {
         let capability = open_projection_root_nofollow(root)?;
         let display_projection_control = root.join(".kin");
         let kin_control = open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
@@ -6727,24 +7025,42 @@ impl ProjectionRoot {
                 &control,
                 &display_control,
                 lock_deadline,
+                custody,
             )?;
+        let acquired = ProjectionAcquisition::new(custody, projection_lock);
         let authority_key = load_existing_reconciliation_authority_key(&control, &display_control)?;
+        let display_root = root.to_path_buf();
+        let projection_control_name = std::ffi::OsString::from(".kin");
         let projection = Self {
             root: capability,
             kin_control,
             control,
-            projection_lock,
+            projection_lock: acquired.release(),
             projection_lock_identity,
-            display_root: root.to_path_buf(),
-            projection_control_name: std::ffi::OsString::from(".kin"),
+            display_root,
+            projection_control_name,
             display_projection_control,
             kin_control_identity,
             control_identity,
             authority_key,
         };
+        let acquired = ProjectionAcquisition::new(custody, projection);
+        let projection = acquired.held();
         projection.revalidate_projection_lock()?;
         #[cfg(unix)]
-        projection.recover_exact_eject()?;
+        if matches!(
+            disposition,
+            ExistingReconciliationDisposition::RetainPrepared
+        ) {
+            // Prepared recovery must not replay an in-progress eject: that
+            // moves the namespace before the WAL evidence is classified. A
+            // journal copied back out of a finished eject is not that
+            // transaction. The archive still holds the original `.kin`, so
+            // the copy is retired here and the commit can open.
+            projection.retire_carried_finished_eject_journal()?;
+        } else {
+            projection.recover_exact_eject()?;
+        }
         match disposition {
             ExistingReconciliationDisposition::Refuse => {
                 projection.refuse_reconciliation_transactions()?
@@ -6753,9 +7069,10 @@ impl ProjectionRoot {
             ExistingReconciliationDisposition::Recover => {
                 projection.recover_reconciliation_transactions()?
             }
-            ExistingReconciliationDisposition::Retain => {}
+            ExistingReconciliationDisposition::Retain
+            | ExistingReconciliationDisposition::RetainPrepared => {}
         }
-        Ok(projection)
+        Ok(acquired.release())
     }
 
     fn refuse_reconciliation_transactions(&self) -> Result<()> {
@@ -7031,6 +7348,32 @@ impl ProjectionRoot {
             directory = next;
         }
         Ok(true)
+    }
+
+    /// Drop a journal that a copied `.kin` carried out of a finished eject.
+    ///
+    /// An in-progress eject, and a journal the archive cannot prove, stay on
+    /// disk. Prepared recovery classifies commit evidence before it mutates
+    /// the namespace, so those journals are still a competing transaction.
+    #[cfg(unix)]
+    fn retire_carried_finished_eject_journal(&self) -> Result<()> {
+        let Some(journal) = self.load_exact_eject_journal()? else {
+            return Ok(());
+        };
+        let root_identity = tracked_open_directory_identity(&self.root)
+            .map_err(|error| KinError::io(&self.display_root, error))?;
+        let carried = journal.root_identity != root_identity
+            || journal.kin_control_identity != self.kin_control_identity
+            || journal.control_identity != self.control_identity;
+        if carried && self.exact_eject_journal_names_a_detached_kin(&journal, root_identity)? {
+            let journal_path = self
+                .reconciliation_control_path()
+                .join(EXACT_EJECT_JOURNAL_FILE);
+            return self.remove_exact_eject_journal(&journal, &journal_path);
+        }
+        Err(KinError::Other(
+            "prepared projection recovery refuses a competing exact-eject journal".into(),
+        ))
     }
 
     #[cfg(unix)]
@@ -7512,9 +7855,11 @@ impl ProjectionRoot {
                             checkout_projection_commit: checkout_projection_commit.clone(),
                             state: ReconciliationTransactionState::Pending,
                             actions: Vec::new(),
+                            action_watermark: Some(ReconciliationActionWatermark::default()),
                         },
                         action_log_bytes: 0,
                         action_tail_authentication: Vec::new(),
+                        action_recording_failed: false,
                     };
                     if let Err(error) = self.persist_reconciliation_manifest(&transaction) {
                         let cleanup = self.cleanup_reconciliation_transaction(transaction);
@@ -7899,11 +8244,22 @@ impl ProjectionRoot {
         &self,
         transaction: &ReconciliationTransaction,
     ) -> Result<()> {
-        let mut descriptor = transaction.manifest.clone();
-        // Recovery actions live in the append-only authenticated WAL. Keeping
-        // the fixed descriptor action-free makes every phase update bounded,
-        // independent of repository size.
-        descriptor.actions.clear();
+        // Build only fixed fields: cloning then clearing the actions Vec on
+        // each intent would make a linear WAL take quadratic copying work.
+        let manifest = &transaction.manifest;
+        let descriptor = ReconciliationManifest {
+            schema: manifest.schema,
+            transaction_id: manifest.transaction_id.clone(),
+            root_identity: manifest.root_identity,
+            kin_control_identity: manifest.kin_control_identity,
+            control_identity: manifest.control_identity,
+            transaction_identity: manifest.transaction_identity,
+            authority_commit: manifest.authority_commit.clone(),
+            checkout_projection_commit: manifest.checkout_projection_commit.clone(),
+            state: manifest.state,
+            actions: Vec::new(),
+            action_watermark: manifest.action_watermark.clone(),
+        };
         let authenticated = AuthenticatedReconciliationManifest {
             authentication: self.authenticate_reconciliation_manifest(&descriptor)?,
             manifest: descriptor,
@@ -7980,6 +8336,12 @@ impl ProjectionRoot {
             let _ = transaction.directory.remove_file(&temporary);
             return Err(KinError::io(step("publish-rename"), error));
         }
+        #[cfg(test)]
+        if INJECT_MANIFEST_ERROR_AFTER_RENAME.replace(false) {
+            return Err(KinError::Other(
+                "injected manifest error after successful replacement".into(),
+            ));
+        }
         file.sync_all()
             .map_err(|error| KinError::io(step("sync-final"), error))?;
         drop(file);
@@ -7992,6 +8354,22 @@ impl ProjectionRoot {
         transaction: &mut ReconciliationTransaction,
         action: ReconciliationRecoveryAction,
     ) -> Result<()> {
+        if transaction.action_recording_failed
+            || transaction.manifest.schema != RECONCILIATION_MANIFEST_SCHEMA
+            || !transaction
+                .manifest
+                .action_watermark
+                .as_ref()
+                .is_some_and(|seal| {
+                    seal.count == transaction.manifest.actions.len() as u64
+                        && seal.tail_authentication == transaction.action_tail_authentication
+                })
+        {
+            return Err(KinError::Other(
+                "reconciliation writer has an unresolved action seal".into(),
+            ));
+        }
+        transaction.action_recording_failed = true;
         if transaction.manifest.actions.len() >= MAX_RECONCILIATION_ACTIONS {
             return Err(KinError::Other(format!(
                 "exact-source reconciliation exceeds the bounded {}-action recovery log",
@@ -8002,8 +8380,12 @@ impl ProjectionRoot {
             KinError::Other("exact-source recovery action sequence overflow".to_string())
         })?;
         let previous_authentication = transaction.action_tail_authentication.clone();
-        let authentication =
-            self.authenticate_reconciliation_action(sequence, &previous_authentication, &action)?;
+        let authentication = self.authenticate_reconciliation_action(
+            &transaction.manifest,
+            sequence,
+            &previous_authentication,
+            &action,
+        )?;
         let record = AuthenticatedReconciliationAction {
             sequence,
             previous_authentication,
@@ -8070,20 +8452,51 @@ impl ProjectionRoot {
 
         transaction.manifest.actions.push(action);
         transaction.action_log_bytes += record_bytes;
-        transaction.action_tail_authentication = authentication;
+        transaction.action_tail_authentication = authentication.clone();
+        #[cfg(test)]
+        fail_action_seal_if_injected()?;
+        transaction.manifest.action_watermark = Some(ReconciliationActionWatermark {
+            count: sequence + 1,
+            tail_authentication: authentication,
+        });
+        // No caller may perform its namespace mutation before this durable
+        // watermark acknowledges every intent that mutation could require.
+        self.persist_reconciliation_manifest(transaction)?;
+        transaction.action_recording_failed = false;
         Ok(())
     }
 
     fn authenticate_reconciliation_action(
         &self,
+        manifest: &ReconciliationManifest,
         sequence: u64,
         previous_authentication: &[u8],
         action: &ReconciliationRecoveryAction,
     ) -> Result<Vec<u8>> {
-        let encoded =
-            serde_json::to_vec(&(sequence, previous_authentication, action)).map_err(|error| {
-                KinError::Other(format!("encode reconciliation action payload: {error}"))
-            })?;
+        let encoded = match manifest.schema {
+            LEGACY_RECONCILIATION_MANIFEST_SCHEMA => {
+                serde_json::to_vec(&(sequence, previous_authentication, action))
+            }
+            RECONCILIATION_MANIFEST_SCHEMA => serde_json::to_vec(&(
+                "kin.reconciliation.action.v4",
+                &manifest.transaction_id,
+                manifest.root_identity,
+                manifest.kin_control_identity,
+                manifest.control_identity,
+                manifest.transaction_identity,
+                sequence,
+                previous_authentication,
+                action,
+            )),
+            _ => {
+                return Err(KinError::Other(
+                    "unsupported reconciliation action schema".into(),
+                ))
+            }
+        }
+        .map_err(|error| {
+            KinError::Other(format!("encode reconciliation action payload: {error}"))
+        })?;
         Ok(reconciliation_hmac(&self.authority_key, &encoded).to_vec())
     }
 
@@ -8155,7 +8568,32 @@ impl ProjectionRoot {
         &self,
         transaction_name: &std::ffi::OsStr,
         directory: &cap_std::fs::Dir,
+        manifest: &ReconciliationManifest,
     ) -> Result<(Vec<ReconciliationRecoveryAction>, u64, Vec<u8>)> {
+        let watermark = match manifest.schema {
+            RECONCILIATION_MANIFEST_SCHEMA => {
+                let seal = manifest.action_watermark.as_ref().ok_or_else(|| {
+                    KinError::Other(
+                        "schema-4 reconciliation descriptor has no action watermark".into(),
+                    )
+                })?;
+                if seal.count > MAX_RECONCILIATION_ACTIONS as u64
+                    || (seal.count == 0 && !seal.tail_authentication.is_empty())
+                    || (seal.count != 0 && seal.tail_authentication.len() != 32)
+                {
+                    return Err(KinError::Other(
+                        "invalid reconciliation action watermark".into(),
+                    ));
+                }
+                Some(seal)
+            }
+            LEGACY_RECONCILIATION_MANIFEST_SCHEMA if manifest.action_watermark.is_none() => None,
+            _ => {
+                return Err(KinError::Other(
+                    "unsupported reconciliation action watermark schema".into(),
+                ))
+            }
+        };
         let mut names = Vec::new();
         for entry in directory.entries().map_err(|error| {
             KinError::io(
@@ -8186,9 +8624,21 @@ impl ProjectionRoot {
             )));
         }
 
+        if let Some(seal) = watermark {
+            // One durable intent may precede the next watermark when the
+            // writer stops before its namespace mutation. No second intent
+            // can be written until the first recorder returned successfully.
+            let count = names.len() as u64;
+            if count < seal.count || count > seal.count + 1 {
+                return Err(KinError::Other(
+                    "reconciliation action count differs from its sealed watermark".into(),
+                ));
+            }
+        }
         let mut actions = Vec::with_capacity(names.len());
         let mut total_bytes = 0_u64;
         let mut tail = Vec::new();
+        let mut sealed_tail = Vec::new();
         for (index, name) in names.into_iter().enumerate() {
             let expected_name = format!("{RECONCILIATION_ACTION_FILE_PREFIX}{index:020}.json");
             if name != std::ffi::OsStr::new(&expected_name) {
@@ -8251,6 +8701,7 @@ impl ProjectionRoot {
                 )));
             }
             let expected = self.authenticate_reconciliation_action(
+                manifest,
                 record.sequence,
                 &record.previous_authentication,
                 &record.action,
@@ -8272,6 +8723,14 @@ impl ProjectionRoot {
             }
             tail = record.authentication;
             actions.push(record.action);
+            if watermark.is_some_and(|seal| seal.count == actions.len() as u64) {
+                sealed_tail = tail.clone();
+            }
+        }
+        if watermark.is_some_and(|seal| seal.tail_authentication != sealed_tail) {
+            return Err(KinError::Other(
+                "reconciliation action tail differs from its sealed watermark".into(),
+            ));
         }
         Ok((actions, total_bytes, tail))
     }
@@ -8321,35 +8780,18 @@ impl ProjectionRoot {
             let identity = tracked_open_directory_identity(&directory).map_err(|error| {
                 KinError::io(self.reconciliation_control_path().join(&name), error)
             })?;
-            let manifest = match self.load_reconciliation_manifest(&name, &directory)? {
-                Some(manifest) => manifest,
-                None => {
-                    let transaction = ReconciliationTransaction {
-                        name,
-                        directory,
-                        identity,
-                        manifest: ReconciliationManifest {
-                            schema: RECONCILIATION_MANIFEST_SCHEMA,
-                            transaction_id: String::new(),
-                            root_identity,
-                            kin_control_identity: self.kin_control_identity,
-                            control_identity: self.control_identity,
-                            transaction_identity: identity,
-                            authority_commit: None,
-                            checkout_projection_commit: None,
-                            state: ReconciliationTransactionState::Pending,
-                            actions: Vec::new(),
-                        },
-                        action_log_bytes: 0,
-                        action_tail_authentication: Vec::new(),
-                    };
-                    self.cleanup_reconciliation_transaction(transaction)?;
-                    continue;
-                }
-            };
+            let manifest = self
+                .load_reconciliation_manifest(&name, &directory)?
+                .ok_or_else(|| {
+                    KinError::Other(
+                        "missing projection descriptor; retain incomplete WAL for diagnosis".into(),
+                    )
+                })?;
             let expected_name = format!("tx-{}", manifest.transaction_id);
-            if manifest.schema != RECONCILIATION_MANIFEST_SCHEMA
-                || name != std::ffi::OsStr::new(&expected_name)
+            if !matches!(
+                manifest.schema,
+                RECONCILIATION_MANIFEST_SCHEMA | LEGACY_RECONCILIATION_MANIFEST_SCHEMA
+            ) || name != std::ffi::OsStr::new(&expected_name)
                 || manifest.root_identity != root_identity
                 || manifest.kin_control_identity != self.kin_control_identity
                 || manifest.control_identity != self.control_identity
@@ -8365,18 +8807,6 @@ impl ProjectionRoot {
                     "reconciliation transaction {} embedded actions in its fixed descriptor",
                     self.reconciliation_control_path().join(&name).display()
                 )));
-            }
-            if manifest.state == ReconciliationTransactionState::Committed {
-                let transaction = ReconciliationTransaction {
-                    name,
-                    directory,
-                    identity,
-                    manifest,
-                    action_log_bytes: 0,
-                    action_tail_authentication: Vec::new(),
-                };
-                self.cleanup_reconciliation_transaction(transaction)?;
-                continue;
             }
             let authority_committed = match &manifest.authority_commit {
                 Some(marker) => {
@@ -8397,22 +8827,22 @@ impl ProjectionRoot {
                 }
                 None => false,
             };
-            if authority_committed || checkout_committed {
-                let transaction = ReconciliationTransaction {
-                    name,
-                    directory,
-                    identity,
-                    manifest,
-                    action_log_bytes: 0,
-                    action_tail_authentication: Vec::new(),
-                };
-                self.cleanup_reconciliation_transaction(transaction)?;
-                continue;
+            if manifest.schema == LEGACY_RECONCILIATION_MANIFEST_SCHEMA
+                && !(authority_committed
+                    || checkout_committed
+                    || (manifest.state == ReconciliationTransactionState::Committed
+                        && manifest.authority_commit.is_none()
+                        && manifest.checkout_projection_commit.is_none()))
+            {
+                return Err(KinError::Other("legacy pending reconciliation WAL has no complete action watermark; retain evidence for exact recovery".into()));
             }
             let (actions, action_log_bytes, action_tail_authentication) =
-                self.load_reconciliation_actions(&name, &directory)?;
+                self.load_reconciliation_actions(&name, &directory, &manifest)?;
             let mut manifest = manifest;
             manifest.actions = actions;
+            let committed = authority_committed
+                || checkout_committed
+                || manifest.state == ReconciliationTransactionState::Committed;
             let transaction = ReconciliationTransaction {
                 name,
                 directory,
@@ -8420,7 +8850,12 @@ impl ProjectionRoot {
                 manifest,
                 action_log_bytes,
                 action_tail_authentication,
+                action_recording_failed: false,
             };
+            if committed {
+                self.cleanup_reconciliation_transaction(transaction)?;
+                continue;
+            }
             self.rollback_reconciliation_manifest(&transaction)?;
             self.cleanup_reconciliation_transaction(transaction)?;
         }
@@ -15387,6 +15822,48 @@ mod tests {
     /// namespace moves.
     #[cfg(unix)]
     #[test]
+    fn prepared_recovery_retires_a_carried_finished_eject_journal() {
+        let (fixture, carried, archived_journal) = eject_then_copy_back_a_journal_carrying_kin();
+
+        drop(
+            ProjectionRoot::open_existing_with_reconciliation_disposition(
+                &fixture.root,
+                std::time::Duration::from_secs(5),
+                ExistingReconciliationDisposition::RetainPrepared,
+            )
+            .expect("a finished carried journal is not a competing eject"),
+        );
+
+        assert!(!carried.exists(), "the carried journal is retired on open");
+        assert!(archived_journal.is_file(), "the archive is left as it was");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_recovery_refuses_a_journal_the_archive_does_not_prove() {
+        let (fixture, carried, _archived_journal) = eject_then_copy_back_a_journal_carrying_kin();
+        std::fs::remove_dir_all(fixture.archive.join("kin")).unwrap();
+
+        let error = match ProjectionRoot::open_existing_with_reconciliation_disposition(
+            &fixture.root,
+            std::time::Duration::from_secs(5),
+            ExistingReconciliationDisposition::RetainPrepared,
+        ) {
+            Err(error) => error,
+            Ok(_opened) => panic!("a journal the archive cannot prove stays competing"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("prepared projection recovery refuses a competing exact-eject journal"),
+            "{error}"
+        );
+        assert!(carried.is_file(), "a refused journal is left in place");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_journal_carried_by_a_copied_kin_is_retired_when_the_archive_proves_the_eject_finished() {
         let (fixture, carried, archived_journal) = eject_then_copy_back_a_journal_carrying_kin();
 
@@ -16491,10 +16968,29 @@ mod tests {
                 .unwrap();
         }
 
+        let manifest_after = std::fs::read(&manifest_path).unwrap();
+        assert!(
+            manifest_after.len() <= manifest_before.len() + 256,
+            "the fixed watermark must not embed the growing action list"
+        );
+        let before: AuthenticatedReconciliationManifest =
+            serde_json::from_slice(&manifest_before).unwrap();
+        let mut after = projection
+            .load_reconciliation_manifest(&transaction.name, &transaction.directory)
+            .unwrap()
+            .unwrap();
+        assert!(after.actions.is_empty());
+        let seal = after.action_watermark.as_ref().unwrap();
+        assert_eq!(seal.count, 32);
         assert_eq!(
-            std::fs::read(&manifest_path).unwrap(),
-            manifest_before,
-            "action growth must never rewrite the fixed transaction descriptor"
+            seal.tail_authentication,
+            transaction.action_tail_authentication
+        );
+        after.action_watermark = before.manifest.action_watermark.clone();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before.manifest).unwrap(),
+            "only the bounded action watermark may change in the fixed descriptor"
         );
         assert_eq!(transaction.manifest.actions.len(), 32);
         assert!(transaction.action_log_bytes < MAX_RECONCILIATION_ACTION_LOG_BYTES);
@@ -16587,7 +17083,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn startup_cleans_pre_manifest_transaction_residue() {
+    fn startup_retains_unqualified_pre_manifest_transaction_residue() {
         let root = tempfile::tempdir().unwrap();
         let projection = ProjectionRoot::open(root.path()).unwrap();
         let residue = projection
@@ -16597,9 +17093,12 @@ mod tests {
         std::fs::write(residue.join("staged-only"), b"no root mutation").unwrap();
         drop(projection);
 
-        ProjectionRoot::open(root.path()).unwrap();
-
-        assert!(!residue.exists());
+        let error = ProjectionRoot::open(root.path()).err().unwrap();
+        assert!(error.to_string().contains("missing projection descriptor"));
+        assert_eq!(
+            std::fs::read(residue.join("staged-only")).unwrap(),
+            b"no root mutation"
+        );
     }
 
     #[cfg(any(unix, windows))]

@@ -75,6 +75,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "path",
             "context",
             "refs",
+            "source",
             "impact",
             "trace-data-flow",
             "deps",
@@ -114,6 +115,8 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "agent",
             "assistant",
             "mcp",
+            "describe",
+            "call",
             "vfs",
         ],
     ),
@@ -166,6 +169,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "daemon",
             "registry",
             "update",
+            "upgrade",
             "completions",
         ],
     ),
@@ -442,6 +446,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Print the exact implementation body for an entity
+    ///
+    /// The same command as `kin graph source`, at the top level so that `kin
+    /// source`, the word the routed MCP tool teaches for reading one entity's
+    /// code, runs in a shell too.
+    Source(EntitySourceArgs),
     /// Hidden ContextBench locate wrapper that keeps benchmark query shaping inside Kin
     #[command(hide = true)]
     ContextbenchLocate {
@@ -639,9 +649,12 @@ enum Command {
         #[arg(long = "include-tests", default_value_t = false)]
         include_tests: bool,
         /// Which JSON shape `--json` emits: `full` (every field, the default) or
-        /// `compact` (the agent surface: id, name, kind, file, line, signature
-        /// and score per hit, ranked file paths, and a `_kin` envelope naming
-        /// the embedding coverage behind the ranking).
+        /// `compact` (the agent surface: id, or the artifact path on a hit for a
+        /// tracked file with no parsed entities, name, kind, file, line,
+        /// signature, score and match kind per hit, `collapsed_rows` on a Go
+        /// package row that folded at least that many of the package's other
+        /// files, ranked file paths, and a `_kin` envelope naming the embedding
+        /// coverage behind the ranking).
         ///
         /// `full` stays the default because it is what ContextBench, the
         /// acceptance scripts and `--diagnose` read. How much `compact` saves
@@ -769,7 +782,7 @@ enum Command {
         /// Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set.
         #[arg(long)]
         entities: Option<String>,
-        /// If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count, receiver_name_candidate_count}).
+        /// If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count, receiver_name_candidate_count, unconfirmed_candidate_count}). A row holding an unconfirmed candidate caller reads `reference_count` null beside `known_reference_count`, and `has_references` null unless a caller is confirmed.
         /// Set --no-compact for verbose rows with name/kind/file_path/matched_kinds.
         #[arg(long, default_value_t = true)]
         compact: bool,
@@ -877,11 +890,12 @@ enum Command {
         /// edges, without inlining any source body.
         #[arg(long = "no-bodies", default_value_t = false)]
         no_bodies: bool,
-        /// Serialized characters this response may occupy before the tool cuts
-        /// bodies, and then steps, to fit. Defaults to the same budget every
-        /// retrieval tool answers under, and is clamped to the same ceiling; the
-        /// numbers live in one place, `kin_mcp::budget`, rather than being
-        /// written out here to go stale.
+        /// UTF-8 bytes the printed JSON may occupy. A hard limit here: the walk
+        /// cuts bodies, and then steps, to fit, and a walk whose smallest
+        /// retained form still does not fit is refused rather than printed over
+        /// it. Defaults to the same budget every retrieval tool answers under,
+        /// and is clamped to the same range; the numbers live in one place,
+        /// `kin_mcp::budget`, rather than being written out here to go stale.
         #[arg(long = "max-response-chars", value_name = "C")]
         max_response_chars: Option<usize>,
         /// Walk through a type-annotation edge to a type this repository
@@ -1016,13 +1030,47 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Show a routed kin tool command's or any Kin tool's arguments
+    ///
+    /// Prints what the routed `kin` MCP tool's `describe` command answers: the
+    /// command's or tool's arguments as a JSON schema and one call that works.
+    /// With no command it lists every routed command and every other tool `kin
+    /// call` runs, marking each tool that writes. It answers as the
+    /// agent-routed profile does, needs no repository, and exits 1 when the
+    /// name is neither a command nor a tool.
+    Describe {
+        /// A routed command, such as locate or mutate, or any Kin tool's name.
+        /// Omit it to list them all
+        command: Option<String>,
+    },
+    /// Run any Kin tool by its registered name, as the routed kin tool's call
+    ///
+    /// Sends the routed `kin` MCP tool's `call` command through the same server
+    /// path `kin mcp start` answers it on, against this repository's daemon, and
+    /// prints the tool's answer with its `_kin` envelope. The arguments are one
+    /// JSON object of the tool's fields, which `kin describe <tool>` lists, and
+    /// `-` reads that object from stdin. A tool that answers with an error
+    /// exits 1, with the answer printed as usual.
+    ///
+    /// It answers as the agent-routed profile does, writes included. A
+    /// read-only MCP profile limits what its one tool reaches, not what a shell
+    /// on the same machine runs, and a shell already writes through `kin
+    /// commit`. A name a shell runs another way is refused with the command
+    /// that works: `kin init` for kin_init, `kin describe` and `kin call` for
+    /// the tool dispatchers, and the CLI spelling of a routed command's name.
+    Call {
+        /// The tool's registered name, as `kin describe` lists it
+        tool: String,
+        /// The tool's arguments as one JSON object, or `-` to read it from
+        /// stdin. Omitted, the tool is called with none
+        arguments: Option<String>,
+    },
     /// Run a task through Kin's own agent loop, or check that it can start.
     ///
     /// The agent answers repository questions from the Kin graph over MCP and has no
     /// shell, no grep and no file-reading tool, so it cannot fall back to raw file
-    /// search. Its only writes are edit_file and write_file, and each one runs inside a
-    /// Kin transaction under a Kin session, so the change carries provenance naming the
-    /// agent rather than landing as an anonymous file write.
+    /// search. Its one write is kin_mutate on an entity, under a Kin session, so the
+    /// change names the entity it changes and carries provenance naming the agent.
     Agent {
         #[command(subcommand)]
         action: AgentAction,
@@ -1223,15 +1271,30 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Publish an exact restoration of a previous change
-    #[command(visible_alias = "revert")]
+    /// Publish a new change restoring an earlier change's complete content
+    ///
+    /// This is not a single-change undo. Later changes remain in immutable
+    /// history, but their effects are removed from the working view. Unless
+    /// the target already is the tip, --discard-later must accept restoring
+    /// its complete content. Restore the previous tip's content with another
+    /// rollback using --discard-later; the output names that command.
     Rollback {
-        /// Change ID to rollback to. Omit when naming a work item with --feature.
+        /// Change whose complete content the new restoring change will carry.
+        /// Omit when naming a work item with --feature.
         #[arg(required_unless_present = "feature", conflicts_with = "feature")]
         change_id: Option<String>,
         /// Roll back every change the named work item records
         #[arg(long)]
         feature: Option<String>,
+        /// Accept replacing current content, even when the preview count is unknown
+        #[arg(long)]
+        discard_later: bool,
+    },
+    /// No single-change undo; rollback publishes a complete restoration
+    #[command(hide = true)]
+    Revert {
+        /// Ignored; kin has no revert. See the refusal this prints.
+        change_id: Option<String>,
     },
     /// Run benchmarks (delegates to kin-bench binary)
     Bench {
@@ -1309,9 +1372,10 @@ enum Command {
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
-        /// Deny the assistant's native discovery tools for this launch, leaving
-        /// Kin's semantic tools as the only discovery surface; the enforcement
-        /// tier is printed at launch and differs per assistant
+        /// Launch the assistant with none of its built-in tools and Kin's MCP
+        /// server as its only other one, so it reads and changes code through
+        /// Kin, by entity; the enforcement tier is printed at launch and differs
+        /// per assistant
         #[arg(long)]
         semantic_only: bool,
         /// Task prompt
@@ -1383,6 +1447,20 @@ enum Command {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
+    },
+    /// Bring this store up to this build's replay semantics, keeping its history
+    ///
+    /// A store an older Kin build wrote serves state that build derived, and
+    /// every answer is qualified until it is re-derived. This re-derives the
+    /// state every branch head and the workspace serve, records each head's
+    /// difference as one new change with no file change, and keeps every earlier
+    /// change, branch, review, spec and history record exactly as it was. It
+    /// stops this repository's daemon while it runs, and refuses, changing
+    /// nothing, when it cannot finish.
+    Upgrade {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Update Kin to the latest release
     Update {
@@ -1563,6 +1641,20 @@ enum Command {
         /// with its size, and deletes nothing.
         #[arg(long = "reclaim-staging", default_value_t = false)]
         reclaim_staging: bool,
+        /// Report one file's persisted conversion coverage and its entity
+        /// counts by kind
+        ///
+        /// A conversion diagnostic: whether an adapter parsed the file and how
+        /// completely, the tier it is tracked at, whether its type is one no
+        /// adapter claims, and how many entities of each kind conversion
+        /// produced. It lists no entities. A path the graph does not track is
+        /// refused.
+        #[arg(
+            long = "conversion-source",
+            value_name = "PATH",
+            conflicts_with_all = ["fix", "install_language_servers", "drift", "heal", "reclaim_staging"]
+        )]
+        conversion_source: Option<String>,
     },
     /// First-time setup and health checks for the Kin system
     Setup {
@@ -1621,6 +1713,19 @@ enum Command {
         /// edit itself. Without the line a bare `kin` does not resolve.
         #[arg(long = "skip-path", global = true)]
         skip_path: bool,
+        /// Tool profile to write into every AI client this run configures
+        ///
+        /// Without it each client gets the profile that suits it: agent-routed
+        /// for a client that sends every tool with every request, agent-default
+        /// for the rest. A profile set by hand is kept. With it, the entry is
+        /// marked with KIN_MCP_TOOL_PROFILE_PINNED=1 so later runs of `kin
+        /// setup` and `kin update` keep this profile too.
+        #[arg(
+            long = "tool-profile",
+            global = true,
+            value_parser = ["agent-default", "agent-query", "agent-search", "agent-routed", "agent-routed-query"]
+        )]
+        tool_profile: Option<String>,
         /// Skip the wizard and only run the first-run health check
         #[arg(long, default_value_t = false)]
         check: bool,
@@ -1911,6 +2016,15 @@ enum GraphAction {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Show the owed derivation ledger repository authority holds: each source
+    /// body owed a parse, and the re-derivation that last paid the workspace.
+    /// Reads the local store only; starts no daemon, admits nothing, and
+    /// migrates no earlier build's records
+    Owed {
+        /// Output machine-readable JSON (`kin.graph.owed-derivations.v1`)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Look up an entity by name and show its relations
     Inspect {
         /// Entity name or UUID to inspect. A name can carry its pin:
@@ -1927,35 +2041,9 @@ enum GraphAction {
         json: bool,
     },
     /// Print the exact implementation body for an entity
-    Source {
-        /// Entity name or ID. A name with twins can carry its pin:
-        /// `Name@file`, `Name@file:line`, `Name#kind`
-        entity: String,
-        /// Exact repo-relative file of the entity, when its name has twins
-        #[arg(long)]
-        file: Option<String>,
-        /// Exact entity kind (for example: function), when its name has twins
-        #[arg(long)]
-        kind: Option<String>,
-        /// Output machine-readable JSON
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Source(EntitySourceArgs),
     /// Alias for source: print the exact implementation body for an entity
-    Body {
-        /// Entity name or ID. A name with twins can carry its pin:
-        /// `Name@file`, `Name@file:line`, `Name#kind`
-        entity: String,
-        /// Exact repo-relative file of the entity, when its name has twins
-        #[arg(long)]
-        file: Option<String>,
-        /// Exact entity kind (for example: function), when its name has twins
-        #[arg(long)]
-        kind: Option<String>,
-        /// Output machine-readable JSON
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Body(EntitySourceArgs),
     /// Export the drawable projection of the live graph as JSON
     Export {
         /// Cap the exported node count, sampled by degree with per-module
@@ -2001,6 +2089,37 @@ enum GraphAction {
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
+}
+
+/// What `kin source`, `kin graph source` and `kin graph body` take: one
+/// definition, so the three cannot drift apart.
+#[derive(clap::Args)]
+struct EntitySourceArgs {
+    /// Entity name or ID. A name with twins can carry its pin:
+    /// `Name@file`, `Name@file:line`, `Name#kind`
+    entity: String,
+    /// Exact repo-relative file of the entity, when its name has twins
+    #[arg(long)]
+    file: Option<String>,
+    /// Exact entity kind (for example: function), when its name has twins
+    #[arg(long)]
+    kind: Option<String>,
+    /// Output machine-readable JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+impl EntitySourceArgs {
+    /// Print the entity's body. The flags are the `Name#kind@path` pin every
+    /// resolver reads, so the daemon sees one spelling.
+    async fn print(self) -> Result<()> {
+        let entity = kin_cli::entity_ref::compose_entity_ref(
+            &self.entity,
+            self.file.as_deref(),
+            self.kind.as_deref(),
+        );
+        commands::graph::source(entity, self.json).await
+    }
 }
 
 #[derive(Subcommand)]
@@ -2467,7 +2586,11 @@ enum McpAction {
         /// and the default), `agent-query` (that belt without the session and
         /// transaction tools, for a client that only queries), `agent-search`
         /// (the measured always-on set plus registry discovery through
-        /// `kin_tool_search`; discovery does not enable withheld tools), `full`
+        /// `kin_tool_search`; discovery does not enable withheld tools),
+        /// `agent-routed` (one tool, `kin`, whose commands reach the agent
+        /// belt, writes included, and every other tool through `describe` and
+        /// `call`, for a client that sends every tool with every request),
+        /// `agent-routed-query` (that one tool without a write path), `full`
         /// (every tool; schema token cost depends on the model), `benchmark`,
         /// or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE.
         #[arg(long = "tool-profile", value_name = "PROFILE")]
@@ -2804,6 +2927,14 @@ enum DaemonAction {
         /// Widen --all to every daemon on this machine, whatever KIN_HOME it runs under
         #[arg(long, requires = "all")]
         machine: bool,
+        /// Stop only daemons nothing is using, and name the rest
+        ///
+        /// A daemon with an attached client, a request in flight, a write it
+        /// has not flushed, or enrichment or embedding still running is left up
+        /// and says which, then exits on its own as soon as that ends. Without
+        /// this flag the stop happens now, whatever is attached.
+        #[arg(long)]
+        when_unused: bool,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -3394,6 +3525,26 @@ fn run() -> Result<()> {
                 } => {
                     commands::context::run(entities, question, budget, assistant, max_focals, json)
                         .await
+                }
+                Command::Source(args) => args.print().await,
+                // The routed tool's answer is the output either way, and an
+                // error answer is the exit status, as `kin path` reports a
+                // missing route.
+                Command::Describe { command } => {
+                    let answer = commands::routed_words::describe(command.as_deref());
+                    println!("{}", answer.text);
+                    if answer.is_error {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
+                Command::Call { tool, arguments } => {
+                    let answer = commands::routed_words::call(&tool, arguments.as_deref()).await?;
+                    println!("{}", answer.text);
+                    if answer.is_error {
+                        std::process::exit(1);
+                    }
+                    Ok(())
                 }
                 Command::ContextbenchLocate {
                     task_file,
@@ -4115,9 +4266,10 @@ fn run() -> Result<()> {
                     .join()
                     .map_err(|_| anyhow::anyhow!("the agent thread panicked"))??;
                     // The run's own taxonomy is reported through the exit code: 2 tool-call
-                    // budget, 3 deadline, 4 endpoint, 5 MCP, 6 changes unpublished, 7 context
-                    // window. A caller must be able to tell a task the agent could not do
-                    // from an endpoint that was never there.
+                    // budget, 3 deadline, 4 endpoint, 5 MCP, 7 context window. 6 is retired
+                    // with the file tools whose unpublished changes it reported. A caller must
+                    // be able to tell a task the agent could not do from an endpoint that was
+                    // never there.
                     if code != 0 {
                         std::process::exit(code);
                     }
@@ -4347,12 +4499,18 @@ fn run() -> Result<()> {
                     commands::capabilities::require_ready("tag")?;
                     commands::tag::run(tag, require_proof, require_approval, force).await
                 }
-                Command::Rollback { change_id, feature } => {
+                Command::Rollback {
+                    change_id,
+                    feature,
+                    discard_later,
+                } => {
                     commands::capabilities::require_ready("rollback")?;
-                    commands::rollback::run(change_id, feature).await
+                    commands::rollback::run(change_id, feature, discard_later).await
                 }
+                Command::Revert { .. } => commands::rollback::refuse_revert(),
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate { source, target } => commands::migrate::run(source, target).await,
+                Command::Upgrade { json } => commands::upgrade::run(json).await,
                 Command::Cache { action } => match action {
                     CacheAction::Status { json, limit } => {
                         commands::cache::status(json, limit).await
@@ -4367,6 +4525,7 @@ fn run() -> Result<()> {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
                     GraphAction::Materialize { json } => commands::graph::materialize(json).await,
+                    GraphAction::Owed { json } => commands::graph_owed::owed(json).await,
                     // The flags are the `Name#kind@path` pin every resolver
                     // reads, so the daemon sees one spelling.
                     GraphAction::Inspect {
@@ -4382,32 +4541,7 @@ fn run() -> Result<()> {
                         );
                         commands::graph::inspect(name, json).await
                     }
-                    GraphAction::Source {
-                        entity,
-                        file,
-                        kind,
-                        json,
-                    } => {
-                        let entity = kin_cli::entity_ref::compose_entity_ref(
-                            &entity,
-                            file.as_deref(),
-                            kind.as_deref(),
-                        );
-                        commands::graph::source(entity, json).await
-                    }
-                    GraphAction::Body {
-                        entity,
-                        file,
-                        kind,
-                        json,
-                    } => {
-                        let entity = kin_cli::entity_ref::compose_entity_ref(
-                            &entity,
-                            file.as_deref(),
-                            kind.as_deref(),
-                        );
-                        commands::graph::body(entity, json).await
-                    }
+                    GraphAction::Source(args) | GraphAction::Body(args) => args.print().await,
                     GraphAction::Export {
                         limit,
                         kinds,
@@ -4637,9 +4771,12 @@ fn run() -> Result<()> {
                 },
                 Command::Daemon { action } => match action {
                     DaemonAction::Status { json } => commands::daemon::status(json).await,
-                    DaemonAction::Stop { all, machine, json } => {
-                        commands::daemon::stop(all, machine, json).await
-                    }
+                    DaemonAction::Stop {
+                        all,
+                        machine,
+                        when_unused,
+                        json,
+                    } => commands::daemon::stop(all, machine, when_unused, json).await,
                     DaemonAction::Sweep { no_wait, json } => {
                         commands::daemon::sweep(no_wait, json).await
                     }
@@ -4651,11 +4788,17 @@ fn run() -> Result<()> {
                     drift,
                     heal,
                     reclaim_staging,
+                    conversion_source,
                 } => {
                     // `--drift` reports the derived projection against graph
                     // truth; `--heal` rematerializes it. Bare `kin doctor`
                     // stays the first-run config health check.
-                    if heal {
+                    if let Some(path) = conversion_source {
+                        // A daemon graph read of one file's persisted
+                        // coverage, like `kin graph inspect`, so it takes no
+                        // readiness gate either.
+                        commands::graph::doctor_conversion_source(path, json).await
+                    } else if heal {
                         commands::capabilities::require_ready("doctor --heal")?;
                         commands::drift::heal(json).await
                     } else if drift {
@@ -4732,6 +4875,7 @@ fn run() -> Result<()> {
                     embedding_model,
                     embedding_provider,
                     skip_path,
+                    tool_profile,
                     check,
                 } => match action {
                     Some(SetupAction::Status { json }) => commands::setup::status(json).await,
@@ -4761,6 +4905,7 @@ fn run() -> Result<()> {
                             embedding_model,
                             embedding_provider,
                             skip_path,
+                            tool_profile,
                         })
                         .await
                     }
@@ -6310,6 +6455,7 @@ mod tests {
                 Command::Rollback {
                     change_id: None,
                     feature: Some(ref work_id),
+                    ..
                 } if work_id == "some-work-id"
             ));
 
@@ -6320,8 +6466,51 @@ mod tests {
                 Command::Rollback {
                     change_id: Some(ref change),
                     feature: None,
+                    ..
                 } if change == "abc123"
             ));
+        });
+    }
+
+    /// `--discard-later` is off by default, and naming it does not need a
+    /// change id in the same slot the flag itself occupies.
+    #[test]
+    fn rollback_discard_later_flag_parses_and_defaults_off() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["kin", "rollback", "abc123"])
+                .expect("a bare change id stays a complete rollback invocation");
+            assert!(matches!(
+                cli.command,
+                Command::Rollback {
+                    discard_later: false,
+                    ..
+                }
+            ));
+
+            let cli = Cli::try_parse_from(["kin", "rollback", "abc123", "--discard-later"])
+                .expect("the flag stays a complete rollback invocation");
+            assert!(matches!(
+                cli.command,
+                Command::Rollback {
+                    discard_later: true,
+                    ..
+                }
+            ));
+        });
+    }
+
+    /// `revert` used to be a `rollback` alias that suggested a single-change
+    /// undo. It is its own command now, so a Git habit reaches a refusal
+    /// that names rollback instead of running rollback's destructive path
+    /// under a misleading name.
+    #[test]
+    fn revert_is_its_own_command_not_a_rollback_alias() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["kin", "revert", "abc123"])
+                .expect("revert parses on its own so it can explain itself");
+            assert!(
+                matches!(cli.command, Command::Revert { change_id: Some(ref id) } if id == "abc123")
+            );
         });
     }
 
@@ -7128,3 +7317,6 @@ mod tests {
 
 #[cfg(test)]
 mod help_tests;
+
+#[cfg(test)]
+mod routed_words_tests;

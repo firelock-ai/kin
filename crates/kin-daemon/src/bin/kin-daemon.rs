@@ -298,29 +298,17 @@ fn create_state(
                 allowed_repo_ids,
                 Arc::clone(&publication_control),
             )?;
-            let spine_startup = if let Some(pending) = bootstrap {
-                let legacy_writer_drain_proof_sha256 =
-                    kin_daemon::hosted_start::SPINE_LEGACY_DRAIN_PROOF.read();
-                // The sequence itself lives on the state so the same bytes run
-                // under a test clock; see `complete_hosted_startup_rollout`.
-                runtime.block_on(state.complete_hosted_startup_rollout(
-                    &publication_control,
-                    pending,
-                    legacy_writer_drain_proof_sha256,
-                ))
-            } else {
-                match publication_control.runtime_spine_authority() {
-                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::Completed(
-                        evidence,
-                    )) => runtime.block_on(state.adopt_hosted_spine_rollout_fence(evidence)),
-                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::RolloutActive(
-                        blocking,
-                    )) => Err(format!(
-                        "a hosted {blocking}; semantic readiness stays closed while the authenticated publication-control API resumes or replaces it"
-                    )),
-                    Err(error) => Err(error.to_string()),
-                }
-            };
+            // The drain proof is only an input to the first boot's rollout.
+            let legacy_writer_drain_proof_sha256 = bootstrap
+                .as_ref()
+                .and_then(|_| kin_daemon::hosted_start::SPINE_LEGACY_DRAIN_PROOF.read());
+            // The whole startup decision lives on the state, so a test drives
+            // the same bytes a restarted pod runs, including the kill switch.
+            let spine_startup = runtime.block_on(state.start_hosted_spine_after_open(
+                &publication_control,
+                bootstrap,
+                legacy_writer_drain_proof_sha256,
+            ));
             if let Err(error) = spine_startup {
                 state.record_hosted_spine_startup_failure(error.clone());
                 eprintln!(

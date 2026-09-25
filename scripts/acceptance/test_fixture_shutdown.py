@@ -51,6 +51,12 @@ class FixtureShutdownTests(unittest.TestCase):
                 (path / ".kin" / "daemon.pid").write_text(pid)
             suite.fixtures[str(index)] = str(path)
         suite.kin_run = mock.Mock(return_value=(0, response(), ""))
+        # __new__ skips the constructor, so give the fake the evidence store
+        # the real one starts with: a failing run writes it to the kept root.
+        if module.__name__ == "magic_repro":
+            suite.responses = []
+        else:
+            suite.payloads = {}
         return suite
 
     def test_foreign_or_reused_pid_never_authorizes_a_signal(self):
@@ -196,7 +202,13 @@ class FixtureShutdownTests(unittest.TestCase):
                     self.assertEqual(rows["cleanup"]["status"], module.FAIL if failed is True else module.PASS)
                     failures, _ = GATE.decide({"fixture": rows}, {})
                     self.assertEqual(bool(failures), bool(failed))
-                    self.assertEqual(workdir.exists(), failed is True)
+                    # Any losing run keeps its root (run_root_removable): a
+                    # failed cleanup, and an empty selection, which is unreadable.
+                    self.assertEqual(workdir.exists(), bool(failed))
+                    if failed:
+                        # A kept root carries the responses its checks read.
+                        evidence = json.loads((workdir / "mcp-payloads.json").read_text())
+                        self.assertIsInstance(evidence, list)
                     self.kill.assert_not_called()
 
 

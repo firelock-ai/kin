@@ -701,6 +701,45 @@ pub(crate) fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
     Vec::new()
 }
 
+/// What a remap of an unmapped image would open, reduced to what tells two
+/// attempts apart: the manifest's bytes, and the length and modification time of
+/// each segment file it names.
+///
+/// A read repeats a failed attempt only when this changes, so an intact image
+/// that still cannot be mapped costs one mapping rather than one per read. A
+/// commit does not consult it and always tries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageProbe {
+    manifest: Vec<u8>,
+    segments: Vec<(usize, u64, Option<std::time::SystemTime>)>,
+}
+
+/// Check, without mapping anything, whether the mapped image at `storage_path`
+/// could be mapped at all.
+///
+/// `None` when there is no readable mapped manifest, or when a segment it names
+/// is missing, which are the cases where a mapping cannot succeed. Otherwise
+/// what the image is made of, for [`ImageProbe`]'s comparison. It reads the
+/// manifest and stats the segment files; it opens no segment and writes nothing.
+pub(crate) fn probe_image(storage_path: &Path) -> Option<ImageProbe> {
+    let storage_path = crate::storage_file_path_for(storage_path);
+    let manifest = std::fs::read(manifest_path(&storage_path)).ok()?;
+    if manifest.len() < 4
+        || u32::from_le_bytes([manifest[0], manifest[1], manifest[2], manifest[3]])
+            != MAPPED_SEGMENT_VERSION
+    {
+        return None;
+    }
+    let decoded: MappedManifest = bincode::deserialize(&manifest).ok()?;
+    let mut segments = Vec::new();
+    for (segment, gen) in decoded.segment_gens.iter().enumerate() {
+        let Some(gen) = gen else { continue };
+        let metadata = std::fs::metadata(segment_path(&storage_path, segment, *gen)).ok()?;
+        segments.push((segment, metadata.len(), metadata.modified().ok()));
+    }
+    Some(ImageProbe { manifest, segments })
+}
+
 /// What a write should do with one segment.
 ///
 /// The distinction is not an optimisation, it is the difference between an
@@ -1699,6 +1738,7 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
         }
 
         let mut manifest = manifest;
+        crate::run_before_segments_open_hook();
         let segments = open_segments(&storage_path, &manifest, &m_path, archive_corrupt)?;
         reconcile(&m_path, &mut manifest, &segments, archive_corrupt)?;
 
@@ -2529,7 +2569,7 @@ mod tests {
             for term in ["parse", "widget", "shared", "user", "zzzznotathing"] {
                 assert_eq!(
                     mapped.doc_frequency(term),
-                    heap.doc_frequency(term),
+                    heap.doc_frequency(term).expect("heap doc_frequency"),
                     "segments={segment_count}: doc_frequency({term:?})"
                 );
             }
@@ -2607,7 +2647,7 @@ mod tests {
         for term in ["parse", "user", "shared", "render"] {
             assert_eq!(
                 mapped.doc_frequency(term),
-                reference.doc_frequency(term),
+                reference.doc_frequency(term).expect("heap doc_frequency"),
                 "doc_frequency({term:?}) must exclude tombstoned documents"
             );
         }
@@ -2659,7 +2699,7 @@ mod tests {
         // has to name the right tokens or a removal takes the wrong postings.
         reopened.remove(&Key(1)).expect("remove");
         reopened.commit().expect("commit");
-        assert!(!reopened.contains(&Key(1)));
+        assert!(!reopened.contains(&Key(1)).expect("contains"));
         let survivors: Vec<(Key, Doc)> = corpus().into_iter().filter(|(id, _)| id.0 != 1).collect();
         let reference = heap_index(&survivors);
         for query in QUERIES {
@@ -3360,7 +3400,7 @@ mod tests {
         for term in ["renderwidget", "renderwidget shared", "shared renderwidget"] {
             assert_eq!(
                 mapped.doc_frequency(term),
-                reference.doc_frequency(term),
+                reference.doc_frequency(term).expect("heap doc_frequency"),
                 "doc_frequency({term:?}) after the only holder of `renderwidget` was removed"
             );
         }
@@ -3419,7 +3459,7 @@ mod tests {
         assert_eq!(opened.live_document_count(), heap.live_document_count());
         for (id, _) in &docs {
             assert!(
-                opened.contains(id),
+                opened.contains(id).expect("contains"),
                 "{id:?} is missing through the public api"
             );
         }
@@ -3449,8 +3489,8 @@ mod tests {
         );
         for term in ["parse", "widget", "shared", "user", "zzzznotathing"] {
             assert_eq!(
-                opened.doc_frequency(term),
-                heap.doc_frequency(term),
+                opened.doc_frequency(term).expect("mapped doc_frequency"),
+                heap.doc_frequency(term).expect("heap doc_frequency"),
                 "doc_frequency({term:?}) through the public api"
             );
         }
@@ -3509,12 +3549,15 @@ mod tests {
             "document count after the delta"
         );
         assert!(
-            !opened.contains(&removed),
+            !opened.contains(&removed).expect("contains"),
             "the removed document is still visible"
         );
-        assert!(opened.contains(&added), "the added document is missing");
         assert!(
-            opened.contains(&resurrected),
+            opened.contains(&added).expect("contains"),
+            "the added document is missing"
+        );
+        assert!(
+            opened.contains(&resurrected).expect("contains"),
             "the resurrected document is missing"
         );
 
