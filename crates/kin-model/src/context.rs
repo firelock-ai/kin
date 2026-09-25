@@ -93,7 +93,8 @@ pub enum TrafficProximity {
     Direct,
     /// Locks a transitive dependency of the focal entity.
     Downstream,
-    /// Locks a file that contains the focal entity.
+    /// Locks the focal file or another entity whose graph-owned origin is that file.
+    /// An exact focal/direct-dependency entity scope takes precedence.
     SameFile,
 }
 

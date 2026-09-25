@@ -761,6 +761,21 @@ fn publish_hold(layout: &KinLayout, hold: Option<&CensusHold>) {
     }
 }
 
+/// Make `census` the store's baseline whatever the previous one held, and
+/// retire any hold.
+///
+/// For a pass that re-derived the whole graph, which is what `kin upgrade`
+/// does. Fewer relations than the previous baseline is then the re-derivation
+/// removing edges an older build minted, not a loss, and [`record`] would
+/// refuse exactly that and hold the store below a baseline no build will
+/// reach again, reporting the difference as lost on every later commit. Only
+/// a caller that just re-derived the graph it measured may use this.
+pub fn rebaseline(layout: &KinLayout, census: &RelationCensus) -> std::io::Result<()> {
+    write(layout, census)?;
+    publish_hold(layout, None);
+    Ok(())
+}
+
 /// Record `census` as the store's baseline, unless it lost ground.
 ///
 /// This is the write half of the rule the module doc states. A baseline is a

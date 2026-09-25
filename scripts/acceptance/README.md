@@ -143,6 +143,24 @@ receive route through `router()`, `pull_into_replica` through
 `clone_native_replica`, a hosted control and a refused-pack control. What is not
 covered anywhere is the same proof against the shipped binaries.
 
+`published_store_upgrade_repro.py` is the one suite whose store the binary under
+test did not write. It downloads the last published release and checks the
+archive against the SHA-256 that release published. That release then runs
+`kin init` on a small Rust, Python and JavaScript repository. The suite edits
+three files without committing and lets the published daemon admit them before
+stopping it. The result is the store an upgrading user has, with owed parses and
+a declaration set the older parser minted differently. The binary under test
+must serve that store within two minutes (`serve`). `kin status` must name what
+the start re-derived (`disclosure`), and the uncommitted edit's new function
+must answer at its current line (`answer`). A published build that left no owed
+parse behind did not reach the upgrade state, so every check reads UNREADABLE
+rather than passing over a store that could not have failed. The v0.8.0
+candidate failed `serve` here. Its startup repair ran one pass per cause, a file
+another cause owed refused each pass, and the daemon exited without publishing
+its endpoint. `loop_runner::tests::startup_rederives_owed_parses_beside_declarations_an_older_parser_minted`
+in kin-daemon grades the same repair per pull request without a published
+binary.
+
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories
 holding the exact pinned tree object. Check 0 asserts the run stayed off the GPU
@@ -225,6 +243,18 @@ cursor, which reads as paging and is not. Check 11 asks an entity page that
 ranked nothing to still ship its primary as an empty array and count it zero,
 with a populated page as the control, since a server reporting every page empty
 would satisfy the empty arm on every call.
+
+Check 12 grades the trace budget as the contract it is, a target rather than a
+hard ceiling, in two arms. At 12,000 characters, a ceiling the smallest retained
+walk fits under, the cut walk has to ship inside it and must not carry
+`response_over_budget`, because that note there would mean the tool could not
+reach a number it can reach. At 3,000 the focal's identity, the disclosures a cut
+requires and the `_kin` envelope do not fit on their own, so the walk may ship
+over, and then it has to say so under `response_over_budget`. Check 0 sits at the
+same floor at 2,000 and still requires a chain with one step and its elision:
+below its floor the MCP route answers with the smallest retained walk rather than
+refusing, which `kin trace-data-flow` does at the same budget. Neither arm passes
+on a walk the ceiling never cut.
 
 `memory_pressure_refusal.py` covers the back-off Kin owes a machine it is
 running on, and the disclosure it owes the person running it. A daemon that
@@ -463,22 +493,29 @@ Both hermetic suites stayed green, because kin-agent's scripted MCP server
 projected whatever it was sent and kin-daemon's commit tests staged without writing
 first, so only the real binaries together could show it. The suite runs `kin init`,
 `kin agent run` against a scripted chat endpoint, and a direct `kin mcp start`
-session to read the result back. `edit_lands` requires an edit to commit, with the
-file, `get_entity_source` and the durability block agreeing. `refused_edit_is_clean`
-drives an edit the planner refuses (an unterminated comment that hides a
-declaration) and requires the file untouched and the model told. `create_lands` and
-`refused_create_is_clean` do the same for `write_file`, the second one requiring the
-refused content to come back to the model rather than as a file the graph does not
-hold. `edit_survives_a_daemon_restart` stops the fixture's daemon with
-`kin daemon stop` after the agent's session opens and before its first edit, which
-is what an unattended update did to the demo's real-model run. Sessions live in the
-daemon, so the next begin names a session that no longer exists. The check requires
-the edit to commit through Kin anyway: the harness has to open a new session, and
-the file, `get_entity_source`, the durability block and the edit's own provenance
-must agree. It is the one place where kin-mcp's refusal wording meets kin-agent's
-reading of it. `pure_kin_mutate_lands` runs the same binary a second time under
-`KIN_AGENT_PURE_KIN`, whose belt carries no `edit_file` and no `write_file` at
-all, and requires one `kin_mutate` naming the ENTITY to commit: the file and
+session to read the result back. The agent's file tools have since been retired, so
+every check drives an entity operation through `kin_mutate`: the suite reads each
+target's entity id and `source_base` over its own session and scripts the model to
+send them back. `edit_lands` requires an anchored `EntitySourcePatch` to commit, with
+the file, `get_entity_source` and the durability block agreeing and no file tool
+used. `refused_edit_is_clean` drives a patch the planner refuses (an unterminated
+comment that hides a declaration) and requires the file and the entity untouched,
+the model told, and no entity recorded as changed. A refused change is an error
+result the model reads, so the run itself exits 0 and its record carries the
+refusal. `create_lands` requires an `EntityCreate` that puts a new function in a new
+source unit beside a Python anchor to commit, with the unit, the graph listing,
+`get_entity_source` and durability agreeing. `refused_create_is_clean` asks for a new
+source unit whose generated path a tracked file already holds, and requires the
+tracked file untouched, the function kept out of the graph, the model told why, and
+the declaration it sent still in the conversation it goes on with.
+`edit_survives_a_daemon_restart` stops the fixture's daemon with `kin daemon stop`
+after the agent's session opens and before its first change, which is what an
+unattended update did to the demo's real-model run. Sessions live in the daemon, so
+the session the harness opened no longer exists. The check requires a whole-body
+`update` guarded by the entity's `source_base` to commit through Kin anyway: the
+file, `get_entity_source`, the durability block and a clean final `kin_mutate` must
+agree. `pure_kin_mutate_lands` requires one `kin_mutate` naming the ENTITY by its
+UUID, with the `source_base` a read returned for it, to commit: the file and
 `get_entity_source` carry it, durability reads `recorded`, the run records
 `entities_changed` and no file, and `kin log` carries the agent's own summary
 rather than the bare transaction line. Its load-bearing assertion is that the

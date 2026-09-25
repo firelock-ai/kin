@@ -141,8 +141,14 @@ pub(super) fn extract_typescript_tree(
         .collect();
     entities.retain(|e| e.kind != EntityKind::Module || !merged.contains(&e.name));
 
+    // A file that declared nothing and imported nothing contributes no entity
+    // of its own. Minting the module surface there reported the file as
+    // parsed, so a comment-only or unreadable file read `typescript 4/4` on
+    // the doctor's parse-coverage row and the parse-hole census could not name
+    // it.
     let (module_name, is_package) = js_module_identity(&file_id.0, suffixes);
-    if !module_name.is_empty() {
+    let produced_surface = !entities.is_empty() || !imports.is_empty();
+    if produced_surface && !module_name.is_empty() {
         entities.push(ExtractedEntity {
             kind: EntityKind::Module,
             name: module_name,
@@ -184,6 +190,7 @@ pub(super) fn extract_typescript_tree(
     }
 
     Ok(ParseOutput {
+        derived_members: Vec::new(),
         entities,
         relations,
         imports,
@@ -529,11 +536,25 @@ fn extract_ts_node(
         // `declare namespace` all reached the walk as `ambient_declaration` and
         // matched nothing. Unwrap it and the arms above do the work.
         "ambient_declaration" => {
+            let declared_from = entities.len();
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 extract_ts_node(
                     &child, source, file_id, entities, relations, owners, definers,
                 );
+            }
+            // Unwrapping hands the arms above the plain declaration, so a
+            // `declare const x: T` came out with the same signature as a
+            // `const x = ...` that defines the value, and nothing downstream
+            // could tell a binding with its body elsewhere from one with its
+            // body here. The linker treats a declared binding as a declaration
+            // and hands a call to it on to the definitions that share its name.
+            // Members keep their own signatures: an ambient class's methods are
+            // reached through the class, not by a bare name.
+            for entity in &mut entities[declared_from..] {
+                if !entity.name.contains('.') && !entity.signature.starts_with("declare ") {
+                    entity.signature = format!("declare {}", entity.signature);
+                }
             }
         }
         "import_statement" => {}
@@ -1064,6 +1085,7 @@ fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
                                     local_name: text,
                                     original_name: Some("default".to_string()),
                                     is_default: true,
+                                    site: Some(crate::adapter::site_from_node(&clause_child)),
                                 });
                             }
                         }
@@ -1131,6 +1153,9 @@ fn extract_ts_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<F
             local_name: "*".to_string(),
             original_name: Some("*".to_string()),
             is_default: false,
+            // `export * from './x'` writes no name down, so there is no
+            // specifier span to record and the statement's answers.
+            site: None,
         });
     }
 
@@ -1162,6 +1187,7 @@ fn extract_namespace_import_name(node: &tree_sitter::Node, source: &[u8]) -> Opt
         local_name,
         original_name: Some("*".to_string()),
         is_default: false,
+        site: Some(crate::adapter::site_from_node(node)),
     })
 }
 
@@ -1201,6 +1227,7 @@ fn extract_ts_export_specifiers(
                         local_name: text.clone(),
                         original_name: None,
                         is_default: false,
+                        site: Some(crate::adapter::site_from_node(&child)),
                     });
                 }
             }
@@ -1246,6 +1273,7 @@ fn extract_single_import_name(node: &tree_sitter::Node, source: &[u8]) -> Option
         local_name,
         original_name: final_original_name,
         is_default: false,
+        site: Some(crate::adapter::site_from_node(node)),
     })
 }
 
@@ -2248,6 +2276,57 @@ export declare const MAX_LENGTH = 256;
         );
     }
 
+    /// The linker hands a call to a declared binding on to the definitions
+    /// that share its name, so a declared binding has to read as one. Unwrapped,
+    /// `declare const helper: T` came out with the signature of a
+    /// `const helper = ...` that defines the value here, so the adapter keeps
+    /// the `declare` at the head of the signature.
+    #[test]
+    fn an_ambient_declaration_keeps_declare_at_the_head_of_its_signature() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+declare const helper: (n: number) => number;
+
+declare class Widget {
+    render(): string;
+}
+
+const defined = (n: number): number => n * 2;
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("globals.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let signature = |name: &str| -> &str {
+            output
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .map(|entity| entity.signature.as_str())
+                .unwrap_or_else(|| panic!("`{name}` was not extracted"))
+        };
+
+        assert!(
+            signature("helper").starts_with("declare "),
+            "an ambient const: {}",
+            signature("helper")
+        );
+        assert!(
+            signature("Widget").starts_with("declare "),
+            "an ambient class: {}",
+            signature("Widget")
+        );
+        assert!(
+            !signature("Widget.render").starts_with("declare "),
+            "a member is reached through its class and keeps its own signature: {}",
+            signature("Widget.render")
+        );
+        assert!(
+            !signature("defined").starts_with("declare "),
+            "a const that gives its value here defines it: {}",
+            signature("defined")
+        );
+    }
+
     /// A member signature of an interface is a declaration a caller asks about
     /// by itself, so it has to be an entity by itself.
     ///
@@ -2446,5 +2525,65 @@ export const Reexported = Bar as Baz
             !named.iter().any(|(_, n)| *n == "Reexported"),
             "`export const X = Y as Z` is a re-export and must stay filtered: {named:?}"
         );
+    }
+
+    /// A file whose bytes declare nothing mints no module surface.
+    ///
+    /// The surface is synthetic: it stands for the file, not for anything the
+    /// file wrote. Minting it unconditionally made a comment-only or unreadable
+    /// file count as parsed, so the parse-coverage census read a clean row for a
+    /// repository holding a hole and could not name the file. Rust carried this
+    /// rule already; these adapters did not.
+    #[test]
+    fn comment_only_typescript_file_mints_no_module_surface() {
+        let adapter = TypeScriptAdapter;
+        let source = b"// nothing is declared here\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/silent.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        // A comment is valid source, not a broken file. The census separates
+        // the two, and only a file that parses clean and declares nothing is
+        // the case this rule is about.
+        assert!(matches!(output.parse_state, ParseState::Valid));
+        assert!(
+            output.entities.is_empty(),
+            "expected no entity, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typescript_file_with_one_declaration_mints_the_module_surface() {
+        let adapter = TypeScriptAdapter;
+        let source = b"export function greet(): void {}\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/greeter.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let modules: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "greeter");
+    }
+
+    /// An import alone is a surface too, and the edge is sourced at the module.
+    #[test]
+    fn typescript_file_with_only_an_import_mints_the_module_surface() {
+        let adapter = TypeScriptAdapter;
+        let source = b"import { other } from './other';\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/greeter.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(!output.imports.is_empty());
+        assert!(output
+            .entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Module && e.name == "greeter"));
     }
 }

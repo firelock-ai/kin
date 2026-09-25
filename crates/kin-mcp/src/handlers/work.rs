@@ -658,8 +658,6 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _cwd = CurrentDirGuard(std::env::current_dir().unwrap());
-
         let repo = tempfile::tempdir().unwrap();
         kin_core::init(repo.path()).unwrap();
 
@@ -672,6 +670,9 @@ mod tests {
         )
         .unwrap();
 
+        // Declared after the repository so it drops first: the working
+        // directory is restored before the directory it points into is deleted.
+        let _cwd = CurrentDirGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(repo.path()).unwrap();
         let store = kin_db::InMemoryGraph::new();
         let refused = handle_todo_import(&path_args(&outside.path().to_string_lossy()), &store);
@@ -688,8 +689,6 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _cwd = CurrentDirGuard(std::env::current_dir().unwrap());
-
         let repo = tempfile::tempdir().unwrap();
         kin_core::init(repo.path()).unwrap();
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
@@ -699,6 +698,9 @@ mod tests {
         )
         .unwrap();
 
+        // Declared after the repository so it drops first: the working
+        // directory is restored before the directory it points into is deleted.
+        let _cwd = CurrentDirGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(repo.path()).unwrap();
         let store = kin_db::InMemoryGraph::new();
         let text = result_text(

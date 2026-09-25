@@ -50,12 +50,14 @@ pub use publication::{
     SpineSourceCursor, LEGACY_SPINE_WRITER_DRAIN_SCHEMA, REPO_PUBLICATION_SCHEMA_VERSION,
     SPINE_ROLLOUT_FENCE_SCHEMA,
 };
-pub use query::{classify_spine_probe, SpineProbe, SpineQuery};
+pub use query::{
+    classify_spine_probe, DaemonSpine, SpineProbe, SpineQuery, SPINE_CANDIDATE_REPRESENTATION_GAP,
+};
 pub use routing::{RepoEndpoint, RoutingTable};
 pub use store::{
-    LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
-    RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition, StorePublicationStageGuard,
-    StoreRepoHeadGuard,
+    DurableReadMeter, DurableReadStats, LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence,
+    PreparedStorePublication, RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition,
+    StorePublicationStageGuard, StoreRepoHeadGuard,
 };
 pub use xref::{
     collect_unresolved_imports, materialize_edges, resolve_imports, ResolveResult, UnresolvedImport,

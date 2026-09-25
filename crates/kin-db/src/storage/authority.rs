@@ -207,6 +207,18 @@ where
         AuthorityReadLease(Arc::clone(&self.current.read()))
     }
 
+    /// Inspect and durably prepare against the exact predecessor while every
+    /// in-process writer is excluded. This cannot replace published authority.
+    pub(crate) fn prepare_exclusive<O>(
+        &self,
+        prepare: impl FnOnce(&Arc<S>) -> Result<O, KinDbError>,
+    ) -> Result<O, KinDbError> {
+        let mut writer = self.writer.lock();
+        let current = Arc::clone(&self.current.read());
+        let current = self.reconcile_pending(&mut writer, current)?;
+        prepare(&current)
+    }
+
     #[cfg(test)]
     pub(crate) fn persistence(&self) -> &P {
         &self.persistence
@@ -366,6 +378,28 @@ where
         retain_current: impl FnOnce(&P, &Arc<S>) -> Result<R, KinDbError>,
         persist_and_retain: impl FnOnce(&P, &S, &Arc<S>) -> RetainedPersistOutcome<R>,
     ) -> Result<(O, R), KinDbError> {
+        self.commit_and_retain_inner(prepare, retain_current, persist_and_retain, false)
+    }
+
+    /// The local backend already durably retains and fences this exact
+    /// candidate. An uncertain acknowledgement must be retried through that
+    /// preparation, never through ordinary in-memory pending persistence.
+    pub(crate) fn commit_durably_prepared<O, R>(
+        &self,
+        prepare: impl FnOnce(&S) -> Result<AuthorityCommitDecision<S, O>, KinDbError>,
+        retain_current: impl FnOnce(&P, &Arc<S>) -> Result<R, KinDbError>,
+        persist_and_retain: impl FnOnce(&P, &S, &Arc<S>) -> RetainedPersistOutcome<R>,
+    ) -> Result<(O, R), KinDbError> {
+        self.commit_and_retain_inner(prepare, retain_current, persist_and_retain, true)
+    }
+
+    fn commit_and_retain_inner<O, R>(
+        &self,
+        prepare: impl FnOnce(&S) -> Result<AuthorityCommitDecision<S, O>, KinDbError>,
+        retain_current: impl FnOnce(&P, &Arc<S>) -> Result<R, KinDbError>,
+        persist_and_retain: impl FnOnce(&P, &S, &Arc<S>) -> RetainedPersistOutcome<R>,
+        durably_prepared: bool,
+    ) -> Result<(O, R), KinDbError> {
         let mut writer = self.writer.lock();
         let current = Arc::clone(&self.current.read());
         let current = self.reconcile_pending(&mut writer, current)?;
@@ -400,10 +434,12 @@ where
                     }
                     RetainedPersistOutcome::NotCommitted(error) => Err(error),
                     RetainedPersistOutcome::Indeterminate(error) => {
-                        writer.pending = Some(PendingAuthority {
-                            state: next,
-                            kind: PendingAuthorityKind::Successor,
-                        });
+                        if !durably_prepared {
+                            writer.pending = Some(PendingAuthority {
+                                state: next,
+                                kind: PendingAuthorityKind::Successor,
+                            });
+                        }
                         Err(error)
                     }
                 }

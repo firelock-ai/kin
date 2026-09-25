@@ -221,32 +221,52 @@ fn write_fake_mcp_server(dir: &Path) -> PathBuf {
     path
 }
 
-/// Search-only profiles and incomplete transaction surfaces must never turn a local
-/// writing tool into an untracked filesystem edit.
+/// The model reads an entity's exact source and sends its whole new body back through
+/// `kin_mutate`, so the harness asks every server for exact bodies when it connects, whatever
+/// profile that server would otherwise present them in.
 #[test]
-fn incomplete_publication_surface_refuses_edit_and_create_without_changing_files() {
-    for missing in [
-        "all",
-        "kin_session_start",
-        "kin_transaction_begin",
-        "kin_transaction_stage",
-        "kin_transaction_commit",
-        "kin_transaction_abort",
-    ] {
+fn the_harness_asks_for_exact_entity_bodies_when_it_connects() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let endpoint = FakeEndpoint::start(vec![completion("Nothing to change.", None)]);
+    let base_url = endpoint.base_url.clone();
+    kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    let params: Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{}.initialize", log.display()))
+            .expect("the server saw an initialize"),
+    )
+    .unwrap();
+    assert_eq!(
+        params["capabilities"]["experimental"]["kin"]["exactEntityBodies"],
+        json!(true),
+        "{params}"
+    );
+}
+
+/// The retired file tools are refused by name whenever a model reaches for them. The call
+/// never reaches Kin, nothing on disk changes, and the refusal points at the one write tool
+/// the belt carries, or says the run has none.
+#[test]
+fn a_file_tool_call_is_refused_by_name_and_changes_nothing() {
+    for serves_mutate in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let repo = fixture_repo(dir.path());
         let original = std::fs::read(repo.join("src/greet.py")).unwrap();
-        let server = dir.path().join("incomplete_mcp.py");
-        let filter = if missing == "all" {
-            "TOOLS = [t for t in TOOLS if not t['name'].startswith('kin_')]".to_string()
+        let server = dir.path().join("mcp_server.py");
+        let script = if serves_mutate {
+            FAKE_SERVER.replace(
+                "ENVELOPE =",
+                "TOOLS.append({\"name\": \"kin_mutate\", \"description\": \"Change entities.\",\n\
+                 \"inputSchema\": {\"type\": \"object\", \"properties\": {}}})\n\nENVELOPE =",
+            )
         } else {
-            format!("TOOLS = [t for t in TOOLS if t['name'] != '{missing}']")
+            FAKE_SERVER.to_string()
         };
-        std::fs::write(
-            &server,
-            FAKE_SERVER.replace("ENVELOPE =", &format!("{filter}\n\nENVELOPE =")),
-        )
-        .unwrap();
+        std::fs::write(&server, script).unwrap();
         let log = dir.path().join("mcp-calls.jsonl");
         let endpoint = FakeEndpoint::start(vec![
             completion(
@@ -269,44 +289,94 @@ fn incomplete_publication_surface_refuses_edit_and_create_without_changing_files
                     }),
                 )),
             ),
-            completion("Both changes landed.", None),
+            completion("Neither change was possible.", None),
         ]);
+        let base_url = endpoint.base_url.clone();
         let outcome = kin_agent::run(config(
             &repo,
             &dir.path().join("out"),
-            &endpoint.base_url,
+            &base_url,
             mcp_command(&server, &log),
         ))
         .unwrap();
+        let case = if serves_mutate {
+            "with kin_mutate"
+        } else {
+            "without kin_mutate"
+        };
+
         assert_eq!(
             std::fs::read(repo.join("src/greet.py")).unwrap(),
             original,
-            "missing {missing}"
+            "{case}"
         );
-        assert!(!repo.join("src/new.py").exists(), "missing {missing}");
-        assert_eq!(
-            outcome.status,
-            ExitStatus::ChangesUnpublished,
-            "missing {missing}"
-        );
-        assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 2);
-        let analyzed = analyze(&read_jsonl(&outcome.transcript_path));
-        assert_eq!(analyzed.tool_results.len(), 2);
-        assert!(analyzed
-            .tool_results
-            .iter()
-            .all(|(_, text, error)| *error && text.contains("was not changed")));
+        assert!(!repo.join("src/new.py").exists(), "{case}");
+        assert_eq!(outcome.status, ExitStatus::Success, "{case}");
+        assert_eq!(outcome.result["kin_agent"]["refused_calls"], 2, "{case}");
+        assert_eq!(outcome.result["kin_agent"]["kin_calls"], 0, "{case}");
+
+        let view = analyze(&read_jsonl(&outcome.transcript_path));
         assert!(
-            !mcp_log(&log)
+            !view.init["tools"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .any(|row| row["tool"] == "kin_transaction_begin"),
-            "an incomplete surface must not open a transaction: missing {missing}"
+                .any(|name| name == "edit_file" || name == "write_file"),
+            "{case}: the transcript's belt carries no file tool"
+        );
+        assert_eq!(view.tool_results.len(), 2, "{case}");
+        for (_, text, is_error) in &view.tool_results {
+            assert!(*is_error, "{case}: a refusal is an error result");
+            assert!(text.contains("file tools are retired"), "{case}: {text}");
+            assert_eq!(
+                text.contains("`mcp__kin__kin_mutate`"),
+                serves_mutate,
+                "{case}: the refusal names kin_mutate only when the belt carries it: {text}"
+            );
+        }
+
+        // Only the session bracket reached the server: no transaction, no stage.
+        let names: Vec<String> = mcp_log(&log)
+            .iter()
+            .map(|call| call["tool"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["kin_session_start", "kin_session_end"],
+            "{case}"
+        );
+
+        // The trace files both calls as refusals and has no local surface at all.
+        let trace = read_jsonl(&outcome.trace_path);
+        let refused = trace
+            .iter()
+            .filter(|row| row["policy"] == "refused")
+            .count();
+        assert_eq!(refused, 2, "{case}");
+        assert!(!trace.iter().any(|row| row["surface"] == "local"), "{case}");
+
+        // The tools array the model was sent carried no file tool either.
+        let requests = endpoint.requests();
+        let sent: Vec<&str> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|spec| spec["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !sent.contains(&"edit_file") && !sent.contains(&"write_file"),
+            "{case}: {sent:?}"
+        );
+        assert_eq!(
+            sent.contains(&"mcp__kin__kin_mutate"),
+            serves_mutate,
+            "{case}: {sent:?}"
         );
     }
 }
 
 const FAKE_SERVER: &str = r#"#!/usr/bin/env python3
-import json, os, sys, time
+import json, sys, time
 
 LOG = sys.argv[1]
 
@@ -316,12 +386,11 @@ LOG = sys.argv[1]
 TTL = int(sys.argv[2]) if len(sys.argv) > 2 else None
 SESSION = {"last": None, "reaped": False}
 
-# Staged operations per transaction, so a commit publishes what was staged rather than
-# answering yes to anything. The server runs with the repository as its cwd.
-STAGED = {}
 # Every session this server has opened, in order.
 SESSIONS = []
 
+# The transaction tools are declared because a real server declares them. The harness owns
+# them and keeps them off the model's belt, and nothing in this suite calls them.
 TOOLS = [
     {"name": "semantic_locate", "description": "Find entities by meaning.",
      "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
@@ -343,9 +412,9 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "kin_transaction_abort", "description": "Abort a transaction.",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "kin_artifact_list", "description": "List repository artifacts.",
-     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"},
-                                                     "offset": {"type": "integer"}}}},
+    {"name": "entity_history", "description": "Read one entity's history.",
+     "inputSchema": {"type": "object", "properties": {"entity_id": {"type": "string"}, "limit": {"type": "integer"},
+                                                     "offset": {"type": "integer"}}, "required": ["entity_id"]}},
 ]
 
 ENVELOPE = {"envelope_version": "1", "runtime": "RepoDaemon",
@@ -358,25 +427,8 @@ def payload(obj, is_error=False, indent=None):
             "isError": is_error}
 
 
-def disk_snapshot(operations):
-    # What the working copy holds, at the moment of this call, at every path the call's
-    # operations name. The real daemon reads the working copy at commit to decide whether it
-    # may project over it, so the order a harness writes in is part of the contract, and a
-    # test has to be able to see it.
-    seen = {}
-    for op in operations:
-        target = op.get("target")
-        if target and os.path.isfile(target):
-            with open(target) as fh:
-                seen[target] = fh.read()
-    return seen
-
-
 def call(name, args):
-    operations = args.get("operations", [])
-    if name == "kin_transaction_commit":
-        operations = STAGED.get(args.get("transaction_id"), [])
-    row = {"tool": name, "args": args, "disk": disk_snapshot(operations)}
+    row = {"tool": name, "args": args}
     if TTL is not None:
         now = time.monotonic()
         if SESSION["last"] is not None and now - SESSION["last"] > TTL:
@@ -391,15 +443,17 @@ def call(name, args):
         return payload({"error": "session sess-fixture-1 was reaped after %d s idle; call "
                                  "kin_session_start for a new one" % TTL,
                         "_kin": ENVELOPE}, is_error=True)
-    if name == "kin_artifact_list":
-        # Pretty-printed with one row per artifact, like the real server, so a listing
-        # asked for a large limit is large for the same reason the real one is.
+    if name == "entity_history":
+        # Semantic history with the real entity_id/limit/offset contract.
+        # One 600-row page fits the anchored window; two exceed its byte heuristic.
         limit = int(args.get("limit", 200))
-        rows = [{"artifact_id": "00000000-0000-4000-8000-%012d" % i,
-                 "path_label": "crates/module_%04d/src/file_%04d.rs" % (i, i),
-                 "path_label_lossy": False} for i in range(limit)]
-        return payload({"artifact_count": 5000, "offset": 0, "returned": limit,
-                        "artifacts": rows, "_kin": ENVELOPE}, indent=2)
+        offset = int(args.get("offset", 0))
+        rows = [{"change_id": "%064x" % i,
+                 "entity_id": args["entity_id"],
+                 "message": "Update entity behavior."}
+                for i in range(offset, offset + limit)]
+        return payload({"change_count": 5000, "offset": offset, "returned": limit,
+                        "result": rows, "_kin": ENVELOPE}, indent=2)
     if name == "semantic_locate":
         if args.get("query") == "nothing at all":
             return payload({"results": [], "_kin": ENVELOPE,
@@ -420,81 +474,8 @@ def call(name, args):
     if name == "kin_session_heartbeat":
         return payload({"session_id": args.get("session_id"), "status": "alive",
                         "_kin": ENVELOPE})
-    if name == "kin_transaction_begin":
-        # src/stale.py: the first session is gone, as after a daemon restart; a re-opened
-        # session is accepted. src/nobegin.py: every begin is refused the same way.
-        scope, session = args.get("scope"), args.get("session_id")
-        gone = {"error": "Session not found: " + str(session) + ". It was ended or expired "
-                         "after its idle timeout.", "_kin": ENVELOPE}
-        if scope == "src/nobegin.py" or (scope == "src/stale.py" and session == "sess-fixture-1"):
-            return payload(gone, is_error=True)
     if name == "kin_session_end":
         return payload({"ended": True, "_kin": ENVELOPE})
-    if name == "kin_transaction_begin":
-        return payload({"transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
-    if name == "kin_transaction_stage":
-        # The daemon refuses a create whose path repository authority already tracks, and
-        # the mirror of it: a replace whose path authority does not track. TRACKED stands
-        # for the fixture graph's contents, so both refusals are the graph's answer rather
-        # than a look at the working tree.
-        TRACKED = ("src/greet.py", "README.md", "src/dirty.py", "src/stale.py")
-        for op in args.get("operations", []):
-            verb = op.get("verb")
-            target = op.get("target")
-            if verb in ("replace", "overwrite"):
-                if target not in TRACKED:
-                    return payload({"error": "path " + str(target) + " is not tracked by "
-                                             "repository authority, so there is nothing to "
-                                             "replace", "_kin": ENVELOPE}, is_error=True)
-                continue
-            if target in TRACKED:
-                return payload({"error": "path " + str(target) + " is already tracked",
-                                "_kin": ENVELOPE}, is_error=True)
-        STAGED.setdefault(args.get("transaction_id"), []).extend(args.get("operations", []))
-        return payload({"staged": len(args.get("operations", [])),
-                        "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
-    if name == "kin_transaction_commit":
-        # The real daemon refuses to publish onto an untracked working-copy path, and
-        # materialises the file itself when it does publish. A stand-in that always
-        # answers "committed" cannot fail the way the product fails, which is how
-        # FIR-2624 shipped: the harness wrote the file first and every real commit was
-        # refused while this suite stayed green.
-        operations = STAGED.pop(args.get("transaction_id"), [])
-        # Real authority validates tree cleanliness at COMMIT, not at stage, so a rewrite
-        # can stage cleanly and still be refused when the working copy drifted. A stand-in
-        # that only ever refuses at stage cannot produce the state this test is about.
-        for op in operations:
-            if op.get("verb") in ("replace", "overwrite") and op.get("target") == "src/dirty.py":
-                return payload({"message": "repository authority refused the rewrite of "
-                                           "src/dirty.py: the working copy is not clean",
-                                "_kin": ENVELOPE}, is_error=True)
-        # A create that stages cleanly and is refused when it commits, the create twin of the
-        # rewrite above, so a harness's behaviour after a refused commit is observable.
-        for op in operations:
-            if op.get("verb") in ("create", "add", "insert") and op.get("target") == "src/refused.py":
-                return payload({"message": "repository authority refused the create of "
-                                           "src/refused.py: its directory is not admitted",
-                                "_kin": ENVELOPE}, is_error=True)
-        for op in operations:
-            target = op.get("target")
-            if op.get("verb") in ("create", "add", "insert") and os.path.exists(target):
-                return payload({"message": "repository projection conflict: untracked "
-                                           "working-copy path " + os.path.abspath(target) +
-                                           " conflicts with exact workspace target " + target,
-                                "_kin": ENVELOPE}, is_error=True)
-        for op in operations:
-            target = op.get("target")
-            if op.get("verb") in ("create", "add", "insert", "replace", "overwrite"):
-                parent = os.path.dirname(target)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with open(target, "w") as fh:
-                    fh.write(op.get("body", ""))
-        return payload({"committed": True, "published": len(operations),
-                        "transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
-    if name == "kin_transaction_abort":
-        STAGED.pop(args.get("transaction_id"), None)
-        return payload({"aborted": True, "_kin": ENVELOPE})
     return payload({"error": "unknown tool " + name}, is_error=True)
 
 
@@ -507,6 +488,9 @@ for line in sys.stdin:
     if "id" not in msg:
         continue
     if method == "initialize":
+        # Kept beside the call log rather than in it, which counts tool calls.
+        with open(LOG + ".initialize", "w") as fh:
+            fh.write(json.dumps(msg.get("params", {})))
         result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
                   "serverInfo": {"name": "fake-kin", "version": "0"}}
     elif method == "tools/list":
@@ -529,26 +513,6 @@ fn fixture_repo(dir: &Path) -> PathBuf {
     )
     .unwrap();
     std::fs::write(repo.join("README.md"), "# fixture\n").unwrap();
-    // Tracked in the fixture graph and refused at COMMIT by the scripted server, which is
-    // how a rewrite fails in the product: authority validates tree cleanliness when it
-    // commits, not when it stages, so a replace can stage cleanly and still not land.
-    std::fs::write(
-        repo.join("src/dirty.py"),
-        "def stale(name):\n    return name\n",
-    )
-    .unwrap();
-    // The scripted server refuses begin for these two by path: src/stale.py only under the
-    // first session, as after a daemon restart, and src/nobegin.py under every session.
-    std::fs::write(
-        repo.join("src/stale.py"),
-        "def later(name):\n    return name\n",
-    )
-    .unwrap();
-    std::fs::write(
-        repo.join("src/nobegin.py"),
-        "def never(name):\n    return name\n",
-    )
-    .unwrap();
     repo
 }
 
@@ -576,8 +540,6 @@ fn config(repo: &Path, out: &Path, base_url: &str, mcp_command: Vec<String>) -> 
         },
         max_result_bytes: None,
         tool_profile: None,
-        // These runs grade the file-tool path the operator can still switch on.
-        belt_file_tools: Some(true),
     }
 }
 
@@ -696,222 +658,8 @@ fn mcp_log(path: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// The bytes a refusal quoted, which is what the next call re-issues with.
-fn quoted_bytes(refusal: &str) -> &str {
-    let (_, after) = refusal
-        .split_once("<<<KIN-EXACT\n")
-        .unwrap_or_else(|| panic!("the refusal quotes the file's bytes: {refusal}"));
-    let (bytes, _) = after
-        .split_once("\n>>>KIN-EXACT")
-        .unwrap_or_else(|| panic!("the quote is closed: {refusal}"));
-    bytes
-}
-
 #[test]
-fn a_byte_match_refusal_carries_the_bytes_the_very_next_call_lands_with() {
-    // The measured regression in one run. On 2026-09-15 `qwen/qwen3-coder-next` sent a
-    // `find` whose escape sequences were literal, because the source it had read came
-    // back inside a JSON result, and was told only that the text did not appear. It never
-    // attempted the change again and spent its remaining sixteen calls on graph
-    // questions. The refusal now carries the file's exact bytes, and this is the proof
-    // they are usable: the second call's `find` is read OUT of the first call's refusal,
-    // so the test fails if the refusal stops carrying them or carries them wrong.
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-
-    // What the model reads out of a JSON tool result, copied back without being written
-    // as the characters themselves.
-    let escaped = "def greet(name):\\n    return f\\\"hello {name}\\\"";
-    // The same text as the file actually holds it.
-    let exact = "def greet(name):\n    return f\"hello {name}\"";
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Making the greeting warmer.",
-            Some(tool_call(
-                "c1",
-                "edit_file",
-                json!({
-                    "path": "src/greet.py",
-                    "find": escaped,
-                    "replace": "def greet(name):\\n    return f\\\"hi {name}\\\"",
-                }),
-            )),
-        ),
-        completion(
-            "Those were escaped. Sending the file's own bytes.",
-            Some(tool_call(
-                "c2",
-                "edit_file",
-                json!({
-                    "path": "src/greet.py",
-                    "find": exact,
-                    "replace": "def greet(name):\n    return f\"hi {name}\"",
-                }),
-            )),
-        ),
-        completion("greet now returns a shorter greeting.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::Success);
-
-    let view = analyze(&read_jsonl(&outcome.transcript_path));
-    assert_eq!(view.tool_results.len(), 2);
-
-    // The first call is refused, and the refusal is not only a refusal.
-    let (_, refusal, is_error) = &view.tool_results[0];
-    assert!(
-        is_error,
-        "the byte mismatch must still be refused: {refusal}"
-    );
-    assert!(
-        refusal.contains("escape sequences literal"),
-        "the refusal must name why it did not match: {refusal}"
-    );
-    assert!(
-        refusal.contains("lines 1 to 2"),
-        "the refusal must say where it looked: {refusal}"
-    );
-    assert!(
-        refusal.contains("mcp__kin__kin_mutate"),
-        "the refusal must name the route that needs no old bytes: {refusal}"
-    );
-
-    // The load-bearing assertion: the bytes the refusal handed back ARE the bytes the
-    // next call sent, so a model that copies them recovers in one turn.
-    assert_eq!(
-        quoted_bytes(refusal),
-        exact,
-        "the refusal must quote the file's exact current bytes"
-    );
-    assert_eq!(
-        view.tool_uses[1].2["find"].as_str().unwrap(),
-        quoted_bytes(refusal),
-        "the recovering call re-issues with exactly what the refusal quoted"
-    );
-
-    // And that call lands.
-    assert!(
-        !view.tool_results[1].2,
-        "the retry must succeed: {}",
-        view.tool_results[1].1
-    );
-    let edited = std::fs::read_to_string(repo.join("src/greet.py")).unwrap();
-    assert_eq!(edited, "def greet(name):\n    return f\"hi {name}\"\n");
-
-    // It landed through repository authority, not by a local write.
-    let trace = read_jsonl(&outcome.trace_path);
-    let published = trace
-        .iter()
-        .filter(|row| row["surface"] == "local" && row["tool"] == "edit_file")
-        .collect::<Vec<_>>();
-    assert_eq!(published.len(), 2);
-    assert_eq!(published[0]["is_error"], true);
-    assert_eq!(
-        published[0]["provenance"]["closed_with"], "kin_transaction_abort",
-        "a refused edit stages nothing and closes its bracket"
-    );
-    assert_eq!(published[1]["is_error"], false);
-    assert_eq!(
-        published[1]["provenance"]["closed_with"],
-        "kin_transaction_commit"
-    );
-    assert_eq!(view.result["kin_agent"]["files_changed"][0], "src/greet.py");
-}
-
-#[test]
-fn a_target_refused_twice_is_not_attempted_a_third_time() {
-    // The other half of the measured failure: a run that keeps sending bytes the file
-    // does not hold spends its budget one refusal at a time. Two are allowed, because the
-    // first is the one a model reads and corrects from. The third is not run at all, and
-    // the model is sent to read the entity's source instead.
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-
-    let attempt = |id: &str, find: &str| {
-        completion(
-            "Trying the edit.",
-            Some(tool_call(
-                id,
-                "edit_file",
-                json!({ "path": "src/greet.py", "find": find, "replace": "return 1" }),
-            )),
-        )
-    };
-    let endpoint = FakeEndpoint::start(vec![
-        attempt("c1", "return \"hello \" + name"),
-        attempt("c2", "return 'hello ' + name"),
-        attempt("c3", "return  \"hello\"  +  name"),
-        completion("I could not match the line I meant to change.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::Success);
-
-    let view = analyze(&read_jsonl(&outcome.transcript_path));
-    assert_eq!(view.tool_results.len(), 3);
-    assert!(view.tool_results[0].2 && view.tool_results[1].2);
-
-    // The third was answered by the guard rather than run.
-    let third = &view.tool_results[2].1;
-    assert!(view.tool_results[2].2, "a stopped call is an error result");
-    assert!(
-        third.contains("This call was not run")
-            && third.contains("has been refused 2 times on `src/greet.py`"),
-        "the redirect must say what it stopped and why: {third}"
-    );
-    assert!(
-        third.contains("mcp__kin__get_entity_source"),
-        "the redirect must send the model to the source: {third}"
-    );
-    assert!(
-        third.contains("mcp__kin__kin_mutate"),
-        "the redirect must name the route that needs no old bytes: {third}"
-    );
-
-    let trace = read_jsonl(&outcome.trace_path);
-    let stopped = trace
-        .iter()
-        .find(|row| row["policy"] == "repeat_guard")
-        .expect("the guard's decision is traced");
-    assert_eq!(stopped["tool"], "edit_file");
-    assert_eq!(stopped["verdict"], "redirected");
-    assert_eq!(stopped["escalations"], 1);
-
-    // Nothing was opened for the call that did not run. Two attempts, two brackets.
-    let begins = mcp_log(&log)
-        .iter()
-        .filter(|call| call["tool"] == "kin_transaction_begin")
-        .count();
-    assert_eq!(
-        begins, 2,
-        "a call the guard stopped must not open a transaction"
-    );
-
-    // The file is untouched, and the run still ends with an answer.
-    assert_eq!(
-        std::fs::read_to_string(repo.join("src/greet.py")).unwrap(),
-        "def greet(name):\n    return f\"hello {name}\"\n"
-    );
-    assert_eq!(
-        outcome.final_text,
-        "I could not match the line I meant to change."
-    );
-}
-
-#[test]
-fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
+fn a_tool_call_reaches_kin_and_is_recorded_in_the_shape_the_analyzers_read() {
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture_repo(dir.path());
     let out = dir.path().join("out");
@@ -928,21 +676,14 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
             )),
         ),
         completion(
-            "Now the edit.",
+            "Now its source.",
             Some(tool_call(
                 "c2",
-                "edit_file",
-                json!({
-                    "path": "src/greet.py",
-                    "find": "def greet(name):",
-                    "replace": "def greet(name):\n    \"\"\"Return a greeting for name.\"\"\""
-                }),
+                "mcp__kin__get_entity_source",
+                json!({ "entity": "greet" }),
             )),
         ),
-        completion(
-            "greet is in src/greet.py and now carries a docstring.",
-            None,
-        ),
+        completion("greet is defined in src/greet.py.", None),
     ]);
     let base_url = endpoint.base_url.clone();
 
@@ -950,21 +691,10 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
         .expect("the run completes");
 
     assert_eq!(outcome.status, ExitStatus::Success);
-    assert_eq!(
-        outcome.final_text,
-        "greet is in src/greet.py and now carries a docstring."
-    );
+    assert_eq!(outcome.final_text, "greet is defined in src/greet.py.");
 
-    // The edit landed on disk.
-    let edited = std::fs::read_to_string(repo.join("src/greet.py")).unwrap();
-    assert!(
-        edited.contains("\"\"\"Return a greeting for name.\"\"\""),
-        "the docstring must be in the file: {edited}"
-    );
-
-    // The call reached the graph server, and the edit was bracketed and published: the
-    // stage surface's `replace` shape is keyed on a repository-relative path plus the
-    // file's complete new text, which is exactly what an edit leaves the harness holding.
+    // Both calls reached the graph server, inside the session the harness opened, and
+    // nothing else did: the harness opens no transaction of its own.
     let calls = mcp_log(&log);
     let names: Vec<&str> = calls
         .iter()
@@ -975,36 +705,11 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
         vec![
             "kin_session_start",
             "semantic_locate",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_commit",
+            "get_entity_source",
             "kin_session_end"
-        ],
-        "an edit must be staged as a replace and committed, not left unbracketed"
+        ]
     );
     assert_eq!(calls[1]["args"]["query"], "greet");
-
-    // The staged operation carries the file's WHOLE new text, not the fragment the model
-    // sent as `replace`. A body built from the fragment would satisfy every assertion
-    // above and destroy the file at commit, so the untouched line is asserted too.
-    let staged_op = &calls
-        .iter()
-        .find(|call| call["tool"] == "kin_transaction_stage")
-        .expect("the edit is staged")["args"]["operations"][0];
-    assert_eq!(staged_op["verb"], "replace");
-    assert_eq!(staged_op["target"], "src/greet.py");
-    let staged_body = staged_op["body"]
-        .as_str()
-        .expect("the replace carries a body");
-    assert!(
-        staged_body.contains("\"\"\"Return a greeting for name.\"\"\""),
-        "the staged body must carry the edit: {staged_body}"
-    );
-    assert!(
-        staged_body.contains("return f\"hello {name}\""),
-        "the staged body must be the file's complete new text, keeping the lines the edit \
-         did not touch: {staged_body}"
-    );
 
     // The transcript records it in the shape the analyzers read.
     let records = read_jsonl(&outcome.transcript_path);
@@ -1020,14 +725,14 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
         .map(|t| t.as_str().unwrap())
         .collect();
     assert!(tools.contains(&"mcp__kin__semantic_locate"));
-    assert!(tools.contains(&"edit_file"));
+    assert!(!tools.contains(&"edit_file") && !tools.contains(&"write_file"));
     // The session and transaction tools are the harness's, never the model's.
     assert!(!tools.iter().any(|name| name.contains("kin_transaction")));
     assert!(!tools.iter().any(|name| name.contains("kin_session")));
 
     assert_eq!(view.tool_uses.len(), 2);
     assert_eq!(view.tool_uses[0].1, "mcp__kin__semantic_locate");
-    assert_eq!(view.tool_uses[1].1, "edit_file");
+    assert_eq!(view.tool_uses[1].1, "mcp__kin__get_entity_source");
     assert_eq!(view.tool_results.len(), 2);
     // Each result is joinable to its call, which is how latency is derived.
     assert_eq!(view.tool_uses[0].0, view.tool_results[0].0);
@@ -1038,13 +743,16 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
     assert_eq!(view.result["subtype"], "success");
     assert_eq!(view.result["kin_agent"]["exit_code"], 0);
     assert_eq!(view.result["kin_agent"]["tool_calls"], 2);
-    assert_eq!(view.result["kin_agent"]["kin_calls"], 1);
-    assert_eq!(view.result["kin_agent"]["local_calls"], 1);
-    assert_eq!(view.result["kin_agent"]["files_changed"][0], "src/greet.py");
+    assert_eq!(view.result["kin_agent"]["kin_calls"], 2);
+    assert_eq!(view.result["kin_agent"]["refused_calls"], 0);
+    // A run changes entities, never files, so the record has no file list to fill.
+    assert_eq!(view.result["kin_agent"]["entities_changed"], json!([]));
+    assert!(view.result["kin_agent"].get("files_changed").is_none());
+    assert!(view.result["kin_agent"].get("local_calls").is_none());
     // Usage is carried through from the endpoint rather than defaulted.
     assert_eq!(view.result["usage"]["input_tokens"], 300);
 
-    // The sidecar carries the envelope and the provenance, joinable on tool_use_id.
+    // The sidecar carries the envelope, joinable on tool_use_id.
     let trace = read_jsonl(&outcome.trace_path);
     let locate = trace
         .iter()
@@ -1054,37 +762,20 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
     assert_eq!(locate["envelope"]["runtime"], "RepoDaemon");
     assert_eq!(locate["envelope"]["semantic_coverage"], 0.91);
     assert_eq!(locate["policy"], "allowed");
-    let edit = trace
+    let source = trace
         .iter()
-        .find(|row| row["surface"] == "local" && row["tool"] == "edit_file")
-        .expect("the local edit is traced");
-    assert_eq!(edit["provenance"]["bracketed"], true);
-    assert_eq!(edit["provenance"]["staged"]["verb"], "replace");
-    assert_eq!(edit["provenance"]["staged"]["target"], "src/greet.py");
-    assert_eq!(edit["provenance"]["staged"]["accepted"], true);
-    assert_eq!(
-        edit["provenance"]["closed_with"], "kin_transaction_commit",
-        "a staged edit is committed, never aborted"
+        .find(|row| row["tool"] == "get_entity_source" && row["surface"] == "kin")
+        .expect("the second Kin call is traced");
+    assert_eq!(source["tool_use_id"], view.tool_uses[1].0);
+    assert_eq!(source["args"]["entity"], "greet");
+    assert!(
+        !trace.iter().any(|row| row["surface"] == "local"),
+        "a run has no local surface to trace"
     );
-    assert_eq!(edit["provenance"]["closed_cleanly"], true);
-    // The stage row is in the sidecar under the verb it actually used.
-    let staged_row = trace
-        .iter()
-        .find(|row| row["tool"] == "kin_transaction_stage")
-        .expect("the stage call is traced");
-    assert_eq!(staged_row["verb"], "replace");
-    assert_eq!(staged_row["target"], "src/greet.py");
-    assert_eq!(staged_row["is_error"], false);
-    assert!(staged_row["body_bytes"].as_u64().unwrap() > 0);
-    // The whole written body stays out of the trace row; the transcript already has it.
-    assert!(edit["args"]["replace"]
-        .as_str()
-        .unwrap()
-        .ends_with(" bytes>"));
 
     let requests = endpoint.requests();
     assert_eq!(requests.len(), 3);
-    // The belt reached the model, and the shell never did.
+    // The belt reached the model, and neither the shell nor a file tool did.
     let sent: Vec<&str> = requests[0]["tools"]
         .as_array()
         .unwrap()
@@ -1092,7 +783,7 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
         .map(|spec| spec["function"]["name"].as_str().unwrap())
         .collect();
     assert!(sent.contains(&"mcp__kin__semantic_locate"));
-    assert!(sent.contains(&"edit_file"));
+    assert!(!sent.contains(&"edit_file") && !sent.contains(&"write_file"));
     assert!(!sent.iter().any(|name| name.contains("bash")));
     // The observation went back as a tool message keyed on the same id.
     assert_eq!(
@@ -1101,735 +792,10 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
     );
 }
 
-/// A staged edit the daemon refuses to commit must not read to the model as a success.
-///
-/// The create path has amended its own result since kin#1082. The edit path could not: until
-/// an edit could stage, nothing reached this branch, so it incremented `unpublished_changes`
-/// and handed the model "Edited `src/dirty.py`: replaced 1 occurrence" with no hint that the
-/// transaction aborted. The trace recorded the refusal, which does not help a model that
-/// only reads its own tool result and goes on believing the graph has its change.
+/// Two repositories, two servers, two graphs. Each server opens its own session in the
+/// tree it serves, and a Kin call reaches only the server whose prefix the model used.
 #[test]
-fn a_staged_edit_the_daemon_refuses_tells_the_model_it_did_not_land() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Fixing it.",
-            Some(tool_call(
-                "c1",
-                "edit_file",
-                json!({
-                    "path": "src/dirty.py",
-                    "find": "return name",
-                    "replace": "return name.strip()"
-                }),
-            )),
-        ),
-        completion("Fixed.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-
-    // The stage was taken and the commit was refused, so the run is downgraded.
-    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
-
-    let calls = mcp_log(&log);
-    let staged = calls
-        .iter()
-        .find(|call| call["tool"] == "kin_transaction_stage")
-        .expect("the edit is staged");
-    assert_eq!(staged["args"]["operations"][0]["verb"], "replace");
-
-    // Authority is the only writer, so a refusal leaves the working copy exactly as it was.
-    // A harness that wrote first stranded the edit on disk here while the graph kept the old
-    // text, which is the split FIR-3550 found on a real store.
-    assert_eq!(
-        std::fs::read_to_string(repo.join("src/dirty.py")).unwrap(),
-        "def stale(name):\n    return name\n",
-        "a refused edit must leave the file untouched"
-    );
-
-    // The refused transaction is released rather than left open. Each refusal would
-    // otherwise hold one of the session's unfinished-transaction slots until the session
-    // ends, and a model that keeps retrying would be refused a bracket altogether.
-    let names: Vec<&str> = calls
-        .iter()
-        .map(|call| call["tool"].as_str().unwrap())
-        .collect();
-    let commit_at = names
-        .iter()
-        .position(|name| *name == "kin_transaction_commit")
-        .expect("the edit reached the commit");
-    assert_eq!(
-        names.get(commit_at + 1),
-        Some(&"kin_transaction_abort"),
-        "a refused commit must be followed by an abort: {names:?}"
-    );
-    let trace = read_jsonl(&outcome.trace_path);
-    let edit = trace
-        .iter()
-        .find(|row| row["surface"] == "local" && row["tool"] == "edit_file")
-        .expect("the local edit is traced");
-    assert_eq!(edit["provenance"]["closed_with"], "kin_transaction_commit");
-    assert_eq!(edit["provenance"]["closed_cleanly"], false);
-    assert_eq!(
-        edit["provenance"]["aborted_after_refusal"]["closed_cleanly"],
-        true
-    );
-
-    // The assertion this test exists for. The model's own tool result, which is the only
-    // thing it reads, has to say the change did not land.
-    let records = read_jsonl(&outcome.transcript_path);
-    let view = analyze(&records);
-    let (_, result, is_error) = view
-        .tool_results
-        .iter()
-        .find(|(id, _, _)| id == &view.tool_uses[0].0)
-        .expect("the edit has a result");
-    assert!(
-        result.contains("did not publish it"),
-        "the model must be told its edit did not land, got: {result}"
-    );
-    assert!(
-        result.contains("working copy is not clean"),
-        "the model must be told WHY, in the server's own words, got: {result}"
-    );
-    assert!(
-        result.contains("unchanged on disk and in the graph"),
-        "the model must be told where things stand, got: {result}"
-    );
-    assert!(*is_error, "an edit that did not land is a failed call");
-}
-
-/// FIR-3550: an in-place edit is published through repository authority before the working
-/// copy changes, and the commit is what writes the file.
-///
-/// Staged after a local write, the edit reached the real daemon holding a working copy that
-/// already carried the new bytes, and the commit refused it as drift from the prior tree. So
-/// the order is asserted directly, from what the server saw on disk when each call arrived:
-/// the old text at the stage, and the old text still at the commit.
-#[test]
-fn an_in_place_edit_is_published_by_authority_before_the_file_changes() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-    let original = std::fs::read_to_string(repo.join("src/greet.py")).unwrap();
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Documenting greet.",
-            Some(tool_call(
-                "c1",
-                "edit_file",
-                json!({
-                    "path": "src/greet.py",
-                    "find": "def greet(name):",
-                    "replace": "def greet(name):\n    \"\"\"Return a greeting for name.\"\"\""
-                }),
-            )),
-        ),
-        completion("greet carries a docstring.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::Success, "{:?}", outcome.result);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 0);
-
-    let calls = mcp_log(&log);
-    let stage = calls
-        .iter()
-        .find(|call| call["tool"] == "kin_transaction_stage")
-        .expect("the edit is staged");
-    assert_eq!(
-        stage["disk"]["src/greet.py"], original,
-        "the working copy must still hold the old text when the edit is staged"
-    );
-    let commit = calls
-        .iter()
-        .find(|call| call["tool"] == "kin_transaction_commit")
-        .expect("the edit is committed");
-    assert_eq!(
-        commit["disk"]["src/greet.py"], original,
-        "the working copy must still hold the old text when the commit arrives, because the \
-         commit is what writes it"
-    );
-    let staged_body = stage["args"]["operations"][0]["body"].as_str().unwrap();
-    assert!(
-        staged_body.contains("\"\"\"Return a greeting for name.\"\"\""),
-        "the staged body carries the edit: {staged_body}"
-    );
-
-    // The file holds what the commit published, and the model is told authority wrote it.
-    assert_eq!(
-        std::fs::read_to_string(repo.join("src/greet.py")).unwrap(),
-        staged_body
-    );
-    let requests = endpoint.requests();
-    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        observation.contains("published it through repository authority"),
-        "the model must be told the edit landed: {observation}"
-    );
-}
-
-/// The end-to-end shape FIR-2586 is about: a new file the model writes is staged as the
-/// `create` operation and committed, so the run lands something rather than opening a
-/// transaction it never fills.
-#[test]
-fn a_new_file_is_staged_as_a_create_and_then_committed() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-    let body = "def farewell(name):\n    return f\"bye {name}\"\n";
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Writing the new module.",
-            Some(tool_call(
-                "c1",
-                "write_file",
-                json!({ "path": "src/farewell.py", "content": body }),
-            )),
-        ),
-        completion("src/farewell.py now holds farewell.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::Success);
-
-    // The file landed on disk.
-    assert_eq!(
-        std::fs::read_to_string(repo.join("src/farewell.py")).unwrap(),
-        body
-    );
-
-    // The write was bracketed, staged, and committed, in that order.
-    let calls = mcp_log(&log);
-    let names: Vec<&str> = calls
-        .iter()
-        .map(|call| call["tool"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_commit",
-            "kin_session_end"
-        ],
-        "a new file must be staged inside the bracket before the commit"
-    );
-
-    // The staged operation is the FIR-2417 create shape: a repository-relative target and
-    // the full body, carried in the call rather than read off disk by the daemon.
-    let stage = calls
-        .iter()
-        .find(|call| call["tool"] == "kin_transaction_stage")
-        .expect("the create is staged");
-    assert_eq!(stage["args"]["transaction_id"], "txn-fixture-1");
-    assert_eq!(stage["args"]["session_id"], "sess-fixture-1");
-    let operations = stage["args"]["operations"].as_array().unwrap();
-    assert_eq!(operations.len(), 1);
-    assert_eq!(operations[0]["verb"], "create");
-    assert_eq!(operations[0]["target"], "src/farewell.py");
-    assert_eq!(operations[0]["body"], body);
-    assert!(operations[0]["description"]
-        .as_str()
-        .unwrap()
-        .contains("src/farewell.py"));
-
-    // The commit carries the daemon's own accepted answer into the trace, so the evidence
-    // is what the server said rather than the harness's summary of it.
-    let trace = read_jsonl(&outcome.trace_path);
-    let write = trace
-        .iter()
-        .find(|row| row["surface"] == "local" && row["tool"] == "write_file")
-        .expect("the local write is traced");
-    assert_eq!(write["provenance"]["bracketed"], true);
-    assert_eq!(write["provenance"]["staged"]["verb"], "create");
-    assert_eq!(write["provenance"]["staged"]["target"], "src/farewell.py");
-    assert_eq!(write["provenance"]["staged"]["accepted"], true);
-    assert_eq!(write["provenance"]["closed_with"], "kin_transaction_commit");
-    assert_eq!(write["provenance"]["closed_cleanly"], true);
-    let response = write["provenance"]["response"].as_str().unwrap();
-    assert!(
-        response.contains("committed"),
-        "the commit response must be the daemon's own: {response}"
-    );
-
-    // The stage call is traced in its own right, joinable with the transaction.
-    let staged = trace
-        .iter()
-        .find(|row| row["tool"] == "kin_transaction_stage")
-        .expect("the stage call is traced");
-    assert_eq!(staged["event"], "transaction_stage");
-    assert_eq!(staged["transaction_id"], "txn-fixture-1");
-    assert_eq!(staged["is_error"], false);
-    assert_eq!(staged["body_bytes"], body.len());
-}
-
-/// FIR-2624: a created file must be published by repository authority, not written to the
-/// working copy ahead of the commit.
-///
-/// The daemon refuses to publish onto an untracked working-copy path sitting on its exact
-/// workspace target, so a harness that writes first turns every commit into a refusal and
-/// lands nothing. The scripted server refuses on the same ground, which is what makes this
-/// test able to fail: restore the old ordering and the run ends `ChangesUnpublished` with
-/// the projection conflict in its trace.
-#[test]
-fn a_created_file_is_published_by_authority_rather_than_written_before_the_commit() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-    let body = "def shout(text):\n    return text.upper()\n";
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Adding the helper.",
-            Some(tool_call(
-                "c1",
-                "write_file",
-                json!({ "path": "src/shout.py", "content": body }),
-            )),
-        ),
-        completion("src/shout.py now holds shout.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-
-    assert_eq!(outcome.status, ExitStatus::Success);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 0);
-    // The bytes are on disk, and the only writer was the commit.
-    assert_eq!(
-        std::fs::read_to_string(repo.join("src/shout.py")).unwrap(),
-        body
-    );
-
-    let calls = mcp_log(&log);
-    let names: Vec<&str> = calls
-        .iter()
-        .map(|call| call["tool"].as_str().unwrap())
-        .collect();
-    assert!(
-        names.contains(&"kin_transaction_commit"),
-        "the create must be committed, not aborted: {names:?}"
-    );
-    assert!(
-        !names.contains(&"kin_transaction_abort"),
-        "a create the daemon can publish must never abort: {names:?}"
-    );
-
-    let trace = read_jsonl(&outcome.trace_path);
-    let write = trace
-        .iter()
-        .find(|row| row["tool"] == "write_file")
-        .expect("the local write is traced");
-    assert_eq!(write["provenance"]["bracketed"], true);
-    assert_eq!(
-        write["provenance"]["closed_with"], "kin_transaction_commit",
-        "the bracket must close by committing"
-    );
-    assert_eq!(
-        write["provenance"]["closed_cleanly"], true,
-        "the commit must be accepted, not refused on the harness's own file"
-    );
-
-    // The model is told publication happened, so it can tell a landed change from a file
-    // left sitting on disk.
-    let requests = endpoint.requests();
-    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        observation.contains("published it through repository authority"),
-        "the model must be told the change landed: {observation}"
-    );
-}
-
-/// FIR-2625: a run whose change repository authority never published must not report
-/// success, and the reason must survive into the trace instead of being spent on the
-/// `_kin` envelope.
-#[test]
-fn a_refused_commit_downgrades_the_run_and_keeps_its_reason_in_the_trace() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-
-    // README.md is tracked in the fixture graph, so the scripted server refuses the stage
-    // by name, exactly as the daemon does.
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Rewriting the readme.",
-            Some(tool_call(
-                "c1",
-                "write_file",
-                json!({ "path": "README.md", "content": "# again\n" }),
-            )),
-        ),
-        completion("Readme rewritten.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-
-    // The model's closing paragraph reads like a success. The run does not.
-    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
-    assert_eq!(outcome.status.code(), 6);
-    assert_eq!(outcome.result["subtype"], "changes_unpublished");
-    assert_eq!(outcome.result["is_error"], true);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
-
-    // The reason reaches the trace. The `_kin` envelope alone is longer than the 300
-    // character budget, so truncating the raw answer dropped the message entirely.
-    let trace = read_jsonl(&outcome.trace_path);
-    let staged = trace
-        .iter()
-        .find(|row| row["tool"] == "kin_transaction_stage")
-        .expect("the stage call is traced");
-    assert_eq!(staged["is_error"], true);
-    let detail = staged["detail"].as_str().unwrap();
-    assert!(
-        detail.contains("already tracked"),
-        "the refusal reason must survive truncation, got: {detail}"
-    );
-    assert!(
-        !detail.contains("envelope_version"),
-        "the envelope must not be what the budget was spent on: {detail}"
-    );
-
-    // Nothing was written, so the tracked file keeps its text. The model's work comes back
-    // in its own tool result rather than as a file the graph does not hold, and the model
-    // is told it did not land.
-    assert_eq!(
-        std::fs::read_to_string(repo.join("README.md")).unwrap(),
-        "# fixture\n"
-    );
-    let requests = endpoint.requests();
-    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        observation.contains("did not publish it"),
-        "the model must be told the change did not land: {observation}"
-    );
-    assert!(
-        observation.contains("# again"),
-        "the refused content must come back to the model: {observation}"
-    );
-}
-
-/// FIR-3550, the create half: a `write_file` repository authority refuses at commit leaves
-/// no file behind.
-///
-/// The harness used to write the file locally after the refusal so the model kept its
-/// work, which left a file on disk the graph did not hold, the same split a refused edit
-/// left. The work now travels back in the tool result, the refused transaction is
-/// released, and the path stays absent.
-#[test]
-fn a_create_authority_refuses_leaves_no_file_and_hands_the_content_back() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-    let body = "def refused(name):\n    return name\n";
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Adding the module.",
-            Some(tool_call(
-                "c1",
-                "write_file",
-                json!({ "path": "src/refused.py", "content": body }),
-            )),
-        ),
-        completion("src/refused.py is in place.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
-    assert!(
-        !repo.join("src/refused.py").exists(),
-        "a refused create must leave no file behind"
-    );
-
-    let calls = mcp_log(&log);
-    let names: Vec<&str> = calls
-        .iter()
-        .map(|call| call["tool"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_commit",
-            "kin_transaction_abort",
-            "kin_session_end"
-        ],
-        "a create refused at commit must be released with an abort"
-    );
-
-    let requests = endpoint.requests();
-    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        observation.contains("did not publish it"),
-        "the model must be told the create did not land: {observation}"
-    );
-    assert!(
-        observation.contains("its directory is not admitted"),
-        "the model must be told WHY, in the server's own words: {observation}"
-    );
-    assert!(
-        observation.contains(body),
-        "the refused content must come back to the model: {observation}"
-    );
-}
-
-/// When the session is gone, as after the daemon that held it was stopped and started again,
-/// the edit re-opens the session once, begins again under the new one, and lands.
-#[test]
-fn an_edit_after_the_session_is_gone_reopens_it_and_publishes() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Fixing it.",
-            Some(tool_call(
-                "c1",
-                "edit_file",
-                json!({ "path": "src/stale.py", "find": "return name", "replace": "return name.strip()" }),
-            )),
-        ),
-        completion("Fixed.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::Success, "{:?}", outcome.result);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 0);
-
-    let calls = mcp_log(&log);
-    let names: Vec<&str> = calls
-        .iter()
-        .map(|call| call["tool"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_commit",
-            "kin_session_end"
-        ],
-        "a gone session is re-opened once and the begin retried: {names:?}"
-    );
-    let stage = calls
-        .iter()
-        .find(|call| call["tool"] == "kin_transaction_stage")
-        .expect("the edit is staged");
-    assert_eq!(
-        stage["args"]["session_id"], "sess-fixture-2",
-        "the stage names the re-opened session"
-    );
-    assert_eq!(
-        std::fs::read_to_string(repo.join("src/stale.py")).unwrap(),
-        "def later(name):\n    return name.strip()\n"
-    );
-}
-
-/// When Kin is attached but no transaction opens, the edit writes nothing and the model is
-/// told why, in the server's own words with the envelope stripped.
-///
-/// The harness used to fall back to a local write and report "Edited", which is how a real
-/// run left ten lines on disk that repository authority never saw.
-#[test]
-fn an_edit_kin_cannot_open_a_transaction_for_writes_nothing_and_says_why() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Fixing it.",
-            Some(tool_call(
-                "c1",
-                "edit_file",
-                json!({ "path": "src/nobegin.py", "find": "return name", "replace": "return name.strip()" }),
-            )),
-        ),
-        completion("Fixed.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
-    assert_eq!(
-        std::fs::read_to_string(repo.join("src/nobegin.py")).unwrap(),
-        "def never(name):\n    return name\n",
-        "nothing may be written without a transaction"
-    );
-
-    let calls = mcp_log(&log);
-    let names: Vec<&str> = calls
-        .iter()
-        .map(|call| call["tool"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_session_end"
-        ],
-        "begin is retried once and nothing is staged: {names:?}"
-    );
-
-    // The refusal's own words reach the trace, not the envelope that comes first.
-    let trace = read_jsonl(&outcome.trace_path);
-    let begin = trace
-        .iter()
-        .rev()
-        .find(|row| row["tool"] == "kin_transaction_begin")
-        .expect("the refused begin is traced");
-    let detail = begin["detail"].as_str().unwrap();
-    assert!(detail.contains("Session not found"), "{detail}");
-    assert!(!detail.contains("envelope_version"), "{detail}");
-
-    let requests = endpoint.requests();
-    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        observation.contains("was not changed")
-            && observation.contains("Session not found")
-            && observation.contains("unchanged on disk and in the graph"),
-        "the model must be told nothing changed and why: {observation}"
-    );
-}
-
-/// A `write_file` over a path the graph already tracks is refused by repository authority
-/// rather than by the harness looking at the disk, and the refusal aborts the transaction.
-#[test]
-fn a_write_over_a_tracked_path_is_refused_by_the_graph_and_aborts() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(dir.path());
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let log = dir.path().join("mcp-calls.jsonl");
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Rewriting the readme.",
-            Some(tool_call(
-                "c1",
-                "write_file",
-                json!({ "path": "README.md", "content": "# rewritten\n" }),
-            )),
-        ),
-        completion("README.md rewritten.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
-        .expect("the run completes");
-    // Nothing was published, so the run does not get to call itself a success, and nothing
-    // was written: the tracked file keeps its text and the model's content comes back in
-    // its tool result.
-    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
-    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
-    assert_eq!(
-        std::fs::read_to_string(repo.join("README.md")).unwrap(),
-        "# fixture\n"
-    );
-
-    // Repository authority refuses the create by name, so the transaction aborts rather
-    // than committing, and the harness never claims a provenance it did not get.
-    let calls = mcp_log(&log);
-    let names: Vec<&str> = calls
-        .iter()
-        .map(|call| call["tool"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_abort",
-            "kin_session_end"
-        ],
-        "a refused stage must abort rather than commit an empty transaction"
-    );
-
-    let trace = read_jsonl(&outcome.trace_path);
-    let write = trace
-        .iter()
-        .find(|row| row["surface"] == "local" && row["tool"] == "write_file")
-        .expect("the local write is traced");
-    assert_eq!(write["provenance"]["bracketed"], true);
-    assert_eq!(write["provenance"]["staged"]["accepted"], false);
-    assert_eq!(write["provenance"]["closed_with"], "kin_transaction_abort");
-    let detail = write["provenance"]["staged"]["detail"].as_str().unwrap();
-    assert!(
-        detail.contains("already tracked"),
-        "the graph's refusal must survive into the provenance: {detail}"
-    );
-}
-
-/// Two repositories, two servers, two graphs. Each write is staged and committed into the
-/// graph of the repository that owns its path, and a Kin call reaches only the server whose
-/// prefix the model used.
-#[test]
-fn two_repositories_each_get_their_own_server_session_and_commits() {
+fn two_repositories_each_get_their_own_server_and_session() {
     let dir = tempfile::tempdir().unwrap();
     let alpha = fixture_repo_named(dir.path(), "alpha");
     let beta = fixture_repo_named(dir.path(), "beta");
@@ -1837,7 +803,6 @@ fn two_repositories_each_get_their_own_server_session_and_commits() {
     let server = write_fake_mcp_server(dir.path());
     let alpha_log = dir.path().join("alpha-calls.jsonl");
     let beta_log = dir.path().join("beta-calls.jsonl");
-    let beta_file = beta.join("src/new_b.py");
 
     let endpoint = FakeEndpoint::start(vec![
         completion(
@@ -1849,22 +814,14 @@ fn two_repositories_each_get_their_own_server_session_and_commits() {
             )),
         ),
         completion(
-            "Writing into the primary.",
+            "Reading it in the primary.",
             Some(tool_call(
                 "c2",
-                "write_file",
-                json!({ "path": "src/new_a.py", "content": "a = 1\n" }),
+                "mcp__kin_alpha__get_entity_source",
+                json!({ "entity": "greet" }),
             )),
         ),
-        completion(
-            "Writing into beta.",
-            Some(tool_call(
-                "c3",
-                "write_file",
-                json!({ "path": beta_file.display().to_string(), "content": "b = 2\n" }),
-            )),
-        ),
-        completion("Both files are written.", None),
+        completion("greet is defined in both repositories.", None),
     ]);
     let base_url = endpoint.base_url.clone();
 
@@ -1877,66 +834,31 @@ fn two_repositories_each_get_their_own_server_session_and_commits() {
     let outcome = kin_agent::run(cfg).expect("the run completes");
     assert_eq!(outcome.status, ExitStatus::Success);
 
-    // Both files landed, each in its own tree.
-    assert_eq!(
-        std::fs::read_to_string(alpha.join("src/new_a.py")).unwrap(),
-        "a = 1\n"
-    );
-    assert!(
-        beta_file.exists(),
-        "the absolute-path write must land in the second repository at {}",
-        beta_file.display()
-    );
-    assert_eq!(std::fs::read_to_string(&beta_file).unwrap(), "b = 2\n");
-
-    // The primary server saw its own session, its own transaction, and no beta work.
-    let alpha_names: Vec<String> = mcp_log(&alpha_log)
+    // The primary server saw its own session and only the call made with its prefix.
+    let alpha_calls = mcp_log(&alpha_log);
+    let alpha_names: Vec<&str> = alpha_calls
         .iter()
-        .map(|call| call["tool"].as_str().unwrap().to_string())
+        .map(|call| call["tool"].as_str().unwrap())
         .collect();
     assert_eq!(
         alpha_names,
-        vec![
-            "kin_session_start",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_commit",
-            "kin_session_end"
-        ],
-        "the primary must carry only its own relative-path write"
+        vec!["kin_session_start", "get_entity_source", "kin_session_end"],
+        "the primary must carry only the call named with its own prefix"
     );
+    assert_eq!(alpha_calls[0]["args"]["cwd"], alpha.display().to_string());
 
-    // The second server saw the model's Kin call and its own absolute-path write.
+    // The second server saw its own session and the call made with its prefix.
     let beta_calls = mcp_log(&beta_log);
-    let beta_names: Vec<String> = beta_calls
+    let beta_names: Vec<&str> = beta_calls
         .iter()
-        .map(|call| call["tool"].as_str().unwrap().to_string())
+        .map(|call| call["tool"].as_str().unwrap())
         .collect();
     assert_eq!(
         beta_names,
-        vec![
-            "kin_session_start",
-            "semantic_locate",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_commit",
-            "kin_session_end"
-        ],
-        "the prefixed Kin call and the absolute-path write must both reach beta"
+        vec!["kin_session_start", "semantic_locate", "kin_session_end"],
+        "the prefixed Kin call must reach beta and only beta"
     );
-
-    // Each staged create names the path relative to its OWN repository, never the other's.
-    let staged_target = |calls: &[Value]| -> String {
-        calls
-            .iter()
-            .find(|call| call["tool"] == "kin_transaction_stage")
-            .expect("a create is staged")["args"]["operations"][0]["target"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    assert_eq!(staged_target(&mcp_log(&alpha_log)), "src/new_a.py");
-    assert_eq!(staged_target(&beta_calls), "src/new_b.py");
+    assert_eq!(beta_calls[0]["args"]["cwd"], beta.display().to_string());
 
     // The trace attributes every call to the server that served it.
     let trace = read_jsonl(&outcome.trace_path);
@@ -1945,22 +867,14 @@ fn two_repositories_each_get_their_own_server_session_and_commits() {
         .find(|row| row["tool"] == "semantic_locate")
         .expect("the Kin call is traced");
     assert_eq!(locate["server"], "kin_beta");
-    let writes: Vec<&Value> = trace
+    let source = trace
         .iter()
-        .filter(|row| row["surface"] == "local" && row["tool"] == "write_file")
-        .collect();
-    assert_eq!(writes.len(), 2);
-    assert_eq!(writes[0]["server"], "kin_alpha");
-    assert_eq!(writes[0]["repo"], alpha.display().to_string());
-    assert_eq!(writes[1]["server"], "kin_beta");
-    assert_eq!(writes[1]["repo"], beta.display().to_string());
-    for write in &writes {
-        assert_eq!(write["provenance"]["staged"]["accepted"], true);
-        assert_eq!(write["provenance"]["closed_with"], "kin_transaction_commit");
-    }
+        .find(|row| row["tool"] == "get_entity_source")
+        .expect("the Kin call is traced");
+    assert_eq!(source["server"], "kin_alpha");
 
-    // The belt the model was given namespaces each repository's tools, and carries no
-    // ambiguous bare Kin name.
+    // The belt the model was given namespaces each repository's tools, carries no
+    // ambiguous bare Kin name, and carries no file tool.
     let requests = endpoint.requests();
     let sent: Vec<String> = requests[0]["tools"]
         .as_array()
@@ -1978,82 +892,23 @@ fn two_repositories_each_get_their_own_server_session_and_commits() {
         !sent.iter().any(|name| name == "mcp__kin__semantic_locate"),
         "a multi-repository run must not expose an unqualified Kin tool: {sent:?}"
     );
-
-    // Files changed are recorded absolutely, because the same relative path exists in both.
-    let changed: Vec<String> = outcome.result["kin_agent"]["files_changed"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|value| value.as_str().unwrap().to_string())
-        .collect();
-    assert!(changed
-        .iter()
-        .any(|path| path.ends_with("alpha/src/new_a.py")));
-    assert!(changed
-        .iter()
-        .any(|path| path.ends_with("beta/src/new_b.py")));
-}
-
-/// A path in no attached repository runs nothing at all, and the refusal names the roots.
-#[test]
-fn a_path_outside_every_attached_repository_writes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let alpha = fixture_repo_named(dir.path(), "alpha");
-    let beta = fixture_repo_named(dir.path(), "beta");
-    let out = dir.path().join("out");
-    let server = write_fake_mcp_server(dir.path());
-    let alpha_log = dir.path().join("alpha-calls.jsonl");
-    let beta_log = dir.path().join("beta-calls.jsonl");
-    let stray = dir.path().join("elsewhere/escaped.py");
-
-    let endpoint = FakeEndpoint::start(vec![
-        completion(
-            "Writing outside.",
-            Some(tool_call(
-                "c1",
-                "write_file",
-                json!({ "path": stray.display().to_string(), "content": "x = 1\n" }),
-            )),
-        ),
-        completion("I could not write there.", None),
-    ]);
-    let base_url = endpoint.base_url.clone();
-
-    let mut cfg = config(&alpha, &out, &base_url, mcp_command(&server, &alpha_log));
-    cfg.extra_servers = vec![kin_agent::ServerSpec {
-        repo: beta.clone(),
-        mcp_command: mcp_command(&server, &beta_log),
-    }];
-
-    let outcome = kin_agent::run(cfg).expect("the run completes");
-    assert_eq!(outcome.status, ExitStatus::Success);
     assert!(
-        !stray.exists(),
-        "nothing may be written outside the repositories"
-    );
-
-    // Neither server opened a transaction for it.
-    for log in [&alpha_log, &beta_log] {
-        let names: Vec<String> = mcp_log(log)
+        !sent
             .iter()
-            .map(|call| call["tool"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(names, vec!["kin_session_start", "kin_session_end"]);
-    }
-
-    let trace = read_jsonl(&outcome.trace_path);
-    let write = trace
-        .iter()
-        .find(|row| row["surface"] == "local" && row["tool"] == "write_file")
-        .expect("the refused write is traced");
-    assert_eq!(write["is_error"], true);
-    let problem = write["problem"].as_str().unwrap();
-    assert!(
-        problem.contains("outside every repository")
-            && problem.contains(&alpha.display().to_string())
-            && problem.contains(&beta.display().to_string()),
-        "the refusal must name every root: {problem}"
+            .any(|name| name == "edit_file" || name == "write_file"),
+        "{sent:?}"
     );
+
+    // The model is told which repositories are attached and how to address each, and
+    // is no longer told how a file path resolves, since no tool takes one.
+    let system = requests[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains(&alpha.display().to_string())
+            && system.contains(&beta.display().to_string())
+            && system.contains("call the one belonging to the repository you mean"),
+        "{system}"
+    );
+    assert!(!system.contains("absolute path"), "{system}");
 }
 
 #[test]
@@ -2275,14 +1130,14 @@ fn two_large_listings(counts: Option<[(u64, u64); 3]>) -> Vec<Value> {
     let listing = |id: &str, offset: u64| {
         Some(tool_call(
             id,
-            "mcp__kin__kin_artifact_list",
-            json!({ "limit": 600, "offset": offset }),
+            "mcp__kin__entity_history",
+            json!({ "entity_id": "entity-1", "limit": 600, "offset": offset }),
         ))
     };
     let turns = [
-        ("Listing the artifacts.", listing("a1", 0)),
+        ("Listing the entity changes.", listing("a1", 0)),
         ("Listing the next page.", listing("a2", 600)),
-        ("This repository holds 5000 artifacts.", None),
+        ("This entity has 5000 changes.", None),
     ];
     turns
         .into_iter()
@@ -2349,10 +1204,8 @@ fn an_endpoint_that_counts_its_own_prompt_governs_the_budget_over_the_byte_heuri
     let base_url = endpoint.base_url.clone();
 
     // The wide belt, for the same reason the clipping and withholding tests take
-    // it: the artifact listing is the tool whose answer is large enough to fill a
-    // window, and the belt this run would otherwise get does not carry it. Asked
-    // for here rather than through `KIN_AGENT_BELT` so the rest of this process
-    // keeps the belt it expects.
+    // it: the entity history fixture is large enough to fill a window. Asking
+    // explicitly keeps every other test independent of process environment.
     let outcome = kin_agent::run_with_options(
         wide_window_config(&repo, &out, &base_url, mcp_command(&server, &log)),
         wide_belt(),
@@ -2426,10 +1279,8 @@ fn an_endpoint_that_counts_nothing_leaves_the_byte_heuristic_in_charge() {
     let base_url = endpoint.base_url.clone();
 
     // The wide belt, for the same reason the clipping and withholding tests take
-    // it: the artifact listing is the tool whose answer is large enough to fill a
-    // window, and the belt this run would otherwise get does not carry it. Asked
-    // for here rather than through `KIN_AGENT_BELT` so the rest of this process
-    // keeps the belt it expects.
+    // it: the entity history fixture is large enough to fill a window. Asking
+    // explicitly keeps every other test independent of process environment.
     let outcome = kin_agent::run_with_options(
         wide_window_config(&repo, &out, &base_url, mcp_command(&server, &log)),
         wide_belt(),
@@ -2693,10 +1544,9 @@ fn a_batch_that_crosses_the_tool_call_budget_runs_only_what_the_budget_allows() 
 
 /// Run options asking for the belt that carries every tool the server serves.
 ///
-/// Two tests here drive `kin_artifact_list` because it is the tool whose answer
-/// is big enough to clip and to withhold. The default belt withholds it, so they
-/// say which belt they want rather than setting `KIN_AGENT_BELT` for the whole
-/// test process.
+/// Two tests here drive `entity_history` because it is the tool whose answer
+/// is big enough to clip and to withhold. They use an explicit wide belt
+/// rather than setting `KIN_AGENT_BELT` for the whole test process.
 fn wide_belt() -> kin_agent::RunOptions {
     kin_agent::RunOptions {
         belt: Some(kin_agent::belt::BeltProfile::Wide),
@@ -2720,28 +1570,25 @@ fn an_oversized_result_is_cut_to_the_ceiling_with_a_note_naming_size_ceiling_and
             "Listing everything.",
             Some(tool_call(
                 "c1",
-                "mcp__kin__kin_artifact_list",
-                json!({ "limit": 1000 }),
+                "mcp__kin__entity_history",
+                json!({ "entity_id": "entity-1", "limit": 1000 }),
             )),
         ),
-        completion("There are many artifacts.", None),
+        completion("There are many changes.", None),
     ]);
     let base_url = endpoint.base_url.clone();
 
     let mut cfg = config(&repo, &out, &base_url, mcp_command(&server, &log));
     cfg.max_result_bytes = Some(8_192);
-    // The wide belt, because what this grades is clipping and the artifact
-    // listing is only the vehicle: it is the tool that returns a result large
-    // enough to cut. The default belt leaves it to `KIN_AGENT_BELT=wide`, and
-    // asking for that here rather than through the environment keeps every other
-    // test in this process on the belt it expects.
+    // The history fixture exercises clipping with a real semantic paging contract.
+    // The explicit belt keeps other tests independent of process environment.
     let outcome = kin_agent::run_with_options(cfg, wide_belt()).expect("the run completes");
     assert_eq!(outcome.status, ExitStatus::Success);
 
     let trace = read_jsonl(&outcome.trace_path);
     let row = trace
         .iter()
-        .find(|row| row["tool"] == "kin_artifact_list" && row["surface"] == "kin")
+        .find(|row| row["tool"] == "entity_history" && row["surface"] == "kin")
         .expect("the Kin call is traced");
     let result_bytes = row["result_bytes"].as_u64().unwrap();
     let shown_bytes = row["shown_bytes"].as_u64().unwrap();
@@ -2804,8 +1651,8 @@ fn a_result_the_window_cannot_hold_is_withheld_and_the_run_ends_on_its_context_b
             "Listing.",
             Some(tool_call(
                 "c1",
-                "mcp__kin__kin_artifact_list",
-                json!({ "limit": 50 }),
+                "mcp__kin__entity_history",
+                json!({ "entity_id": "entity-1", "limit": 50 }),
             )),
             3_000,
             20,
@@ -2820,7 +1667,7 @@ fn a_result_the_window_cannot_hold_is_withheld_and_the_run_ends_on_its_context_b
         source: kin_agent::ContextSource::Flag,
     };
     // The wide belt, for the same reason as the clipping test above: this grades
-    // withholding, and the artifact listing is the tool whose answer is too
+    // withholding, and the entity history is the tool whose answer is too
     // large for the window to hold.
     let outcome = kin_agent::run_with_options(cfg, wide_belt()).expect("the run completes");
 
@@ -2859,7 +1706,7 @@ fn a_result_the_window_cannot_hold_is_withheld_and_the_run_ends_on_its_context_b
     let content = tool_message["content"].as_str().unwrap();
     assert!(content.contains("was not sent"), "{content}");
     assert!(
-        !content.contains("path_label"),
+        !content.contains("change_id"),
         "no withheld row may reach the model: {content}"
     );
 }

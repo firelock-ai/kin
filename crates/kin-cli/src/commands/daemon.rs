@@ -10,10 +10,11 @@
 //! behavior-env divergence warning tells them to). This command group is that
 //! surface, replacing raw `kill $(cat .kin/daemon.pid)`.
 //!
-//! Stop authority is always bound to one process incarnation. Linux uses a
-//! pidfd, native Windows uses a process handle, and macOS uses an authenticated
-//! cooperative endpoint whose request names the expected birth identity. The
-//! wait is a ceiling, not a fixed delay.
+//! Unix first requests cooperative shutdown of the recorded incarnation.
+//! Signals additionally require the executing image recorded at publication.
+//! Linux pins the incarnation with a pidfd; macOS rechecks before numeric
+//! signals. Image checks are point-in-time, not atomic with delivery. Native
+//! Windows retains its existing process-handle stop path.
 //!
 //! `--all` bounds the sweep, not just each step in it. Stopping identities in
 //! sequence under a per-identity ceiling left the command's real bound
@@ -25,17 +26,195 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::daemon_client::process_runs_a_kin_image;
+use crate::daemon_client::process_executable::{self, ExecutableIdentity};
 use crate::daemon_client::{
-    caller_home_id, fetch_registered_daemons, is_port_open, is_process_alive, probe_daemon_port,
-    process_identity, process_identity_is_current, read_endpoint_owner_record,
+    caller_home_id, connect_loopback_port, fetch_registered_daemons, is_process_alive,
+    probe_daemon_port, process_identity, process_identity_is_current, read_endpoint_owner_record,
     read_supervisor_owner_record, remove_stale_daemon_files, remove_stale_supervisor_files,
     repo_daemon_owner_path, repo_daemon_pid_path, repo_daemon_port_path,
     repo_daemon_recorded_endpoint, retire_stopped_daemon_endpoint, supervisor_owner_path,
     supervisor_pid_path, supervisor_port_path, supervisor_recorded_endpoint,
     try_acquire_supervisor_startup_lock_in_dir, DaemonHomeScope, DaemonPortProbe,
-    PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon, SupervisorStartupLock,
+    EndpointOwnerRecord, PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon,
+    SupervisorStartupLock,
 };
+
+#[derive(Debug, Clone)]
+struct AttributedStopTarget {
+    owner: EndpointOwnerRecord,
+    #[cfg(unix)]
+    selected_install_image: Option<ExecutableIdentity>,
+}
+
+impl AttributedStopTarget {
+    fn published(owner: EndpointOwnerRecord) -> Self {
+        Self {
+            owner,
+            #[cfg(unix)]
+            selected_install_image: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn expected_image(&self) -> std::io::Result<ExecutableIdentity> {
+        match &self.selected_install_image {
+            Some(image) => Ok(image.clone()),
+            None => self.owner.executable_identity(),
+        }
+    }
+}
+
+impl std::ops::Deref for AttributedStopTarget {
+    type Target = ProcessIdentity;
+
+    fn deref(&self) -> &Self::Target {
+        self.owner.identity()
+    }
+}
+
+/// One validated process incarnation retained across every Unix signal stage.
+/// Linux uses its pinned descriptor exclusively; macOS retains a documented
+/// point-in-time image/incarnation check before its numeric signal.
+#[cfg(unix)]
+struct UnixSignalTarget {
+    identity: ProcessIdentity,
+    expected_image: ExecutableIdentity,
+    #[cfg(target_os = "linux")]
+    pidfd: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl UnixSignalTarget {
+    fn open(target: &AttributedStopTarget) -> std::io::Result<Option<Self>> {
+        Self::open_with_probe(target, process_identity_is_current)
+    }
+
+    fn open_with_probe(
+        target: &AttributedStopTarget,
+        mut probe: impl FnMut(&ProcessIdentity) -> std::io::Result<bool>,
+    ) -> std::io::Result<Option<Self>> {
+        if !probe(target)? {
+            return Ok(None);
+        }
+        let expected_image = target.expected_image()?;
+        #[cfg(target_os = "linux")]
+        let pidfd = {
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, target.pid(), 0) as libc::c_int };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                return if !probe(target)? {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            // Own immediately: any subsequent identity/image failure must
+            // close the descriptor, including an error from the probe itself.
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+        };
+        if !probe(target)? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            identity: target.owner.identity().clone(),
+            expected_image,
+            #[cfg(target_os = "linux")]
+            pidfd,
+        }))
+    }
+
+    fn send(&self, signal: libc::c_int, deadline: Instant) -> std::io::Result<bool> {
+        self.send_with(
+            signal,
+            deadline,
+            process_identity_is_current,
+            process_executable::observe,
+        )
+    }
+
+    /// [`send`](Self::send) with its two host readers injected.
+    ///
+    /// A recorded process can stop inside the microseconds between the
+    /// incarnation probe and the image read, and what that failure is
+    /// classified as decides whether a stop reports a verdict or reports
+    /// nothing. Waiting for the host to land in that window is not a test, so
+    /// the readers are parameters here and the real ones are what `send`
+    /// passes.
+    fn send_with(
+        &self,
+        signal: libc::c_int,
+        deadline: Instant,
+        mut probe: impl FnMut(&ProcessIdentity) -> std::io::Result<bool>,
+        observe: impl FnOnce(u32, Instant) -> std::io::Result<ExecutableIdentity>,
+    ) -> std::io::Result<bool> {
+        if !probe(&self.identity)? {
+            return Ok(false);
+        }
+        let actual = match observe(self.identity.pid(), deadline) {
+            Ok(actual) => actual,
+            Err(error) => {
+                // A process that stopped between the probe above and this read
+                // publishes no image to compare against: Linux drops
+                // `/proc/PID/exe` the moment it stops running, including while
+                // it is a corpse its parent has not reaped, so the read fails
+                // rather than answering. Re-probe the recorded incarnation and
+                // report it gone, which is what it is, instead of an
+                // unclassifiable stop. A process still running its recorded
+                // incarnation keeps the error, so an image this stop may not
+                // signal still refuses. No signal is sent on either path.
+                if !probe(&self.identity)? {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+        };
+        if actual != self.expected_image {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the recorded process is no longer executing its published image; refusing to signal it",
+            ));
+        }
+        if !probe(&self.identity)? {
+            return Ok(false);
+        }
+        process_executable::check_deadline(deadline)?;
+        #[cfg(target_os = "linux")]
+        let rc = {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                ) as libc::c_int
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::kill(self.identity.pid() as libc::pid_t, signal) };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = signal;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "executable-bound process signals are unavailable on this platform",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if rc == 0 {
+            Ok(true)
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
 
 /// Liveness of a recorded daemon/supervisor endpoint. Pure classification of the
 /// recorded pid plus the observed process/port state, so the policy is testable
@@ -82,8 +261,8 @@ impl DaemonLiveness {
     }
 
     /// Whether the process is alive and this state says the daemon cannot be
-    /// talked to. `kin daemon stop` is the remedy in every one of these, and it
-    /// is the state that decides whether to say so.
+    /// talked to. `kin daemon stop` attempts an attributed shutdown in these
+    /// states and reports when the recorded process cannot be stopped.
     fn is_wedged(self) -> bool {
         matches!(
             self,
@@ -173,10 +352,12 @@ fn stop_all_budget() -> Duration {
 
 /// Budget left before `deadline`.
 ///
-/// Reaching zero does not skip an identity: the stop request is still delivered,
+/// For ordinary explicit stop, zero does not skip an identity: the request is delivered,
 /// and only the wait for the process to disappear is what the exhausted budget
 /// gives up. The identity is then reported `timeout`, which is the honest
 /// outcome, since the request went out and this command did not stay to watch.
+/// Retirement instead carries the absolute deadline and refuses unsent requests
+/// once it expires, because it has no authority to force a worker down.
 fn remaining_budget(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
@@ -192,6 +373,9 @@ enum StopOutcome {
     Timeout,
     /// Delivering the platform stop request failed while the owner remained.
     SignalFailed(String),
+    /// Asked to retire (`--when-unused`), the daemon is still needed, so it was
+    /// left running. It exits on its own once what it named has ended.
+    InUse(Vec<String>),
 }
 
 impl StopOutcome {
@@ -201,61 +385,22 @@ impl StopOutcome {
         matches!(self, StopOutcome::NotRunning | StopOutcome::Stopped)
     }
 
+    /// Whether this outcome is what the stop was entitled to. A daemon left
+    /// running because it is still in use is the correct answer to a
+    /// `--when-unused` stop, never a failure, and never a reason to escalate.
+    fn is_settled(&self) -> bool {
+        self.is_success() || matches!(self, StopOutcome::InUse(_))
+    }
+
     fn detail(&self) -> &str {
         match self {
             StopOutcome::NotRunning => "not-running",
             StopOutcome::Stopped => "stopped",
             StopOutcome::Timeout => "timeout",
             StopOutcome::SignalFailed(_) => "signal-failed",
+            StopOutcome::InUse(_) => "in-use",
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn terminate_attributed_process(identity: &ProcessIdentity) -> std::io::Result<bool> {
-    // pidfd_open pins the task incarnation before identity revalidation. PID
-    // reuse after this point cannot redirect pidfd_send_signal to a successor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid(), 0) as libc::c_int };
-    if fd < 0 {
-        return if !process_identity_is_current(identity)? {
-            Ok(false)
-        } else {
-            Err(std::io::Error::last_os_error())
-        };
-    }
-    let outcome = if !process_identity_is_current(identity)? {
-        Ok(false)
-    } else {
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                fd,
-                libc::SIGTERM,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        if rc == 0 {
-            Ok(true)
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(false)
-            } else {
-                Err(error)
-            }
-        }
-    };
-    let _ = unsafe { libc::close(fd) };
-    outcome
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn terminate_attributed_process(_identity: &ProcessIdentity) -> std::io::Result<bool> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "incarnation-bound daemon stop is unsupported on this Unix platform",
-    ))
 }
 
 #[cfg(windows)]
@@ -312,7 +457,7 @@ fn terminate_attributed_process(identity: &ProcessIdentity) -> std::io::Result<b
 /// Stop exactly one attributed process incarnation and wait up to `wait` for
 /// that incarnation to disappear. A reused numeric PID compares unequal and is
 /// never signaled or mistaken for a surviving daemon.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 fn stop_identity_graceful(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
     match terminate_attributed_process(identity) {
         Ok(false) => return StopOutcome::NotRunning,
@@ -338,19 +483,20 @@ fn stop_identity_graceful(identity: &ProcessIdentity, wait: Duration) -> StopOut
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn stop_identity_cooperatively<F>(
     identity: &ProcessIdentity,
     wait: Duration,
     request_shutdown: F,
 ) -> StopOutcome
 where
-    F: FnOnce(&ProcessIdentity) -> std::io::Result<bool>,
+    F: FnOnce(&ProcessIdentity, Instant) -> std::io::Result<bool>,
 {
     if matches!(process_identity_is_current(identity), Ok(false)) {
         return StopOutcome::NotRunning;
     }
-    match request_shutdown(identity) {
+    let deadline = Instant::now() + wait;
+    match request_shutdown(identity, deadline) {
         Ok(false) => return StopOutcome::NotRunning,
         Ok(true) => {}
         Err(error) => {
@@ -360,7 +506,6 @@ where
             return StopOutcome::SignalFailed(error.to_string());
         }
     }
-    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if matches!(process_identity_is_current(identity), Ok(false)) {
             return StopOutcome::Stopped;
@@ -374,18 +519,21 @@ where
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn cooperative_shutdown_request(
     port: u16,
     token: Option<String>,
     identity: &ProcessIdentity,
+    deadline: Instant,
 ) -> std::io::Result<bool> {
     use std::io::{Read as _, Write as _};
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    process_executable::check_deadline(deadline)?;
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &addr,
+        remaining_budget(deadline).min(Duration::from_secs(2)),
+    )?;
     let body = serde_json::to_vec(identity).map_err(std::io::Error::other)?;
     let authorization = match token {
         Some(token) if token.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) => {
@@ -402,11 +550,36 @@ fn cooperative_shutdown_request(
         body.len(),
         authorization
     );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
+    let mut request = head.into_bytes();
+    request.extend(body);
+    while !request.is_empty() {
+        process_executable::check_deadline(deadline)?;
+        stream.set_write_timeout(Some(remaining_budget(deadline).min(Duration::from_secs(5))))?;
+        let written = stream.write(&request)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "shutdown request write returned zero",
+            ));
+        }
+        request.drain(..written);
+    }
     let mut response = Vec::new();
-    stream.take(16 * 1024).read_to_end(&mut response)?;
+    // Bound both bytes and elapsed time even if a peer trickles a response.
+    while response.len() < 16 * 1024 {
+        process_executable::check_deadline(deadline)?;
+        stream.set_read_timeout(Some(remaining_budget(deadline).min(Duration::from_secs(5))))?;
+        let mut bytes = [0_u8; 1024];
+        let count = stream.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        response.extend_from_slice(&bytes[..count]);
+        if response.contains(&b'\n') {
+            break;
+        }
+    }
+    process_executable::check_deadline(deadline)?;
     let status = response
         .split(|byte| *byte == b'\n')
         .next()
@@ -416,14 +589,17 @@ fn cooperative_shutdown_request(
         .ok_or_else(|| std::io::Error::other("invalid cooperative shutdown HTTP response"))?;
     match status {
         200..=299 => Ok(true),
-        409 | 410 => Ok(false),
+        409 | 410 => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cooperative shutdown endpoint does not own the recorded process incarnation",
+        )),
         _ => Err(std::io::Error::other(format!(
             "cooperative shutdown endpoint returned HTTP {status}"
         ))),
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn stop_worker_identity(
     kin_root: &Path,
     identity: &ProcessIdentity,
@@ -442,7 +618,15 @@ fn stop_worker_identity(
             identity.pid()
         ));
     };
-    let token = std::env::var("KIN_DAEMON_AUTH_TOKEN")
+    let token = worker_auth_token(kin_root);
+    stop_identity_cooperatively(identity, wait, |expected, deadline| {
+        cooperative_shutdown_request(port, token, expected, deadline)
+    })
+}
+
+/// The bearer token a request to this repository's worker carries, if any.
+fn worker_auth_token(kin_root: &Path) -> Option<String> {
+    std::env::var("KIN_DAEMON_AUTH_TOKEN")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -451,13 +635,135 @@ fn stop_worker_identity(
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-        });
-    stop_identity_cooperatively(identity, wait, |expected| {
-        cooperative_shutdown_request(port, token, expected)
-    })
+        })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// How long a `--when-unused` stop waits for a daemon it asked to retire.
+///
+/// A retiring daemon checks every 100 milliseconds and flushes its graph
+/// before it exits, so one that is free to go is gone well inside this. One
+/// still needed after it is left running and named, which is the answer and
+/// not a timeout.
+const RETIRE_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Ask a worker to exit as soon as nothing needs it, and report whether it has.
+///
+/// Never escalates, which is the whole difference from `stop_worker_at`: a
+/// daemon still serving a client, running enrichment or embedding, or holding
+/// a write it has not flushed stays up, says which, and exits by itself once
+/// that ends.
+async fn retire_worker_at(kin_root: &Path, pid: u32, deadline: Instant) -> Result<StopOutcome> {
+    let Some(identity) = attributed_worker_identity(kin_root, pid)? else {
+        return Ok(StopOutcome::NotRunning);
+    };
+    let (recorded_pid, recorded_port) = repo_daemon_recorded_endpoint(kin_root);
+    if recorded_pid != Some(identity.pid()) {
+        return Ok(StopOutcome::SignalFailed(format!(
+            "worker endpoint changed before the retirement request for pid {pid}"
+        )));
+    }
+    let Some(port) = recorded_port else {
+        return Ok(StopOutcome::SignalFailed(format!(
+            "worker pid {pid} has no recorded port to ask it to retire"
+        )));
+    };
+    let blocked_by =
+        match request_worker_retirement(port, worker_auth_token(kin_root), &identity, deadline)
+            .await
+        {
+            Ok(blocked_by) => blocked_by,
+            Err(error) => return Ok(StopOutcome::SignalFailed(error)),
+        };
+    // A daemon that named something it is waiting on is not going to be free
+    // in seconds, so it gets one second to catch a request that was about to
+    // finish; one that named nothing gets the time an exit and a flush take.
+    let window = if blocked_by.is_empty() {
+        RETIRE_EXIT_WAIT
+    } else {
+        Duration::from_secs(1)
+    };
+    let deadline = deadline.min(Instant::now() + window);
+    loop {
+        if matches!(process_identity_is_current(&identity), Ok(false)) {
+            return Ok(StopOutcome::Stopped);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(remaining_budget(deadline).min(Duration::from_millis(50))).await;
+    }
+    Ok(StopOutcome::InUse(if blocked_by.is_empty() {
+        vec!["it has not finished exiting yet".to_string()]
+    } else {
+        blocked_by
+    }))
+}
+
+/// Send `POST /retire` to a worker and return what it said it is waiting on.
+async fn request_worker_retirement(
+    port: u16,
+    token: Option<String>,
+    identity: &ProcessIdentity,
+    deadline: Instant,
+) -> std::result::Result<Vec<String>, String> {
+    let remaining = remaining_budget(deadline);
+    if remaining.is_zero() {
+        return Err("retirement deadline exhausted before a request could be sent".to_string());
+    }
+    // Headers, body and exit observation share the caller's original budget.
+    // In a sweep an exhausted worker must not receive a new per-request wait.
+    let client = reqwest::Client::builder()
+        .timeout(remaining.min(Duration::from_secs(5)))
+        .connect_timeout(remaining.min(Duration::from_secs(2)))
+        .build()
+        .map_err(|error| format!("could not build the retirement request: {error}"))?;
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        let mut request = client
+            .post(format!("http://127.0.0.1:{port}/retire"))
+            .json(identity);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("the retirement request did not reach the daemon: {error}"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(
+                "this daemon predates retirement requests; stop it with `kin daemon stop` instead"
+                    .to_string(),
+            );
+        }
+        if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::GONE {
+            return Err(
+                "the retirement endpoint does not own the recorded process incarnation".to_string(),
+            );
+        }
+        if !status.is_success() {
+            return Err(format!("the retirement endpoint returned HTTP {status}"));
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("the retirement answer was not JSON: {error}"))?;
+        Ok(body
+            .get("blocked_by")
+            .and_then(serde_json::Value::as_array)
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    })
+    .await
+    .map_err(|_| "retirement deadline exhausted before the answer completed".to_string())?
+}
+
+#[cfg(not(unix))]
 fn stop_worker_identity(
     _kin_root: &Path,
     identity: &ProcessIdentity,
@@ -466,7 +772,7 @@ fn stop_worker_identity(
     stop_identity_graceful(identity, wait)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
     let (recorded_pid, recorded_port) = supervisor_recorded_endpoint();
     if recorded_pid != Some(identity.pid()) {
@@ -492,17 +798,17 @@ fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopO
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         });
-    stop_identity_cooperatively(identity, wait, |expected| {
-        cooperative_shutdown_request(port, token, expected)
+    stop_identity_cooperatively(identity, wait, |expected, deadline| {
+        cooperative_shutdown_request(port, token, expected, deadline)
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
     stop_identity_graceful(identity, wait)
 }
 
-fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<ProcessIdentity>> {
+fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<AttributedStopTarget>> {
     let owner = read_endpoint_owner_record(kin_root).with_context(|| {
         format!(
             "worker endpoint {} has no valid process-incarnation owner record",
@@ -518,7 +824,7 @@ fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<Proces
         );
     }
     match process_identity_is_current(owner.identity()) {
-        Ok(true) => Ok(Some(owner.identity().clone())),
+        Ok(true) => Ok(Some(AttributedStopTarget::published(owner))),
         Ok(false) => Ok(None),
         Err(error) => Err(error).with_context(|| {
             format!(
@@ -530,7 +836,7 @@ fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<Proces
     }
 }
 
-fn attributed_supervisor_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
+fn attributed_supervisor_identity(pid: u32) -> Result<Option<AttributedStopTarget>> {
     let owner = read_supervisor_owner_record().with_context(|| {
         format!(
             "supervisor endpoint {} has no valid process-incarnation owner record",
@@ -545,7 +851,7 @@ fn attributed_supervisor_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
         );
     }
     match process_identity_is_current(owner.identity()) {
-        Ok(true) => Ok(Some(owner.identity().clone())),
+        Ok(true) => Ok(Some(AttributedStopTarget::published(owner))),
         Ok(false) => Ok(None),
         Err(error) => Err(error).context("could not verify supervisor process incarnation"),
     }
@@ -592,104 +898,41 @@ fn wait_for_recorded_exit(identity: &ProcessIdentity, window: Duration) -> bool 
     }
 }
 
-/// Deliver one signal to a recorded daemon pid.
-///
-/// `Ok(true)` delivered, `Ok(false)` the process was already gone, `Err` the
-/// signal could not be delivered at all.
-#[cfg(unix)]
-fn signal_recorded_pid(pid: u32, signal: libc::c_int) -> std::io::Result<bool> {
-    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(false)
-    } else {
-        Err(error)
-    }
-}
-
-/// Signal the pid the store recorded, after proving twice that it is safe.
-///
-/// `kin daemon stop` names itself in the error a wedged daemon produces: "`kin
-/// daemon stop` ends a wedged one". On macOS it could not, by construction. The
-/// stop is an authenticated `POST /shutdown` to the daemon's own port
-/// ([`cooperative_shutdown_request`]), so a daemon that has stopped answering
-/// HTTP is exactly the daemon that cannot answer the request meant to end it.
-/// The recorded incident got `stop request failed: connection timed out` and
-/// left a daemon running, holding the repository's singleton, with no supported
-/// way to end it.
-///
-/// The request stays the first move, because a daemon that can answer should
-/// shut itself down and flush. A signal is the second, and two independent
-/// proofs gate it, because a signal is not recoverable:
-///
-/// * the incarnation the endpoint recorded is still the live one, which is what
-///   keeps PID reuse from redirecting this, and
-/// * that process is running a Kin image, read from the OS rather than from the
-///   record that named the pid.
-///
-/// Either proof failing ends the escalation instead of widening it. An
-/// unreadable image is "do not signal", never "not Kin".
-///
-/// `None` means the escalation did not run and the caller keeps its own
-/// outcome.
-///
-/// The two waits are arguments rather than reads of the constants so a test can
-/// drive the whole `SIGTERM` then `SIGKILL` ladder in milliseconds. Production
-/// has exactly one caller and it passes the constants.
+/// Escalate only with the executable evidence recorded at publication (or the
+/// explicit uninstall-only installation proof). A name which happens to look
+/// like Kin is not signal authority. Retain one Linux pidfd across both stages.
 #[cfg(unix)]
 fn escalate_to_recorded_pid(
-    identity: &ProcessIdentity,
+    target: &AttributedStopTarget,
     sigterm_wait: Duration,
     sigkill_wait: Duration,
     steps: &mut Vec<String>,
 ) -> Option<StopOutcome> {
-    let pid = identity.pid();
-    match process_identity_is_current(identity) {
-        Ok(false) => {
-            steps.push(format!(
-                "pid {pid} no longer names the recorded daemon; nothing to signal"
-            ));
-            return Some(StopOutcome::NotRunning);
-        }
+    let pid = target.pid();
+    // Executable observation consumes this stage's existing budget, rather
+    // than adding an unbounded read/hash before either wait. Preserve the full
+    // TERM grace after delivery; observation reduces the final KILL wait.
+    let deadline = Instant::now() + sigterm_wait.saturating_add(sigkill_wait);
+    let signal_target = match UnixSignalTarget::open(target) {
+        Ok(Some(target)) => target,
+        Ok(None) => return Some(StopOutcome::NotRunning),
         Err(error) => {
-            steps.push(format!(
-                "did not signal pid {pid}: its process incarnation could not be verified ({error})"
-            ));
+            steps.push(format!("did not signal pid {pid}: {error}"));
             return None;
         }
-        Ok(true) => {}
-    }
-
-    match process_runs_a_kin_image(pid) {
-        Some(true) => {}
-        Some(false) => {
-            steps.push(format!(
-                "did not signal pid {pid}: it is not running a Kin image"
-            ));
-            return None;
-        }
-        None => {
-            steps.push(format!(
-                "did not signal pid {pid}: its executable could not be read"
-            ));
-            return None;
-        }
-    }
-
-    match signal_recorded_pid(pid, libc::SIGTERM) {
+    };
+    let term_deadline = deadline.checked_sub(sigterm_wait).unwrap_or(deadline);
+    match signal_target.send(libc::SIGTERM, term_deadline) {
         Ok(true) => steps.push(format!("sent SIGTERM to the recorded daemon pid {pid}")),
-        Ok(false) => {
-            steps.push(format!("pid {pid} was already gone"));
-            return Some(StopOutcome::NotRunning);
-        }
+        Ok(false) => return Some(StopOutcome::NotRunning),
         Err(error) => {
-            steps.push(format!("SIGTERM to pid {pid} failed: {error}"));
+            steps.push(format!(
+                "did not signal pid {pid}: SIGTERM refused ({error})"
+            ));
             return None;
         }
     }
-    if wait_for_recorded_exit(identity, sigterm_wait) {
+    if wait_for_recorded_exit(target, sigterm_wait) {
         steps.push(format!("pid {pid} exited after SIGTERM"));
         return Some(StopOutcome::Stopped);
     }
@@ -697,42 +940,21 @@ fn escalate_to_recorded_pid(
         "pid {pid} was still alive {:.1}s after SIGTERM",
         sigterm_wait.as_secs_f64()
     ));
-
-    // Prove the incarnation again. The SIGTERM wait is long enough for the
-    // daemon to exit and the kernel to hand its number to something else, and
-    // `SIGKILL` is the one signal nothing can decline.
-    match process_identity_is_current(identity) {
-        Ok(false) => {
-            steps.push(format!("pid {pid} no longer names the recorded daemon"));
-            return Some(StopOutcome::Stopped);
-        }
-        Err(error) => {
-            steps.push(format!(
-                "did not send SIGKILL to pid {pid}: its incarnation could not be re-verified ({error})"
-            ));
-            return None;
-        }
-        Ok(true) => {}
-    }
-    match signal_recorded_pid(pid, libc::SIGKILL) {
+    // An exec may preserve PID and birth identity. Re-observe the actual image
+    // as well as the incarnation before the non-cooperative final signal.
+    match signal_target.send(libc::SIGKILL, deadline) {
         Ok(true) => steps.push(format!("sent SIGKILL to the recorded daemon pid {pid}")),
-        Ok(false) => {
-            steps.push(format!("pid {pid} was already gone"));
-            return Some(StopOutcome::Stopped);
-        }
+        Ok(false) => return Some(StopOutcome::Stopped),
         Err(error) => {
-            steps.push(format!("SIGKILL to pid {pid} failed: {error}"));
+            steps.push(format!("did not send SIGKILL to pid {pid}: {error}"));
             return None;
         }
     }
-    if wait_for_recorded_exit(identity, sigkill_wait) {
+    if wait_for_recorded_exit(target, remaining_budget(deadline)) {
         steps.push(format!("pid {pid} exited after SIGKILL"));
         Some(StopOutcome::Stopped)
     } else {
-        steps.push(format!(
-            "pid {pid} survived SIGKILL for {:.1}s",
-            sigkill_wait.as_secs_f64()
-        ));
+        steps.push(format!("pid {pid} survived the remaining SIGKILL wait"));
         Some(StopOutcome::Timeout)
     }
 }
@@ -743,11 +965,13 @@ fn escalate_to_recorded_pid(
 /// Windows has nothing to escalate to: its stop is already `TerminateProcess`
 /// through a pinned handle.
 fn escalate_if_unstopped(
-    identity: &ProcessIdentity,
+    identity: &AttributedStopTarget,
     outcome: StopOutcome,
     steps: &mut Vec<String>,
 ) -> StopOutcome {
-    if outcome.is_success() {
+    // A daemon still in use was asked to retire, not to stop. Signalling it
+    // would take it out from under the client the request just deferred to.
+    if outcome.is_settled() {
         return outcome;
     }
     #[cfg(unix)]
@@ -780,7 +1004,7 @@ fn escalate_if_unstopped(
 
 /// Stop the supervisor and escalate to its recorded pid if the request fails.
 fn stop_supervisor_attributed(
-    identity: &ProcessIdentity,
+    identity: &AttributedStopTarget,
     wait: Duration,
     steps: &mut Vec<String>,
 ) -> StopOutcome {
@@ -795,6 +1019,7 @@ fn stop_worker_at(
     legacy_install_root: Option<&Path>,
     steps: &mut Vec<String>,
 ) -> Result<StopOutcome> {
+    let deadline = Instant::now() + wait;
     let identity = match attributed_worker_identity(kin_root, pid) {
         Ok(identity) => identity,
         Err(error)
@@ -808,6 +1033,7 @@ fn stop_worker_at(
                 legacy_install_root.context("legacy install root disappeared")?,
                 pid,
                 Some(kin_root.parent().unwrap_or(kin_root)),
+                deadline.min(Instant::now() + Duration::from_secs(5)),
             )
             .with_context(|| format!("legacy worker attribution failed after: {error:#}"))?
         }
@@ -815,6 +1041,8 @@ fn stop_worker_at(
     };
     Ok(match identity {
         Some(identity) => {
+            #[cfg(unix)]
+            let wait = remaining_budget(deadline);
             let outcome = stop_worker_identity(kin_root, &identity, wait);
             escalate_if_unstopped(&identity, outcome, steps)
         }
@@ -825,7 +1053,8 @@ fn stop_worker_at(
 fn supervisor_identity_for_stop(
     pid: u32,
     legacy_install_root: Option<&Path>,
-) -> Result<Option<ProcessIdentity>> {
+    deadline: Instant,
+) -> Result<Option<AttributedStopTarget>> {
     match attributed_supervisor_identity(pid) {
         Ok(identity) => Ok(identity),
         Err(error)
@@ -839,6 +1068,7 @@ fn supervisor_identity_for_stop(
                 legacy_install_root.context("legacy install root disappeared")?,
                 pid,
                 None,
+                deadline.min(Instant::now() + Duration::from_secs(5)),
             )
             .with_context(|| format!("legacy supervisor attribution failed after: {error:#}"))
         }
@@ -852,12 +1082,14 @@ fn stop_supervisor_pid(
     legacy_install_root: Option<&Path>,
     steps: &mut Vec<String>,
 ) -> Result<StopOutcome> {
-    Ok(
-        match supervisor_identity_for_stop(pid, legacy_install_root)? {
-            Some(identity) => stop_supervisor_attributed(&identity, wait, steps),
-            None => StopOutcome::NotRunning,
-        },
-    )
+    let deadline = Instant::now() + wait;
+    let identity = supervisor_identity_for_stop(pid, legacy_install_root, deadline)?;
+    #[cfg(unix)]
+    let wait = remaining_budget(deadline);
+    Ok(match identity {
+        Some(identity) => stop_supervisor_attributed(&identity, wait, steps),
+        None => StopOutcome::NotRunning,
+    })
 }
 
 /// The supervisor URL if a live supervisor is recorded, without ever spawning
@@ -865,7 +1097,7 @@ fn stop_supervisor_pid(
 fn supervisor_url_if_running() -> Option<String> {
     let (pid, port) = supervisor_recorded_endpoint();
     let (pid, port) = (pid?, port?);
-    if is_process_alive(pid) && is_port_open(port) {
+    if is_process_alive(pid) && connect_loopback_port(port).is_open() {
         Some(format!("http://127.0.0.1:{port}"))
     } else {
         None
@@ -1056,7 +1288,7 @@ pub async fn status(json: bool) -> Result<()> {
         if current.state.is_wedged() {
             println!(
                 "  note: the process is alive and still holds its socket but is not serving; \
-                 `kin daemon stop` ends it and clears the endpoint"
+                 `kin daemon stop` attempts shutdown and reports whether the recorded process could be stopped"
             );
         }
     }
@@ -1176,19 +1408,46 @@ impl StopScope {
     }
 }
 
+/// How a stop treats a daemon something still needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopMode {
+    /// Stop it now, draining and flushing on the way out. What `kin daemon
+    /// stop` has always done.
+    Now,
+    /// Ask it to exit as soon as nothing needs it, and leave it running, named,
+    /// while an attached client, a request in flight, a pending write, or
+    /// running enrichment or embedding still does. Never escalates to a signal.
+    WhenUnused,
+}
+
+impl StopMode {
+    fn keeps_supervisor_for(self, outcome: &StopOutcome) -> bool {
+        match self {
+            Self::WhenUnused => !outcome.is_success(),
+            Self::Now => matches!(outcome, StopOutcome::InUse(_)),
+        }
+    }
+}
+
 /// `kin daemon stop` — gracefully stop the current repo's worker daemon, or with
 /// `--all` every worker under this managed home plus the supervisor (supervisor
-/// last). `--machine` widens the sweep to the whole box.
-pub async fn stop(all: bool, machine: bool, json: bool) -> Result<()> {
+/// last). `--machine` widens the sweep to the whole box. `--when-unused` stops
+/// only what nothing needs and names the rest.
+pub async fn stop(all: bool, machine: bool, when_unused: bool, json: bool) -> Result<()> {
+    let mode = if when_unused {
+        StopMode::WhenUnused
+    } else {
+        StopMode::Now
+    };
     if all {
         let scope = if machine {
             StopScope::Machine
         } else {
             StopScope::Home
         };
-        stop_all(scope, json, false).await
+        stop_all(scope, json, false, mode).await
     } else {
-        stop_current_repo(json, false, None).await
+        stop_current_repo(json, false, None, mode).await
     }
 }
 
@@ -1315,8 +1574,10 @@ async fn wait_for_sweep(
                 // `kin init` tells a reader to run next, so the two surfaces
                 // disagreeing is the defect arriving at its own remedy.
                 let skipped = super::init::skipped_languages_from_status(&status);
-                let (line, _) =
-                    super::init::cross_file_enrichment_outcome(done, total, blocked, &skipped);
+                let owed = super::init::owed_from_status(&status);
+                let (line, _) = super::init::cross_file_enrichment_outcome(
+                    done, total, blocked, &skipped, &owed,
+                );
                 // The leading indent belongs to the note block `kin init` prints
                 // this under. Continuation lines keep their own.
                 println!("{}", line.trim_start());
@@ -1413,7 +1674,7 @@ pub(crate) async fn stop_all_quiet() -> Result<()> {
     // Machine scope on purpose: uninstall removes the binaries every daemon on
     // this box is running from, so leaving another home's daemon alive would
     // strand a live process on a deleted install.
-    stop_all(StopScope::Machine, true, true).await
+    stop_all(StopScope::Machine, true, true, StopMode::Now).await
 }
 
 /// Startup authority retained by full uninstall until the install root is
@@ -1490,7 +1751,14 @@ pub(crate) async fn stop_all_for_uninstall(install_root: &Path) -> Result<Uninst
             }
         }
     };
-    stop_all_inner(StopScope::Machine, false, true, Some(install_root)).await?;
+    stop_all_inner(
+        StopScope::Machine,
+        false,
+        true,
+        Some(install_root),
+        StopMode::Now,
+    )
+    .await?;
     let fence = UninstallDaemonFence {
         _startup_authority: startup_authority,
     };
@@ -1538,7 +1806,9 @@ fn retire_worker_endpoint(
             let _ = remove_stale_daemon_files(kin_root);
             None
         }
-        StopOutcome::Timeout | StopOutcome::SignalFailed(_) => return None,
+        // Still running, whether it refused or is still in use: its endpoint
+        // is still the truth, so it stays published.
+        StopOutcome::Timeout | StopOutcome::SignalFailed(_) | StopOutcome::InUse(_) => return None,
     };
     // Only an escalated stop reports this. A healthy one needs no account of
     // itself, and a step line on every stop would bury the one case a reader
@@ -1559,7 +1829,12 @@ fn retire_worker_endpoint(
 /// on stdout there is not chatty output, it corrupts `kin init --json`. Never
 /// widened to a machine-wide stop for that caller, which would take down other
 /// lanes' daemons to tidy up after one conversion.
-async fn stop_current_repo(json: bool, quiet: bool, kin_root: Option<&Path>) -> Result<()> {
+async fn stop_current_repo(
+    json: bool,
+    quiet: bool,
+    kin_root: Option<&Path>,
+    mode: StopMode,
+) -> Result<()> {
     // The repository this stop is about, named by the caller when it has one.
     //
     // Discovering it from the process working directory is right for
@@ -1608,7 +1883,12 @@ async fn stop_current_repo(json: bool, quiet: bool, kin_root: Option<&Path>) -> 
     };
 
     let mut steps = Vec::new();
-    let outcome = stop_worker_at(&kin_root, pid, stop_timeout(), None, &mut steps)?;
+    let outcome = match mode {
+        StopMode::Now => stop_worker_at(&kin_root, pid, stop_timeout(), None, &mut steps)?,
+        StopMode::WhenUnused => {
+            retire_worker_at(&kin_root, pid, Instant::now() + stop_timeout()).await?
+        }
+    };
     let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome, &mut steps);
     let report = vec![StopReport {
         kind: "repo-daemon",
@@ -1626,7 +1906,7 @@ async fn stop_current_repo(json: bool, quiet: bool, kin_root: Option<&Path>) -> 
 
 /// Stop this repository's worker daemon without writing a report to stdout.
 pub(crate) async fn stop_current_repo_quiet(kin_root: &Path) -> Result<()> {
-    stop_current_repo(false, true, Some(kin_root)).await
+    stop_current_repo(false, true, Some(kin_root), StopMode::Now).await
 }
 
 /// Resolve the pid of the current repo's worker daemon, the way the daemon
@@ -1655,8 +1935,8 @@ async fn resolve_repo_worker_pid(kin_root: &Path, working_dir: &Path) -> Result<
         .map(|d| d.pid))
 }
 
-async fn stop_all(scope: StopScope, json: bool, quiet: bool) -> Result<()> {
-    stop_all_inner(scope, json, quiet, None).await
+async fn stop_all(scope: StopScope, json: bool, quiet: bool, mode: StopMode) -> Result<()> {
+    stop_all_inner(scope, json, quiet, None, mode).await
 }
 
 /// Whether the current-repo fallback may stop `pid`. The fallback exists for a
@@ -1677,6 +1957,7 @@ async fn stop_all_inner(
     json: bool,
     quiet: bool,
     uninstall_root: Option<&Path>,
+    mode: StopMode,
 ) -> Result<()> {
     // One budget for the whole sweep. Each identity below waits only for what
     // is left of it, so this command's bound is the budget rather than the
@@ -1700,11 +1981,12 @@ async fn stop_all_inner(
     if let Some(pid) = sup_pid {
         if !is_process_alive(pid) {
             remove_stale_supervisor_files();
-        } else if let Some(identity) = supervisor_identity_for_stop(pid, uninstall_root)? {
+        } else if let Some(identity) = supervisor_identity_for_stop(pid, uninstall_root, deadline)?
+        {
             let port = require_supervisor_port_for_stop(
                 pid,
                 sup_port,
-                sup_port.is_some_and(is_port_open),
+                sup_port.is_some_and(|port| connect_loopback_port(port).is_open()),
             )?;
             let url = format!("http://127.0.0.1:{port}");
             daemons = fetch_registered_daemons(&url).await.with_context(|| {
@@ -1765,13 +2047,18 @@ async fn stop_all_inner(
         let label = daemon_label(&daemon);
         let kin_root = Path::new(&daemon.repo_root).join(".kin");
         let mut steps = Vec::new();
-        let outcome = stop_worker_at(
-            &kin_root,
-            daemon.pid,
-            remaining_budget(worker_deadline),
-            uninstall_root,
-            &mut steps,
-        )?;
+        let outcome = match mode {
+            StopMode::Now => stop_worker_at(
+                &kin_root,
+                daemon.pid,
+                remaining_budget(worker_deadline),
+                uninstall_root,
+                &mut steps,
+            )?,
+            StopMode::WhenUnused => {
+                retire_worker_at(&kin_root, daemon.pid, worker_deadline).await?
+            }
+        };
         let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome, &mut steps);
         reports.push(StopReport {
             kind: "repo-daemon",
@@ -1801,13 +2088,18 @@ async fn stop_all_inner(
                 if may_stop && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
                     let mut steps = Vec::new();
-                    let outcome = stop_worker_at(
-                        &kin_root,
-                        pid,
-                        remaining_budget(worker_deadline),
-                        uninstall_root,
-                        &mut steps,
-                    )?;
+                    let outcome = match mode {
+                        StopMode::Now => stop_worker_at(
+                            &kin_root,
+                            pid,
+                            remaining_budget(worker_deadline),
+                            uninstall_root,
+                            &mut steps,
+                        )?,
+                        StopMode::WhenUnused => {
+                            retire_worker_at(&kin_root, pid, worker_deadline).await?
+                        }
+                    };
                     let preserved_endpoint =
                         retire_worker_endpoint(&kin_root, &outcome, &mut steps);
                     reports.push(StopReport {
@@ -1828,10 +2120,16 @@ async fn stop_all_inner(
     // same boundary violation as stopping them outright. A home-scoped sweep
     // that left anything behind therefore retains it and says so.
     let supervisor_retained = scope == StopScope::Home && !foreign.is_empty();
+    // Retirement may leave a worker in use or fail before its state is known.
+    // Neither authorizes taking away its routing. Ordinary explicit stop keeps
+    // its existing behavior, including supervisor escalation.
+    let supervisor_kept_for_workers = reports
+        .iter()
+        .any(|report| mode.keeps_supervisor_for(&report.outcome));
 
     // The ordinary `kin daemon stop --all` path keeps the historical order:
     // workers first, supervisor last. Full uninstall already stopped it above.
-    if uninstall_root.is_none() && !supervisor_retained {
+    if uninstall_root.is_none() && !supervisor_retained && !supervisor_kept_for_workers {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
             let mut steps = Vec::new();
             let outcome =
@@ -1858,6 +2156,7 @@ async fn stop_all_inner(
         scope: Some(scope),
         foreign,
         supervisor_retained,
+        supervisor_kept_for_workers,
     };
 
     if reports.is_empty() {
@@ -1896,6 +2195,9 @@ pub(crate) struct StopDisclosure {
     /// The supervisor was deliberately left running because other homes still
     /// depend on it.
     supervisor_retained: bool,
+    /// The supervisor was left running because retirement did not establish
+    /// that every repository daemon had stopped.
+    supervisor_kept_for_workers: bool,
 }
 
 impl StopDisclosure {
@@ -1920,13 +2222,20 @@ impl StopDisclosure {
             StopScope::Machine => "stopped_other_homes",
         };
         payload[key] = serde_json::Value::Array(listed);
-        payload["supervisor_retained"] = serde_json::Value::Bool(self.supervisor_retained);
+        payload["supervisor_retained"] =
+            serde_json::Value::Bool(self.supervisor_retained || self.supervisor_kept_for_workers);
     }
 
     fn write_text(&self) {
         let Some(scope) = self.scope else {
             return;
         };
+        if self.supervisor_kept_for_workers {
+            println!(
+                "  Supervisor left running: a repository daemon above was not confirmed stopped. \
+                 Its routing is retained."
+            );
+        }
         if self.foreign.is_empty() {
             return;
         }
@@ -2072,7 +2381,8 @@ fn legacy_managed_identity(
     install_root: &Path,
     pid: u32,
     expected_repo: Option<&Path>,
-) -> Result<Option<ProcessIdentity>> {
+    deadline: Instant,
+) -> Result<Option<AttributedStopTarget>> {
     // Capture the incarnation before inspecting its executable/arguments. The
     // old order scanned one process and then captured whatever later reused
     // its PID, accidentally lending the predecessor's provenance to a
@@ -2082,6 +2392,10 @@ fn legacy_managed_identity(
     else {
         return Ok(None);
     };
+    #[cfg(unix)]
+    let image_before = process_executable::observe(pid, deadline)?;
+    #[cfg(not(unix))]
+    let _ = deadline;
     let expected_repo = expected_repo.map(canonical);
     let matched = managed_daemon_processes(install_root)
         .into_iter()
@@ -2102,10 +2416,134 @@ fn legacy_managed_identity(
             "legacy daemon pid {pid} is not an exact install-owned process with the expected role; refusing to signal it"
         );
     }
+    #[cfg(unix)]
+    let selected_install_image = {
+        let image_after = process_executable::observe(pid, deadline)?;
+        anyhow::ensure!(
+            image_before == image_after,
+            "legacy daemon pid {pid} changed executable during install attribution"
+        );
+        Some(image_after)
+    };
     if process_identity_is_current(&identity)? {
-        Ok(Some(identity))
+        Ok(Some(AttributedStopTarget {
+            owner: EndpointOwnerRecord::for_identity(identity),
+            #[cfg(unix)]
+            selected_install_image,
+        }))
     } else {
         Ok(None)
+    }
+}
+
+/// Stop only processes whose current executable belongs to the install being
+/// replaced. The updater holds install authority across this call and commit,
+/// so a cooperating launcher cannot start a new owned image in that interval.
+/// A shared supervisor or worker running from another install is untouched.
+pub(crate) fn stop_install_owned_daemons_for_update(install_root: &Path) -> Result<()> {
+    let deadline = Instant::now() + stop_all_budget();
+    let mut reports = Vec::new();
+    let mut processes = managed_daemon_processes(install_root);
+    // Keep routing available while owned workers drain; the supervisor exits
+    // only after those workers. Foreign workers are never in this selection.
+    processes.sort_by_key(|process| matches!(process.kind, ManagedDaemonKind::Supervisor));
+    for process in processes {
+        let expected_repo = match &process.kind {
+            ManagedDaemonKind::Worker { repo_root } => Some(repo_root.as_path()),
+            ManagedDaemonKind::Supervisor => None,
+            ManagedDaemonKind::Unknown => bail!(
+                "update found install-owned daemon pid {} without an attributable role",
+                process.pid
+            ),
+        };
+        let Some(target) =
+            install_owned_stop_target(install_root, process.pid, expected_repo, deadline)?
+        else {
+            continue;
+        };
+        let mut steps = Vec::new();
+        let (kind, label, outcome, preserved_endpoint) = match &process.kind {
+            ManagedDaemonKind::Worker { repo_root } => {
+                let kin_root = repo_root.join(".kin");
+                let outcome = stop_worker_identity(&kin_root, &target, remaining_budget(deadline));
+                let outcome = escalate_if_unstopped(&target, outcome, &mut steps);
+                let preserved = retire_worker_endpoint(&kin_root, &outcome, &mut steps);
+                ("repo-daemon", repo_label(repo_root), outcome, preserved)
+            }
+            ManagedDaemonKind::Supervisor => (
+                "supervisor",
+                "supervisor".to_string(),
+                stop_supervisor_attributed(&target, remaining_budget(deadline), &mut steps),
+                None,
+            ),
+            ManagedDaemonKind::Unknown => unreachable!(),
+        };
+        reports.push(StopReport {
+            kind,
+            label,
+            pid: process.pid,
+            outcome,
+            preserved_endpoint,
+            steps,
+        });
+    }
+    finish_stop_with_output("install", &reports, true, true, &StopDisclosure::default())?;
+    let remaining = managed_daemon_processes(install_root);
+    anyhow::ensure!(
+        remaining.is_empty(),
+        "install-owned daemons remain after update shutdown: {}",
+        remaining
+            .iter()
+            .map(ManagedDaemonProcess::description)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+/// Installation ownership is additional evidence, never a replacement for a
+/// present endpoint's published incarnation/image proof. Re-observe around the
+/// install scan so PID reuse or exec cannot borrow its predecessor's scope.
+fn install_owned_stop_target(
+    install_root: &Path,
+    pid: u32,
+    repo_root: Option<&Path>,
+    deadline: Instant,
+) -> Result<Option<AttributedStopTarget>> {
+    let Some(owned) = legacy_managed_identity(install_root, pid, repo_root, deadline)? else {
+        return Ok(None);
+    };
+    let (published, owner_path) = match repo_root {
+        Some(root) => {
+            let kin_root = root.join(".kin");
+            (
+                attributed_worker_identity(&kin_root, pid),
+                repo_daemon_owner_path(&kin_root),
+            )
+        }
+        None => (attributed_supervisor_identity(pid), supervisor_owner_path()),
+    };
+    match published {
+        Ok(Some(published)) => {
+            anyhow::ensure!(
+                *published == *owned,
+                "daemon incarnation changed during install attribution"
+            );
+            #[cfg(unix)]
+            anyhow::ensure!(
+                published.expected_image()? == owned.expected_image()?,
+                "published daemon executable differs from the install-owned image"
+            );
+            Ok(Some(published))
+        }
+        Ok(None) => Ok(None),
+        Err(_)
+            if matches!(std::fs::symlink_metadata(owner_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(Some(owned))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -2243,6 +2681,9 @@ fn finish_stop_with_output(
                         "reason": preserved.reason(),
                     });
                 }
+                if let StopOutcome::InUse(reasons) = &r.outcome {
+                    entry["in_use"] = serde_json::json!(reasons);
+                }
                 entry
             })
             .collect();
@@ -2271,6 +2712,13 @@ fn finish_stop_with_output(
                 StopOutcome::SignalFailed(err) => {
                     format!("{} (pid {}): stop request failed: {}", r.label, r.pid, err)
                 }
+                StopOutcome::InUse(reasons) => format!(
+                    "{} (pid {}): left running because it is still in use ({}). It exits on \
+                     its own as soon as that ends.",
+                    r.label,
+                    r.pid,
+                    reasons.join("; ")
+                ),
             };
             println!("  {line}");
             for step in &r.steps {
@@ -2293,12 +2741,15 @@ fn finish_stop_with_output(
         }
     }
 
-    if !all_stopped {
-        let failed: Vec<String> = reports
-            .iter()
-            .filter(|r| !r.outcome.is_success())
-            .map(|r| format!("{} (pid {})", r.label, r.pid))
-            .collect();
+    // A daemon left running because it is still in use is what a
+    // `--when-unused` stop promised, so only an outcome the stop was not
+    // entitled to fails the command.
+    let failed: Vec<String> = reports
+        .iter()
+        .filter(|r| !r.outcome.is_settled())
+        .map(|r| format!("{} (pid {})", r.label, r.pid))
+        .collect();
+    if !failed.is_empty() {
         bail!(
             "one or more Kin daemons did not stop: {}",
             failed.join(", ")
@@ -2692,7 +3143,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(unix))]
     fn stop_identity_graceful_reports_not_running_for_dead_incarnation() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -2705,12 +3156,12 @@ mod tests {
         assert_eq!(outcome, StopOutcome::NotRunning);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn cooperative_incarnation_mismatch_never_authorizes_shutdown() {
         let identity = process_identity(std::process::id()).unwrap().unwrap();
         let delivered = std::cell::Cell::new(false);
-        let outcome = stop_identity_cooperatively(&identity, Duration::from_millis(10), |_| {
+        let outcome = stop_identity_cooperatively(&identity, Duration::from_millis(10), |_, _| {
             delivered.set(true);
             Ok(false)
         });
@@ -2766,8 +3217,7 @@ mod tests {
             .expect("a running stand-in daemon has an identity");
 
         let wait = Duration::from_secs(10);
-        #[cfg(target_os = "macos")]
-        let outcome = stop_identity_cooperatively(&identity, wait, |expected| {
+        let outcome = stop_identity_cooperatively(&identity, wait, |expected, _| {
             // Model the cooperative `/shutdown` endpoint accepting the request:
             // on macOS the daemon is asked over HTTP rather than signalled.
             let killed = unsafe { libc::kill(expected.pid() as libc::pid_t, libc::SIGTERM) };
@@ -2777,8 +3227,6 @@ mod tests {
             );
             Ok(true)
         });
-        #[cfg(not(target_os = "macos"))]
-        let outcome = stop_identity_graceful(&identity, wait);
 
         // Nothing waited on the child before the outcome above was decided,
         // which is the condition under test. Reap afterwards so the corpse does
@@ -2793,210 +3241,754 @@ mod tests {
         reaped.expect("reap the stand-in daemon");
     }
 
-    /// Env var that turns this test binary into the stand-in daemon the
-    /// escalation tests signal.
-    ///
-    /// It has to be THIS binary. The escalation refuses to signal a pid whose
-    /// executable is not a Kin image, and the test harness is
-    /// `target/debug/deps/kin_cli-<hash>`, which is one. A `sleep` child is the
-    /// control in the refusal test below, not the subject here.
     #[cfg(unix)]
     const ESCALATION_STANDIN: &str = "KIN_TEST_ESCALATION_STANDIN";
 
-    /// The child half of the escalation tests. Does nothing until signalled.
-    ///
-    /// `ignore-sigterm` models the case the escalation exists to end: a process
-    /// that takes the polite signal and keeps running.
+    // These fixtures execute the debug test binary, which Linux hashes in full.
+    // Grade identity and signal ordering with a fixture budget, independently of
+    // the production daemon's lifecycle ceiling and concurrent CI disk pressure.
+    #[cfg(unix)]
+    const STANDIN_IMAGE_BUDGET: Duration = Duration::from_secs(60);
+
+    #[cfg(unix)]
+    const STANDIN_READY_BUDGET: Duration = Duration::from_secs(90);
+
+    #[cfg(unix)]
+    static STANDIN_TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(unix)]
+    extern "C" fn standin_term_handler(_: libc::c_int) {
+        STANDIN_TERM.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The owned child publishes its own OS identity after installing its
+    /// signal disposition. The pipe acknowledges that exact point, avoiding
+    /// the parent observing a pre-exec test harness or guessing at readiness.
     #[cfg(unix)]
     #[test]
     fn escalation_standin_daemon_worker() {
-        let Some(mode) = std::env::var_os(ESCALATION_STANDIN) else {
+        use std::io::{Read, Write};
+        use std::os::unix::process::CommandExt;
+        let Ok(raw) = std::env::var(ESCALATION_STANDIN) else {
             return;
         };
+        let spec: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mode = spec["mode"].as_str().unwrap();
+        unsafe {
+            libc::alarm(180);
+        }
         if mode == "ignore-sigterm" {
             unsafe {
                 libc::signal(libc::SIGTERM, libc::SIG_IGN);
             }
+        } else if mode == "exec-on-term" {
+            unsafe {
+                libc::signal(
+                    libc::SIGTERM,
+                    standin_term_handler as *const () as libc::sighandler_t,
+                );
+            }
         }
-        std::thread::sleep(Duration::from_secs(30));
+        if mode == "foreign" {
+            println!("KIN_EXEC_READY");
+        } else {
+            let started = Instant::now();
+            let owner = EndpointOwnerRecord::current_with_deadline(started + STANDIN_IMAGE_BUDGET)
+                .expect("the stand-in must observe its process incarnation");
+            owner.executable_identity().unwrap_or_else(|error| {
+                let image_bytes = std::env::current_exe()
+                    .and_then(std::fs::metadata)
+                    .map(|metadata| metadata.len());
+                panic!(
+                    "self-publication contains no executable evidence: {error}; \
+                     elapsed={:?}, budget={STANDIN_IMAGE_BUDGET:?}, image_bytes={image_bytes:?}",
+                    started.elapsed()
+                );
+            });
+            println!("KIN_OWNER:{}", serde_json::to_string(&owner).unwrap());
+        }
+        std::io::stdout().flush().unwrap();
+        if mode == "exec-on-term" {
+            while !STANDIN_TERM.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            let mut byte = [0];
+            if std::io::stdin().read(&mut byte).unwrap_or(0) == 0 {
+                return;
+            }
+        }
+        if matches!(mode, "exec-on-command" | "exec-on-term") {
+            let error = std::process::Command::new(spec["exec_path"].as_str().unwrap())
+                .args([
+                    "--exact",
+                    "commands::daemon::tests::escalation_standin_daemon_worker",
+                    "--nocapture",
+                ])
+                .env(ESCALATION_STANDIN, r#"{"mode":"foreign"}"#)
+                .exec();
+            panic!("owned stand-in exec failed: {error}");
+        }
     }
 
     #[cfg(unix)]
-    fn spawn_escalation_standin(mode: &str) -> std::process::Child {
-        std::process::Command::new(
-            std::env::current_exe().expect("read this test binary's own path"),
-        )
-        .arg("--exact")
-        .arg("commands::daemon::tests::escalation_standin_daemon_worker")
-        .env(ESCALATION_STANDIN, mode)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn the stand-in daemon")
+    struct OwnedTestChild(std::process::Child);
+
+    #[cfg(unix)]
+    impl std::ops::Deref for OwnedTestChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
     }
 
-    /// The defect KIN-4 recorded: a stop whose request cannot reach the daemon
-    /// has to end it anyway.
-    ///
-    /// On macOS the stop is an authenticated `POST /shutdown` to the daemon's
-    /// own port, so a daemon that has stopped answering HTTP is exactly the one
-    /// that cannot answer the request meant to end it. The recorded incident
-    /// got `stop request failed: connection timed out`, `kin daemon stop`
-    /// reported failure, and the daemon kept running and kept the repository's
-    /// singleton. The error message it printed named `kin daemon stop` as the
-    /// remedy for a wedged daemon.
-    ///
-    /// Falsify by deleting the `escalate_to_recorded_pid` call in
-    /// `escalate_if_unstopped`: the outcome comes back `SignalFailed`, the
-    /// stand-in is still alive, and both assertions go red.
+    #[cfg(unix)]
+    impl std::ops::DerefMut for OwnedTestChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OwnedTestChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    struct Standin {
+        child: OwnedTestChild,
+        target: AttributedStopTarget,
+        stdout: std::process::ChildStdout,
+        pending: Vec<u8>,
+        executable: PathBuf,
+        stderr: PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl Standin {
+        fn diagnostics(&self) -> String {
+            std::fs::read_to_string(&self.stderr)
+                .unwrap_or_else(|error| format!("could not read child stderr: {error}"))
+        }
+
+        fn event(&mut self, prefix: &str) -> String {
+            use std::io::Read;
+            let deadline = Instant::now() + STANDIN_READY_BUDGET;
+            loop {
+                while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+                    let line: Vec<_> = self.pending.drain(..=end).collect();
+                    let line = String::from_utf8(line).unwrap();
+                    if let Some(value) = line.trim_end().strip_prefix(prefix) {
+                        return value.to_owned();
+                    }
+                }
+                let mut bytes = [0; 4096];
+                match self.stdout.read(&mut bytes) {
+                    Ok(0) => panic!(
+                        "owned child exited before {prefix}: {:?}; stderr: {}",
+                        self.child.try_wait(),
+                        self.diagnostics()
+                    ),
+                    Ok(count) => self.pending.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("owned child receipt failed: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owned child did not acknowledge {prefix} within {STANDIN_READY_BUDGET:?}; stderr: {}",
+                    self.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn command(&mut self) {
+            use std::io::Write;
+            self.child.stdin.as_mut().unwrap().write_all(b"E").unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_escalation_standin(mode: &str) -> Standin {
+        spawn_escalation_standin_at(mode, None)
+    }
+
+    #[cfg(unix)]
+    fn spawn_escalation_standin_at(mode: &str, install: Option<(&Path, &Path)>) -> Standin {
+        use std::os::fd::AsRawFd;
+        let directory = tempfile::tempdir().unwrap();
+        let current = std::env::current_exe().unwrap();
+        let executable = install
+            .map(|(root, _)| root.join("bin/kin-daemon"))
+            .unwrap_or_else(|| directory.path().join("custom-worker"));
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::copy(&current, &executable).unwrap();
+        let next_executable = directory.path().join("kin-foreign-process");
+        if matches!(mode, "exec-on-command" | "exec-on-term") {
+            // Only an image-transition case needs a second, distinct inode.
+            std::fs::copy(&current, &next_executable).unwrap();
+        }
+        let stderr = directory.path().join("stderr.log");
+        let spec = if mode == "exec-same-image" {
+            serde_json::json!({"mode": "exec-on-command", "exec_path": executable})
+        } else {
+            serde_json::json!({"mode": mode, "exec_path": next_executable})
+        };
+        let mut child = OwnedTestChild(
+            std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "commands::daemon::tests::escalation_standin_daemon_worker",
+                    "--nocapture",
+                ])
+                .args(
+                    install
+                        .map(|(_, repo)| {
+                            vec![
+                                "--".to_string(),
+                                "--repo".to_string(),
+                                repo.display().to_string(),
+                            ]
+                        })
+                        .unwrap_or_default(),
+                )
+                .env(ESCALATION_STANDIN, spec.to_string())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.stdout.take().unwrap();
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let placeholder =
+            EndpointOwnerRecord::for_identity(process_identity(child.id()).unwrap().unwrap());
+        let mut standin = Standin {
+            child,
+            target: AttributedStopTarget::published(placeholder),
+            stdout,
+            pending: Vec::new(),
+            executable,
+            stderr,
+            _directory: directory,
+        };
+        let owner = serde_json::from_str(&standin.event("KIN_OWNER:")).unwrap();
+        standin.target = AttributedStopTarget::published(owner);
+        assert_eq!(standin.target.pid(), standin.child.id());
+        assert!(process_identity_is_current(&standin.target).unwrap());
+        standin
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_stop_request_that_never_arrives_still_ends_the_recorded_daemon() {
-        let mut child = spawn_escalation_standin("plain");
-        let identity = process_identity(child.id())
-            .expect("read the stand-in daemon's birth identity")
-            .expect("a running stand-in daemon has an identity");
-
+        let child = spawn_escalation_standin("plain");
+        assert_eq!(child.executable.file_name().unwrap(), "custom-worker");
         let mut steps = Vec::new();
+        // Linux hashes this large debug fixture before each signal. Keep the
+        // production wrapper covered on platforms without that full-file read.
+        #[cfg(target_os = "linux")]
+        let outcome = escalate_to_recorded_pid(
+            &child.target,
+            ESCALATION_SIGTERM_WAIT,
+            STANDIN_IMAGE_BUDGET,
+            &mut steps,
+        )
+        .expect("the published fixture must authorize escalation");
+        #[cfg(not(target_os = "linux"))]
         let outcome = escalate_if_unstopped(
-            &identity,
-            StopOutcome::SignalFailed("connection timed out".to_string()),
+            &child.target,
+            StopOutcome::SignalFailed("connection timed out".to_owned()),
             &mut steps,
         );
-        // Defensive, so a regression fails on the assertion below rather than
-        // blocking for the whole stand-in sleep. A daemon the escalation ended
-        // is already a corpse and this is a no-op on it.
-        let _ = child.kill();
-        let reaped = child.wait();
-
-        assert_eq!(
-            outcome,
-            StopOutcome::Stopped,
-            "a stop the endpoint could not deliver must still end the daemon: {steps:?}"
-        );
+        assert_eq!(outcome, StopOutcome::Stopped, "{steps:?}");
         assert!(
-            steps
-                .iter()
-                .any(|step| step.contains("the stop request did not reach the daemon")),
-            "the report must say why it escalated: {steps:?}"
+            steps.iter().any(|s| s.contains("sent SIGTERM")),
+            "{steps:?}"
         );
-        assert!(
-            steps.iter().any(|step| step.contains("sent SIGTERM")),
-            "the report must name the signal it sent: {steps:?}"
-        );
-        reaped.expect("reap the stand-in daemon");
+        assert!(!process_identity_is_current(&child.target).unwrap());
     }
 
-    /// A daemon that takes SIGTERM and keeps running is ended by SIGKILL, and
-    /// the ladder is reported rung by rung.
-    ///
-    /// The waits are arguments so this runs in under a second. Production
-    /// passes `ESCALATION_SIGTERM_WAIT`, which is the daemon's own force-exit
-    /// bound, so a daemon that is about to exit cleanly is never cut short.
     #[cfg(unix)]
     #[test]
     fn a_daemon_that_ignores_sigterm_is_ended_by_sigkill() {
-        let mut child = spawn_escalation_standin("ignore-sigterm");
-        let identity = process_identity(child.id())
-            .expect("read the stand-in daemon's birth identity")
-            .expect("a running stand-in daemon has an identity");
-        // The child installs its SIGTERM disposition after start-up, so give it
-        // a moment or the first signal lands on the default disposition and
-        // this proves nothing.
-        std::thread::sleep(Duration::from_millis(500));
-
+        let child = spawn_escalation_standin("ignore-sigterm");
         let mut steps = Vec::new();
         let outcome = escalate_to_recorded_pid(
-            &identity,
-            Duration::from_millis(400),
-            Duration::from_secs(5),
+            &child.target,
+            Duration::from_millis(200),
+            STANDIN_IMAGE_BUDGET,
             &mut steps,
         );
-        let _ = child.kill();
-        let reaped = child.wait();
-
-        assert_eq!(
-            outcome,
-            Some(StopOutcome::Stopped),
-            "SIGKILL must end a daemon that ignored SIGTERM: {steps:?}"
-        );
+        assert_eq!(outcome, Some(StopOutcome::Stopped), "{steps:?}");
         assert!(
-            steps.iter().any(|step| step.contains("still alive")),
-            "the report must say SIGTERM did not work: {steps:?}"
+            steps.iter().any(|s| s.contains("sent SIGKILL")),
+            "{steps:?}"
         );
-        assert!(
-            steps.iter().any(|step| step.contains("sent SIGKILL")),
-            "the report must name the signal that did: {steps:?}"
-        );
-        reaped.expect("reap the stand-in daemon");
+        assert!(!process_identity_is_current(&child.target).unwrap());
     }
 
-    /// The guard on the whole escalation: a recorded pid that is not running a
-    /// Kin image is never signalled.
-    ///
-    /// A signal is not recoverable, so the proof that this pid is ours is read
-    /// from the OS rather than from the record that named it. `sleep` is a live
-    /// process with a real incarnation and the wrong executable, which is the
-    /// exact shape of a recorded pid the kernel has since handed to someone
-    /// else.
-    ///
-    /// Falsify by dropping the `process_runs_a_kin_image` check: the outcome
-    /// becomes `Stopped` and the liveness assertion goes red because the
-    /// escalation killed a process that was not a daemon.
     #[cfg(unix)]
     #[test]
     fn the_escalation_never_signals_a_pid_that_is_not_a_kin_process() {
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("exec sleep 30")
-            .spawn()
-            .expect("spawn a non-Kin stand-in");
-        let identity = process_identity(child.id())
-            .expect("read the stand-in's birth identity")
-            .expect("a running stand-in has an identity");
-
+        // The record contains valid self-published evidence; the process then
+        // execs a different owned executable whose basename starts with Kin.
+        let mut child = spawn_escalation_standin("exec-on-command");
+        child.command();
+        child.event("KIN_EXEC_READY");
+        assert!(process_identity_is_current(&child.target).unwrap());
         let mut steps = Vec::new();
-        let outcome = escalate_if_unstopped(
-            &identity,
-            StopOutcome::SignalFailed("connection timed out".to_string()),
+        let original = StopOutcome::SignalFailed("connection timed out".to_owned());
+        #[cfg(target_os = "linux")]
+        let outcome = escalate_to_recorded_pid(
+            &child.target,
+            ESCALATION_SIGTERM_WAIT,
+            STANDIN_IMAGE_BUDGET,
             &mut steps,
-        );
-
-        // Liveness first, while the stand-in is still this test's to observe.
-        let still_alive = process_identity_is_current(&identity);
-        child.kill().expect("clean up the non-Kin stand-in");
-        child.wait().expect("reap the non-Kin stand-in");
-
+        )
+        .unwrap_or_else(|| original.clone());
+        #[cfg(not(target_os = "linux"))]
+        let outcome = escalate_if_unstopped(&child.target, original.clone(), &mut steps);
+        assert_eq!(outcome, original, "{steps:?}");
         assert!(
-            matches!(still_alive, Ok(true)),
-            "a process that is not a Kin daemon must be left alone: {steps:?}"
-        );
-        assert_eq!(
-            outcome,
-            StopOutcome::SignalFailed("connection timed out".to_string()),
-            "the caller's own outcome must survive a refused escalation: {steps:?}"
+            process_identity_is_current(&child.target).unwrap(),
+            "{steps:?}"
         );
         assert!(
-            steps
-                .iter()
-                .any(|step| step.contains("did not signal") && step.contains("Kin image")),
-            "the report must say why it refused: {steps:?}"
+            steps.iter().any(|s| s.contains("published image")),
+            "{steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.contains("sent SIGTERM")),
+            "{steps:?}"
         );
     }
 
-    /// A stop that worked is never escalated, and reports no steps.
+    #[cfg(unix)]
+    #[test]
+    fn exec_after_sigterm_withdraws_sigkill_authority() {
+        let mut child = spawn_escalation_standin("exec-on-term");
+        let signal_target = UnixSignalTarget::open(&child.target).unwrap().unwrap();
+        assert!(signal_target
+            .send(libc::SIGTERM, Instant::now() + STANDIN_IMAGE_BUDGET)
+            .unwrap());
+        // This acknowledgment establishes the image change before the KILL
+        // decision; elapsed time alone cannot prove that the child exec'd.
+        child.event("KIN_EXEC_READY");
+        let error = signal_target
+            .send(libc::SIGKILL, Instant::now() + STANDIN_IMAGE_BUDGET)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(process_identity_is_current(&child.target).unwrap());
+    }
+
+    /// A recorded process that stops inside the window between the incarnation
+    /// probe and the image read.
+    ///
+    /// That window is microseconds wide and a loaded host lands in it: SIGTERM
+    /// delivered, the pid still alive at the grace boundary, and the kernel's
+    /// executing-image reference already gone by the KILL stage, because Linux
+    /// drops it the moment a process stops running. Reading that as a failure
+    /// makes a stop that did end the daemon report no verdict at all, so the
+    /// readers are injected here rather than waiting for the race.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_stops_during_image_observation_reads_as_gone() {
+        let child = spawn_escalation_standin("plain");
+        let signal_target = UnixSignalTarget::open(&child.target).unwrap().unwrap();
+        let mut probes = [true, false].into_iter();
+        let delivered = signal_target
+            .send_with(
+                libc::SIGKILL,
+                Instant::now() + Duration::from_secs(5),
+                |_| Ok(probes.next().expect("the incarnation is probed twice")),
+                |_, _| Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            )
+            .unwrap();
+        assert!(!delivered);
+        // The control: the classification alone answered, so nothing was
+        // signalled and the live standin still holds its recorded incarnation.
+        assert!(process_identity_is_current(&child.target).unwrap());
+    }
+
+    /// The same read failing while the recorded incarnation is still running.
+    ///
+    /// An image this stop cannot read is not an image it may signal, and it is
+    /// not an exit either. Answering `gone` here would report a stop that never
+    /// happened.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_image_on_a_running_incarnation_still_refuses() {
+        let child = spawn_escalation_standin("plain");
+        let signal_target = UnixSignalTarget::open(&child.target).unwrap().unwrap();
+        let error = signal_target
+            .send_with(
+                libc::SIGKILL,
+                Instant::now() + Duration::from_secs(5),
+                |_| Ok(true),
+                |_, _| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+            )
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(process_identity_is_current(&child.target).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exhausted_publication_cannot_gain_signal_authority_from_its_live_process() {
+        let owner = EndpointOwnerRecord::current_with_deadline(Instant::now())
+            .expect("the expired capture retains a real live incarnation");
+        let target = AttributedStopTarget::published(owner);
+        assert!(process_identity_is_current(&target).unwrap());
+        let result = UnixSignalTarget::open(&target);
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "a live process with no published image must not become a signal target"
+        );
+        assert!(process_identity_is_current(&target).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_install_path_keeps_the_published_running_image_authority() {
+        let child = spawn_escalation_standin("plain");
+        std::fs::remove_file(&child.executable).unwrap();
+        std::fs::write(
+            &child.executable,
+            b"a later installation is not the running executable",
+        )
+        .unwrap();
+        let mut steps = Vec::new();
+        let outcome = escalate_to_recorded_pid(
+            &child.target,
+            Duration::from_millis(200),
+            STANDIN_IMAGE_BUDGET,
+            &mut steps,
+        );
+        assert_eq!(outcome, Some(StopOutcome::Stopped), "{steps:?}");
+        assert!(!process_identity_is_current(&child.target).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_owner_can_cooperate_but_cannot_authorize_signals() {
+        let mut child = spawn_escalation_standin("plain");
+        let legacy = AttributedStopTarget::published(EndpointOwnerRecord::for_identity(
+            child.target.owner.identity().clone(),
+        ));
+        let mut steps = Vec::new();
+        assert_eq!(
+            escalate_to_recorded_pid(
+                &legacy,
+                Duration::from_millis(10),
+                Duration::from_secs(1),
+                &mut steps
+            ),
+            None
+        );
+        assert!(process_identity_is_current(&legacy).unwrap());
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("only cooperative shutdown")),
+            "{steps:?}"
+        );
+        let outcome =
+            stop_identity_cooperatively(&legacy, Duration::from_secs(5), |expected, _| {
+                assert_eq!(expected, legacy.owner.identity());
+                // Model the daemon accepting the identity-bound request: its own
+                // read loop exits cooperatively when its controller closes input.
+                drop(child.child.stdin.take());
+                Ok(true)
+            });
+        assert_eq!(outcome, StopOutcome::Stopped);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_execution_version_rejects_exec_of_the_same_image() {
+        let mut child = spawn_escalation_standin("exec-same-image");
+        child.command();
+        child.event("KIN_EXEC_READY");
+        assert!(process_identity_is_current(&child.target).unwrap());
+        let signal_target = UnixSignalTarget::open(&child.target).unwrap().unwrap();
+        let error = signal_target
+            .send(libc::SIGTERM, Instant::now() + Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(process_identity_is_current(&child.target).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_and_unusable_evidence_workers_still_stop_through_the_recorded_socket() {
+        use std::io::{BufRead, Read, Write};
+        for executable in [
+            None,
+            Some(serde_json::json!({"algorithm":"future-v99"})),
+            Some(serde_json::json!(["malformed"])),
+        ] {
+            let mut child = spawn_escalation_standin("plain");
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut owner = serde_json::to_value(EndpointOwnerRecord::for_identity(
+                child.target.owner.identity().clone(),
+            ))
+            .unwrap();
+            if let Some(evidence) = executable {
+                owner["executable"] = evidence;
+            }
+            std::fs::write(
+                repo_daemon_owner_path(root),
+                serde_json::to_vec(&owner).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(repo_daemon_pid_path(root), child.child.id().to_string()).unwrap();
+            std::fs::write(repo_daemon_port_path(root), port.to_string()).unwrap();
+            let input = child.child.stdin.take().unwrap();
+            let expected = child.target.owner.identity().clone();
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("owned fixture accept: {error}"),
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                // The listener polls for the connection, and a BSD accept
+                // hands the accepted socket that flag while a Linux accept
+                // does not. Say what this reader needs rather than inherit an
+                // answer that differs by host: a read timeout does not make a
+                // non-blocking socket wait, so the first read returns
+                // WouldBlock on macOS whenever the request has not landed yet.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut line = String::new();
+                assert!(
+                    reader.read_line(&mut line).unwrap() > 0,
+                    "request ended before its status line"
+                );
+                assert!(line.starts_with("POST /shutdown HTTP/1.1"));
+                let mut length = None;
+                loop {
+                    line.clear();
+                    assert!(
+                        reader.read_line(&mut line).unwrap() > 0,
+                        "request ended before its headers"
+                    );
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("Content-Length: ") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let length = length.unwrap();
+                assert!(length < 4096);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<ProcessIdentity>(&body).unwrap(),
+                    expected
+                );
+                drop(reader);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                drop(input);
+            });
+            let mut steps = Vec::new();
+            let outcome = stop_worker_at(
+                root,
+                child.child.id(),
+                Duration::from_secs(5),
+                None,
+                &mut steps,
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(outcome, StopOutcome::Stopped, "{steps:?}");
+            assert!(!steps.iter().any(|s| s.contains("sent SIG")), "{steps:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_signal_budget_leaves_the_owned_process_alive() {
+        let child = spawn_escalation_standin("plain");
+        let signal_target = UnixSignalTarget::open(&child.target).unwrap().unwrap();
+        let error = signal_target
+            .send(libc::SIGTERM, Instant::now())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(process_identity_is_current(&child.target).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_target_keeps_its_pidfd_after_the_owned_child_exits() {
+        use std::os::fd::AsRawFd;
+        let mut child = spawn_escalation_standin("plain");
+        let target = UnixSignalTarget::open(&child.target).unwrap().unwrap();
+        drop(child.child.stdin.take());
+        child.child.wait().unwrap();
+        assert!(unsafe { libc::fcntl(target.pidfd.as_raw_fd(), libc::F_GETFD) } >= 0);
+        assert!(!target
+            .send(libc::SIGTERM, Instant::now() + Duration::from_secs(1))
+            .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfds_for_owned_child(pid: u32) -> Vec<PathBuf> {
+        let wanted = format!("Pid:\t{pid}");
+        std::fs::read_dir("/proc/self/fdinfo")
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let body = std::fs::read_to_string(entry.path()).ok()?;
+                body.lines()
+                    .any(|line| line == wanted)
+                    .then(|| entry.path())
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_post_pin_probe_error_closes_the_owned_pidfd() {
+        let child = spawn_escalation_standin("plain");
+        assert!(pidfds_for_owned_child(child.target.pid()).is_empty());
+        let mut calls = 0;
+        let result = UnixSignalTarget::open_with_probe(&child.target, |_| {
+            calls += 1;
+            if calls == 1 {
+                return Ok(true);
+            }
+            assert_eq!(pidfds_for_owned_child(child.target.pid()).len(), 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected post-pin probe refusal",
+            ))
+        });
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(pidfds_for_owned_child(child.target.pid()).is_empty());
+        assert!(process_identity_is_current(&child.target).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pidfd_open_error_survives_the_followup_identity_probe() {
+        let mut value = serde_json::to_value(
+            EndpointOwnerRecord::current_with_deadline(Instant::now() + STANDIN_IMAGE_BUDGET)
+                .unwrap(),
+        )
+        .unwrap();
+        // This is not a possible positive Linux pid_t and no process is
+        // signalled. The second probe deliberately changes thread-local errno.
+        value["identity"]["pid"] = serde_json::json!(u32::MAX);
+        let target = AttributedStopTarget::published(serde_json::from_value(value).unwrap());
+        let mut calls = 0;
+        let result = UnixSignalTarget::open_with_probe(&target, |_| {
+            calls += 1;
+            if calls == 2 {
+                unsafe {
+                    libc::close(-1);
+                }
+            }
+            Ok(true)
+        });
+        assert_eq!(calls, 2);
+        assert!(matches!(result, Err(ref error) if error.raw_os_error() == Some(libc::EINVAL)));
+    }
+
     #[test]
     fn a_successful_stop_is_never_escalated() {
-        let identity = process_identity(std::process::id())
-            .expect("read this process's identity")
-            .expect("this process has an identity");
+        let target = AttributedStopTarget::published(EndpointOwnerRecord::for_identity(
+            process_identity(std::process::id()).unwrap().unwrap(),
+        ));
         for outcome in [StopOutcome::Stopped, StopOutcome::NotRunning] {
             let mut steps = Vec::new();
-            let after = escalate_if_unstopped(&identity, outcome.clone(), &mut steps);
-            assert_eq!(after, outcome);
-            assert!(steps.is_empty(), "{steps:?}");
+            assert_eq!(
+                escalate_if_unstopped(&target, outcome.clone(), &mut steps),
+                outcome
+            );
+            assert!(steps.is_empty());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_stop_preserves_same_named_daemons_from_another_install() {
+        let fixture = tempfile::tempdir().unwrap();
+        let install = fixture.path().join("install");
+        let foreign_install = fixture.path().join("foreign");
+        let repo = fixture.path().join("repo");
+        let foreign_repo = fixture.path().join("foreign-repo");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        std::fs::create_dir_all(foreign_repo.join(".kin")).unwrap();
+        let owned = spawn_escalation_standin_at("wait", Some((&install, &repo)));
+        let mut foreign =
+            spawn_escalation_standin_at("wait", Some((&foreign_install, &foreign_repo)));
+        let kin_root = repo.join(".kin");
+        std::fs::write(
+            repo_daemon_pid_path(&kin_root),
+            owned.child.id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            repo_daemon_owner_path(&kin_root),
+            serde_json::to_vec(&owned.target.owner).unwrap(),
+        )
+        .unwrap();
+        stop_install_owned_daemons_for_update(&install).unwrap();
+        assert!(!process_identity_is_current(&owned.target).unwrap());
+        assert!(
+            foreign.child.try_wait().unwrap().is_none(),
+            "foreign daemon was interrupted"
+        );
+        assert!(process_identity_is_current(&foreign.target).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_stop_cannot_replace_malformed_publication_with_install_ownership() {
+        let fixture = tempfile::tempdir().unwrap();
+        let install = fixture.path().join("install");
+        let repo = fixture.path().join("repo");
+        let kin_root = repo.join(".kin");
+        std::fs::create_dir_all(&kin_root).unwrap();
+        let mut owned = spawn_escalation_standin_at("wait", Some((&install, &repo)));
+        std::fs::write(
+            repo_daemon_pid_path(&kin_root),
+            owned.child.id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(repo_daemon_owner_path(&kin_root), b"not a valid owner").unwrap();
+        assert!(stop_install_owned_daemons_for_update(&install).is_err());
+        assert!(owned.child.try_wait().unwrap().is_none());
+        assert!(process_identity_is_current(&owned.target).unwrap());
     }
 
     #[cfg(windows)]
@@ -3080,35 +4072,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         Ok(())
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn stop_identity_graceful_stops_a_live_process() {
-        // Spawn a real process that sleeps, then prove SIGTERM stops it and the
-        // wait observes the process actually gone.
-        //
-        // A SIGTERM'd *child* becomes a zombie until its parent reaps it, and
-        // `kill(pid, 0)` still succeeds for a zombie — so we reap concurrently in
-        // a background thread. In production this models reality rather than
-        // hiding it: the daemon is never the stopping CLI's child (it is detached
-        // with setsid and reparented to init), so init reaps it and
-        // `is_process_alive` returns false the moment it dies.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep child");
-        let pid = child.id();
-        let identity = process_identity(pid).unwrap().unwrap();
-        assert!(is_process_alive(pid));
-
-        let reaper = std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-        let outcome = stop_identity_graceful(&identity, Duration::from_secs(10));
-        let _ = reaper.join();
-
-        assert_eq!(outcome, StopOutcome::Stopped);
     }
 
     fn registered(label: &str, pid: u32, kin_home: &str) -> RegisteredRepoDaemon {
@@ -3291,6 +4254,7 @@ mod tests {
             scope: Some(StopScope::Home),
             foreign: foreign.clone(),
             supervisor_retained: true,
+            supervisor_kept_for_workers: false,
         };
         let mut payload = serde_json::json!({});
         skipped.write_json(&mut payload);
@@ -3302,10 +4266,151 @@ mod tests {
             scope: Some(StopScope::Machine),
             foreign,
             supervisor_retained: false,
+            supervisor_kept_for_workers: false,
         };
         let mut payload = serde_json::json!({});
         taken.write_json(&mut payload);
         assert_eq!(payload["stopped_other_homes"][0]["pid"], 202);
         assert!(payload.get("skipped_other_homes").is_none());
+    }
+
+    /// A daemon a `--when-unused` stop left running is the answer that stop
+    /// promised: it never escalates to a signal, never fails the command, and
+    /// keeps its supervisor, which the disclosure says.
+    #[test]
+    fn an_in_use_daemon_is_a_settled_outcome_that_keeps_its_supervisor() {
+        let in_use = StopOutcome::InUse(vec!["a client session is attached".to_string()]);
+        assert!(in_use.is_settled());
+        assert!(!in_use.is_success(), "an in-use daemon is still running");
+        assert_eq!(in_use.detail(), "in-use");
+        assert!(!StopOutcome::Timeout.is_settled());
+        assert!(!StopOutcome::SignalFailed("x".to_string()).is_settled());
+
+        let kept = StopDisclosure {
+            scope: Some(StopScope::Home),
+            foreign: Vec::new(),
+            supervisor_retained: false,
+            supervisor_kept_for_workers: true,
+        };
+        let mut payload = serde_json::json!({});
+        kept.write_json(&mut payload);
+        assert_eq!(payload["supervisor_retained"], true);
+    }
+
+    #[tokio::test]
+    async fn retirement_failures_keep_routing_without_changing_explicit_stop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let identity = process_identity(std::process::id()).unwrap().unwrap();
+        for response in [
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 202 Accepted\r\nContent-Length: 1\r\n\r\nx",
+        ] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = [0; 4096];
+                let count = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(request[..count].starts_with(b"POST /retire "));
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let error = request_worker_retirement(
+                port,
+                None,
+                &identity,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a failed retirement must not establish a stopped worker");
+            server.await.unwrap();
+            let outcome = StopOutcome::SignalFailed(error);
+            assert!(StopMode::WhenUnused.keeps_supervisor_for(&outcome));
+            assert!(
+                !outcome.is_settled(),
+                "routing retention must not hide failure"
+            );
+            assert!(
+                !StopMode::Now.keeps_supervisor_for(&outcome),
+                "ordinary explicit stop still reaches the supervisor"
+            );
+
+            let disclosure = StopDisclosure {
+                scope: Some(StopScope::Home),
+                supervisor_kept_for_workers: StopMode::WhenUnused.keeps_supervisor_for(&outcome),
+                ..Default::default()
+            };
+            let mut payload = serde_json::json!({});
+            disclosure.write_json(&mut payload);
+            assert_eq!(payload["supervisor_retained"], true);
+        }
+        for outcome in [StopOutcome::Stopped, StopOutcome::NotRunning] {
+            assert!(!StopMode::WhenUnused.keeps_supervisor_for(&outcome));
+        }
+        assert!(StopMode::WhenUnused.keeps_supervisor_for(&StopOutcome::Timeout));
+        assert!(!StopMode::Now.keeps_supervisor_for(&StopOutcome::Timeout));
+    }
+
+    #[tokio::test]
+    async fn retirement_deadline_covers_body_and_is_not_renewed_for_the_next_worker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let identity = process_identity(std::process::id()).unwrap().unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut request = [0; 4096];
+            let count = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(request[..count].starts_with(b"POST /retire "));
+            // Headers arrive promptly; the declared body never completes.
+            socket
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 100\r\n\r\n{")
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), release_rx).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err(),
+                "an expired sweep must not contact another worker"
+            );
+        });
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            request_worker_retirement(port, None, &identity, deadline),
+        )
+        .await
+        .expect("the response body must obey the original deadline");
+        assert!(first.is_err());
+        let second = request_worker_retirement(port, None, &identity, deadline)
+            .await
+            .unwrap_err();
+        assert!(
+            second.contains("before a request could be sent"),
+            "{second}"
+        );
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
     }
 }

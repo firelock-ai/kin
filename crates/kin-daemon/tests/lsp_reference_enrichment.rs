@@ -36,6 +36,11 @@ use kin_model::{EntityId, GraphNodeId, LanguageId};
 /// can have.
 const INDEX_BUDGET: Duration = Duration::from_secs(60);
 
+/// Set by a runner provisioned for the Go proof, once gopls and the `go` command
+/// it loads packages through are both installed and answer. A runner that sets
+/// it and lacks either fails the proof rather than skipping it.
+const GO_LANGUAGE_SERVER_PROVISIONED: &str = "KIN_CI_GO_LANGUAGE_SERVER_INSTALLED";
+
 /// Resolve the server for `language`, or explain the skip and return `None`.
 fn server_command_or_skip(language: LanguageId, test: &str) -> Option<(String, Vec<String>)> {
     let root = Path::new("/");
@@ -45,48 +50,95 @@ fn server_command_or_skip(language: LanguageId, test: &str) -> Option<(String, V
              ENRICHABLE_LANGUAGES"
         );
     };
-    match which::which(&command) {
-        Ok(path) => {
-            eprintln!(
-                "{test}: using {language} language server at {}",
-                path.display()
-            );
-            Some((command, args))
+    // In CI the skip is not allowed to be quiet. `scripts/ci-install-language-servers.sh`
+    // sets KIN_CI_LANGUAGE_SERVERS_INSTALLED only after proving its binaries are
+    // executable, so if it is set and a binary is still missing, the proof is being
+    // skipped in the one environment built to run it. A skip that nextest swallows (it
+    // captures a passing test's stderr) would read as a 0.02s pass, which is what a real
+    // run never looks like and what nobody would notice.
+    //
+    // The script provisions pyright and typescript-language-server and nothing else, so
+    // only a missing one of those contradicts it. A runner provisioned for Go says so with
+    // its own variable, because the Go proof needs a toolchain the script does not install.
+    let provisioned = match language {
+        LanguageId::Python | LanguageId::TypeScript | LanguageId::JavaScript => {
+            std::env::var_os("KIN_CI_LANGUAGE_SERVERS_INSTALLED")
+                .map(|_| "KIN_CI_LANGUAGE_SERVERS_INSTALLED")
         }
-        Err(_) => {
-            // In CI the skip is not allowed to be quiet. `scripts/ci-install-language-servers.sh`
-            // sets this variable only after proving both binaries are executable, so if it is
-            // set and the binary is still missing, the proof is being skipped in the one
-            // environment built to run it. A skip that nextest swallows (it captures a passing
-            // test's stderr) would read as a 0.02s pass, which is what a real run never looks
-            // like and what nobody would notice.
-            if std::env::var_os("KIN_CI_LANGUAGE_SERVERS_INSTALLED").is_some() {
-                panic!(
-                    "{test}: KIN_CI_LANGUAGE_SERVERS_INSTALLED is set, so this runner was \
-                     provisioned, yet `{command}` is not on PATH. The enrichment proof would \
-                     have skipped silently."
-                );
-            }
-            eprintln!(
-                "SKIP {test}: no `{command}` on PATH, so the {language} enrichment path cannot be \
-                 exercised on this host. Install it with `{}` and re-run.",
-                install_hint(language)
-            );
-            None
+        LanguageId::Go => {
+            std::env::var_os(GO_LANGUAGE_SERVER_PROVISIONED).map(|_| GO_LANGUAGE_SERVER_PROVISIONED)
         }
+        _ => None,
+    };
+    let skip = |why: String| -> Option<(String, Vec<String>)> {
+        if let Some(variable) = provisioned {
+            panic!(
+                "{test}: {variable} is set, so this runner was provisioned for the {language} \
+                 proof, yet {why}. The enrichment proof would have skipped silently."
+            );
+        }
+        eprintln!(
+            "SKIP {test}: {why}, so the {language} enrichment path cannot be exercised on \
+             this host. {}",
+            install_hint(language)
+        );
+        None
+    };
+    let path = match which::which(&command) {
+        Ok(path) => path,
+        Err(_) => return skip(format!("no `{command}` is on PATH")),
+    };
+    if let Err(why) = server_prerequisite(language) {
+        return skip(why);
+    }
+    eprintln!(
+        "{test}: using {language} language server at {}",
+        path.display()
+    );
+    Some((command, args))
+}
+
+/// What a language's server needs beyond its own binary, checked the way the
+/// server will look for it.
+///
+/// gopls loads every workspace through the `go` command. Without one it starts,
+/// answers `initialize`, and then answers every query with nothing: "go command
+/// required, not found" in its own log, and a `null` definition to its client,
+/// which is exactly what a real miss looks like. On runners carrying gopls and
+/// no `go`, the Go proof failed after a minute of polling for an answer that
+/// could never come. So a missing `go` is a missing server, and the proof skips
+/// or fails on that rather than on its own deadline.
+fn server_prerequisite(language: LanguageId) -> Result<(), String> {
+    if language != LanguageId::Go {
+        return Ok(());
+    }
+    match std::process::Command::new("go").arg("version").output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "`go version` exited {}, and gopls loads every package through the `go` command",
+            output.status
+        )),
+        Err(error) => Err(format!(
+            "no working `go` command is on PATH ({error}), and gopls loads every package \
+             through it"
+        )),
     }
 }
 
-/// The command that provisions a language's server, mirrored from
+/// How to provision a language's server, mirrored from
 /// `kin_cli::commands::language_servers` so the skip message names a real fix.
 fn install_hint(language: LanguageId) -> &'static str {
     match language {
-        LanguageId::Python => "npm install -g pyright",
+        LanguageId::Python => "Install it with `npm install -g pyright` and re-run.",
         LanguageId::TypeScript | LanguageId::JavaScript => {
-            "npm install -g typescript-language-server typescript"
+            "Install it with `npm install -g typescript-language-server typescript` and re-run."
         }
-        LanguageId::Rust => "rustup component add rust-analyzer",
-        _ => "see `kin doctor`",
+        LanguageId::Rust => "Install it with `rustup component add rust-analyzer` and re-run.",
+        LanguageId::Go => {
+            "Install Go from https://go.dev/dl/, then gopls with \
+             `go install golang.org/x/tools/gopls@v0.22.0`, and re-run."
+        }
+        _ => "See `kin doctor`.",
     }
 }
 
@@ -186,6 +238,8 @@ fn entity_refs(fixtures: &[Fixture]) -> Vec<EntityRef> {
             end_line: fixture.name_line + 2,
             name_line: fixture.name_line,
             name_col: fixture.name_col,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
         })
         .collect()
 }
@@ -263,13 +317,16 @@ async fn python_resolves_a_call_through_an_attribute_that_a_name_match_cannot() 
         .find(|r| r.id == dispatch)
         .expect("caller")
         .clone();
-    let index = EntityIndex::new(refs);
+    let index = EntityIndex::new(refs, root);
 
     let server = start_server(&command, &args, root, LanguageId::Python).await;
     open_documents(&server, root, &["adapters.py", "sessions.py"], "python").await;
-    let relations = kin_lsp::enrichment::enrich_entity_calls(&server, &caller, &index, root)
-        .await
-        .expect("enrichment must not error");
+    let source_text = std::fs::read_to_string(root.join(&caller.file_path)).unwrap();
+    let documents = |file: &str| (file == caller.file_path).then(|| source_text.clone());
+    let relations =
+        kin_lsp::enrichment::enrich_entity_calls(&server, &caller, &index, root, Some(&documents))
+            .await
+            .expect("enrichment must not error");
 
     let targets: Vec<GraphNodeId> = relations.iter().map(|relation| relation.dst).collect();
     assert!(
@@ -364,13 +421,16 @@ async fn javascript_resolves_a_require_chain_that_a_name_match_cannot() {
         .find(|r| r.id == listen)
         .expect("caller")
         .clone();
-    let index = EntityIndex::new(refs);
+    let index = EntityIndex::new(refs, root);
 
     let server = start_server(&command, &args, root, LanguageId::JavaScript).await;
     open_documents(&server, root, &["router.js", "app.js"], "javascript").await;
-    let relations = kin_lsp::enrichment::enrich_entity_calls(&server, &caller, &index, root)
-        .await
-        .expect("enrichment must not error");
+    let source_text = std::fs::read_to_string(root.join(&caller.file_path)).unwrap();
+    let documents = |file: &str| (file == caller.file_path).then(|| source_text.clone());
+    let relations =
+        kin_lsp::enrichment::enrich_entity_calls(&server, &caller, &index, root, Some(&documents))
+            .await
+            .expect("enrichment must not error");
 
     let targets: Vec<GraphNodeId> = relations.iter().map(|relation| relation.dst).collect();
     assert!(
@@ -627,4 +687,556 @@ async fn pyright_resolves_the_one_hop_to_the_base_and_the_two_hop_to_the_overrid
              Overrides edge or can count the caller directly."
         );
     }
+}
+
+/// A Flask-shaped package reduced to the shapes that took their
+/// language-server edges away on the v0.8.0 candidate, parsed by the real
+/// Python adapter and handed to pyright through the daemon's own
+/// `lsp_entity_ref`. The view imports from its own package relatively, as
+/// Flask's modules and its tutorial's views do:
+///
+/// - the module surface, whose signature is its path, so its name hint (11)
+///   ran past the end of `import os` and failed the file's whole definitions
+///   pass, imports and call sites included;
+/// - a decorated view, whose signature leads with the decorator, so its hint
+///   landed on the `next_url` parameter and its own call hierarchy was lost;
+/// - an imported constant read as a receiver (`current_app.config`), which
+///   answers from another file and was taken for a module, so no edge was
+///   recorded for it at all;
+/// - an imported module whose first line declares a class, which pyright
+///   answers with an empty range at the top of the file.
+///
+/// A second importer beside the package reaches the same values through
+/// `from pkg import ...` and the package's `__init__.py` re-exports. pyright
+/// answers `pkg` with the empty range at the top of `__init__.py`, whose first
+/// line is an import, so that edge names the package surface and is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn python_decorated_views_keep_their_file_and_imported_values_are_references() {
+    const TEST: &str = "python_decorated_views_keep_their_file_and_imported_values_are_references";
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let sources = [
+        (
+            "pkg/__init__.py",
+            "from .globals import current_app as current_app\n\
+             from .helpers import redirect as redirect\n",
+        ),
+        (
+            "pkg/globals.py",
+            "class _Proxy:\n\
+             \x20   config: dict = {}\n\
+             \n\
+             \n\
+             current_app = _Proxy()\n",
+        ),
+        (
+            "pkg/helpers.py",
+            "def redirect(location):\n\
+             \x20   return location\n",
+        ),
+        (
+            "pkg/views.py",
+            "import os\n\
+             from .globals import current_app\n\
+             from .helpers import redirect\n\
+             \n\
+             \n\
+             def route(rule):\n\
+             \x20   def decorator(view):\n\
+             \x20       return view\n\
+             \n\
+             \x20   return decorator\n\
+             \n\
+             \n\
+             @route(\"/login\")\n\
+             def login(next_url: str, remember: bool) -> str:\n\
+             \x20   return redirect(current_app.config[os.sep])\n",
+        ),
+        (
+            "app.py",
+            "from pkg import current_app, redirect\n\
+             \n\
+             \n\
+             def index():\n\
+             \x20   return redirect(current_app.config[1])\n",
+        ),
+    ];
+    let text_of = |file: &str| {
+        sources
+            .iter()
+            .find(|(path, _)| *path == file)
+            .map(|(_, text)| *text)
+            .unwrap()
+    };
+    for (path, text) in sources {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+
+    let pipeline = kin_index::IndexPipeline::new();
+    let mut entities = Vec::new();
+    for (path, text) in sources {
+        let indexed = pipeline
+            .index_file_content_with_tests(
+                &kin_model::FilePathId::new(path),
+                text.as_bytes(),
+                kin_blobs::digest(text.as_bytes()),
+            )
+            .expect("fixture indexes")
+            .indexed_file;
+        entities.extend(indexed.entities.into_iter().map(|entity| (path, entity)));
+    }
+    let find = |path: &str, name: &str, kind: kin_model::EntityKind| {
+        entities
+            .iter()
+            .find(|(file, entity)| *file == path && entity.name == name && entity.kind == kind)
+            .map(|(_, entity)| entity.id)
+            .unwrap_or_else(|| panic!("the adapter must mint {kind:?} {path}:{name}"))
+    };
+    let module = find("pkg/views.py", "views", kin_model::EntityKind::Module);
+    let login = find("pkg/views.py", "login", kin_model::EntityKind::Function);
+    let proxy = find("pkg/globals.py", "_Proxy", kin_model::EntityKind::Class);
+    let redirect = find(
+        "pkg/helpers.py",
+        "redirect",
+        kin_model::EntityKind::Function,
+    );
+    let current_app = find(
+        "pkg/globals.py",
+        "current_app",
+        kin_model::EntityKind::Constant,
+    );
+    let package = find("pkg/__init__.py", "pkg", kin_model::EntityKind::Module);
+    let app = find("app.py", "app", kin_model::EntityKind::Module);
+    let index_view = find("app.py", "index", kin_model::EntityKind::Function);
+    let refs: Vec<EntityRef> = entities
+        .iter()
+        .filter_map(|(path, entity)| kin_daemon::daemon::lsp_entity_ref(entity, path))
+        .collect();
+    let login_ref = refs.iter().find(|r| r.id == login).unwrap().clone();
+    let module_ref = refs.iter().find(|r| r.id == module).unwrap().clone();
+    assert_eq!(
+        (login_ref.start_line, login_ref.name_line),
+        (12, 13),
+        "the view's span opens on its decorator and its name is asked on the `def` line"
+    );
+    assert!(
+        !module_ref.declares_name,
+        "a module surface declares no name of its own"
+    );
+    let index = EntityIndex::new(refs, &root);
+
+    // Everything above holds on any host. Only what follows needs a server.
+    let Some((command, args)) = server_command_or_skip(LanguageId::Python, TEST) else {
+        return;
+    };
+    let server = start_server(&command, &args, &root, LanguageId::Python).await;
+    open_documents(&server, &root, &["pkg/views.py", "app.py"], "python").await;
+    // Until the server has bound an opened file's imports it answers
+    // `definition` with nothing, which is what a real miss looks like. Wait
+    // for the answers the passes depend on: `redirect` at each call site.
+    let deadline = tokio::time::Instant::now() + INDEX_BUDGET;
+    for (file, line, character) in [("pkg/views.py", 14, 11), ("app.py", 4, 11)] {
+        let uri = kin_lsp::protocol::path_to_uri(&root.join(file));
+        loop {
+            let answer = server
+                .client
+                .request(
+                    "textDocument/definition",
+                    serde_json::json!({
+                        "textDocument": { "uri": uri },
+                        "position": { "line": line, "character": character },
+                    }),
+                )
+                .await
+                .unwrap_or_default();
+            if answer.to_string().contains("pkg/helpers.py") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pyright never resolved `redirect` in {file}: {answer}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    let documents = |file: &str| {
+        sources
+            .iter()
+            .find(|(path, _)| *path == file)
+            .map(|(_, text)| text.to_string())
+    };
+    let pass = kin_lsp::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.join("pkg/views.py"),
+        text_of("pkg/views.py"),
+        &index,
+        &root,
+        Some(&documents),
+    )
+    .await
+    .expect("the definitions pass must not fail on a decorated view or a module surface");
+    assert_eq!(
+        pass.failed_queries, 0,
+        "every query in the file is answerable, so the file can be recorded as enriched"
+    );
+    let has = |kind: kin_model::RelationKind, src, dst| {
+        pass.relations.iter().any(|relation| {
+            relation.kind == kind
+                && relation.src == GraphNodeId::Entity(src)
+                && relation.dst == GraphNodeId::Entity(dst)
+        })
+    };
+    use kin_model::RelationKind::{Calls, References};
+    assert!(
+        has(References, module, current_app) && has(References, module, redirect),
+        "the import lines keep their edges: {:?}",
+        pass.relations
+    );
+    assert!(
+        has(References, login, redirect),
+        "the call site keeps its reference: {:?}",
+        pass.relations
+    );
+    assert!(
+        has(References, login, current_app),
+        "an imported constant read as a receiver is a reference to it: {:?}",
+        pass.relations
+    );
+    assert!(
+        has(Calls, login, redirect),
+        "the decorated view is asked at its own name and keeps its call: {:?}",
+        pass.relations
+    );
+    assert!(
+        pass.relations
+            .iter()
+            .all(|relation| relation.dst != GraphNodeId::Entity(proxy)),
+        "`from .globals import` names the module, not the class its first line declares: {:?}",
+        pass.relations
+    );
+    assert!(
+        pass.relations
+            .iter()
+            .all(|relation| relation.dst != GraphNodeId::Entity(module)),
+        "nothing in the file references its own module surface: {:?}",
+        pass.relations
+    );
+
+    let importer = kin_lsp::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.join("app.py"),
+        text_of("app.py"),
+        &index,
+        &root,
+        Some(&documents),
+    )
+    .await
+    .expect("the definitions pass over the package's importer must not fail");
+    assert_eq!(
+        importer.failed_queries, 0,
+        "every query in the importer is answerable: {:?}",
+        importer.relations
+    );
+    let imports = |kind: kin_model::RelationKind, src, dst| {
+        importer.relations.iter().any(|relation| {
+            relation.kind == kind
+                && relation.src == GraphNodeId::Entity(src)
+                && relation.dst == GraphNodeId::Entity(dst)
+        })
+    };
+    assert!(
+        imports(References, app, package),
+        "`from pkg import` names the package, whose first line is an import, so its \
+         empty-range answer keeps its edge: {:?}",
+        importer.relations
+    );
+    assert!(
+        imports(References, app, current_app) && imports(References, app, redirect),
+        "names imported through the package's re-exports resolve to their own declarations: {:?}",
+        importer.relations
+    );
+    assert!(
+        imports(References, index_view, redirect) && imports(References, index_view, current_app),
+        "the importer's call site and receiver keep their references: {:?}",
+        importer.relations
+    );
+    assert!(
+        importer
+            .relations
+            .iter()
+            .all(|relation| relation.dst != GraphNodeId::Entity(proxy)),
+        "no answer in the importer names the class `globals.py` opens with: {:?}",
+        importer.relations
+    );
+
+    let references = kin_lsp::enrichment::enrich_entity_references(
+        &server,
+        &module_ref,
+        &index,
+        &root,
+        Some(&documents),
+    )
+    .await
+    .expect("a module surface is not asked about, so it cannot fail");
+    assert!(references.is_empty());
+    let calls = kin_lsp::enrichment::enrich_entity_calls(
+        &server,
+        &login_ref,
+        &index,
+        &root,
+        Some(&documents),
+    )
+    .await
+    .expect("the view's own call hierarchy answers");
+    assert!(
+        calls
+            .iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(redirect)),
+        "{calls:?}"
+    );
+    server.shutdown().await.unwrap();
+}
+
+/// A Go method reached through an interface, parsed by the real Go adapter,
+/// handed to gopls through the daemon's own `lsp_entity_ref`, and asked every
+/// question the daemon asks about a file: the definitions pass over each file
+/// and the four per-entity arms over each entity.
+///
+/// gopls answers `references` for a method with the references of every
+/// method related to it through interface satisfaction as well. The call in
+/// `ViaInterface` is written against `repo.Interface`, so the Go type checker
+/// resolves it to the interface method and never to `Concrete.RepoOwner`, yet
+/// the references arm recorded it as a proven caller of the concrete method,
+/// and the direct call in `Direct` as one of the interface method. The direct
+/// call has to stay a caller of the concrete method, and the interface call
+/// of the interface method.
+#[tokio::test(flavor = "multi_thread")]
+async fn go_calls_through_an_interface_are_not_callers_of_the_concrete_method() {
+    const TEST: &str = "go_calls_through_an_interface_are_not_callers_of_the_concrete_method";
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let sources = [
+        (
+            "repo/repo.go",
+            "package repo\n\
+             \n\
+             // Interface is satisfied by Concrete.\n\
+             type Interface interface {\n\
+             \tRepoOwner() string\n\
+             }\n\
+             \n\
+             // Concrete implements Interface.\n\
+             type Concrete struct {\n\
+             \towner string\n\
+             }\n\
+             \n\
+             // RepoOwner is the concrete method.\n\
+             func (c Concrete) RepoOwner() string {\n\
+             \treturn c.owner\n\
+             }\n",
+        ),
+        (
+            "use/use.go",
+            "package use\n\
+             \n\
+             import \"example.com/dispatch/repo\"\n\
+             \n\
+             // ViaInterface calls the interface method.\n\
+             func ViaInterface(r repo.Interface) string {\n\
+             \treturn r.RepoOwner()\n\
+             }\n\
+             \n\
+             // Direct calls the concrete method.\n\
+             func Direct(c repo.Concrete) string {\n\
+             \treturn c.RepoOwner()\n\
+             }\n",
+        ),
+    ];
+    std::fs::write(
+        root.join("go.mod"),
+        "module example.com/dispatch\n\ngo 1.21\n",
+    )
+    .unwrap();
+    for (path, text) in sources {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let text_of = |file: &str| {
+        sources
+            .iter()
+            .find(|(path, _)| *path == file)
+            .map(|(_, text)| *text)
+            .unwrap()
+    };
+
+    let pipeline = kin_index::IndexPipeline::new();
+    let mut entities = Vec::new();
+    for (path, text) in sources {
+        let indexed = pipeline
+            .index_file_content_with_tests(
+                &kin_model::FilePathId::new(path),
+                text.as_bytes(),
+                kin_blobs::digest(text.as_bytes()),
+            )
+            .expect("fixture indexes")
+            .indexed_file;
+        entities.extend(indexed.entities.into_iter().map(|entity| (path, entity)));
+    }
+    let find = |path: &str, name: &str, kind: kin_model::EntityKind| {
+        entities
+            .iter()
+            .find(|(file, entity)| *file == path && entity.name == name && entity.kind == kind)
+            .map(|(_, entity)| entity.id)
+            .unwrap_or_else(|| panic!("the adapter must mint {kind:?} {path}:{name}"))
+    };
+    use kin_model::EntityKind::{Function, Method};
+    let interface_method = find("repo/repo.go", "Interface.RepoOwner", Method);
+    let concrete_method = find("repo/repo.go", "Concrete.RepoOwner", Method);
+    let via = find("use/use.go", "ViaInterface", Function);
+    let direct = find("use/use.go", "Direct", Function);
+    let refs: Vec<EntityRef> = entities
+        .iter()
+        .filter_map(|(path, entity)| kin_daemon::daemon::lsp_entity_ref(entity, path))
+        .collect();
+    let index = EntityIndex::new(refs.clone(), &root);
+
+    // Everything above holds on any host. Only what follows needs a server.
+    let Some((command, args)) = server_command_or_skip(LanguageId::Go, TEST) else {
+        return;
+    };
+    let server = start_server(&command, &args, &root, LanguageId::Go).await;
+    assert!(
+        server.has_implementation(),
+        "gopls names what a concrete method corresponds to, which is what spares a method no \
+         interface reaches from proving every site"
+    );
+    open_documents(&server, &root, &["repo/repo.go", "use/use.go"], "go").await;
+    // Until gopls has loaded the module it answers `definition` with nothing,
+    // which is what a real miss looks like. Wait for the call through the
+    // interface to resolve into repo.go.
+    let deadline = tokio::time::Instant::now() + INDEX_BUDGET;
+    let use_uri = kin_lsp::protocol::path_to_uri(&root.join("use/use.go"));
+    loop {
+        let answer = server
+            .client
+            .request(
+                "textDocument/definition",
+                serde_json::json!({
+                    "textDocument": { "uri": use_uri },
+                    "position": { "line": 6, "character": 10 },
+                }),
+            )
+            .await
+            .unwrap_or_default();
+        if answer.to_string().contains("repo/repo.go") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gopls never resolved the call through the interface: {answer}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let documents = |file: &str| {
+        sources
+            .iter()
+            .find(|(path, _)| *path == file)
+            .map(|(_, text)| text.to_string())
+    };
+    let mut relations = Vec::new();
+    for file in ["repo/repo.go", "use/use.go"] {
+        let pass = kin_lsp::file_enrichment::enrich_file_definitions(
+            &server,
+            &root.join(file),
+            text_of(file),
+            &index,
+            &root,
+            Some(&documents),
+        )
+        .await
+        .expect("the definitions pass answers");
+        relations.extend(pass.relations);
+    }
+    // The daemon's per-entity arms, in its order. A declined or failed arm
+    // costs that arm's relations and nothing else, as it does there; the
+    // references arm is the one under test, so it has to answer.
+    let mut concrete_references = Vec::new();
+    for entity in &refs {
+        let documents = Some(&documents as kin_lsp::DocumentProvider<'_>);
+        if let Ok(found) =
+            kin_lsp::enrichment::enrich_entity_calls(&server, entity, &index, &root, documents)
+                .await
+        {
+            relations.extend(found);
+        }
+        if let Ok(found) =
+            kin_lsp::enrichment::enrich_entity_overrides(&server, entity, &index, &root, documents)
+                .await
+        {
+            relations.extend(found);
+        }
+        if let Ok(found) =
+            kin_lsp::enrichment::enrich_entity_uses_type(&server, entity, &index, &root, documents)
+                .await
+        {
+            relations.extend(found);
+        }
+        let found = kin_lsp::enrichment::enrich_entity_references(
+            &server, entity, &index, &root, documents,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the references arm answers for {}: {error}", entity.name));
+        if entity.id == concrete_method {
+            concrete_references = found.clone();
+        }
+        relations.extend(found);
+    }
+    server.shutdown().await.unwrap();
+
+    let callers_of = |dst: EntityId| {
+        relations
+            .iter()
+            .filter(|relation| {
+                matches!(
+                    relation.kind,
+                    kin_model::RelationKind::Calls | kin_model::RelationKind::References
+                ) && relation.dst == GraphNodeId::Entity(dst)
+            })
+            .map(|relation| relation.src)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let concrete_callers = callers_of(concrete_method);
+    let interface_callers = callers_of(interface_method);
+    assert_eq!(
+        concrete_references
+            .iter()
+            .map(|relation| relation.src)
+            .collect::<Vec<_>>(),
+        [GraphNodeId::Entity(direct)],
+        "gopls widened Concrete.RepoOwner's references with the interface call, and only the \
+         direct call resolves to it: {concrete_references:?}"
+    );
+    assert!(
+        concrete_callers.contains(&GraphNodeId::Entity(direct)),
+        "the direct call is a caller of the concrete method: {relations:?}"
+    );
+    assert!(
+        !concrete_callers.contains(&GraphNodeId::Entity(via)),
+        "a call through the interface is not a caller of the concrete method: {relations:?}"
+    );
+    assert!(
+        interface_callers.contains(&GraphNodeId::Entity(via)),
+        "the call through the interface is a caller of the interface method: {relations:?}"
+    );
+    assert!(
+        !interface_callers.contains(&GraphNodeId::Entity(direct)),
+        "a direct call of the concrete method is not a caller of the interface method: \
+         {relations:?}"
+    );
 }

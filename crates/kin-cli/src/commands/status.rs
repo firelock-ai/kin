@@ -972,6 +972,108 @@ pub struct StatusReading {
     pub merge: Option<MergeInProgress>,
     pub workspace_tip: crate::commands::workspace_tip::WorkspaceTip,
     pub source: AuthoritySource,
+    /// Tracked files the working copy changed while no daemon watched, as
+    /// this command measured them. Taken only when no daemon is running,
+    /// because a running one admits before this command reads and owns the
+    /// reading; `None` everywhere else.
+    pub unwatched_changes: Option<UnwatchedChanges>,
+}
+
+/// Tracked files the working copy edited or removed since the last complete
+/// admission, measured by `kin status` itself because no daemon is running to
+/// take them.
+///
+/// Without it the one surface that opens the store in-process could only say
+/// that nothing measured the working copy, while a renamed function and a
+/// deleted file sat in it and every query the next daemon answered before
+/// admitting them described the old bytes. The walk is the one the daemon's
+/// startup catch-up runs, stat-first, reading only the tracked files touched
+/// since that admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnwatchedChanges {
+    /// Tracked paths whose bytes, kind or mode changed, and tracked paths the
+    /// host no longer holds, since the last complete admission.
+    Measured {
+        changed: Vec<String>,
+        removed: Vec<String>,
+    },
+    /// No window can be placed, and why: the store records no admission
+    /// instant to measure from.
+    Unplaceable(String),
+    /// The walk could not complete, and why.
+    Failed(String),
+}
+
+/// Measure [`UnwatchedChanges`] against the workspace tree this open holds.
+fn unwatched_changes_at(
+    layout: &kin_core::KinLayout,
+    authority: &ActiveRepositoryAuthority,
+) -> UnwatchedChanges {
+    let since = match kin_core::last_admission::read(layout) {
+        LastAdmissionRead::Recorded(recorded) => {
+            let seconds = recorded.at.timestamp();
+            if seconds < 0 {
+                std::time::SystemTime::UNIX_EPOCH
+            } else {
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::new(seconds as u64, recorded.at.timestamp_subsec_nanos())
+            }
+        }
+        LastAdmissionRead::Absent => {
+            return UnwatchedChanges::Unplaceable(
+                "this store records no complete admission to measure from".to_string(),
+            )
+        }
+        LastAdmissionRead::Unreadable(reason) => {
+            return UnwatchedChanges::Unplaceable(format!(
+                "the last-admission record will not parse ({reason})"
+            ))
+        }
+    };
+    // Through the authority's own accessor rather than off the lease, for the
+    // reason `workspace_tip_at` gives: the zero file-search gate pins this
+    // file's `.metadata()` spellings, and this lookup is the accessor's.
+    let workspace = match authority.workspace() {
+        Ok(workspace) => workspace,
+        Err(error) => return UnwatchedChanges::Failed(error.to_string()),
+    };
+    let tree = &workspace.tree;
+    let mut graph_only = Vec::new();
+    for artifact in tree.artifacts_by_path() {
+        match kin_core::source_projection_disposition(&artifact.path, artifact.entry) {
+            Ok(kin_core::SourceProjectionDisposition::Materialized) => {}
+            Ok(_) => graph_only.push(artifact.path.clone()),
+            Err(error) => return UnwatchedChanges::Failed(error.to_string()),
+        }
+    }
+    let working_dir = layout.working_dir();
+    let ignore = match kin_index::RepositoryIgnore::load(working_dir) {
+        Ok(ignore) => ignore,
+        Err(error) => return UnwatchedChanges::Failed(error.to_string()),
+    };
+    match kin_index::scan_working_copy_changes_since(
+        working_dir,
+        &ignore,
+        None,
+        tree.artifacts_by_path()
+            .map(|artifact| (&artifact.path, artifact.entry)),
+        graph_only.iter(),
+        since,
+    ) {
+        Ok(changes) => UnwatchedChanges::Measured {
+            changed: changes
+                .tracked_changed
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            removed: changes
+                .tracked_removed
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        },
+        Err(error) => UnwatchedChanges::Failed(error.to_string()),
+    }
 }
 
 /// One complete status reading: the live daemon's when it answers, and this
@@ -998,9 +1100,11 @@ async fn read_status_once(
                 merge: merge_in_progress_at(&authority),
                 workspace_tip: workspace_tip_at(&authority),
                 source: AuthoritySource::RunningDaemonAndOwnOpen,
+                unwatched_changes: None,
             })
         }
         Ok(response) => Ok(StatusReading {
+            unwatched_changes: None,
             report: response.report,
             merge: response.merge,
             // A responder that says it took the readings and then carries no tip
@@ -1036,6 +1140,13 @@ async fn read_status_once(
                 merge: merge_in_progress_at(&authority),
                 workspace_tip: workspace_tip_at(&authority),
                 report,
+                // Only with no daemon at all. One that is running owns the
+                // working copy's reading and admits it on its own, so a second
+                // measurement here would be a second authority for one fact.
+                unwatched_changes: gap
+                    .beside_live_daemon
+                    .is_none()
+                    .then(|| unwatched_changes_at(layout, &authority)),
                 source: if gap.beside_live_daemon.is_some() {
                     AuthoritySource::OwnAuthorityOpenBesideLiveDaemon
                 } else {
@@ -1249,6 +1360,15 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
         if let Some(line) = daemon_memory_line(layout.root()) {
             println!("{line}");
         }
+        // The store's replay-semantics standing, read from the store's own
+        // record for the reason the lines above are, and printed exactly as
+        // `kin graph status` and `kin doctor` print it, so a store an older build
+        // wrote names `kin upgrade` on the first command a reader runs.
+        if let Some(line) = crate::commands::graph::hydration_semantics_line(
+            &kin_core::hydration_semantics::standing(&layout),
+        ) {
+            println!("{line}");
+        }
         // What the working copy holds that graph truth does not. Appended for
         // the same reason as the three lines above, and it is the one this
         // command was missing: every line before it is authority truth, so a
@@ -1261,6 +1381,21 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
         // untracked files were named" is exactly the shape a reader takes for
         // "there are none".
         println!("{}", untracked_host_content_line(&pass));
+        // The tracked half of the same question, measured here only when no
+        // daemon is running to admit it. A file the graph holds that the host
+        // edited or deleted is the one kind of divergence that makes an answer
+        // wrong rather than short, so a status that could name it and did not
+        // would be leaving the reader to find it by grep.
+        if let Some(changes) = reading.unwatched_changes.as_ref() {
+            println!("{}", unwatched_changes_line(changes));
+        }
+        // What this daemon re-derived before it served. Silent on a daemon whose
+        // start owed nothing; on one that re-derived files it is the only
+        // account of why an answer moved with nobody editing, and of why the
+        // first start after an upgrade took as long as it did.
+        if let Some(line) = startup_rederivation_line(&pass) {
+            println!("{line}");
+        }
         // Why the daemon is quiet, when it is deliberately quiet. Every line
         // above describes what the store holds; this one describes what the
         // daemon has decided to stop doing about it, which is the question a
@@ -1294,6 +1429,59 @@ fn admission_hold_line(pass: &StatusAdmission) -> Option<String> {
          after {} consecutive failures; it tries again in {}s (holding {}s). Refusal: {error}",
         reconcile.admission_failure_streak, hold.next_attempt_in_seconds, hold.held_for_seconds
     ))
+}
+
+/// The `kin status` reading of tracked files the working copy changed while no
+/// daemon watched, when this command measured them.
+///
+/// Each arm names its basis, like the untracked line above it: a measured list,
+/// a measured nothing, and the two reasons nothing could be measured. The list
+/// is bounded so a branch switched while nothing watched does not bury the
+/// count.
+fn unwatched_changes_line(changes: &UnwatchedChanges) -> String {
+    const LEAD: &str = "Tracked changes since the last admission:";
+    const SAMPLE: usize = 5;
+    match changes {
+        UnwatchedChanges::Measured { changed, removed }
+            if changed.is_empty() && removed.is_empty() =>
+        {
+            format!("{LEAD} none, measured now")
+        }
+        UnwatchedChanges::Measured { changed, removed } => {
+            let count = changed.len() + removed.len();
+            let mut named = changed
+                .iter()
+                .map(|path| format!("{path} (changed)"))
+                .chain(removed.iter().map(|path| format!("{path} (removed)")))
+                .take(SAMPLE)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if count > SAMPLE {
+                named.push_str(&format!(", and {} more", count - SAMPLE));
+            }
+            format!(
+                "{LEAD} {count} tracked path(s) changed or removed while no daemon was watching \
+                 and not admitted yet: {named}. Graph truth still holds their old bytes; the \
+                 next kin command that starts the daemon admits them, and `kin admit` takes \
+                 them now"
+            )
+        }
+        UnwatchedChanges::Unplaceable(why) => format!(
+            "{LEAD} not measured; {why}, so no window can be placed, and `kin admit` reads the \
+             whole working copy"
+        ),
+        UnwatchedChanges::Failed(why) => format!(
+            "{LEAD} not measured; the walk could not complete ({why}), and `kin admit` reads \
+             the whole working copy"
+        ),
+    }
+}
+
+/// The `kin status` reading of the source files this daemon re-derived at
+/// startup, before it served.
+fn startup_rederivation_line(pass: &StatusAdmission) -> Option<String> {
+    let rederived = pass.reconcile()?.startup_rederivation.as_ref()?;
+    Some(format!("Startup repair: {}", rederived.clause()))
 }
 
 /// The `kin status` reading of host content graph truth does not carry.
@@ -2857,6 +3045,7 @@ mod tests {
             embeddings_total: 6,
             reconcile: crate::commands::resources::ReconcileHealth::default(),
             tree_moved: Some(false),
+            repository_authority_moved: None,
             prior_admission_at: None,
             admitted: true,
             failure: None,
@@ -3085,6 +3274,50 @@ mod tests {
 
         let skipped = untracked_host_content_line(&skipped_pass());
         assert!(skipped.contains("no daemon is running"), "{skipped}");
+    }
+
+    /// With no daemon running, `kin status` names the tracked files the working
+    /// copy changed since the last admission, and each arm states its basis.
+    #[test]
+    fn the_tracked_changes_line_names_what_no_daemon_has_taken() {
+        let owed = unwatched_changes_line(&UnwatchedChanges::Measured {
+            changed: vec!["src/lib.rs".to_string()],
+            removed: vec!["src/doomed.rs".to_string()],
+        });
+        assert!(
+            owed.starts_with("Tracked changes since the last admission: 2 tracked path(s)"),
+            "{owed}"
+        );
+        assert!(owed.contains("src/lib.rs (changed)"), "{owed}");
+        assert!(owed.contains("src/doomed.rs (removed)"), "{owed}");
+        assert!(owed.contains("kin admit"), "{owed}");
+
+        let many = unwatched_changes_line(&UnwatchedChanges::Measured {
+            changed: (0..7).map(|index| format!("src/file_{index}.rs")).collect(),
+            removed: Vec::new(),
+        });
+        assert!(many.contains("7 tracked path(s)"), "{many}");
+        assert!(many.contains("and 2 more"), "the list is bounded: {many}");
+
+        let none = unwatched_changes_line(&UnwatchedChanges::Measured {
+            changed: Vec::new(),
+            removed: Vec::new(),
+        });
+        assert_eq!(
+            none,
+            "Tracked changes since the last admission: none, measured now"
+        );
+
+        let unplaceable = unwatched_changes_line(&UnwatchedChanges::Unplaceable(
+            "this store records no complete admission to measure from".to_string(),
+        ));
+        assert!(unplaceable.contains("not measured"), "{unplaceable}");
+        let failed =
+            unwatched_changes_line(&UnwatchedChanges::Failed("permission denied".to_string()));
+        assert!(
+            failed.contains("not measured") && failed.contains("permission denied"),
+            "{failed}"
+        );
     }
 
     /// A refused admission is an answer and it is not an admission. Reporting it
@@ -3560,6 +3793,7 @@ mod tests {
                     merge: None,
                     workspace_tip: crate::commands::workspace_tip::WorkspaceTip::Detached,
                     source: AuthoritySource::OwnAuthorityOpen,
+                    unwatched_changes: None,
                 })
             }
         })

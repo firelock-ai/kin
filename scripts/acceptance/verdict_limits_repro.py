@@ -223,6 +223,7 @@ def import_class_never_absent_on_importing_source(payload):
 # label its reading writes. The absence gate composes its own clauses out of
 # every gap it pushed and is not held to one label.
 INPUT_CLAUSE_LABELS = {
+    "caller_arrival": ("caller_arrival_",),
     "edge_coverage": ("cross_file_edges_", "edge_coverage_unknown"),
     "withheld_candidates": ("withheld_candidates",),
     "degradations": ("retrieval_degraded",),
@@ -519,7 +520,7 @@ class Suite(object):
         key = (tuple(kinds or ()), tuple(sorted((extra or {}).items())))
         if key in self.payloads:
             return self.payloads[key]
-        args = {"query": "blank_code"}
+        args = {"query": "blank_code", "answer_only": False}
         if kinds:
             args["relation_kinds"] = list(kinds)
         args.update(extra or {})

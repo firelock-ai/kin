@@ -640,10 +640,20 @@ test('provision surfaces a failed download loudly', async () => {
 });
 
 test('probeBinaryVersion parses the kin version line and null on failure', () => {
-  const okSpawn = () => ({ status: 0, stdout: 'kin 1.2.3 (abc detached)\n' });
+  const okSpawn = (binary, args, options) => {
+    assert.equal(binary, '/any');
+    assert.deepEqual(args, ['--version']);
+    assert.equal(options.timeout, 5000);
+    assert.equal(options.killSignal, 'SIGKILL');
+    assert.equal(options.maxBuffer, 16 * 1024);
+    return { status: 0, stdout: 'kin 1.2.3 (abc detached)\n' };
+  };
   const badSpawn = () => ({ status: 1, stdout: '', stderr: 'boom' });
   assert.equal(probeBinaryVersion('/any', okSpawn), '1.2.3');
   assert.equal(probeBinaryVersion('/any', badSpawn), null);
+  assert.equal(probeBinaryVersion('/any', () => ({ status: 0, stdout: 'kin unknown\n' })), null);
+  assert.equal(probeBinaryVersion('/any', () => ({ status: null, error: new Error('timeout') })), null);
+  assert.equal(probeBinaryVersion('/any', () => ({ status: 0, stdout: 'kin 1.2.3-rc.1+build\n' })), '1.2.3-rc.1+build');
 });
 
 test('ensureProvisioned respects KIN_MANAGED_BIN and never provisions over it', async () => {
@@ -671,7 +681,7 @@ test('ensureProvisioned is resolve-only under KIN_NO_PROVISION', async () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('ensureProvisioned runs a stamped current install without probing or network', async () => {
+test('ensureProvisioned verifies a stamped current install without network', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stamped-'));
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
@@ -686,9 +696,7 @@ test('ensureProvisioned runs a stamped current install without probing or networ
     fetchImpl: async () => {
       throw new Error('network must not be touched');
     },
-    spawnImpl: () => {
-      throw new Error('probe must not run');
-    },
+    spawnImpl: () => ({ status: 0, stdout: `kin ${targetKinVersion()}\n` }),
     log: () => {},
   });
   assert.equal(result, path.join(binDir, kinName));
@@ -698,9 +706,9 @@ test('ensureProvisioned runs a stamped current install without probing or networ
 // ── mismatch matrix ─────────────────────────────────────────────────────────
 //
 // ensureProvisioned's pin-vs-installed policy, exercised on both the stamped
-// (this package provisioned it before; no probe needed) and foreign (probed
-// via `--version`) code paths: an older install upgrades automatically, a
-// newer install is refused loudly, an equal install just runs, and
+// (this package provisioned it before) and foreign installs, always probing
+// via `--version`: an older install upgrades automatically, a newer install
+// runs with a one-time notice, an equal install just runs, and
 // KIN_LAUNCHER_ADOPT=1 forces a re-provision regardless.
 
 test('ensureProvisioned auto-provisions over an older foreign install (no ADOPT needed)', async () => {
@@ -725,6 +733,12 @@ test('ensureProvisioned auto-provisions over an older foreign install (no ADOPT 
   assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
   assert.equal(readLauncherStamp(env), targetKinVersion());
   assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
+  assert.ok(
+    notices.some(
+      (l) => l.includes('run `kin upgrade`') && l.includes(`npx -y @kinlab/kin@${targetKinVersion()} upgrade`),
+    ),
+    notices.join('\n'),
+  );
   fs.rmSync(work, { recursive: true, force: true });
 });
 
@@ -743,9 +757,7 @@ test('ensureProvisioned auto-provisions when a stamped install is older than the
     platform,
     arch,
     fetchImpl,
-    spawnImpl: () => {
-      throw new Error('a stamped install must not be probed');
-    },
+    spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1\n' }),
     log: (line) => notices.push(line),
   });
   const { targetKinVersion } = await import('../lib/resolve.mjs');
@@ -753,37 +765,55 @@ test('ensureProvisioned auto-provisions when a stamped install is older than the
   assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
   assert.equal(readLauncherStamp(env), targetKinVersion());
   assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
+  assert.ok(
+    notices.some(
+      (l) => l.includes('run `kin upgrade`') && l.includes(`npx -y @kinlab/kin@${targetKinVersion()} upgrade`),
+    ),
+    notices.join('\n'),
+  );
   fs.rmSync(work, { recursive: true, force: true });
 });
 
-test('ensureProvisioned refuses to downgrade a newer foreign install (fail loud, no ADOPT)', async () => {
+// `kin update` and the shell installer move $KIN_HOME forward without touching
+// the npm package, so a launcher that refused a newer install made every
+// command exit 1 the day after an update, and named only a downgrade as the
+// way out. The launcher runs the newer install instead and says so once.
+test('ensureProvisioned runs a newer foreign install instead of refusing it', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-foreign-'));
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
   const kinName = binaryName('kin', process.platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
-  await assert.rejects(
-    ensureProvisioned({
-      env,
-      platform: process.platform,
-      fetchImpl: async () => {
-        throw new Error('must not provision when refusing a downgrade');
-      },
-      spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0 (newer)\n' }),
-      log: () => {},
-    }),
-    /refusing to downgrade.*KIN_LAUNCHER_ADOPT=1/s,
+  fs.writeFileSync(path.join(binDir, kinName), 'preserve the newer executable');
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    platform: process.platform,
+    fetchImpl: async () => {
+      throw new Error('a newer install must never be replaced by the older pin');
+    },
+    spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0 (newer)\n' }),
+    log: (line) => notices.push(line),
+  });
+  assert.equal(result, path.join(binDir, kinName), 'the newer install is what runs');
+  assert.equal(
+    fs.readFileSync(path.join(binDir, kinName), 'utf8'),
+    'preserve the newer executable',
+    'the newer binary must be left exactly as it was',
   );
-  assert.equal(readLauncherStamp(env), null);
-  assert.ok(
-    fs.existsSync(path.join(binDir, kinName)),
-    'the existing binary must be left in place',
-  );
+  assert.equal(notices.length, 1, `exactly one notice: ${JSON.stringify(notices)}`);
+  const [notice] = notices;
+  assert.match(notice, /running managed kin 99\.0\.0/);
+  assert.ok(notice.includes(`newer than the ${targetKinVersion()}`), notice);
+  assert.ok(notice.includes('npm install -g @kinlab/kin@latest'), `the forward move is named: ${notice}`);
+  assert.ok(notice.includes('KIN_LAUNCHER_ADOPT=1'), `the deliberate downgrade is still named: ${notice}`);
+  assert.equal(/refusing/.test(notice), false, notice);
+  assert.equal(readLauncherStamp(env), '99.0.0', 'the confirmed version is recorded');
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('ensureProvisioned refuses to downgrade when the stamp itself is newer than the pin', async () => {
+test('a newer install the launcher already confirmed runs without a notice', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-stamped-'));
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
@@ -791,21 +821,48 @@ test('ensureProvisioned refuses to downgrade when the stamp itself is newer than
   fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   writeLauncherStamp('99.0.0', env);
-  await assert.rejects(
-    ensureProvisioned({
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    platform: process.platform,
+    fetchImpl: async () => {
+      throw new Error('a newer install must never be replaced by the older pin');
+    },
+    spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0\n' }),
+    log: (line) => notices.push(line),
+  });
+  assert.equal(result, path.join(binDir, kinName));
+  assert.deepEqual(notices, [], 'the notice is owed once per installed version, not once per run');
+  assert.equal(readLauncherStamp(env), '99.0.0');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('the newer-install notice comes back when the installed version moves again', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-moved-'));
+  const env = { KIN_HOME: home };
+  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(binary, '#!/bin/sh\n');
+  let installed = '99.0.0';
+  const run = async () => {
+    const notices = [];
+    const result = await ensureProvisioned({
       env,
       platform: process.platform,
-      fetchImpl: async () => {
-        throw new Error('must not provision when refusing a downgrade');
-      },
-      spawnImpl: () => {
-        throw new Error('a stamped install must not be probed');
-      },
-      log: () => {},
-    }),
-    /refusing to downgrade.*KIN_LAUNCHER_ADOPT=1/s,
-  );
-  assert.equal(readLauncherStamp(env), '99.0.0');
+      fetchImpl: async () => { throw new Error('must not download'); },
+      spawnImpl: () => ({ status: 0, stdout: `kin ${installed}\n` }),
+      log: (line) => notices.push(line),
+    });
+    assert.equal(result, binary);
+    return notices;
+  };
+  assert.equal((await run()).length, 1, 'first sight of 99.0.0 is announced');
+  assert.equal((await run()).length, 0, 'second run on the same version is quiet');
+  installed = '99.1.0';
+  const moved = await run();
+  assert.equal(moved.length, 1, 'a further update is announced again');
+  assert.match(moved[0], /running managed kin 99\.1\.0/);
+  assert.equal(readLauncherStamp(env), '99.1.0');
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -829,6 +886,172 @@ test('ensureProvisioned adopts a foreign install when its version already matche
   assert.equal(result, path.join(binDir, kinName));
   assert.equal(readLauncherStamp(env), targetKinVersion());
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+for (const stamped of ['0.0.1', '99.0.0']) {
+  test(`a stale ${stamped} stamp cannot override the matching installed binary`, async (t) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stale-stamp-'));
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const env = { KIN_HOME: home };
+    const binary = path.join(home, 'bin', binaryName('kin', process.platform));
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, 'preserve the existing executable');
+    writeLauncherStamp(stamped, env);
+    const { targetKinVersion } = await import('../lib/resolve.mjs');
+    let probes = 0;
+    const result = await ensureProvisioned({
+      env,
+      fetchImpl: async () => { throw new Error('matching installed bytes must not be replaced'); },
+      spawnImpl: (command, args) => {
+        assert.equal(command, binary);
+        assert.deepEqual(args, ['--version']);
+        probes += 1;
+        return { status: 0, stdout: `kin ${targetKinVersion()} (installed separately)\n` };
+      },
+      log: () => {},
+    });
+    assert.equal(result, binary);
+    assert.equal(probes, 1);
+    assert.equal(readLauncherStamp(env), targetKinVersion());
+    assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve the existing executable');
+  });
+}
+
+test('a stale older stamp cannot authorize downgrading a newer installed binary', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stale-downgrade-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { KIN_HOME: home };
+  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(binary, 'preserve the newer executable');
+  writeLauncherStamp('0.0.1', env);
+  let probes = 0;
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    fetchImpl: async () => { throw new Error('must not download a downgrade'); },
+    spawnImpl: () => {
+      probes += 1;
+      return { status: 0, stdout: 'kin 99.0.0 (installed separately)\n' };
+    },
+    log: (line) => notices.push(line),
+  });
+  assert.equal(result, binary);
+  assert.equal(probes, 1);
+  assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve the newer executable');
+  assert.ok(notices.some((line) => line.includes('running managed kin 99.0.0')), notices.join('\n'));
+  assert.equal(readLauncherStamp(env), '99.0.0');
+});
+
+test('a receipt write failure repeats the newer-install notice rather than failing the run', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-receipt-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { KIN_HOME: home };
+  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
+  // A directory at the receipt path refuses writes even for privileged test users.
+  fs.mkdirSync(path.join(home, 'bin', '.kinlab-kin-version'), { recursive: true });
+  fs.writeFileSync(binary, 'preserve the newer executable');
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    fetchImpl: async () => { throw new Error('must not download a downgrade'); },
+    spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0\n' }),
+    log: (line) => notices.push(line),
+  });
+  assert.equal(result, binary);
+  assert.ok(notices.some((line) => line.includes('running managed kin 99.0.0')));
+  assert.ok(notices.some((line) => line.includes('could not record the launcher receipt')));
+});
+
+// The whole bin, end to end: the launcher probes the real file it would run and
+// forwards the command to it. On a newer install this used to exit 1 before the
+// command ran at all.
+const posixLauncherTest = process.platform === 'win32' ? test.skip : test;
+posixLauncherTest('the kin bin forwards a command to a newer managed install and mirrors its exit', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-launcher-forward-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const binary = path.join(home, 'bin', 'kin');
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(
+    binary,
+    '#!/bin/sh\n' +
+      'if [ "$1" = "--version" ]; then echo "kin 99.0.0"; exit 0; fi\n' +
+      'echo "forwarded: $*"\n' +
+      'exit 3\n',
+  );
+  fs.chmodSync(binary, 0o755);
+  const launcher = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'kin.mjs');
+  const env = { ...process.env, KIN_HOME: home };
+  delete env.KIN_MANAGED_BIN;
+  delete env.KIN_NO_PROVISION;
+  delete env.KIN_LAUNCHER_ADOPT;
+  const first = spawnSync(process.execPath, [launcher, 'status', '--json'], { env, encoding: 'utf8' });
+  assert.equal(first.stdout, 'forwarded: status --json\n', `stderr: ${first.stderr}`);
+  assert.equal(first.status, 3, 'the managed binary\'s own exit is mirrored');
+  assert.match(first.stderr, /running managed kin 99\.0\.0/);
+  const second = spawnSync(process.execPath, [launcher, 'status'], { env, encoding: 'utf8' });
+  assert.equal(second.stdout, 'forwarded: status\n');
+  assert.equal(second.stderr, '', 'the notice is not repeated once the version is recorded');
+});
+
+test('a stale matching stamp cannot hide an older installed binary', async (t) => {
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
+  t.after(() => fs.rmSync(work, { recursive: true, force: true }));
+  const env = { KIN_HOME: path.join(work, 'kin-home') };
+  const binary = path.join(env.KIN_HOME, 'bin', binaryName('kin', platform));
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(binary, 'old executable');
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
+  writeLauncherStamp(targetKinVersion(), env);
+  const result = await ensureProvisioned({
+    env, platform, arch, fetchImpl,
+    spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1 (restored backup)\n' }),
+    log: () => {},
+  });
+  assert.equal(result, binary);
+  assert.match(fs.readFileSync(binary, 'utf8'), /9\.9\.9/);
+});
+
+test('a stale stamp is not version evidence when the installed binary cannot be probed', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stale-unknown-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { KIN_HOME: home };
+  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(binary, 'preserve unknown executable');
+  writeLauncherStamp('0.0.1', env);
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    fetchImpl: async () => { throw new Error('cannot establish upgrade direction'); },
+    spawnImpl: () => ({ status: 1, stdout: '' }),
+    log: (line) => notices.push(line),
+  });
+  assert.equal(result, binary);
+  assert.ok(notices.some((line) => line.includes('version unknown')));
+  assert.equal(readLauncherStamp(env), '0.0.1');
+  assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve unknown executable');
+});
+
+test('receipt write failure does not block a verified matching installed binary', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-receipt-write-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { KIN_HOME: home };
+  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
+  // A directory at the receipt path refuses writes even for privileged test users.
+  fs.mkdirSync(path.join(home, 'bin', '.kinlab-kin-version'), { recursive: true });
+  fs.writeFileSync(binary, 'preserve the verified executable');
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    fetchImpl: async () => { throw new Error('matching installed binary must not be replaced'); },
+    spawnImpl: () => ({ status: 0, stdout: `kin ${targetKinVersion()}\n` }),
+    log: (line) => notices.push(line),
+  });
+  assert.equal(result, binary);
+  assert.ok(notices.some((line) => line.includes('could not refresh the launcher receipt')));
+  assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve the verified executable');
 });
 
 test('KIN_LAUNCHER_ADOPT=1 forces re-provisioning even when the stamped version already matches', async () => {
@@ -857,7 +1080,7 @@ test('KIN_LAUNCHER_ADOPT=1 forces re-provisioning even when the stamped version 
   fs.rmSync(work, { recursive: true, force: true });
 });
 
-test('KIN_LAUNCHER_ADOPT=1 forces the downgrade it would otherwise refuse', async () => {
+test('KIN_LAUNCHER_ADOPT=1 forces the downgrade the launcher otherwise never makes', async () => {
   const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
   const home = path.join(work, 'kin-home');
   const env = { KIN_HOME: home, KIN_LAUNCHER_ADOPT: '1' };

@@ -44,6 +44,7 @@ pub mod collaboration;
 pub mod conflict;
 pub mod context;
 pub mod contract;
+pub mod derivation;
 pub mod entity;
 pub mod error;
 pub mod evidence;
@@ -96,6 +97,10 @@ pub use context::{
     WorkItemEntry,
 };
 pub use contract::{Contract, ContractKind};
+pub use derivation::{
+    entity_derivation, is_derived_member, is_file_module_surface, require_independent_source,
+    EntityDerivation,
+};
 pub use entity::{
     Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, ParseState,
     SemanticFingerprint, SourceSpan, Visibility,
@@ -122,8 +127,9 @@ pub use git_authority::{
     GIT_EXTERNAL_AUTHORITY_SCHEMA_VERSION,
 };
 pub use graph::{
-    ChangeStore, EntityFilter, EntityPage, EntityPageResult, EntityStore, GraphStore,
-    ProvenanceStore, ReviewStore, SessionStore, SubGraph, VerificationStore, WorkStore,
+    BindingHistoryObservation, ChangeStore, EntityFilter, EntityPage, EntityPageResult,
+    EntityStore, GraphStore, ProvenanceStore, RelationLookup, ReviewStore, SessionStore, SubGraph,
+    VerificationStore, WorkStore,
 };
 pub use identity::{
     compute_semantic_change_id, content_identity_from_deltas, validate_semantic_change_id,
@@ -171,6 +177,7 @@ pub use refs::{
 };
 pub use relation::{
     CallArgShape, GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
+    LSP_PROVEN_METHOD_REFERENCES_RULE, LSP_REFERENCES_RULE,
 };
 pub use repository::{
     compute_resolved_tree_hash, AuthorityRoot, RepositoryAuthorityStore, RepositoryCommitOutcome,

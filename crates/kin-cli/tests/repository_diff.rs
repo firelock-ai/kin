@@ -275,15 +275,39 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
     // Admission binds the semantics of every imported change, so a diff across
     // imported history carries entity deltas as well as the exact tree. Both
     // edited supported-language files keep their declaration set and change one
-    // body each: the Rust `answer`, the Python `answer`, and the Python module
-    // that contains it. The unsupported-language, binary, symlink, gitlink, and
+    // body each, and each file's own module surface fingerprints the whole file
+    // and moves with it: the Rust `answer` and its module, the Python `answer`
+    // and its module. The unsupported-language, binary, symlink, gitlink, and
     // raw-path artifacts contribute none.
     assert_eq!(report["summary"]["entities_added"], 0);
-    assert_eq!(report["summary"]["entities_modified"], 3);
+    assert_eq!(report["summary"]["entities_modified"], 4);
     assert_eq!(report["summary"]["entities_removed"], 0);
     assert_eq!(report["summary"]["relations_added"], 0);
-    assert_eq!(report["summary"]["relations_modified"], 0);
+    assert_eq!(report["summary"]["relations_modified"], 2);
     assert_eq!(report["summary"]["relations_removed"], 0);
+    // Each edited source replaces its body-bound parser certificate. These are
+    // provenance changes, not newly inferred calls or references.
+    let relations: Vec<kin_model::RelationDelta> =
+        serde_json::from_value(report["relation_deltas"].clone()).unwrap();
+    let mut coverage_paths = std::collections::BTreeSet::new();
+    for delta in relations {
+        let kin_model::RelationDelta::Modified { old, new } = delta else {
+            panic!("the fixture only changes existing source certificates");
+        };
+        let kin_model::GraphNodeId::Artifact(artifact) = old.src else {
+            panic!("expected artifact-owned coverage");
+        };
+        let file = old.evidence[0].source_path.as_deref().unwrap();
+        assert_eq!(old.id, new.id);
+        assert!(kin_index::is_parse_coverage_relation(&old, file, artifact));
+        assert!(kin_index::is_parse_coverage_relation(&new, file, artifact));
+        assert_ne!(old.evidence, new.evidence);
+        coverage_paths.insert(file.to_string());
+    }
+    assert_eq!(
+        coverage_paths,
+        ["scripts/tool.py".into(), "src/lib.rs".into()].into()
+    );
 
     let deltas = deltas_by_representative_path(&report);
     assert_eq!(deltas.len(), 12);

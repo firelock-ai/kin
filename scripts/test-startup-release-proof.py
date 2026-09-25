@@ -88,6 +88,40 @@ for label in ('legacy-fixed', 'recorded-fixed'):
             del changed['semantic_debt'][index]
             refuses(lambda: profile(fixture, changed, label), 'receipt profile changed')
 
+# The debt a daemon is held to is read from repository authority. `owed` runs the
+# candidate CLI's `kin graph owed --json` in the fixture and returns every
+# workspace's records, and refuses a failed read or a ledger of another schema.
+calls = []
+ledger = {'schema': 'kin.graph.owed-derivations.v1', 'workspaces': [
+    {'records': [{'path': 'orphan.py', 'body': 'b' * 64, 'cause': 'legacy'}]},
+    {'records': [{'path': None, 'path_hex': 'ff', 'body': 'c' * 64, 'cause': 'publication'}]}]}
+outcome = {'returncode': 0, 'ledger': ledger}
+def fake_run(command, cwd, env, capture_output, text, timeout):
+    calls.append((command, cwd, env))
+    return types.SimpleNamespace(returncode=outcome['returncode'],
+                                 stdout=json.dumps(outcome['ledger']), stderr='refused by fixture')
+owed_ns = {'subprocess': types.SimpleNamespace(run=fake_run), 'json': json,
+           'kin': Path('/owned/kin'), 'fixture': Path('/owned/fixture'),
+           'env': {'PATH': '/usr/bin', 'HOME': '/owned/home', 'TMPDIR': '/owned/home'}}
+owed = load_function(ROOT / 'probe_startup_binary.py', 'owed', owed_ns)
+assert [record['path'] for record in owed()] == ['orphan.py', None]
+assert calls[-1][:2] == (['/owned/kin', 'graph', 'owed', '--json'], Path('/owned/fixture'))
+assert calls[-1][2] is owed_ns['env'], 'the ledger read must run in the probe environment'
+outcome['returncode'] = 1
+refuses(owed, 'kin graph owed refused')
+outcome['returncode'] = 0
+outcome['ledger'] = dict(ledger, schema='kin.graph.owed-derivations.v0')
+refuses(owed, 'unexpected owed ledger schema')
+source = (ROOT / 'probe_startup_binary.py').read_text()
+for key in ('debt_before_stop', 'debt_after_stop'):
+    assert f"result['{key}'] = owed()" in source, key
+    assert f"result['{key}'] = legacy_debt()" not in source, key
+assert "result['debt_before_start'] = legacy_debt()" in source
+assert "result['owed_before_start'] = owed()" in source
+# The fixtures still ship their original bytes: the manifest pins them, and the
+# runner must hand the probe the candidate CLI it reads the ledger with.
+assert '"--kin", str(args.kin.resolve())' in (ROOT / 'run.py').read_text()
+
 # Evaluate the actual candidate environment assignments with credential canaries.
 import os
 for name in ('run.py', 'probe_startup_binary.py'):

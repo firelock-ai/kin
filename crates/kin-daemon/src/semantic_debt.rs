@@ -1,10 +1,10 @@
-//! Paths whose exact bytes reached authority without their semantics, recorded
-//! against the body identity the parse is owed for.
+//! Paths whose exact bytes reached authority without their semantics, and the
+//! body each one's parse is owed for.
 //!
 //! # Why this exists
 //!
-//! A disposable session publishes a complete exact tree of its own. The bytes
-//! become graph authority, and nothing parses them, so the derived graph keeps
+//! A standalone tree publication moves a workspace's exact bytes into
+//! authority, and nothing parses them there, so the derived graph keeps
 //! answering about those files at the positions the previous parse recorded.
 //! The commit that follows cannot notice: it forces one complete admission,
 //! that admission plans its transition from a working copy the publication has
@@ -13,57 +13,55 @@
 //! seventeen lines left the whole file answering seventeen lines short, under an
 //! envelope with nothing to report.
 //!
-//! The publication re-derives the semantics on the spot, which fixes the live
-//! daemon. It does not survive a restart. Entities reach durable authority only
-//! inside a semantic change, a session reconcile deliberately publishes the
-//! workspace tree with no history and no ref move, and a derived-graph mutation
-//! that no change carries is gone when the next daemon replays that history.
-//! Measured rather than assumed: a daemon reopened between the session's edit
-//! and its commit read the pre-edit span back, and a synchronous
-//! `save_snapshot` immediately after the re-derivation did not change that.
+//! The daemon re-derives the semantics on the spot, which fixes the live graph.
+//! It does not survive a restart: entities reach durable authority only inside
+//! a semantic change, and a derived-graph mutation that no change carries is
+//! gone when the next daemon replays that history. So something has to outlive
+//! the daemon and tell the next one, and the next commit, which parse is owed.
 //!
-//! So something has to outlive the daemon and tell the next commit it owes a
-//! parse. That is what this file records.
+//! # Where the record lives
 //!
-//! # Why it is bound to a hash
+//! In repository authority, as the workspace's owed derivation ledger. The
+//! standalone publication records what it owes inside its own compare-and-swap,
+//! so a record is durable exactly when the bytes it describes are, and a
+//! refused publication records nothing. A daemon commit pays the workspace's
+//! records inside its own commit, because a commit derives its change from the
+//! live graph the drain brought current. Every other transaction that moves a
+//! path off an owed body overtakes that record in storage. Nothing here writes
+//! a file or decides anything by a file's identity.
+//!
+//! # Why it is bound to a body
 //!
 //! A path alone cannot say whether the debt is still real. The working copy
-//! moves on, other writers publish over the same path, and a commit lands. A
-//! path plus the body the parse is owed for answers all three. An entry whose
-//! tree no longer names that body describes either an overtaken transition or
-//! an unpublished proposal. Standalone publication records its proposal before
-//! authority moves, retaining the current owed body beside it. Only the exact
-//! identity that the tree no longer owes can be settled.
+//! moves on, other writers publish over the same path, and a commit lands. The
+//! ledger binds each record to the exact body its parse is owed for, and a
+//! record drives re-derivation only while the answering graph lacks a
+//! parse-coverage certificate bound to that body.
 //!
-//! # Why a file under the store root
+//! # The records earlier builds kept
 //!
-//! Every read and write here is ingestion IO at an explicit boundary, never a
-//! semantic answer: the record says which paths are owed a parse, and the parse
-//! itself reads graph-owned CAS. The two durable markers that already serve this
-//! path, `unpublished-enrichment.json` and the LSP-enriched marker, are sidecar
-//! JSON under the same root, and the graph exposes no general metadata surface
-//! to hang a third one from.
-//!
-//! # Who settles it
-//!
-//! The commit that publishes, and only after its transaction reaches authority.
-//! A commit derives its change from the live graph, so everything the drain put
-//! back into that graph reaches history with it. Settling at the drain instead
-//! would clear the record for a parse the next crash could still lose.
+//! A daemon from an earlier build kept these records in `semantic-debt.json`
+//! and the paths it derived entities for in `unpublished-enrichment.json`,
+//! beside the store. They are migration inputs and nothing more. This build's
+//! first start judges each entry against authority and the answering graph,
+//! re-derives what is still owed in that start's pass, carries it into the
+//! ledger on this daemon's next authority transaction, and removes both files
+//! once that transaction is durable. A crash before then repeats the judgment,
+//! which only reads authority and adds.
 
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use kin_index::{FileClassification, FileClassifier};
-use kin_model::{RepoPath, TreeEntry};
-use serde::{Deserialize, Serialize};
+use kin_model::{Hash256, RepoPath, TreeEntry};
+use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::state::DaemonState;
 
-/// One path owed a parse, and the body it is owed for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One path owed a parse, and the body it is owed for, as this daemon reads it
+/// out of its workspace's owed derivation ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticDebt {
     /// The repository path, in its UTF-8 rendering. A path with no UTF-8
     /// rendering carries no semantic identity and is never recorded.
@@ -72,22 +70,22 @@ pub(crate) struct SemanticDebt {
     pub(crate) body: String,
 }
 
-/// Ingestion IO: the record of what is owed, under the store root.
-///
-/// The root is read from the daemon's own layout here rather than taken as a
-/// parameter, the way the sibling markers in `loop_runner` and `daemon` read
-/// it, so the only path this module ever opens is a constant join under a root
-/// the daemon bound at open and nothing a caller passes can reach the join.
-fn marker_path(state: &DaemonState) -> PathBuf {
-    state.layout.root().join("semantic-debt.json")
+impl SemanticDebt {
+    fn from_record(record: &kin_db::OwedDerivation) -> Option<Self> {
+        Some(Self {
+            path: record.path().as_utf8()?.to_string(),
+            body: record.body().to_string(),
+        })
+    }
 }
 
-/// Every path one publication moved, paired with the body it published there.
+/// Every path one publication moved, paired with the body it published there,
+/// in the form the publication's own commit records them.
 ///
 /// Removals and the vacated half of a rename carry no body to parse and are
 /// skipped, as are symlinks and Gitlinks, which are never source owned by the
 /// link path.
-pub(crate) fn owed_by(deltas: &[kin_model::TreeDelta]) -> Vec<SemanticDebt> {
+pub(crate) fn owed_by(deltas: &[kin_model::TreeDelta]) -> Vec<(RepoPath, Hash256)> {
     let mut owed = Vec::new();
     for delta in deltas {
         let Some(new) = delta.new_state() else {
@@ -104,9 +102,9 @@ pub(crate) fn owed_by(deltas: &[kin_model::TreeDelta]) -> Vec<SemanticDebt> {
         // is written by the same admission that publishes its bytes, so there is
         // no deferred derivation for a later drain to perform.
         //
-        // Recording one anyway is not merely waste. Nothing but a commit settles
-        // a debt entry, and the install proof never commits, so such an entry is
-        // owed on every later reconcile tick. Each drain hands the path to
+        // Recording one anyway is not merely waste. Nothing but a commit pays a
+        // record, and the install proof never commits, so such an entry is owed
+        // on every later reconcile tick. Each drain hands the path to
         // `readmit_semantics_for_paths`, whose non-source branch re-persists the
         // facet, and kin-db's artifact upsert calls `invalidate_artifact_for_embedding`,
         // which REMOVES the artifact's vector and re-queues it. The store then
@@ -123,187 +121,425 @@ pub(crate) fn owed_by(deltas: &[kin_model::TreeDelta]) -> Vec<SemanticDebt> {
         ) {
             continue;
         }
-        owed.push(SemanticDebt {
-            path: path.to_string(),
-            body: hash.to_string(),
-        });
+        #[cfg(test)]
+        if RECORD_NOTHING_FOR_TEST.get() {
+            continue;
+        }
+        owed.push((new.path.clone(), hash));
     }
     owed
 }
 
-/// Merge `owed` into the record, replacing any earlier entry for the same path.
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that stands in for a build from before the ledger, whose
+    /// standalone publications recorded nothing in authority.
+    static RECORD_NOTHING_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `work` as a build from before the ledger would: every standalone
+/// publication it makes on this thread records no owed parse.
+#[cfg(test)]
+pub(crate) fn recording_nothing<T>(work: impl FnOnce() -> T) -> T {
+    RECORD_NOTHING_FOR_TEST.set(true);
+    let outcome = work();
+    RECORD_NOTHING_FOR_TEST.set(false);
+    outcome
+}
+
+/// Every record this daemon's workspace owes, read from the current authority
+/// through its per-publication cache.
 ///
-/// A failed write is reported and never fatal. The record makes a loss
-/// recoverable; a store that cannot write it is no worse off than one built
-/// before this existed, and refusing a durable publication over it would trade a
-/// recoverable gap for an unrecoverable refusal.
-pub(crate) fn record(state: &DaemonState, owed: &[SemanticDebt]) {
-    if owed.is_empty() {
-        return;
-    }
-    let mut entries = outstanding(state);
-    entries.retain(|entry| !owed.iter().any(|fresh| fresh.path == entry.path));
-    entries.extend_from_slice(owed);
-    write(state, &entries);
-}
-
-/// Prepare recoverable semantics before a standalone tree publication.
+/// For a caller that must not act on an absence it could not read: an
+/// authority that will not open is an error here, never an empty record.
 ///
-/// The current body remains owed until authority moves. Keep it beside the
-/// proposed body so a refused or interrupted publication cannot erase an
-/// earlier unpaid parse. Do not retire any identity here: another publisher
-/// can move authority between this write and the publication compare-and-swap.
-/// The next drain or a successful semantic commit settles obsolete records.
-pub(crate) fn record_before_standalone_publication(
-    state: &DaemonState,
-    owed: &[SemanticDebt],
-) -> std::io::Result<()> {
-    if owed.is_empty() {
-        return Ok(());
-    }
-    let marker = marker_path(state);
-    let mut entries: Vec<SemanticDebt> = match std::fs::read(&marker) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error),
-    };
-    for entry in owed {
-        if !entries.contains(entry) {
-            entries.push(entry.clone());
-        }
-    }
-    write_checked(state, &entries)
+/// The first read after a publication this daemon has not loaded opens the
+/// whole store, so it never holds a runtime worker while it does. The
+/// admission that plans the next transition shares that load.
+pub(crate) fn outstanding_checked(state: &DaemonState) -> crate::error::Result<Vec<SemanticDebt>> {
+    let records =
+        crate::loop_runner::off_the_runtime_worker(|| crate::api::cached_owed_derivations(state))
+            .map_err(|(_status, message)| {
+            crate::error::DaemonError::Io(std::io::Error::other(format!(
+                "could not read the owed derivation ledger from repository authority: {message}"
+            )))
+        })?;
+    Ok(records
+        .iter()
+        .filter_map(SemanticDebt::from_record)
+        .collect())
 }
 
-fn write_checked(state: &DaemonState, entries: &[SemanticDebt]) -> std::io::Result<()> {
-    let marker = marker_path(state);
-    let bytes = serde_json::to_vec(entries).map_err(std::io::Error::other)?;
-    let temporary = state
-        .layout
-        .root()
-        .join(format!(".semantic-debt-{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let result = (|| {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, &marker)?;
-        crate::state::sync_directory_metadata(state.layout.root())?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
-/// Read the record. An unreadable or unparseable one is treated as empty and
-/// said out loud, because the alternative is refusing every commit on the store.
+/// [`outstanding_checked`] for a caller that has nothing better to do with an
+/// unreadable authority than say so: the failure is logged and read as empty.
 pub(crate) fn outstanding(state: &DaemonState) -> Vec<SemanticDebt> {
-    let marker = marker_path(state);
-    let Ok(bytes) = std::fs::read(&marker) else {
-        return Vec::new();
-    };
-    match serde_json::from_slice::<Vec<SemanticDebt>>(&bytes) {
-        Ok(entries) => entries,
+    match outstanding_checked(state) {
+        Ok(records) => records,
         Err(error) => {
             warn!(
-                marker = %marker.display(),
                 error = %error,
-                "the semantic-debt record will not parse, so a path whose bytes moved without \
-                 their semantics stays stale until it is edited again"
+                "could not read the owed derivation ledger, so a path whose bytes moved without \
+                 their semantics is not named from it"
             );
             Vec::new()
         }
     }
 }
 
-/// Split a record into what is still owed and what a later transition overtook.
+/// The paths among `entries` whose parse is still owed to the graph that
+/// answers.
 ///
-/// Owed means the tree still names the exact body the debt was recorded for. A
-/// path the tree no longer carries, or carries at a different body, does not
-/// owe that parse. The entry may describe an overtaken body or a proposal that
-/// never reached authority; only that exact debt identity is spent.
-pub(crate) fn partition_against_tree(
+/// Owed means the tree still names the exact body the record was made for and
+/// the answering graph holds no clean parse of that body. The ledger drops a
+/// record whose body the authority tree no longer names, so a record whose body
+/// this graph's tree does not name describes a transition the graph is ahead of
+/// authority on; this graph parses its own bytes, and that record is not owed
+/// here.
+///
+/// A record whose body the answering graph already parsed is not re-derived.
+/// It is not paid either, because only a commit pays: after `kin upgrade`
+/// every body the upgrade derived carries a certificate bound to it, so a
+/// daemon start no longer re-derives what the store already holds, and the same
+/// bytes published again over a later commit's parse are owed again.
+pub(crate) fn owed_against_tree(
     state: &DaemonState,
     entries: &[SemanticDebt],
-) -> (BTreeSet<RepoPath>, Vec<SemanticDebt>) {
+) -> BTreeSet<RepoPath> {
     let tree = state.graph.resolved_tree();
     let mut owed = BTreeSet::new();
-    let mut spent = Vec::new();
     for entry in entries {
         let Ok(repo_path) = RepoPath::from_utf8(entry.path.clone()) else {
-            spent.push(entry.clone());
             continue;
         };
-        let still_owed =
+        let names_body =
             tree.artifact_at_path(&repo_path)
                 .is_some_and(|artifact| match artifact.entry {
                     TreeEntry::Blob { hash, .. } => hash.to_string() == entry.body,
                     _ => false,
                 });
-        if still_owed {
+        if names_body && !answering_graph_parsed(state, &tree, &repo_path) {
             owed.insert(repo_path);
-        } else {
-            spent.push(entry.clone());
         }
     }
-    (owed, spent)
+    owed
 }
 
-/// Drop exact debt identities, retaining another owed body at the same path.
-pub(crate) fn settle(state: &DaemonState, spent: &[SemanticDebt]) {
-    if spent.is_empty() {
-        return;
-    }
-    let mut entries = outstanding(state);
-    let before = entries.len();
-    entries.retain(|entry| !spent.contains(entry));
-    if entries.len() == before {
-        return;
-    }
-    write(state, &entries);
-}
-
-/// Clear the whole record.
+/// Name source whose bytes reached authority and whose parse is still owed.
 ///
-/// Called once a commit's transaction reaches authority. A commit derives its
-/// change from the live graph, so every parse the drain put back into that graph
-/// is in history by the time this runs, and nothing the record named is still
-/// owed. The coordination gate spans both the publication that records a debt
-/// and the commit that clears it, so nothing can be recorded in between and lost
-/// here.
-pub(crate) fn settle_all(state: &DaemonState) {
-    let marker = marker_path(state);
-    match std::fs::remove_file(&marker) {
-        Ok(()) => debug!(
-            marker = %marker.display(),
-            "a commit published every re-derived parse, so the semantic-debt record is spent"
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => warn!(
-            marker = %marker.display(),
-            error = %error,
-            "could not clear the semantic-debt record; the next commit re-parses paths that are \
-             already published, which costs time and loses nothing"
-        ),
+/// A complete admission records untracked host paths as empty once the tree
+/// holds them. That zero is stamped, so a later reading is not due, and the
+/// durability block then compares entity counts that cannot see a file nobody
+/// has parsed. The result is `recorded` over a module the working copy holds.
+///
+/// These paths are already in the tree, so they are not in the untracked scan
+/// and they do not belong in its count either. The first cut of this
+/// disclosure added them to `untracked_path_count`, which reaches the agent as
+/// paths that "have never been admitted" with `kin admit` as the remedy: the
+/// gap was real and both the label and the lever were wrong. They get their
+/// own count, and the surfaces that read it say what actually clears it.
+///
+/// A record the answering graph has already parsed is not one of them. The
+/// ambient admission that records it re-derives the file into the live graph
+/// on the spot, so its entities are in the counts the durability block
+/// compares, and a surplus there already reads `live_uncommitted`. Counting
+/// that path as well withdrew the reading to `unknown`, over the very write the
+/// block exists to disclose. What the record says of such a path is that the
+/// next commit owes its parse to durable authority, which is the same fact.
+///
+/// Read from the records this daemon already holds, never through a store
+/// open: `/health` answers inside a two-second probe budget. They are the
+/// newest the daemon has loaded or written, and every standalone publication
+/// it makes writes its own, so what a publication owes is disclosed from the
+/// moment it lands. Records a later commit paid or overtook can still be held
+/// for a moment; the tree and certificate checks below drop them.
+///
+/// The sample cap matches the untracked probe. The count is the full set.
+pub(crate) fn disclose_underived_source(
+    state: &DaemonState,
+    report: &mut kin_cli::commands::resources::ReconcileHealth,
+) {
+    let Some(records) = crate::api::held_owed_derivations(state) else {
+        return;
+    };
+    let recorded: Vec<SemanticDebt> = records
+        .iter()
+        .filter_map(SemanticDebt::from_record)
+        .collect();
+    let owed = owed_against_tree(state, &recorded);
+    if owed.is_empty() {
+        return;
+    }
+    report.underived_path_count = report
+        .underived_path_count
+        .saturating_add(owed.len() as u64);
+    const SAMPLE_LIMIT: usize = 5;
+    for path in owed {
+        if report.underived_paths_sample.len() >= SAMPLE_LIMIT {
+            break;
+        }
+        let named = path.to_string();
+        if !report
+            .underived_paths_sample
+            .iter()
+            .any(|existing| existing == &named)
+        {
+            report.underived_paths_sample.push(named);
+        }
     }
 }
 
-fn write(state: &DaemonState, entries: &[SemanticDebt]) {
-    if entries.is_empty() {
-        settle_all(state);
+/// Whether the live graph holds a clean parse of the exact body the tree names
+/// at `path`.
+///
+/// Read off the file's parse-coverage certificate, which is the graph's own
+/// record of the bytes a file's semantics came from. The live reconcile binds it
+/// to the blob it parsed, writes it for a file that declares nothing as much as
+/// for one that declares plenty, and writes none for a parse that did not read
+/// the file cleanly. A certificate bound to an earlier body, or none at all,
+/// leaves the path owed.
+fn answering_graph_parsed(
+    state: &DaemonState,
+    tree: &kin_model::ResolvedTree,
+    path: &RepoPath,
+) -> bool {
+    let Some(artifact) = tree.artifact_at_path(path) else {
+        return false;
+    };
+    let TreeEntry::Blob { hash, .. } = artifact.entry else {
+        return false;
+    };
+    let Some(file) = path.as_utf8() else {
+        return false;
+    };
+    // The certificate's identity depends on the artifact alone, so building an
+    // empty one is how its id is named without restating the factory's rule.
+    let certificate = kin_index::build_parse_coverage_relation(
+        &kin_index::FileParseData {
+            file_path: file.to_string(),
+            entities: Vec::new(),
+            relations: Vec::new(),
+            imports: Vec::new(),
+        },
+        artifact.artifact_id,
+        &kin_model::ParseCompleteness::Full,
+        &std::collections::HashSet::<String>::new(),
+    )
+    .id;
+    state
+        .graph
+        .get_relation_by_id(&certificate)
+        .is_some_and(|relation| {
+            kin_index::is_parse_coverage_relation(&relation, file, artifact.artifact_id)
+                && kin_index::parse_coverage_source_digest(&relation) == Some(hash)
+        })
+}
+
+/// Where a daemon from an earlier build kept the parses it owed.
+///
+/// A constant join under the root the daemon bound at open, so nothing a
+/// caller passes can reach it.
+fn legacy_debt_path(state: &DaemonState) -> PathBuf {
+    state.layout.root().join("semantic-debt.json")
+}
+
+/// Where a daemon from an earlier build kept the paths it derived entities
+/// for and could not have published.
+fn legacy_enrichment_path(state: &DaemonState) -> PathBuf {
+    state.layout.root().join("unpublished-enrichment.json")
+}
+
+/// What one legacy record file held when this build read it.
+pub(crate) enum LegacyRecord<T> {
+    /// No earlier build left the file.
+    Absent,
+    /// Every entry the file held.
+    Entries(Vec<T>),
+    /// The file is there and does not read as the record it names, so which
+    /// work it held is unknown. Treated as owing everything it could name,
+    /// never as owing nothing.
+    Unknown(String),
+}
+
+impl<T> LegacyRecord<T> {
+    pub(crate) fn is_present(&self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyDebtEntry {
+    path: String,
+    body: String,
+}
+
+/// Ingestion IO at the migration boundary: the owed parses an earlier build's
+/// daemon recorded beside the store.
+pub(crate) fn read_legacy_debt(state: &DaemonState) -> LegacyRecord<SemanticDebt> {
+    let marker = legacy_debt_path(state);
+    let bytes = match std::fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LegacyRecord::Absent;
+        }
+        Err(error) => return LegacyRecord::Unknown(format!("{}: {error}", marker.display())),
+    };
+    match serde_json::from_slice::<Vec<LegacyDebtEntry>>(&bytes) {
+        Ok(entries) => LegacyRecord::Entries(
+            entries
+                .into_iter()
+                .map(|entry| SemanticDebt {
+                    path: entry.path,
+                    body: entry.body,
+                })
+                .collect(),
+        ),
+        Err(error) => LegacyRecord::Unknown(format!("{}: {error}", marker.display())),
+    }
+}
+
+/// Ingestion IO at the migration boundary: the paths an earlier build's daemon
+/// derived entities for and no commit had published when it stopped.
+///
+/// Judged against graph truth by the startup planner, never trusted as it
+/// stands, and never written by this build.
+pub(crate) fn read_legacy_enrichment(state: &DaemonState) -> LegacyRecord<String> {
+    let marker = legacy_enrichment_path(state);
+    let bytes = match std::fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LegacyRecord::Absent;
+        }
+        Err(error) => return LegacyRecord::Unknown(format!("{}: {error}", marker.display())),
+    };
+    match serde_json::from_slice::<Vec<String>>(&bytes) {
+        Ok(paths) => LegacyRecord::Entries(paths),
+        Err(error) => LegacyRecord::Unknown(format!("{}: {error}", marker.display())),
+    }
+}
+
+/// Judge the owed parses an earlier build recorded against this daemon's
+/// graph, which at startup is the durable authority's.
+///
+/// An entry survives while the tree names its exact body and the graph holds
+/// no certificate bound to that body. A file that will not read owes, for all
+/// this build can tell, every entity-source body the graph has no certificate
+/// for, so that is what it is judged to owe.
+pub(crate) fn judge_legacy_debt(
+    state: &DaemonState,
+    record: &LegacyRecord<SemanticDebt>,
+) -> Vec<(RepoPath, Hash256)> {
+    let tree = state.graph.resolved_tree();
+    let candidates: Vec<(RepoPath, Hash256)> = match record {
+        LegacyRecord::Absent => return Vec::new(),
+        LegacyRecord::Entries(entries) => entries
+            .iter()
+            .filter_map(|entry| {
+                let path = RepoPath::from_utf8(entry.path.clone()).ok()?;
+                let body = Hash256::from_hex(&entry.body).ok()?;
+                Some((path, body))
+            })
+            .collect(),
+        LegacyRecord::Unknown(why) => {
+            warn!(
+                record = %why,
+                "an earlier build's owed-parse record will not read, so every source body this \
+                 graph holds no parse certificate for is treated as owed"
+            );
+            tree.artifacts_by_path()
+                .filter_map(|artifact| {
+                    let TreeEntry::Blob { hash, .. } = artifact.entry else {
+                        return None;
+                    };
+                    let path = artifact.path.as_utf8()?;
+                    matches!(
+                        FileClassifier::classify(Path::new(path)),
+                        FileClassification::EntitySource
+                    )
+                    .then(|| (artifact.path.clone(), hash))
+                })
+                .collect()
+        }
+    };
+    candidates
+        .into_iter()
+        .filter(|(path, body)| {
+            tree.artifact_at_path(path).is_some_and(
+                |artifact| matches!(artifact.entry, TreeEntry::Blob { hash, .. } if hash == *body),
+            ) && !answering_graph_parsed(state, &tree, path)
+        })
+        .collect()
+}
+
+/// Hold what the legacy records still owe until an authority transaction of
+/// this daemon carries it, or remove the records now when they owe nothing.
+///
+/// `found` says whether either legacy file was there. A file whose every entry
+/// authority or the graph already accounts for carries no obligation this build
+/// lacks, so it goes at once.
+pub(crate) fn hold_legacy_carry(state: &DaemonState, found: bool, owed: Vec<(RepoPath, Hash256)>) {
+    if !found {
         return;
     }
-    if let Err(error) = write_checked(state, entries) {
-        warn!(
-            error = %error,
-            "could not persist the semantic-debt record, so a daemon restart before the \
-             next commit would leave these paths answering at their previous positions"
-        );
+    if owed.is_empty() {
+        remove_legacy_records(state);
+        return;
+    }
+    debug!(
+        paths = owed.len(),
+        "holding what an earlier build's records still owe for this daemon's next authority \
+         transaction"
+    );
+    if let Ok(mut carry) = state.legacy_owed_derivations.lock() {
+        *carry = Some(owed);
+    }
+}
+
+/// What the legacy records still owe, for the next authority transaction to
+/// carry into the ledger.
+pub(crate) fn legacy_carry(state: &DaemonState) -> Vec<(RepoPath, Hash256)> {
+    state
+        .legacy_owed_derivations
+        .lock()
+        .ok()
+        .and_then(|carry| carry.clone())
+        .unwrap_or_default()
+}
+
+/// An authority transaction that carried or paid what the legacy records owed
+/// is durable, so the records themselves have nothing left to say.
+///
+/// Called only after that transaction's receipt, never before: a daemon that
+/// stops earlier leaves the files for the next start to judge again.
+pub(crate) fn legacy_carried(state: &DaemonState) {
+    let pending = state
+        .legacy_owed_derivations
+        .lock()
+        .ok()
+        .and_then(|mut carry| carry.take());
+    if pending.is_some() {
+        remove_legacy_records(state);
+    }
+}
+
+/// Ingestion IO at the migration boundary: remove both legacy record files.
+///
+/// A removal that fails is reported and not retried here. The next start
+/// judges the file again against an authority that already holds what it
+/// carried, and adds nothing twice.
+fn remove_legacy_records(state: &DaemonState) {
+    for marker in [legacy_debt_path(state), legacy_enrichment_path(state)] {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => debug!(
+                marker = %marker.display(),
+                "removed an earlier build's owed-work record, whose work authority now holds"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                marker = %marker.display(),
+                error = %error,
+                "could not remove an earlier build's owed-work record; the next start judges it \
+                 again against authority, which already holds what it carried"
+            ),
+        }
     }
 }

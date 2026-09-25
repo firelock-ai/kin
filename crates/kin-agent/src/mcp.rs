@@ -246,7 +246,11 @@ impl McpClient {
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
+                // The model reads an entity's exact source and sends its whole
+                // new body back through `kin_mutate`, so this harness asks for
+                // exact bodies whatever the server's profile would present.
+                // kin-mcp reads the flag as `entity_lines::EXACT_BODIES_CAPABILITY`.
+                "capabilities": { "experimental": { "kin": { "exactEntityBodies": true } } },
                 "clientInfo": { "name": "kin-agent", "version": env!("CARGO_PKG_VERSION") },
             }),
         )?;

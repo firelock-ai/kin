@@ -176,6 +176,103 @@ fn modified_pairs(delta: &TransactionDelta) -> Vec<(&Entity, &Entity)> {
         .collect()
 }
 
+#[test]
+fn a_single_imported_decorator_is_owned_by_its_declaration() {
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "mod.py",
+        "from foreign import wrap\n\n@wrap\ndef run():\n    return 1\n",
+    );
+    repo.reopen();
+    repo.commit(
+        "mod.py",
+        "from foreign import wrap\n\n@wrap\ndef run():\n    return 2\n",
+    );
+}
+
+#[test]
+fn repeated_names_keep_separate_imported_call_occurrences() {
+    let mut repo = LiveRepo::new();
+    let source = "from foreign import step\n\ndef run():\n    return step(1)\n\ndef run():\n    return step(2)\n";
+    repo.commit("mod.py", source);
+    for reopen in [false, true] {
+        if reopen {
+            repo.reopen();
+            repo.commit("mod.py", source);
+        }
+        let declarations: Vec<_> = repo
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .filter(|entity| entity.name == "run")
+            .collect();
+        assert_eq!(declarations.len(), 2);
+        for declaration in declarations {
+            let edges = repo
+                .graph
+                .get_all_relations_for_entity(&declaration.id)
+                .unwrap();
+            let calls: Vec<_> = edges
+                .iter()
+                .filter(|edge| {
+                    edge.src.as_entity() == Some(declaration.id)
+                        && edge.kind == RelationKind::Calls
+                        && edge.import_source.as_deref() == Some("foreign")
+                })
+                .collect();
+            assert_eq!(calls.len(), 1, "each declaration owns its imported call");
+            assert_eq!(
+                calls[0]
+                    .evidence
+                    .iter()
+                    .map(|row| row.occurrence_count)
+                    .sum::<u32>(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn adding_and_removing_decorators_preserves_existing_function_identity() {
+    let plain = "from foreign import wrap\n\ndef run():\n    return 1\n";
+    let decorated = plain.replace("\n\ndef", "\n@wrap\ndef");
+    let mut repo = LiveRepo::new();
+    repo.commit("mod.py", plain);
+    let identity = repo
+        .graph
+        .list_all_entities()
+        .unwrap()
+        .into_iter()
+        .find(|entity| entity.name == "run")
+        .unwrap()
+        .id;
+    for source in [&decorated, plain] {
+        repo.reopen();
+        repo.commit("mod.py", source);
+        let current = repo
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "run")
+            .unwrap();
+        assert_eq!(current.id, identity);
+        let calls = repo
+            .graph
+            .get_all_relations_for_entity(&identity)
+            .unwrap()
+            .into_iter()
+            .filter(|edge| {
+                edge.src.as_entity() == Some(identity)
+                    && edge.import_source.as_deref() == Some("foreign")
+            })
+            .count();
+        assert_eq!(calls, usize::from(source.contains("@wrap")));
+    }
+}
+
 /// The defect exactly as FIR-2479 reports it: an edit that touches no member of
 /// a same-name group still rotates the group's members onto each other, and the
 /// rotation surfaces as breaking-change findings that contradict one another.
@@ -703,9 +800,30 @@ fn a_planner_retained_rename_keeps_identity_with_a_same_signature_sibling() {
     let sibling = render_bodies(&repo)["render_str(value)"].clone();
     repo.reopen();
 
-    // Parse real CAS bytes, then retain the chosen entity id as a semantic
-    // rename planner does. Remap its relation and layout references as well.
+    // Parse real CAS bytes, then retain the chosen entity id through the step
+    // the semantic rename planner runs. It remaps the declaration's relations
+    // with their occurrence certificates, and its layout references.
     let hash = repo.blobs.write(edited.as_bytes()).expect("rename source");
+    let path = RepoPath::from_utf8("mod.py").unwrap();
+    let artifact_id = repo
+        .graph
+        .artifact_id_at_path(&path)
+        .expect("held artifact");
+    let old_entry = repo
+        .graph
+        .get_tree_entry(&kin_model::FilePathId::new("mod.py"))
+        .unwrap()
+        .expect("held source");
+    repo.graph
+        .apply_transaction_delta(&TransactionDelta {
+            tree_deltas: vec![TreeDelta::Updated {
+                artifact_id,
+                old: LocatedEntry::new(path.clone(), old_entry),
+                new: LocatedEntry::new(path, TreeEntry::blob(Hash256::from_bytes(hash.0), false)),
+            }],
+            ..TransactionDelta::default()
+        })
+        .expect("admit exact planner source under its retained artifact");
     let mut indexed = kin_index::IndexPipeline::new()
         .index_file_content_with_tests(
             &kin_model::FilePathId::new("mod.py"),
@@ -714,37 +832,24 @@ fn a_planner_retained_rename_keeps_identity_with_a_same_signature_sibling() {
         )
         .expect("real parser")
         .indexed_file;
-    let renamed = indexed
+    let parser_id = indexed
         .entities
-        .iter_mut()
+        .iter()
         .find(|entity| {
             entity.name == "render"
                 && entity.span.as_ref().is_some_and(|span| {
                     edited[span.start_byte..span.end_byte].contains("render_int(value)")
                 })
         })
-        .expect("parsed renamed declaration");
-    let parser_id = renamed.id;
+        .expect("parsed renamed declaration")
+        .id;
     assert_ne!(
         parser_id, old.id,
         "a rename must retain an explicit, non-parser id"
     );
-    renamed.id = old.id;
-    for relation in &mut indexed.relations {
-        if relation.src == GraphNodeId::Entity(parser_id) {
-            relation.src = GraphNodeId::Entity(old.id);
-        }
-        if relation.dst == GraphNodeId::Entity(parser_id) {
-            relation.dst = GraphNodeId::Entity(old.id);
-        }
-    }
-    for region in &mut indexed.file_layout.regions {
-        if let kin_model::SourceRegion::EntityRef { entity_id, .. } = region {
-            if *entity_id == parser_id {
-                *entity_id = old.id;
-            }
-        }
-    }
+    indexed
+        .retain_entity_identity(parser_id, old.id)
+        .expect("retain the planner's chosen identity");
     let result = repo
         .reconciler
         .reconcile_indexed_content(&indexed, &repo.blobs, &repo.graph)

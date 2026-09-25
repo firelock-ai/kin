@@ -1661,28 +1661,37 @@ fn write_vector_index_metadata(
 }
 
 #[cfg(feature = "vector")]
-fn current_embedding_runtime_fields() -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<usize>,
-) {
+fn current_embedding_runtime_fields(
+    graph: Option<&InMemoryGraph>,
+) -> Result<
+    (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<usize>,
+    ),
+    KinDbError,
+> {
     #[cfg(feature = "embeddings")]
     {
-        let runtime = crate::embed::configured_embedding_runtime();
-        return (
+        let runtime = match graph.and_then(InMemoryGraph::loaded_embedding_runtime) {
+            Some(runtime) => runtime,
+            None => crate::embed::resolved_embedding_runtime()?,
+        };
+        return Ok((
             Some(runtime.provider),
             Some(runtime.model_id),
             Some(runtime.revision),
             Some(runtime.pipeline_epoch),
             runtime.dimensions,
-        );
+        ));
     }
 
     #[cfg(not(feature = "embeddings"))]
     {
-        (None, None, None, None, None)
+        let _ = graph;
+        Ok((None, None, None, None, None))
     }
 }
 
@@ -1722,6 +1731,15 @@ pub enum VectorSidecarDisposition {
     /// it, so the pair was archived aside and nothing was installed. `reason`
     /// carries what the index itself reported.
     ArchivedIncompatibleIndex { reason: String },
+    /// The same contradiction, met by an open that may not write: nothing was
+    /// installed and the pair was left exactly where it was. `reason` carries
+    /// what the index itself reported.
+    ///
+    /// A read-only open is a reader of another process's store, such as a CLI
+    /// command beside a live daemon, and what it read may be a pair that
+    /// process was replacing at that moment. Moving it aside would rename the
+    /// owner's files out from under it, so only the owner archives.
+    RefusedIncompatibleIndex { reason: String },
 }
 
 /// What a persisted vector-index sidecar load did to a store's coverage.
@@ -1804,7 +1822,16 @@ fn classify_vector_sidecar(
 ) -> SidecarVerdict {
     #[cfg(feature = "embeddings")]
     {
-        let runtime = crate::embed::configured_embedding_runtime();
+        let runtime = match crate::embed::resolved_embedding_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return SidecarVerdict::Refuse {
+                    check: "embedding_runtime_identity",
+                    stored: metadata.embedding_model_id.clone(),
+                    current: error.to_string(),
+                };
+            }
+        };
         if metadata.embedding_provider != runtime.provider {
             return SidecarVerdict::Refuse {
                 check: "embedding_provider",
@@ -1814,7 +1841,13 @@ fn classify_vector_sidecar(
         }
         if metadata.embedding_model_id != runtime.model_id {
             return SidecarVerdict::Refuse {
-                check: "embedding_model_id",
+                check: if crate::embed::is_local_content_identity(&runtime.model_id)
+                    && !crate::embed::is_local_content_identity(&metadata.embedding_model_id)
+                {
+                    "legacy_local_model_content_unproven"
+                } else {
+                    "embedding_model_id"
+                },
                 stored: metadata.embedding_model_id.clone(),
                 current: runtime.model_id,
             };
@@ -1910,6 +1943,21 @@ fn archive_incompatible_index(vector_path: &Path, metadata_path: &Path) {
             );
         }
     }
+}
+
+/// Who is loading a vector sidecar, which decides what the load may do to the
+/// files it finds.
+#[cfg(feature = "vector")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidecarLoader {
+    /// The process that owns the store. An index that contradicts the
+    /// metadata beside it is archived aside, so it is neither served nor
+    /// detected again on every open.
+    Owner,
+    /// A reader of a store another process may own, such as a CLI command
+    /// beside a live daemon. It never archives, renames or writes: an index
+    /// that contradicts its metadata is refused and left where it is.
+    ReadOnly,
 }
 
 /// Outcome of a single incremental embed-progress flush
@@ -2192,7 +2240,8 @@ impl SnapshotManager {
         embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let vector_path = vector_index_path_for(path);
-        if graph.vector_index_stats().is_none() {
+        let index_stats = graph.vector_index_stats();
+        if index_stats.is_none() {
             // No index is loaded for this graph. A graph-only save must not
             // manufacture an unbound empty vector artifact. If an older
             // sidecar exists, leave its exact bytes and metadata untouched;
@@ -2201,8 +2250,39 @@ impl SnapshotManager {
         };
 
         let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
-            current_embedding_runtime_fields();
+            current_embedding_runtime_fields(Some(graph))?;
         let stored_descriptor = graph.vector_index_descriptor();
+        #[cfg(feature = "embeddings")]
+        if model_id
+            .as_deref()
+            .is_some_and(crate::embed::is_local_content_identity)
+            && index_stats.is_some_and(|(_, indexed)| indexed > 0)
+            && stored_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.model_id.as_ref())
+                .is_none()
+        {
+            return Err(KinDbError::StorageError(
+                "refusing to assign a local model content identity to unproven existing vectors"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "embeddings")]
+        if let (Some(current), Some(stored)) = (
+            model_id.as_deref(),
+            stored_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.model_id.as_deref()),
+        ) {
+            if (crate::embed::is_local_content_identity(current)
+                || crate::embed::is_local_content_identity(stored))
+                && current != stored
+            {
+                return Err(KinDbError::StorageError(
+                    "refusing to relabel a vector index with a different local model content identity".into(),
+                ));
+            }
+        }
         let model_id = model_id
             .or_else(|| stored_descriptor.and_then(|descriptor| descriptor.model_id))
             .filter(|value| !value.is_empty())
@@ -2370,6 +2450,7 @@ impl SnapshotManager {
         retrieval_authority_hash: [u8; 32],
         write_missing_metadata: bool,
         expected_embedder_identity: Option<&str>,
+        loader: SidecarLoader,
     ) -> Result<VectorSidecarLoadOutcome, KinDbError> {
         let vector_path = vector_index_path_for(path);
         // Read once, before anything can create or archive it: a caller cannot
@@ -2531,19 +2612,33 @@ impl SnapshotManager {
         ) {
             crate::vector::IndexLoadOutcome::Loaded(index) => index,
             crate::vector::IndexLoadOutcome::Incompatible(reason) => {
-                tracing::warn!(
-                    path = %vector_path.display(),
-                    check = "index_self_description",
-                    reason = %reason,
-                    "LOUD WARNING: archiving incompatible vector index (its self-description contradicts the sidecar metadata beside it) and rebuilding"
-                );
-                archive_incompatible_index(&vector_path, &metadata_path);
+                let disposition = match loader {
+                    SidecarLoader::Owner => {
+                        tracing::warn!(
+                            path = %vector_path.display(),
+                            check = "index_self_description",
+                            reason = %reason,
+                            "LOUD WARNING: archiving incompatible vector index (its self-description contradicts the sidecar metadata beside it) and rebuilding"
+                        );
+                        archive_incompatible_index(&vector_path, &metadata_path);
+                        VectorSidecarDisposition::ArchivedIncompatibleIndex { reason }
+                    }
+                    SidecarLoader::ReadOnly => {
+                        tracing::warn!(
+                            path = %vector_path.display(),
+                            check = "index_self_description",
+                            reason = %reason,
+                            "refusing incompatible vector index (its self-description contradicts the sidecar metadata beside it); this open is read-only, so the pair is left in place"
+                        );
+                        VectorSidecarDisposition::RefusedIncompatibleIndex { reason }
+                    }
+                };
                 if write_missing_metadata {
                     graph.queue_missing_for_embedding();
                     graph.queue_missing_artifacts_for_embedding();
                 }
                 return Ok(VectorSidecarLoadOutcome {
-                    disposition: VectorSidecarDisposition::ArchivedIncompatibleIndex { reason },
+                    disposition,
                     durable_coverage_before_load,
                     ..Default::default()
                 });
@@ -2558,19 +2653,33 @@ impl SnapshotManager {
         );
         if let Err(error) = shape_validation {
             let reason = error.to_string();
-            tracing::warn!(
-                path = %vector_path.display(),
-                check = "decoded_shape",
-                reason = %reason,
-                "LOUD WARNING: archiving incompatible vector index because its declared shape does not match its decoded contents"
-            );
-            archive_incompatible_index(&vector_path, &metadata_path);
+            let disposition = match loader {
+                SidecarLoader::Owner => {
+                    tracing::warn!(
+                        path = %vector_path.display(),
+                        check = "decoded_shape",
+                        reason = %reason,
+                        "LOUD WARNING: archiving incompatible vector index because its declared shape does not match its decoded contents"
+                    );
+                    archive_incompatible_index(&vector_path, &metadata_path);
+                    VectorSidecarDisposition::ArchivedIncompatibleIndex { reason }
+                }
+                SidecarLoader::ReadOnly => {
+                    tracing::warn!(
+                        path = %vector_path.display(),
+                        check = "decoded_shape",
+                        reason = %reason,
+                        "refusing incompatible vector index because its declared shape does not match its decoded contents; this open is read-only, so the pair is left in place"
+                    );
+                    VectorSidecarDisposition::RefusedIncompatibleIndex { reason }
+                }
+            };
             if write_missing_metadata {
                 graph.queue_missing_for_embedding();
                 graph.queue_missing_artifacts_for_embedding();
             }
             return Ok(VectorSidecarLoadOutcome {
-                disposition: VectorSidecarDisposition::ArchivedIncompatibleIndex { reason },
+                disposition,
                 durable_coverage_before_load,
                 ..Default::default()
             });
@@ -2717,6 +2826,34 @@ impl SnapshotManager {
             retrieval_authority_hash,
             false,
             expected_embedder_identity,
+            SidecarLoader::Owner,
+        )
+    }
+
+    /// [`Self::load_vector_index_into_graph_if_valid`] for a process that does
+    /// not own the store, such as a read-only CLI open beside a live daemon.
+    ///
+    /// It validates and installs exactly as the owner's load does, and it never
+    /// archives, renames or writes. An index that contradicts the metadata
+    /// beside it is refused and left in place, and the outcome says so with
+    /// [`VectorSidecarDisposition::RefusedIncompatibleIndex`]. The owner's load
+    /// archives that pair instead, and this one used to as well: a CLI read
+    /// that caught the daemon's pair mid-replacement renamed the daemon's new
+    /// pair aside.
+    #[cfg(feature = "vector")]
+    pub fn load_vector_index_into_graph_if_valid_read_only(
+        graph: &InMemoryGraph,
+        snapshot_path: &Path,
+        expected_embedder_identity: Option<&str>,
+    ) -> Result<VectorSidecarLoadOutcome, KinDbError> {
+        let retrieval_authority_hash = graph.retrieval_authority_hash();
+        Self::load_vector_index_if_valid(
+            snapshot_path,
+            graph,
+            retrieval_authority_hash,
+            false,
+            expected_embedder_identity,
+            SidecarLoader::ReadOnly,
         )
     }
 
@@ -2724,6 +2861,16 @@ impl SnapshotManager {
     /// so the outcome reports an unattached load with no durable coverage.
     #[cfg(not(feature = "vector"))]
     pub fn load_vector_index_into_graph_if_valid(
+        _graph: &InMemoryGraph,
+        _snapshot_path: &Path,
+        _expected_embedder_identity: Option<&str>,
+    ) -> Result<VectorSidecarLoadOutcome, KinDbError> {
+        Ok(VectorSidecarLoadOutcome::default())
+    }
+
+    /// Feature-disabled stub of the read-only load: nothing to load.
+    #[cfg(not(feature = "vector"))]
+    pub fn load_vector_index_into_graph_if_valid_read_only(
         _graph: &InMemoryGraph,
         _snapshot_path: &Path,
         _expected_embedder_identity: Option<&str>,
@@ -2846,7 +2993,13 @@ impl SnapshotManager {
                 Self::invalidate_locate_cache(path)?;
             }
 
+            // A read-only open cleared nothing above, and it must not write
+            // below either: the index under this path can be another
+            // process's, and a writing open archives what it cannot read.
             let graph = match text_index_path {
+                Some(text_path) if !skip_text_index && read_only => {
+                    InMemoryGraph::with_text_index_read_only(text_path.clone())
+                }
                 Some(text_path) if !skip_text_index => {
                     InMemoryGraph::with_text_index(text_path.clone())
                 }
@@ -2913,6 +3066,11 @@ impl SnapshotManager {
                 retrieval_authority_hash,
                 !read_only,
                 None,
+                if read_only {
+                    SidecarLoader::ReadOnly
+                } else {
+                    SidecarLoader::Owner
+                },
             )?;
         }
 
@@ -2989,6 +3147,7 @@ impl SnapshotManager {
                     retrieval_authority_hash,
                     false,
                     None,
+                    SidecarLoader::ReadOnly,
                 )?;
             }
             return Ok((graph, generation));
@@ -3027,7 +3186,14 @@ impl SnapshotManager {
         #[cfg(feature = "vector")]
         {
             let retrieval_authority_hash = graph.retrieval_authority_hash();
-            Self::load_vector_index_if_valid(path, &graph, retrieval_authority_hash, false, None)?;
+            Self::load_vector_index_if_valid(
+                path,
+                &graph,
+                retrieval_authority_hash,
+                false,
+                None,
+                SidecarLoader::ReadOnly,
+            )?;
         }
 
         Ok((graph, generation))
@@ -3805,7 +3971,7 @@ mod tests {
         embedder_identity: &str,
     ) -> VectorIndexMetadata {
         let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
-            current_embedding_runtime_fields();
+            current_embedding_runtime_fields(None).unwrap();
         VectorIndexMetadata {
             version: VectorIndexMetadata::VERSION,
             graph_root_hash: hex::encode(graph_root_hash),
@@ -3831,7 +3997,7 @@ mod tests {
         index: &VectorIndex,
         vector_path: &Path,
     ) {
-        let (_, runtime_model_id, _, _, _) = current_embedding_runtime_fields();
+        let (_, runtime_model_id, _, _, _) = current_embedding_runtime_fields(None).unwrap();
         let descriptor = crate::vector::IndexDescriptor {
             model_id: Some(runtime_model_id.unwrap_or_else(|| "test-model".to_string())),
             graph_root: Some(hex::encode(graph.retrieval_authority_hash())),
@@ -4888,6 +5054,57 @@ mod tests {
         );
     }
 
+    /// A read-only open of a store with no authority yet reads the text index
+    /// beside it read-only.
+    ///
+    /// It used to open that index for writing even on the read-only path, and
+    /// a writing open archives what it cannot read, so a missing segment was
+    /// enough for a reader to rename a manifest it does not own.
+    #[test]
+    fn read_only_open_without_authority_moves_nothing_in_the_text_index() {
+        fn index_files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .map(|entry| {
+                    (
+                        entry.file_name().to_str().unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let text_path = text_index_dir_for(&snapshot_path).unwrap();
+        {
+            let index = crate::search::TextIndex::open(Some(&text_path)).unwrap();
+            for n in 0..8 {
+                index.upsert(&test_entity(&format!("unowned_{n}"))).unwrap();
+            }
+            index.commit().unwrap();
+        }
+        let segment = index_files(&text_path)
+            .into_keys()
+            .find(|name| name.contains(".kinseg-") && !name.ends_with(".kinseg-manifest"))
+            .expect("the committed index is segmented");
+        std::fs::remove_file(text_path.join(&segment)).unwrap();
+        let before = index_files(&text_path);
+        assert!(before.keys().any(|name| name.ends_with(".kinseg-manifest")));
+
+        let opened = SnapshotManager::open_read_only(&snapshot_path).unwrap();
+        assert_eq!(opened.graph().entity_count(), 0);
+        let after = index_files(&text_path);
+        assert!(
+            after == before,
+            "a read-only open changed the text index: before {:?}, after {:?}",
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn open_without_text_index_skips_text_index_rebuild() {
         let dir = TempDir::new().unwrap();
@@ -4907,7 +5124,7 @@ mod tests {
 
         let stats = warm_graph.graph_stats();
         assert_eq!(stats.total_entities, 1);
-        assert_eq!(stats.text_indexed_entity_count, 0);
+        assert_eq!(stats.text_indexed_entity_count, Some(0));
     }
 
     #[test]
@@ -6459,6 +6676,213 @@ mod tests {
         );
     }
 
+    /// Real graph callers must preserve the unavailable published text image,
+    /// then carry pending graph edits through recovery and a new process.
+    #[test]
+    fn published_text_readback_failure_preserves_graph_edits_on_cold_reopen() {
+        const CHILD_ROOT: &str = "KIN_DB_TEXT_READBACK_REOPEN_ROOT";
+        const TEST_NAME: &str = "storage::snapshot::tests::published_text_readback_failure_preserves_graph_edits_on_cold_reopen";
+
+        fn index_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .map(|entry| {
+                    (
+                        entry.file_name().to_str().unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let snapshot_path = root.join("graph.kndb");
+            let text_path = text_index_dir_for(&snapshot_path).unwrap();
+            let (expected, removed, expected_root): (Vec<Entity>, EntityId, [u8; 32]) =
+                serde_json::from_slice(&std::fs::read(root.join("expected.json")).unwrap())
+                    .unwrap();
+            let before = index_bytes(&text_path);
+            let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+            let graph = reopened.graph();
+            assert_eq!(graph.retrieval_authority_hash(), expected_root);
+            assert_eq!(graph.entity_count(), expected.len());
+            assert!(graph.get_entity(&removed).unwrap().is_none());
+            for entity in &expected {
+                let actual = graph.get_entity(&entity.id).unwrap().unwrap();
+                assert_eq!(actual.name, entity.name);
+                assert_eq!(actual.signature, entity.signature);
+            }
+            let persisted = crate::search::TextIndex::open_read_only(Some(&text_path)).unwrap();
+            assert_eq!(persisted.graph_root_hash(), Some(expected_root));
+            assert_eq!(persisted.live_document_count(), expected.len());
+            let rebuilt = InMemoryGraph::from_snapshot(graph.to_snapshot()).unwrap();
+            for query in ["proof", "arrival"] {
+                let actual = graph.text_search(query, 100).unwrap();
+                let control = rebuilt.text_search(query, 100).unwrap();
+                let mut actual_ids: Vec<_> = actual.into_iter().map(|(id, _)| id).collect();
+                let mut control_ids: Vec<_> = control.into_iter().map(|(id, _)| id).collect();
+                actual_ids.sort();
+                control_ids.sort();
+                assert!(
+                    !actual_ids.is_empty(),
+                    "query {query} must exercise actual retrieval"
+                );
+                assert_eq!(actual_ids, control_ids, "query {query}");
+            }
+            assert!(
+                index_bytes(&text_path) == before,
+                "cold reopen must preserve every persisted index byte"
+            );
+            std::fs::write(
+                root.join("child-verified"),
+                b"exact graph and persisted index verified\n",
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let text_path = text_index_dir_for(&snapshot_path).unwrap();
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let originals: Vec<_> = (0..16)
+            .map(|n| test_entity(&format!("proof_original_{n}")))
+            .collect();
+        for entity in &originals {
+            graph.upsert_entity(entity).unwrap();
+        }
+        mgr.save().unwrap();
+        assert_eq!(
+            graph.text_search("proof", 100).unwrap().len(),
+            originals.len()
+        );
+        let initial_root = graph.retrieval_authority_hash();
+        let segment_names: Vec<_> = index_bytes(&text_path)
+            .into_keys()
+            .filter(|name| name.contains(".kinseg-") && !name.ends_with(".kinseg-manifest"))
+            .collect();
+        assert!(
+            segment_names.len() > 1,
+            "exercise a segmented persisted store"
+        );
+        let missing = text_path.join(&segment_names[0]);
+        let saved_segment = std::fs::read(&missing).unwrap();
+        std::fs::remove_file(&missing).unwrap();
+
+        // Changing actual repository authority without a text-document delta
+        // forces a carry-only mapped commit, independent of entity hash routing.
+        graph.admit_artifact_for_test(
+            "compose.yaml",
+            TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+        );
+        let root = graph.retrieval_authority_hash();
+        assert_ne!(root, initial_root);
+        let error = graph.persist_text_index_with_root_hash(root).unwrap_err();
+        let published = index_bytes(&text_path);
+        assert!(published
+            .keys()
+            .any(|name| name.ends_with(".kinseg-manifest")));
+        assert!(!published.keys().any(|name| name.contains(".corrupt-")));
+        assert!(
+            error.to_string().contains("could not map it back"),
+            "{error}"
+        );
+        assert!(graph
+            .text_search("proof", 100)
+            .unwrap_err()
+            .to_string()
+            .contains("search is refused"));
+        assert_eq!(
+            graph.entity_count(),
+            originals.len(),
+            "derived failure cannot drop authority"
+        );
+
+        let added = test_entity("proof_arrival");
+        let removed = originals[0].id;
+        graph.upsert_entity(&added).unwrap();
+        graph.remove_entity(&removed).unwrap();
+        let error = graph.flush_text_index().unwrap_err();
+        assert!(
+            error.to_string().contains("still cannot be mapped back"),
+            "{error}"
+        );
+        assert!(
+            index_bytes(&text_path) == published,
+            "failed graph flush must preserve every committed index byte"
+        );
+        assert!(graph.get_entity(&added.id).unwrap().is_some());
+        assert!(graph.get_entity(&removed).unwrap().is_none());
+        assert!(graph.text_search("arrival", 100).is_err());
+
+        std::fs::write(&missing, saved_segment).unwrap();
+        graph
+            .flush_text_index()
+            .expect("retry must keep the pending upsert and removal");
+        let arrival = graph.text_search("arrival", 100).unwrap();
+        assert_eq!(arrival.len(), 1);
+        assert_eq!(arrival[0].0, RetrievalKey::Entity(added.id));
+        assert!(!graph
+            .text_search("proof", 100)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == RetrievalKey::Entity(removed)));
+        mgr.save().unwrap();
+        let final_root = graph.retrieval_authority_hash();
+        let mut expected: Vec<_> = originals
+            .into_iter()
+            .filter(|entity| entity.id != removed)
+            .collect();
+        expected.push(added);
+        std::fs::write(
+            dir.path().join("expected.json"),
+            serde_json::to_vec(&(expected, removed, final_root)).unwrap(),
+        )
+        .unwrap();
+        drop(graph);
+        drop(mgr);
+
+        let stdout_path = dir.path().join("child.stdout");
+        let stderr_path = dir.path().join("child.stderr");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ROOT, dir.path())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned cold-reopen child exceeded 15 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "child {status}: stdout={} stderr={}",
+            std::fs::read_to_string(stdout_path).unwrap(),
+            std::fs::read_to_string(stderr_path).unwrap()
+        );
+        eprintln!(
+            "cold-reopen child {status}: {}",
+            std::fs::read_to_string(dir.path().join("child.stdout")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("child-verified")).unwrap(),
+            b"exact graph and persisted index verified\n"
+        );
+    }
+
     #[test]
     fn save_updates_text_index_root_hash_even_without_entity_changes() {
         let dir = TempDir::new().unwrap();
@@ -7142,6 +7566,94 @@ mod tests {
         assert_eq!(graph.vector_actual_producers(), before);
     }
 
+    /// A read-only load of a vector index that contradicts its metadata refuses
+    /// it and moves nothing, on both refusal paths: bytes that are not the
+    /// index the metadata describes, and a declared shape the decoded contents
+    /// do not match.
+    ///
+    /// Both read-only routes are checked: a read-only `SnapshotManager` open,
+    /// which loads the sidecar itself, and the explicit read-only load the CLI
+    /// makes over a daemon bootstrap. The owner's open of the same bytes
+    /// archives them, which is the control that the first half is about the
+    /// mode and not the fixture.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn a_read_only_vector_load_refuses_an_incompatible_index_and_moves_nothing() {
+        for corrupt_bytes in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let snapshot_path = dir.path().join("graph.kndb");
+            let vector_path = vector_index_path_for(&snapshot_path);
+            let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+            let mgr = SnapshotManager::new(&snapshot_path);
+            let graph = mgr.graph();
+            let entity = test_entity("read_only_vector_owner");
+            graph.upsert_entity(&entity).unwrap();
+            let vectors = VectorIndex::new(4).unwrap();
+            vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+            mgr.save().unwrap();
+            drop(graph);
+            drop(mgr);
+
+            if corrupt_bytes {
+                std::fs::write(&vector_path, b"garbage: not a vector index").unwrap();
+            } else {
+                let mut metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+                metadata.indexed = 2;
+                write_vector_index_metadata(&metadata_path, &metadata).unwrap();
+            }
+            let pair = || {
+                (
+                    std::fs::read(&vector_path).unwrap(),
+                    std::fs::read(&metadata_path).unwrap(),
+                )
+            };
+            let before = pair();
+            let case = if corrupt_bytes {
+                "unreadable index bytes"
+            } else {
+                "declared shape mismatch"
+            };
+
+            let reader = SnapshotManager::open_read_only(&snapshot_path).unwrap();
+            assert_eq!(
+                reader.graph().embedding_status().indexed,
+                0,
+                "{case}: a contradicting index is never installed"
+            );
+            let outcome = SnapshotManager::load_vector_index_into_graph_if_valid_read_only(
+                reader.graph().as_ref(),
+                &snapshot_path,
+                None,
+            )
+            .unwrap();
+            assert!(!outcome.attached, "{case}: {outcome:?}");
+            assert!(
+                matches!(
+                    outcome.disposition,
+                    VectorSidecarDisposition::RefusedIncompatibleIndex { .. }
+                ),
+                "{case}: a read-only load reports the contradiction: {outcome:?}"
+            );
+            assert!(
+                pair() == before,
+                "{case}: a read-only load must not move or rewrite the pair"
+            );
+            assert!(!archived_sidecar_path(&vector_path).exists(), "{case}");
+            assert!(!archived_sidecar_path(&metadata_path).exists(), "{case}");
+            drop(reader);
+
+            let owner = SnapshotManager::open(&snapshot_path).unwrap();
+            assert_eq!(owner.graph().embedding_status().indexed, 0, "{case}");
+            assert!(
+                archived_sidecar_path(&vector_path).exists(),
+                "{case}: the control, the owner archives these same bytes"
+            );
+            assert!(!vector_path.exists(), "{case}");
+        }
+    }
+
     #[test]
     #[cfg(feature = "vector")]
     fn sidecar_replacement_before_attach_refuses_and_preserves_served_index() {
@@ -7412,6 +7924,113 @@ mod tests {
             "a foreign-space sidecar is preserved in place"
         );
         assert!(!archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// Exercise the persisted product path without loading inference. The
+    /// child process isolates environment selection from parallel unit tests.
+    #[test]
+    #[cfg(all(feature = "vector", feature = "embeddings"))]
+    fn local_model_content_identity_reopen_reuses_and_refuses_unproven_vectors() {
+        const CHILD: &str = "KIN_TEST_LOCAL_MODEL_IDENTITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::snapshot::tests::local_model_content_identity_reopen_reuses_and_refuses_unproven_vectors",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("HF_HUB_OFFLINE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let model = dir.path().join("linux-swerank-location");
+        let moved = dir.path().join("native-location");
+        crate::embed::write_test_local_model(&model);
+        std::env::set_var("KIN_EMBED_PROVIDER", "local");
+        std::env::set_var("KIN_EMBED_MODEL_ID", &model);
+        std::env::set_var("KIN_EMBED_MODEL_REVISION", "original-label");
+        let path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&path);
+        let metadata_path = vector_index_metadata_path_for(&path);
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let entity = test_entity("portable-vector-owner");
+        graph.upsert_entity(&entity).unwrap();
+        let index = VectorIndex::new(2).unwrap();
+        index.upsert(entity.id, &[1.0, 0.0]).unwrap();
+        install_current_test_vector_index(&graph, &index, &vector_path);
+        mgr.save().unwrap();
+        let metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+        assert!(crate::embed::is_local_content_identity(
+            &metadata.embedding_model_id
+        ));
+        let before_index = std::fs::read(&vector_path).unwrap();
+        let before_metadata = std::fs::read(&metadata_path).unwrap();
+        drop(graph);
+        drop(mgr);
+
+        std::fs::rename(&model, &moved).unwrap();
+        std::env::set_var("KIN_EMBED_MODEL_ID", &moved);
+        std::env::set_var("KIN_EMBED_MODEL_REVISION", "different-provenance-label");
+        let reopened = SnapshotManager::open(&path).unwrap();
+        assert_eq!(reopened.graph().embedding_status().indexed, 1);
+        assert_eq!(reopened.graph().pending_embeddings(), 0);
+        assert_eq!(std::fs::read(&vector_path).unwrap(), before_index);
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), before_metadata);
+        drop(reopened);
+
+        // Same location and revision label, different weights: preserve the
+        // old pair and queue only because its content identity really changed.
+        std::fs::write(moved.join("model.safetensors"), b"changed-weights").unwrap();
+        let changed = SnapshotManager::open(&path).unwrap();
+        assert_eq!(changed.graph().embedding_status().indexed, 0);
+        assert_eq!(changed.graph().pending_embeddings(), 1);
+        assert_eq!(std::fs::read(&vector_path).unwrap(), before_index);
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), before_metadata);
+        drop(changed);
+
+        // An internally coherent old v4 pair contains only the old locator.
+        // Even matching caller revision labels cannot prove historical bytes.
+        let mut legacy = metadata;
+        legacy.embedding_model_id = "/retired/model-location".into();
+        legacy.embedding_model_revision = "different-provenance-label".into();
+        index
+            .save_with_provenance(
+                &vector_path,
+                Some(crate::vector::IndexDescriptor {
+                    model_id: Some(legacy.embedding_model_id.clone()),
+                    graph_root: Some(legacy.graph_root_hash.clone()),
+                }),
+                |receipt| {
+                    legacy.index_binding_sha256 = hex::encode(receipt.index_binding_sha256);
+                    write_vector_index_metadata(&metadata_path, &legacy)
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            classify_vector_sidecar(&legacy, [0; 32], None),
+            SidecarVerdict::Refuse {
+                check: "legacy_local_model_content_unproven",
+                ..
+            }
+        ));
+        let legacy_index = std::fs::read(&vector_path).unwrap();
+        let legacy_metadata = std::fs::read(&metadata_path).unwrap();
+        let legacy_open = SnapshotManager::open(&path).unwrap();
+        assert_eq!(legacy_open.graph().embedding_status().indexed, 0);
+        assert_eq!(legacy_open.graph().pending_embeddings(), 1);
+        assert_eq!(std::fs::read(&vector_path).unwrap(), legacy_index);
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), legacy_metadata);
     }
 
     /// "Model swap on a live repo": an index that positively declares a DIFFERENT

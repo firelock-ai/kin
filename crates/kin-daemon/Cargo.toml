@@ -48,6 +48,7 @@ kin-mcp = { workspace = true }
 kin-review = { workspace = true }
 kin-remote = { workspace = true, features = ["http"] }
 axum = { workspace = true }
+http-body = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -103,8 +104,11 @@ kin-migrate = { workspace = true }
 # real FirestoreSpineBackend over a fake transport rather than a second
 # implementation of the CAS semantics.
 kin-spine = { workspace = true, features = ["test-support"] }
-http-body = "1"
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+# `full` does not carry `test-util`, so paused time for a deadline test needs it
+# named here: a sibling's dev dependency unifies it only into that sibling's
+# own test build.
+tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }

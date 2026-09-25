@@ -531,3 +531,42 @@ fn a_partial_name_reaching_several_entities_is_asked_about_not_guessed() {
         assert!(error.contains(&twin.id.to_string()), "{error}");
     }
 }
+
+/// The five twins answer disjoint caller sets. Each file calls the
+/// `human_bytes` it defines, so each definition's callers are exactly the one
+/// caller in its own file, read the way `kin refs` reads them.
+///
+/// Without a language server the linker used to link a call that resolved in
+/// its own file to every same-named definition elsewhere as well, so each of
+/// the five answered all five callers, including callers in files that cannot
+/// reach it. Pinning each twin in turn is what makes the sets comparable: an
+/// unpinned query answers about one twin and would hide the other four.
+#[test]
+fn each_twin_answers_only_the_caller_in_its_own_file() {
+    let graph = twins_graph(&FILES);
+    let own_callers = [
+        ("src/byte_fmt.rs", "memory_line"),
+        ("src/cache.rs", "print_status"),
+        ("src/init_attempt.rs", "doctor_row"),
+        ("src/memory_pressure.rs", "describe"),
+        ("src/spawn.rs", "cause_sentence"),
+    ];
+    for (file, own_caller) in own_callers {
+        let refs = refs_response(&graph, &format!("human_bytes@{file}"));
+        assert!(refs.error.is_none(), "{:?}", refs.lines);
+        let answer = refs.lines.join("\n");
+        assert!(
+            answer.contains(&format!("  {own_caller} @ {file}")),
+            "the twin in {file} is called by {own_caller} beside it: {answer}"
+        );
+        for (other_file, other_caller) in own_callers {
+            if other_file == file {
+                continue;
+            }
+            assert!(
+                !answer.contains(&format!("  {other_caller} @ ")),
+                "{other_caller} calls the twin in {other_file}, not the one in {file}: {answer}"
+            );
+        }
+    }
+}

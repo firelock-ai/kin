@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashSet};
 use kin_index::RelationResolution;
 use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
-use kin_model::ids::{EntityId, RepoPath, SemanticChangeId};
+use kin_model::ids::{EntityId, SemanticChangeId};
 use kin_model::provenance::{Actor, ActorId, ActorKind, Approval, ApprovalDecision, AuditEvent};
 use kin_model::relation::{GraphNodeId, Relation, RelationKind};
 use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
@@ -40,11 +40,18 @@ fn entity_identity_key(entity: &Entity) -> (String, String, String) {
 /// by construction, so a ref-scoped implementation cannot be misused to
 /// mutate graph state.
 pub trait ImpactGraph {
-    /// Whether graph-owned parser coverage proves every entity-bearing source
-    /// file was parsed fully. The default is fail-closed so implementations of
+    /// Whether graph-owned parser coverage proves complete source coverage for
+    /// this view. The default is fail-closed so implementations of
     /// the older public trait remain source-compatible without certifying new
     /// rename-neutralization behavior accidentally.
     fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+        Ok(false)
+    }
+
+    /// Complete call-shape reasoning additionally needs checked prior-local
+    /// binding evidence. Older and historical implementations stay unproven
+    /// until they can establish that prerequisite for their selected view.
+    fn call_shape_binding_prerequisites_complete(&self) -> Result<bool, ReviewError> {
         Ok(false)
     }
 
@@ -79,68 +86,156 @@ pub trait ImpactGraph {
 /// graph state.
 pub struct LiveGraph<'a, G>(pub &'a G);
 
-impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
-    fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
-        let layouts = self.0.list_file_layouts().map_err(ReviewError::graph)?;
-        let entities = self.0.list_all_entities().map_err(ReviewError::graph)?;
-        let mut source_files = BTreeSet::new();
+fn live_call_shape_coverage_with_tree_read<G: GraphStore>(
+    graph: &G,
+    read_tree: impl FnMut() -> Result<Option<kin_model::ResolvedTree>, ReviewError>,
+) -> Result<bool, ReviewError> {
+    live_call_shape_prerequisites_with_tree_read(graph, read_tree, false)
+}
 
-        for layout in layouts {
-            if !matches!(
-                layout.parse_completeness,
-                kin_model::ParseCompleteness::Full
-            ) {
-                return Ok(false);
-            }
-            source_files.insert(layout.file_id.0);
+fn live_call_shape_prerequisites_with_tree_read<G: GraphStore>(
+    graph: &G,
+    mut read_tree: impl FnMut() -> Result<Option<kin_model::ResolvedTree>, ReviewError>,
+    require_binding: bool,
+) -> Result<bool, ReviewError> {
+    let binding_history = graph.binding_history_observation();
+    if require_binding
+        && !matches!(
+            binding_history,
+            kin_model::BindingHistoryObservation::Checked { .. }
+        )
+    {
+        return Ok(false);
+    }
+    let Some(tree) = read_tree()? else {
+        return Ok(false);
+    };
+    let layouts = graph.list_file_layouts().map_err(ReviewError::graph)?;
+    let entities = graph.list_all_entities().map_err(ReviewError::graph)?;
+    let mut by_file: std::collections::BTreeMap<String, Vec<Entity>> =
+        std::collections::BTreeMap::new();
+    for entity in entities {
+        if let Some(file) = entity_file(&entity) {
+            by_file.entry(file).or_default().push(entity);
         }
-        for entity in entities {
-            if let Some(file) = entity.file_origin {
-                source_files.insert(file.0);
-            } else if let Some(span) = entity.span {
-                source_files.insert(span.file.0);
-            }
+    }
+    let mut source_files = BTreeSet::new();
+    for artifact in tree.artifacts_by_path() {
+        let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        // This boundary constructs a byte-exact path without reading the host.
+        // Classify before requiring UTF-8 so an unrelated non-source asset does
+        // not disable coverage merely because its filename is not Unicode.
+        let Ok(classification_path) =
+            kin_index::host_path_from_repo_path(std::path::Path::new(""), &artifact.path)
+        else {
+            return Ok(false);
+        };
+        // Completeness covers full semantic adapters. Non-source artifacts
+        // have no call-shape contract. A source-named binary may be excluded
+        // only by an opaque facet bound to these same admitted bytes.
+        if !matches!(
+            kin_index::FileClassifier::classify(&classification_path),
+            kin_index::FileClassification::EntitySource
+        ) {
+            continue;
         }
-
-        for file in source_files {
-            let Ok(path) = RepoPath::from_utf8(file.clone()) else {
-                return Ok(false);
-            };
-            let Some(artifact_id) = self.0.artifact_id_at_path(&path) else {
-                return Ok(false);
-            };
-            let artifact = GraphNodeId::Artifact(artifact_id);
-            let neighborhood = self
-                .0
-                .traverse(&artifact, &[RelationKind::DependsOn], 1)
+        let Some(file) = artifact.path.as_utf8() else {
+            return Ok(false);
+        };
+        if graph
+            .get_opaque_artifact(&kin_model::FilePathId::new(file))
+            .map_err(ReviewError::graph)?
+            .is_some_and(|opaque| opaque.content_hash == hash)
+        {
+            continue;
+        }
+        source_files.insert(file.to_string());
+        let declarations = by_file.get(file).map(Vec::as_slice).unwrap_or_default();
+        let digests: Vec<_> = declarations
+            .iter()
+            .map(kin_db::SourceEntityBinding::source_digest)
+            .collect();
+        let node = GraphNodeId::Artifact(artifact.artifact_id);
+        let neighborhood = graph.traverse(&node, &[], 1).map_err(ReviewError::graph)?;
+        let relations: Vec<_> = neighborhood.relations.iter().collect();
+        if !crate::source_derivation::inspect_file(
+            file,
+            artifact.artifact_id,
+            hash,
+            &digests,
+            &relations,
+        )
+        .complete
+        {
+            return Ok(false);
+        }
+        if require_binding {
+            use crate::source_derivation::{ExactBindingRecord, PriorLocalBindingStatus};
+            let exact = graph
+                .lookup_relation_by_id(&kin_index::binding_debt::local_binding_debt_id(
+                    artifact.artifact_id,
+                ))
                 .map_err(ReviewError::graph)?;
-            let mut full = false;
-            for relation in neighborhood
-                .relations
-                .iter()
-                .filter(|relation| relation.src == artifact)
-            {
-                for evidence in &relation.evidence {
-                    match evidence.parser_rule.as_deref() {
-                        Some(
-                            kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
-                            | kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
-                        ) => return Ok(false),
-                        Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1)
-                            if evidence.source_path.as_deref() == Some(file.as_str()) =>
-                        {
-                            full = true;
-                        }
-                        _ => {}
-                    }
+            let exact = match &exact {
+                kin_model::RelationLookup::Unavailable => ExactBindingRecord::Unavailable,
+                kin_model::RelationLookup::Absent => ExactBindingRecord::Absent,
+                kin_model::RelationLookup::Present(relation) => {
+                    ExactBindingRecord::Present(relation)
                 }
-            }
-            if !full {
+            };
+            if crate::source_derivation::inspect_local_binding(
+                file,
+                artifact.artifact_id,
+                hash,
+                &relations,
+                exact,
+                &binding_history,
+            )
+            .status
+                != PriorLocalBindingStatus::NoRecordedDebt
+            {
                 return Ok(false);
             }
         }
+    }
+    // Held source slices outside the current inventory are not current
+    // evidence either, including a source replaced by another artifact kind.
+    if by_file.keys().any(|file| !source_files.contains(file))
+        || layouts.iter().any(|layout| {
+            !source_files.contains(&layout.file_id.0)
+                || !matches!(
+                    layout.parse_completeness,
+                    kin_model::ParseCompleteness::Full
+                )
+        })
+    {
+        return Ok(false);
+    }
+    // Reads above are graph-only but not one transaction. Refuse a tree
+    // transition observed during the census rather than combine versions.
+    Ok(read_tree()?.as_ref() == Some(&tree)
+        && (!require_binding || graph.binding_history_observation() == binding_history))
+}
 
-        Ok(true)
+#[cfg(test)]
+#[path = "impact_freshness_tests.rs"]
+mod freshness_tests;
+
+impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
+    fn call_shape_binding_prerequisites_complete(&self) -> Result<bool, ReviewError> {
+        live_call_shape_prerequisites_with_tree_read(
+            self.0,
+            || self.0.resolved_tree_snapshot().map_err(ReviewError::graph),
+            true,
+        )
+    }
+
+    fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+        live_call_shape_coverage_with_tree_read(self.0, || {
+            self.0.resolved_tree_snapshot().map_err(ReviewError::graph)
+        })
     }
 
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
@@ -152,13 +247,17 @@ impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
         id: &EntityId,
         kinds: &[RelationKind],
     ) -> Result<Vec<Relation>, ReviewError> {
-        self.0.get_relations(id, kinds).map_err(ReviewError::graph)
+        let mut relations = self
+            .0
+            .get_relations(id, kinds)
+            .map_err(ReviewError::graph)?;
+        kin_index::relation_read::project_relations_for_read(self.0, &mut relations)
+            .map_err(ReviewError::graph)?;
+        Ok(relations)
     }
 
     fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, ReviewError> {
-        self.0
-            .get_all_relations_for_entity(id)
-            .map_err(ReviewError::graph)
+        kin_index::relation_read::relations_for_read(self.0, id).map_err(ReviewError::graph)
     }
 
     fn get_downstream_impact(
@@ -559,7 +658,8 @@ pub fn analyze_impact_at<I: ImpactGraph>(
     let mut seen_tests = HashSet::new();
 
     let mut entity_impacts: Vec<EntityImpact> = Vec::new();
-    let call_shape_parse_coverage_complete = graph.call_shape_parse_coverage_complete()?;
+    let call_shape_binding_prerequisites_complete =
+        graph.call_shape_binding_prerequisites_complete()?;
 
     for &entity_id in &changed_ids {
         // Per-entity inbound attribution accumulated alongside the global
@@ -598,7 +698,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // accumulate a distinct union only; iteration order never reaches output.
         let mut ent_caller_keyword_names: BTreeSet<String> = BTreeSet::new();
         let mut ent_any_var_keyword_caller = false;
-        let mut ent_all_consumers_shaped_calls = call_shape_parse_coverage_complete;
+        let mut ent_all_consumers_shaped_calls = call_shape_binding_prerequisites_complete;
 
         // Find relations pointing TO this entity (callers, dependents, etc.).
         // `get_relations` serves outgoing edges only, so the inbound harvest
@@ -648,7 +748,10 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 let is_derived = consumer_is_derived(&entity);
                 // Only a real consumer surface counts as a migrated consumer;
                 // a co-updated test or regenerated copy was never a break.
-                if !is_test && !is_derived {
+                if !is_test
+                    && !is_derived
+                    && !kin_index::resolution::is_derived_member_candidate(rel)
+                {
                     ent_migrated.insert(affected_id);
                 }
                 continue;
@@ -677,7 +780,9 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 if RelationResolution::of(&rel).is_proven() {
                     ent_proven_consumers.insert(affected_id);
                 }
-                if rel.kind == RelationKind::ConsumesContract {
+                if rel.kind == RelationKind::ConsumesContract
+                    && !kin_index::resolution::is_derived_member_candidate(rel)
+                {
                     ent_contract_consumers.insert(affected_id);
                 }
                 if let Some(file) = entity_file(&entity) {
@@ -696,7 +801,11 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                     if rel.evidence.is_empty() {
                         ent_all_consumers_shaped_calls = false;
                     }
-                    for evidence in &rel.evidence {
+                    let shape_records = kin_index::occurrence::call_shape_records(&rel);
+                    if shape_records.is_none() {
+                        ent_all_consumers_shaped_calls = false;
+                    }
+                    for evidence in shape_records.unwrap_or_default() {
                         match evidence.call_shape.as_ref() {
                             Some(shape) => {
                                 if evidence.parser_rule.as_deref()
@@ -900,7 +1009,9 @@ fn entity_file(entity: &Entity) -> Option<String> {
 /// counted one it was not already), and `role` is not part of entity identity,
 /// so this changes no persisted state.
 fn consumer_is_derived(entity: &Entity) -> bool {
-    if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored) {
+    if kin_model::is_derived_member(entity)
+        || matches!(entity.role, EntityRole::Generated | EntityRole::Vendored)
+    {
         return true;
     }
     entity_file(entity)
@@ -971,6 +1082,50 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    #[test]
+    fn derived_member_live_impact_does_not_count_proven_or_strong_consumers() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut target = entity_in_file("app.get", "members.js", 1);
+        target.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        let caller = entity_in_file("caller", "caller.js", 1);
+        let ordinary = entity_in_file("ordinary", "ordinary.js", 1);
+        for entity in [&target, &caller, &ordinary] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let mut contract = calls(&caller, &target);
+        contract.kind = RelationKind::ConsumesContract;
+        let mut overrides = calls(&caller, &target);
+        overrides.kind = RelationKind::Overrides;
+        for relation in [
+            calls(&caller, &target),
+            contract,
+            overrides,
+            calls(&caller, &ordinary),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target), modified(&ordinary)],
+            ..Default::default()
+        };
+        let report = analyze_impact(&graph, &diff).unwrap();
+        let candidate = report.entity_impact(&target.id).unwrap();
+        assert_eq!(candidate.proven_consumer_count, 0);
+        assert_eq!(candidate.strong_consumer_count, 0);
+        assert_eq!(candidate.contract_consumer_count, 0);
+        let control = report.entity_impact(&ordinary.id).unwrap();
+        assert_eq!(control.proven_consumer_count, 1);
+        assert_eq!(control.strong_consumer_count, 1);
+        let ranked = crate::ranked_impact::rank_impact(&graph, &target.id, 1).unwrap();
+        assert_eq!(ranked.candidates.len(), 1);
+        let row = &ranked.candidates[0];
+        assert_eq!(row.score_components.confidence_points, 30);
+        assert_eq!(row.path[0].confidence_basis_points, 3000);
+        assert_eq!(row.path[0].resolution, "name_only");
+        assert_ne!(row.path[0].relation_kind, RelationKind::Overrides);
     }
 
     #[test]
@@ -1173,6 +1328,12 @@ mod tests {
     }
 
     impl ImpactGraph for MockImpactGraph {
+        // These hand-built fixtures explicitly model the full proof boundary.
+        // Live and ref-scoped behavior is exercised separately.
+        fn call_shape_binding_prerequisites_complete(&self) -> Result<bool, ReviewError> {
+            Ok(true)
+        }
+
         fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
             Ok(true)
         }

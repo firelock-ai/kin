@@ -17,7 +17,7 @@ daemon if you were only proving the install works. Six sections follow, in that 
 
 ## Step 1: install the Kin CLI
 
-Start here. One command, identical on macOS, Linux, Windows and WSL, and it needs no domain:
+Start here. One command, identical on macOS, Linux and WSL2, and it needs no domain:
 
 ```sh
 npx -y @kinlab/kin setup --intent agent --no-interactive
@@ -59,9 +59,13 @@ irm https://get.kinlab.dev/install.ps1 | iex
 ```
 
 Native Windows x86_64 support is early: repository admission and graph, lexical, and
-daemon-backed queries work natively, filesystem projection does not ship there, and the
-end-to-end install proof does not yet cover MCP on native Windows. Prefer WSL2 and follow
-the Linux path inside it.
+daemon-backed queries work natively, and the end-to-end install proof runs agent setup and
+graph-backed MCP tool calls there, but filesystem projection does not ship there and review
+workflows have no native Windows tests yet. Prefer WSL2 and follow the Linux path inside
+it. The PowerShell installer installs the CLI and does not run `kin setup`, so on native
+Windows it connects no AI clients. Wire them from inside WSL2.
+There is no native Windows ARM64 build. On an ARM64 machine, x64 PowerShell installs the
+x86_64 build under emulation.
 
 From npm:
 
@@ -252,21 +256,24 @@ SHA-256, and caches the binaries per user:
 }
 ```
 
-Codex CLI uses TOML rather than JSON:
+Codex CLI uses TOML rather than JSON, and applies its config to every project, so its entry
+names one repository with `--repo`. Use the absolute path of the repository from step 2:
 
 ```toml
 [mcp_servers.kin]
 command = "npx"
-args = ["-y", "@kinlab/kin", "mcp", "start"]
+args = ["-y", "@kinlab/kin", "mcp", "start", "--repo", "/absolute/path/to/repository"]
 ```
 
-`kin setup status` and `kin doctor` recognize this exact shape and the absolute-path form
-above, and grade any other argument vector MISCONFIGURED. The older `@kinlab/kin-mcp`
-package keeps working for configurations that already name it. Run step 2 before you wire
-a client either way, because a client pointed at a directory with no graph gets a tool
-surface with nothing behind it. If you want the older wrapper to admit a repository on its
-own instead, add `"env": { "KIN_MCP_AUTO_INIT": "1" }` to the entry. Say so out loud before
-enabling it, because it means an agent session can admit a repository without being asked.
+`kin setup status` and `kin doctor` recognize these exact shapes and the absolute-path form
+above, and grade any other argument vector MISCONFIGURED. Run them inside the repository a
+Codex entry names, because that is the repository they compare its `--repo` against. The
+older `@kinlab/kin-mcp` package keeps working for configurations that already name it. Run
+step 2 before you wire a client either way, because a client pointed at a directory with no
+graph gets a tool surface with nothing behind it. If you want the older wrapper to admit a
+repository on its own instead, add `"env": { "KIN_MCP_AUTO_INIT": "1" }` to the entry. Say
+so out loud before enabling it, because it means an agent session can admit a repository
+without being asked.
 
 ## Step 5: verify
 

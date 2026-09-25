@@ -23,6 +23,8 @@ use crate::state::{
     RECON_PROCESSING,
 };
 
+mod source_batch;
+
 pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str = "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE";
 
 fn env_flag_enabled(value: Option<String>) -> bool {
@@ -235,6 +237,10 @@ struct ExactTreeAdmission {
     /// the caller can publish it standalone if its own transaction never
     /// reaches authority.
     deferred_tree: Option<crate::repository_commit::AdmittedWorkspaceTree>,
+    /// Actual observation before the admitted tree moved, including bindings
+    /// never recorded in a source commit. Independent of deferred publication.
+    semantic_predecessor: Option<kin_db::GraphSnapshot>,
+    prepared_sources: Option<source_batch::PreparedLiveBatch>,
     /// The pass yielded to a pending commit or an open merge. Nothing was
     /// published or applied to the derived graph. The caller retains its host
     /// events until repository authority can admit them.
@@ -254,6 +260,8 @@ impl ExactTreeAdmission {
             semantic_events: Vec::new(),
             policy,
             deferred_tree: None,
+            semantic_predecessor: None,
+            prepared_sources: None,
             yielded_authority: true,
         }
     }
@@ -403,6 +411,34 @@ fn host_entry_matches_graph(
     host_path: &Path,
     repo_path: &RepoPath,
 ) -> Result<bool> {
+    let expected = state
+        .graph
+        .artifact_id_at_path(repo_path)
+        .and_then(|artifact_id| state.graph.resolved_artifact(&artifact_id))
+        .map(|artifact| artifact.entry);
+    host_entry_matches_entry(state, host_path, repo_path, expected)
+}
+
+fn host_entry_matches_tree(
+    state: &DaemonState,
+    host_path: &Path,
+    repo_path: &RepoPath,
+    tree: &kin_model::ResolvedTree,
+) -> Result<bool> {
+    host_entry_matches_entry(
+        state,
+        host_path,
+        repo_path,
+        tree.artifact_at_path(repo_path).map(|a| a.entry),
+    )
+}
+
+fn host_entry_matches_entry(
+    state: &DaemonState,
+    host_path: &Path,
+    repo_path: &RepoPath,
+    expected: Option<TreeEntry>,
+) -> Result<bool> {
     let observed = match std::fs::symlink_metadata(host_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             let target = std::fs::read_link(host_path).map_err(DaemonError::Io)?;
@@ -430,11 +466,6 @@ fn host_entry_matches_graph(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(DaemonError::Io(error)),
     };
-    let expected = state
-        .graph
-        .artifact_id_at_path(repo_path)
-        .and_then(|artifact_id| state.graph.resolved_artifact(&artifact_id))
-        .map(|artifact| artifact.entry);
     if expected.is_none() && observed.is_some() {
         // A file present on disk with no graph entry is what an excluded path
         // looks like once the rules cover it. Retraction untracks rather than
@@ -523,10 +554,12 @@ pub(crate) fn publish_exact_workspace_tree(
     state: &DaemonState,
     admitted: &crate::repository_commit::AdmittedWorkspaceTree,
 ) -> Result<Option<u64>> {
-    crate::semantic_debt::record_before_standalone_publication(
-        state,
-        &crate::semantic_debt::owed_by(&admitted.exact_deltas()?),
-    )?;
+    // Recorded by the publication's own compare-and-swap rather than ahead of
+    // it: the parse these bodies owe is durable exactly when the bytes are, and
+    // a refused publication records nothing. What an earlier build's records
+    // still owe rides the same transaction.
+    let owed = crate::semantic_debt::owed_by(&admitted.exact_deltas()?);
+    let legacy = crate::semantic_debt::legacy_carry(state);
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let started = Instant::now();
@@ -543,10 +576,18 @@ pub(crate) fn publish_exact_workspace_tree(
         // a change a person authored takes that person's resolved identity from
         // the caller instead.
         kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
+        &owed,
+        &legacy,
     )?
     else {
         return Ok(None);
     };
+    if !legacy.is_empty() {
+        crate::semantic_debt::legacy_carried(state);
+    }
+    state
+        .projection_authority
+        .note_owed(admission.receipt.generation, Arc::new(admission.owed));
     // What this cost is what the reconcile tick is deciding whether to spend, so
     // it is measured here rather than modelled from the store's size.
     state.record_authority_publication(started.elapsed());
@@ -633,6 +674,20 @@ pub(crate) fn current_authority_admission(
 /// authority and whose checkout is therefore not evidence about anything.
 pub(crate) fn refresh_untracked_reading(state: &DaemonState) -> Result<bool> {
     refresh_untracked_reading_with(state, true)
+}
+
+/// The reconcile reading an answer is allowed to state.
+///
+/// The probe report alone treats a tree admission as an all-clear. Source
+/// whose parse is still owed is part of that reading, because the durability
+/// block cannot see it in the entity counts.
+pub(crate) fn answered_reconcile_health(
+    state: &DaemonState,
+    now: Instant,
+) -> kin_cli::commands::resources::ReconcileHealth {
+    let mut report = state.background_work.reconcile_report(now);
+    crate::semantic_debt::disclose_underived_source(state, &mut report);
+    report
 }
 
 /// [`refresh_untracked_reading`] for a caller that must answer now.
@@ -869,6 +924,33 @@ fn unobserved_move_destinations(
         .collect()
 }
 
+/// Final host check of the exact rule observation used to prepare this scan.
+/// A changed body is refused; it is never recompiled into the already-built plan.
+fn revalidate_proposed_root_rule(
+    working_dir: &Path,
+    scan: &kin_index::CompleteRepositoryScan,
+    path: &RepoPath,
+) -> Result<()> {
+    if let Some(entry) = scan.entry(path) {
+        kin_index::read_verified_scanned_entry(entry).map_err(|error| {
+            invalid_tree_transition(format!(
+                "proposed .kinignore changed before publication: {error}"
+            ))
+        })?;
+    } else {
+        match std::fs::symlink_metadata(working_dir.join(".kinignore")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DaemonError::Io(error)),
+            Ok(_) => {
+                return Err(invalid_tree_transition(
+                    "proposed .kinignore absence changed before publication",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Derive one complete exact-tree transition from the working copy.
 ///
 /// `observation` bounds what may be admitted. `None` is an explicit admission
@@ -907,6 +989,7 @@ fn exact_tree_admission_once(
     state: &DaemonState,
     observation: Option<&BTreeSet<RepoPath>>,
     publication: TreePublication,
+    reconciler: Option<&mut kin_reconcile::Reconciler>,
 ) -> Result<ExactTreeAdmission> {
     let working_dir = state.layout.working_dir();
     // Read the authority roots the observation is about to be planned against.
@@ -929,8 +1012,87 @@ fn exact_tree_admission_once(
         .map(|artifact| artifact.path.clone())
         .collect::<Vec<_>>();
     let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
-    let ignore =
-        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let root_rule = RepoPath::from_utf8(".kinignore").expect("fixed repository path");
+    let proposes_root_rule =
+        observation.is_none_or(|paths| observation_covers_path(paths, &root_rule));
+    let ignore = if proposes_root_rule {
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?
+    } else if let Some(artifact) = previous.artifact_at_path(&root_rule) {
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            return Err(invalid_tree_transition(
+                "admitted root .kinignore is not a regular source",
+            ));
+        };
+        let bytes = state.blobs.read(&kin_blobs::Hash256(hash.0))?;
+        if kin_blobs::digest(&bytes).0 != hash.0 {
+            return Err(invalid_tree_transition(
+                "admitted root .kinignore CAS digest differs",
+            ));
+        }
+        kin_index::RepositoryIgnore::from_root_rule_bytes(&working_dir.join(".kinignore"), bytes)
+            .map_err(kin_index::IndexError::from)?
+    } else {
+        kin_index::RepositoryIgnore::default()
+    };
+    // Keep the standing generation's allowances. Only a path both the
+    // root-removed and exact proposed-root matchers allow can gain eligibility;
+    // a new negation cannot override an unrelated standing exclusion.
+    let scan_unignore = if proposes_root_rule {
+        policy
+            .as_ref()
+            .map(|held| {
+                let without_root = held
+                    .with_replaced_shared_source(&root_rule, None)
+                    .map_err(|error| invalid_tree_transition(error.to_string()))?;
+                let proposed_root = held
+                    .with_replaced_shared_source(&root_rule, ignore.captured_kinignore_bytes())
+                    .map_err(|error| invalid_tree_transition(error.to_string()))?;
+                Ok::<_, DaemonError>((without_root, proposed_root))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    // A deferred scan is part of a Native commit. Its first parent can still
+    // carry older rules than this dirty workspace. Do not introduce a path
+    // publication must refuse merely because an earlier workspace admission
+    // made a new negation visible. Reuse the held manager and pin the same
+    // roots/base, rather than reopening the store or guessing from live files.
+    let native_admission = if publication == TreePublication::DeferredToCaller {
+        let binding = state
+            .local_repository_authority_binding()
+            .map_err(|error| invalid_tree_transition(error.to_string()))?;
+        let authority = crate::api::held_repository_authority(state)
+            .map_err(|(_, message)| invalid_tree_transition(message))?;
+        Some(
+            authority
+                .workspace_native_admission_snapshot(
+                    binding.repository_id(),
+                    &binding.workspace_id(),
+                    &expected_roots,
+                )?
+                .ok_or_else(|| {
+                    invalid_tree_transition("Native admission preview workspace is absent")
+                })?,
+        )
+    } else {
+        None
+    };
+    let native_unignore = native_admission
+        .as_ref()
+        .filter(|_| proposes_root_rule)
+        .map(|snapshot| {
+            let without = snapshot
+                .matcher
+                .with_replaced_shared_source(&root_rule, None)
+                .map_err(|error| invalid_tree_transition(error.to_string()))?;
+            let proposed = snapshot
+                .matcher
+                .with_replaced_shared_source(&root_rule, ignore.captured_kinignore_bytes())
+                .map_err(|error| invalid_tree_transition(error.to_string()))?;
+            Ok::<_, DaemonError>((without, proposed))
+        })
+        .transpose()?;
     // A rule that begins matching an already-admitted path retracts it. Ignoring
     // a path is a statement about the semantic index rather than about future
     // walks alone, so the rules are applied to graph-owned tracked identity here
@@ -966,10 +1128,21 @@ fn exact_tree_admission_once(
         .filter(|path| !retracted_paths.contains(*path))
         .collect::<Vec<&RepoPath>>();
     let scan = crate::mcp_commit::timed_commit_phase("scan_working_copy", || {
-        kin_index::scan_repository_preserving_graph_only(
+        kin_index::repository::scan_repository_with_native_admission(
             working_dir,
             &ignore,
             policy.as_ref(),
+            scan_unignore
+                .as_ref()
+                .map(|(without, proposed)| (without, proposed)),
+            native_admission
+                .as_ref()
+                .map(|snapshot| kin_index::repository::NativeScanAdmission {
+                    policy: &snapshot.matcher,
+                    root_unignore: native_unignore
+                        .as_ref()
+                        .map(|(without, proposed)| (without, proposed)),
+                }),
             scanned_tracked.into_iter(),
             graph_only_paths.iter(),
         )
@@ -1057,6 +1230,21 @@ fn exact_tree_admission_once(
     // `.kinignore` is exactly that shape of event, so without this the surface a
     // user writes the rule on is the one surface where it never takes effect.
     observed.retain(|path, _| !retracted_paths.contains(path));
+    if proposes_root_rule {
+        let matches = match (
+            ignore.captured_kinignore_bytes(),
+            observed.entries().get(&root_rule),
+        ) {
+            (Some(bytes), Some(TreeEntry::Blob { hash, .. })) => kin_blobs::digest(bytes) == *hash,
+            (None, None) => true,
+            _ => false,
+        };
+        if !matches {
+            return Err(invalid_tree_transition(
+                "proposed .kinignore bytes differ from the completed source observation",
+            ));
+        }
+    }
     let mut deltas = retraction_deltas;
     deltas.extend(kin_core::plan_observed_tree_deltas(
         &planning_base,
@@ -1093,8 +1281,68 @@ fn exact_tree_admission_once(
     );
 
     let mut deferred_tree = None;
+    let mut semantic_predecessor = None;
+    let mut prepared_sources = None;
     if !deltas.is_empty() {
         let desired_tree = previous.apply(&deltas).map_err(invalid_tree_transition)?;
+        let relocations = path_relocations_in(&deltas);
+        let vacated = crate::repository_commit::VacatedPaths::from_deltas(&deltas);
+        let (mut entity_deltas, mut relation_deltas) =
+            crate::repository_commit::retire_live_semantics_on_vacated(
+                state.graph.as_ref(),
+                &vacated,
+            )?;
+        relation_deltas.extend(
+            crate::repository_commit::plan_moved_source_coverage_withdrawals(
+                state.graph.as_ref(),
+                &relocations,
+            )?,
+        );
+        crate::repository_commit::plan_live_move_binding_transition(
+            state,
+            &relocations,
+            &mut relation_deltas,
+        )?;
+        kin_reconcile::relocate_binding_obligations(
+            state.graph.as_ref(),
+            &relocations,
+            &mut relation_deltas,
+        )
+        .map_err(|error| invalid_tree_transition(error.to_string()))?;
+        entity_deltas.extend(plan_relocated_entities(state, &deltas, &relocations)?);
+        let mut live_delta = TransactionDelta {
+            entity_deltas,
+            relation_deltas,
+            tree_deltas: deltas.clone(),
+            ..TransactionDelta::default()
+        };
+        if let Some(reconciler) = reconciler {
+            // Complete sources, one or many, are planned and traffic/host
+            // checked before either tree or semantics cross authority. The
+            // captured successor then carries both in the same publication, so
+            // a pass carrying a single source does not publish its bytes and
+            // leave its parse to the live graph alone.
+            let before = state.graph.semantic_observation();
+            let staged = kin_db::InMemoryGraph::from_snapshot_without_text_index(before.clone())?;
+            staged.apply_transaction_delta(&live_delta)?;
+            let paths = source_batch::with_owed_paths(state, changed_paths.clone());
+            prepared_sources = source_batch::prepare(
+                state,
+                reconciler,
+                &staged,
+                &paths,
+                source_batch::BatchPredecessor::Observed(Some(&before)),
+                &changed_paths,
+                source_batch::BatchScope::ExactAdmission,
+            )?;
+            if let Some(prepared) = &prepared_sources {
+                let mut joined = source_batch::semantic_delta(&before, prepared.snapshot())?;
+                joined.tree_deltas = live_delta.tree_deltas;
+                live_delta = joined;
+            }
+        }
+        kin_model::validate_transaction_delta(&live_delta)
+            .map_err(|error| invalid_tree_transition(error.to_string()))?;
         // Repository authority moves first. The in-memory graph is a derived
         // staging/query view and must never acknowledge dirty file truth that
         // has not crossed the repository-v6 compare-and-swap. The scanner's
@@ -1105,7 +1353,14 @@ fn exact_tree_admission_once(
             expected_roots,
             previous.clone(),
             desired_tree,
-        );
+        )
+        .with_live_observation(state.graph.as_ref(), &live_delta)?;
+        #[cfg(test)]
+        after_admission_capture_for_test(state);
+        if proposes_root_rule {
+            revalidate_proposed_root_rule(working_dir, &scan, &root_rule)?;
+        }
+        semantic_predecessor = admitted.semantic_predecessor().cloned();
         // A deferring caller publishes this same transition inside its own
         // transaction, so authority still moves before anything outside the
         // caller can observe the graph: the coordination gate the caller holds
@@ -1157,41 +1412,29 @@ fn exact_tree_admission_once(
             let _ = crate::mcp_commit::timed_commit_phase("publish_workspace_admission", || {
                 publish_exact_workspace_tree(state, &admitted)
             })?;
+            #[cfg(all(test, unix))]
+            tests::split_after_standalone_publication_for_test(state);
         }
-        // Authority has committed the removal, so the entities derived from
-        // those paths go before the graph is asked to match. kin-db refuses a
-        // tree transition that leaves an entity on a path the staged tree no
-        // longer carries, and it is right to: an artifact that stops existing
-        // while its entities keep ranking is the exposure this ordering exists
-        // to prevent.
-        evict_enrichment_for_removed_paths(state, &deltas)?;
-        // A path change is not a removal, so the eviction above skips it and
-        // the entities on the old path have to move instead. They move in THIS
-        // transaction, beside the tree delta that carries them, because kin-db
-        // refuses a transition that leaves an entity on a path the staged tree
-        // no longer holds, and a relocation published as a second transaction is
-        // refused exactly as a stranded entity is.
-        //
-        // Through the same planner and binder the session admission uses, not a
-        // shorter local rule. A file's module takes its name, its signature and
-        // its id from the path it sits on, so relocating only `file_origin`
-        // leaves the derived graph holding a module named for a path nothing
-        // carries, and the next parse at the new path mints a different id for
-        // it: the old identity is dropped and every reference to it with it. The
-        // binder is what keeps one id across that rename.
-        let relocations = path_relocations_in(&deltas);
-        let relocated_entities = plan_relocated_entities(state, &deltas, &relocations)?;
+        // The live plan was checked before publication. Apply its removals,
+        // binding obligations, relocations and tree as one transaction, without
+        // rediscovering fallible source evidence after authority has moved.
+        // Standalone publication restores its newly durable capability below.
+        // Only a deferred successor still needs a runtime derivation from the
+        // earlier live observation; it must not overwrite the newer witness.
+        let batch_derivation = (defer && prepared_sources.is_some())
+            .then(|| crate::binding_history::Derivation::begin(state));
         let applied = state
             .graph
-            .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: relocated_entities,
-                relation_deltas: Vec::new(),
-                tree_deltas: deltas.clone(),
-                ..TransactionDelta::default()
-            })
+            .apply_transaction_delta(&live_delta)
             .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas));
         match applied {
-            Ok(()) => relocate_file_records_for(state, &relocations)?,
+            Ok(()) => {
+                finish_removed_path_enrichment(state, &vacated, &live_delta.entity_deltas)?;
+                relocate_file_records_for(state, &relocations)?;
+                if !defer {
+                    crate::binding_history::restore_exact_authority(state);
+                }
+            }
             // A deferred tree has not crossed authority, so a refusal here
             // splits nothing: the caller's transaction never runs and authority
             // keeps the tree this graph still holds.
@@ -1199,8 +1442,14 @@ fn exact_tree_admission_once(
             // Authority has already accepted `desired_tree`. Handing the refusal
             // back from here is how a graph falls behind authority for good, so
             // the graph is levelled with authority in this same round instead.
-            Err(refusal) => level_after_refused_apply(state, refusal)?,
+            Err(refusal) => {
+                // Levelling may select newer authority; its caches cannot be
+                // replaced by the plan of a transaction the live graph refused.
+                prepared_sources = None;
+                level_after_refused_apply(state, refusal)?;
+            }
         }
+        drop(batch_derivation);
     }
 
     if observation.is_none() {
@@ -1224,6 +1473,11 @@ fn exact_tree_admission_once(
                 std::iter::empty::<&RepoPath>(),
                 excluded_host_content(&scan),
             );
+        // The same holds for tracked paths the host edited or removed while no
+        // daemon watched. This walk read every one of them and the transition
+        // took whatever it found, so none of them still describes old bytes,
+        // and a startup check that could not run is answered by a walk that did.
+        state.background_work.reconcile().clear_changed_paths();
         // The same pass took whatever the retirements were holding back, so they
         // have served their purpose. A caller who explicitly admits the subtree
         // under a removed Gitlink has said outright that the content is theirs,
@@ -1237,6 +1491,8 @@ fn exact_tree_admission_once(
         semantic_events: dedup_file_events(semantic_events),
         policy,
         deferred_tree,
+        semantic_predecessor,
+        prepared_sources,
         yielded_authority: false,
     })
 }
@@ -1255,6 +1511,7 @@ fn exact_tree_admission_once(
 /// The whole of it runs through [`off_the_runtime_worker`]: a publication opens
 /// repository authority end to end, and holding a runtime worker for that long
 /// is how a daemon in the middle of an admission stopped answering `/readiness`.
+#[cfg(test)]
 fn exact_tree_admission(
     state: &DaemonState,
     observation: Option<&BTreeSet<RepoPath>>,
@@ -1263,7 +1520,20 @@ fn exact_tree_admission(
     off_the_runtime_worker(|| {
         #[cfg(test)]
         pause_admission_for_test(state);
-        exact_tree_admission_on_this_thread(state, observation, publication)
+        exact_tree_admission_on_this_thread(state, observation, publication, None)
+    })
+}
+
+fn exact_tree_admission_with_reconciler(
+    state: &DaemonState,
+    observation: Option<&BTreeSet<RepoPath>>,
+    publication: TreePublication,
+    reconciler: &mut kin_reconcile::Reconciler,
+) -> Result<ExactTreeAdmission> {
+    off_the_runtime_worker(|| {
+        #[cfg(test)]
+        pause_admission_for_test(state);
+        exact_tree_admission_on_this_thread(state, observation, publication, Some(reconciler))
     })
 }
 
@@ -1309,16 +1579,96 @@ fn pause_admission_for_test(state: &DaemonState) {
     }
 }
 
+// Every coherent source batch one daemon state prepared, in order, keyed by the
+// state's address. A test marks the log, drives the real loop, and reads back
+// exactly which paths each pass derived together, which is what says whether
+// an unrelated record was padded into an edit's batch.
+#[cfg(test)]
+static PREPARED_BATCHES_FOR_TEST: std::sync::Mutex<Vec<(usize, BTreeSet<RepoPath>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_prepared_batch_for_test(state: &DaemonState, paths: &BTreeSet<RepoPath>) {
+    PREPARED_BATCHES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((state as *const DaemonState as usize, paths.clone()));
+}
+
+/// A position in the prepared-batch log. Only batches recorded after it are
+/// read back, so an earlier test whose state reused this address cannot leak in.
+#[cfg(test)]
+pub(crate) fn prepared_batch_mark_for_test() -> usize {
+    PREPARED_BATCHES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+/// The path set of every coherent batch `state` prepared since `mark`.
+#[cfg(test)]
+pub(crate) fn prepared_batches_since_for_test(
+    state: &DaemonState,
+    mark: usize,
+) -> Vec<BTreeSet<RepoPath>> {
+    let owner = state as *const DaemonState as usize;
+    PREPARED_BATCHES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .skip(mark)
+        .filter(|(recorded, _)| *recorded == owner)
+        .map(|(_, paths)| paths.clone())
+        .collect()
+}
+
+// A one-shot interleaving at the exact capture/publication boundary. The
+// address key prevents a concurrent unrelated repository from consuming it.
+#[cfg(test)]
+type AdmissionCaptureHook = Box<dyn FnOnce(&DaemonState) + Send>;
+
+#[cfg(test)]
+static ADMISSION_CAPTURE_HOOK: std::sync::Mutex<Option<(usize, AdmissionCaptureHook)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_admission_capture_hook_for_test(state: &DaemonState, hook: AdmissionCaptureHook) {
+    let mut slot = ADMISSION_CAPTURE_HOOK.lock().unwrap();
+    assert!(slot.is_none(), "only one owned capture hook may be pending");
+    *slot = Some((state as *const DaemonState as usize, hook));
+}
+
+#[cfg(test)]
+fn after_admission_capture_for_test(state: &DaemonState) {
+    let hook = {
+        let mut slot = ADMISSION_CAPTURE_HOOK.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == state as *const DaemonState as usize)
+        {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(state);
+    }
+}
+
 /// [`exact_tree_admission`] on whichever thread it was handed.
 fn exact_tree_admission_on_this_thread(
     state: &DaemonState,
     observation: Option<&BTreeSet<RepoPath>>,
     publication: TreePublication,
+    mut reconciler: Option<&mut kin_reconcile::Reconciler>,
 ) -> Result<ExactTreeAdmission> {
-    let refusal = match exact_tree_admission_once(state, observation, publication) {
-        Err(error) if crate::repository_commit::is_stale_plan_refusal(&error) => error,
-        answered => return answered,
-    };
+    let refusal =
+        match exact_tree_admission_once(state, observation, publication, reconciler.as_deref_mut())
+        {
+            Err(error) if crate::repository_commit::is_stale_plan_refusal(&error) => error,
+            answered => return answered,
+        };
     let levelling = match settle_levelling(state, level_graph_with_authority(state)) {
         Ok(Some(levelling)) => levelling,
         // Already level, so authority moved between this plan and its
@@ -1328,7 +1678,8 @@ fn exact_tree_admission_on_this_thread(
         // clear is still the answer.
         Ok(None) | Err(_) => return Err(refusal),
     };
-    let mut admission = exact_tree_admission_once(state, observation, publication)?;
+    let mut admission =
+        exact_tree_admission_once(state, observation, publication, reconciler.as_deref_mut())?;
     admission.absorb_levelling(state.layout.working_dir(), levelling);
     Ok(admission)
 }
@@ -1466,6 +1817,21 @@ fn level_graph_with_authority(state: &DaemonState) -> Result<Option<AuthorityLev
     evict_enrichment_for_removed_paths(state, &deltas)?;
     let relocations = path_relocations_in(&deltas);
     let relocated_entities = plan_relocated_entities(state, &deltas, &relocations)?;
+    let mut moved_coverage = crate::repository_commit::plan_moved_source_coverage_withdrawals(
+        state.graph.as_ref(),
+        &relocations,
+    )?;
+    crate::repository_commit::plan_live_move_binding_transition(
+        state,
+        &relocations,
+        &mut moved_coverage,
+    )?;
+    kin_reconcile::relocate_binding_obligations(
+        state.graph.as_ref(),
+        &relocations,
+        &mut moved_coverage,
+    )
+    .map_err(|error| invalid_tree_transition(error.to_string()))?;
     // The census walks the relations without copying the graph, so the copy
     // the scan needs is paid only when there is a strand to find.
     let stranded = if state.graph.stranded_relation_count() == 0 {
@@ -1484,6 +1850,7 @@ fn level_graph_with_authority(state: &DaemonState) -> Result<Option<AuthorityLev
             relation_deltas: stranded
                 .into_iter()
                 .map(|old| kin_model::RelationDelta::Removed { old })
+                .chain(moved_coverage)
                 .collect(),
             tree_deltas: deltas.clone(),
             ..TransactionDelta::default()
@@ -1969,39 +2336,6 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
     );
 }
 
-/// Retire every relation bound to an artifact node that is leaving the tree.
-///
-/// An artifact-class endpoint is not reachable from any entity, so clearing a
-/// path's entities leaves these edges standing: the file-level `Imports` and
-/// `Includes` edges the cross-file linker mints, its parse-coverage self-loop,
-/// and the `DerivedFrom` edges projection markers produce. kin-db validates
-/// every relation the graph holds against the staged tree on each transaction,
-/// so one surviving edge makes the removal of its artifact fail with
-/// `transaction relation <id> has unadmitted source endpoint artifact:<id>`,
-/// and it fails the whole transaction rather than the one edge. That is how a
-/// deleted file could take the entire commit path down with it: nothing else
-/// collects these, and only emptying the file first, which routes the retirement
-/// through the linker's own re-derivation, ever cleared them.
-fn retire_artifact_node_relations(
-    graph: &kin_db::InMemoryGraph,
-    artifact_id: kin_model::ArtifactId,
-) -> Result<()> {
-    let node = kin_model::GraphNodeId::Artifact(artifact_id);
-    let bound = graph.get_all_relations_for_node(&node)?;
-    if bound.is_empty() {
-        return Ok(());
-    }
-    let retired: Vec<kin_model::RelationId> = bound.iter().map(|relation| relation.id).collect();
-    let borrowed: Vec<&kin_model::RelationId> = retired.iter().collect();
-    graph.remove_relations_batch(&borrowed)?;
-    debug!(
-        ?artifact_id,
-        retired = retired.len(),
-        "retired the relations bound to a departing artifact node"
-    );
-    Ok(())
-}
-
 /// Say what a refused tree transition was about when kin-db reports one of its
 /// relations still naming a node the staged tree no longer carries.
 ///
@@ -2083,24 +2417,39 @@ pub(crate) fn evict_enrichment_for_removed_paths(
     state: &DaemonState,
     deltas: &[TreeDelta],
 ) -> Result<()> {
-    for delta in deltas {
-        let TreeDelta::Removed { old, .. } = delta else {
+    let vacated = crate::repository_commit::VacatedPaths::from_deltas(deltas);
+    if vacated.is_empty() {
+        return Ok(());
+    }
+    let (entity_deltas, relation_deltas) =
+        crate::repository_commit::retire_live_semantics_on_vacated(state.graph.as_ref(), &vacated)?;
+    state.graph.apply_transaction_delta(&TransactionDelta {
+        entity_deltas: entity_deltas.clone(),
+        relation_deltas,
+        ..TransactionDelta::default()
+    })?;
+    finish_removed_path_enrichment(state, &vacated, &entity_deltas)
+}
+
+fn finish_removed_path_enrichment(
+    state: &DaemonState,
+    vacated: &crate::repository_commit::VacatedPaths,
+    entity_deltas: &[kin_model::EntityDelta],
+) -> Result<()> {
+    for path in &vacated.paths {
+        clear_incompatible_facets(state, &FilePathId::new(path), EnrichmentFacet::None)?;
+    }
+    for delta in entity_deltas {
+        let kin_model::EntityDelta::Removed { old } = delta else {
             continue;
         };
-        retire_artifact_node_relations(state.graph.as_ref(), delta.artifact_id())?;
-        let Some(file_id) = semantic_file_id(&old.path) else {
-            continue;
-        };
-        let cleanup = clear_incompatible_facets(state, &file_id, EnrichmentFacet::None)?;
-        for id in cleanup.removed_entities {
-            state.emit_event(DaemonEvent::EntityChanged {
-                entity_id: id,
-                node: None,
-                change_type: ChangeType::Deleted,
-                file_path: Some(file_id.0.clone()),
-                session_id: None,
-            });
-        }
+        state.emit_event(DaemonEvent::EntityChanged {
+            entity_id: old.id,
+            node: None,
+            change_type: ChangeType::Deleted,
+            file_path: old.file_origin.as_ref().map(|file| file.0.clone()),
+            session_id: None,
+        });
     }
     Ok(())
 }
@@ -2212,8 +2561,26 @@ fn opaque_artifact_is_current(
 /// trade one defect for another. Only the write is conditional: a record that
 /// already describes these exact bytes is left alone, so the artifact keeps its
 /// vector and the drain stops churning a store that never commits.
+/// Install a non-source facet already derived before repository publication.
+pub(crate) fn persist_prepared_non_entity_enrichment(
+    state: &DaemonState,
+    indexed: IndexedAny,
+) -> Result<()> {
+    persist_non_entity_enrichment(state, indexed).map(|_| ())
+}
+
 fn persist_non_entity_enrichment(
     state: &DaemonState,
+    indexed: IndexedAny,
+) -> Result<(FilePathId, FacetCleanup, EnrichmentPersistence)> {
+    persist_non_entity_enrichment_in(state.graph.as_ref(), indexed)
+}
+
+/// The same persistence against a graph named outright rather than reached
+/// through the daemon's live state, for the reason
+/// [`clear_incompatible_facets_in`] gives.
+fn persist_non_entity_enrichment_in(
+    graph: &kin_db::InMemoryGraph,
     indexed: IndexedAny,
 ) -> Result<(FilePathId, FacetCleanup, EnrichmentPersistence)> {
     match indexed {
@@ -2222,10 +2589,12 @@ fn persist_non_entity_enrichment(
         ))),
         IndexedAny::ShallowSyntax(shallow) => {
             let shallow = shallow_tracked_file(shallow);
-            let cleanup =
-                clear_incompatible_facets(state, &shallow.file_id, EnrichmentFacet::ShallowSyntax)?;
-            if state
-                .graph
+            let cleanup = clear_incompatible_facets_in(
+                graph,
+                &shallow.file_id,
+                EnrichmentFacet::ShallowSyntax,
+            )?;
+            if graph
                 .get_shallow_file(&shallow.file_id)?
                 .is_some_and(|stored| shallow_file_is_current(&stored, &shallow))
             {
@@ -2235,17 +2604,16 @@ fn persist_non_entity_enrichment(
                     EnrichmentPersistence::AlreadyCurrent,
                 ));
             }
-            state.graph.upsert_shallow_file(&shallow)?;
+            graph.upsert_shallow_file(&shallow)?;
             Ok((shallow.file_id, cleanup, EnrichmentPersistence::Written))
         }
         IndexedAny::StructuredArtifact(artifact) => {
-            let cleanup = clear_incompatible_facets(
-                state,
+            let cleanup = clear_incompatible_facets_in(
+                graph,
                 &artifact.file_id,
                 EnrichmentFacet::StructuredArtifact,
             )?;
-            if state
-                .graph
+            if graph
                 .get_structured_artifact(&artifact.file_id)?
                 .is_some_and(|stored| structured_artifact_is_current(&stored, &artifact))
             {
@@ -2255,17 +2623,16 @@ fn persist_non_entity_enrichment(
                     EnrichmentPersistence::AlreadyCurrent,
                 ));
             }
-            state.graph.upsert_structured_artifact(&artifact)?;
+            graph.upsert_structured_artifact(&artifact)?;
             Ok((artifact.file_id, cleanup, EnrichmentPersistence::Written))
         }
         IndexedAny::OpaqueArtifact(artifact) => {
-            let cleanup = clear_incompatible_facets(
-                state,
+            let cleanup = clear_incompatible_facets_in(
+                graph,
                 &artifact.file_id,
                 EnrichmentFacet::OpaqueArtifact,
             )?;
-            if state
-                .graph
+            if graph
                 .get_opaque_artifact(&artifact.file_id)?
                 .is_some_and(|stored| opaque_artifact_is_current(&stored, &artifact))
             {
@@ -2275,7 +2642,7 @@ fn persist_non_entity_enrichment(
                     EnrichmentPersistence::AlreadyCurrent,
                 ));
             }
-            state.graph.upsert_opaque_artifact(&artifact)?;
+            graph.upsert_opaque_artifact(&artifact)?;
             Ok((artifact.file_id, cleanup, EnrichmentPersistence::Written))
         }
     }
@@ -2310,10 +2677,147 @@ fn persist_non_entity_enrichment(
 /// feature subsets.
 #[cfg(feature = "embeddings")]
 pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Result<usize> {
-    let tree = state.graph.resolved_tree();
+    ensure_non_entity_enrichment_coverage_in(state.graph.as_ref(), state.blobs.as_ref())
+}
+
+/// [`ensure_non_entity_enrichment_coverage`] against a graph and CAS named
+/// outright rather than reached through the daemon's live state.
+///
+/// Each record goes through the graph's upserts, and each upsert queues its
+/// artifact for embedding. That is right for a record new to a running graph.
+#[cfg(feature = "embeddings")]
+fn ensure_non_entity_enrichment_coverage_in(
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+) -> Result<usize> {
+    let tree = graph.resolved_tree();
+    let coverage = cover_missing_non_entity_facets(
+        &tree,
+        blobs,
+        |file_id| {
+            Ok(graph.get_shallow_file(file_id)?.is_some()
+                || graph.get_structured_artifact(file_id)?.is_some()
+                || graph.get_opaque_artifact(file_id)?.is_some()
+                || graph.get_file_layout(file_id)?.is_some())
+        },
+        |indexed| {
+            persist_non_entity_enrichment_in(graph, indexed).map(|(_, _, persistence)| persistence)
+        },
+    )?;
+    if coverage.created > 0 || coverage.unreadable > 0 {
+        info!(
+            created = coverage.created,
+            unreadable = coverage.unreadable,
+            "enrichment coverage pass created missing non-entity records"
+        );
+    }
+    Ok(coverage.created)
+}
+
+/// What one non-entity enrichment coverage pass did.
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NonEntityCoverage {
+    /// Records the pass wrote.
+    pub(crate) created: usize,
+    /// Tracked bodies the CAS could not return, left for a later pass.
+    pub(crate) unreadable: usize,
+}
+
+/// Add to a workspace snapshot, before a graph is built from it, the
+/// non-entity enrichment records that graph would otherwise lack.
+///
+/// Repository authority records tree and entity truth. The shallow, structured
+/// and opaque records [`ensure_non_entity_enrichment_coverage`] writes live in
+/// the served graph alone, and the retrieval authority a persisted vector or
+/// text index is stamped with covers them. A graph rebuilt from authority
+/// without them cannot match a stamp written after them, so a reopen salvaged
+/// the vector sidecar and dropped every artifact vector.
+///
+/// The records go into the snapshot rather than through a graph's upserts
+/// because each upsert queues its artifact for embedding, and an exact sidecar
+/// load leaves that queue as it found it. A graph built from the snapshot holds
+/// the records with nothing queued, and the step that resumes embedding after
+/// a restart then queues only the artifact keys the installed index lacks.
+///
+/// The walk and the records are the live pass's own, so the same tree and
+/// bodies give the same records. One difference is deliberate. The live pass
+/// retires any entity still recorded at a path whose bytes no longer classify
+/// as entity source. Here that would change the entity truth the workspace
+/// binding was checked against, so a path that still holds an entity counts as
+/// covered and is left to the live pass. A sidecar stamped after such a
+/// retirement is salvaged per key on reopen, as before.
+///
+/// Additive and in memory only: no existing record or entity changes, and
+/// nothing is persisted.
+#[cfg(feature = "embeddings")]
+pub(crate) fn ensure_non_entity_enrichment_coverage_in_snapshot(
+    snapshot: &mut kin_db::GraphSnapshot,
+    blobs: &kin_blobs::BlobStore,
+) -> Result<NonEntityCoverage> {
+    let kin_db::GraphSnapshot {
+        entities,
+        shallow_files,
+        file_layouts,
+        structured_artifacts,
+        opaque_artifacts,
+        resolved_tree,
+        ..
+    } = snapshot;
+    let covered: std::collections::HashSet<FilePathId> = shallow_files
+        .iter()
+        .map(|record| record.file_id.clone())
+        .chain(file_layouts.iter().map(|layout| layout.file_id.clone()))
+        .chain(
+            structured_artifacts
+                .iter()
+                .map(|record| record.file_id.clone()),
+        )
+        .chain(opaque_artifacts.iter().map(|record| record.file_id.clone()))
+        .chain(
+            entities
+                .values()
+                .filter_map(|entity| entity.file_origin.clone()),
+        )
+        .collect();
+    cover_missing_non_entity_facets(
+        resolved_tree,
+        blobs,
+        |file_id| Ok(covered.contains(file_id)),
+        |indexed| {
+            match indexed {
+                IndexedAny::EntitySource(_) => {
+                    return Err(DaemonError::Io(std::io::Error::other(
+                        "entity source reached non-entity enrichment path",
+                    )))
+                }
+                IndexedAny::ShallowSyntax(shallow) => {
+                    shallow_files.push(shallow_tracked_file(shallow));
+                }
+                IndexedAny::StructuredArtifact(record) => structured_artifacts.push(record),
+                IndexedAny::OpaqueArtifact(record) => opaque_artifacts.push(record),
+            }
+            Ok(EnrichmentPersistence::Written)
+        },
+    )
+}
+
+/// The walk every coverage pass shares: which tracked paths are owed a
+/// non-entity record, and what that record is.
+///
+/// `covered` says whether a path already carries enrichment and is skipped.
+/// `install` receives the record derived for each path that carries none and
+/// reports whether it wrote it. One walk behind every caller is what keeps the
+/// records they derive for the same tree and bodies identical.
+#[cfg(feature = "embeddings")]
+fn cover_missing_non_entity_facets(
+    tree: &kin_model::ResolvedTree,
+    blobs: &kin_blobs::BlobStore,
+    mut covered: impl FnMut(&FilePathId) -> Result<bool>,
+    mut install: impl FnMut(IndexedAny) -> Result<EnrichmentPersistence>,
+) -> Result<NonEntityCoverage> {
     let pipeline = IndexPipeline::new();
-    let mut created = 0usize;
-    let mut unreadable = 0usize;
+    let mut coverage = NonEntityCoverage::default();
 
     for artifact in tree.artifacts() {
         if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
@@ -2329,20 +2833,16 @@ pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Resu
         };
         let file_id = FilePathId::new(path);
 
-        if state.graph.get_shallow_file(&file_id)?.is_some()
-            || state.graph.get_structured_artifact(&file_id)?.is_some()
-            || state.graph.get_opaque_artifact(&file_id)?.is_some()
-            || state.graph.get_file_layout(&file_id)?.is_some()
-        {
+        if covered(&file_id)? {
             continue;
         }
 
-        let content = match state.blobs.read(&hash) {
+        let content = match blobs.read(&hash) {
             Ok(content) => content,
             Err(error) => {
                 // A missing derived body must not fail daemon startup; CAS
                 // hydration owns repairing it, and the next pass retries.
-                unreadable += 1;
+                coverage.unreadable += 1;
                 debug!(
                     file = %file_id,
                     error = %error,
@@ -2359,12 +2859,12 @@ pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Resu
         }
 
         match pipeline.index_any_content(&file_id, &content, hash) {
-            Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
+            Ok(indexed) => match install(indexed) {
                 // The guard above admits only paths carrying no facet at all,
                 // so this pass always writes. Counting the write rather than
                 // the call keeps `created` honest if that guard ever loosens.
-                Ok((_, _, EnrichmentPersistence::Written)) => created += 1,
-                Ok((_, _, EnrichmentPersistence::AlreadyCurrent)) => {}
+                Ok(EnrichmentPersistence::Written) => coverage.created += 1,
+                Ok(EnrichmentPersistence::AlreadyCurrent) => {}
                 Err(error) => warn!(
                     file = %file_id,
                     error = %error,
@@ -2379,13 +2879,7 @@ pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Resu
         }
     }
 
-    if created > 0 || unreadable > 0 {
-        info!(
-            created,
-            unreadable, "enrichment coverage pass created missing non-entity records"
-        );
-    }
-    Ok(created)
+    Ok(coverage)
 }
 
 /// Deferrals of one path before its log line escalates from debug to warn.
@@ -2563,6 +3057,49 @@ fn admission_is_held(
     marks: RepositoryMarks,
 ) -> bool {
     hold.is_some_and(|hold| now < hold.until && hold.marks == marks)
+}
+
+/// The pending-admission mark over the events the reconcile loop has queued and
+/// not yet published or given back.
+///
+/// A name-resolving read treats the mark as a writer: the files those events
+/// name are on their way into the graph, and a read that answered from the
+/// graph as it stands would report a name the agent just wrote as absent. So
+/// the mark has to be up for as long as the loop holds such an event, not only
+/// while a pass runs. Between draining the watcher and starting a pass the loop
+/// can wait out the grace for an imminent commit, stand down for a commit, or
+/// leave the tail of a burst for the next round, and a read that landed in any
+/// of those found no writer and no mark and certified the name absent.
+///
+/// One mark covers the whole queue and is carried across rounds. The loop puts
+/// it up as soon as the queue holds an event, unless the admission hold is
+/// about to stand the round down, and takes it down when the queue empties,
+/// when the admission hold stands a round down, and when a pass fails and gives
+/// its batch back to the retry lane. A commit stand-down keeps it, because the
+/// events are still queued and the commit that will publish them has not done
+/// so yet.
+///
+/// How long a read waits on the mark is the read's own limit, the writer-wait
+/// limit every name-resolving read runs under; past it the read refuses and
+/// names the write window rather than certifying an absence. The mark lives in
+/// the loop's own frame, so a shutdown, a panic or the task being dropped takes
+/// it down with the loop. The one exit that outlives the frame, parking after a
+/// supervisor stop, drops it before it parks.
+#[derive(Default)]
+struct QueuedEventsMark(Option<crate::state::PendingAdmissionGuard>);
+
+impl QueuedEventsMark {
+    /// Put the mark up, unless it is up already.
+    fn hold(&mut self, state: &DaemonState) {
+        if self.0.is_none() {
+            self.0 = Some(state.begin_pending_admission());
+        }
+    }
+
+    /// Take the mark down, which wakes every read waiting on it.
+    fn release(&mut self) {
+        self.0 = None;
+    }
 }
 
 /// What one deferral cost the path that caused it.
@@ -2876,6 +3413,8 @@ async fn wait_out_imminent_commit(
     if grace.is_zero() {
         return false;
     }
+    #[cfg(test)]
+    round_hold_point_for_test(state, RoundHoldPoint::CommitGrace).await;
     tokio::select! {
         _ = arrival => {}
         _ = tokio::time::sleep(grace) => {}
@@ -2889,13 +3428,83 @@ async fn wait_out_imminent_commit(
     state.pending_commits.any()
 }
 
+/// A point in a reconcile round at which a test can hold the loop, after the
+/// round has queued what it drained and before it takes any lock.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundHoldPoint {
+    /// Inside the grace a round waits out for an imminent commit.
+    CommitGrace,
+    /// A round standing down for a commit inside the daemon.
+    CommitStandDown,
+}
+
+/// One hold a test asked for: the daemon state it applies to, where, and the
+/// two halves of the handshake with that test.
+#[cfg(test)]
+struct RoundHold {
+    owner: usize,
+    point: RoundHoldPoint,
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Keyed by the state's address, so no other test's loop stops at a hold.
+#[cfg(test)]
+static ROUND_HOLDS_FOR_TEST: std::sync::Mutex<Vec<RoundHold>> = std::sync::Mutex::new(Vec::new());
+
+/// Stop the next round of `state`'s loop that reaches `point`. The receiver
+/// completes once the round is there, and sending on the sender lets it go.
+#[cfg(test)]
+fn hold_next_round_at_for_test(
+    state: &DaemonState,
+    point: RoundHoldPoint,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached, reached_by_test) = tokio::sync::oneshot::channel();
+    let (released_by_test, release) = tokio::sync::oneshot::channel();
+    ROUND_HOLDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(RoundHold {
+            owner: state as *const DaemonState as usize,
+            point,
+            reached,
+            release,
+        });
+    (reached_by_test, released_by_test)
+}
+
+/// Where a round passes `point`: waits there if a test asked it to.
+#[cfg(test)]
+async fn round_hold_point_for_test(state: &DaemonState, point: RoundHoldPoint) {
+    let owner = state as *const DaemonState as usize;
+    let hold = {
+        let mut holds = ROUND_HOLDS_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holds
+            .iter()
+            .position(|hold| hold.owner == owner && hold.point == point)
+            .map(|index| holds.remove(index))
+    };
+    if let Some(hold) = hold {
+        let _ = hold.reached.send(());
+        // Bounded so a failed test cannot hang the suite. A test that went
+        // away dropped its sender, which ends this at once.
+        let _ = tokio::time::timeout(Duration::from_secs(60), hold.release).await;
+    }
+}
+
 /// What the reconciliation loop becomes after the background-work supervisor
 /// stops its pass: parked, not exited.
 ///
 /// The loop's exit is one of the daemon's shutdown arms, so exiting on a
 /// supervisor stop tore down the API task and every other task with it,
-/// directly contradicting the stop announcement's "the daemon keeps serving"
-/// (FIR-2317). Parking keeps the task alive doing only the coordination
+/// directly contradicting the stop announcement's "the daemon keeps serving".
+/// Parking keeps the task alive doing only the coordination
 /// housekeeping the daemon still owes, and ends on the daemon's own shutdown
 /// signal. Admission stays stopped until a daemon restart clears the
 /// in-memory halt, which is the "a restart retries it" the announcement
@@ -2942,22 +3551,57 @@ async fn park_reconcile_loop(
 /// refused — and a daemon that waited on a channel none of those paths closes
 /// would never publish its endpoint at all.
 #[derive(Debug)]
-pub struct WatchArmed(Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>);
+pub struct WatchArmed {
+    watch: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+    canonical: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+}
 
 impl WatchArmed {
     pub fn new(signal: tokio::sync::oneshot::Sender<std::result::Result<(), String>>) -> Self {
-        Self(Some(signal))
+        Self {
+            watch: Some(signal),
+            canonical: None,
+        }
     }
 
-    /// Report the watch, once. Later calls and the drop below do nothing.
+    /// Production readiness separates fast watcher registration from canonical
+    /// repair, whose exact-CAS work can legitimately exceed the watch deadline.
+    pub(crate) fn with_canonical_ready(
+        watch: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        canonical: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) -> Self {
+        Self {
+            watch: Some(watch),
+            canonical: Some(canonical),
+        }
+    }
+
+    /// Report the watch once; this does not certify canonical repair.
     fn arm(&mut self) {
-        if let Some(signal) = self.0.take() {
+        if let Some(signal) = self.watch.take() {
+            let _ = signal.send(Ok(()));
+        }
+    }
+
+    /// A production no-watch branch reports that fact before its potentially
+    /// long repair. Preserve the original one-channel observer's repair wait.
+    fn no_watch(&mut self) {
+        if self.canonical.is_some() {
+            self.watch.take();
+        }
+    }
+
+    fn canonical_ready(&mut self) {
+        if let Some(signal) = self.canonical.take() {
             let _ = signal.send(Ok(()));
         }
     }
 
     fn fail(&mut self, error: String) {
-        if let Some(signal) = self.0.take() {
+        if let Some(signal) = self.watch.take() {
+            let _ = signal.send(Err(error.clone()));
+        }
+        if let Some(signal) = self.canonical.take() {
             let _ = signal.send(Err(error));
         }
     }
@@ -2977,8 +3621,10 @@ impl WatchArmed {
 /// A store with no marker gets no catch-up. Absent means either never admitted
 /// or admitted by a build older than the marker, and neither supplies a window;
 /// with no lower bound the pass would propose the entire working copy, which is
-/// exactly the sweep startup must not perform. An unreadable marker is the same
-/// answer said louder, so it is logged rather than silently treated as absent.
+/// exactly the sweep startup must not perform. An unreadable marker also names
+/// no window, but it did record an admission once, so the stretch since then is
+/// one nothing can vouch for: it is recorded as a check that could not run,
+/// which qualifies answers and holds the marker until a complete admission.
 fn startup_catch_up_window(state: &DaemonState) -> Option<SystemTime> {
     match kin_core::last_admission::read(&state.layout) {
         kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => {
@@ -3003,6 +3649,13 @@ fn startup_catch_up_window(state: &DaemonState) -> Option<SystemTime> {
                 "the last-admission marker will not parse, so no catch-up window can be named; \
                  `kin admit` takes whatever the host changed while nothing was watching"
             );
+            state
+                .background_work
+                .reconcile()
+                .record_changed_paths_unchecked(format!(
+                    "the last-admission marker will not parse ({reason}), so no check for \
+                     working-copy changes made while no daemon watched could run"
+                ));
             None
         }
     }
@@ -3022,117 +3675,310 @@ fn unix_instant(at: chrono::DateTime<chrono::Utc>) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, at.timestamp_subsec_nanos())
 }
 
-/// Host events for every path the working copy changed at or after `since`.
+/// What a daemon owes the working copy for the stretch nothing watched it, planned
+/// once when the daemon starts.
 ///
-/// Stat-only: the walk that produces this opens nothing and hashes nothing, so
-/// a store whose host did not move since its last admission pays one traversal
-/// and returns an empty list. The events it does return go through the ordinary
-/// tick, so a catch-up path is admitted by the same bounded observation, the
-/// same policy filter and the same compare-and-swap as one the watcher saw.
-/// This plans no transition of its own and publishes nothing.
+/// One stat-first walk ([`kin_index::scan_working_copy_changes_since`]) sorts
+/// the host into the populations the loop admits: tracked paths the host edited
+/// or removed, new files beside tracked content, and directories graph truth has
+/// never met. Each of them crosses authority through the ordinary tick, so the
+/// same bounded observation, policy filter and compare-and-swap a watched edit
+/// meets applies here unchanged. This plans no transition and publishes nothing.
+#[derive(Debug, Default)]
+pub(crate) struct CatchUpPlan {
+    /// Events for the window's own population: tracked paths the host edited
+    /// (`Changed`) or removed (`Removed`), and new files beside tracked content.
+    window: Vec<FileEvent>,
+    /// Repository paths under a directory graph truth has never met, admitted
+    /// under [`CATCH_UP_ARRIVAL_PROVENANCE`] rather than by the window.
+    arrivals: Vec<RepoPath>,
+    /// Tracked paths whose graph truth no longer describes the working copy.
+    /// These are what every answer is qualified by until a tick admits them,
+    /// because until then the graph answers from bytes the host no longer holds.
+    tracked: Vec<RepoPath>,
+    /// Every repository path the plan's events name. The loop drains this as
+    /// ticks admit them and withholds the last-admission marker until it is
+    /// empty, so a daemon that stops mid catch-up leaves the window open for
+    /// the next one instead of stamping past paths it never took.
+    owed: BTreeSet<RepoPath>,
+    /// What the plan cost: the walk and every read it took.
+    elapsed: Duration,
+    tracked_candidates_read: usize,
+    tracked_bytes_read: u64,
+}
+
+impl CatchUpPlan {
+    /// The window's events and the never-met arrivals, in the order the loop
+    /// enqueues them.
+    fn events(&self, working_dir: &Path) -> Vec<FileEvent> {
+        let mut events = self.window.clone();
+        events.extend(never_met_directory_events(working_dir, &self.arrivals));
+        events
+    }
+}
+
+/// Plan the startup catch-up over everything the working copy changed at or
+/// after `since`.
 ///
-/// The bound is inclusive because filesystem modification times are coarse. A
-/// file written in the same second the marker was stamped is re-observed, and
-/// re-observing an unchanged path costs one admission that plans nothing.
-fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<FileEvent>> {
+/// A tracked path is proposed when the host edited or removed it inside the
+/// window. The watcher admits exactly such an edit when it is alive for it, and
+/// a daemon that was down for it has to reach the same graph or every answer it
+/// gives describes a file the host no longer holds: a renamed function is found
+/// under its old name, its new name is certified absent, and a deleted file is
+/// served as a top hit. Divergence that predates the window is left alone, as
+/// before, because the last admission observed the whole working copy and a
+/// path that differs without having moved since is one graph truth moved away
+/// from, which `kin doctor --drift` reports and `--heal` restores.
+///
+/// The bound is inclusive and deliberately generous for tracked paths
+/// ([`kin_index::TRACKED_CHANGE_WINDOW_MARGIN`]), because each tracked
+/// candidate is read and compared with its admitted entry before it is
+/// proposed: re-reading a file touched just before the marker costs one hash
+/// and never proposes an unchanged path.
+pub(crate) fn plan_catch_up(state: &DaemonState, since: SystemTime) -> Result<CatchUpPlan> {
+    let started = Instant::now();
     let working_dir = state.layout.working_dir();
     let (_, policy) = current_authority_admission(state)?;
     let previous = state.graph.resolved_tree();
-    let tracked_paths = previous
-        .artifacts_by_path()
-        .map(|artifact| artifact.path.clone())
-        .collect::<Vec<_>>();
     let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
     let ignore =
         kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
-    let modified = kin_index::scan_repository_modified_since(
+    let changes = kin_index::scan_working_copy_changes_since(
         working_dir,
         &ignore,
         policy.as_ref(),
-        tracked_paths.iter(),
+        previous
+            .artifacts_by_path()
+            .map(|artifact| (&artifact.path, artifact.entry)),
         graph_only_paths.iter(),
         since,
     )
     .map_err(kin_index::IndexError::from)?;
-    Ok(modified
-        .iter()
-        .filter_map(|path| kin_index::host_path_from_repo_path(working_dir, path).ok())
-        .map(FileEvent::Changed)
-        .collect())
+    let host = |path: &RepoPath| kin_index::host_path_from_repo_path(working_dir, path).ok();
+    let mut window = Vec::new();
+    window.extend(
+        changes
+            .tracked_changed
+            .iter()
+            .chain(changes.untracked.iter())
+            .filter_map(host)
+            .map(FileEvent::Changed),
+    );
+    window.extend(
+        changes
+            .tracked_removed
+            .iter()
+            .filter_map(host)
+            .map(FileEvent::Removed),
+    );
+    let tracked = changes.tracked().cloned().collect::<Vec<_>>();
+    let owed = changes
+        .tracked()
+        .chain(changes.untracked.iter())
+        .chain(changes.never_met.iter())
+        .cloned()
+        .collect();
+    Ok(CatchUpPlan {
+        window,
+        arrivals: changes.never_met,
+        tracked,
+        owed,
+        elapsed: started.elapsed(),
+        tracked_candidates_read: changes.tracked_candidates_read,
+        tracked_bytes_read: changes.tracked_bytes_read,
+    })
 }
 
-/// Where a daemon records the paths it derived entities for that durable
-/// authority is not known to hold.
-///
-/// Operational state beside the pid and port files, never semantic authority.
-fn unpublished_enrichment_marker_path(state: &DaemonState) -> PathBuf {
-    state.layout.root().join("unpublished-enrichment.json")
+/// Host events for the window's own population of [`plan_catch_up`]: tracked
+/// paths the host edited or removed at or after `since`, and new files beside
+/// tracked content. The never-met directory population is planned beside it and
+/// admitted under its own provenance.
+#[cfg(test)]
+fn plan_catch_up_events(state: &DaemonState, since: SystemTime) -> Result<Vec<FileEvent>> {
+    Ok(plan_catch_up(state, since)?.window)
 }
 
-/// Record that this daemon derived entities for a path, and persist the set
-/// when it grows.
+/// Plan the startup catch-up and state what it owes before any answer is served.
 ///
-/// Written after the transaction is applied, so the record is of enrichment the
-/// graph actually holds rather than of a pass that was attempted. Persisted only
-/// when the path is new to the set, which bounds this to one write per path per
-/// daemon life however often that path is edited.
-///
-/// A failed write is not fatal and is not retried. The marker exists to make a
-/// loss recoverable; a store that cannot write it is no worse off than one built
-/// before this existed, and failing an admission over it would trade a
-/// recoverable gap for an unrecoverable refusal.
-fn mark_enrichment_unpublished(state: &DaemonState, file_id: &FilePathId) {
-    let snapshot = {
-        let Ok(mut marked) = state.unpublished_enrichment.lock() else {
-            return;
-        };
-        if !marked.insert(file_id.0.clone()) {
-            return;
+/// Called before canonical readiness, which is what releases the endpoint, so
+/// no client can reach this daemon while the tracked paths it is about to admit
+/// are unrecorded: every surface built from the reconcile report names them
+/// and no answer certifies over them until a tick admits them. A plan that
+/// cannot be made is stated the same way, as a check that did not run, because
+/// a graph that may be stale must say so rather than certify.
+fn plan_startup_catch_up(state: &DaemonState, since: SystemTime) -> Option<CatchUpPlan> {
+    let probes = state.background_work.reconcile();
+    match plan_catch_up(state, since) {
+        Ok(plan) => {
+            info!(
+                elapsed_ms = plan.elapsed.as_millis() as u64,
+                tracked_changed = plan.tracked.len(),
+                untracked = plan
+                    .owed
+                    .len()
+                    .saturating_sub(plan.tracked.len() + plan.arrivals.len()),
+                never_met = plan.arrivals.len(),
+                tracked_candidates_read = plan.tracked_candidates_read,
+                tracked_bytes_read = plan.tracked_bytes_read,
+                "planned the startup catch-up over what the working copy changed while no daemon \
+                 watched"
+            );
+            probes.record_changed_paths(plan.tracked.iter());
+            Some(plan)
         }
-        marked.iter().cloned().collect::<Vec<_>>()
-    };
-    match serde_json::to_vec(&snapshot) {
-        Ok(bytes) => {
-            if let Err(error) = std::fs::write(unpublished_enrichment_marker_path(state), bytes) {
-                debug!(
-                    error = %error,
-                    "could not persist the unpublished-enrichment marker; a loss on this path \
-                     would need an edit to recover"
-                );
-            }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "could not plan the startup catch-up, so host content written while nothing was \
+                 watching stays unadmitted until `kin admit` or a commit takes it"
+            );
+            probes.record_changed_paths_unchecked(format!(
+                "the check for working-copy changes made while no daemon watched could not run \
+                 ({error})"
+            ));
+            None
         }
-        Err(error) => debug!(error = %error, "could not encode the unpublished-enrichment marker"),
     }
 }
 
-/// Read the marker one previous daemon left, decide each entry against graph
-/// truth, and return canonical paths whose entities did not survive.
+/// The never-met arrivals [`plan_catch_up`] found, as the ordinary host events
+/// the ambient admission pipeline already knows how to carry.
+///
+/// Sharing that pipeline, rather than admitting these paths through a seam of
+/// their own, is deliberate: entity derivation, the reconciler, and every
+/// per-path failure and retry rule already proven for a watched edit apply
+/// here unchanged, including the one this population most needs -- content
+/// inside the swept directory that cannot be read still fails and retries
+/// exactly as any other unreadable content does, rather than being silently
+/// skipped. Only the discovery of these paths, and the record that they
+/// arrived this way, is new.
+fn never_met_directory_events(working_dir: &Path, paths: &[RepoPath]) -> Vec<FileEvent> {
+    paths
+        .iter()
+        .filter_map(|path| kin_index::host_path_from_repo_path(working_dir, path).ok())
+        .map(FileEvent::Changed)
+        .collect()
+}
+
+/// The provenance word this daemon records for entities admitted because
+/// startup catch-up met a directory graph truth had never tracked before,
+/// rather than declining them to the behind disclosure and `kin admit`.
+///
+/// No existing provenance vocabulary answers "how did this content enter the
+/// graph" at this grain: an ambient watch and an explicit `kin admit` both
+/// publish their workspace-tree transition under the same actor,
+/// [`DAEMON_ADMISSION_ACTOR`], and neither mints a record a later reader
+/// could use to tell them apart, because neither needs one -- both carry
+/// stronger evidence about when their content changed than this population
+/// ever had. This is the new word, and [`catch_up_arrival_marker_path`] is
+/// where it is recorded.
+pub(crate) const CATCH_UP_ARRIVAL_PROVENANCE: &str = "arrived";
+
+/// Where a daemon records the repository paths it swept into reconciliation
+/// under [`CATCH_UP_ARRIVAL_PROVENANCE`].
+///
+/// Operational state beside the pid and port files, never semantic authority:
+/// nothing reads this back to decide what to admit, and losing it loses a
+/// record, not any content. It exists so an operator or a later tool can
+/// answer "how did this file's entities enter the graph" for a directory a
+/// pull carried in whole.
+fn catch_up_arrival_marker_path(state: &DaemonState) -> PathBuf {
+    state.layout.root().join("catch-up-arrivals.json")
+}
+
+/// Record that this sweep is admitting `paths` under
+/// [`CATCH_UP_ARRIVAL_PROVENANCE`], growing whatever an earlier sweep in this
+/// daemon's life already recorded rather than replacing it.
+///
+/// Written before the admission it documents: the record of intent survives a
+/// crash the admission itself does not, and re-admitting an already-recorded
+/// path the next time it is still unmet costs nothing, since this file is read
+/// back by nothing this daemon does.
+///
+/// Best-effort and never fatal. The admission this documents is not withheld
+/// by a write that fails, and a store that cannot write it is no worse off
+/// than one built before this existed.
+fn record_catch_up_arrivals(state: &DaemonState, paths: &[RepoPath]) {
+    if paths.is_empty() {
+        return;
+    }
+    let marker = catch_up_arrival_marker_path(state);
+    let mut recorded: Vec<String> = std::fs::read(&marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default();
+    for path in paths {
+        let named = path.to_string();
+        if !recorded.contains(&named) {
+            recorded.push(named);
+        }
+    }
+    match serde_json::to_vec(&recorded) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(&marker, bytes) {
+                debug!(
+                    error = %error,
+                    "could not persist the catch-up arrival marker; the admission this tick \
+                     performs is unaffected"
+                );
+            }
+        }
+        Err(error) => debug!(error = %error, "could not encode the catch-up arrival marker"),
+    }
+}
+
+/// Judge the paths an earlier build's daemon recorded deriving entities for
+/// against graph truth, and return each one whose entities did not survive,
+/// with the body the tree names there now.
+///
+/// That build wrote the record after a live apply and outside any publication,
+/// so it could name work no commit carried. This build records owed work in
+/// repository authority instead, and reads the record only as a migration
+/// input, at its first daemon start.
 ///
 /// Every entry is checked rather than trusted. A path whose entities a commit
 /// published is resolved and dropped; only a path the graph holds no entity for
 /// is owed a re-derivation, and that is the exact shape of the FIR-2606 wedge.
 /// A converted store therefore pays nothing: its paths were marked while the
-/// conversion derived them and its own commit published them, so the next
-/// daemon resolves every entry and re-derives none.
+/// conversion derived them and its own commit published them, so this start
+/// resolves every entry and re-derives none.
 ///
-/// The file is rewritten with what is still owed, so a marker cannot grow
-/// without bound across restarts, and it is rewritten before the paths are
-/// returned so a daemon that dies mid-repair does not lose the record of what
-/// it still owed.
-fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<RepoPath>> {
+/// A path whose current bytes declare nothing is resolved too. The graph
+/// holding no entity for it is what every derivation of those bytes produces,
+/// not a loss, and such a path was marked whenever a re-derivation withdrew
+/// what an older parse minted for it.
+///
+/// A record that will not read names, for all this build can tell, any source
+/// path, so every one is judged the same way. Nothing is rewritten: what
+/// survives rides this daemon's next authority transaction, and the record
+/// goes once that transaction is durable.
+fn plan_unpublished_enrichment_repair(
+    state: &DaemonState,
+    record: &crate::semantic_debt::LegacyRecord<String>,
+) -> Result<Vec<(RepoPath, kin_model::Hash256)>> {
     use kin_model::EntityStore;
 
-    let marker = unpublished_enrichment_marker_path(state);
-    let Ok(bytes) = std::fs::read(&marker) else {
-        return Ok(Vec::new());
-    };
-    let Ok(marked) = serde_json::from_slice::<Vec<String>>(&bytes) else {
-        warn!(
-            marker = %marker.display(),
-            "the unpublished-enrichment marker will not parse, so nothing can be recovered from \
-             it; a path missing its entities stays unqueryable until it is edited"
-        );
-        return Ok(Vec::new());
+    let tree = state.graph.resolved_tree();
+    let marked: Vec<String> = match record {
+        crate::semantic_debt::LegacyRecord::Absent => return Ok(Vec::new()),
+        crate::semantic_debt::LegacyRecord::Entries(paths) => paths.clone(),
+        crate::semantic_debt::LegacyRecord::Unknown(why) => {
+            warn!(
+                record = %why,
+                "an earlier build's unpublished-enrichment record will not read, so every \
+                 source path the graph holds no entity for is judged as if it were named"
+            );
+            tree.artifacts_by_path()
+                .filter_map(|artifact| artifact.path.as_utf8())
+                .filter(|path| {
+                    matches!(
+                        FileClassifier::classify(Path::new(path)),
+                        FileClassification::EntitySource
+                    )
+                })
+                .map(str::to_string)
+                .collect()
+        }
     };
     if marked.is_empty() {
         return Ok(Vec::new());
@@ -3144,38 +3990,74 @@ fn plan_unpublished_enrichment_repair(state: &DaemonState) -> Result<Vec<RepoPat
         .into_iter()
         .filter_map(|entity| entity.file_origin)
         .collect();
-    let mut still_owed = Vec::new();
-    let mut paths = Vec::new();
+    let mut owed = Vec::new();
     for path in marked {
         let file_id = FilePathId::new(&path);
         if held.contains(&file_id) {
             continue;
         }
         // A path the tree no longer carries was removed rather than lost, and
-        // re-deriving it would ask the host for bytes the repository has
-        // retired. The entry goes with the artifact.
-        let Ok(repo_path) = RepoPath::from_utf8(path.clone()) else {
+        // re-deriving it would ask for bytes the repository has retired. The
+        // entry goes with the artifact.
+        let Ok(repo_path) = RepoPath::from_utf8(path) else {
             continue;
         };
-        if state.graph.artifact_id_at_path(&repo_path).is_none() {
+        let Some(artifact) = tree.artifact_at_path(&repo_path) else {
+            continue;
+        };
+        if tree_bytes_declare_nothing(state, &file_id, &artifact.entry) {
             continue;
         }
-        still_owed.push(path);
-        paths.push(repo_path);
+        // Only a blob declares anything, so a surviving entry always names one.
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        owed.push((repo_path, hash));
     }
+    Ok(owed)
+}
 
-    if let Ok(mut set) = state.unpublished_enrichment.lock() {
-        *set = still_owed.iter().cloned().collect();
+/// Whether the exact bytes the tree names for a marked path produce no entity
+/// under this build, so the graph holding none for it is what a re-derivation
+/// would leave.
+///
+/// The body is read from graph-owned CAS, never the working copy, exactly as
+/// the startup re-derivation reads it. Only a complete parse that yields no
+/// entity shows the bytes declare nothing: an incomplete parse is an ordinary
+/// result too, and an extractor that read nothing from malformed bytes also
+/// reports no entity. A body that cannot be read, indexed or completely parsed
+/// answers `false`, which keeps the path owed and leaves the re-derivation to
+/// report why rather than dropping a loss this check could not rule out.
+fn tree_bytes_declare_nothing(
+    state: &DaemonState,
+    file_id: &FilePathId,
+    entry: &TreeEntry,
+) -> bool {
+    // Symlinks and gitlinks are never parsed as source owned by the link path,
+    // so no derivation gives one an entity.
+    let TreeEntry::Blob { hash, .. } = entry else {
+        return true;
+    };
+    let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+    let Ok(content) = state.blobs.read(&body_hash) else {
+        return false;
+    };
+    // Content decides whether a path is entity source at all, exactly as
+    // admission decides it, and a path that is not carries no entity.
+    if !matches!(
+        FileClassifier::classify_with_content(Path::new(&file_id.0), &content),
+        FileClassification::EntitySource
+    ) {
+        return true;
     }
-    match serde_json::to_vec(&still_owed) {
-        Ok(bytes) => {
-            if let Err(error) = std::fs::write(&marker, bytes) {
-                debug!(error = %error, "could not rewrite the unpublished-enrichment marker");
-            }
-        }
-        Err(error) => debug!(error = %error, "could not encode the unpublished-enrichment marker"),
-    }
-    Ok(paths)
+    IndexPipeline::new()
+        .index_file_content_with_tests(file_id, &content, body_hash)
+        .is_ok_and(|indexed| {
+            matches!(
+                indexed.indexed_file.parse_state,
+                kin_model::ParseState::Valid
+            ) && indexed.indexed_file.entities.is_empty()
+        })
 }
 
 /// What one layout backfill pass observed and published.
@@ -3196,7 +4078,7 @@ pub(crate) struct LayoutBackfill {
     pub(crate) other_facet: usize,
     /// Artifacts whose graph entities disagree with a fresh parse of the bytes
     /// the tree holds: published as `Partial` rather than `Full`, and owed a
-    /// re-derivation. Counted inside `published`.
+    /// re-derivation. The snapshot pass defers these instead of publishing them.
     pub(crate) stale: usize,
     /// Repository paths whose canonical source bytes need semantic re-derivation.
     /// These are not host observations and must never enqueue filesystem admission.
@@ -3292,9 +4174,126 @@ pub(crate) fn spans_a_fresh_parse_does_not_reproduce(
 /// daemon life. A store whose files were committed through Kin pays a tree walk
 /// and no parses at all.
 pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<LayoutBackfill> {
+    derive_missing_source_layouts(
+        &state.graph.resolved_tree(),
+        state.blobs.as_ref(),
+        |file_id| {
+            Ok(if state.graph.get_file_layout(file_id)?.is_some() {
+                SourceLayoutFacet::Layout
+            } else if state.graph.get_shallow_file(file_id)?.is_some()
+                || state.graph.get_structured_artifact(file_id)?.is_some()
+                || state.graph.get_opaque_artifact(file_id)?.is_some()
+            {
+                SourceLayoutFacet::Other
+            } else {
+                SourceLayoutFacet::Missing
+            })
+        },
+        |file_id| {
+            Ok(state.graph.query_entities(&EntityFilter {
+                file_path: Some(file_id.clone()),
+                ..Default::default()
+            })?)
+        },
+        |layout, _stale| {
+            state.graph.upsert_file_layout(&layout)?;
+            Ok(true)
+        },
+    )
+}
+
+/// Reconstruct missing source layouts before the graph validates its retrieval
+/// sidecars. Git-import authority carries entities but not these derived parse
+/// observations. Deriving them only during canonical startup made every reopen
+/// compare the sidecar with a graph missing the layouts its writer had held.
+///
+/// This uses the canonical startup pass's exact CAS and parser checks. Existing
+/// facets remain untouched. Stale declarations and unreadable bodies remain
+/// absent here so canonical startup still observes and repairs or refuses them.
+/// Fresh layouts arrive without graph mutations or embedding work; the later
+/// startup pass sees them present and does not parse their bodies again.
+#[cfg(feature = "embeddings")]
+pub(crate) fn restore_missing_source_layouts_in_snapshot(
+    snapshot: &mut kin_db::GraphSnapshot,
+    blobs: &kin_blobs::BlobStore,
+) -> Result<LayoutBackfill> {
+    let kin_db::GraphSnapshot {
+        entities,
+        shallow_files,
+        file_layouts,
+        structured_artifacts,
+        opaque_artifacts,
+        resolved_tree,
+        ..
+    } = snapshot;
+    let layouts: std::collections::HashSet<_> = file_layouts
+        .iter()
+        .map(|layout| layout.file_id.clone())
+        .collect();
+    let other: std::collections::HashSet<_> = shallow_files
+        .iter()
+        .map(|record| record.file_id.clone())
+        .chain(
+            structured_artifacts
+                .iter()
+                .map(|record| record.file_id.clone()),
+        )
+        .chain(opaque_artifacts.iter().map(|record| record.file_id.clone()))
+        .collect();
+    let mut entities_by_file: HashMap<&FilePathId, Vec<&kin_model::Entity>> = HashMap::new();
+    for entity in entities.values() {
+        if let Some(file_id) = &entity.file_origin {
+            entities_by_file.entry(file_id).or_default().push(entity);
+        }
+    }
+    derive_missing_source_layouts(
+        resolved_tree,
+        blobs,
+        |file_id| {
+            Ok(if layouts.contains(file_id) {
+                SourceLayoutFacet::Layout
+            } else if other.contains(file_id) {
+                SourceLayoutFacet::Other
+            } else {
+                SourceLayoutFacet::Missing
+            })
+        },
+        |file_id| {
+            Ok(entities_by_file
+                .get(file_id)
+                .into_iter()
+                .flatten()
+                .map(|entity| (**entity).clone())
+                .collect())
+        },
+        |layout, stale| {
+            if stale {
+                return Ok(false);
+            }
+            file_layouts.push(layout);
+            Ok(true)
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SourceLayoutFacet {
+    Missing,
+    Layout,
+    Other,
+}
+
+/// The shared CAS derivation behind snapshot restoration and canonical startup.
+/// `install` may defer a stale layout so the live repair still sees it missing.
+fn derive_missing_source_layouts(
+    tree: &kin_model::ResolvedTree,
+    blobs: &kin_blobs::BlobStore,
+    mut facet: impl FnMut(&FilePathId) -> Result<SourceLayoutFacet>,
+    mut entities_for: impl FnMut(&FilePathId) -> Result<Vec<kin_model::Entity>>,
+    mut install: impl FnMut(kin_model::FileLayout, bool) -> Result<bool>,
+) -> Result<LayoutBackfill> {
     let mut report = LayoutBackfill::default();
     let pipeline = IndexPipeline::new();
-    let tree = state.graph.resolved_tree();
 
     for artifact in tree.artifacts_by_path() {
         let Some(path) = artifact.path.as_utf8() else {
@@ -3312,29 +4311,29 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
             continue;
         }
         let file_id = FilePathId::new(path);
-        if state.graph.get_file_layout(&file_id)?.is_some() {
-            report.already_published += 1;
-            continue;
-        }
         // Another facet already owns this path. The four are mutually exclusive
         // per file and the watcher seam enforces that
         // ([`clear_incompatible_facets_in`]), so publishing a layout beside one
         // would leave the store holding two answers to how the file is tracked.
         // The gap this pass closes is a path carrying no facet at all, which is
         // exactly what a Git import leaves behind.
-        if state.graph.get_shallow_file(&file_id)?.is_some()
-            || state.graph.get_structured_artifact(&file_id)?.is_some()
-            || state.graph.get_opaque_artifact(&file_id)?.is_some()
-        {
-            report.other_facet += 1;
-            continue;
+        match facet(&file_id)? {
+            SourceLayoutFacet::Layout => {
+                report.already_published += 1;
+                continue;
+            }
+            SourceLayoutFacet::Other => {
+                report.other_facet += 1;
+                continue;
+            }
+            SourceLayoutFacet::Missing => {}
         }
 
         // `TreeEntry` carries kin-model's hash and the blob store speaks
         // kin-blobs', so the identity crosses that boundary by bytes, exactly
         // as the historical rebuild crosses it.
         let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
-        let Ok(content) = state.blobs.read(&body_hash) else {
+        let Ok(content) = blobs.read(&body_hash) else {
             debug!(
                 file = %file_id,
                 "no CAS body for an admitted artifact, so its parse observation stays unpublished"
@@ -3367,16 +4366,19 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
         };
         let mut completeness = indexed.file_layout.parse_completeness;
 
-        let mut entities = state.graph.query_entities(&EntityFilter {
-            file_path: Some(file_id.clone()),
-            ..Default::default()
-        })?;
+        let mut entities = entities_for(&file_id)?;
+        // The live file query is id-sorted before this stable span sort.
+        // Snapshot maps have arbitrary order, so preserve that tie-break here
+        // too when a container and declaration begin at the same byte.
         entities.sort_by_key(|entity| {
-            entity
-                .span
-                .as_ref()
-                .map(|span| span.start_byte)
-                .unwrap_or(usize::MAX)
+            (
+                entity
+                    .span
+                    .as_ref()
+                    .map(|span| span.start_byte)
+                    .unwrap_or(usize::MAX),
+                entity.id,
+            )
         });
         // The parse just taken is of the bytes the tree holds NOW. The entities
         // the graph holds may have been derived from an earlier blob at this
@@ -3402,8 +4404,9 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
         }
         let layout =
             kin_core::build_entity_file_layout(&file_id, &entities, content.len(), completeness);
-        state.graph.upsert_file_layout(&layout)?;
-        report.published += 1;
+        if install(layout, stale > 0 || missing > 0)? {
+            report.published += 1;
+        }
     }
 
     Ok(report)
@@ -3420,51 +4423,69 @@ pub async fn run_loop(
 /// Repair derived semantics from the canonical tree and CAS, without observing
 /// or admitting host paths. The caller owns local repository authority; remote
 /// backend daemons must retain their existing graph-only write boundary.
+///
+/// Every source this start owes a re-derivation is planned first and then
+/// re-derived in one coherent pass. That pass reads every admitted source
+/// outside itself through the strict dependency reader, which refuses a source
+/// whose graph declarations its own bytes do not produce. Run once per cause,
+/// each pass was refused by a source another cause owed: on a store an older
+/// build wrote with uncommitted edits, the owed parses, the missing entities and
+/// the stale spans each failed on the others, the repair reported incomplete,
+/// and the daemon exited without ever serving. The census before the pass is
+/// that same strict reader over every admitted source, so the one pass also
+/// covers a source none of the planners named, such as one whose declarations
+/// an older parser minted.
 async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()> {
+    // Under the gate every other graph-authority mutation takes, including the
+    // watcher tick, commit and checkout, and held from planning through the
+    // final restore: the census names what the pass must cover, and a mutation
+    // in between could invalidate it.
+    let _coordination = state.coordination_gate.lock().await;
+    let started = Instant::now();
     let mut failures = Vec::new();
-    {
-        // Under the gate every other graph-authority mutation takes,
-        // including the watcher tick, commit and checkout. The drain applies
-        // entity transactions to the live graph, and a mutation outside
-        // the gate can interleave with a commit planning its change from
-        // that same graph.
-        let _coordination = state.coordination_gate.lock().await;
-        if let Err(error) = drain_semantic_debt(state).await {
+
+    // What authority says this workspace owes. An authority this start cannot
+    // read is a failure, never an empty ledger.
+    let mut owed_parse = match crate::semantic_debt::outstanding_checked(state) {
+        Ok(recorded) => crate::semantic_debt::owed_against_tree(state, &recorded),
+        Err(error) => {
             failures.push(error.to_string());
-            warn!(
-                error = %error,
-                "a path whose bytes reached authority without a parse could not be re-parsed \
-                 at startup, so it still answers at the positions its previous bytes held"
-            );
+            BTreeSet::new()
         }
+    };
+
+    // The migration boundary. An earlier build kept its owed work beside the
+    // store, and each entry is judged here against the graph this start loaded
+    // from authority. What survives is re-derived in this start's pass and held
+    // for this daemon's next authority transaction to carry into the ledger;
+    // the records go once that transaction is durable, or now if nothing
+    // survives. Nothing is decided by the files' identity.
+    let legacy_debt = crate::semantic_debt::read_legacy_debt(state);
+    let mut legacy_owed = crate::semantic_debt::judge_legacy_debt(state, &legacy_debt);
+    owed_parse.extend(legacy_owed.iter().map(|(path, _)| path.clone()));
+    if !owed_parse.is_empty() {
+        info!(
+            paths = owed_parse.len(),
+            "re-deriving the semantics for paths whose bytes reached authority without them"
+        );
     }
 
-    {
-        let _coordination = state.coordination_gate.lock().await;
-        match plan_unpublished_enrichment_repair(state) {
-            Ok(paths) if paths.is_empty() => {
-                debug!("no path is owed a re-derivation from a previous daemon");
-            }
-            Ok(paths) => {
-                warn!(
-                    count = paths.len(),
-                    "a previous daemon derived entities for these paths and ended before a \
-                     commit published them, so nothing can query them; re-deriving them now"
-                );
-                let repaired =
-                    readmit_semantics_for_paths(state, &paths.into_iter().collect()).await;
-                if !repaired.failed.is_empty() {
-                    failures.extend(
-                        repaired
-                            .failed
-                            .iter()
-                            .filter(|failure| !failure.unparseable)
-                            .map(|failure| {
-                                format!("unpublished enrichment repair failed for {}", failure.path)
-                            }),
+    let legacy_enrichment = crate::semantic_debt::read_legacy_enrichment(state);
+    let missing_entities: BTreeSet<RepoPath> =
+        match plan_unpublished_enrichment_repair(state, &legacy_enrichment) {
+            Ok(owed) => {
+                if owed.is_empty() {
+                    debug!("no path is owed a re-derivation from a previous daemon");
+                } else {
+                    warn!(
+                        count = owed.len(),
+                        "a previous daemon derived entities for these paths and ended before a \
+                         commit published them, so nothing can query them; re-deriving them now"
                     );
-                    warn!(failed = repaired.failed.len(), "canonical unpublished-enrichment repair remains incomplete; no host admission was scheduled");
                 }
+                let paths = owed.iter().map(|(path, _)| path.clone()).collect();
+                legacy_owed.extend(owed);
+                paths
             }
             Err(error) => {
                 failures.push(error.to_string());
@@ -3473,14 +4494,14 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
                     "could not plan the unpublished-enrichment repair, so a path missing its \
                      entities stays unqueryable until it is edited"
                 );
+                BTreeSet::new()
             }
-        }
-    }
+        };
+    let legacy_found = legacy_debt.is_present() || legacy_enrichment.is_present();
 
-    {
-        let _coordination = state.coordination_gate.lock().await;
-        let report = backfill_missing_file_layouts(state);
-        if let Ok(report) = &report {
+    let mut stale_declarations = BTreeSet::new();
+    match backfill_missing_file_layouts(state) {
+        Ok(report) => {
             if report.unreadable > 0 {
                 let message = format!(
                     "{} admitted source file(s) have no readable canonical parse observation",
@@ -3489,9 +4510,7 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
                 warn!(%message, "canonical layout backfill remains incomplete");
                 failures.push(message);
             }
-        }
-        match report {
-            Ok(report) if report.published == 0 => {
+            if report.published == 0 {
                 debug!(
                     observed = report.observed(),
                     already_published = report.already_published,
@@ -3499,8 +4518,7 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
                     other_facet = report.other_facet,
                     "every admitted source file already carries its parse observation"
                 );
-            }
-            Ok(report) => {
+            } else {
                 info!(
                     published = report.published,
                     already_published = report.already_published,
@@ -3519,37 +4537,200 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
                          their parse observation was published as partial and they are being \
                          re-derived"
                     );
-                    let paths = report.rederive.into_iter().collect();
-                    let repaired = readmit_semantics_for_paths(state, &paths).await;
-                    if !repaired.failed.is_empty() {
-                        failures.extend(
-                            repaired
-                                .failed
-                                .iter()
-                                .filter(|failure| !failure.unparseable)
-                                .map(|failure| {
-                                    format!("canonical layout repair failed for {}", failure.path)
-                                }),
-                        );
-                        warn!(
-                            failed = repaired.failed.len(),
-                            "canonical semantic backfill remains incomplete; no host admission was scheduled"
-                        );
-                    }
                 }
+                stale_declarations.extend(report.rederive);
                 state.bump_version();
             }
-            Err(error) => {
-                failures.push(error.to_string());
-                warn!(
-                    error = %error,
-                    "could not publish per-file parse observations, so `list_file_entities` \
-                     cannot certify an enumeration on this store"
+        }
+        Err(error) => {
+            failures.push(error.to_string());
+            warn!(
+                error = %error,
+                "could not publish per-file parse observations, so `list_file_entities` \
+                 cannot certify an enumeration on this store"
+            );
+        }
+    }
+
+    // The strict reader every later pass applies, run over every admitted
+    // source. When nothing is owed and nothing is stale this IS the canonical
+    // restore, installed here, so a healthy store parses its sources once.
+    if failures.is_empty() {
+        let census = state
+            .reconciler
+            .write()
+            .await
+            .restore_canonical_source_state_or_name_stale(
+                state.graph.as_ref(),
+                state.blobs.as_ref(),
+            );
+        match census {
+            Ok(named) => {
+                if !named.is_empty() {
+                    warn!(
+                        count = named.len(),
+                        sample = %named
+                            .iter()
+                            .take(5)
+                            .map(|source| format!("{} ({})", source.file, source.reason))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        "these admitted sources hold declarations their current bytes do not \
+                         produce under this build, from edits no commit recorded or from a \
+                         store an older Kin build wrote; re-deriving them before serving"
+                    );
+                }
+                stale_declarations.extend(
+                    named
+                        .into_iter()
+                        .filter_map(|source| RepoPath::from_utf8(source.file.0).ok()),
                 );
             }
+            Err(error) => failures.push(format!(
+                "canonical source and dependency reconstruction failed: {error}"
+            )),
+        }
+    }
+
+    let owed: BTreeSet<RepoPath> = owed_parse
+        .iter()
+        .chain(&missing_entities)
+        .chain(&stale_declarations)
+        .cloned()
+        .collect();
+    if failures.is_empty() && !owed.is_empty() {
+        // Each file is counted under the first cause that names it, so the
+        // three counts add up to the files re-derived.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Cause {
+            OwedParse,
+            MissingEntities,
+            StaleDeclarations,
+        }
+        let cause = |path: &RepoPath| {
+            if owed_parse.contains(path) {
+                Cause::OwedParse
+            } else if missing_entities.contains(path) {
+                Cause::MissingEntities
+            } else {
+                Cause::StaleDeclarations
+            }
+        };
+        let by_cause = |which| owed.iter().filter(|path| cause(path) == which).count();
+        warn!(
+            files = owed.len(),
+            owed_parse = by_cause(Cause::OwedParse),
+            missing_entities = by_cause(Cause::MissingEntities),
+            stale_declarations = by_cause(Cause::StaleDeclarations),
+            "re-deriving these admitted source files from the bytes the store holds, in one \
+             pass, before this daemon serves; `kin status` reports what was re-derived"
+        );
+        let readmitted = readmit_semantics_at_startup(state, &owed).await;
+        let withdrawn_unrecorded = readmitted.withdrawn_unrecorded;
+        if withdrawn_unrecorded > 0 {
+            warn!(
+                bindings = withdrawn_unrecorded,
+                "the re-derivation retired declarations that other files' stale derivations \
+                 bound to, and dropped those bindings without a withdrawal record, because no \
+                 observation from before this start survives to ground one"
+            );
+        }
+        let external_unreproduced = readmitted.external_unreproduced;
+        if external_unreproduced > 0 {
+            warn!(
+                edges = external_unreproduced,
+                "the re-derivation retired stored external-import edges that this build's \
+                 parser does not reproduce from the exact source bytes they were recorded \
+                 against; their targets and those bytes were verified first"
+            );
+        }
+        let (unparseable, unresolved): (Vec<_>, Vec<_>) = readmitted
+            .failed
+            .into_iter()
+            .partition(|failure| failure.unparseable);
+        // Source the parser cannot read is the file's own state, and retaining
+        // last-known-good is the designed answer to it rather than a fault.
+        if !unparseable.is_empty() {
+            warn!(
+                files = unparseable
+                    .iter()
+                    .map(|failure| failure.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "these paths could not be parsed, so they keep the spans their last readable \
+                 version produced; the commit records their bytes either way"
+            );
+        }
+        if unresolved.is_empty() {
+            if let Err(error) = state
+                .reconciler
+                .write()
+                .await
+                .restore_canonical_source_state(state.graph.as_ref(), state.blobs.as_ref())
+            {
+                failures.push(format!(
+                    "canonical source and dependency reconstruction failed: {error}"
+                ));
+            }
+        } else {
+            failures.push(format!(
+                "the bytes for {} of these paths are durable authority and their semantics could \
+                 not be re-derived from them, so the graph still answers about them at the \
+                 positions their previous bytes held: {}",
+                unresolved.len(),
+                unresolved
+                    .iter()
+                    .map(|failure| failure.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if failures.is_empty() {
+            let unparsed: BTreeSet<&str> = unparseable
+                .iter()
+                .map(|failure| failure.path.as_str())
+                .collect();
+            let rederived: Vec<&RepoPath> = owed
+                .iter()
+                .filter(|path| !unparsed.contains(path.to_string().as_str()))
+                .collect();
+            let mut counts = crate::background_work::StartupRederivationCounts {
+                files: rederived.len() as u64,
+                withdrawn_bindings_unrecorded: withdrawn_unrecorded as u64,
+                external_edges_unreproduced: external_unreproduced as u64,
+                elapsed: started.elapsed(),
+                ..Default::default()
+            };
+            for path in rederived {
+                match cause(path) {
+                    Cause::OwedParse => counts.owed_parse += 1,
+                    Cause::MissingEntities => counts.missing_entities += 1,
+                    Cause::StaleDeclarations => counts.stale_declarations += 1,
+                }
+                counts.paths.push(path.to_string());
+            }
+            info!(
+                files = counts.files,
+                owed_parse = counts.owed_parse,
+                missing_entities = counts.missing_entities,
+                stale_declarations = counts.stale_declarations,
+                withdrawn_bindings_unrecorded = counts.withdrawn_bindings_unrecorded,
+                external_edges_unreproduced = counts.external_edges_unreproduced,
+                elapsed_ms = u64::try_from(counts.elapsed.as_millis()).unwrap_or(u64::MAX),
+                "re-derived the owed source files; this daemon now serves them from their \
+                 current bytes, and the next commit records the result durably"
+            );
+            state
+                .background_work
+                .reconcile()
+                .record_startup_rederivation(counts, Instant::now());
         }
     }
     if failures.is_empty() {
+        // Every survivor of the migration boundary was re-derived in the pass
+        // above, so this daemon's next authority transaction can carry it. A
+        // start that fails leaves the records for the next one to judge again.
+        crate::semantic_debt::hold_legacy_carry(state, legacy_found, legacy_owed);
         Ok(())
     } else {
         Err(DaemonError::SemanticReadmissionFailed(format!(
@@ -3557,6 +4738,54 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
             failures.join("; ")
         )))
     }
+}
+
+/// Finish canonical local repair before any host catch-up or normal serving.
+/// Cancellation closes the readiness channel without claiming completion.
+async fn finish_canonical_startup(
+    state: &DaemonState,
+    armed: &mut Option<WatchArmed>,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<bool> {
+    if !repair_canonical_startup(state, armed, cancel).await? {
+        return Ok(false);
+    }
+    if let Some(armed) = armed.as_mut() {
+        armed.canonical_ready();
+    }
+    Ok(true)
+}
+
+/// Canonical local repair, without signalling the readiness it gates.
+///
+/// Split from [`finish_canonical_startup`] for the one caller with work that
+/// must land between the two: the watching loop plans its startup catch-up
+/// after repair and before readiness releases the endpoint.
+async fn repair_canonical_startup(
+    state: &DaemonState,
+    armed: &mut Option<WatchArmed>,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<bool> {
+    if *cancel.borrow() {
+        return Ok(false);
+    }
+    if state.storage_backend.is_none() {
+        let repaired = tokio::select! {
+            result = repair_canonical_semantics_at_startup(state) => result,
+            _ = cancel.changed() => return Ok(false),
+        };
+        if let Err(error) = repaired {
+            if let Some(armed) = armed.as_mut() {
+                armed.fail(error.to_string());
+            }
+            return Err(error);
+        }
+    }
+    // A remote backend is deliberately exempt from local write authority.
+    if *cancel.borrow() || cancel.has_changed().is_err() {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Run the loop and report when its file watcher has acknowledged callback delivery.
@@ -3582,24 +4811,14 @@ pub async fn run_loop_armed(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
             "filesystem watcher and host admission disabled; canonical graph remains authoritative"
         );
-        // Disabling a local projection does not disable repair from its own
-        // canonical bytes. A storage backend, however, owns a remote graph:
-        // this loop must not acquire new write authority over it.
+        // No watch is required, but exact canonical repair still is. Only a
+        // remote backend is exempt from acquiring local repair authority.
+        if let Some(armed) = armed.as_mut() {
+            armed.no_watch();
+        }
         let mut cancel = cancel;
-        if state.storage_backend.is_none() && !*cancel.borrow() {
-            // Readiness waits for canonical repair, never host observation.
-            // Async suspension happens at coordination/reconciler lock waits;
-            // cancellation cannot interrupt a synchronous graph transaction.
-            let repair = tokio::select! {
-                result = repair_canonical_semantics_at_startup(&state) => result,
-                _ = cancel.changed() => return Ok(()),
-            };
-            if let Err(error) = repair {
-                if let Some(armed) = armed.as_mut() {
-                    armed.fail(error.to_string());
-                }
-                return Err(error);
-            }
+        if !finish_canonical_startup(&state, &mut armed, &mut cancel).await? {
+            return Ok(());
         }
         drop(armed.take());
         while !*cancel.borrow() {
@@ -3613,8 +4832,14 @@ pub async fn run_loop_armed(
     let working_dir = state.layout.working_dir();
     if is_bare_repository(working_dir) {
         info!(working_dir = %working_dir.display(), "working directory is a bare Git repository; reconciliation loop disabled");
-        drop(armed.take());
+        if let Some(armed) = armed.as_mut() {
+            armed.no_watch();
+        }
         let mut cancel = cancel;
+        if !finish_canonical_startup(&state, &mut armed, &mut cancel).await? {
+            return Ok(());
+        }
+        drop(armed.take());
         while !*cancel.borrow() {
             if cancel.changed().await.is_err() {
                 break;
@@ -3643,17 +4868,38 @@ pub async fn run_loop_armed(
     };
     // Read while the watcher is already reporting and before the endpoint can
     // be published, so the catch-up window and the watch meet rather than leave
-    // a seam between them. Planning the pass itself is deliberately left to the
-    // first round: the window is fixed here, the walk is not on the path to
-    // publication, and a client finding the port is never waiting on a
-    // traversal.
-    let mut catch_up_owed = startup_catch_up_window(&state);
-    // Canonical repair is independent of host catch-up and runs once per
-    // daemon life. It pays semantic debt, restores unpublished enrichment,
-    // and backfills parse observations from admitted bytes only.
-    let mut canonical_repair_owed = true;
+    // a seam between them.
+    let catch_up_window = startup_catch_up_window(&state);
     if let Some(armed) = armed.as_mut() {
         armed.arm();
+    }
+    // The watcher now retains notifications while canonical CAS repair runs.
+    // Neither host catch-up nor API publication can precede this barrier.
+    if !repair_canonical_startup(&state, &mut armed, &mut startup_cancel).await? {
+        return Ok(());
+    }
+    // Planned after repair and BEFORE readiness releases the endpoint, which is
+    // the whole point of planning here rather than on the first round. A
+    // tracked file the host edited or deleted while nothing watched is served
+    // from its old bytes until a tick admits it, so the answers a client gets
+    // in that stretch must say so, and they can only say so if the plan that
+    // names those paths exists before the first client can ask. One stat-first
+    // walk, reading only the tracked files touched inside the window; its cost
+    // is logged with the plan.
+    let mut catch_up = catch_up_window
+        .and_then(|since| off_the_runtime_worker(|| plan_startup_catch_up(&state, since)));
+    // What the catch-up still owes, drained as ticks admit it. The durable
+    // last-admission marker is not advanced past a path in here, so a daemon
+    // that stops mid catch-up leaves the window open for the next one.
+    let mut catch_up_owed = catch_up
+        .as_ref()
+        .map(|plan| plan.owed.clone())
+        .unwrap_or_default();
+    if *startup_cancel.borrow() || startup_cancel.has_changed().is_err() {
+        return Ok(());
+    }
+    if let Some(armed) = armed.as_mut() {
+        armed.canonical_ready();
     }
     let enrichment_pipeline = IndexPipeline::new();
     // The watcher's running total of host events it could not place inside this
@@ -3691,11 +4937,12 @@ pub async fn run_loop_armed(
     // The one exception is bounded by a clock rather than by taste. A file
     // watcher reports only the edits it was alive for, so the stretch between
     // one daemon's last complete admission and the next daemon's watch was
-    // observed by nobody and nothing replays it. `catch_up_owed` above names
-    // that stretch, and the first round below re-observes exactly the paths the
-    // host modified inside it. Everything older is untouched: it predates the
-    // last admission, which already covered it, and divergence with no window
-    // to place it in stays projection drift until an explicit seam admits it.
+    // observed by nobody and nothing replays it. `catch_up` above names what
+    // the host changed inside that stretch, tracked edits and deletions
+    // included, and the first round below re-observes exactly those paths.
+    // Everything older is untouched: it predates the last admission, which
+    // already covered it, and divergence with no window to place it in stays
+    // projection drift until an explicit seam admits it.
 
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
@@ -3742,6 +4989,9 @@ pub async fn run_loop_armed(
     // than for the function that computes it, because a local called
     // `admission_hold` shadows that function for the whole body.
     let mut held_admission: Option<AdmissionHoldState> = None;
+    // Up while `pending_events` holds anything this loop is still going to
+    // attempt, across rounds; see [`QueuedEventsMark`].
+    let mut queued_mark = QueuedEventsMark::default();
 
     // Register with the self-limit supervisor. Registered here rather than at
     // daemon start so a repository that never runs this loop — filesystem
@@ -3795,46 +5045,48 @@ pub async fn run_loop_armed(
             drop(watcher);
             drop(pending_events);
             drop(retry_lane);
+            // The queue is gone, so nothing in it is on its way into the graph,
+            // and a parked loop never comes back round to take the mark down.
+            drop(queued_mark);
             return park_reconcile_loop(&state, cancel, interval).await;
         }
 
         sweep_expired_intents(&state).await;
 
-        // The catch-up, owed once and taken on the first round that gets this
-        // far. Enqueued as ordinary host events rather than admitted here, so
-        // every one of them crosses authority through the same bounded
-        // observation, the same policy filter and the same compare-and-swap a
-        // watcher-observed edit does. A pass that fails is logged and dropped:
-        // it is a repair, and retrying it forever would spend a traversal per
-        // round on a store that already has an explicit seam for this.
-        if let Some(since) = catch_up_owed.take() {
-            match plan_catch_up_events(&state, since) {
-                Ok(events) if events.is_empty() => {
-                    debug!("no host path changed since the last complete admission");
-                }
-                Ok(events) => {
-                    info!(
-                        count = events.len(),
-                        "admitting host paths modified since the last complete admission"
-                    );
-                    enqueue_file_events(&mut pending_events, events);
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "could not plan the startup catch-up, so host content written while \
-                         nothing was watching stays unadmitted until `kin admit` or a commit \
-                         takes it"
-                    );
-                }
+        // The catch-up, planned before the endpoint was published and enqueued
+        // on the first round that gets this far. Enqueued as ordinary host
+        // events rather than admitted here, so every one of them crosses
+        // authority through the same bounded observation, the same policy
+        // filter and the same compare-and-swap a watcher-observed edit does.
+        if let Some(plan) = catch_up.take() {
+            if plan.window.is_empty() {
+                debug!("no host path changed since the last complete admission");
+            } else {
+                info!(
+                    count = plan.window.len(),
+                    tracked = plan.tracked.len(),
+                    "admitting host paths modified since the last complete admission"
+                );
             }
-        }
-
-        if canonical_repair_owed {
-            canonical_repair_owed = false;
-            // A watched daemon keeps serving explicit graph gaps and can
-            // retry through its existing admission/commit seams.
-            let _ = repair_canonical_semantics_at_startup(&state).await;
+            // The catch-up's other half: a directory graph truth has never
+            // met, which the window cannot place because modification time
+            // cannot tell a clone or a move from authored work. Swept in here
+            // under its own provenance instead of left to the behind
+            // disclosure and `kin admit`, so a large pull that added a
+            // directory does not leave the store reporting itself stale until
+            // an operator notices and re-ingests it by hand.
+            if plan.arrivals.is_empty() {
+                debug!("no directory this graph has never met is present in the working copy");
+            } else {
+                info!(
+                    count = plan.arrivals.len(),
+                    provenance = CATCH_UP_ARRIVAL_PROVENANCE,
+                    "admitting host paths under a directory this graph has never met before \
+                     this pull, instead of declining them to `kin admit`"
+                );
+                record_catch_up_arrivals(&state, &plan.arrivals);
+            }
+            enqueue_file_events(&mut pending_events, plan.events(working_dir));
         }
 
         // Collect retries first and real watcher notifications second. Dedup once per tick,
@@ -3952,6 +5204,24 @@ pub async fn run_loop_armed(
             FileEvent::Changed(path) => !retry_lane.waiting(path, tick_started),
         });
         enqueue_file_events(&mut pending_events, incoming_events);
+        // Up from the moment the queue holds an event, not from the moment a
+        // pass starts. Everything between here and a pass's writer guard, the
+        // grace for an imminent commit, a commit stand-down and the tail of a
+        // burst waiting for the next round, is time in which a name-resolving
+        // read would otherwise answer from a graph the queued files have not
+        // reached. A round the admission hold is going to stand down is the
+        // exception: it attempts nothing, so its events are not on their way
+        // anywhere, and a read must not wait on them. Should that hold run out
+        // during this round, the mark goes up again before the pass below.
+        if !pending_events.is_empty()
+            && !admission_is_held(
+                held_admission,
+                Instant::now(),
+                RepositoryMarks::read(&state),
+            )
+        {
+            queued_mark.hold(&state);
+        }
 
         // Report the retry queue's own state every tick, including the ticks
         // that find nothing to do. This clock ages independently of the working
@@ -3994,6 +5264,9 @@ pub async fn run_loop_armed(
         }
 
         if pending_events.is_empty() {
+            // Nothing queued, so nothing is on its way into the graph.
+            queued_mark.release();
+
             // Nothing to admit this tick, so the working stretch ends.
             //
             // This does NOT mean the loop is doing nothing. A tick that keeps
@@ -4057,6 +5330,11 @@ pub async fn run_loop_armed(
                 pending = pending_events.len(),
                 "holding this reconcile round for a commit inside the daemon"
             );
+            // The queued events keep their mark through the stand-down. They
+            // are still queued, and the commit this stands down for has not
+            // published them, so a read by name must still wait for them.
+            #[cfg(test)]
+            round_hold_point_for_test(&state, RoundHoldPoint::CommitStandDown).await;
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = cancel.changed() => {}
@@ -4109,6 +5387,11 @@ pub async fn run_loop_armed(
             // advancing for the length of the hold. That is the 2026-08-29 class
             // arriving by a new route, on the one daemon whose standing a reader
             // most wants.
+            //
+            // A held round attempts nothing, so its queued events are not on
+            // their way into the graph, and no read may wait out a hold that
+            // can last minutes for them.
+            queued_mark.release();
             stand_down_tick(&state, &pass);
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -4128,6 +5411,15 @@ pub async fn run_loop_armed(
             state.background_work.reconcile().clear_admission_hold();
         }
 
+        // This round attempts, so the queued events are on their way and the
+        // mark is up from here until the pass publishes them or gives them
+        // back. It is already up, unless the admission hold was still running
+        // when the queue was filled and has run out since. The pass still
+        // waits for the coordination gate and the reconciler lock before it
+        // takes its writer guard, and the mark is what covers that wait. Put up
+        // before the processing status, so a reader that sees the status sees
+        // the mark.
+        queued_mark.hold(&state);
         state
             .reconciliation_status
             .store(RECON_PROCESSING, Ordering::Relaxed);
@@ -4228,10 +5520,11 @@ pub async fn run_loop_armed(
                 }
             })
             .collect::<BTreeSet<_>>();
-        let exact_admission = match exact_tree_admission(
+        let mut exact_admission = match exact_tree_admission_with_reconciler(
             &state,
             Some(&observation),
             TreePublication::StandaloneUnlessACommitIsWaiting,
+            &mut reconciler,
         ) {
             // A commit entered the daemon while this pass was walking the
             // working copy, so the pass derived a transition and published
@@ -4243,6 +5536,9 @@ pub async fn run_loop_armed(
                 drop(graph_mutation);
                 drop(reconciler);
                 drop(coordination);
+                // Back on the queue with the mark still up. The commit that
+                // took this publication gets the gate next, and until it
+                // publishes, the mark is all that says these files are coming.
                 enqueue_file_events(&mut pending_events, watcher_batch);
                 debug!(
                     consecutive = commit_yields,
@@ -4260,10 +5556,29 @@ pub async fn run_loop_armed(
                     .background_work
                     .reconcile()
                     .record_admission_success(Instant::now());
-                crate::background_work::record_durable_admission(
-                    &state.layout,
-                    state.graph.resolved_tree().len() as u64,
-                );
+                // The marker says the working copy was observed through this
+                // instant, and while the startup catch-up still owes paths it
+                // was not: a daemon that stopped now would open its next window
+                // past edits nothing took. So it waits for the catch-up to
+                // drain, which the end of this tick records, and a daemon that
+                // stops first leaves the next one to re-plan from the older
+                // marker, whose re-reads of paths already taken plan nothing.
+                // A catch-up that could not be planned owes nothing it can
+                // name, and waits the same way, for a complete admission.
+                let unchecked = state.background_work.reconcile().changed_paths_unchecked();
+                if catch_up_owed.is_empty() && !unchecked {
+                    crate::background_work::record_durable_admission(
+                        &state.layout,
+                        state.graph.resolved_tree().len() as u64,
+                    );
+                } else {
+                    debug!(
+                        owed = catch_up_owed.len(),
+                        unchecked,
+                        "holding the last-admission marker until the startup catch-up drains or \
+                         a complete admission reads the working copy"
+                    );
+                }
                 graph_owned_policy.clone_from(&admission.policy);
                 admission
             }
@@ -4307,6 +5622,10 @@ pub async fn run_loop_armed(
                     retry_lane.defer(path, deferred_at, retry_base);
                 }
                 drop(graph_mutation);
+                // Given back to the retry lane, so no longer on their way. What
+                // is still queued puts the mark up again next round, unless the
+                // hold this failure may have armed stands that round down.
+                queued_mark.release();
                 drop(reconciler);
                 drop(coordination);
                 state
@@ -4316,6 +5635,7 @@ pub async fn run_loop_armed(
                 continue;
             }
         };
+        let binding_derivation = crate::binding_history::Derivation::begin(&state);
         if !exact_admission.deltas.is_empty() {
             graph_changed = true;
             state.bump_version();
@@ -4324,6 +5644,57 @@ pub async fn run_loop_armed(
         batch.extend(exact_admission.semantic_events.iter().cloned());
         let batch = dedup_file_events(batch);
 
+        let batch_paths = source_batch::with_owed_paths(
+            &state,
+            observation
+                .union(&exact_admission.changed_paths)
+                .cloned()
+                .collect(),
+        );
+        let batch_result = if let Some(prepared) = exact_admission.prepared_sources.take() {
+            prepared.finish(&state, &mut reconciler, &mut pass_delta)
+        } else {
+            source_batch::try_readmit(
+                &state,
+                &mut reconciler,
+                &batch_paths,
+                exact_admission.semantic_predecessor.as_ref(),
+                &observation,
+                &mut pass_delta,
+            )
+        };
+        let handled = match batch_result {
+            Ok(handled) => handled,
+            Err(error) => {
+                warn!(%error, "coherent semantic batch failed; retaining all paths for retry");
+                state
+                    .background_work
+                    .reconcile()
+                    .record_event_skipped(&error, Instant::now());
+                for event in &batch {
+                    let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                    retry_lane.defer(path, Instant::now(), retry_base);
+                }
+                if graph_changed {
+                    state.mark_dirty();
+                }
+                if let Some(boundary) = pass_delta.into_event() {
+                    state.emit_event(boundary);
+                }
+                drop(binding_derivation);
+                drop(graph_mutation);
+                // Given back to the retry lane, as above.
+                queued_mark.release();
+                drop(reconciler);
+                drop(coordination);
+                state
+                    .reconciliation_status
+                    .store(RECON_IDLE, Ordering::Relaxed);
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
+
         // What this pass sees about which paths the graph is answering about
         // from an earlier parse. Collected here and published once below rather
         // than written per file, because the record is one document and a pass
@@ -4331,6 +5702,16 @@ pub async fn run_loop_armed(
         let mut observed_parses: Vec<kin_core::retained_parse::ObservedParse> = Vec::new();
 
         for event in &batch {
+            let (FileEvent::Changed(host) | FileEvent::Removed(host)) = event;
+            if repo_path(host, state.layout.working_dir())
+                .ok()
+                .flatten()
+                .as_ref()
+                .is_some_and(|path| handled.contains(path))
+            {
+                admitted_events += 1;
+                continue;
+            }
             let admitted = match admit_file_event_with_exact_tree(
                 &state,
                 event,
@@ -4635,7 +6016,6 @@ pub async fn run_loop_armed(
                                 continue;
                             }
                         }
-                        let derived_entities = !delta.entity_deltas.is_empty();
                         if let Err(error) = persist_partial_observation(&state.layout, &outcome) {
                             warn!(%error, "partial admission retained all entities because coverage could not persist");
                             continue;
@@ -4654,16 +6034,6 @@ pub async fn run_loop_armed(
                         };
                         let layout_changed =
                             reconcile_layout_changed(&state, &reconciler, &outcome);
-                        // Recorded after the apply, so what is marked is
-                        // enrichment the graph holds. Nothing publishes it to
-                        // durable authority outside a commit, so if this daemon
-                        // ends first the next one needs to know this path is
-                        // owed one (FIR-2606).
-                        if derived_entities {
-                            if let Some(file_id) = semantic_file_id(&semantic_repo_path) {
-                                mark_enrichment_unpublished(&state, &file_id);
-                            }
-                        }
                         if let Err(e) =
                             state.persist_projection_truth_from_reconcile(&reconciler, &outcome)
                         {
@@ -4856,7 +6226,15 @@ pub async fn run_loop_armed(
                 }
             }
         }
+        drop(binding_derivation);
         drop(graph_mutation);
+        // Published: every event this pass took is in the graph now. The tail
+        // of a burst is still queued for the next round and keeps the mark up
+        // through it, the coordination gate at the top of that round and its
+        // grace included.
+        if pending_events.is_empty() {
+            queued_mark.release();
+        }
 
         // One publication for the whole pass, after the graph mutation is
         // released so a marker write never sits under it, and before the
@@ -4875,6 +6253,43 @@ pub async fn run_loop_armed(
             let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
             if !retry_lane.is_queued(path) {
                 retry_lane.forget(path);
+            }
+        }
+
+        // What this pass took for good is no longer owed: its bytes crossed
+        // authority and its parse was applied in the same pass. A path still
+        // queued for a retry is owed yet, because until it lands the graph
+        // describes the file as it was, so the answers built over it stay
+        // qualified exactly as long as that is true.
+        let settled = batch
+            .iter()
+            .filter_map(|event| {
+                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                if retry_lane.is_queued(path) {
+                    return None;
+                }
+                repo_path(path, state.layout.working_dir()).ok().flatten()
+            })
+            .collect::<Vec<_>>();
+        state
+            .background_work
+            .reconcile()
+            .settle_changed_paths(settled.iter());
+        if !catch_up_owed.is_empty() {
+            for path in &settled {
+                catch_up_owed.remove(path);
+            }
+            // The startup catch-up has drained, so the working copy has now been
+            // observed through this pass: the marker may move past the stretch
+            // nothing watched.
+            if catch_up_owed.is_empty()
+                && !state.background_work.reconcile().changed_paths_unchecked()
+            {
+                crate::background_work::record_durable_admission(
+                    &state.layout,
+                    state.graph.resolved_tree().len() as u64,
+                );
+                info!("the startup catch-up admitted everything it owed");
             }
         }
 
@@ -5008,11 +6423,16 @@ mod tests {
     use std::path::PathBuf;
 
     include!("loop_runner/tests/startup_recovery.rs");
+    include!("loop_runner/tests/canonical_ready_test.rs");
     include!("loop_runner/tests/enrichment_churn.rs");
     include!("loop_runner/tests/authority_split.rs");
     include!("loop_runner/tests/admission_worker.rs");
     include!("loop_runner/tests/graph_only_repair.rs");
+    include!("loop_runner/tests/startup_rederivation.rs");
     include!("loop_runner/tests/catch_up_completion.rs");
+    include!("loop_runner/tests/reference_read_admission.rs");
+    include!("loop_runner/tests/offline_tracked_changes.rs");
+    include!("loop_runner/tests/single_source_scope.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
@@ -5216,38 +6636,6 @@ mod tests {
 
     #[cfg(unix)]
     async fn check_reconcile_dirty_work(edit: bool, repair_layout: u8, already_dirty: bool) {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        struct Outcomes(Arc<std::sync::atomic::AtomicU64>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Outcomes {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct Outcome(bool);
-                impl tracing::field::Visit for Outcome {
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        if field.name() == "outcome" {
-                            self.0 = format!("{value:?}").contains("FilePathId(\"stable.rs\")");
-                        }
-                    }
-                }
-                let mut outcome = Outcome(false);
-                event.record(&mut outcome);
-                if outcome.0 {
-                    self.0.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        let controlled_outcomes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let _capture = crate::capture_events_on_this_thread(
-            tracing_subscriber::registry().with(Outcomes(Arc::clone(&controlled_outcomes))),
-        );
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
         let canonical = repo.path().canonicalize().unwrap();
@@ -5365,6 +6753,13 @@ mod tests {
             !state.is_dirty(),
             "the fixture must start the observation clean"
         );
+        // Saving takes this gate itself. Hold it only after that publication,
+        // across the controlled fixture changes and diagnostic readback.
+        let coordination = state.coordination_gate.lock().await;
+        assert!(
+            !state.is_dirty(),
+            "no new graph work may race the controlled observation setup"
+        );
         match repair_layout {
             0 => {}
             1 => state.graph.delete_file_layout(&file_id).unwrap(),
@@ -5384,7 +6779,36 @@ mod tests {
             .registered(crate::background_work::PASS_RECONCILE)
             .unwrap();
         let before = pass.progress();
-        let before_controlled = controlled_outcomes.load(Ordering::Relaxed);
+        // Deliberately stale diagnostic metadata, not a fabricated parse or
+        // graph fact. Both production reconcile routes durably clear only the
+        // paths they actually processed. A different path, an absent/unreadable
+        // record, or a blanket clear cannot acknowledge this controlled write.
+        const SENTINEL: &str = "unobserved-watch-sentinel.py";
+        kin_core::retained_parse::record(
+            &state.layout,
+            &[
+                kin_core::retained_parse::ObservedParse::retained("stable.rs", 1),
+                kin_core::retained_parse::ObservedParse::retained(SENTINEL, 7),
+            ],
+        );
+        let seeded = kin_core::retained_parse::read(&state.layout);
+        assert!(matches!(
+            seeded,
+            kin_core::retained_parse::RetainedParseRead::Recorded(_)
+        ));
+        assert_eq!(seeded.errors_for("stable.rs"), Some(1));
+        assert_eq!(seeded.errors_for(SENTINEL), Some(7));
+        let controlled_completed = || match kin_core::retained_parse::read(&state.layout) {
+            kin_core::retained_parse::RetainedParseRead::Recorded(recorded) => {
+                !recorded.paths.iter().any(|path| path.path == "stable.rs")
+                    && recorded
+                        .paths
+                        .iter()
+                        .any(|path| path.path == SENTINEL && path.errors == 7)
+            }
+            _ => false,
+        };
+        assert!(!controlled_completed());
         let content = if edit {
             "pub fn changed() -> u32 { 8 }\n"
         } else {
@@ -5395,9 +6819,9 @@ mod tests {
         let replacement = repo.path().join(".kin/stable-notification");
         std::fs::write(&replacement, content).unwrap();
         std::fs::rename(&replacement, &host).unwrap();
+        drop(coordination);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while (pass.progress() <= before
-            || controlled_outcomes.load(Ordering::Relaxed) <= before_controlled)
+        while (pass.progress() <= before || !controlled_completed())
             && Instant::now() < deadline
             && !runner.is_finished()
         {
@@ -5406,14 +6830,19 @@ mod tests {
         let finished_before_cancel = runner.is_finished();
         cancel_tx.send(true).ok();
         let terminated = runner.await;
-        eprintln!("watch controlled observation: root={}, progress={before}->{}, outcomes={before_controlled}->{}, status={}, early_exit={finished_before_cancel}, runner={terminated:?}",
-            canonical.display(), pass.progress(), controlled_outcomes.load(Ordering::Relaxed),
+        eprintln!("watch controlled observation: root={}, progress={before}->{}, retained={:?}, status={}, early_exit={finished_before_cancel}, runner={terminated:?}",
+            canonical.display(), pass.progress(), kin_core::retained_parse::read(&state.layout),
             state.reconciliation_status.load(Ordering::Relaxed));
         terminated.unwrap().unwrap();
         assert!(
-            pass.progress() > before
-                && controlled_outcomes.load(Ordering::Relaxed) > before_controlled,
+            pass.progress() > before && controlled_completed(),
             "the real watcher must reconcile stable.rs after the controlled write"
+        );
+        let entry = state.graph.get_tree_entry(&file_id).unwrap().unwrap();
+        assert_eq!(
+            read_tree_entry_bytes(&state, entry),
+            content.as_bytes(),
+            "the acknowledgement must describe the controlled admitted source"
         );
         assert_eq!(state.is_dirty(), edit || repair_layout != 0 || already_dirty,
             "an identical settled notification must not create dirty work; edits, layout repairs and existing dirty work must remain dirty");
@@ -5805,6 +7234,37 @@ mod tests {
         incoming
     }
 
+    #[cfg(unix)]
+    fn moved_caller_binding_debt(
+        state: &Arc<DaemonState>,
+    ) -> Option<kin_index::binding_debt::LocalBindingDebt> {
+        let file = FilePathId::new(CALLER_PATH);
+        let artifact = state
+            .graph
+            .artifact_id_at_path(&test_repo_path(CALLER_PATH))
+            .unwrap();
+        let reserved = kin_index::binding_debt::local_binding_debt_id(artifact);
+        let mut relations = state
+            .graph
+            .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(artifact))
+            .unwrap();
+        if let Some(occupant) = state.graph.get_relation_by_id(&reserved) {
+            if !relations.iter().any(|relation| relation.id == reserved) {
+                relations.push(occupant);
+            }
+        }
+        let mut found = None;
+        for relation in &relations {
+            if let Some(debt) =
+                kin_index::binding_debt::decode_local_binding_debt(&file, artifact, relation)
+                    .unwrap()
+            {
+                assert!(found.replace(debt).is_none(), "one canonical debt record");
+            }
+        }
+        found
+    }
+
     /// A move whose arrival half the observation did not carry.
     ///
     /// A bare `mv` reaches the watcher as two events and nothing makes them one
@@ -5832,6 +7292,7 @@ mod tests {
         derive_semantics_linked(&state, CALLER_PATH);
 
         let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+        let caller = sole_entity_named(&state, CALLER_PATH, "moved_caller");
         let incoming = incoming_relations(&state, target.id);
         // The module's `Imports` and the function's `Calls`, which is what
         // `kin refs moved_target` renders as two referencing entities.
@@ -5840,6 +7301,18 @@ mod tests {
             2,
             "the fixture never produced the incoming edges this test is about: {incoming:?}"
         );
+        let prior_call = state
+            .graph
+            .get_relations(&caller.id, &[kin_model::RelationKind::Calls])
+            .unwrap()
+            .into_iter()
+            .find(|relation| {
+                relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                    && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+            })
+            .expect("a real incoming local call before relocation");
+        assert!(kin_index::RelationResolution::of(&prior_call).is_proven());
+        assert!(moved_caller_binding_debt(&state).is_none());
         let artifact = state
             .graph
             .resolved_tree()
@@ -5864,11 +7337,37 @@ mod tests {
             Some(FilePathId::new(RELOCATED_PATH)),
             "the moved entity must sit at the path it arrived on"
         );
+        assert!(
+            incoming_relations(&state, target.id).is_empty(),
+            "an unchanged import of moved must not follow the renamed module"
+        );
         assert_eq!(
-            incoming_relations(&state, target.id),
-            incoming,
-            "the caller lost its edge into the moved function, which is what a removal plus an \
-             addition does and what relocating in one delta exists to prevent"
+            sole_entity_named(&state, CALLER_PATH, "moved_caller"),
+            caller
+        );
+        assert_eq!(
+            std::fs::read(working.join(CALLER_PATH)).unwrap(),
+            MOVED_CALLER.as_bytes()
+        );
+        let debt = moved_caller_binding_debt(&state).expect("withdrawal retains the caller's debt");
+        assert!(
+            debt.obligations.iter().any(|obligation| {
+                obligation.retired_relation == prior_call
+                    && obligation.target_artifact == artifact
+                    && obligation.target_file.0 == MOVED_PATH
+                    && obligation.source_digest
+                        == kin_model::Hash256::from_bytes(
+                            kin_blobs::digest(MOVED_CALLER.as_bytes()).0,
+                        )
+            }),
+            "exact admitted prior occurrence must survive the bounded move: {debt:?}"
+        );
+        assert!(
+            !kin_review::ImpactGraph::call_shape_parse_coverage_complete(
+                &kin_review::impact::LiveGraph(state.graph.as_ref())
+            )
+            .unwrap(),
+            "a withdrawn caller must not make impact completeness vacuously true"
         );
         let tree = state.graph.resolved_tree();
         assert!(
@@ -5883,6 +7382,63 @@ mod tests {
             artifact,
             "the move must preserve artifact identity"
         );
+
+        // Fix the actual import through the same bounded admission and source
+        // re-derivation route. Identity continuity never licenses an old path.
+        std::fs::write(
+            working.join(CALLER_PATH),
+            MOVED_CALLER.replace("from moved", "from renamed"),
+        )
+        .unwrap();
+        let caller_observation = BTreeSet::from([test_repo_path(CALLER_PATH)]);
+        assert!(!ambient_admission_for_test(&state, &caller_observation).unwrap());
+        derive_semantics_linked(&state, CALLER_PATH);
+        assert_eq!(
+            sole_entity_named(&state, CALLER_PATH, "moved_caller").id,
+            caller.id
+        );
+        assert_eq!(
+            sole_entity_named(&state, RELOCATED_PATH, "moved_target").id,
+            target.id
+        );
+        assert!(
+            state
+                .graph
+                .get_relations(&caller.id, &[kin_model::RelationKind::Calls])
+                .unwrap()
+                .iter()
+                .any(|relation| {
+                    relation.src == prior_call.src
+                        && relation.dst == prior_call.dst
+                        && kin_index::linker::has_named_import_factory_identity(relation)
+                        && relation.import_source.is_none()
+                        // A fresh parser call also carries span-free occurrence
+                        // certificates after its original records. Validate
+                        // them, then judge the original occurrence alone.
+                        && kin_index::occurrence::uniform_original_evidence(relation).is_some_and(
+                            |records| {
+                                records.len() == 1
+                                    && records.iter().all(|occurrence| {
+                                        occurrence.token.as_deref() == Some("moved_target")
+                                            && occurrence.source_path.as_deref() == Some("renamed")
+                                            && occurrence.resolved_path.as_deref()
+                                                == Some("src/renamed.py")
+                                            && occurrence.occurrence_count == 1
+                                            && occurrence.source_span.as_ref().is_some_and(
+                                                |span| {
+                                                    span.file.0 == "src/caller.py"
+                                                        && span.start_byte == 65
+                                                        && span.end_byte == 79
+                                                },
+                                            )
+                                    })
+                            },
+                        )
+                        && kin_index::RelationResolution::of(relation).is_proven()
+                }),
+            "the corrected import must bind the original target identity"
+        );
+        assert!(moved_caller_binding_debt(&state).is_none());
     }
 
     /// A twin under a retired graph-only member is not a destination.
@@ -6347,7 +7903,7 @@ mod tests {
         );
     }
 
-    /// FIR-3208. A daemon start pays the semantic debt a previous daemon left,
+    /// A daemon start pays the semantic debt a previous daemon left,
     /// before the loop answers anything.
     ///
     /// The record is the only thing carrying a parse across a restart, and a
@@ -6376,6 +7932,7 @@ mod tests {
                 })
                 .unwrap()
                 .into_iter()
+                .filter(|entity| entity.kind != kin_model::EntityKind::Module)
                 .find_map(|entity| entity.span.map(|span| span.start_line))
         };
         assert_eq!(start_line(&state), Some(0));
@@ -6385,9 +7942,9 @@ mod tests {
         std::fs::write(&host, &shifted).unwrap();
         let admission = exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
         assert!(!admission.deltas.is_empty(), "the bytes moved");
-        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(&admission.deltas));
+        // The publication recorded what it owes inside its own commit.
         let recorded = crate::semantic_debt::outstanding(&state);
-        let (owed, _) = crate::semantic_debt::partition_against_tree(&state, &recorded);
+        let owed = crate::semantic_debt::owed_against_tree(&state, &recorded);
         assert_eq!(owed.len(), 1, "the tree carries the body the record names");
         assert_eq!(
             start_line(&state),
@@ -6427,6 +7984,341 @@ mod tests {
         );
     }
 
+    /// Run one daemon start's loop until `served` holds, then stop it.
+    async fn serve_until(
+        state: &Arc<DaemonState>,
+        what: &str,
+        served: impl Fn(&DaemonState) -> bool,
+    ) {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut handle = tokio::spawn(run_loop(
+            Arc::clone(state),
+            LoopConfig::default(),
+            cancel_rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !served(state) {
+            assert!(
+                !handle.is_finished(),
+                "the loop exited before it served {what}"
+            );
+            assert!(Instant::now() < deadline, "the loop never served {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), &mut handle)
+            .await
+            .expect("the loop exits on shutdown")
+            .expect("the loop task must not panic")
+            .expect("the loop exits cleanly");
+    }
+
+    /// The declaration `name` in `file`, never the file's own module entity,
+    /// which can carry the same name and always starts at the first line.
+    fn declares(state: &DaemonState, file: &str, name: &str) -> Option<kin_model::Entity> {
+        state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new(file)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == name && entity.kind != kin_model::EntityKind::Module)
+    }
+
+    /// The enrichment marker has no successor, and needs none.
+    ///
+    /// A comment-only file declares nothing, so the graph holds no entity for
+    /// it. When it gains a function and the bytes are published on their own,
+    /// a daemon that stops before any commit takes the derived function with
+    /// it, and the file is admitted at exactly the bytes on disk, so no later
+    /// event asks about it. The builds before the ledger wrote a marker for
+    /// exactly this. Now the publication records the parse it owes inside its
+    /// own commit, and the next daemon serves the function from that record.
+    ///
+    /// Bytes publish on their own when the parser refuses the body as it
+    /// lands: a hard indexing error, for which the test-only readmission index
+    /// failure stands in, hands the one-source batch back and the sequential
+    /// reconciler records the failure. The next admission's drain derives the
+    /// owed parse into the live graph and publishes nothing, since only a
+    /// commit pays owed work, so the function is live and never durable until
+    /// the next commit or tree-moving admission. The test-only failure fails a
+    /// one-source batch's indexing as well as the sequential readmission's,
+    /// which is the case this needs.
+    ///
+    /// The start's other repairs re-derive the file too, so what is pinned is
+    /// the cause the start discloses: owed parse, from the record the
+    /// publication made. Falsify by recording nothing in the publication: the
+    /// file is re-derived under another cause and never as owed work.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_function_published_before_a_stop_is_served_by_the_next_daemon() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let host = repo.path().join("quiet.py");
+        std::fs::write(&host, b"# nothing is declared here yet\n").unwrap();
+        let (status, body) = startup_diagnostic_commit(&state).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(declares(&state, "quiet.py", "gained").is_none());
+
+        std::fs::write(
+            &host,
+            b"# nothing is declared here yet\ndef gained():\n    return 1\n",
+        )
+        .unwrap();
+        *state.readmission_index_failure.lock().unwrap() = Some(FilePathId::new("quiet.py"));
+        let refused = sync_filesystem_with_graph(&state).await;
+        *state.readmission_index_failure.lock().unwrap() = None;
+        assert!(
+            declares(&state, "quiet.py", "gained").is_none(),
+            "a refused parse derives nothing: {refused:?}"
+        );
+        assert!(
+            crate::semantic_debt::outstanding(&state)
+                .iter()
+                .any(|entry| entry.path == "quiet.py"),
+            "the bytes published with their parse owed"
+        );
+        // The ledger records every moved path, so read authority itself: the
+        // bytes must be there and their parse must not.
+        let refused_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let refused_durable = refused_context
+            .open()
+            .unwrap()
+            .read_authority()
+            .workspace_graph_snapshot(&refused_context.workspace_id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            refused_durable
+                .resolved_tree
+                .artifact_at_path(&test_repo_path("quiet.py"))
+                .is_some_and(|artifact| artifact.entry.blob_identity()
+                    == Some(Hash256::from_bytes(
+                        kin_blobs::digest(
+                            b"# nothing is declared here yet\ndef gained():\n    return 1\n"
+                        )
+                        .0
+                    ))),
+            "the refused admission still publishes the bytes"
+        );
+        assert!(
+            refused_durable
+                .entities
+                .values()
+                .all(|entity| entity.name != "gained"),
+            "the refused parse must not reach persisted authority"
+        );
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(
+            declares(&state, "quiet.py", "gained").is_some(),
+            "the live graph derives the function once its parse is drained"
+        );
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let durable = context
+            .open()
+            .unwrap()
+            .read_authority()
+            .workspace_graph_snapshot(&context.workspace_id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            durable
+                .entities
+                .values()
+                .all(|entity| entity.name != "gained"),
+            "the drained parse is live and absent from persisted authority"
+        );
+        assert!(
+            !state
+                .layout
+                .root()
+                .join("unpublished-enrichment.json")
+                .exists(),
+            "and nothing writes a marker for it"
+        );
+        let layout = state.layout.clone();
+        drop(state);
+
+        let restarted = Arc::new(DaemonState::open(layout).unwrap());
+        assert!(
+            declares(&restarted, "quiet.py", "gained").is_none(),
+            "nothing durable carried the derivation across the stop"
+        );
+        serve_until(&restarted, "the published function", |state| {
+            declares(state, "quiet.py", "gained").is_some()
+        })
+        .await;
+        let rederived = restarted
+            .background_work
+            .reconcile()
+            .report(Instant::now())
+            .startup_rederivation
+            .expect("the start discloses what it re-derived");
+        assert!(
+            rederived.owed_parse >= 1 && rederived.sample.iter().any(|path| path == "quiet.py"),
+            "the start re-derived the function as owed work, from the record its publication \
+             made: {rederived:?}"
+        );
+    }
+
+    /// An earlier build's owed-parse record is honoured at this build's first
+    /// start, and goes once an authority transaction has carried it.
+    ///
+    /// The bytes reached authority without their parse, and the only record of
+    /// that is the file an earlier build kept beside the store. The start
+    /// judges each entry against the graph it loaded, re-derives what is still
+    /// owed, and holds it for its next authority transaction, which records it
+    /// in the ledger; the file goes once that transaction is durable.
+    ///
+    /// Falsify by skipping the migration boundary at startup: the file is
+    /// re-derived under another cause and never as owed work, and the record
+    /// goes without a transaction ever carrying what it owed.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_legacy_owed_parse_is_served_and_carried_into_authority() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let host = repo.path().join("shifted.rs");
+        let original = b"pub fn shifted() -> u32 { 7 }\n".to_vec();
+        std::fs::write(&host, &original).unwrap();
+        let (status, body) = startup_diagnostic_commit(&state).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let start_line = |state: &DaemonState| {
+            declares(state, "shifted.rs", "shifted")
+                .and_then(|entity| entity.span.map(|span| span.start_line))
+        };
+        assert_eq!(start_line(&state), Some(0));
+
+        // An earlier build published these bytes without their parse and kept
+        // the debt beside the store.
+        let mut shifted = b"// prepended\n".repeat(17);
+        shifted.extend_from_slice(&original);
+        std::fs::write(&host, &shifted).unwrap();
+        crate::semantic_debt::recording_nothing(|| {
+            exact_tree_admission(&state, None, TreePublication::Standalone)
+        })
+        .unwrap();
+        let Some(TreeEntry::Blob { hash, .. }) = state
+            .graph
+            .get_tree_entry(&FilePathId::new("shifted.rs"))
+            .unwrap()
+        else {
+            panic!("the fixture is admitted source");
+        };
+        let legacy = state.layout.root().join("semantic-debt.json");
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec(&serde_json::json!([
+                {"path": "shifted.rs", "body": hash.to_string()}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(crate::semantic_debt::outstanding(&state).is_empty());
+        let layout = state.layout.clone();
+        drop(state);
+
+        let restarted = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        assert_eq!(
+            start_line(&restarted),
+            Some(0),
+            "nothing has parsed the new bytes"
+        );
+        serve_until(&restarted, "the span the legacy record owed", |state| {
+            start_line(state) == Some(17)
+        })
+        .await;
+        let rederived = restarted
+            .background_work
+            .reconcile()
+            .report(Instant::now())
+            .startup_rederivation
+            .expect("the start discloses what it re-derived");
+        assert!(
+            rederived.owed_parse >= 1 && rederived.sample.iter().any(|path| path == "shifted.rs"),
+            "the start re-derived the file as the owed work the legacy record named: \
+             {rederived:?}"
+        );
+        assert!(
+            legacy.exists(),
+            "the record stays until a transaction has carried what it owed"
+        );
+        assert_eq!(
+            crate::semantic_debt::legacy_carry(&restarted),
+            vec![(test_repo_path("shifted.rs"), hash)]
+        );
+
+        // The next authority transaction carries it.
+        std::fs::write(repo.path().join("other.rs"), b"pub fn other() {}\n").unwrap();
+        exact_tree_admission(&restarted, None, TreePublication::Standalone).unwrap();
+        assert!(
+            !legacy.exists(),
+            "a durable transaction carried it, so it goes"
+        );
+        assert!(crate::semantic_debt::legacy_carry(&restarted).is_empty());
+        let carried = crate::api::cached_owed_derivations(&restarted).unwrap();
+        assert!(
+            carried
+                .iter()
+                .any(|record| record.path() == &test_repo_path("shifted.rs")
+                    && record.body() == hash
+                    && record.cause() == kin_db::OwedDerivationCause::Legacy),
+            "the ledger now owes the parse the legacy record named: {carried:?}"
+        );
+        drop(restarted);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        assert!(
+            crate::semantic_debt::outstanding_checked(&reopened)
+                .unwrap()
+                .iter()
+                .any(|debt| debt.path == "shifted.rs" && debt.body == hash.to_string()),
+            "and a store reopened after it still does"
+        );
+    }
+
+    /// Readers name an owed parse from authority, with nothing beside the
+    /// store.
+    ///
+    /// Earlier builds read owed parses out of `semantic-debt.json`, so a store
+    /// whose file was deleted told every reader nothing was owed. Falsify by
+    /// reading the record from that file again: the reopened daemon names
+    /// nothing.
+    #[test]
+    fn readers_name_an_owed_parse_from_authority() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join("owed.py"), b"def owed():\n    return 1\n").unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        let layout = state.layout.clone();
+        drop(state);
+        let _ = std::fs::remove_file(layout.root().join("semantic-debt.json"));
+        assert!(!layout.root().join("semantic-debt.json").exists());
+
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        let recorded = crate::semantic_debt::outstanding_checked(&reopened).unwrap();
+        assert!(
+            crate::semantic_debt::owed_against_tree(&reopened, &recorded)
+                .contains(&test_repo_path("owed.py")),
+            "the reopened daemon reads what is owed from authority: {recorded:?}"
+        );
+        let report = answered_reconcile_health(&reopened, Instant::now());
+        assert!(
+            report.underived_path_count >= 1
+                && report
+                    .underived_paths_sample
+                    .iter()
+                    .any(|path| path == "owed.py"),
+            "and every surface that reads the disclosure names the path: {:?}",
+            report.underived_paths_sample
+        );
+    }
+
     fn copy_canonical_test_store(source: &Path, destination: &Path) {
         std::fs::create_dir_all(destination).unwrap();
         for entry in std::fs::read_dir(source).unwrap() {
@@ -6447,12 +8339,15 @@ mod tests {
         let path = "stranded.rs";
         let content = b"// canonical body\npub fn stranded() -> u32 { 7 }\n";
         std::fs::write(original.path().join(path), content).unwrap();
-        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
-        // Retained stores predating the debt record recover through the marker
-        // or the missing-layout planner, which this pair tests independently.
-        startup_diagnostic_legacy_without_debt(&state);
+        // Retained stores predating the owed derivation ledger recover through
+        // an earlier build's marker or the missing-layout planner, which this
+        // pair tests independently, so the publication records nothing.
+        crate::semantic_debt::recording_nothing(|| {
+            exact_tree_admission(&state, None, TreePublication::Standalone)
+        })
+        .unwrap();
         if marked {
-            mark_enrichment_unpublished(&state, &FilePathId::new(path));
+            startup_diagnostic_write_legacy_marker(&state, &[path]);
         }
         let expected_tree = state.graph.resolved_tree();
         drop(state);
@@ -6472,7 +8367,14 @@ mod tests {
         assert_eq!(state.graph.resolved_tree(), expected_tree);
         assert_eq!(state.graph.entity_count(), 0);
         assert!(crate::semantic_debt::outstanding(&state).is_empty());
-        assert_eq!(unpublished_enrichment_marker_path(&state).exists(), marked);
+        assert_eq!(
+            state
+                .layout
+                .root()
+                .join("unpublished-enrichment.json")
+                .exists(),
+            marked
+        );
         assert!(state
             .graph
             .get_file_layout(&FilePathId::new(path))
@@ -6560,9 +8462,7 @@ mod tests {
                 .unwrap();
             let current = b"// published\npub fn canonical() -> u32 { 8 }\n";
             std::fs::write(&host, current).unwrap();
-            let admission =
-                exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
-            crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(&admission.deltas));
+            exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
             let expected_tree = state.graph.resolved_tree();
             if missing {
                 std::fs::remove_file(&host).unwrap();
@@ -7016,6 +8916,186 @@ mod tests {
         );
     }
 
+    /// Admitting a new file must not erase the checked binding-history witness.
+    ///
+    /// The acceptance control commits that file and then asks whether a name
+    /// nothing declares is absent. That answer is `local_binding_unproven`
+    /// once an admission has replaced the witness with an empty one.
+    #[test]
+    fn admitting_a_new_module_keeps_the_checked_binding_witness() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let history_len = || {
+            let context =
+                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &state,
+                )
+                .unwrap();
+            let authority = context.open().unwrap();
+            authority.read_authority().metadata().binding_history.len()
+        };
+        let before = history_len();
+        assert!(before > 0, "kin init must leave a checked binding witness");
+        std::fs::write(repo.path().join("added.py"), "def added():\n    return 1\n").unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        let after = history_len();
+        assert_eq!(
+            after, before,
+            "a tree admission of one new module must extend the witness, not clear it"
+        );
+        crate::binding_history::restore_exact_authority(&state);
+        assert!(
+            matches!(
+                state.graph.binding_history_observation(),
+                kin_model::BindingHistoryObservation::Checked { .. }
+            ),
+            "the live graph must recover that witness after the admission write"
+        );
+    }
+
+    /// A tree admission stamps untracked empty because the file is now
+    /// tracked, and the entity census has not moved. That pair is the
+    /// recorded all-clear the acceptance fixture rejects. The answer reading
+    /// has to name the unpaid parse instead.
+    #[test]
+    fn a_tree_admission_of_an_unparsed_module_does_not_read_as_recorded() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::create_dir_all(repo.path().join("linkgraph")).unwrap();
+        std::fs::write(
+            repo.path().join("linkgraph/predicates.py"),
+            "RESOLVE_PREDICATE = \"(notes.key = links.target_key)\"\n\n\
+             def dangling_links(conn):\n    return conn.execute(\"SELECT 1\")\n",
+        )
+        .unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        state.record_durable_entity_count(state.graph.entity_count() as u64);
+        state.record_durable_relation_count(state.graph.relation_count() as u64);
+
+        let report = answered_reconcile_health(&state, std::time::Instant::now());
+        let health = serde_json::json!({
+            "graph_entity_count": state.graph.entity_count(),
+            "durable_entity_count": state.durable_entity_count(),
+            "graph_relation_count": state.graph.relation_count(),
+            "durable_relation_count": state.durable_relation_count(),
+            "reconcile": &report,
+        });
+        let behind = kin_mcp::envelope::GraphBehind::from_health(&health);
+        let durability =
+            kin_mcp::envelope::Durability::observe(kin_mcp::envelope::DurabilityCounts {
+                live_entities: state.graph.entity_count() as u64,
+                durable_entities: state.durable_entity_count(),
+                live_relations: Some(state.graph.relation_count() as u64),
+                durable_relations: state.durable_relation_count(),
+            });
+        let durability = if behind.is_some() {
+            durability.withdraw_all_clear()
+        } else {
+            durability
+        };
+        assert_ne!(
+            durability.state,
+            "recorded",
+            "a stamped empty untracked set must not all-clear an unpaid module: \
+             underived={} behind={behind:?} debt={:?}",
+            report.underived_path_count,
+            crate::semantic_debt::outstanding(&state),
+        );
+        let behind = behind.expect("the unpaid module is disclosed as behind");
+        assert!(
+            behind.underived_paths >= 1,
+            "the disclosure has to name a positive count: {behind:?}"
+        );
+        assert_eq!(
+            behind.unadmitted_paths, 0,
+            "the tree holds this path, so it is not one nothing admitted: {behind:?}"
+        );
+        assert!(
+            behind
+                .underived_sample
+                .iter()
+                .any(|path| path.contains("predicates.py")),
+            "the disclosure has to name the module: {behind:?}"
+        );
+        let factor = behind.limiting_factor();
+        assert!(
+            factor.contains("still owed their parse") && !factor.contains("never been admitted"),
+            "the disclosure has to name the gap it is actually about: {factor}"
+        );
+    }
+
+    /// The other half of the test above, and the state an agent's write reaches.
+    ///
+    /// The admission that publishes a new module records the parse it owes
+    /// durable authority and re-derives the module into the live graph straight
+    /// after. The graph that answers then holds the module, so the entity counts
+    /// see it and the reading is `live_uncommitted`. Reading the debt record
+    /// alone reported the same path as owed its parse, and the behind block that
+    /// raised withdrew that reading to `unknown` over exactly the uncommitted
+    /// work it exists to count.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_admission_whose_module_was_derived_reads_live_uncommitted() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let durable_entities = state.graph.entity_count() as u64;
+        let durable_relations = state.graph.relation_count() as u64;
+        state.record_durable_entity_count(durable_entities);
+        state.record_durable_relation_count(durable_relations);
+        std::fs::create_dir_all(repo.path().join("linkgraph")).unwrap();
+        std::fs::write(
+            repo.path().join("linkgraph/predicates.py"),
+            "RESOLVE_PREDICATE = \"(notes.key = links.target_key)\"\n\n\
+             def dangling_links(conn):\n    return conn.execute(\"SELECT 1\")\n",
+        )
+        .unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        derive_semantics(&state, "linkgraph/predicates.py");
+
+        let recorded = crate::semantic_debt::outstanding(&state);
+        assert!(
+            recorded
+                .iter()
+                .any(|entry| entry.path.contains("predicates.py")),
+            "the admission must leave its debt on record, or this does not grade the rule: \
+             {recorded:?}"
+        );
+        let report = answered_reconcile_health(&state, std::time::Instant::now());
+        assert_eq!(
+            report.underived_path_count, 0,
+            "the live graph holds the parse of the owed bytes, so nothing is behind: {:?}",
+            report.underived_paths_sample
+        );
+        let health = serde_json::json!({
+            "graph_entity_count": state.graph.entity_count(),
+            "durable_entity_count": state.durable_entity_count(),
+            "graph_relation_count": state.graph.relation_count(),
+            "durable_relation_count": state.durable_relation_count(),
+            "reconcile": &report,
+        });
+        let behind = kin_mcp::envelope::GraphBehind::from_health(&health);
+        assert!(
+            behind.is_none(),
+            "a measured working copy whose only admission was parsed is not behind: {behind:?}"
+        );
+        let durability =
+            kin_mcp::envelope::Durability::observe(kin_mcp::envelope::DurabilityCounts {
+                live_entities: state.graph.entity_count() as u64,
+                durable_entities: state.durable_entity_count(),
+                live_relations: Some(state.graph.relation_count() as u64),
+                durable_relations: state.durable_relation_count(),
+            });
+        assert_eq!(
+            durability.state, "live_uncommitted",
+            "the module's entities are live and uncommitted, and the reading says so: \
+             {durability:?}"
+        );
+        assert!(
+            durability.live_only_entities.is_some_and(|count| count > 0),
+            "with a count: {durability:?}"
+        );
+    }
+
     /// Read the repository-authority generation one admission would advance.
     ///
     /// Every committed repository transaction advances it by exactly one, and
@@ -7163,6 +9243,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("out-of-band-authority-writer"),
+            &[],
+            &[],
         )
         .expect("the fixture's own authority write must succeed")
         .expect("it has to move authority, or the deferral below would still publish cleanly");
@@ -8228,6 +10310,132 @@ mod tests {
             state.graph.pending_artifact_embeddings() >= 1,
             "recreated record must enter the artifact embedding backfill"
         );
+    }
+
+    /// The workspace snapshot a local daemon open reads from repository
+    /// authority, exactly as that open reads it.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn authority_workspace_snapshot(state: &DaemonState) -> kin_db::GraphSnapshot {
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &state.layout,
+            )
+            .unwrap();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        lease
+            .workspace_graph_snapshot(&context.workspace_id())
+            .unwrap()
+            .expect("the local workspace exists in authority")
+    }
+
+    /// Track one structured artifact, one opaque note, binary bytes under a
+    /// source name and one real source file, the way the live loop admits them.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    async fn state_with_non_entity_bodies(repo: &tempfile::TempDir) -> Arc<DaemonState> {
+        let state = open_test_state(repo);
+        std::fs::write(repo.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(
+            repo.path().join("AGENTS.md"),
+            "# Doctrine\n\nArtifacts keep their vectors across a reopen.\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("blob.rs"), b"\0\xff\x10not-source").unwrap();
+        std::fs::write(repo.path().join("main.py"), "def fail():\n    return 1\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        state
+    }
+
+    /// The records a local open adds to its workspace snapshot are the records
+    /// the live coverage pass writes for the same tree and bodies, and they
+    /// arrive with nothing queued for embedding.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[tokio::test]
+    async fn snapshot_coverage_derives_the_live_records_without_queueing_them() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = state_with_non_entity_bodies(&repo).await;
+        let base = authority_workspace_snapshot(&state);
+        assert!(
+            base.shallow_files.is_empty()
+                && base.structured_artifacts.is_empty()
+                && base.opaque_artifacts.is_empty(),
+            "premise: repository authority holds no non-entity record, whatever the live graph \
+             holds"
+        );
+
+        let live = kin_db::InMemoryGraph::from_snapshot_without_text_index(base.clone()).unwrap();
+        let live_created =
+            ensure_non_entity_enrichment_coverage_in(&live, state.blobs.as_ref()).unwrap();
+
+        let mut enriched = base;
+        let coverage =
+            ensure_non_entity_enrichment_coverage_in_snapshot(&mut enriched, state.blobs.as_ref())
+                .unwrap();
+        let restored = kin_db::InMemoryGraph::from_snapshot_without_text_index(enriched).unwrap();
+
+        assert_eq!(
+            live_created, 3,
+            "the Dockerfile, the note and the binary body each owe a record; main.py owes none"
+        );
+        assert_eq!(
+            coverage,
+            NonEntityCoverage {
+                created: live_created,
+                unreadable: 0
+            }
+        );
+        assert_eq!(
+            restored.retrieval_authority_hash(),
+            live.retrieval_authority_hash(),
+            "both passes must hold the same records, which this hash compares field for field"
+        );
+        assert_eq!(
+            live.pending_artifact_embeddings(),
+            live_created,
+            "control: the live pass queues every record it writes"
+        );
+        assert_eq!(
+            restored.pending_artifact_embeddings(),
+            0,
+            "records that arrive with the snapshot queue nothing"
+        );
+        assert!(
+            !restored.has_unpersisted_changes(),
+            "records that arrive with the snapshot are not a pending graph mutation"
+        );
+    }
+
+    /// A path that still holds an entity gets no record from the snapshot pass,
+    /// and its entity is left alone. The live pass would retire that entity,
+    /// which a snapshot cannot do without changing the entity truth its
+    /// workspace binding was checked against.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[tokio::test]
+    async fn snapshot_coverage_leaves_a_path_that_still_holds_an_entity() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = state_with_non_entity_bodies(&repo).await;
+        let mut snapshot = authority_workspace_snapshot(&state);
+        let stranded = test_entity("stranded", "AGENTS.md");
+        snapshot.entities.insert(stranded.id, stranded.clone());
+        let entities_before = snapshot.entities.len();
+
+        let coverage =
+            ensure_non_entity_enrichment_coverage_in_snapshot(&mut snapshot, state.blobs.as_ref())
+                .unwrap();
+
+        assert_eq!(
+            coverage.created, 2,
+            "only the Dockerfile and the binary body get records"
+        );
+        assert!(
+            snapshot
+                .opaque_artifacts
+                .iter()
+                .all(|record| record.file_id.0 != "AGENTS.md"),
+            "a path that still holds an entity must not gain a record beside it"
+        );
+        assert_eq!(snapshot.entities.len(), entities_before);
+        assert!(snapshot.entities.contains_key(&stranded.id));
     }
 
     #[tokio::test]
@@ -9522,6 +11730,107 @@ mod tests {
         assert_eq!(entity_ids_for(&state, "keep.rs"), kept_entities);
     }
 
+    #[tokio::test]
+    async fn unignore_proposal_changed_after_capture_refuses_before_authority_publication() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join(".kinignore"), b"hidden.py\n").unwrap();
+        std::fs::write(repo.path().join("hidden.py"), b"def hidden(): return 1\n").unwrap();
+        std::fs::write(repo.path().join("keep.py"), b"def kept(): return 1\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let roots = current_authority_admission(&state).unwrap().0;
+        let before = state.graph.semantic_observation();
+        std::fs::write(repo.path().join(".kinignore"), b"").unwrap();
+        set_admission_capture_hook_for_test(
+            &state,
+            Box::new(|state| {
+                std::fs::write(
+                    state.layout.working_dir().join(".kinignore"),
+                    b"hidden.py\n",
+                )
+                .unwrap();
+            }),
+        );
+        let refusal = sync_filesystem_with_graph(&state).await.unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains(".kinignore changed before publication"),
+            "{refusal}"
+        );
+        assert_eq!(current_authority_admission(&state).unwrap().0, roots);
+        assert_eq!(state.graph.resolved_tree(), before.resolved_tree);
+        assert_eq!(state.graph.semantic_observation().entities, before.entities);
+        assert_eq!(
+            state.graph.semantic_observation().relations,
+            before.relations
+        );
+        assert!(tree_entry(&state, "hidden.py").is_none());
+        std::fs::write(repo.path().join(".kinignore"), b"").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(tree_entry(&state, "hidden.py").is_some());
+    }
+
+    #[tokio::test]
+    async fn unignore_proposal_outside_the_observed_event_does_not_admit_hidden_content() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join(".kinignore"), b"hidden.py\n").unwrap();
+        std::fs::write(repo.path().join("hidden.py"), b"def hidden(): return 1\n").unwrap();
+        std::fs::write(repo.path().join("keep.py"), b"def kept(): return 1\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let held_rule = tree_entry(&state, ".kinignore");
+        let held_policy = current_authority_admission(&state)
+            .unwrap()
+            .1
+            .unwrap()
+            .generation();
+        std::fs::write(repo.path().join(".kinignore"), b"").unwrap();
+        std::fs::write(repo.path().join("keep.py"), b"def kept(): return 2\n").unwrap();
+        exact_tree_admission(
+            &state,
+            Some(&BTreeSet::from([test_repo_path("keep.py")])),
+            TreePublication::StandaloneUnlessACommitIsWaiting,
+        )
+        .unwrap();
+        assert_eq!(tree_entry(&state, ".kinignore"), held_rule);
+        assert_eq!(
+            current_authority_admission(&state)
+                .unwrap()
+                .1
+                .unwrap()
+                .generation(),
+            held_policy
+        );
+        assert!(tree_entry(&state, "hidden.py").is_none());
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(tree_entry(&state, "hidden.py").is_some());
+    }
+
+    #[tokio::test]
+    async fn unignore_proposal_unobserved_restriction_cannot_retract_admitted_content() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join(".kinignore"), b"").unwrap();
+        std::fs::write(repo.path().join("keep.py"), b"def kept(): return 1\n").unwrap();
+        std::fs::write(repo.path().join("other.py"), b"def other(): return 1\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let kept = tree_entry(&state, "keep.py");
+        let rule = tree_entry(&state, ".kinignore");
+        std::fs::write(repo.path().join(".kinignore"), b"keep.py\n").unwrap();
+        std::fs::write(repo.path().join("other.py"), b"def other(): return 2\n").unwrap();
+        exact_tree_admission(
+            &state,
+            Some(&BTreeSet::from([test_repo_path("other.py")])),
+            TreePublication::StandaloneUnlessACommitIsWaiting,
+        )
+        .unwrap();
+        assert_eq!(tree_entry(&state, "keep.py"), kept);
+        assert_eq!(tree_entry(&state, ".kinignore"), rule);
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(tree_entry(&state, "keep.py").is_none());
+    }
+
     /// Establish a repository whose graph-owned admission policy excludes
     /// `.claude/`, the way every real one does: the rule file is tracked before
     /// the excluded content exists.
@@ -9916,7 +12225,7 @@ mod tests {
         sync_filesystem_with_graph(&state).await.unwrap();
         assert_eq!(
             entity_names_for(&state, "hooks.rs"),
-            vec!["hook".to_string(), "hook".to_string()],
+            vec!["hook".to_string(), "hook".to_string(), "hooks".to_string()],
             "the fixture needs both halves of the duplicated declaration admitted"
         );
 
@@ -9934,7 +12243,12 @@ mod tests {
         );
         assert_eq!(
             entity_names_for(&state, "hooks.rs"),
-            vec!["hook".to_string(), "hook".to_string(), "probe".to_string()],
+            vec![
+                "hook".to_string(),
+                "hook".to_string(),
+                "hooks".to_string(),
+                "probe".to_string()
+            ],
             "the edit must leave one entity per declaration"
         );
     }
@@ -9957,7 +12271,11 @@ mod tests {
         .unwrap();
         sync_filesystem_with_graph(&state).await.unwrap();
         let before = entity_ids_for(&state, "notes.rs");
-        assert_eq!(before.len(), 2, "the fixture needs both declarations");
+        assert_eq!(
+            before.len(),
+            3,
+            "the fixture needs both declarations and module"
+        );
 
         std::fs::write(
             root.join("notes.rs"),
@@ -10626,7 +12944,7 @@ mod tests {
         );
     }
 
-    /// FIR-2499. The catch-up names what the host changed inside the window and
+    /// the staleness-decay case. The catch-up names what the host changed inside the window and
     /// nothing older, and what it names is admissible by the ordinary ambient
     /// path.
     ///
@@ -10727,67 +13045,112 @@ mod tests {
         );
     }
 
-    /// FIR-2499. A path graph truth already tracks is projection drift, not
-    /// catch-up work, however recently the host touched it.
+    /// A tracked file edited and another deleted while no daemon watched are
+    /// catch-up work, exactly as they are watcher work when a daemon is alive
+    /// for them.
     ///
-    /// Repository authority holds bytes for a tracked path, so a host edit to
-    /// one is what `kin doctor --drift` reports and `kin doctor --heal`
-    /// repairs. A catch-up that took it would advance the workspace over
-    /// graph-owned content at daemon start and empty the report an operator is
-    /// about to read. The untracked file beside it is the positive control:
-    /// same directory, same window, and it is still named.
+    /// Graph truth keeps answering from the old bytes until a tick takes them,
+    /// so a renamed function stays findable under its old name, the new one is
+    /// certified absent, and the deleted file stays a top hit. The edit is
+    /// proposed as a change and the deletion as a removal, beside the untracked
+    /// file that was always named. A tracked file touched without a byte
+    /// changing is read and not proposed, and one that differs from graph truth
+    /// without having moved inside the window is projection drift, left to
+    /// `kin doctor` as before.
     #[test]
-    fn the_catch_up_leaves_a_tracked_path_to_the_drift_report() {
+    fn the_catch_up_names_a_tracked_edit_and_a_tracked_deletion() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
 
-        let tracked = repo.path().join("tracked.rs");
-        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 1 }\n").unwrap();
-        admit_file_event_ambient(&state, &FileEvent::Changed(tracked.clone())).unwrap();
+        let edited = repo.path().join("edited.rs");
+        let deleted = repo.path().join("deleted.rs");
+        let touched = repo.path().join("touched.rs");
+        let drifted = repo.path().join("drifted.rs");
+        for (path, body) in [
+            (&edited, "pub fn old_name() -> u32 { 1 }\n"),
+            (&deleted, "pub fn doomed() -> u32 { 2 }\n"),
+            (&touched, "pub fn same() -> u32 { 3 }\n"),
+            (&drifted, "pub fn drifted() -> u32 { 4 }\n"),
+        ] {
+            std::fs::write(path, body).unwrap();
+            admit_file_event_ambient(&state, &FileEvent::Changed(path.clone())).unwrap();
+        }
         assert!(
-            tree_entry(&state, "tracked.rs").is_some(),
-            "the fixture needs this path tracked before the window is opened"
-        );
-        std::fs::write(&tracked, b"pub fn tracked() -> u32 { 2 }\n").unwrap();
-        stamp_modified(
-            &tracked,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
+            tree_entry(&state, "edited.rs").is_some() && tree_entry(&state, "deleted.rs").is_some(),
+            "the fixture needs these paths tracked before the window is opened"
         );
 
+        // The window opens after every real timestamp in the fixture, so the
+        // stamps below decide which side of it each path lands on.
+        let window = SystemTime::now() + Duration::from_secs(3_600);
+        let inside = window + Duration::from_secs(60);
+        // Different bytes nothing touched since the last admission: graph
+        // truth moved away from this file, the file did not move.
+        std::fs::write(&drifted, b"pub fn drifted_elsewhere() -> u32 { 5 }\n").unwrap();
+        std::fs::write(&edited, b"pub fn new_name() -> u32 { 1 }\n").unwrap();
+        stamp_modified(&edited, inside);
+        std::fs::remove_file(&deleted).unwrap();
+        stamp_modified(&touched, inside);
         let untracked = repo.path().join("untracked.rs");
-        std::fs::write(&untracked, b"pub fn untracked() -> u32 { 3 }\n").unwrap();
-        stamp_modified(
-            &untracked,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000),
-        );
+        std::fs::write(&untracked, b"pub fn untracked() -> u32 { 6 }\n").unwrap();
+        stamp_modified(&untracked, inside);
+        // A deletion leaves no file to read a time from; the directory that
+        // lost it records it, inside the window like the edit beside it.
+        let directory = std::fs::File::open(repo.path()).unwrap();
+        directory
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(inside)
+                    .set_modified(inside),
+            )
+            .unwrap();
 
-        let window = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
-        let named = event_paths(&plan_catch_up_events(&state, window).unwrap())
+        let planned = plan_catch_up_events(&state, window).unwrap();
+        let leaf = |path: &PathBuf| {
+            path.file_name()
+                .map(|leaf| leaf.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        let changed = planned
             .iter()
-            .filter_map(|path| path.file_name())
-            .map(|leaf| leaf.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
+            .filter_map(|event| match event {
+                FileEvent::Changed(path) => Some(leaf(path)),
+                FileEvent::Removed(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let removed = planned
+            .iter()
+            .filter_map(|event| match event {
+                FileEvent::Removed(path) => Some(leaf(path)),
+                FileEvent::Changed(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
 
-        assert!(
-            named.contains(&"untracked.rs".to_string()),
-            "the positive control: content the graph has never met is still named: {named:?}"
+        assert_eq!(
+            changed,
+            BTreeSet::from(["edited.rs".to_string(), "untracked.rs".to_string()]),
+            "the tracked edit is proposed beside the untracked file, and neither the touched nor \
+             the drifted file is: {planned:?}"
         );
-        assert!(
-            !named.contains(&"tracked.rs".to_string()),
-            "a tracked path edited off-watch is drift for `kin doctor`, not a silent catch-up \
-             admission: {named:?}"
+        assert_eq!(
+            removed,
+            BTreeSet::from(["deleted.rs".to_string()]),
+            "the tracked deletion is proposed as a removal: {planned:?}"
         );
     }
 
-    /// FIR-2499. A directory graph truth has never met is disclosed, not swept
-    /// in.
-    ///
-    /// A directory arriving whole is a clone, a move, an unpacked archive or a
-    /// renamed control directory, and a move restamps every entry it carries,
-    /// so modification times cannot tell that content from authored work.
-    /// Admitting one at daemon start is the working-copy sweep startup must
-    /// never perform. The file beside the tracked one is the positive control:
-    /// it sits where the graph already looks, so the window still reaches it.
+    /// the staleness-decay shape. `plan_catch_up_events` itself still declines a directory
+    /// graph truth has never met, on the same modification-time boundary it
+    /// always has: a directory arriving whole is a clone, a move, an unpacked
+    /// archive or a renamed control directory, and a move restamps every
+    /// entry it carries, so modification time cannot tell that content from
+    /// authored work. This function is not where that content is admitted
+    /// from, and never becomes that; `plan_never_met_directory_arrivals`
+    /// admits it instead, under its own provenance, so this boundary keeps
+    /// gating which mechanism admits the population rather than whether the
+    /// daemon admits it at all. The file beside the tracked one is the
+    /// positive control: it sits where the graph already looks, so the window
+    /// still reaches it.
     #[test]
     fn the_catch_up_declines_a_directory_the_graph_has_never_met() {
         let repo = tempfile::tempdir().unwrap();
@@ -10932,13 +13295,25 @@ mod tests {
             .unwrap();
     }
 
+    /// The planner's verdict on an earlier build's enrichment marker, as it
+    /// reads now.
+    fn plan_legacy_marker(state: &DaemonState) -> Vec<(RepoPath, Hash256)> {
+        plan_unpublished_enrichment_repair(
+            state,
+            &crate::semantic_debt::read_legacy_enrichment(state),
+        )
+        .unwrap()
+    }
+
     /// FIR-2606. A path a previous daemon derived entities for, whose entities
     /// did not survive, is re-derived by the next daemon's first pass.
     ///
     /// That is the whole wedge: the artifact is admitted at exactly the bytes on
     /// disk, so no watcher event fires for it and the startup catch-up window,
     /// keyed on host modification time, cannot see it either. Without a record
-    /// of what was derived, nothing ever asks about the path again.
+    /// of what was derived, nothing ever asks about the path again. This build
+    /// records that in authority; the marker an earlier build kept is judged
+    /// here, and what survives carries the body the tree names now.
     #[test]
     fn a_path_whose_derived_entities_did_not_survive_is_owed_a_re_derivation() {
         let repo = tempfile::tempdir().unwrap();
@@ -10946,19 +13321,27 @@ mod tests {
         let stranded = repo.path().join("stranded.rs");
         std::fs::write(&stranded, b"pub fn stranded() -> u32 { 1 }\n").unwrap();
         admit_file_event(&state, &FileEvent::Changed(stranded)).unwrap();
-        mark_enrichment_unpublished(&state, &FilePathId::new("stranded.rs"));
+        startup_diagnostic_write_legacy_marker(&state, &["stranded.rs"]);
 
-        let owed = plan_unpublished_enrichment_repair(&state).unwrap();
+        let owed = plan_legacy_marker(&state);
 
         let named = owed
             .iter()
-            .map(|path| path.as_utf8().unwrap().to_string())
+            .map(|(path, _)| path.as_utf8().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(
             named,
             vec!["stranded.rs".to_string()],
             "a marked path the graph holds no entity for is exactly what needs re-deriving"
         );
+        let Some(TreeEntry::Blob { hash, .. }) = state
+            .graph
+            .get_tree_entry(&FilePathId::new("stranded.rs"))
+            .unwrap()
+        else {
+            panic!("the fixture is admitted source");
+        };
+        assert_eq!(owed[0].1, hash, "the survivor owes the body the tree names");
     }
 
     /// The control that keeps the repair off everyone else's path, and the one
@@ -10977,44 +13360,53 @@ mod tests {
         let published = repo.path().join("published.rs");
         std::fs::write(&published, b"pub fn published() -> u32 { 1 }\n").unwrap();
         admit_file_event(&state, &FileEvent::Changed(published)).unwrap();
-        mark_enrichment_unpublished(&state, &FilePathId::new("published.rs"));
+        startup_diagnostic_write_legacy_marker(&state, &["published.rs"]);
         assert_eq!(
-            plan_unpublished_enrichment_repair(&state).unwrap().len(),
+            plan_legacy_marker(&state).len(),
             1,
             "the positive control: before its entities land the path is owed one pass"
         );
-        mark_enrichment_unpublished(&state, &FilePathId::new("published.rs"));
         admit_entity_for(&state, "published", "published.rs");
 
         assert!(
-            plan_unpublished_enrichment_repair(&state)
-                .unwrap()
-                .is_empty(),
+            plan_legacy_marker(&state).is_empty(),
             "a path whose entities the graph holds is resolved, not re-derived"
         );
     }
 
-    /// A resolved entry is dropped from the durable marker as well as from this
-    /// pass, so a marker cannot grow without bound across restarts and a second
-    /// daemon does not redo the first one's decision.
+    /// An earlier build's marker whose every entry graph truth resolves goes at
+    /// the start that judges it, so no later daemon judges it again.
+    ///
+    /// That build rewrote its marker after each judgment. This one never writes
+    /// it: the start removes a record that owes nothing and holds any other for
+    /// an authority transaction to carry. Falsify by leaving a record that owes
+    /// nothing in place: the file survives.
     #[test]
-    fn a_resolved_entry_is_dropped_from_the_marker() {
+    fn a_legacy_marker_that_owes_nothing_is_removed_at_once() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
         let published = repo.path().join("published.rs");
         std::fs::write(&published, b"pub fn published() -> u32 { 1 }\n").unwrap();
         admit_file_event(&state, &FileEvent::Changed(published)).unwrap();
-        mark_enrichment_unpublished(&state, &FilePathId::new("published.rs"));
+        startup_diagnostic_write_legacy_marker(&state, &["published.rs"]);
         admit_entity_for(&state, "published", "published.rs");
 
-        plan_unpublished_enrichment_repair(&state).unwrap();
+        let record = crate::semantic_debt::read_legacy_enrichment(&state);
+        let owed = plan_unpublished_enrichment_repair(&state, &record).unwrap();
+        assert!(owed.is_empty(), "the control: every entry is resolved");
+        crate::semantic_debt::hold_legacy_carry(&state, record.is_present(), owed);
 
-        let written =
-            std::fs::read(unpublished_enrichment_marker_path(&state)).expect("the marker persists");
-        let still_owed: Vec<String> = serde_json::from_slice(&written).unwrap();
         assert!(
-            still_owed.is_empty(),
-            "the resolved entry is gone from the marker: {still_owed:?}"
+            !state
+                .layout
+                .root()
+                .join("unpublished-enrichment.json")
+                .exists(),
+            "a record that owes nothing goes at the start that judged it"
+        );
+        assert!(
+            crate::semantic_debt::legacy_carry(&state).is_empty(),
+            "and nothing is held for a transaction to carry"
         );
     }
 
@@ -11024,13 +13416,146 @@ mod tests {
     fn a_marked_path_that_left_the_tree_is_not_re_derived() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
-        mark_enrichment_unpublished(&state, &FilePathId::new("never_admitted.rs"));
+        startup_diagnostic_write_legacy_marker(&state, &["never_admitted.rs"]);
 
         assert!(
-            plan_unpublished_enrichment_repair(&state)
-                .unwrap()
-                .is_empty(),
+            plan_legacy_marker(&state).is_empty(),
             "a path with no artifact in the tree is not owed a re-derivation"
+        );
+    }
+
+    /// A marked path whose bytes declare nothing is resolved, not re-derived.
+    ///
+    /// For such a file the graph holding no entity is what every derivation
+    /// produces, not a loss, so "no entity survived" cannot decide it. A
+    /// re-derivation that withdrew a module an older build minted for a
+    /// comment-only file marked the path, and the entry then named a path no
+    /// derivation will ever give an entity.
+    #[test]
+    fn a_marked_path_whose_bytes_declare_nothing_is_resolved_not_re_derived() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let quiet = repo.path().join("quiet.js");
+        std::fs::write(&quiet, b"// nothing is declared in this file\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(quiet)).unwrap();
+        assert!(
+            state
+                .graph
+                .artifact_id_at_path(&RepoPath::from_utf8("quiet.js".to_string()).unwrap())
+                .is_some(),
+            "the fixture path must be in the tree, or the entry is dropped for leaving it"
+        );
+        startup_diagnostic_write_legacy_marker(&state, &["quiet.js"]);
+
+        assert!(
+            plan_legacy_marker(&state).is_empty(),
+            "a path whose bytes declare nothing owes no re-derivation"
+        );
+    }
+
+    /// The control for the case above: bytes that yield no entity because
+    /// they do not parse have not been shown to declare nothing.
+    ///
+    /// The parser returns such a result as an ordinary success carrying an
+    /// incomplete parse state, and the JavaScript extractor emits no module for
+    /// a file it extracted nothing from. Resolving on an empty entity list
+    /// alone therefore dropped the record of a path whose declarations were
+    /// never read, so no later daemon asked about it again.
+    #[test]
+    fn a_marked_path_whose_bytes_do_not_parse_stays_owed_and_is_retried() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let broken = repo.path().join("broken.js");
+        std::fs::write(&broken, b"((( function\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(broken)).unwrap();
+        let path = RepoPath::from_utf8("broken.js".to_string()).unwrap();
+        let artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&path)
+            .expect("the fixture path must be in the tree, or the entry is dropped for leaving it")
+            .clone();
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            panic!("the fixture path must be a blob");
+        };
+        let body = state
+            .blobs
+            .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+            .expect("the tree's body is in CAS");
+        let parsed = IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("broken.js"),
+                &body,
+                kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+            )
+            .expect("the parser answers malformed bytes with an ordinary result")
+            .indexed_file;
+        assert!(
+            parsed.entities.is_empty()
+                && !matches!(parsed.parse_state, kin_model::ParseState::Valid),
+            "the fixture must be malformed bytes that yield no entity: {:?}, {} entities",
+            parsed.parse_state,
+            parsed.entities.len()
+        );
+        startup_diagnostic_write_legacy_marker(&state, &["broken.js"]);
+
+        for pass in ["first", "second"] {
+            assert_eq!(
+                plan_legacy_marker(&state),
+                vec![(path.clone(), hash)],
+                "the {pass} planning pass must still owe the re-derivation of a path whose \
+                 bytes did not parse"
+            );
+            let written = std::fs::read(state.layout.root().join("unpublished-enrichment.json"))
+                .expect("the marker persists");
+            let still_owed: Vec<String> = serde_json::from_slice(&written).unwrap();
+            assert_eq!(
+                still_owed,
+                vec!["broken.js".to_string()],
+                "the entry stays recorded after the {pass} pass, so a start that fails before \
+                 carrying it retries it"
+            );
+        }
+    }
+
+    /// An earlier build's marker that will not read is judged as if it named
+    /// every source path, never as if it named none.
+    ///
+    /// That build read such a marker as empty and left it in place, so a path
+    /// whose entities died with its daemon stayed unqueryable. Falsify by
+    /// judging an unreadable record as an absent one: nothing is owed.
+    #[test]
+    fn an_unreadable_legacy_marker_owes_every_source_path_the_graph_holds_no_entity_for() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let stranded = repo.path().join("stranded.rs");
+        std::fs::write(&stranded, b"pub fn stranded() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(stranded)).unwrap();
+        let published = repo.path().join("published.rs");
+        std::fs::write(&published, b"pub fn published() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(published)).unwrap();
+        admit_entity_for(&state, "published", "published.rs");
+        std::fs::write(
+            state.layout.root().join("unpublished-enrichment.json"),
+            b"[\"stranded.r",
+        )
+        .unwrap();
+
+        let record = crate::semantic_debt::read_legacy_enrichment(&state);
+        assert!(matches!(
+            record,
+            crate::semantic_debt::LegacyRecord::Unknown(_)
+        ));
+        let owed: Vec<String> = plan_unpublished_enrichment_repair(&state, &record)
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path.to_string())
+            .collect();
+        assert_eq!(
+            owed,
+            vec!["stranded.rs".to_string()],
+            "every source path with no entity is owed, and one whose entities the graph holds \
+             is not"
         );
     }
 
@@ -11041,9 +13566,7 @@ mod tests {
         let state = open_test_state(&repo);
 
         assert!(
-            plan_unpublished_enrichment_repair(&state)
-                .unwrap()
-                .is_empty(),
+            plan_legacy_marker(&state).is_empty(),
             "a store no daemon ever marked owes no re-derivation"
         );
     }
@@ -11213,30 +13736,32 @@ pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
     sync_filesystem_with_graph_publishing(state, TreePublication::DeferredToCaller).await
 }
 
-/// Re-derive the semantics every recorded debt still owes, and refuse in words
-/// if any of them cannot be.
+/// Re-derive the semantics every owed derivation record still owes, and refuse
+/// in words if any of them cannot be.
 ///
-/// Entries for an overtaken body or an unpublished proposal are settled here
-/// rather than re-parsed: the current tree does not owe that exact body. A
-/// different owed body at the same path remains recorded. Surviving debt is settled
-/// only by the commit that publishes it, because a commit is the transaction
-/// that makes a parse durable and a crash before one would otherwise clear the
-/// record for work nothing carried.
+/// Nothing is settled here. A record whose body the tree no longer names is
+/// not owed to this graph, and storage drops it from the ledger in the same
+/// transaction that moves authority's tree off that body. A record still owed
+/// is paid only by the commit that carries its parse, because a commit is the
+/// transaction that makes a parse durable. A deferred tree that never reaches
+/// authority therefore leaves every record where it was.
+///
+/// A ledger this call cannot read is an error rather than an empty one: a
+/// commit that follows would pay records whose parse nothing re-derived.
 pub(crate) async fn drain_semantic_debt(state: &DaemonState) -> Result<()> {
-    drain_semantic_debt_inner(state, false).await
+    drain_semantic_debt_except(state, &BTreeSet::new()).await
 }
 
-async fn drain_semantic_debt_inner(state: &DaemonState, retain_spent: bool) -> Result<()> {
-    let recorded = crate::semantic_debt::outstanding(state);
+async fn drain_semantic_debt_except(
+    state: &DaemonState,
+    handled: &BTreeSet<RepoPath>,
+) -> Result<()> {
+    let recorded = crate::semantic_debt::outstanding_checked(state)?;
     if recorded.is_empty() {
         return Ok(());
     }
-    let (owed, spent) = crate::semantic_debt::partition_against_tree(state, &recorded);
-    // A deferred tree has not displaced authority yet. Its older body may
-    // still be owed after publication refuses and the derived tree resets.
-    if !retain_spent {
-        crate::semantic_debt::settle(state, &spent);
-    }
+    let mut owed = crate::semantic_debt::owed_against_tree(state, &recorded);
+    owed.retain(|path| !handled.contains(path));
     if owed.is_empty() {
         return Ok(());
     }
@@ -11271,9 +13796,10 @@ async fn drain_semantic_debt_inner(state: &DaemonState, retain_spent: bool) -> R
         return Ok(());
     }
     // Everything else is this daemon failing at something it should have
-    // managed, and a caller can retry it. Letting one through would settle the
-    // record unpaid and reproduce the stale spans silently, which is the whole
-    // class this record exists to close.
+    // managed, and a caller can retry it. Letting one through would let the
+    // commit that follows pay the record with no parse behind it and reproduce
+    // the stale spans silently, which is the whole class this record exists to
+    // close.
     Err(DaemonError::SemanticReadmissionFailed(format!(
         "the bytes for {} of these paths are durable authority and their semantics could not be \
          re-derived from them, so the graph still answers about them at the positions their \
@@ -11298,6 +13824,15 @@ pub(crate) struct SemanticReadmission {
     /// re-derived, named so a caller can refuse in words rather than report a
     /// count of zero.
     pub(crate) failed: Vec<SemanticFailure>,
+    /// Withdrawn cross-file bindings a startup re-derivation dropped without a
+    /// withdrawal record, because the store it loaded could not certify their
+    /// caller. Always zero outside [`readmit_semantics_at_startup`].
+    pub(crate) withdrawn_unrecorded: usize,
+    /// Stored external-import edges a startup re-derivation retired because
+    /// this build's parser, re-reading the exact bytes each was recorded
+    /// against, does not reproduce it. Always zero outside
+    /// [`readmit_semantics_at_startup`].
+    pub(crate) external_unreproduced: usize,
 }
 
 /// One path whose semantics did not follow its bytes, and whether the file
@@ -11367,17 +13902,89 @@ pub(crate) async fn readmit_semantics_for_paths(
     state: &DaemonState,
     paths: &BTreeSet<RepoPath>,
 ) -> SemanticReadmission {
+    readmit_semantics_for_paths_with(state, paths, false).await
+}
+
+/// [`readmit_semantics_for_paths`] for the startup repair, whose only
+/// observation from before this start is the store as it loaded it.
+///
+/// A withdrawn cross-file binding keeps its withdrawal record wherever that
+/// store certifies the caller. Where it cannot, the binding is dropped and
+/// counted in [`SemanticReadmission::withdrawn_unrecorded`] instead of refusing
+/// the whole repair, because the live parse that bound it did not survive the
+/// restart and a refusal there leaves the daemon unable to serve at all. A
+/// stored external-import edge whose only failed check is the recount of its
+/// recorded bytes under this build's parser is retired the same way, and
+/// counted in [`SemanticReadmission::external_unreproduced`].
+async fn readmit_semantics_at_startup(
+    state: &DaemonState,
+    paths: &BTreeSet<RepoPath>,
+) -> SemanticReadmission {
+    readmit_semantics_for_paths_with(state, paths, true).await
+}
+
+async fn readmit_semantics_for_paths_with(
+    state: &DaemonState,
+    paths: &BTreeSet<RepoPath>,
+    at_startup: bool,
+) -> SemanticReadmission {
     let mut outcome = SemanticReadmission::default();
     if paths.is_empty() {
         return outcome;
     }
+    let _binding_derivation = crate::binding_history::Derivation::begin(state);
     let working_dir = state.layout.working_dir();
     let tree = state.graph.resolved_tree();
     let enrichment_pipeline = IndexPipeline::new();
     let mut reconciler = state.reconciler.write().await;
+    // A complete batch also depends on project inputs and unchanged sources.
+    // It must not recapture a newer tree after waiting for the reconciler and
+    // then skip the per-file predecessor checks below as already handled.
+    if state.graph.resolved_tree() != tree {
+        outcome.failed.extend(paths.iter().filter_map(|path| {
+            semantic_file_id(path).map(|file| SemanticFailure::unresolved(file.0))
+        }));
+        return outcome;
+    }
     let mut graph_changed = false;
+    let mut batch_delta = crate::state::PassDelta::default();
+    let batch_result = if at_startup {
+        source_batch::try_readmit_at_startup(state, &mut reconciler, paths, &mut batch_delta)
+    } else {
+        source_batch::try_readmit(
+            state,
+            &mut reconciler,
+            paths,
+            None,
+            &BTreeSet::new(),
+            &mut batch_delta,
+        )
+        .map(|handled| (handled, source_batch::StartupRetirements::default()))
+    };
+    if let Some(event) = batch_delta.into_event() {
+        state.emit_event(event);
+    }
+    let handled = match batch_result {
+        Ok((handled, retirements)) => {
+            outcome.withdrawn_unrecorded = retirements.withdrawn_unrecorded;
+            outcome.external_unreproduced = retirements.external_unreproduced;
+            handled
+        }
+        Err(error) => {
+            warn!(%error, "coherent readmission failed for admitted source paths");
+            outcome.failed.extend(paths.iter().filter_map(|path| {
+                path.as_utf8()
+                    .map(|path| SemanticFailure::unresolved(path.to_string()))
+            }));
+            return outcome;
+        }
+    };
+    outcome.enriched += handled.len();
 
     for repo_path in paths {
+        if handled.contains(repo_path) {
+            continue;
+        }
         let Some(artifact) = tree.artifact_at_path(repo_path) else {
             continue;
         };
@@ -11466,9 +14073,22 @@ pub(crate) async fn readmit_semantics_for_paths(
 
         // The parser consumes the exact CAS body, not a second host read. The
         // same partial/LKG policy still applies to syntactically incomplete bytes.
-        let indexed = match enrichment_pipeline
-            .index_file_content_with_tests(&file_id, &content, body_hash)
-        {
+        let index =
+            || enrichment_pipeline.index_file_content_with_tests(&file_id, &content, body_hash);
+        #[cfg(test)]
+        let index = || {
+            if state.readmission_index_failure.lock().unwrap().as_ref() == Some(&file_id) {
+                Err(kin_index::IndexError::Parse(
+                    kin_parser::ParseError::ParseFailed {
+                        file: file_id.0.clone(),
+                        reason: "injected canonical readmission failure".to_string(),
+                    },
+                ))
+            } else {
+                index()
+            }
+        };
+        let indexed = match index() {
             Ok(indexed) => indexed.indexed_file,
             Err(error) => {
                 warn!(file = %file_id, %error, "canonical source could not be parsed");
@@ -11546,7 +14166,6 @@ pub(crate) async fn readmit_semantics_for_paths(
                             .push(SemanticFailure::unresolved(file_id.0.clone()));
                         continue;
                     }
-                    let derived_entities = !delta.entity_deltas.is_empty();
                     if let Err(error) = persist_partial_observation(&state.layout, &reconciled) {
                         warn!(%error, "partial admission retained all entities because coverage could not persist");
                         outcome
@@ -11568,9 +14187,6 @@ pub(crate) async fn readmit_semantics_for_paths(
                     }
                     if let Some(observation) = observed_parse_of(repo_path, &reconciled) {
                         kin_core::retained_parse::record(&state.layout, &[observation]);
-                    }
-                    if derived_entities {
-                        mark_enrichment_unpublished(state, &file_id);
                     }
                     // The file's declarations just moved, so whatever a language
                     // server said about them was said at positions this delta
@@ -11817,10 +14433,13 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // An explicit admission seam. Everything the working copy holds crosses
     // the compare-and-swap here, which is why `/commands/commit` calls it
     // rather than relying on whatever the watcher happened to observe.
-    let mut exact_admission = exact_tree_admission(state, None, publication)?;
+    let mut reconciler = state.reconciler.write().await;
+    let mut exact_admission =
+        exact_tree_admission_with_reconciler(state, None, publication, &mut reconciler)?;
     // Recorded before anything below can fail, so a pass that dies part way
     // through enrichment still hands the deferral back to be closed.
     *deferred_out = exact_admission.deferred_tree.take();
+    let binding_derivation = crate::binding_history::Derivation::begin(state);
     // Drain what earlier publications owe a parser, on both paths and before the
     // empty-transition conclusion below.
     //
@@ -11836,11 +14455,32 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // settles the whole record once its transaction reaches authority. Draining
     // only on the empty path would let one unrelated edit clear a debt nothing
     // had paid.
-    if let Err(error) = drain_semantic_debt_inner(state, deferred_out.is_some()).await {
+    let batch_paths = source_batch::with_owed_paths(state, exact_admission.changed_paths.clone());
+    let mut batch_delta = crate::state::PassDelta::default();
+    let batch_result = if let Some(prepared) = exact_admission.prepared_sources.take() {
+        prepared.finish(state, &mut reconciler, &mut batch_delta)
+    } else {
+        source_batch::try_readmit(
+            state,
+            &mut reconciler,
+            &batch_paths,
+            exact_admission.semantic_predecessor.as_ref(),
+            &exact_admission.changed_paths,
+            &mut batch_delta,
+        )
+    };
+    drop(reconciler);
+    if let Some(event) = batch_delta.into_event() {
+        state.emit_event(event);
+    }
+    let handled = batch_result?;
+    if let Err(error) = drain_semantic_debt_except(state, &handled).await {
+        drop(binding_derivation);
         drop(graph_mutation);
         return Err(error);
     }
     if exact_admission.deltas.is_empty() {
+        drop(binding_derivation);
         drop(graph_mutation);
         return Ok(());
     }
@@ -11866,6 +14506,13 @@ async fn sync_filesystem_with_graph_publishing_inner(
     let mut observed_parses: Vec<kin_core::retained_parse::ObservedParse> = Vec::new();
 
     for event in events {
+        let (FileEvent::Changed(host) | FileEvent::Removed(host)) = &event;
+        if repo_path(host, working_dir)?
+            .as_ref()
+            .is_some_and(|path| handled.contains(path))
+        {
+            continue;
+        }
         let admitted = match admit_file_event_with_exact_tree(
             state,
             &event,
@@ -12082,24 +14729,12 @@ async fn sync_filesystem_with_graph_publishing_inner(
                              {semantic_repo_path}"
                         ))));
                     }
-                    let derived_entities = !delta.entity_deltas.is_empty();
                     persist_partial_observation(&state.layout, &outcome)?;
                     if let Err(e) = state.graph.apply_transaction_delta(&delta) {
                         warn!(error = %e, "failed to apply synced transaction into primary graph");
                         continue;
                     }
                     observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
-                    // Marked here for the same reason as on the ambient tick.
-                    // This seam runs under a commit as often as not, and a
-                    // commit publishes what it derived, so most entries written
-                    // here resolve against graph truth on the next daemon's
-                    // first pass and cost nothing. The ones that do not are
-                    // exactly the losses worth recovering.
-                    if derived_entities {
-                        if let Some(file_id) = semantic_file_id(&semantic_repo_path) {
-                            mark_enrichment_unpublished(state, &file_id);
-                        }
-                    }
                     // The file's declarations just moved, so whatever a language
                     // server said about them was said at positions this delta
                     // retired. The marker claims the opposite, and until it is
@@ -12176,6 +14811,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
         state.mark_dirty();
         state.bump_version();
     }
+    drop(binding_derivation);
     drop(graph_mutation);
 
     Ok(())

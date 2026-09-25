@@ -21,7 +21,7 @@
 
 use anyhow::Result;
 use kin_cli::commands::admit::{
-    graph_moved, summary_lines, AdmitReport, AdmitResponse, ADMIT_SCHEMA,
+    admission_moved, summary_lines, AdmitReport, AdmitResponse, ADMIT_SCHEMA,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -231,12 +231,22 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?
             .repository_id()
             .clone();
+    let _coordination = state.coordination_gate.lock().await;
+    let authority_before = crate::api::cached_authority_admission(state)
+        .ok()
+        .map(|(roots, _)| roots);
     let before = census(state);
     let watcher_loss = watcher_loss_this_pass_can_cover(state);
 
-    // The same seam `/commands/commit` calls. It takes the coordination gate
-    // itself, so this must not already hold it.
-    let outcome = crate::loop_runner::sync_filesystem_with_graph(state).await;
+    // The same admission implementation, using its existing caller-held gate
+    // entry point so both authority measurements cover this one coordinated pass.
+    let outcome = crate::loop_runner::sync_filesystem_with_graph_under_coordination(state).await;
+    let authority_after = crate::api::cached_authority_admission(state)
+        .ok()
+        .map(|(roots, _)| roots);
+    let repository_authority_moved = authority_before
+        .zip(authority_after)
+        .map(|(before, after)| before != after);
 
     // Record the outcome on the same probes the ambient loop records to. A pass
     // requested here is a complete exact-tree admission by every measure that
@@ -318,8 +328,9 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
         // explicit admission run against a store whose ambient loop is parked
         // says so. The probes alone report a quiet loop and a parked one
         // identically.
-        reconcile: state.background_work.reconcile_report(now),
+        reconcile: crate::loop_runner::answered_reconcile_health(state, now),
         tree_moved: tree_moved(&before, &after),
+        repository_authority_moved,
         prior_admission_at,
         admitted: failure.is_none(),
         failure,
@@ -328,7 +339,7 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
     let lines = summary_lines(&report);
     // The wider question, so a content-only admission is not published as a
     // no-op to every caller that reads this flag rather than the prose.
-    let mutated = graph_moved(&report);
+    let mutated = admission_moved(&report);
     Ok(AdmitResponse {
         lines,
         mutated,

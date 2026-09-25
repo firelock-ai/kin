@@ -93,7 +93,7 @@ async fn durable_entity_draft_invalid_empty_utf8_survives_restart_session_loss_a
 
     // The draft tools require no session ID. Even deleting the target entity
     // must not remove the user's editing state or its original read.
-    source_base_commit_operation(&state, serde_json::json!({"verb":"delete","target":"src/value.rs","description":"retire entity while its draft is open"})).await;
+    source_tree_conversion_fixture(&state, serde_json::json!({"verb":"delete","target":"src/value.rs","description":"retire entity while its draft is open"})).await;
     let reopened = entity_draft_reopen(&state);
     drop(state);
     let current = entity_draft_ok(
@@ -494,17 +494,25 @@ async fn durable_entity_draft_apply_replays_original_receipt_after_restart_and_l
     assert_eq!(first["draft"]["content_revision"], 1);
     assert_eq!(first["receipt"]["ops_applied"], 1);
     assert!(first["receipt"].get("already_applied").is_none());
+    assert!(first["receipt"].get("publication_accounting").is_none());
+    assert_eq!(first["publication_accounting"]["status"], "exact");
+    // This is the pre-accounting receipt shape already stored by older Apply
+    // versions. Its exact value must continue to match after upgrade/replay.
+    assert_eq!(
+        first["draft"]["applied_receipt"]["receipt"],
+        first["receipt"]
+    );
     let later = "pub fn value() -> u8 { 3 }";
-    source_base_commit_operation(
-        &state,
-        serde_json::json!({"verb":"update","target":source["id"],"description":"Intervening edit","body":later}),
-    )
-    .await;
+    source_base_commit_fresh(&state, &source["id"], later, "Intervening edit").await;
     let roots = source_base_roots(&state);
     let reopened = entity_draft_reopen(&state);
     drop(state);
     let replay = entity_draft_ok(&entity_draft_http(&reopened, "kin_draft_apply", request).await);
     assert_eq!(replay["receipt"], first["receipt"]);
+    assert_eq!(
+        replay["publication_accounting"],
+        first["publication_accounting"]
+    );
     assert_eq!(replay["draft"]["revision"], 3);
     assert_eq!(source_base_roots(&reopened), roots);
     let current = mcp_call(
@@ -630,19 +638,31 @@ async fn durable_entity_draft_apply_receipt_failure_recovers_without_republicati
     assert_eq!(uncertain["code"], "draft_apply_receipt_not_saved");
     assert_eq!(uncertain["repository_source_applied"], true);
     assert_eq!(uncertain["receipt_saved"], false);
+    assert!(uncertain["receipt"].get("publication_accounting").is_none());
+    assert_eq!(uncertain["publication_accounting"]["status"], "exact");
     drop(fault);
     let pending = entity_draft_ok(
         &entity_draft_http(&state, "kin_draft_read", serde_json::json!({"draft_id":id})).await,
     );
     assert_eq!(pending["pending_apply"], uncertain["attempt"]);
     assert!(pending["applied_receipt"].is_null());
-    source_base_commit_operation(&state, serde_json::json!({"verb":"update","target":source["id"],"description":"Intervening edit","body":"pub fn value() -> u8 { 9 }"})).await;
+    source_base_commit_fresh(
+        &state,
+        &source["id"],
+        "pub fn value() -> u8 { 9 }",
+        "Intervening edit",
+    )
+    .await;
     let roots = source_base_roots(&state);
     let reopened = entity_draft_reopen(&state);
     drop(state);
     let recovered =
         entity_draft_ok(&entity_draft_http(&reopened, "kin_draft_apply", request).await);
     assert_eq!(recovered["receipt"], uncertain["receipt"]);
+    assert_eq!(
+        recovered["publication_accounting"],
+        uncertain["publication_accounting"]
+    );
     assert_eq!(source_base_roots(&reopened), roots);
     let second = entity_draft_reopen(&reopened);
     let saved = entity_draft_ok(
@@ -670,7 +690,13 @@ async fn durable_entity_draft_stale_and_invalid_apply_refuse_but_preserve_newer_
         let id = create["draft_id"].as_str().unwrap();
         entity_draft_ok(&entity_draft_http(&state, "kin_draft_create", create.clone()).await);
         if stale {
-            source_base_commit_operation(&state, serde_json::json!({"verb":"update","target":source["id"],"description":"Intervening edit","body":"pub fn value() -> u8 { 4 }"})).await;
+            source_base_commit_fresh(
+                &state,
+                &source["id"],
+                "pub fn value() -> u8 { 4 }",
+                "Intervening edit",
+            )
+            .await;
         }
         let roots = source_base_roots(&state);
         let request = serde_json::json!({"draft_id":id,"expected_revision":1,"session_id":mcp_test_session(&state)});

@@ -418,8 +418,21 @@ fn build_context_response_inner(
 
     let assistant_hint = assistant_hint_from(request.assistant.as_deref());
 
-    let Some(target) = resolve_context_target(graph, &request.entity)? else {
-        let lines = context_not_found_guidance(&request.entity);
+    // A member name several owners share names none of them, so the pack is
+    // refused with every candidate rather than built around one of them.
+    let shared = shared_member_focal_candidates(graph, &request.entity)?.map(|candidates| {
+        crate::entity_identity::name_candidate_lines(
+            &crate::entity_ref::parse_entity_ref(&request.entity).name,
+            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            &candidates,
+        )
+    });
+    let target = match shared {
+        Some(_) => None,
+        None => resolve_context_target(graph, &request.entity)?,
+    };
+    let Some(target) = target else {
+        let lines = shared.unwrap_or_else(|| context_not_found_guidance(&request.entity));
         let measured_tokens = kin_context::estimate_tokens(&lines.join("\n"));
         return Ok(ContextResponse {
             error: Some(lines.join("\n")),
@@ -795,6 +808,28 @@ fn resolve_context_target(
     crate::entity_identity::choose_definition(graph, &matches)
 }
 
+/// The candidates a focal token reaches when it is a member name several
+/// owners share and its pins leave more than one of them, or `None` for any
+/// other token.
+///
+/// Public for the daemon's `get_context_pack` route, which answers such a
+/// token with every candidate instead of handing the pack builder one of them,
+/// the way `get_entity_source` and `find_references` answer the same name.
+pub fn shared_member_focal_candidates(
+    graph: &kin_db::InMemoryGraph,
+    token: &str,
+) -> Result<Option<Vec<Entity>>> {
+    let reference = crate::entity_ref::parse_entity_ref(token);
+    let resolved =
+        crate::entity_identity::resolve_identity(graph, &reference.name, &reference.qualifiers)?;
+    if !resolved.member_name {
+        return Ok(None);
+    }
+    let mut matches = resolved.matches;
+    crate::entity_ref::apply_line(&mut matches, reference.line);
+    Ok((matches.len() > 1).then_some(matches))
+}
+
 fn parse_budget(s: &str) -> Result<TokenBudget> {
     match s {
         "8k" => Ok(TokenBudget::Small8k),
@@ -957,6 +992,13 @@ fn resolve_focal(
 
     let mut matches = resolved.matches.clone();
     crate::entity_ref::apply_line(&mut matches, reference.line);
+    if resolved.member_name && matches.len() > 1 {
+        return Ok(Err(crate::entity_identity::name_candidate_lines(
+            &reference.name,
+            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            &matches,
+        )));
+    }
     let Some(chosen) = crate::entity_identity::choose_definition(graph, &matches)? else {
         // The name is in the graph and the pin excluded every entity carrying
         // it. Naming the twins that do exist is what turns this from a dead end

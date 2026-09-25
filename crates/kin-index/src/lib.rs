@@ -21,16 +21,26 @@ fn kin_process_group_guardian_worker() {
 
 pub mod admission;
 pub mod artifacts;
+pub mod binding_debt;
+pub mod binding_history;
 pub mod classifier;
 pub mod dispatch;
 pub mod error;
 pub mod fingerprint;
 pub mod history;
+/// Where a Go, Java, Kotlin, PHP, Rust or Swift import coordinate lands in
+/// this repository. Private: the linker owns what an import binding becomes.
+mod import_binding;
+pub mod key_domain;
 pub mod linker;
 pub mod overlay;
+pub mod overrides;
 pub mod pipeline;
+pub mod relation_read;
+mod relation_source;
 pub mod repository;
 pub mod resolution;
+pub mod rust_project;
 pub mod support;
 pub mod watcher;
 
@@ -53,39 +63,50 @@ pub use fingerprint::{
 };
 pub use history::{
     derive_historical_semantic_deltas, is_external_reference_target, placeholder_target_entity,
-    HistoricalSemanticDelta, HistoricalSemanticFold,
+    rederive_tree_semantics, rederive_tree_semantics_from, HistoricalSemanticDelta,
+    HistoricalSemanticFold, RederivedTreeSemantics,
 };
 pub use linker::{
-    bare_entity_name, build_projection_derived_relations_for_file,
-    build_projection_derived_relations_from_markers, extract_projection_source_markers,
-    link_cross_file, link_cross_file_against_entities,
+    bare_entity_name, bind_parse_coverage_source, build_incremental_parse_coverage_relation,
+    build_parse_coverage_relation, build_projection_derived_relations_for_file,
+    build_projection_derived_relations_from_markers, coverage_evidence,
+    extract_projection_source_markers, is_parse_coverage_relation, is_self_dispatch_candidate,
+    is_superseded_parse_coverage_relation, link_cross_file, link_cross_file_against_entities,
     link_cross_file_against_entities_with_completeness, link_cross_file_borrowed_with_completeness,
     link_cross_file_incremental, link_cross_file_incremental_with_completeness,
-    link_cross_file_with_completeness, CrossFileLinker, FileParseCompletenessMap, FileParseData,
-    IncrementalLinker, IncrementalLinkerCheckpointV1, LinkingOutcome, UnresolvedRelation,
-    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1,
-    CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1, CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
-    CALL_SHAPE_PARSE_COVERAGE_FULL_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
-    IMPORT_RESOLUTION_COVERAGE_V1, INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
+    link_cross_file_incremental_with_graph, link_cross_file_with_completeness,
+    parse_coverage_source_digest, unanimous_entity_source_digest,
+    workspace_package_import_candidate_paths, CrossFileLinker, FileParseCompletenessMap,
+    FileParseData, IncrementalLinker, IncrementalLinkerCheckpointV1, LinkingOutcome,
+    UnresolvedRelation, BASE_RESOLUTION_COVERAGE_V1, CALL_SHAPE_EVIDENCE_AGGREGATION_V1,
+    CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
+    CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1, CALL_SHAPE_PARSE_COVERAGE_FULL_V1,
+    CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1, IMPORT_RESOLUTION_COVERAGE_V1,
+    INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
+    SELF_DISPATCH_OVERRIDE_EVIDENCE_V1,
 };
 pub use linker::{
-    is_external_import_placeholder, is_raise_classifiable_call_edge, is_raise_target_edge,
-    trace_crossing_for, TraceCrossing, EXTERNAL_IMPORT_REFERENCE_RULE, RAISE_TARGET_CALL_RULE,
+    is_external_import_occurrence, is_external_import_placeholder, is_js_imported_getter_receiver,
+    is_raise_classifiable_call_edge, is_raise_target_edge, trace_crossing_for, TraceCrossing,
+    EXTERNAL_IMPORT_REFERENCE_RULE, JS_IMPORTED_GETTER_REFERENCE_RULE, RAISE_TARGET_CALL_RULE,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
+pub use overrides::{overriding_methods, OverrideCandidate, OVERRIDDEN_BY_FIELD};
 pub use pipeline::{
     classify_file_role, normalize_file_path_id, IndexPipeline, IndexedAny, IndexedFile,
     COMMAND_EFFECT_CONTRACT_KEY,
 };
+pub use relation_source::{relation_source_entity, RelationSourceIndex};
 pub use repository::{
     canonicalize_host_parent_preserving_leaf, host_path_from_repo_path, is_repository_control_path,
-    read_verified_scanned_entry, repo_path_from_host_relative, scan_repository,
-    scan_repository_modified_since, scan_repository_preserving_graph_only,
-    scan_repository_untracked_paths, should_track_host_relative_path,
-    tracked_paths_covered_by_ignore, tracked_paths_retracted_by_ignore, CompleteRepositoryScan,
-    CompleteScanToken, IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore,
-    RepositoryScanDiagnostics, ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES,
-    PYTHON_VIRTUALENV_MARKER,
+    observe_host_tree_entry, read_verified_scanned_entry, repo_path_from_host_relative,
+    scan_repository, scan_repository_never_met_directories, scan_repository_preserving_graph_only,
+    scan_repository_untracked_paths, scan_working_copy_changes_since,
+    should_track_host_relative_path, tracked_paths_covered_by_ignore,
+    tracked_paths_retracted_by_ignore, CompleteRepositoryScan, CompleteScanToken,
+    IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore, RepositoryScanDiagnostics,
+    ScannedEntryKind, ScannedRepositoryEntry, WorkingCopyChangesSince, DEFAULT_IGNORED_NAMES,
+    PYTHON_VIRTUALENV_MARKER, TRACKED_CHANGE_WINDOW_MARGIN,
 };
 pub use resolution::{RelationResolution, RESOLUTION_FIELD, RESOLUTION_TIER_LADDER};
 pub use support::{compute_coverage_report, CoverageReport};
@@ -186,3 +207,6 @@ mod tests {
         );
     }
 }
+
+/// Durable occurrence qualification shared by reference and path readers.
+pub mod occurrence;

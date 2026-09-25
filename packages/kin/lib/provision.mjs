@@ -598,19 +598,61 @@ export async function provision(version, opts = {}) {
 
 /** First line of `<binary> --version`, or null if it cannot be run. */
 export function probeBinaryVersion(binary, spawnImpl = spawnSync) {
-  const res = spawnImpl(binary, ['--version'], { encoding: 'utf8' });
+  const res = spawnImpl(binary, ['--version'], {
+    encoding: 'utf8',
+    timeout: 5000,
+    killSignal: 'SIGKILL',
+    maxBuffer: 16 * 1024,
+  });
   if (res.error || res.status !== 0) return null;
   const m = String(res.stdout).match(/^kin\s+(\S+)/);
-  return m ? m[1] : null;
+  return m && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(m[1])
+    ? m[1]
+    : null;
 }
 
 /**
- * Ensure the managed `kin` binary matching this launcher's pinned release is
- * present, provisioning (or re-provisioning) when needed. Returns the binary
- * path, or null when nothing usable exists and provisioning is unavailable.
- * Throws when an installed release outranks the pin and the caller has not
- * opted into a downgrade — this function never returns a value while quietly
- * declining to honor the pin.
+ * The notice a launcher prints the first time it runs a managed install that
+ * is newer than its own pin.
+ *
+ * It names the version that runs, the pin it outranks, what usually put it
+ * there, and both ways to change the outcome: bring the launcher forward, or
+ * install the pinned release over the newer one on purpose. The forward move
+ * comes first because it is the one almost everybody wants.
+ */
+export function newerInstallNotice(installed, target, installedPath) {
+  return (
+    `kin: running managed kin ${installed} at ${installedPath}, which is newer than the ${target} ` +
+    'this @kinlab/kin launcher pins (`kin update` and the shell installer move the managed install ' +
+    'forward without touching the npm package). `npm install -g @kinlab/kin@latest` brings the ' +
+    `launcher forward too; KIN_LAUNCHER_ADOPT=1 installs ${target} over it instead.`
+  );
+}
+
+/**
+ * What to do about stores the replaced kin wrote, said once after the managed
+ * binary moves to a newer release. It names the same command `kin status`,
+ * `kin doctor` and an MCP answer's verdict name for a store behind this
+ * release, pinned to the release just provisioned. Conditional because not
+ * every release changes what a store derives, and `kin status` is what says
+ * whether one does.
+ */
+export function storeUpgradeNotice(target) {
+  return (
+    'kin: a store an older kin wrote can read behind this release. When `kin status` in a ' +
+    'repository names `kin upgrade`, run `kin upgrade` in that repository ' +
+    `(\`npx -y @kinlab/kin@${target} upgrade\` when Kin runs through npm), which re-derives ` +
+    'the state the store serves and keeps every native commit, branch, review and history record.'
+  );
+}
+
+/**
+ * Ensure a managed `kin` binary at least as new as this launcher's pinned
+ * release is present, provisioning (or re-provisioning) when needed. Returns
+ * the binary path, or null when nothing usable exists and provisioning is
+ * unavailable. Never downgrades unless the caller opts in with
+ * $KIN_LAUNCHER_ADOPT=1, and never runs a version other than the pin without
+ * saying so.
  *
  * Policy, in order:
  *   - $KIN_MANAGED_BIN is an explicit user pin: use it as-is, never provision.
@@ -618,14 +660,17 @@ export function probeBinaryVersion(binary, spawnImpl = spawnSync) {
  *   - $KIN_LAUNCHER_ADOPT=1: always (re-)provision the pinned release,
  *     regardless of what is already installed.
  *   - nothing installed yet: provision the pinned release.
- *   - installed version is known — from the launcher stamp when this package
- *     provisioned it (no probe needed), otherwise by probing a foreign
- *     install's `--version` once:
- *       - installed == pinned: reuse it (a foreign match adopts the stamp).
+ *   - installed version is known from a bounded `--version` probe. An old
+ *     launcher stamp cannot describe bytes replaced by `kin update`, the
+ *     shell installer, or a restored backup:
+ *       - installed == pinned: reuse it and refresh a missing or stale stamp.
  *       - installed < pinned: the pin is an upgrade — provision it
  *         automatically with a one-line notice. Never a silent no-op.
- *       - installed > pinned: the pin would downgrade a newer install — fail
- *         loud with an actionable message instead of running anything.
+ *       - installed > pinned: `kin update` or the shell installer moved the
+ *         install past this launcher. Run the newer binary, which serves
+ *         every command the pin would have. The first run says so and
+ *         records the confirmed version in the stamp, so later runs are
+ *         quiet until the installed version changes again.
  *   - installed version unparseable (foreign binary that will not report a
  *     version): can't prove direction, so respect it — notice and reuse.
  */
@@ -660,7 +705,7 @@ export async function ensureProvisioned(opts = {}) {
 
   const installedPath = managedBinaryPath('kin', env, platform);
   const stamp = readLauncherStamp(env);
-  const installed = stamp ?? probeBinaryVersion(existing, spawnImpl);
+  const installed = probeBinaryVersion(existing, spawnImpl);
 
   if (installed === null) {
     log(
@@ -672,16 +717,37 @@ export async function ensureProvisioned(opts = {}) {
 
   const cmp = compareVersions(target, installed);
   if (cmp === 0) {
-    if (stamp === null) writeLauncherStamp(target, env);
+    if (stamp !== target) {
+      try {
+        writeLauncherStamp(target, env);
+      } catch (error) {
+        log(`kin: could not refresh the launcher receipt (${error.code ?? 'write failed'}); using verified kin ${installed}.`);
+      }
+    }
     return existing;
   }
   if (cmp > 0) {
     log(`kin: managed kin ${installed} is older than the pinned ${target}; upgrading automatically.`);
-    return doProvision();
+    const upgraded = await doProvision();
+    if (upgraded) {
+      log(storeUpgradeNotice(target));
+    }
+    return upgraded;
   }
-  throw new Error(
-    `refusing to downgrade managed kin ${installed} to the pinned ${target} (at ${installedPath}). ` +
-      'This @kinlab/kin would replace a newer managed install with an older one; nothing was run. ' +
-      'Set KIN_LAUNCHER_ADOPT=1 to force it if the downgrade is intended.',
-  );
+  // The install is newer than the pin. This used to refuse, and because
+  // `kin update` and the shell installer both move $KIN_HOME forward without
+  // touching the npm package, every launcher hit that refusal the first time
+  // its owner updated: every command exited 1, and the only way out it named
+  // was a downgrade. The newer binary answers every command the pinned one
+  // would, so the launcher runs it. The stamp is written only after the notice
+  // has been printed, which is what keeps the notice to one run per version.
+  if (stamp !== installed) {
+    log(newerInstallNotice(installed, target, installedPath));
+    try {
+      writeLauncherStamp(installed, env);
+    } catch (error) {
+      log(`kin: could not record the launcher receipt (${error.code ?? 'write failed'}), so this notice repeats next run.`);
+    }
+  }
+  return existing;
 }

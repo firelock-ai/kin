@@ -120,6 +120,9 @@ class Suite(object):
         self.workdir = workdir
         self.verbose = verbose
         self.fixtures = {}
+        # Every MCP answer and refusal a check read, and every conversion report,
+        # in order. A failing run writes them beside its kept root.
+        self.responses = []
         self._comment_only_evidence = None
         self.run_id = "r%d" % os.getpid()
         self.env = dict(os.environ)
@@ -147,7 +150,21 @@ class Suite(object):
         The MCP path is the surface that applies the negative/completeness
         envelope, so envelope claims are probed here rather than on the raw
         daemon route, which wraps a payload carrying no such envelope.
+
+        The answer, or the refusal, is recorded in `responses` for a failing run
+        to keep.
         """
+        try:
+            payload, size = self._mcp_exchange(repo, tool, args, timeout)
+        except McpError as exc:
+            self.responses.append({"repo": repo, "tool": tool, "args": args,
+                                   "error": str(exc)})
+            raise
+        self.responses.append({"repo": repo, "tool": tool, "args": args, "payload": payload})
+        return payload, size
+
+    def _mcp_exchange(self, repo, tool, args, timeout):
+        """The exchange `mcp` records: one initialize, one call, one parsed answer."""
         env = dict(self.env)
         env["KIN_MCP_REPO"] = repo
         proc = subprocess.Popen(
@@ -667,7 +684,7 @@ class Suite(object):
         resolved the symbol yet. The retry is bounded and a symbol that never
         resolves still reports unresolved rather than absent.
         """
-        args = {"query": query}
+        args = {"query": query, "answer_only": False}
         if relation_kinds:
             args["relation_kinds"] = list(relation_kinds)
         payload, _ = self.mcp(repo, "find_references", args)
@@ -2659,6 +2676,79 @@ def read_until_enriched(read, rel):
     return cov, why
 
 
+def conversion_coverage(suite, repo, rel):
+    """One file's conversion coverage, read through `kin doctor --conversion-source`.
+
+    Checks 15, 17 and 21 used to read this through `list_file_entities`, the
+    whole-file catalog the agent surface has retired. The facts they assert are
+    conversion facts, not catalog rows, so they are read here at the explicit
+    conversion boundary instead: the operator diagnostic reports the file's
+    persisted `file_coverage` and its entity counts by kind, from the same
+    reading the retired enumeration published, and lists no entity.
+
+    Returns the `file_coverage` object with the report's `total` and
+    `counts_by_kind` folded in, or None and the reason when the command refused
+    the path, printed no report, or reported counts that are missing, malformed
+    or do not add up (see `conversion_counts`). A refusal exits nonzero, so it
+    can never be read as a file that holds nothing.
+    """
+    rc, out, err = suite.kin_run(["doctor", "--conversion-source", rel, "--json"], repo)
+    responses = getattr(suite, "responses", None)
+    if responses is not None:
+        responses.append({"repo": repo, "command": ["doctor", "--conversion-source", rel, "--json"],
+                          "exit": rc, "stdout": out, "stderr": err or ""})
+    if rc != 0:
+        return None, ("kin doctor --conversion-source %s exited %d: %s"
+                      % (rel, rc, (err or out).strip()[-300:]))
+    try:
+        report = json.loads(out)
+    except ValueError:
+        return None, ("kin doctor --conversion-source %s printed no JSON report "
+                      "(first 160 chars: %r)" % (rel, out[:160]))
+    if not isinstance(report, dict):
+        return None, "kin doctor --conversion-source %s printed %r, not a report" % (
+            rel, out[:160])
+    cov = report.get("file_coverage")
+    if not isinstance(cov, dict):
+        return None, ("the report carries no file_coverage object; keys were %s"
+                      % sorted(report.keys())[:12])
+    total, counts, why = conversion_counts(report)
+    if why:
+        return None, "kin doctor --conversion-source %s: %s" % (rel, why)
+    cov = dict(cov)
+    cov["total"] = total
+    cov["counts_by_kind"] = counts
+    return cov, None
+
+
+def conversion_counts(report):
+    """The observed entity total and counts by kind from one conversion report.
+
+    Returns (total, counts, None), or (None, None, reason) when either is missing
+    or malformed. An empty file's report says `total: 0` with no kinds, and that
+    reads as an observation; a report with no counts, or counts that do not add
+    up to its total, is unreadable rather than a file that declares nothing.
+    """
+    def count(value):
+        # `bool` is an `int` in Python, and `true` is no count.
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    total = report.get("total")
+    if not count(total):
+        return None, None, "the report's total is %r, not a nonnegative integer" % (total,)
+    counts = report.get("counts_by_kind")
+    if not isinstance(counts, dict):
+        return None, None, "the report's counts_by_kind is %r, not an object" % (counts,)
+    bad = sorted(str(kind) for kind, value in counts.items()
+                 if not isinstance(kind, str) or not count(value))
+    if bad:
+        return None, None, "counts_by_kind holds no nonnegative integer count for %s" % bad
+    if sum(counts.values()) != total:
+        return None, None, ("counts_by_kind sums to %d but the report's total is %d"
+                            % (sum(counts.values()), total))
+    return total, dict(counts), None
+
+
 def check_15(suite):
     """FIR-2604: parsed, tier and certifies_enumeration must be observations.
 
@@ -2692,23 +2782,18 @@ def check_15(suite):
     pre-fix bytes and what a future regression would break again. Reverting the
     backfill in kin-daemon's reconcile loop returns all three to `absent` and
     fails arms one, three and four.
+
+    Read through `kin doctor --conversion-source` since `list_file_entities`
+    left the agent surface. The same `file_coverage` facts arrive from the same
+    reading, and the declares-nothing arm reads the file's entity counts by kind
+    where it used to scan the enumeration's rows for a function, class or
+    method.
     """
     res = Result("15", "FIR-2604", "three parse outcomes read three ways on a converted store")
     repo = suite.fixture("threestate")
 
     def coverage(rel):
-        try:
-            payload, _ = suite.mcp(repo, "list_file_entities", {"path": rel})
-        except McpError as exc:
-            return None, str(exc)
-        cov = payload.get("file_coverage")
-        if not isinstance(cov, dict):
-            return None, ("the response carries no file_coverage object; keys were %s"
-                          % sorted(payload.keys())[:12])
-        cov = dict(cov)
-        cov["total_in_file"] = payload.get("total_in_file")
-        cov["entities"] = payload.get("entities") or []
-        return cov, None
+        return conversion_coverage(suite, repo, rel)
 
     readings = {}
     for name, rel in sorted(THREE_STATE_FILES.items()):
@@ -2717,14 +2802,15 @@ def check_15(suite):
         # catch. Waiting separates them; the reading decides.
         cov, why = read_until_enriched(coverage, rel)
         if cov is None:
-            res.unknown("%s could not be read through MCP: %s" % (rel, why[:250]))
+            res.unknown("%s could not be read through kin doctor --conversion-source: %s"
+                        % (rel, why[:250]))
             return res
         readings[name] = cov
 
     parsed = readings["parsed"]
     if parsed.get("parsed") == "full" and parsed.get("certifies_enumeration") is True:
         res.ok("%s reads parsed=full, tier=%s, certifies_enumeration=true over %s entities"
-               % (THREE_STATE_FILES["parsed"], parsed.get("tier"), parsed.get("total_in_file")))
+               % (THREE_STATE_FILES["parsed"], parsed.get("tier"), parsed.get("total")))
     else:
         res.bad("%s holds entities an adapter read completely but reads parsed=%r "
                 "certifies_enumeration=%r tier=%r, so no enumeration on this store can be "
@@ -2749,10 +2835,12 @@ def check_15(suite):
     # The declares-nothing arm. Python's adapter emits a module entity for every
     # file it reads, so "declares nothing" is the absence of a function or a
     # class rather than an empty list, and asserting an empty list here would be
-    # asserting something no Python file can satisfy.
+    # asserting something no Python file can satisfy. Read from the counts by
+    # kind, which name the kinds the graph holds without listing an entity.
     empty = readings["empty"]
-    declarations = [entity.get("name") for entity in empty.get("entities", [])
-                    if entity.get("kind") in ("function", "class", "method")]
+    declarations = sorted("%s=%s" % (kind, count)
+                          for kind, count in (empty.get("counts_by_kind") or {}).items()
+                          if kind in ("function", "class", "method") and count)
     if empty.get("parsed") == "full" and empty.get("certifies_enumeration") is True \
             and not declarations:
         res.ok("%s parsed completely and declares nothing, and its enumeration is certified "
@@ -3101,41 +3189,39 @@ def check_17(suite):
     Numbered 17 because kin#1078 landed FIR-2524 as check 16 while this one was
     in flight, and a landed number is named by allowance entries, so the free
     number is taken rather than the one that merely looks next.
+
+    Read through `kin doctor --conversion-source` since `list_file_entities`
+    left the agent surface. The positive arm used to cite the enumeration's
+    `truncated: false` as the sign it held the whole file; the diagnostic pages
+    nothing and carries no such field, so the arm now reads the whole-file
+    `total` beside the certified coverage, which is the claim `truncated` was
+    standing in for.
     """
     res = Result("17", "FIR-2641", "an enumeration certifies only when the file actually parsed")
     repo = suite.fixture("threestate")
 
     def coverage(rel):
-        try:
-            payload, _ = suite.mcp(repo, "list_file_entities", {"path": rel})
-        except McpError as exc:
-            return None, str(exc)
-        cov = payload.get("file_coverage")
-        if not isinstance(cov, dict):
-            return None, ("the response carries no file_coverage object; keys were %s"
-                          % sorted(payload.keys())[:12])
-        cov = dict(cov)
-        cov["total_in_file"] = payload.get("total_in_file")
-        cov["truncated"] = payload.get("truncated")
-        return cov, None
+        return conversion_coverage(suite, repo, rel)
 
     # The positive arm, in the shape the stranger hit: a complete enumeration
     # that must say so.
     parsed_rel = THREE_STATE_FILES["parsed"]
     cov, why = read_until_enriched(coverage, parsed_rel)
     if cov is None:
-        res.unknown("%s could not be read through MCP: %s" % (parsed_rel, why[:250]))
+        res.unknown("%s could not be read through kin doctor --conversion-source: %s"
+                    % (parsed_rel, why[:250]))
         return res
     if cov.get("certifies_enumeration") is True and cov.get("parsed") not in (None, "absent"):
-        res.ok("%s enumerates %s entities (truncated=%s) and certifies it, reading parsed=%s "
-               "tier=%s" % (parsed_rel, cov.get("total_in_file"), cov.get("truncated"),
-                            cov.get("parsed"), cov.get("tier")))
+        res.ok("%s holds %s entities in all, counted %s, and certifies them as the whole "
+               "file, reading parsed=%s tier=%s"
+               % (parsed_rel, cov.get("total"), cov.get("counts_by_kind"),
+                  cov.get("parsed"), cov.get("tier")))
     else:
-        res.bad("%s returned an enumeration of %s entities and refuses to certify it: "
+        res.bad("%s holds %s entities and refuses to certify them: "
                 "parsed=%r tier=%r certifies_enumeration=%r. That is the contradiction the "
                 "stranger hit, and following the envelope's own advice sends a reader back "
                 "to grep over a complete answer"
-                % (parsed_rel, cov.get("total_in_file"), cov.get("parsed"),
+                % (parsed_rel, cov.get("total"), cov.get("parsed"),
                    cov.get("tier"), cov.get("certifies_enumeration")))
 
     # The negative control. Without it the arm above is satisfied by a build
@@ -3416,28 +3502,25 @@ def check_21(suite):
     (`crates/kin-mcp/src/handlers/file_entities.rs`), where `src/empty.py` is
     parsed `full` with zero entities. Said out loud because an arm that reads
     like a control and is not one is worse than no arm.
+
+    Read through `kin doctor --conversion-source` since `list_file_entities`
+    left the agent surface. `content_opaque` and `opaque_reason` arrive in the
+    same `file_coverage` words from the same reading, and the controls cite the
+    report's whole-file `total` where they cited the enumeration's
+    `total_in_file`.
     """
     res = Result("21", "MD-OPAQUE",
                  "a file whose type no adapter claims discloses that as the reason")
     repo = suite.fixture("threestate")
 
     def coverage(rel):
-        try:
-            payload, _ = suite.mcp(repo, "list_file_entities", {"path": rel})
-        except McpError as exc:
-            return None, str(exc)
-        cov = payload.get("file_coverage")
-        if not isinstance(cov, dict):
-            return None, ("the response carries no file_coverage object; keys were %s"
-                          % sorted(payload.keys())[:12])
-        cov = dict(cov)
-        cov["total_in_file"] = payload.get("total_in_file")
-        return cov, None
+        return conversion_coverage(suite, repo, rel)
 
     # Arm 1: the unclaimed type names itself.
     cov, why = coverage(NO_ADAPTER_FILE)
     if cov is None:
-        res.unknown("%s could not be read through MCP: %s" % (NO_ADAPTER_FILE, why[:250]))
+        res.unknown("%s could not be read through kin doctor --conversion-source: %s"
+                    % (NO_ADAPTER_FILE, why[:250]))
     elif "content_opaque" not in cov:
         res.unknown("%s reports no content_opaque field; file_coverage keys were %s"
                     % (NO_ADAPTER_FILE, sorted(cov.keys())))
@@ -3463,7 +3546,8 @@ def check_21(suite):
         rel = THREE_STATE_FILES[label]
         cov, why = coverage(rel)
         if cov is None:
-            res.unknown("%s could not be read through MCP: %s" % (rel, why[:250]))
+            res.unknown("%s could not be read through kin doctor --conversion-source: %s"
+                        % (rel, why[:250]))
             continue
         if "content_opaque" not in cov:
             res.unknown("%s reports no content_opaque field; keys were %s"
@@ -3473,12 +3557,12 @@ def check_21(suite):
                     "content_opaque=%r opaque_reason=%r. A file with no entities is not the "
                     "same fact as a file with no adapter, and this control is what separates "
                     "them"
-                    % (rel, cov.get("total_in_file"), cov.get("content_opaque"),
+                    % (rel, cov.get("total"), cov.get("content_opaque"),
                        cov.get("opaque_reason")))
         else:
             res.ok("%s holds %s entities and claims no opaque cause, so the disclosure is "
                    "computed rather than unconditional"
-                   % (rel, cov.get("total_in_file")))
+                   % (rel, cov.get("total")))
     return res
 
 
@@ -4095,6 +4179,16 @@ CHECKS = [
 ]
 
 
+
+def run_root_removable(failed, unread, cleanup_status, keep, workdir):
+    """Whether a finished run may delete its own root.
+
+    Only a run with no failed and no unreadable check, whose cleanup passed, and
+    that was neither asked to keep its root nor given one by the caller. Any
+    losing run keeps everything it produced.
+    """
+    return not failed and not unread and cleanup_status == PASS and not keep and not workdir
+
 def main(argv):
     parser = argparse.ArgumentParser(add_help=True, description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -4218,6 +4312,14 @@ def main(argv):
               % (len(regressed), prior_label,
                  ", ".join("%s/%s" % (r.id, r.ticket) for r in regressed)))
 
+    # A failing run keeps the exact responses its checks read, so a FAIL or an
+    # UNREADABLE can be told apart from a reporting defect after the fact.
+    if failed or unread:
+        payload_path = os.path.join(workdir, "mcp-payloads.json")
+        with open(payload_path, "w") as handle:
+            json.dump(suite.responses, handle, indent=2, default=str)
+        print("kin-magic-repro: failing-run responses %s" % payload_path)
+
     if opts.json_out:
         with open(opts.json_out, "w") as handle:
             json.dump({"label": opts.label, "kin": kin, "version": version,
@@ -4230,10 +4332,13 @@ def main(argv):
                       handle, indent=2)
         print("kin-magic-repro: json %s" % opts.json_out)
 
-    if cleanup.status == PASS and not opts.keep and not opts.workdir:
+    if run_root_removable(failed, unread, cleanup.status, opts.keep, opts.workdir):
         shutil.rmtree(workdir, ignore_errors=True)
-    elif cleanup.status != PASS:
-        print("kin-magic-repro: cleanup failed; run root kept at %s" % workdir)
+    else:
+        if failed or unread:
+            print("kin-magic-repro: failed or unreadable checks; run root kept at %s" % workdir)
+        if cleanup.status != PASS:
+            print("kin-magic-repro: cleanup failed; run root kept at %s" % workdir)
 
     if failed:
         return 1

@@ -222,6 +222,24 @@ fn plan_and_commit(
     let previous_change_id = lease
         .resolve_target_change_id(&current_target)
         .context("resolve the change this branch currently names")?;
+    // Bind the user's preview to the authority protected by this mutation.
+    // The repository transaction below keeps these roots and workspace/ref
+    // expectations through durable publication, closing the remaining race.
+    if request.expected.repository_id != authority.repository_id
+        || request.expected.roots != roots
+        || request.expected.workspace_id != workspace.workspace_id
+        || request.expected.workspace_generation != workspace.generation
+        || request.expected.head_change_id != previous_change_id
+    {
+        return Err(conflict(
+            "repository or workspace changed since the rollback preview; run kin rollback again to preview the current state",
+        ));
+    }
+    if target_change_id != previous_change_id && !request.discard_later {
+        return Err(conflict(
+            "restoring an earlier change replaces the complete working content; preview it and pass --discard-later to accept the restoration",
+        ));
+    }
     let previous_policy = metadata
         .admission_policies
         .iter()
@@ -431,6 +449,9 @@ fn plan_and_commit(
         .into());
     }
 
+    // The restored state is the target's, which predates the store's last
+    // `kin upgrade` unless the target descends from one of its anchors.
+    crate::hydration_requalify::before_restoring(state, &history, target_change_id, "rollback")?;
     let (projected_entries, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),

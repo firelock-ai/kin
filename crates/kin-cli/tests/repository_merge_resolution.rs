@@ -2015,15 +2015,20 @@ fn authored_merge_accepts_exact_non_source_bytes_and_refuses_invalid_source_atom
 
 #[test]
 fn authored_merge_rebuilds_cross_file_relations_to_a_new_declaration() {
-    exercise_authored_cross_file_resolution(false);
+    exercise_authored_cross_file_resolution(false, false);
 }
 
 #[test]
 fn authored_merge_rebuilds_cross_file_relations_across_separate_requests() {
-    exercise_authored_cross_file_resolution(true);
+    exercise_authored_cross_file_resolution(true, false);
 }
 
-fn exercise_authored_cross_file_resolution(separate_requests: bool) {
+#[test]
+fn authored_merge_keeps_the_unchanged_callers_lost_binding_in_committed_history() {
+    exercise_authored_cross_file_resolution(false, true);
+}
+
+fn exercise_authored_cross_file_resolution(separate_requests: bool, unchanged_caller: bool) {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
@@ -2033,6 +2038,13 @@ fn exercise_authored_cross_file_resolution(separate_requests: bool) {
     )
     .unwrap();
     fs::write(repo.join("b.py"), b"def beta(value):\n    return value\n").unwrap();
+    if unchanged_caller {
+        fs::write(
+            repo.join("caller.py"),
+            b"from b import beta\n\ndef legacy_call(value):\n    return beta(value)\n",
+        )
+        .unwrap();
+    }
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "linked Python source"]);
     run_git(&repo, &["switch", "-c", "feature"]);
@@ -2153,6 +2165,27 @@ fn exercise_authored_cross_file_resolution(separate_requests: bool) {
     let merged = graph_at(&layout, &branch_change(&layout, "main"));
     let caller = entity_named(&merged, "run");
     let target = entity_named(&merged, "gamma");
+    if unchanged_caller {
+        let file = kin_model::FilePathId::new("caller.py");
+        let artifact = merged
+            .tree
+            .artifact_id_at_path(&kin_model::RepoPath::from_utf8("caller.py").unwrap())
+            .unwrap();
+        let relation = merged
+            .relations
+            .get(&kin_index::binding_debt::local_binding_debt_id(artifact))
+            .expect("committed merge must retain the unchanged caller's broken local binding");
+        let debt = kin_index::binding_debt::decode_local_binding_debt(&file, artifact, relation)
+            .unwrap()
+            .unwrap();
+        assert!(debt
+            .obligations
+            .iter()
+            .any(
+                |obligation| obligation.retired_relation.kind == kin_model::RelationKind::Calls
+                    && obligation.target_file.0 == "b.py"
+            ));
+    }
     assert!(!merged.entities.values().any(|entity| entity.name == "beta"));
     assert!(
         merged.relations.values().any(|relation| {
@@ -2540,4 +2573,498 @@ fn a_parked_merge_records_no_census_because_it_published_no_merged_graph() {
         "a parked merge composed no merged relation set, so it has none to record; a record \
          written here would describe the graph before the merge and carry this merge's timestamp"
     );
+}
+
+#[test]
+fn authored_parent_renamed_theirs_only_declaration_is_retired() {
+    exercise_authored_parent_rename(false, false, false);
+}
+
+#[test]
+fn authored_parent_retained_theirs_only_declaration_has_current_source() {
+    exercise_authored_parent_rename(true, false, false);
+}
+
+#[test]
+fn authored_parent_renamed_removed_target_preserves_incoming_callers_debt() {
+    exercise_authored_parent_rename(false, true, false);
+}
+
+#[test]
+fn authored_parent_old_path_reuse_preserves_unrelated_artifact() {
+    exercise_authored_parent_rename(false, false, true);
+}
+
+fn exercise_authored_parent_rename(retain_extra: bool, incoming: bool, reuse_path: bool) {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    let base = "def keep(value):\n    first = value + 1\n    second = first * 2\n    third = second + 3\n    return third\n";
+    fs::write(repo.join("a.py"), base).unwrap();
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "shared declaration"]);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init rename fixture",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    ok(
+        &run_kin(&runtime, &repo, &["branch", "create", "feature"]),
+        "create native feature",
+    );
+    ok(
+        &run_kin(&runtime, &repo, &["branch", "switch", "feature"]),
+        "switch native feature",
+    );
+    fs::rename(repo.join("a.py"), repo.join("a2.py")).unwrap();
+    ok(&run_kin(&runtime, &repo, &["admit"]), "admit exact move");
+    ok(
+        &run_kin(&runtime, &repo, &["commit", "-m", "move exact source"]),
+        "commit exact move",
+    );
+    fs::write(
+        repo.join("a2.py"),
+        format!("{base}\ndef extra(value):\n    return value - 1\n"),
+    )
+    .unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["commit", "-m", "add declaration on moved source"],
+        ),
+        "commit extra",
+    );
+    if incoming {
+        fs::write(
+            repo.join("caller.py"),
+            "from a2 import extra\n\ndef call_extra(value):\n    return extra(value)\n",
+        )
+        .unwrap();
+        ok(
+            &run_kin(&runtime, &repo, &["admit"]),
+            "admit unchanged incoming caller",
+        );
+        ok(
+            &run_kin(&runtime, &repo, &["commit", "-m", "call moved addition"]),
+            "commit unchanged incoming caller",
+        );
+    }
+    ok(
+        &run_kin(&runtime, &repo, &["branch", "switch", "main"]),
+        "return native main",
+    );
+    fs::write(repo.join("a.py"), base.replace("value + 1", "value + 7")).unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["commit", "-m", "edit shared declaration"],
+        ),
+        "commit main edit",
+    );
+    if reuse_path {
+        fs::write(
+            repo.join("a2.py"),
+            "def unrelated(value):\n    return value * 17\n",
+        )
+        .unwrap();
+        ok(
+            &run_kin(
+                &runtime,
+                &repo,
+                &["commit", "-m", "reuse old path for another artifact"],
+            ),
+            "commit unrelated artifact",
+        );
+    }
+    let ours_id = branch_change(&layout, "main");
+    let ours = graph_at(&layout, &ours_id);
+    let theirs = graph_at(&layout, &branch_change(&layout, "feature"));
+    let artifact = ours
+        .tree
+        .artifact_id_at_path(&kin_model::RepoPath::from_utf8("a.py").unwrap())
+        .unwrap();
+    assert_eq!(
+        theirs
+            .tree
+            .artifact_id_at_path(&kin_model::RepoPath::from_utf8("a2.py").unwrap()),
+        Some(artifact),
+        "the fixture must move one artifact, not import a replacement"
+    );
+    let keep = entity_named(&ours, "keep").id;
+    let extra = entity_named(&theirs, "extra").id;
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park renamed artifact conflict",
+    );
+    let input = root.path().join("authored.py");
+    let mut body = base.replace("value + 1", "value + 9");
+    if retain_extra {
+        body.push_str("\ndef extra(value):\n    return value - 1\n");
+    }
+    if incoming {
+        let source = entity_named(&theirs, "call_extra");
+        assert!(
+            theirs
+                .relations
+                .values()
+                .any(|r| r.kind == kin_model::RelationKind::Calls
+                    && r.src == kin_model::GraphNodeId::Entity(source.id)
+                    && r.dst == kin_model::GraphNodeId::Entity(extra)),
+            "the unchanged caller must actually bind the removed addition"
+        );
+    }
+    fs::write(&input, &body).unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &[
+                "resolve",
+                "--file",
+                "a.py",
+                input.to_str().unwrap(),
+                "--all-ours",
+            ],
+        ),
+        "settle renamed source",
+    );
+    fs::remove_file(input).unwrap();
+    stop_daemon(&runtime, &repo);
+    let before = open_authority(&layout).read_authority().roots().clone();
+    let continued = run_kin_without_enrichment(&runtime, &repo, &["resolve", "--continue"]);
+    if !continued.status.success() {
+        assert_eq!(
+            open_authority(&layout).read_authority().roots(),
+            &before,
+            "refused publication must preserve authority"
+        );
+        assert_eq!(branch_change(&layout, "main"), ours_id);
+        eprintln!(
+            "rename baseline refusal preserved roots: {}",
+            String::from_utf8_lossy(&continued.stderr)
+        );
+    }
+    ok(
+        &continued,
+        "publish authored source without stale renamed declaration",
+    );
+    let merged_id = branch_change(&layout, "main");
+    let merged = graph_at(&layout, &merged_id);
+    assert_eq!(
+        merged
+            .tree
+            .artifact_id_at_path(&kin_model::RepoPath::from_utf8("a.py").unwrap()),
+        Some(artifact)
+    );
+    assert_eq!(entity_named(&merged, "keep").id, keep);
+    if retain_extra {
+        let retained = entity_named(&merged, "extra");
+        let span = retained.span.as_ref().unwrap();
+        assert_eq!(span.file.0, "a.py");
+        assert_eq!(
+            &body.as_bytes()[span.start_byte..span.end_byte],
+            b"def extra(value):\n    return value - 1"
+        );
+        eprintln!(
+            "retained addition identity prior={} current={}",
+            extra, retained.id
+        );
+    } else {
+        assert!(!merged.entities.contains_key(&extra));
+        assert!(!merged.entities.values().any(|e| e.name == "extra"));
+        assert!(!merged
+            .relations
+            .values()
+            .any(|r| [r.src, r.dst].contains(&kin_model::GraphNodeId::Entity(extra))));
+    }
+    if reuse_path {
+        let old = entity_named(&ours, "unrelated");
+        assert_eq!(merged.entities.get(&old.id), Some(&old));
+        assert_eq!(
+            merged
+                .tree
+                .artifact_at_path(&kin_model::RepoPath::from_utf8("a2.py").unwrap()),
+            ours.tree
+                .artifact_at_path(&kin_model::RepoPath::from_utf8("a2.py").unwrap())
+        );
+    } else {
+        assert!(!merged
+            .entities
+            .values()
+            .any(|e| e.file_origin.as_ref().is_some_and(|p| p.0 == "a2.py")));
+    }
+    if incoming {
+        let debt = caller_debt(&merged)
+            .expect("unchanged caller cannot lose its removed-target obligation");
+        assert!(debt.obligations.iter().any(|o| o.target_name == "extra"
+            && o.retired_relation.kind == kin_model::RelationKind::Calls));
+        let old = entity_named(&theirs, "call_extra");
+        assert_eq!(merged.entities.get(&old.id), Some(&old));
+    }
+    assert_eq!(fs::read(repo.join("a.py")).unwrap(), body.as_bytes());
+    stop_daemon(&runtime, &repo);
+    assert_eq!(graph_at(&layout, &merged_id).entities, merged.entities);
+}
+
+fn caller_debt(
+    state: &kin_model::graph::ResolvedGraphState,
+) -> Option<kin_index::binding_debt::LocalBindingDebt> {
+    let file = kin_model::FilePathId::new("caller.py");
+    let artifact = state
+        .tree
+        .artifact_id_at_path(&kin_model::RepoPath::from_utf8("caller.py").unwrap())
+        .unwrap();
+    state
+        .relations
+        .get(&kin_index::binding_debt::local_binding_debt_id(artifact))
+        .map(|relation| {
+            kin_index::binding_debt::decode_local_binding_debt(&file, artifact, relation)
+                .unwrap()
+                .unwrap()
+        })
+}
+
+/// A caller that kept only `target`'s occurrences still owes the parser's own
+/// binding to `target`, and owes nothing outside `target`'s departed file. A
+/// language server can add obligations for the same kept occurrences under
+/// another name: pyright's reference to the module `left`, cited at the `alpha`
+/// token of `from left import alpha` and of `alpha(value)`, is recorded as a
+/// `left` obligation into left.py. So the file, not the name, is what every
+/// obligation must share, and the parser's binding must still be there.
+fn assert_owes_only(debt: &kin_index::binding_debt::LocalBindingDebt, target: &str) {
+    let file = match target {
+        "alpha" => "left.py",
+        "beta" => "right.py",
+        other => panic!("no departed file for {other}"),
+    };
+    let owed: Vec<_> = debt
+        .obligations
+        .iter()
+        .map(|o| {
+            (
+                o.target_name.as_str(),
+                o.target_file.0.as_str(),
+                o.retired_relation.kind,
+                o.retired_relation.origin,
+            )
+        })
+        .collect();
+    assert!(
+        debt.obligations.iter().any(|o| o.target_name == target
+            && kin_index::binding_debt::parser_owns_binding(&o.retired_relation)),
+        "the parser's binding to the kept {target} must still be owed: {owed:?}"
+    );
+    assert!(
+        debt.obligations.iter().all(|o| o.target_file.0 == file),
+        "every obligation must point into {file}, whose occurrences were kept: {owed:?}"
+    );
+}
+
+#[test]
+fn authored_parent_distinct_prior_debt_is_unioned_before_settlement() {
+    exercise_authored_parent_debt(false, false);
+}
+
+#[test]
+fn authored_parent_distinct_prior_debt_survives_swapped_branches() {
+    exercise_authored_parent_debt(true, false);
+}
+
+#[test]
+fn authored_parent_all_prior_debt_clears_after_occurrences_are_removed() {
+    exercise_authored_parent_debt(false, true);
+}
+
+#[test]
+fn authored_parent_all_prior_debt_clears_with_swapped_removed_occurrences() {
+    exercise_authored_parent_debt(true, true);
+}
+
+fn exercise_authored_parent_debt(swap_parents: bool, remove_all: bool) {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    let both = "from left import alpha\nfrom right import beta\n\ndef run(value):\n    return alpha(value) + beta(value)\n";
+    let only_a = "from left import alpha\n\ndef run(value):\n    return alpha(value) + 1\n";
+    let only_b = "from right import beta\n\ndef run(value):\n    return beta(value) + 2\n";
+    let (ours_body, theirs_body, ours_target, theirs_target) = if swap_parents {
+        (only_b, only_a, "beta", "alpha")
+    } else {
+        (only_a, only_b, "alpha", "beta")
+    };
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init debt fixture",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    for (file, body) in [
+        ("left.py", "def alpha(value):\n    return value\n"),
+        ("right.py", "def beta(value):\n    return value\n"),
+        ("caller.py", both),
+    ] {
+        fs::write(repo.join(file), body).unwrap();
+        ok(
+            &run_kin(&runtime, &repo, &["admit"]),
+            "admit real local source in dependency order",
+        );
+    }
+    ok(
+        &run_kin(&runtime, &repo, &["commit", "-m", "two local bindings"]),
+        "commit initial native bindings",
+    );
+    let bound = graph_at(&layout, &branch_change(&layout, "main"));
+    let caller = entity_named(&bound, "run").id;
+    for name in ["alpha", "beta"] {
+        let target = entity_named(&bound, name).id;
+        assert!(
+            bound
+                .relations
+                .values()
+                .any(|r| r.kind == kin_model::RelationKind::Calls
+                    && r.src == kin_model::GraphNodeId::Entity(caller)
+                    && r.dst == kin_model::GraphNodeId::Entity(target)),
+            "initial native local call to {name} must exist"
+        );
+    }
+    fs::remove_file(repo.join("left.py")).unwrap();
+    ok(
+        &run_kin(&runtime, &repo, &["admit"]),
+        "admit alpha retirement",
+    );
+    ok(
+        &run_kin(&runtime, &repo, &["commit", "-m", "retire alpha"]),
+        "retire alpha through real commit",
+    );
+    fs::remove_file(repo.join("right.py")).unwrap();
+    ok(
+        &run_kin(&runtime, &repo, &["admit"]),
+        "admit beta retirement",
+    );
+    ok(
+        &run_kin(&runtime, &repo, &["commit", "-m", "retire beta"]),
+        "retire beta through real commit",
+    );
+    let base = graph_at(&layout, &branch_change(&layout, "main"));
+    let base_debt = caller_debt(&base).expect("both prior bindings recorded before branching");
+    assert!(base_debt
+        .obligations
+        .iter()
+        .any(|o| o.target_name == "alpha"));
+    assert!(base_debt
+        .obligations
+        .iter()
+        .any(|o| o.target_name == "beta"));
+    ok(
+        &run_kin(&runtime, &repo, &["branch", "create", "feature"]),
+        "branch at prior debt",
+    );
+    fs::write(repo.join("caller.py"), ours_body).unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["commit", "-m", "retain only alpha obligation"],
+        ),
+        "commit main caller",
+    );
+    let ours = graph_at(&layout, &branch_change(&layout, "main"));
+    assert_owes_only(&caller_debt(&ours).unwrap(), ours_target);
+    ok(
+        &run_kin(&runtime, &repo, &["branch", "switch", "feature"]),
+        "switch feature",
+    );
+    fs::write(repo.join("caller.py"), theirs_body).unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["commit", "-m", "retain only beta obligation"],
+        ),
+        "commit feature caller",
+    );
+    let theirs = graph_at(&layout, &branch_change(&layout, "feature"));
+    let required = caller_debt(&theirs).unwrap();
+    assert_owes_only(&required, theirs_target);
+    ok(
+        &run_kin(&runtime, &repo, &["branch", "switch", "main"]),
+        "return main",
+    );
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park caller conflict",
+    );
+    let input = root.path().join("authored.py");
+    let body = if remove_all {
+        "def run(value):\n    return value + 9\n".to_string()
+    } else {
+        theirs_body.replace("+ 2", "+ 9").replace("+ 1", "+ 9")
+    };
+    fs::write(&input, &body).unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &[
+                "resolve",
+                "--file",
+                "caller.py",
+                input.to_str().unwrap(),
+                "--all-ours",
+            ],
+        ),
+        "settle caller against both prior debts",
+    );
+    fs::remove_file(input).unwrap();
+    stop_daemon(&runtime, &repo);
+    let prior_digest = required.obligations[0].source_digest;
+    let prior = open_authority(&layout)
+        .load_source_blob(prior_digest)
+        .unwrap()
+        .expect("immutable prior bytes remain in repository CAS");
+    let ingestion = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).unwrap();
+    let hash = kin_blobs::Hash256::from_bytes(*prior_digest.as_bytes());
+    if ingestion.exists(&hash).unwrap() {
+        ingestion.delete(&hash).unwrap();
+    }
+    assert!(
+        !ingestion.exists(&hash).unwrap(),
+        "the cold replay must hydrate its historical input"
+    );
+    assert_eq!(kin_blobs::digest(&prior), hash);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["resolve", "--continue"]),
+        "publish authored caller debt",
+    );
+    let merged_id = branch_change(&layout, "main");
+    let merged = graph_at(&layout, &merged_id);
+    let debt = caller_debt(&merged);
+    if remove_all {
+        assert!(
+            debt.is_none(),
+            "removed occurrences discharge both parents' obligations"
+        );
+    } else {
+        let debt = debt
+            .as_ref()
+            .expect("authored caller still requires the other parent's binding");
+        assert_eq!(
+            debt.obligations, required.obligations,
+            "retain exact original evidence, settle only the removed occurrence"
+        );
+        let artifact = merged
+            .tree
+            .artifact_at_path(&kin_model::RepoPath::from_utf8("caller.py").unwrap())
+            .unwrap();
+        assert_eq!(
+            Some(debt.observed_source_digest),
+            artifact.entry.blob_identity()
+        );
+    }
+    assert!(ingestion.exists(&hash).unwrap());
+    stop_daemon(&runtime, &repo);
+    assert_eq!(caller_debt(&graph_at(&layout, &merged_id)), debt);
 }

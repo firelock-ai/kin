@@ -234,3 +234,114 @@ mod tests {
         let _ = env_bool("yes");
     }
 }
+
+#[cfg(all(test, unix))]
+mod relocation_test;
+
+// What this crate's build script tells cargo to watch, read back from the
+// output cargo recorded for the very run that built this test.
+//
+// Cargo reruns a build script on every invocation while any path it declared
+// with `rerun-if-changed` is missing, and while a declared directory holds a
+// file newer than the last run. kin-buildinfo is linked into every Kin binary,
+// so either mistake relinks all of them on every build of an unchanged tree.
+// Both shipped: the repository root's Cargo.lock was watched for a workspace
+// that sits below the root, and a watched top-level directory held the
+// target directory the build writes into.
+#[cfg(test)]
+mod declared_inputs {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Every `rerun-if-changed` path, from the stdout cargo keeps beside OUT_DIR.
+    fn declared_paths() -> Vec<PathBuf> {
+        let out_dir = Path::new(env!("OUT_DIR"));
+        let output = out_dir
+            .parent()
+            .expect("OUT_DIR has a parent")
+            .join("output");
+        let text = fs::read_to_string(&output).unwrap_or_else(|error| {
+            panic!(
+                "cannot read the build script output cargo recorded at {}: {error}",
+                output.display()
+            )
+        });
+        let paths: Vec<PathBuf> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("cargo:rerun-if-changed=")
+                    .or_else(|| line.strip_prefix("cargo::rerun-if-changed="))
+            })
+            .map(PathBuf::from)
+            .collect();
+        assert!(
+            !paths.is_empty(),
+            "the build script declared no rerun-if-changed path in {}",
+            output.display()
+        );
+        paths
+    }
+
+    #[test]
+    fn every_watched_path_exists() {
+        for path in declared_paths() {
+            assert!(
+                path.exists(),
+                "the build script watches {}, which does not exist, so cargo reruns it and relinks every Kin binary on every build",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn no_watched_path_holds_the_build_output() {
+        let out_dir = fs::canonicalize(env!("OUT_DIR")).expect("OUT_DIR exists");
+        for path in declared_paths() {
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            assert!(
+                !out_dir.starts_with(&path),
+                "the build script watches {}, which holds its own output {}, so every build changes it and the script never reads fresh",
+                path.display(),
+                out_dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_workspace_lock_is_watched() {
+        let manifest_dir =
+            fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("the manifest directory exists");
+        let workspace = manifest_dir
+            .ancestors()
+            .find(|dir| {
+                dir.join("Cargo.lock").is_file()
+                    && fs::read_to_string(dir.join("Cargo.toml")).is_ok_and(|manifest| {
+                        manifest.lines().any(|line| line.trim() == "[workspace]")
+                    })
+            })
+            .expect("this crate sits in a workspace that has a Cargo.lock");
+        let lock = workspace.join("Cargo.lock");
+        let watched: BTreeSet<PathBuf> = declared_paths()
+            .into_iter()
+            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            .collect();
+        assert!(
+            watched.contains(&lock),
+            "the build script hashes {} as the dependency provenance but does not watch it",
+            lock.display()
+        );
+    }
+
+    #[test]
+    fn dependency_provenance_is_known() {
+        let provenance = super::get().dependency_provenance;
+        assert!(
+            provenance.len() == 64
+                && provenance
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "the embedded dependency provenance is {provenance:?}, not the SHA-256 of the workspace Cargo.lock"
+        );
+    }
+}

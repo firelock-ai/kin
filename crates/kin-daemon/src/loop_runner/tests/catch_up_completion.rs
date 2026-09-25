@@ -7,23 +7,28 @@
 // more known-directory changes than one batch admits and part of the delta
 // sitting under a directory the graph has never met. Included into
 // `loop_runner::tests`.
+//
+// The never-met-directory delta was originally left declined here, disclosed
+// as `waiting_deferred` rather than silently swept in
+// (`the_catch_up_declines_a_directory_the_graph_has_never_met` in the parent
+// module still proves `plan_catch_up_events` itself declines it). This test
+// now proves the daemon's OTHER half admits that same content instead of
+// leaving it to `kin admit`; see `catch_up_admits_a_directory_the_graph_has_never_met`
+// below for the focused version of that proof, including the entity and the
+// provenance record this one does not re-check.
 
 /// The known-directory delta must still reach the full count the ordinary
 /// catch-up owns, however many batches it takes. The new-directory delta
-/// crosses a deliberate boundary (modification time cannot tell a clone or a
-/// move from authored work for a directory arriving whole) and must stay
-/// unadmitted, but the reconcile pass must not describe itself as a pass with
-/// nothing left to do while a fresh reading still finds it: it reports
-/// `waiting_deferred`, the same signal already built for a retry ladder that
-/// never converges, rather than settling into the same `idle` a truly
-/// caught-up store would report. `reconciliation_status` itself is
-/// deliberately left reading `idle` throughout, matching
-/// `an_idle_loop_that_stopped_with_work_outstanding_says_so_and_names_the_command`
-/// in kin-mcp: two lifecycle callers already branch on that word. A live edit
-/// under the declined directory -- the ordinary watcher path, not the startup
-/// scan -- then clears the pass back to `idle` on its own next quiet tick.
+/// crosses the same boundary it always has (modification time cannot tell a
+/// clone or a move from authored work for a directory arriving whole), but
+/// that boundary now gates which MECHANISM admits the content rather than
+/// whether it is admitted at all: the never-met-directory sweep admits it
+/// under its own provenance instead of the ordinary modified-since window,
+/// and the reconcile pass settles on `idle` once both halves have drained,
+/// rather than latching onto `waiting_deferred` for content this fix now
+/// takes automatically.
 #[tokio::test]
-async fn catch_up_admits_every_known_directory_path_and_the_pass_will_not_call_itself_idle_while_a_new_directory_remains(
+async fn catch_up_admits_every_known_directory_path_across_several_batches_and_the_never_met_directory_besides(
 ) {
     let repo = tempfile::tempdir().unwrap();
     let state = open_test_state(&repo);
@@ -125,18 +130,13 @@ async fn catch_up_admits_every_known_directory_path_and_the_pass_will_not_call_i
              many batches it takes: file_{i}.rs"
         );
     }
-    assert!(
-        tree_entry(&state, "arrived_whole/carried.rs").is_none(),
-        "the boundary must still hold: a directory the graph has never met is not silently \
-         admitted at startup"
-    );
-
-    // The pass's deferred-work clock needs one more tick past the batch that
-    // admitted the last known-directory file to read the fresh reading; give
-    // it a short, bounded window rather than asserting on the instant above.
-    let disclosed = tokio::time::timeout(Duration::from_secs(10), async {
+    // The never-met-directory sweep runs beside the ordinary catch-up above,
+    // on its own clock, so it may still be one tick behind the known-directory
+    // batches this loop just finished draining; give it a short, bounded
+    // window rather than asserting on the instant above.
+    let admitted = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if reconcile_pass_state(&state).as_deref() == Some("waiting_deferred") {
+            if tree_entry(&state, "arrived_whole/carried.rs").is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -144,43 +144,174 @@ async fn catch_up_admits_every_known_directory_path_and_the_pass_will_not_call_i
     })
     .await;
     assert!(
-        disclosed.is_ok(),
-        "the reconcile pass must report waiting_deferred, not idle, while content the startup \
-         scan declined is still unadmitted (this is the staleness-decay study's stop: idle with \
-         360 of 1,403 files still outstanding, except now the pass says it still owes the work); \
-         last seen state: {:?}",
+        admitted.is_ok(),
+        "a directory the graph has never met is admitted by the catch-up sweep instead of being \
+         left to `kin admit` (this is the staleness-decay study's stop: idle with 360 of 1,403 \
+         files still outstanding, now taken automatically instead)"
+    );
+
+    // Once both halves of catch-up have drained, the pass has nothing left to
+    // report and settles on `idle` rather than latching onto
+    // `waiting_deferred`, which is the signal this same content used to leave
+    // standing.
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if reconcile_pass_state(&state).as_deref() == Some("idle") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the reconcile pass must settle on idle once the never-met directory is admitted, not \
+         latch onto waiting_deferred; last seen state: {:?}",
         reconcile_pass_state(&state)
     );
     assert_eq!(
         state.reconciliation_status_str(),
         "idle",
-        "the status word itself is unchanged on purpose, matching \
+        "the status word stays idle throughout, matching \
          an_idle_loop_that_stopped_with_work_outstanding_says_so_and_names_the_command in \
          kin-mcp: two lifecycle callers already branch on it"
     );
     let report = state.background_work.reconcile().report(Instant::now());
-    assert!(
-        report.untracked_path_count >= 1,
-        "the disclosed count must name the outstanding content: {report:?}"
-    );
-    assert!(
-        report
-            .untracked_paths_sample
-            .iter()
-            .any(|path| path.contains("carried.rs")),
-        "the sample must name a path an operator can act on: {report:?}"
+    assert_eq!(
+        report.untracked_path_count, 0,
+        "nothing should still be disclosed as outstanding once catch-up's own sweep has admitted \
+         the directory it used to decline: {report:?}"
     );
 
-    // A live edit under the declined directory -- the ordinary watcher path,
-    // which carries none of the startup scan's modification-time caution --
-    // must still admit it and must clear the pass back to `idle` on this SAME
-    // running loop's own next quiet tick, with no daemon restart and no
-    // explicit `kin admit`.
-    std::fs::write(&carried, b"pub fn carried() -> u32 { 2 }\n").unwrap();
-    let cleared = tokio::time::timeout(Duration::from_secs(10), async {
+    cancel_tx.send(true).ok();
+    let joined = tokio::time::timeout(Duration::from_secs(5), &mut runner).await;
+    if joined.is_err() {
+        runner.abort();
+        let _ = runner.await;
+    }
+    assert!(joined.is_ok(), "the owned loop must stop after cancellation");
+    joined.unwrap().unwrap().unwrap();
+}
+
+/// This fix's own subject, isolated from the companion test's multi-batch
+/// stress: a directory graph truth has never met is admitted, with no live
+/// edit and no `kin admit`, its entity addressable through the store, the
+/// pass settled on `idle` rather than latched onto `waiting_deferred`, and
+/// the admission's own provenance recorded.
+///
+/// Shares the companion test's fixture shape -- a directory graph truth
+/// already knows, and one it has never met, both inside the startup
+/// catch-up window -- but does not need that test's multi-batch stress,
+/// since this fix does not change how many batches ordinary catch-up takes;
+/// it only changes what happens to the population that window was never
+/// allowed to touch.
+#[tokio::test]
+async fn catch_up_admits_a_directory_the_graph_has_never_met() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = open_test_state(&repo);
+
+    // A directory the graph already knows, purely as a baseline: the fixture
+    // must have SOME admitted content before a "last complete admission"
+    // marker naming an instant makes sense.
+    let known_dir = repo.path().join("known");
+    std::fs::create_dir_all(&known_dir).unwrap();
+    let known_file = known_dir.join("file_0.rs");
+    std::fs::write(&known_file, b"pub fn f_0() -> u32 { 0 }\n").unwrap();
+    admit_file_event_ambient(&state, &FileEvent::Changed(known_file)).unwrap();
+
+    let window = chrono::DateTime::from_timestamp(2_000_000, 0).unwrap();
+    kin_core::last_admission::write(
+        &state.layout,
+        &kin_core::last_admission::LastAdmission::new(window, 1),
+    )
+    .unwrap();
+    let after = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000);
+
+    // A pull's worth of a directory the graph has never met: the same
+    // the staleness-decay shape, this fix's own subject.
+    let arrived = repo.path().join("arrived_whole");
+    std::fs::create_dir_all(&arrived).unwrap();
+    let carried = arrived.join("carried.rs");
+    std::fs::write(&carried, b"pub fn carried() -> u32 { 1 }\n").unwrap();
+    stamp_modified(&carried, after);
+
+    // See the companion test for why this margin exists: it keeps the native
+    // watcher backend's own startup coalescing from folding this write into
+    // ordinary ambient admission, which would exercise a different path than
+    // the startup catch-up this test means to prove.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+    let mut runner = tokio::spawn(run_loop_armed(
+        Arc::clone(&state),
+        LoopConfig {
+            poll_interval_ms: 10,
+            batch_size: 2,
+        },
+        cancel_rx,
+        Some(WatchArmed::new(armed_tx)),
+    ));
+    crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await;
+
+    let reconcile_pass_state = |state: &DaemonState| -> Option<String> {
+        state
+            .background_work
+            .reports(Instant::now())
+            .into_iter()
+            .find(|report| report.name == crate::background_work::PASS_RECONCILE)
+            .map(|report| report.state)
+    };
+
+    // Addressable through the store: not just a tree entry, but the entity a
+    // real reader would go looking for, with no live edit after startup and
+    // no explicit `kin admit`.
+    let carried_file_id = FilePathId::new("arrived_whole/carried.rs");
+    let entity_admitted = |state: &DaemonState| -> bool {
+        tree_entry(state, "arrived_whole/carried.rs").is_some()
+            && state
+                .graph
+                .list_all_entities()
+                .map(|entities| {
+                    entities.iter().any(|entity| {
+                        entity.file_origin.as_ref() == Some(&carried_file_id)
+                            && entity.name == "carried"
+                            && entity.kind == kin_model::EntityKind::Function
+                    })
+                })
+                .unwrap_or(false)
+    };
+    let admitted = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if tree_entry(&state, "arrived_whole/carried.rs").is_some()
-                && reconcile_pass_state(&state).as_deref() == Some("idle")
+            if entity_admitted(&state) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "a directory this graph has never met must be admitted by startup catch-up on its own, \
+         with its entity addressable through the store; last seen tree entry: {:?}",
+        tree_entry(&state, "arrived_whole/carried.rs")
+    );
+
+    // The known-directory baseline must still be admitted too: this fix adds
+    // a population, it does not take one away.
+    assert!(
+        tree_entry(&state, "known/file_0.rs").is_some(),
+        "ordinary catch-up's own population must still be admitted"
+    );
+
+    // Reconciliation runs to completion on its own: the pass settles on
+    // `idle`, never latching onto `waiting_deferred` for content this fix now
+    // admits, and the disclosure this pass would otherwise still owe reads
+    // zero.
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = state.reconciliation_status.load(Ordering::Relaxed);
+            if status != RECON_PROCESSING && reconcile_pass_state(&state).as_deref() == Some("idle")
             {
                 break;
             }
@@ -189,10 +320,29 @@ async fn catch_up_admits_every_known_directory_path_and_the_pass_will_not_call_i
     })
     .await;
     assert!(
-        cleared.is_ok(),
-        "admitting the declined content live must clear waiting_deferred back to idle on the \
-         loop's own next quiet tick; last seen state: {:?}",
+        settled.is_ok(),
+        "reconciliation must reach a settled idle state without a manual re-ingest; last seen \
+         pass state: {:?}",
         reconcile_pass_state(&state)
+    );
+    let report = state.background_work.reconcile().report(Instant::now());
+    assert_eq!(
+        report.untracked_path_count, 0,
+        "nothing should still be disclosed as outstanding once the never-met directory is \
+         admitted: {report:?}"
+    );
+
+    // Provenance: a durable record names the admitted path under the new
+    // word, distinguishing this bulk sweep-in from an ordinary watched edit.
+    let marker_path = catch_up_arrival_marker_path(&state);
+    let marker_bytes = std::fs::read(&marker_path).unwrap_or_else(|error| {
+        panic!("the catch-up arrival marker must be written at {marker_path:?}: {error}")
+    });
+    let recorded: Vec<String> = serde_json::from_slice(&marker_bytes).unwrap();
+    assert!(
+        recorded.iter().any(|path| path.contains("carried.rs")),
+        "the arrival marker must record the admitted path under provenance {:?}: {recorded:?}",
+        CATCH_UP_ARRIVAL_PROVENANCE
     );
 
     cancel_tx.send(true).ok();

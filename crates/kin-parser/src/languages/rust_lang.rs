@@ -67,6 +67,25 @@ impl LanguageAdapter for RustAdapter {
         let mut imports = Vec::new();
         let mut tests = Vec::new();
         let root = tree.root_node();
+        // The file's own module surface is pushed before the walk. Import
+        // linking selects it by the file's module coordinate, not entity order.
+        // Pushing it first still lets the `mod_item` arm enhance this entity
+        // in place when a declared module carries the file's own name;
+        // pushing it afterwards instead left `mod defaults` in `defaults.rs`
+        // minting a SECOND module entity with the same name, the same
+        // generated id and a different span, which a commit's
+        // `semantics_follow_the_bytes` check reads as the graph being behind
+        // its own bytes. A file that declares and imports nothing drops it
+        // again below.
+        let surface = crate::adapter::file_module_surface_name(None, file_id).inspect(|name| {
+            entities.push(crate::adapter::file_module_surface_entity(
+                name.clone(),
+                format!("module {}", file_id.0),
+                &root,
+                source,
+                file_id,
+            ));
+        });
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
@@ -113,7 +132,33 @@ impl LanguageAdapter for RustAdapter {
             }
         }
 
+        crate::import_witness::append_rust_import_witness(
+            tree,
+            source,
+            file_id,
+            &imports,
+            &mut relations,
+        );
+        // A comment-only file declares nothing and imports nothing, so it
+        // contributes no entity. Counting the synthetic module there made parse
+        // coverage report rust 3/3 for files whose bytes produced no
+        // declaration. The surface is withdrawn rather than never pushed,
+        // because the walk above needs it in place to merge a same-named
+        // `mod` declaration into.
+        //
+        // It is hollow only when the walk added nothing beside it AND nothing
+        // merged into it. `declaration_line` is the tell: the surface is minted
+        // with none and the `mod_item` arm sets one, so a file holding just
+        // `pub mod thing {}` under `thing.rs` keeps its real declaration.
+        if surface.is_some()
+            && imports.is_empty()
+            && entities.len() == 1
+            && entities[0].declaration_line.is_none()
+        {
+            entities.clear();
+        }
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -388,16 +433,32 @@ fn extract_rust_node(
         "mod_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::Module,
-                    name,
-                    signature: node_signature(node, source),
-                    visibility: detect_rust_visibility(node, source),
-                    doc_summary: extract_doc_comment(node, source),
-                    fingerprint: compute_fingerprint(node, source),
-                    span: rust_item_span(node, file_id, source),
-                    declaration_line: Some(node.start_position().row as u32),
-                });
+                // When the declared module name matches the file's module
+                // surface entity (already pushed before the tree walk), enhance
+                // that entity instead of pushing a duplicate that would produce
+                // an identical EntityId.
+                if let Some(existing) = entities
+                    .iter_mut()
+                    .find(|e| e.kind == EntityKind::Module && e.name == name)
+                {
+                    existing.signature = node_signature(node, source);
+                    existing.visibility = detect_rust_visibility(node, source);
+                    existing.doc_summary = extract_doc_comment(node, source);
+                    existing.fingerprint = compute_fingerprint(node, source);
+                    existing.span = rust_item_span(node, file_id, source);
+                    existing.declaration_line = Some(node.start_position().row as u32);
+                } else {
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Module,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: detect_rust_visibility(node, source),
+                        doc_summary: extract_doc_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: rust_item_span(node, file_id, source),
+                        declaration_line: Some(node.start_position().row as u32),
+                    });
+                }
             }
             // Descend into an inline module body so functions, impls, and nested
             // modules declared inside `mod m { ... }` are extracted with their own
@@ -726,6 +787,16 @@ fn extract_calls_from_token_tree(
         if token.kind() != "identifier" {
             continue;
         }
+        // A declaration's name and an interpolated token are not a known
+        // callee. Comments are trivia even inside a token tree, so inspect
+        // the preceding non-comment token rather than only the sibling.
+        let previous = tokens[..index]
+            .iter()
+            .rev()
+            .find(|previous| !matches!(previous.kind(), "line_comment" | "block_comment"));
+        if previous.is_some_and(|previous| matches!(previous.kind(), "fn" | "#" | "$")) {
+            continue;
+        }
         // A call needs a parenthesized group immediately after the name.
         let Some(next) = tokens.get(index + 1) else {
             continue;
@@ -912,6 +983,7 @@ fn extract_rust_use(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpor
                             local_name: name,
                             original_name: None,
                             is_default: false,
+                            site: Some(crate::adapter::site_from_node(&child)),
                         }],
                     });
                 }
@@ -938,6 +1010,7 @@ fn extract_scoped_identifier_import(node: &tree_sitter::Node, source: &[u8]) -> 
             local_name,
             original_name: None,
             is_default: false,
+            site: Some(crate::adapter::site_from_node(&name_node)),
         }],
     })
 }
@@ -971,6 +1044,7 @@ fn extract_use_as_clause_import(node: &tree_sitter::Node, source: &[u8]) -> Opti
             local_name: alias,
             original_name: Some(original_name),
             is_default: false,
+            site: Some(crate::adapter::site_from_node(node)),
         }],
     })
 }
@@ -992,6 +1066,7 @@ fn extract_scoped_use_list_import(node: &tree_sitter::Node, source: &[u8]) -> Op
                         local_name: name,
                         original_name: None,
                         is_default: false,
+                        site: Some(crate::adapter::site_from_node(&child)),
                     });
                 }
             }
@@ -1004,6 +1079,7 @@ fn extract_scoped_use_list_import(node: &tree_sitter::Node, source: &[u8]) -> Op
                         local_name: name,
                         original_name: None,
                         is_default: false,
+                        site: Some(crate::adapter::site_from_node(&child)),
                     });
                 }
             }
@@ -1017,6 +1093,7 @@ fn extract_scoped_use_list_import(node: &tree_sitter::Node, source: &[u8]) -> Op
                                 local_name: local,
                                 original_name: Some(orig),
                                 is_default: false,
+                                site: Some(crate::adapter::site_from_node(&child)),
                             });
                         }
                     }
@@ -1186,6 +1263,137 @@ fn callers() {
             !calls.iter().any(|(_, dst)| *dst == "matches"),
             "nested macro names must not become Calls edges, got {calls:?}"
         );
+    }
+
+    #[test]
+    fn macro_token_tree_declarations_are_not_calls() {
+        let adapter = RustAdapter;
+        let source = br#"
+fn build() {
+    quote! {
+        async fn #name() { assert!(ready()); emit(value()); }
+        fn ordinary() { format!("{}", render()); }
+        #[inline]
+        fn attributed() { body_call(); }
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("src/quoted.rs"))
+            .unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        for declaration in ["name", "ordinary", "attributed"] {
+            assert!(
+                !calls.iter().any(|r| r.dst_name == declaration),
+                "function declaration {declaration} fabricated a call: {calls:?}"
+            );
+        }
+        for callee in ["ready", "emit", "value", "render", "body_call"] {
+            let found: Vec<_> = calls.iter().filter(|r| r.dst_name == callee).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "real nested call {callee} lost/duplicated: {calls:?}"
+            );
+            assert_eq!(found[0].src_name, "build");
+            let site = found[0].site.as_ref().unwrap();
+            assert!(source[site.start_byte..site.end_byte].starts_with(callee.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn macro_token_tree_declarations_ignore_intervening_comments() {
+        let adapter = RustAdapter;
+        let source = br#"
+fn build() {
+    quote! {
+        fn /* declaration */ named() { body_call(); }
+        async fn # /* interpolation */ generated() { nested(call()); }
+        # /* interpolated tokens, not a known callee */ callback();
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("src/comments.rs"))
+            .unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        for declaration in ["named", "generated", "callback"] {
+            assert!(
+                !calls.contains(&declaration),
+                "non-call {declaration} in {calls:?}"
+            );
+        }
+        for callee in ["body_call", "nested", "call"] {
+            assert!(
+                calls.contains(&callee),
+                "real call {callee} missing from {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_token_tree_declarations_keep_metavariables_unresolved() {
+        let adapter = RustAdapter;
+        let source = br#"
+fn build() {
+    quote! {
+        macro_rules! generated {
+            ($name:ident, $callback:ident) => {
+                fn $name() { $callback(); stable_call(); }
+                fn literal() { other_call(); }
+            };
+        }
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("src/rules.rs"))
+            .unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        for declaration in ["name", "$name", "callback", "$callback", "literal"] {
+            assert!(
+                !calls.contains(&declaration),
+                "unresolved/declaration {declaration} in {calls:?}"
+            );
+        }
+        for callee in ["stable_call", "other_call"] {
+            assert!(
+                calls.contains(&callee),
+                "real quoted body call {callee} missing from {calls:?}"
+            );
+        }
     }
 
     #[test]
@@ -1784,6 +1992,94 @@ pub enum Status {
             .filter(|e| e.kind == kind)
             .map(|e| e.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn comment_only_rust_file_produces_no_entity() {
+        let adapter = RustAdapter;
+        let source = b"// nothing is declared here\n";
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("lib/silent0.rs"))
+            .unwrap();
+        assert!(
+            out.entities.is_empty(),
+            "a comment-only file produced {:?}",
+            entity_names(&out, EntityKind::Module)
+        );
+        assert!(out.imports.is_empty());
+    }
+
+    /// `mod defaults` inside `defaults.rs` is ONE module entity, not two.
+    ///
+    /// The `mod_item` arm enhances the file surface in place when the names
+    /// agree, and it can only find a surface that is already in the vector. A
+    /// surface added after the walk left two module entities with the same
+    /// name and the same generated id, and a commit then read the graph as
+    /// behind its own bytes because a reparse produced an entity the graph
+    /// could not hold twice.
+    #[test]
+    fn a_module_declared_under_its_own_file_name_stays_one_entity() {
+        let adapter = RustAdapter;
+        let source =
+            b"// leading sibling context\npub mod defaults {\n    pub fn commands() -> String {\n        String::new()\n    }\n}\npub fn outside() { sibling_only(); }\n";
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/defaults.rs"))
+            .unwrap();
+        let modules: Vec<_> = out
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(
+            modules.len(),
+            1,
+            "the declared module merged into the surface: {:?}",
+            entity_names(&out, EntityKind::Module)
+        );
+        assert_eq!(modules[0].name, "defaults");
+        assert!(
+            modules[0].declaration_line.is_some(),
+            "the surviving entity has to be the one the declaration enhanced"
+        );
+        assert!(entity_names(&out, EntityKind::Function).contains(&"commands"));
+        let span = &modules[0].span;
+        let body = std::str::from_utf8(&source[span.start_byte..span.end_byte]).unwrap();
+        assert!(body.starts_with("pub mod defaults {"), "{body}");
+        assert!(body.ends_with("\n}"), "{body}");
+        assert!(!body.contains("sibling_only"), "{body}");
+        assert!(!body.contains("leading sibling"), "{body}");
+    }
+
+    /// The parse-hole rule still holds for a file whose only entity would be a
+    /// surface nothing declared.
+    #[test]
+    fn a_module_only_file_keeps_its_declaration_when_nothing_else_is_declared() {
+        let adapter = RustAdapter;
+        let source = b"pub mod thing {}\n";
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/thing.rs"))
+            .unwrap();
+        assert_eq!(
+            entity_names(&out, EntityKind::Module),
+            vec!["thing"],
+            "a real declaration is not a hollow surface"
+        );
+    }
+
+    #[test]
+    fn a_declared_function_still_carries_the_file_module_first() {
+        let adapter = RustAdapter;
+        let source = b"pub fn answer() -> u8 { 1 }\n";
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("lib/loud.rs"))
+            .unwrap();
+        assert_eq!(out.entities[0].kind, EntityKind::Module);
+        assert_eq!(out.entities[0].name, "loud");
+        assert!(entity_names(&out, EntityKind::Function).contains(&"answer"));
     }
 
     #[test]

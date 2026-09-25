@@ -55,6 +55,26 @@ async fn run_daemon_security(
         .context("daemon security scan failed")
 }
 
+/// The line a scan that found nothing answers with.
+///
+/// Public so a caller that recognises this answer compares it with the one
+/// producer rather than a copy of its wording.
+pub const NO_SECURITY_FINDINGS_LINE: &str = "  No security findings detected.";
+
+/// Whether a scan's answer claims an absence: it found nothing, or it reports
+/// a public entity that nothing calls, which is the row's own claim that the
+/// entity has no caller. The daemon holds such an answer back while an edit
+/// admission may be adding the call.
+pub fn security_response_claims_absence(response: &SecurityResponse) -> bool {
+    response.lines.iter().any(|line| {
+        line == NO_SECURITY_FINDINGS_LINE
+            || line.ends_with(&format!("({ORPHANED_PUBLIC_CATEGORY})"))
+    })
+}
+
+/// The finding category for a public entity nothing calls.
+const ORPHANED_PUBLIC_CATEGORY: &str = "orphaned-public";
+
 pub fn build_security_response(
     graph: &kin_db::InMemoryGraph,
     request: &SecurityRequest,
@@ -77,7 +97,7 @@ pub fn build_security_response(
     lines.push(String::new());
 
     if findings.is_empty() {
-        lines.push("  No security findings detected.".to_string());
+        lines.push(NO_SECURITY_FINDINGS_LINE.to_string());
         return Ok(SecurityResponse { lines });
     }
 

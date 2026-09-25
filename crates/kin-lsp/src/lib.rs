@@ -17,6 +17,9 @@ pub mod lifecycle;
 pub mod proof;
 pub mod protocol;
 pub mod registry;
+mod server_process;
+mod source_positions;
+mod typescript_call_hierarchy;
 
 pub use enrichment::{DocumentProvider, EnrichmentResult, EntityIndex, EntityRef};
 pub use error::{LspError, Result};

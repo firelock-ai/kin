@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
-"""Prove an agent's write reaches graph authority, and a refused one leaves nothing behind.
+"""Prove an agent's change reaches graph authority, and a refused one leaves nothing behind.
 
 FIR-3550. In run 3 of the local-model demo a 27B model under `kin agent run` read a
 function, called the agent's own `edit_file` to put a doc comment above it, and Kin
@@ -16,35 +16,48 @@ without writing first, so neither could see the composition. This suite runs the
 binaries end to end: `kin init`, `kin agent run` against a scripted chat endpoint, and a
 direct `kin mcp start` session to read the result back.
 
+The agent's file tools have since been retired. It changes code only through `kin_mutate`,
+naming the entity it changes, so every check drives an entity operation. The suite reads
+each target's entity id and `source_base` over its own `kin mcp start` session and scripts
+the model to send them back, as a model that had just read the entity would.
+
 Six checks, one repository, run in order:
 
-  edit_lands            an `edit_file` on a tracked function commits: the run exits 0,
-                        the file holds the new text, `get_entity_source` answers with the
-                        new body, and the durability block reads `recorded`
-  refused_edit_is_clean an edit authority refuses (an unterminated comment that hides a
-                        declaration, which the planner rejects) leaves the file exactly as
-                        it was, the run exits 6, and the model is told it did not land
-  create_lands          a `write_file` of a new module commits, the file exists with the
-                        body, and the graph lists its function
+  edit_lands            an anchored `EntitySourcePatch` on a tracked function commits: the
+                        run exits 0, the file holds the new text, `get_entity_source`
+                        answers with the new body, the durability block reads `recorded`,
+                        and the change went out as a `kin_mutate` patch with no file tool
+  refused_edit_is_clean a patch authority refuses (an unterminated comment that hides a
+                        declaration, which the planner rejects) leaves the file and the
+                        entity exactly as they were, the model is told it did not land, and
+                        the run records no entity changed. The run exits 0: a refused
+                        change is an error result the model reads, and the run ends on the
+                        model's own answer
+  create_lands          an `EntityCreate` that puts a new function in a new source unit
+                        beside a Python anchor commits: the unit holds the declaration, the
+                        graph lists the function, `get_entity_source` serves it, and
+                        durability reads `recorded`
   refused_create_is_clean
-                        a `write_file` over a tracked path is refused, the tracked file
-                        keeps its text, and the refused content comes back to the model
-  pure_kin_mutate_lands the same binary under `KIN_AGENT_PURE_KIN`, whose belt carries no
-                        `edit_file` and no `write_file` at all: one `kin_mutate` naming the
-                        ENTITY commits, the file and `get_entity_source` carry it,
-                        durability reads `recorded`, the run records
-                        `entities_changed` and no file, the call went out under a session
-                        the harness supplied (the model never sees `kin_session_start`),
-                        and `kin log` carries the agent's own summary rather than the bare
-                        transaction line
+                        an `EntityCreate` whose generated source unit a tracked file already
+                        holds is refused: the tracked file keeps its text, the function
+                        never reaches the graph, the model is told why, and the declaration
+                        it sent stays in the conversation it goes on with
+  pure_kin_mutate_lands one `kin_mutate` naming the ENTITY by its UUID, with the
+                        `source_base` a read returned for it, commits: the file and
+                        `get_entity_source` carry it, durability reads `recorded`, the run
+                        records that entity in `entities_changed` and no file, the call went
+                        out under a session the harness supplied (the model never sees
+                        `kin_session_start`), and `kin log` carries the agent's own summary
+                        rather than the bare transaction line
   edit_survives_a_daemon_restart
                         the repository's daemon is stopped after the agent's session opens
-                        and before its first edit, as an unattended update did in the
-                        demo's real-model run. Sessions live in the daemon, so begin is
-                        refused for a session that no longer exists; the harness must open
-                        a new one and commit through it. The run exits 0, the file and
-                        `get_entity_source` carry the edit, durability reads `recorded`,
-                        and no edit is written outside a transaction
+                        and before its first change, as an unattended update did in the
+                        demo's real-model run. Sessions live in the daemon, so the session
+                        the harness opened is gone, and the change must commit through Kin
+                        anyway. A whole-body `update` guarded by the entity's `source_base`
+                        is sent; the run exits 0, the file and `get_entity_source` carry it,
+                        durability reads `recorded`, the last `kin_mutate` came back clean,
+                        and no file tool was used
 
 What it is blind to: it drives one agent, one repository and one scripted conversation. It
 does not grade the cost of a commit, the delegate's retry on a slow one, or a real model.
@@ -63,6 +76,7 @@ import argparse
 import functools
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -88,7 +102,16 @@ LIB_RS = "pub fn value() -> u8 {\n    1\n}\n"
 OTHER_RS = "pub fn other() -> u8 {\n    4\n}\n\npub fn kept() -> u8 {\n    5\n}\n"
 README = "# agent write fixture\n"
 
+# A Python module beside the crate, because a new source unit is created next to a
+# Python or Go anchor. Rust has no module-owner creation yet, so a new Rust function can
+# only be placed beside an existing one.
+PY_GREET = "def greet():\n    return 1\n"
+PY_TAKEN = "def keep_me():\n    return 9\n"
+
+# The anchored patch `edit_lands` sends, and the body it leaves.
 EDIT_FIND = "pub fn value() -> u8 {\n    1\n}"
+EDIT_EDITS = [{"old_text": "pub fn value", "new_text": "/// The value this module reports.\npub fn value"},
+              {"old_text": "    1\n", "new_text": "    0x2a\n"}]
 EDIT_REPLACE = "/// The value this module reports.\npub fn value() -> u8 {\n    0x2a\n}"
 EDIT_MARKER = "0x2a"
 
@@ -98,14 +121,31 @@ EDIT_MARKER = "0x2a"
 REFUSED_FIND = "pub fn kept() -> u8 {"
 REFUSED_REPLACE = "/* pub fn kept() -> u8 {"
 
-CREATED_PATH = "src/added.rs"
-CREATED_BODY = "pub fn added() -> u8 {\n    3\n}\n"
-OVERWRITE_BODY = "# replaced wholesale\n"
+# A new function in a new source unit, which Kin places beside its Python anchor.
+CREATED_NAME = "added"
+CREATED_PATH = "py/added.py"
+CREATED_DECLARATION = "def added():\n    return 3"
+CREATED_BODY = CREATED_DECLARATION + "\n"
+# A new source unit whose generated path a tracked file already holds, so creating it
+# would overwrite that file. Kin refuses it and overwrites nothing.
+TAKEN_NAME = "taken"
+TAKEN_PATH = "py/taken.py"
+TAKEN_DECLARATION = "def taken():\n    return 8"
 
-# The edit made after the daemon is restarted, on a function no earlier check changes.
+# The edit made after the daemon is restarted, on a function no earlier check changes. It
+# is a whole-body update guarded by the source base the suite read before the run.
 RESTART_FIND = "pub fn other() -> u8 {\n    4\n}"
 RESTART_REPLACE = "/// The other value.\npub fn other() -> u8 {\n    0x2b\n}"
 RESTART_MARKER = "0x2b"
+
+# How a run ends when Kin refuses its change. The refusal is an error result the model
+# reads, and the run then ends on the model's own answer, so the process exits 0; the
+# record is what says nothing landed: an errored kin_mutate and no entity changed.
+REFUSED_CHANGE_EXIT = 0
+
+# What Kin tells the model when it refuses to overwrite a tracked source unit: "the
+# generated source unit is already occupied; no existing artifact was overwritten".
+CREATE_REFUSAL = "already occupied"
 
 # The pure-Kin check's own file and entity. Its own, and not one of the four
 # above, because the checks run in order against one repository and an entity a
@@ -158,22 +198,15 @@ def mentions(payload, needle):
     return False
 
 
-def grade_edit_lands(rc, disk, source_payload, status_payload):
-    if rc is None or disk is None or source_payload is None or status_payload is None:
-        return UNREADABLE, "the run or its read-back produced nothing to grade"
-    problems = []
-    if rc != 0:
-        problems.append("kin agent run exited %s, not 0" % rc)
-    if EDIT_MARKER not in disk:
-        problems.append("the file on disk does not carry the edit")
-    if not mentions(source_payload, EDIT_MARKER):
-        problems.append("get_entity_source still answers with the old body")
-    state = durability_state(status_payload)
-    if state != "recorded":
-        problems.append("durability reads %r, not 'recorded'" % state)
-    if problems:
-        return FAIL, "; ".join(problems)
-    return PASS, "the edit committed: disk, get_entity_source and durability agree"
+def received(value, limit=240):
+    """What a grader was actually handed, short enough for one CHECK line.
+
+    Every mismatch names this rather than a fixed phrase, so a refusal, an ambiguity list
+    or an unreadable reply can never read as "the old body".
+    """
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def mutate_rows(trace):
@@ -181,8 +214,99 @@ def mutate_rows(trace):
     return [row for row in (trace or []) if row.get("tool") == "kin_mutate"]
 
 
+def entity_change_problems(trace, verb, lands=True):
+    """What is wrong with how a run sent its change.
+
+    A change goes out as a `kin_mutate` operation with this verb and nothing else: a row
+    for a file tool, or for the local surface file tools used to take, is a change made
+    outside the graph. A change that lands ends on a clean `kin_mutate`; a refused one
+    comes back an error on every call that carried it.
+    """
+    problems = []
+    if any(row.get("tool") in ("edit_file", "write_file") or row.get("surface") == "local"
+           for row in trace):
+        problems.append("the run used a file tool")
+    calls = mutate_rows(trace)
+    carried = [row for row in calls
+               if any(op.get("verb") == verb
+                      for op in ((row.get("args") or {}).get("operations") or []))]
+    if not carried:
+        problems.append("no kin_mutate call carried a %r operation" % verb)
+    elif lands and carried[-1].get("is_error"):
+        problems.append("the %s came back an error: %s" % (verb, received(carried[-1])))
+    elif not lands and not all(row.get("is_error") for row in carried):
+        problems.append("a kin_mutate carrying the refused %s came back clean" % verb)
+    return problems
+
+
+def says_it_did_not_land(tool_result, tool_error):
+    """Whether the model was told its change did not land.
+
+    Kin answers a refused `kin_mutate` with an error result that carries its reason, and
+    one that landed with a receipt naming what it applied. The model is told the change
+    failed when it reads the error flag and a reason; a result that reads as a receipt
+    told it the opposite.
+    """
+    if not tool_error or not (tool_result or "").strip():
+        return False
+    try:
+        payload = json.loads(tool_result)
+    except ValueError:
+        return True
+    return not (isinstance(payload, dict)
+                and ("ops_applied" in payload or payload.get("committed") is True))
+
+
+def recorded_changes(result):
+    """The entities a run says it changed, or None when its record is unreadable."""
+    agent = (result or {}).get("kin_agent")
+    if not isinstance(agent, dict):
+        return None
+    return agent.get("entities_changed")
+
+
+def conversation_carries(request, needle):
+    """Whether a request the model sent still holds `needle` in a call it made earlier.
+
+    The model keeps its own work in its conversation: every later request carries the
+    tool calls it already made, arguments included. Arguments travel as a JSON string, so
+    they are decoded before they are searched.
+    """
+    for message in (request or {}).get("messages") or []:
+        for call in message.get("tool_calls") or []:
+            arguments = (call.get("function") or {}).get("arguments")
+            try:
+                decoded = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except ValueError:
+                decoded = arguments
+            if mentions(decoded, needle):
+                return True
+    return False
+
+
+def grade_edit_lands(rc, disk, source_payload, status_payload, trace):
+    if rc is None or disk is None or source_payload is None or status_payload is None \
+            or trace is None:
+        return UNREADABLE, "the run or its read-back produced nothing to grade"
+    problems = []
+    if rc != 0:
+        problems.append("kin agent run exited %s, not 0" % rc)
+    if EDIT_MARKER not in disk:
+        problems.append("the file on disk does not carry the edit: %s" % received(disk))
+    if not mentions(source_payload, EDIT_MARKER):
+        problems.append("get_entity_source answered without the edit: %s"
+                        % received(source_payload))
+    state = durability_state(status_payload)
+    if state != "recorded":
+        problems.append("durability reads %r, not 'recorded'" % state)
+    problems.extend(entity_change_problems(trace, "patch"))
+    if problems:
+        return FAIL, "; ".join(problems)
+    return PASS, "the entity patch committed: disk, get_entity_source and durability agree"
+
+
 def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace, result,
-                                messages):
+                                messages, entity):
     """A belt with no file tools commits by naming the entity, and says what it did.
 
     Five things have to be true together, and each one has been separately true
@@ -208,9 +332,10 @@ def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace,
     if rc != 0:
         problems.append("kin agent run exited %s, not 0" % rc)
     if MUTATE_MARKER not in disk:
-        problems.append("the file on disk does not carry the mutation")
+        problems.append("the file on disk does not carry the mutation: %s" % received(disk))
     if not mentions(source_payload, MUTATE_MARKER):
-        problems.append("get_entity_source still answers with the old body")
+        problems.append("get_entity_source answered without the mutation: %s"
+                        % received(source_payload))
     state = durability_state(status_payload)
     if state != "recorded":
         problems.append("durability reads %r, not 'recorded'" % state)
@@ -229,10 +354,11 @@ def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace,
             problems.append("a kin_mutate went out with no session_id, which a daemon that "
                             "owns sessions refuses; the harness must supply its own")
 
+    # The run records the entity as the agent named it, which is its UUID.
     agent = (result.get("kin_agent") or {})
-    if agent.get("entities_changed") != ["mutable"]:
-        problems.append("the run recorded entities_changed=%r, not ['mutable']"
-                        % (agent.get("entities_changed"),))
+    if agent.get("entities_changed") != [entity]:
+        problems.append("the run recorded entities_changed=%r, not [%r] (mutable)"
+                        % (agent.get("entities_changed"), entity))
     if agent.get("files_changed"):
         problems.append("a belt with no file tools recorded files_changed=%r"
                         % (agent.get("files_changed"),))
@@ -251,49 +377,85 @@ def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace,
                   "supplied, and history carries the agent's own sentence")
 
 
-def grade_refused_edit_is_clean(rc, disk_before, disk_after, tool_result):
-    if rc is None or disk_after is None or tool_result is None:
+def grade_refused_edit_is_clean(rc, disk_before, disk_after, source_before, source_after,
+                                tool_result, tool_error, trace, result):
+    if rc is None or disk_after is None or tool_result is None or source_before is None \
+            or source_after is None or trace is None or result is None:
         return UNREADABLE, "the run produced nothing to grade"
     problems = []
-    if rc != 6:
-        problems.append("kin agent run exited %s, not 6 (changes_unpublished)" % rc)
+    if rc != REFUSED_CHANGE_EXIT:
+        problems.append("kin agent run exited %s, not %s" % (rc, REFUSED_CHANGE_EXIT))
     if disk_after != disk_before:
-        problems.append("the refused edit changed the file on disk")
-    if "did not land" not in tool_result or "unchanged" not in tool_result:
-        problems.append("the model was not told the edit did not land and the file is unchanged")
+        problems.append("the refused edit changed the file on disk: %s" % received(disk_after))
+    if (source_after or {}).get("body") != (source_before or {}).get("body") \
+            or mentions(source_after, REFUSED_REPLACE):
+        problems.append("the refused edit changed the entity in the graph: %s"
+                        % received(source_after))
+    if not says_it_did_not_land(tool_result, tool_error):
+        problems.append("the model was not told the edit did not land (is_error=%s): %s"
+                        % (tool_error, received(tool_result)))
+    problems.extend(entity_change_problems(trace, "patch", lands=False))
+    if recorded_changes(result) != []:
+        problems.append("the run recorded the refused entity as changed: %r"
+                        % (recorded_changes(result),))
     if problems:
         return FAIL, "; ".join(problems)
-    return PASS, "the refused edit left the file untouched and the model was told"
+    return PASS, ("the refused entity patch left the file and the graph untouched and the model "
+                  "was told")
 
 
-def grade_create_lands(rc, disk, listed_payload):
-    if rc is None or listed_payload is None:
+def grade_create_lands(rc, disk, listed_payload, source_payload, status_payload, trace):
+    if rc is None or listed_payload is None or source_payload is None \
+            or status_payload is None or trace is None:
         return UNREADABLE, "the run or its read-back produced nothing to grade"
     problems = []
     if rc != 0:
         problems.append("kin agent run exited %s, not 0" % rc)
     if disk != CREATED_BODY:
-        problems.append("the created file is missing or holds other bytes")
-    if not mentions(listed_payload, "added"):
-        problems.append("the graph does not list the created function")
+        problems.append("the created source unit is missing or holds other bytes: %s"
+                        % received(disk))
+    if not functions_named(listed_payload, CREATED_NAME, CREATED_PATH):
+        problems.append("the graph does not list the created function: %s"
+                        % received(listed_payload))
+    if not mentions(source_payload, CREATED_DECLARATION):
+        problems.append("get_entity_source did not answer with the created declaration: %s"
+                        % received(source_payload))
+    state = durability_state(status_payload)
+    if state != "recorded":
+        problems.append("durability reads %r, not 'recorded'" % state)
+    problems.extend(entity_change_problems(trace, "create"))
     if problems:
         return FAIL, "; ".join(problems)
-    return PASS, "the created module committed and the graph lists its function"
+    return PASS, ("the created function committed in a new source unit: disk, the graph and "
+                  "durability agree")
 
 
-def grade_refused_create_is_clean(rc, disk_before, disk_after, tool_result):
-    if rc is None or disk_after is None or tool_result is None:
+def grade_refused_create_is_clean(rc, disk_before, disk_after, listed_after, tool_result,
+                                  tool_error, next_request, trace, result):
+    if rc is None or disk_after is None or tool_result is None or listed_after is None \
+            or next_request is None or trace is None or result is None:
         return UNREADABLE, "the run produced nothing to grade"
     problems = []
-    if rc != 6:
-        problems.append("kin agent run exited %s, not 6 (changes_unpublished)" % rc)
+    if rc != REFUSED_CHANGE_EXIT:
+        problems.append("kin agent run exited %s, not %s" % (rc, REFUSED_CHANGE_EXIT))
     if disk_after != disk_before:
-        problems.append("the refused write changed the tracked file")
-    if OVERWRITE_BODY.strip() not in tool_result:
-        problems.append("the refused content did not come back to the model")
+        problems.append("the refused create changed the tracked file: %s" % received(disk_after))
+    if functions_named(listed_after, TAKEN_NAME):
+        problems.append("the refused function reached the graph: %s" % received(listed_after))
+    if not tool_error or CREATE_REFUSAL not in tool_result:
+        problems.append("the refusal did not come back to the model (is_error=%s): %s"
+                        % (tool_error, received(tool_result)))
+    if not conversation_carries(next_request, TAKEN_DECLARATION):
+        problems.append("the refused declaration is not in the conversation the model went on "
+                        "with")
+    problems.extend(entity_change_problems(trace, "create", lands=False))
+    if recorded_changes(result) != []:
+        problems.append("the run recorded the refused function as changed: %r"
+                        % (recorded_changes(result),))
     if problems:
         return FAIL, "; ".join(problems)
-    return PASS, "the refused write left the tracked file alone and handed the content back"
+    return PASS, ("the refused create left the tracked file and the graph alone, and the model "
+                  "kept its declaration and was told why")
 
 
 def grade_edit_survives_a_daemon_restart(stop, rc, disk, source_payload, status_payload, trace):
@@ -308,30 +470,22 @@ def grade_edit_survives_a_daemon_restart(stop, rc, disk, source_payload, status_
     if rc != 0:
         problems.append("kin agent run exited %s, not 0" % rc)
     if RESTART_MARKER not in disk:
-        problems.append("the file on disk does not carry the edit")
+        problems.append("the file on disk does not carry the edit: %s" % received(disk))
     if not mentions(source_payload, RESTART_MARKER):
-        problems.append("get_entity_source still answers with the old body")
+        problems.append("get_entity_source answered without the edit: %s"
+                        % received(source_payload))
     state = durability_state(status_payload)
     if state != "recorded":
         problems.append("durability reads %r, not 'recorded'" % state)
-    edits = [row for row in trace if row.get("surface") == "local"
-             and row.get("tool") in ("edit_file", "write_file")]
-    if not edits:
-        problems.append("the trace records no edit")
-    for row in edits:
-        provenance = row.get("provenance") or {}
-        if provenance.get("closed_with") != "kin_transaction_commit" \
-                or provenance.get("closed_cleanly") is not True:
-            problems.append("the edit did not commit through a transaction (%s)" % (
-                provenance.get("reason") or provenance.get("detail") or "no reason recorded"))
+    # A `kin_mutate` is one transaction, begun and committed by the server, so a clean one
+    # is the edit committed through a transaction and an errored one is not.
+    problems.extend(entity_change_problems(trace, "update"))
     if problems:
         return FAIL, "; ".join(problems)
-    refused = any(row.get("tool") == "kin_transaction_begin" and row.get("is_error")
-                  and "Session not found" in str(row.get("detail") or "") for row in trace)
     sessions = sum(1 for row in trace if row.get("tool") == "kin_session_start")
-    how = ("begin was refused for the gone session and the harness opened a new one"
-           if refused and sessions >= 2 else "no begin was refused after the restart")
-    return PASS, "the edit committed through Kin after a daemon restart; %s" % how
+    how = ("the harness opened a new session after the restart" if sessions >= 2
+           else "the session outlived the restart")
+    return PASS, "the entity update committed through Kin after a daemon restart; %s" % how
 
 
 # ── the scripted chat endpoint ─────────────────────────────────────────────
@@ -361,6 +515,9 @@ class Endpoint(object):
         answers = list(script)
         pending = [before_first] if before_first else []
         lock = threading.Lock()
+        # Every request the agent sent, in order, so a check can read what the model
+        # still held when it asked for its next answer.
+        self.requests = requests = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -378,8 +535,12 @@ class Endpoint(object):
                 self._send({"object": "list", "data": [{"id": "scripted", "object": "model"}]})
 
             def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 with lock:
+                    try:
+                        requests.append(json.loads(body.decode() or "null"))
+                    except ValueError:
+                        requests.append(None)
                     while pending:
                         pending.pop(0)()
                     answer = answers.pop(0) if answers else completion("Done.")
@@ -438,6 +599,29 @@ class Mcp(object):
         except ValueError:
             return None
 
+    def lookup(self, name):
+        """`get_entity_source` given a name, the strict name resolution Kin serves.
+
+        One exact name answers with that entity. A name several entities carry answers
+        `ambiguous_focal` with every candidate and no body. A refusal arrives as prose, bare
+        or inside the envelope's `message`, and two of them are answers rather than
+        failures: a name nothing carries, read as `{"not_found": true}`, and a name only a
+        whole-file module node carries (a file's module shares its stem), read as
+        `{"module_node": {"id": ..., "name": ...}}`. None means the reply could not be read.
+        """
+        result = self.request("tools/call", {"name": "get_entity_source",
+                                             "arguments": {"entity_id": name}})
+        answer = result.get("result") or {}
+        text = "".join(block.get("text", "") for block in answer.get("content") or [])
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if not answer.get("isError"):
+            return payload
+        message = payload.get("message") if isinstance(payload, dict) else text
+        return refusal_answer(message, name)
+
     def close(self):
         try:
             self.proc.stdin.close()
@@ -465,6 +649,8 @@ class Suite(object):
         self._runs = 0
         self.last_trace = None
         self.last_result = None
+        self.last_requests = None
+        self.last_tool_error = None
 
     def git(self, cwd, args):
         # The caller's global and system git config stay out of the fixture: a hooks
@@ -491,8 +677,10 @@ class Suite(object):
         path = os.path.join(self.workdir, "repo")
         try:
             os.makedirs(os.path.join(path, "src"))
+            os.makedirs(os.path.join(path, "py"))
             for relative, body in (("src/lib.rs", LIB_RS), ("src/other.rs", OTHER_RS),
                                    ("src/mutable.rs", MUTABLE_RS),
+                                   ("py/greet.py", PY_GREET), (TAKEN_PATH, PY_TAKEN),
                                    ("README.md", README),
                                    ("Cargo.toml", '[package]\nname = "agentwrite"\n'
                                                   'version = "0.1.0"\nedition = "2021"\n')):
@@ -520,13 +708,13 @@ class Suite(object):
     def agent(self, script, before_first=None, env_extra=None):
         """Run `kin agent run` through one scripted conversation.
 
-        Returns the exit code and the last tool result the model was sent, and keeps the
-        run's kin-trace rows on `last_trace` and its result record on `last_result`.
+        Returns the exit code and the last tool result the model was sent. Keeps the run's
+        kin-trace rows on `last_trace`, its result record on `last_result`, whether that
+        last tool result was an error on `last_tool_error`, and every request the agent
+        sent its model on `last_requests`.
 
-        `env_extra` is what lets one check run the same binary with a different
-        belt: `KIN_AGENT_PURE_KIN` decides whether edit_file and write_file exist
-        at all, and it is read per process, so the only way to grade both belts
-        is to run the binary twice.
+        `env_extra` sets environment for this one run, which is how a check names a
+        setting the agent reads per process.
         """
         self._runs += 1
         out = os.path.join(self.workdir, "run-%d" % self._runs)
@@ -543,7 +731,9 @@ class Suite(object):
             endpoint.close()
         if self.verbose:
             print("kin agent run rc=%s\n%s" % (rc, stderr[-2000:]))
+        self.last_requests = endpoint.requests
         tool_result = None
+        self.last_tool_error = None
         transcript = os.path.join(out, "transcript.jsonl")
         if os.path.exists(transcript):
             with open(transcript) as handle:
@@ -552,6 +742,7 @@ class Suite(object):
                     for block in (record.get("message") or {}).get("content") or []:
                         if isinstance(block, dict) and block.get("type") == "tool_result":
                             tool_result = block.get("content")
+                            self.last_tool_error = bool(block.get("is_error"))
         self.last_trace = None
         trace = os.path.join(out, "kin-trace.jsonl")
         if os.path.exists(trace):
@@ -632,77 +823,189 @@ class Result(object):
         self.detail = detail
 
 
-def entity_id(listed, name):
-    stack = [listed]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            if node.get("name") == name and (node.get("id") or node.get("entity_id")):
-                return node.get("id") or node.get("entity_id")
-            stack.extend(node.values())
-        elif isinstance(node, list):
-            stack.extend(node)
+# How Kin words the two refusals a strict name lookup can answer with. An absence is
+# "no entity found matching '<name>'. ..." from the daemon, or exactly
+# "Entity not found: <name>" from the in-process handler; either names what was asked.
+NOT_FOUND_MATCHING = "no entity found matching '%s'"
+NOT_FOUND_EXACT = "Entity not found: %s"
+MODULE_NODE_REFUSAL = re.compile(
+    r"^entity '(?P<name>[^']*)' \((?P<id>[0-9a-fA-F-]{36})\) exists in the graph but has no "
+    r"retrievable source: .* is an import/module relationship node for a whole file")
+
+
+def refusal_answer(message, name):
+    """What a refused name lookup says about `name`: absent, a module node, or unreadable.
+
+    Only a refusal about exactly `name` counts, so another entity's words cannot stand in
+    for this one.
+    """
+    if not isinstance(message, str):
+        return None
+    if message.startswith(NOT_FOUND_MATCHING % name) \
+            or message.strip() == NOT_FOUND_EXACT % name:
+        return {"not_found": True}
+    match = MODULE_NODE_REFUSAL.match(message)
+    if match and match.group("name") == name:
+        return {"module_node": {"id": match.group("id"), "name": name}}
     return None
 
 
-# The belt is Kin tools only by default. The checks that grade edit_file and
-# write_file ask for the two file tools explicitly, so they keep grading the
-# path an operator can still switch on.
-FILE_TOOLS_BELT = {"KIN_AGENT_PURE_KIN": "0"}
+def entity_rows(reply):
+    """The entities a strict name lookup reached, one row each: id, name, kind and file.
+
+    An exact answer is one row; an `ambiguous_focal` answer is every candidate it lists.
+    A caller picks among them by name, kind and file, never by rank, so a name two
+    entities share cannot stand for the wrong one. [] is a name nothing carries. None is
+    a reply that could not be read, including a candidate list cut short.
+    """
+    if not isinstance(reply, dict):
+        return None
+    if reply.get("not_found"):
+        return []
+    if reply.get("module_node"):
+        node = reply["module_node"]
+        return [{"id": node.get("id"), "name": node.get("name"), "kind": "module",
+                 "file_path": None}]
+    if reply.get("ambiguous_focal"):
+        candidates = reply.get("candidates") or []
+        if reply.get("candidate_count") != len(candidates):
+            return None
+        return [{"id": row.get("entity_id"), "name": row.get("name"), "kind": row.get("kind"),
+                 "file_path": row.get("file_path")} for row in candidates]
+    if reply.get("id"):
+        return [{"id": reply.get("id"), "name": reply.get("name"), "kind": reply.get("kind"),
+                 "file_path": reply.get("file_path")}]
+    return None
+
+
+def functions_named(rows, name, path=None):
+    """The rows that are a function named exactly `name`, in `path` when one is named."""
+    return [row for row in rows or []
+            if row.get("name") == name and str(row.get("kind", "")).lower() == "function"
+            and (path is None or row.get("file_path") == path)]
+
+
+# The name the agent's belt gives Kin's one write tool.
+MUTATE = "mcp__kin__kin_mutate"
+
+
+def read_back(suite, path, name, status=True):
+    """Find the function `name` in `path`, read it, and read the graph status, over one
+    session.
+
+    Returns the rows the exact-name lookup reached, the function's entity id, its
+    `get_entity_source` answer by that id (which carries the `source_base` a guarded
+    change names) and the status, each None when Kin did not answer it. The id is set
+    only when exactly one function of that name lives in `path`.
+    """
+    session = suite.mcp()
+    try:
+        rows = entity_rows(session.lookup(name))
+        matches = functions_named(rows, name, path)
+        focal = matches[0]["id"] if len(matches) == 1 else None
+        source = session.call("get_entity_source", {"entity_id": focal}) if focal else None
+        state = session.call("kin_graph_status", {}) if status else None
+    finally:
+        session.close()
+    return rows, focal, source, state
+
+
+def mutate_call(text, operation, summary):
+    """A scripted turn that sends one entity operation through `kin_mutate`."""
+    return completion(text, MUTATE, {"operations": [operation], "summary": summary})
+
+
+def unreadable_base(ident, name):
+    return Result(ident, UNREADABLE, "%s the suite could not read %s's entity id and source base"
+                  % (TICKET, name))
 
 
 def check_edit_lands(suite):
-    rc, _ = suite.agent([completion("Documenting value.", "edit_file",
-                                    {"path": "src/lib.rs", "find": EDIT_FIND,
-                                     "replace": EDIT_REPLACE}),
-                         completion("value is documented.")],
-        env_extra=FILE_TOOLS_BELT)
-    session = suite.mcp()
-    try:
-        listed = session.call("list_file_entities", {"path": "src/lib.rs", "limit": 50})
-        focal = entity_id(listed, "value")
-        source = session.call("get_entity_source", {"entity_id": focal}) if focal else None
-        status = session.call("kin_graph_status", {})
-    finally:
-        session.close()
-    verdict, detail = grade_edit_lands(rc, suite.read("src/lib.rs"), source, status)
+    _, focal, before, _ = read_back(suite, "src/lib.rs", "value", status=False)
+    base = (before or {}).get("source_base")
+    if not focal or not base:
+        return unreadable_base("edit_lands", "value")
+    rc, _ = suite.agent([mutate_call("Documenting value.",
+                                     {"verb": "patch", "target": focal,
+                                      "payload": {"EntitySourcePatch": {"source_base": base,
+                                                                        "edits": EDIT_EDITS}},
+                                      "description": "document value and raise it to 0x2a"},
+                                     "Document value and raise it to 0x2a"),
+                         completion("value is documented.")])
+    trace = suite.last_trace
+    _, _, source, status = read_back(suite, "src/lib.rs", "value")
+    verdict, detail = grade_edit_lands(rc, suite.read("src/lib.rs"), source, status, trace)
     return Result("edit_lands", verdict, "%s %s" % (TICKET, detail))
 
 
 def check_refused_edit_is_clean(suite):
     before = suite.read("src/other.rs")
-    rc, tool_result = suite.agent([completion("Commenting out kept.", "edit_file",
-                                              {"path": "src/other.rs", "find": REFUSED_FIND,
-                                               "replace": REFUSED_REPLACE}),
-                                   completion("kept is commented out.")],
-        env_extra=FILE_TOOLS_BELT)
+    _, focal, source_before, _ = read_back(suite, "src/other.rs", "kept", status=False)
+    base = (source_before or {}).get("source_base")
+    if not focal or not base:
+        return unreadable_base("refused_edit_is_clean", "kept")
+    rc, tool_result = suite.agent([mutate_call("Commenting out kept.",
+                                               {"verb": "patch", "target": focal,
+                                                "payload": {"EntitySourcePatch": {
+                                                    "source_base": base,
+                                                    "edits": [{"old_text": REFUSED_FIND,
+                                                               "new_text": REFUSED_REPLACE}]}},
+                                                "description": "comment out kept"},
+                                               "Comment out kept"),
+                                   completion("kept is commented out.")])
+    tool_error, trace, result = suite.last_tool_error, suite.last_trace, suite.last_result
+    _, _, source_after, _ = read_back(suite, "src/other.rs", "kept", status=False)
     verdict, detail = grade_refused_edit_is_clean(rc, before, suite.read("src/other.rs"),
-                                                  tool_result)
+                                                  source_before, source_after, tool_result,
+                                                  tool_error, trace, result)
     return Result("refused_edit_is_clean", verdict, "%s %s" % (TICKET, detail))
 
 
 def check_create_lands(suite):
-    rc, _ = suite.agent([completion("Adding a module.", "write_file",
-                                    {"path": CREATED_PATH, "content": CREATED_BODY}),
-                         completion("src/added.rs holds added.")],
-        env_extra=FILE_TOOLS_BELT)
-    session = suite.mcp()
-    try:
-        listed = session.call("list_file_entities", {"path": CREATED_PATH, "limit": 50})
-    finally:
-        session.close()
-    verdict, detail = grade_create_lands(rc, suite.read(CREATED_PATH), listed)
+    _, anchor, anchor_source, _ = read_back(suite, "py/greet.py", "greet", status=False)
+    base = (anchor_source or {}).get("source_base")
+    if not anchor or not base:
+        return unreadable_base("create_lands", "greet")
+    rc, _ = suite.agent([mutate_call("Adding a module.",
+                                     {"verb": "create", "target": anchor,
+                                      "payload": {"EntityCreate": {
+                                          "source_base": base, "name": CREATED_NAME,
+                                          "kind": "function", "body": CREATED_DECLARATION,
+                                          "placement": "new_source_unit"}},
+                                      "description": "add added in its own source unit"},
+                                     "Add added in its own source unit"),
+                         completion("py/added.py holds added.")])
+    trace = suite.last_trace
+    listed, _, created, status = read_back(suite, CREATED_PATH, CREATED_NAME)
+    verdict, detail = grade_create_lands(rc, suite.read(CREATED_PATH), listed, created, status,
+                                         trace)
     return Result("create_lands", verdict, "%s %s" % (TICKET, detail))
 
 
 def check_refused_create_is_clean(suite):
-    before = suite.read("README.md")
-    rc, tool_result = suite.agent([completion("Rewriting the readme.", "write_file",
-                                              {"path": "README.md", "content": OVERWRITE_BODY}),
-                                   completion("README.md rewritten.")],
-        env_extra=FILE_TOOLS_BELT)
-    verdict, detail = grade_refused_create_is_clean(rc, before, suite.read("README.md"),
-                                                    tool_result)
+    before = suite.read(TAKEN_PATH)
+    _, anchor, anchor_source, _ = read_back(suite, "py/greet.py", "greet", status=False)
+    base = (anchor_source or {}).get("source_base")
+    if not anchor or not base:
+        return unreadable_base("refused_create_is_clean", "greet")
+    rc, tool_result = suite.agent([mutate_call("Adding taken.",
+                                               {"verb": "create", "target": anchor,
+                                                "payload": {"EntityCreate": {
+                                                    "source_base": base, "name": TAKEN_NAME,
+                                                    "kind": "function",
+                                                    "body": TAKEN_DECLARATION,
+                                                    "placement": "new_source_unit"}},
+                                                "description": "add taken in its own source unit"},
+                                               "Add taken in its own source unit"),
+                                   completion("py/taken.py holds taken.")])
+    tool_error, trace, result = suite.last_tool_error, suite.last_trace, suite.last_result
+    # The request after the refusal is the conversation the model went on with.
+    requests = suite.last_requests or []
+    next_request = requests[1] if len(requests) > 1 else None
+    listed, _, _, _ = read_back(suite, TAKEN_PATH, TAKEN_NAME, status=False)
+    verdict, detail = grade_refused_create_is_clean(rc, before, suite.read(TAKEN_PATH), listed,
+                                                    tool_result, tool_error, next_request,
+                                                    trace, result)
     return Result("refused_create_is_clean", verdict, "%s %s" % (TICKET, detail))
 
 
@@ -711,12 +1014,18 @@ def check_pure_kin_mutate_lands(suite):
 
     `KIN_AGENT_PURE_KIN` is read per process, so this is the same binary run a
     second time rather than a flag on the call. The scripted model calls
-    `mcp__kin__kin_mutate` by the name the belt exposes, names the entity rather
-    than a path, and passes the change message as `summary`.
+    `mcp__kin__kin_mutate` by the name the belt exposes, names the entity by its
+    UUID with the `source_base` a read returned for it rather than a path, and
+    passes the change message as `summary`.
     """
+    _, focal, before, _ = read_back(suite, "src/mutable.rs", "mutable", status=False)
+    base = (before or {}).get("source_base")
+    if not focal or not base:
+        return unreadable_base("pure_kin_mutate_lands", "mutable")
     rc, _ = suite.agent(
         [completion("Raising mutable through Kin.", "mcp__kin__kin_mutate",
-                    {"operations": [{"verb": "update", "target": "mutable",
+                    {"operations": [{"verb": "update", "target": focal,
+                                     "payload": {"EntitySourceBase": base},
                                      "body": MUTATE_BODY,
                                      "description": "raise mutable to 0x2c"}],
                      "summary": MUTATE_SUMMARY}),
@@ -724,38 +1033,30 @@ def check_pure_kin_mutate_lands(suite):
         env_extra={"KIN_AGENT_PURE_KIN": "1"})
     trace, result = suite.last_trace, suite.last_result
     messages = suite.change_messages()
-    session = suite.mcp()
-    try:
-        listed = session.call("list_file_entities", {"path": "src/mutable.rs", "limit": 50})
-        focal = entity_id(listed, "mutable")
-        source = session.call("get_entity_source", {"entity_id": focal}) if focal else None
-        status = session.call("kin_graph_status", {})
-    finally:
-        session.close()
+    _, _, source, status = read_back(suite, "src/mutable.rs", "mutable")
     verdict, detail = grade_pure_kin_mutate_lands(rc, suite.read("src/mutable.rs"), source,
-                                                  status, trace, result, messages)
+                                                  status, trace, result, messages, focal)
     return Result("pure_kin_mutate_lands", verdict, "%s %s" % (TICKET, detail))
 
 
 def check_edit_survives_a_daemon_restart(suite):
+    _, focal, before, _ = read_back(suite, "src/other.rs", "other", status=False)
+    base = (before or {}).get("source_base")
+    if not focal or not base:
+        return unreadable_base("edit_survives_a_daemon_restart", "other")
     stop = []
-    rc, _ = suite.agent([completion("Documenting other.", "edit_file",
-                                    {"path": "src/other.rs", "find": RESTART_FIND,
-                                     "replace": RESTART_REPLACE}),
+    rc, _ = suite.agent([mutate_call("Documenting other.",
+                                     {"verb": "update", "target": focal,
+                                      "payload": {"EntitySourceBase": base},
+                                      "body": RESTART_REPLACE,
+                                      "description": "document other and raise it to 0x2b"},
+                                     "Document other and raise it to 0x2b"),
                          completion("other is documented.")],
-                        before_first=lambda: stop.append(suite.stop_daemon()),
-        env_extra=FILE_TOOLS_BELT)
-    session = suite.mcp()
-    try:
-        listed = session.call("list_file_entities", {"path": "src/other.rs", "limit": 50})
-        focal = entity_id(listed, "other")
-        source = session.call("get_entity_source", {"entity_id": focal}) if focal else None
-        status = session.call("kin_graph_status", {})
-    finally:
-        session.close()
+                        before_first=lambda: stop.append(suite.stop_daemon()))
+    trace = suite.last_trace
+    _, _, source, status = read_back(suite, "src/other.rs", "other")
     verdict, detail = grade_edit_survives_a_daemon_restart(
-        stop[0] if stop else None, rc, suite.read("src/other.rs"), source, status,
-        suite.last_trace)
+        stop[0] if stop else None, rc, suite.read("src/other.rs"), source, status, trace)
     return Result("edit_survives_a_daemon_restart", verdict, "%s %s" % (TICKET, detail))
 
 
@@ -797,49 +1098,145 @@ def self_test():
     old_source = {"source": "pub fn value() -> u8 {\n    1\n}", "_kin": {}}
     edited = EDIT_REPLACE + "\n"
 
+    def mutation(verb, is_error=False):
+        return {"tool": "kin_mutate", "surface": "kin", "is_error": is_error,
+                "args": {"session_id": "s1", "operations": [{"verb": verb, "target": "e1"}]}}
+
+    session = {"tool": "kin_session_start"}
+    patched = [session, mutation("patch")]
+    patch_refused = [session, mutation("patch", is_error=True)]
+    by_edit_file = patched + [{"surface": "local", "tool": "edit_file"}]
+
     expect("edit lands",
-           grade_edit_lands(0, edited, new_source, recorded)[0], PASS)
+           grade_edit_lands(0, edited, new_source, recorded, patched)[0], PASS)
     expect("edit refused by the commit",
-           grade_edit_lands(6, edited, old_source, uncommitted)[0], FAIL)
+           grade_edit_lands(6, edited, old_source, uncommitted, patch_refused)[0], FAIL)
     expect("edit lands on disk only",
-           grade_edit_lands(0, edited, old_source, recorded)[0], FAIL)
+           grade_edit_lands(0, edited, old_source, recorded, patched)[0], FAIL)
     expect("edit with no read-back",
-           grade_edit_lands(0, edited, None, recorded)[0], UNREADABLE)
-
-    told = ("The edit of `src/other.rs` did not land: repository authority did not publish "
-            "it: ... Nothing was written, so `src/other.rs` is unchanged on disk and in the graph.")
-    expect("refused edit, clean",
-           grade_refused_edit_is_clean(6, OTHER_RS, OTHER_RS, told)[0], PASS)
-    expect("refused edit left on disk",
-           grade_refused_edit_is_clean(6, OTHER_RS, OTHER_RS.replace("pub fn kept", "/* pub fn kept"),
-                                       told)[0], FAIL)
-    expect("refused edit reported as a success",
-           grade_refused_edit_is_clean(0, OTHER_RS, OTHER_RS, "Edited `src/other.rs`.")[0], FAIL)
-
-    listed = {"entities": [{"name": "added", "id": "e1"}]}
-    expect("create lands", grade_create_lands(0, CREATED_BODY, listed)[0], PASS)
-    expect("create left no file", grade_create_lands(0, None, listed)[0], FAIL)
-    expect("create not in the graph", grade_create_lands(0, CREATED_BODY, {"entities": []})[0],
+           grade_edit_lands(0, edited, None, recorded, patched)[0], UNREADABLE)
+    expect("edit with no trace",
+           grade_edit_lands(0, edited, new_source, recorded, None)[0], UNREADABLE)
+    expect("edit that also went through a file tool",
+           grade_edit_lands(0, edited, new_source, recorded, by_edit_file)[0], FAIL)
+    expect("edit sent as no entity patch",
+           grade_edit_lands(0, edited, new_source, recorded, [session, mutation("update")])[0],
            FAIL)
+    expect("edit whose patch came back an error",
+           grade_edit_lands(0, edited, new_source, recorded, patch_refused)[0], FAIL)
 
-    handed_back = "`README.md` was not created: ... The 21 bytes you sent follow ...\n" + OVERWRITE_BODY
-    expect("refused create, clean",
-           grade_refused_create_is_clean(6, README, README, handed_back)[0], PASS)
+    kept = {"body": "pub fn kept() -> u8 {\n    5\n}", "_kin": {}}
+    commented = {"body": REFUSED_REPLACE + "\n    5\n}", "_kin": {}}
+    refusal = ("reparsed exact bytes did not preserve existing entity 00000000-0000-4000-8000-"
+               "000000000001")
+    receipt = json.dumps({"transaction_id": "t1", "ops_applied": 1})
+    nothing_changed = {"kin_agent": {"entities_changed": []}}
+    kept_changed = {"kin_agent": {"entities_changed": ["kept"]}}
+    commented_out = OTHER_RS.replace("pub fn kept", "/* pub fn kept")
+
+    def refused_edit(**changes):
+        args = dict(rc=REFUSED_CHANGE_EXIT, disk_before=OTHER_RS, disk_after=OTHER_RS,
+                    source_before=kept, source_after=kept, tool_result=refusal,
+                    tool_error=True, trace=patch_refused, result=nothing_changed)
+        args.update(changes)
+        return grade_refused_edit_is_clean(**args)[0]
+
+    expect("refused edit, clean", refused_edit(), PASS)
+    expect("refused edit left on disk", refused_edit(disk_after=commented_out), FAIL)
+    expect("refused edit reached the graph", refused_edit(source_after=commented), FAIL)
+    expect("refused edit reported without the error flag", refused_edit(tool_error=False), FAIL)
+    expect("refused edit reported as a receipt", refused_edit(tool_result=receipt), FAIL)
+    expect("refused edit with an empty answer", refused_edit(tool_result="  "), FAIL)
+    expect("refused edit recorded as a change", refused_edit(result=kept_changed), FAIL)
+    expect("refused patch came back clean", refused_edit(trace=patched), FAIL)
+    expect("refused edit through a file tool", refused_edit(trace=by_edit_file), FAIL)
+    expect("refused edit run that crashed", refused_edit(rc=1), FAIL)
+    expect("refused edit with no read-back", refused_edit(source_after=None), UNREADABLE)
+
+    created_listed = [{"id": "m2", "name": CREATED_NAME, "kind": "Module",
+                       "file_path": CREATED_PATH},
+                      {"id": "e2", "name": CREATED_NAME, "kind": "Function",
+                       "file_path": CREATED_PATH}]
+    created_source = {"body": CREATED_DECLARATION, "_kin": {}}
+    created = [session, mutation("create")]
+    create_refused = [session, mutation("create", is_error=True)]
+    by_write_file = created + [{"surface": "local", "tool": "write_file"}]
+
+    def create(**changes):
+        args = dict(rc=0, disk=CREATED_BODY, listed_payload=created_listed,
+                    source_payload=created_source, status_payload=recorded, trace=created)
+        args.update(changes)
+        return grade_create_lands(**args)[0]
+
+    expect("create lands", create(), PASS)
+    expect("create left no file", create(disk=None), FAIL)
+    expect("create wrote other bytes", create(disk="def added():\n    pass\n"), FAIL)
+    expect("create not in the graph", create(listed_payload=[]), FAIL)
+    expect("create reached only as its source unit's module",
+           create(listed_payload=created_listed[:1]), FAIL)
+    expect("create listed in another unit",
+           create(listed_payload=[dict(created_listed[1], file_path="py/greet.py")]), FAIL)
+    expect("create not served by get_entity_source",
+           create(source_payload={"body": "", "_kin": {}}), FAIL)
+    expect("create not durable", create(status_payload=uncommitted), FAIL)
+    expect("create through a file tool", create(trace=by_write_file), FAIL)
+    expect("create refused", create(rc=0, trace=create_refused), FAIL)
+    expect("create run that crashed", create(rc=1), FAIL)
+    expect("create with no read-back", create(source_payload=None), UNREADABLE)
+
+    occupied = ("the generated source unit is already occupied; no existing artifact was "
+                "overwritten")
+    # The tracked unit's module is named for its file, so the lookup reaches it. It is
+    # not the function the refused create named, and a lookup that reaches only it is
+    # clean.
+    kept_listed = [{"id": "m1", "name": TAKEN_NAME, "kind": "Module", "file_path": TAKEN_PATH}]
+    reached_listed = kept_listed + [{"id": "e4", "name": TAKEN_NAME, "kind": "Function",
+                                     "file_path": TAKEN_PATH}]
+    sent = json.dumps({"operations": [{"verb": "create", "payload": {"EntityCreate": {
+        "name": TAKEN_NAME, "body": TAKEN_DECLARATION}}}]})
+    went_on = {"messages": [{"role": "assistant", "content": "Adding taken.",
+                             "tool_calls": [{"id": "c1", "type": "function",
+                                             "function": {"name": MUTATE, "arguments": sent}}]},
+                            {"role": "tool", "tool_call_id": "c1", "content": occupied}]}
+    forgot = {"messages": [{"role": "user", "content": "Make the change."}]}
+    taken_changed = {"kin_agent": {"entities_changed": [TAKEN_NAME]}}
+
+    def refused_create(**changes):
+        args = dict(rc=REFUSED_CHANGE_EXIT, disk_before=PY_TAKEN, disk_after=PY_TAKEN,
+                    listed_after=kept_listed, tool_result=occupied, tool_error=True,
+                    next_request=went_on, trace=create_refused, result=nothing_changed)
+        args.update(changes)
+        return grade_refused_create_is_clean(**args)[0]
+
+    expect("refused create, clean", refused_create(), PASS)
     expect("refused create written anyway",
-           grade_refused_create_is_clean(6, README, OVERWRITE_BODY, handed_back)[0], FAIL)
-    expect("refused create without its content",
-           grade_refused_create_is_clean(6, README, README, "did not publish it")[0], FAIL)
+           refused_create(disk_after=TAKEN_DECLARATION + "\n"), FAIL)
+    expect("refused create reached the graph", refused_create(listed_after=reached_listed),
+           FAIL)
+    expect("refused create without its reason", refused_create(tool_result="did not publish it"),
+           FAIL)
+    expect("refused create reported without the error flag", refused_create(tool_error=False),
+           FAIL)
+    expect("refused create whose declaration the model lost", refused_create(next_request=forgot),
+           FAIL)
+    expect("refused create recorded as a change", refused_create(result=taken_changed), FAIL)
+    expect("refused create came back clean", refused_create(trace=created), FAIL)
+    expect("refused create through a file tool", refused_create(trace=by_write_file), FAIL)
+    expect("refused create run that crashed", refused_create(rc=1), FAIL)
+    expect("refused create with no next request", refused_create(next_request=None),
+           UNREADABLE)
 
     mutated = MUTATE_BODY + "\n"
     mutated_source = {"source": MUTATE_BODY, "_kin": {}}
     stale_source = {"source": MUTABLE_RS, "_kin": {}}
+    mutable_id = "00000000-0000-4000-8000-000000000042"
     sessioned = [{"tool": "kin_mutate", "is_error": False,
                   "args": {"session_id": "s1", "summary": MUTATE_SUMMARY,
-                           "operations": [{"verb": "update", "target": "mutable"}]}}]
+                           "operations": [{"verb": "update", "target": mutable_id}]}}]
     unsessioned = [{"tool": "kin_mutate", "is_error": False,
                     "args": {"summary": MUTATE_SUMMARY,
-                             "operations": [{"verb": "update", "target": "mutable"}]}}]
-    kin_only = {"kin_agent": {"entities_changed": ["mutable"], "files_changed": []}}
+                             "operations": [{"verb": "update", "target": mutable_id}]}}]
+    kin_only = {"kin_agent": {"entities_changed": [mutable_id], "files_changed": []}}
     said_it = [MUTATE_SUMMARY + "\n\nMCP transaction 0000", "MCP transaction 0001"]
     # The same sentence where a commit that folded pending working-tree content
     # puts it: the subject declares the fold and the caller's words open the
@@ -851,69 +1248,124 @@ def self_test():
 
     expect("pure-kin mutate lands",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, said_it)[0], PASS)
+                                       kin_only, said_it, mutable_id)[0], PASS)
     # The one this check exists for: the halves were green while the
     # composition was not, so a mutate that goes out unsessioned must be a
     # failure here and not merely a note.
     expect("pure-kin mutate went out with no session",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, unsessioned,
-                                       kin_only, said_it)[0], FAIL)
+                                       kin_only, said_it, mutable_id)[0], FAIL)
     expect("pure-kin mutate said it under a fold",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, said_it_under_a_fold)[0], PASS)
+                                       kin_only, said_it_under_a_fold, mutable_id)[0], PASS)
     expect("pure-kin mutate recorded only the transaction line",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, said_nothing)[0], FAIL)
+                                       kin_only, said_nothing, mutable_id)[0], FAIL)
     expect("pure-kin mutate changed nothing in the graph",
            grade_pure_kin_mutate_lands(0, mutated, stale_source, recorded, sessioned,
-                                       kin_only, said_it)[0], FAIL)
+                                       kin_only, said_it, mutable_id)[0], FAIL)
     expect("pure-kin run recorded a file it has no tool to change",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       {"kin_agent": {"entities_changed": ["mutable"],
+                                       {"kin_agent": {"entities_changed": [mutable_id],
                                                       "files_changed": ["src/mutable.rs"]}},
-                                       said_it)[0], FAIL)
+                                       said_it, mutable_id)[0], FAIL)
     expect("pure-kin mutate made no mutate call",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, [],
-                                       kin_only, said_it)[0], FAIL)
+                                       kin_only, said_it, mutable_id)[0], FAIL)
+    expect("pure-kin run recorded an entity other than the one it named",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
+                                       {"kin_agent": {"entities_changed": ["mutable"],
+                                                      "files_changed": []}},
+                                       said_it, mutable_id)[0], FAIL)
     expect("pure-kin mutate with no log to read",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, None)[0], UNREADABLE)
+                                       kin_only, None, mutable_id)[0], UNREADABLE)
 
     stopped = (0, "the daemon on port 1 stopped")
     other_edited = OTHER_RS.replace(RESTART_FIND, RESTART_REPLACE)
     new_other = {"source": RESTART_REPLACE, "_kin": {}}
     old_other = {"source": RESTART_FIND, "_kin": {}}
-    committed = {"surface": "local", "tool": "edit_file",
-                 "provenance": {"bracketed": True, "closed_with": "kin_transaction_commit",
-                                "closed_cleanly": True}}
-    reopened = [{"tool": "kin_session_start"},
-                {"tool": "kin_transaction_begin", "is_error": True,
-                 "detail": "Session not found: s1. It was ended or expired after its idle "
-                           "timeout."},
-                {"tool": "kin_session_start"}, {"tool": "kin_transaction_begin"},
-                {"tool": "kin_transaction_stage"}, {"tool": "kin_transaction_commit"},
-                committed]
-    written_locally = [{"tool": "kin_session_start"},
-                       {"tool": "kin_transaction_begin", "is_error": True,
-                        "detail": "Session not found: s1."},
-                       {"surface": "local", "tool": "edit_file",
-                        "provenance": {"bracketed": False, "reason": "Session not found: s1."}}]
+    reopened = [session, session, mutation("update")]
+    retried = [session, mutation("update", is_error=True), session, mutation("update")]
+    update_refused = [session, mutation("update", is_error=True)]
+    written_locally = [session, {"surface": "local", "tool": "edit_file"}]
     expect("edit survives a restart",
            grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, new_other, recorded,
                                                 reopened)[0], PASS)
+    expect("edit survives a restart after one refused attempt",
+           grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, new_other, recorded,
+                                                retried)[0], PASS)
     expect("restart ends in a local write",
            grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, old_other,
                                                 uncommitted, written_locally)[0], FAIL)
     expect("restart ends in a refusal",
-           grade_edit_survives_a_daemon_restart(stopped, 6, OTHER_RS, old_other, recorded,
-                                                written_locally)[0], FAIL)
+           grade_edit_survives_a_daemon_restart(stopped, 0, OTHER_RS, old_other, recorded,
+                                                update_refused)[0], FAIL)
     expect("restart's local write picked up only by the reconcile loop",
            grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, new_other, recorded,
                                                 written_locally)[0], FAIL)
+    expect("restart whose last update came back an error",
+           grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, new_other, recorded,
+                                                reopened + [mutation("update", True)])[0], FAIL)
     expect("restart never happened",
            grade_edit_survives_a_daemon_restart((1, "kin daemon stop exited 1"), 0,
                                                 other_edited, new_other, recorded,
                                                 reopened)[0], UNREADABLE)
+
+    # The exact-name lookup. A name a module and a function share, or two functions in
+    # two files share, answers with candidates; the harness takes the one function in the
+    # named file and nothing else.
+    twins = {"ambiguous_focal": True, "query": "other", "candidate_count": 3, "candidates": [
+        {"entity_id": "m9", "name": "other", "kind": "Module", "file_path": "src/other.rs"},
+        {"entity_id": "f9", "name": "other", "kind": "Function", "file_path": "src/other.rs"},
+        {"entity_id": "g9", "name": "other", "kind": "Function", "file_path": "src/lib.rs"}]}
+    rows = entity_rows(twins)
+    expect("lookup picks the function in its file",
+           [row["id"] for row in functions_named(rows, "other", "src/other.rs")], ["f9"])
+    expect("lookup never picks by rank across files",
+           len(functions_named(rows, "other")), 2)
+    expect("lookup of a cut-short candidate list",
+           entity_rows(dict(twins, candidate_count=30)), None)
+    expect("lookup of a name nothing carries", entity_rows({"not_found": True}), [])
+    expect("lookup of an unreadable reply", entity_rows(None), None)
+    # The refusals as a Kin server words them inside the envelope's message.
+    absent = ("no entity found matching 'taken'. Use semantic_search or semantic_locate to "
+              "find the entity, then call get_entity_source with the ID it returns.")
+    module = ("entity 'taken' (821e4f27-4ea4-491f-81af-b5488fc27eeb) exists in the graph but "
+              "has no retrievable source: taken is an import/module relationship node for a "
+              "whole file, not an independently readable or editable declaration.")
+    expect("refused lookup of a name nothing carries",
+           entity_rows(refusal_answer(absent, "taken")), [])
+    expect("refused lookup of a name only a file's module carries",
+           entity_rows(refusal_answer(module, "taken")),
+           [{"id": "821e4f27-4ea4-491f-81af-b5488fc27eeb", "name": "taken", "kind": "module",
+             "file_path": None}])
+    expect("a module node is no function of that name",
+           functions_named(entity_rows(refusal_answer(module, "taken")), "taken"), [])
+    expect("a refusal about another name says nothing about this one",
+           refusal_answer(module, "kept"), None)
+    expect("an absence about another name says nothing about this one",
+           refusal_answer(absent, "kept"), None)
+    expect("any other refusal is unreadable",
+           refusal_answer("daemon unavailable", "taken"), None)
+    expect("a refusal with no message is unreadable", refusal_answer(None, "taken"), None)
+    expect("the in-process absence for exactly this name",
+           refusal_answer("Entity not found: taken", "taken"), {"not_found": True})
+    expect("an in-process absence about another name says nothing about this one",
+           refusal_answer("Entity not found: kept", "taken"), None)
+    expect("an in-process absence about a longer name says nothing about this one",
+           refusal_answer("Entity not found: taken_too", "taken"), None)
+    expect("an absence that names nothing is unreadable",
+           refusal_answer("Entity not found", "taken"), None)
+    expect("a daemon absence about a longer name says nothing about this one",
+           refusal_answer("no entity found matching 'taken_too'.", "taken"), None)
+    exact = {"id": "f8", "name": "value", "kind": "Function", "file_path": "src/lib.rs",
+             "source_base": {}}
+    expect("lookup of an exact answer",
+           [row["id"] for row in functions_named(entity_rows(exact), "value", "src/lib.rs")],
+           ["f8"])
+    expect("lookup that reached a member under another name",
+           functions_named(entity_rows(dict(exact, name="Owner::value")), "value"), [])
 
     report = report_payload([Result("edit_lands", PASS, "x")])
     expect("report keyed results", sorted(report), ["results", "suite", "ticket"])

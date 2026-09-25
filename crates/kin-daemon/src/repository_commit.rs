@@ -12,13 +12,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
+#[cfg(test)]
+use kin_model::RepositoryCommitOutcome;
 use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
     EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepoPath, RepositoryCommitOutcome,
-    RepositoryCommitReceipt, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
-    SharedAdmissionPolicy, Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
-    WorkspaceMutation, WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    RefName, RefTarget, RefUpdatePolicy, RepoPath, RepositoryCommitReceipt, RepositoryTransaction,
+    RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, Timestamp,
+    WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation, WorkspaceSemanticDelta,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::commit_deltas::compute_deltas_vs_repository_authority;
@@ -99,6 +101,15 @@ pub struct NativeCommitPlan {
     /// the authority it already holds for the current publication instead of
     /// opening the whole store again.
     authority: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+    /// What this commit does to the workspace's owed derivation ledger, inside
+    /// its own compare-and-swap.
+    ///
+    /// A plan taken from the daemon's live graph pays every record: the drain
+    /// brought that graph current before planning, and the planner's
+    /// semantics-behind-tree refusal proves the bytes it seals against the
+    /// entities it seals. A plan taken from an authority snapshot re-derives
+    /// nothing, so it pays nothing and storage only drops what it overtakes.
+    owed_derivations: Option<kin_db::OwedDerivationUpdate>,
 }
 
 #[derive(Debug)]
@@ -109,6 +120,9 @@ pub struct NativeCommitResult {
     pub entity_count: usize,
     pub relation_count: usize,
     pub file_count: usize,
+    /// Nonpersisted response evidence. Imported Git bases name immutable raw
+    /// objects; resolve their alias using authority already held by this call.
+    pub(crate) resolved_publication_base: Option<SemanticChangeId>,
 }
 
 /// One coherent, clean workspace authority base for a prospective native
@@ -134,6 +148,9 @@ pub struct WorkspaceAdmissionResult {
     pub workspace_id: WorkspaceId,
     pub tree_hash: Hash256,
     pub file_count: usize,
+    /// The workspace's owed derivation records exactly as this publication's
+    /// own commit left them.
+    pub owed: Vec<kin_db::OwedDerivation>,
 }
 
 /// One exact workspace transition that a complete host scan actually proved.
@@ -149,6 +166,7 @@ pub(crate) struct AdmittedWorkspaceTree {
     previous_tree: kin_model::ResolvedTree,
     desired_tree: kin_model::ResolvedTree,
     expected_roots: RootBundle,
+    observed_semantics: Option<(kin_db::GraphSnapshot, kin_db::GraphSnapshot)>,
     /// Held, not read: the proof does its work by being impossible to supply
     /// without a completed walk, and by staying attached to the tree it
     /// proved.
@@ -157,6 +175,43 @@ pub(crate) struct AdmittedWorkspaceTree {
 }
 
 impl AdmittedWorkspaceTree {
+    /// Capture the actual live predecessor before applying its checked tree
+    /// retirement. Only the serialized local admission boundary calls this.
+    pub(crate) fn with_live_observation(
+        mut self,
+        graph: &kin_db::InMemoryGraph,
+        delta: &kin_model::TransactionDelta,
+    ) -> Result<Self> {
+        let before = graph.semantic_observation();
+        // Independent planning passes can order the same exact changes
+        // differently (for example, ignore retractions before rule-file
+        // additions). Compare every identity-bearing change, not its position
+        // in the vector. Duplicated, omitted and altered changes still refuse.
+        let mut actual = delta.tree_deltas.clone();
+        let mut expected = self.exact_deltas()?;
+        actual.sort_by_key(kin_model::TreeDelta::artifact_id);
+        expected.sort_by_key(kin_model::TreeDelta::artifact_id);
+        if before.resolved_tree != self.previous_tree || actual != expected {
+            return Err(invalid(
+                "live semantic observation differs from the complete tree admission",
+            ));
+        }
+        let staged = kin_db::InMemoryGraph::from_snapshot_without_text_index(before.clone())?;
+        kin_model::EntityStore::apply_transaction_delta(&staged, delta)?;
+        let after = staged.semantic_observation();
+        if after.resolved_tree != self.desired_tree {
+            return Err(invalid(
+                "live semantic retirement differs from the admitted successor tree",
+            ));
+        }
+        self.observed_semantics = Some((before, after));
+        Ok(self)
+    }
+
+    pub(crate) fn semantic_predecessor(&self) -> Option<&kin_db::GraphSnapshot> {
+        self.observed_semantics.as_ref().map(|(before, _)| before)
+    }
+
     pub(crate) fn exact_deltas(&self) -> Result<Vec<kin_model::TreeDelta>> {
         Ok(kin_core::exact_tree_correction(
             &self.previous_tree,
@@ -174,6 +229,7 @@ impl AdmittedWorkspaceTree {
             previous_tree,
             desired_tree,
             expected_roots,
+            observed_semantics: None,
             completion,
         }
     }
@@ -199,6 +255,28 @@ pub(crate) fn authority_workspace_tree(
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
         .map(|workspace| workspace.tree.clone())
+        .ok_or_else(|| {
+            invalid(format!(
+                "repository authority has no local workspace {workspace_id}"
+            ))
+        })
+}
+
+/// One workspace's state as the authority the daemon already holds records
+/// it: generation, head, tree and base. Read from the held authority rather
+/// than an open of its own, so it costs no store read; it lives here for the
+/// same reason [`authority_workspace_tree`] does.
+pub(crate) fn held_authority_workspace(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    workspace_id: WorkspaceId,
+) -> Result<kin_model::WorkspaceState> {
+    let lease = authority.read_authority();
+    lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .cloned()
         .ok_or_else(|| {
             invalid(format!(
                 "repository authority has no local workspace {workspace_id}"
@@ -237,6 +315,7 @@ pub(crate) fn admitted_workspace_tree_for_test(
 
 /// Immutable session-reconcile plan bound to the authority lease captured when
 /// the disposable session was materialized.
+#[cfg(test)]
 pub struct SessionWorkspaceAdmissionPlan {
     pub transaction: RepositoryTransaction,
     pub previous_tree: kin_model::ResolvedTree,
@@ -248,13 +327,13 @@ pub struct SessionWorkspaceAdmissionPlan {
     /// retirement from the live graph with the same set, because the two can
     /// hold different payloads for the same entity and each must drop its own.
     pub vacated: VacatedPaths,
-    pub(crate) module_relocations: Vec<SessionModuleRelocation>,
     pub workspace_id: WorkspaceId,
     source_hashes: Vec<Hash256>,
     recovered_receipt: Option<RepositoryCommitReceipt>,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub struct SessionWorkspaceAdmissionResult {
     pub receipt: RepositoryCommitReceipt,
     pub workspace_id: WorkspaceId,
@@ -275,6 +354,7 @@ pub struct SessionWorkspaceAdmissionResult {
 /// onto a newer workspace. The only accepted moved-authority state is the
 /// exact durable receipt for this session's caller-stable operation and
 /// transaction hash.
+#[cfg(test)]
 pub(crate) fn plan_session_workspace_admission(
     layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
@@ -339,14 +419,25 @@ pub(crate) fn plan_session_workspace_admission(
             Some(snapshot) => {
                 let retirement = retire_semantics_on_vacated(&snapshot, &vacated)?;
                 let mut entities = retirement.entity_deltas().to_vec();
+                let mut relations = retirement.relation_deltas().to_vec();
                 if !moves.is_empty() {
                     let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
+                    relations.extend(plan_moved_source_coverage_withdrawals(&graph, &moves)?);
+                    plan_move_binding_transition(
+                        &graph,
+                        blobs,
+                        &authority,
+                        &moves,
+                        &mut relations,
+                    )?;
+                    kin_reconcile::relocate_binding_obligations(&graph, &moves, &mut relations)
+                        .map_err(|error| invalid(error.to_string()))?;
                     for (from, to) in &moves {
                         entities.extend(plan_session_entity_relocations(&graph, from, to)?);
                     }
                     bind_session_module_relocations(&mut entities, &module_relocations)?;
                 }
-                WorkspaceSemanticDelta::new(entities, retirement.relation_deltas().to_vec())?
+                WorkspaceSemanticDelta::new(entities, relations)?
             }
             None => WorkspaceSemanticDelta::default(),
         }
@@ -487,7 +578,6 @@ pub(crate) fn plan_session_workspace_admission(
         target_tree: desired_tree.clone(),
         deltas,
         vacated,
-        module_relocations,
         workspace_id,
         source_hashes: source_hashes.into_iter().collect(),
         recovered_receipt,
@@ -633,6 +723,7 @@ pub(crate) fn bind_session_module_relocations(
 /// relocated workspace would produce an empty delta and a different hash.
 /// The caller still requires the reconstructed transaction hash to match the
 /// original durable receipt before it can return an idempotent result.
+#[cfg(test)]
 fn restore_retained_session_semantics(
     snapshot: &mut kin_db::GraphSnapshot,
     current: &kin_model::WorkspaceState,
@@ -795,6 +886,110 @@ pub(crate) fn plan_session_entity_relocations(
     Ok(deltas)
 }
 
+/// Resolve moves against current graph-owned bytes before either authority is
+/// published. Repository CAS remains usable when ingestion staging was lost.
+pub(crate) fn plan_move_binding_transition<G: kin_model::GraphStore>(
+    graph: &G,
+    blobs: &kin_blobs::BlobStore,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    moves: &[(kin_model::FilePathId, kin_model::FilePathId)],
+    deltas: &mut Vec<kin_model::RelationDelta>,
+) -> Result<()> {
+    kin_reconcile::plan_moved_import_bindings(graph, moves, deltas, |hash| {
+        read_publishable_source(blobs, authority, hash)
+            .map(|source| source.body().to_vec())
+            .map_err(|error| kin_reconcile::ReconcileError::InvalidTransaction(error.to_string()))
+    })
+    .map_err(|error| invalid(error.to_string()))
+}
+
+pub(crate) fn plan_live_move_binding_transition(
+    state: &crate::state::DaemonState,
+    moves: &[(kin_model::FilePathId, kin_model::FilePathId)],
+    deltas: &mut Vec<kin_model::RelationDelta>,
+) -> Result<()> {
+    if moves.is_empty() {
+        return Ok(());
+    }
+    let authority = LocalRepositoryAuthorityContext::from_state(state)?.open()?;
+    plan_move_binding_transition(
+        state.graph.as_ref(),
+        state.blobs.as_ref(),
+        &authority,
+        moves,
+        deltas,
+    )
+}
+
+/// A parser certificate names the path it parsed. Withdraw it beside an exact
+/// artifact move; only parsing the destination may certify the new path.
+pub(crate) fn plan_moved_source_coverage_withdrawals(
+    graph: &kin_db::InMemoryGraph,
+    moves: &[(kin_model::FilePathId, kin_model::FilePathId)],
+) -> Result<Vec<kin_model::RelationDelta>> {
+    let mut withdrawn = BTreeMap::new();
+    for (from, _) in moves {
+        let path =
+            RepoPath::from_utf8(from.0.clone()).map_err(|error| invalid(error.to_string()))?;
+        let artifact = graph
+            .artifact_id_at_path(&path)
+            .ok_or_else(|| invalid(format!("moved source {from} has no admitted artifact")))?;
+        let node = kin_model::GraphNodeId::Artifact(artifact);
+        let expected_id = kin_index::build_parse_coverage_relation(
+            &kin_index::FileParseData {
+                file_path: from.0.clone(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                imports: Vec::new(),
+            },
+            artifact,
+            &kin_model::ParseCompleteness::Full,
+            &std::collections::HashSet::<String>::new(),
+        )
+        .id;
+        // A certificate an earlier build minted is the factory's own, in an
+        // older shape, and the move withdraws it like a current one.
+        let owned = |relation: &kin_model::Relation| {
+            kin_index::is_parse_coverage_relation(relation, &from.0, artifact)
+                || kin_index::is_superseded_parse_coverage_relation(relation, &from.0, artifact)
+        };
+        if graph
+            .get_relation_by_id(&expected_id)
+            .is_some_and(|relation| !owned(&relation))
+        {
+            return Err(invalid(format!(
+                "moved source {from} has an occupied parse coverage identity"
+            )));
+        }
+        for relation in graph.get_all_relations_for_node(&node)? {
+            let claims = relation.evidence.iter().any(|evidence| {
+                matches!(
+                    evidence.parser_rule.as_deref(),
+                    Some(
+                        kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1
+                            | kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
+                            | kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1
+                            | kin_index::IMPORT_RESOLUTION_COVERAGE_V1
+                    )
+                )
+            });
+            if relation.id != expected_id && !(relation.src == node && claims) {
+                continue;
+            }
+            if !owned(&relation) {
+                return Err(invalid(format!(
+                    "moved source {from} has malformed parse coverage"
+                )));
+            }
+            withdrawn.insert(
+                relation.id,
+                kin_model::RelationDelta::Removed { old: relation },
+            );
+        }
+    }
+    Ok(withdrawn.into_values().collect())
+}
+
 /// The canonical semantic transition that retires everything one graph holds
 /// on a vacated path: every entity the path owns, every relation with such an
 /// entity at either end, and every relation bound to the vacated artifact node
@@ -840,8 +1035,57 @@ pub(crate) fn retire_semantics_on_vacated(
         kin_model::GraphNodeId::Artifact(artifact_id) => vacated.artifacts.contains(artifact_id),
         _ => false,
     };
+    let incident: Vec<_> = snapshot
+        .relations
+        .values()
+        .filter(|relation| {
+            relation
+                .dst
+                .as_entity()
+                .is_some_and(|id| retired.contains(&id))
+        })
+        .cloned()
+        .collect();
+    let withdrawals = kin_reconcile::plan_local_binding_obligations(
+        &retired,
+        &incident,
+        |id| Ok(snapshot.entities.get(&id).cloned()),
+        |file| {
+            let path = RepoPath::from_utf8(file.0.clone())
+                .map_err(|error| kin_reconcile::ReconcileError::Graph(error.to_string()))?;
+            Ok(snapshot
+                .resolved_tree
+                .artifact_at_path(&path)
+                .and_then(|entry| match entry.entry {
+                    kin_model::TreeEntry::Blob { hash, .. } => Some((entry.artifact_id, hash)),
+                    _ => None,
+                }))
+        },
+        |artifact| {
+            Ok(snapshot
+                .relations
+                .values()
+                .filter(|relation| relation.src == kin_model::GraphNodeId::Artifact(artifact))
+                .cloned()
+                .collect())
+        },
+        |id| Ok(snapshot.relations.get(&id).cloned()),
+    )
+    .map_err(|error| invalid(error.to_string()))?;
     let mut desired_relations = snapshot.relations.clone();
     desired_relations.retain(|_, relation| !departs(&relation.src) && !departs(&relation.dst));
+    for withdrawal in withdrawals {
+        match withdrawal {
+            kin_model::RelationDelta::Added { new }
+            | kin_model::RelationDelta::Modified { new, .. } => {
+                desired_relations.insert(new.id, new);
+            }
+            kin_model::RelationDelta::Removed { old } => {
+                desired_relations.remove(&old.id);
+            }
+        }
+    }
+
     kin_core::diff_workspace_semantics(
         &snapshot.entities,
         &snapshot.relations,
@@ -890,10 +1134,46 @@ pub(crate) fn retire_live_semantics_on_vacated(
             departing_relations.insert(relation.id, relation);
         }
     }
+    let departing = entity_deltas
+        .iter()
+        .map(kin_model::EntityDelta::target_id)
+        .collect();
+    let incident = departing_relations.values().cloned().collect::<Vec<_>>();
+    let withdrawals = kin_reconcile::plan_local_binding_obligations(
+        &departing,
+        &incident,
+        |id| {
+            graph
+                .get_entity(&id)
+                .map_err(|error| kin_reconcile::ReconcileError::Graph(error.to_string()))
+        },
+        |file| {
+            let path = RepoPath::from_utf8(file.0.clone())
+                .map_err(|error| kin_reconcile::ReconcileError::Graph(error.to_string()))?;
+            let Some(artifact) = graph.artifact_id_at_path(&path) else {
+                return Ok(None);
+            };
+            Ok(graph
+                .get_tree_entry(file)
+                .map_err(|error| kin_reconcile::ReconcileError::Graph(error.to_string()))?
+                .and_then(|entry| match entry {
+                    kin_model::TreeEntry::Blob { hash, .. } => Some((artifact, hash)),
+                    _ => None,
+                }))
+        },
+        |artifact| {
+            graph
+                .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(artifact))
+                .map_err(|error| kin_reconcile::ReconcileError::Graph(error.to_string()))
+        },
+        |id| Ok(graph.get_relation_by_id(&id)),
+    )
+    .map_err(|error| invalid(error.to_string()))?;
     let mut relation_deltas = departing_relations
         .into_values()
         .map(|old| kin_model::RelationDelta::Removed { old })
         .collect::<Vec<_>>();
+    relation_deltas.extend(withdrawals);
     entity_deltas.sort_by_key(kin_model::EntityDelta::target_id);
     relation_deltas.sort_by_key(kin_model::RelationDelta::target_id);
     Ok((entity_deltas, relation_deltas))
@@ -901,11 +1181,17 @@ pub(crate) fn retire_live_semantics_on_vacated(
 
 /// Persist session-observed immutable bodies and linearize the exact primary
 /// projection with one workspace-only repository transaction.
+///
+/// `owed` is what the same transaction records in the workspace's owed
+/// derivation ledger, for a fixture standing in for a publication that moves
+/// bytes without their semantics.
+#[cfg(test)]
 pub(crate) fn commit_session_workspace_admission(
     layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
     plan: SessionWorkspaceAdmissionPlan,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> Result<SessionWorkspaceAdmissionResult> {
     let repository_id = authority_context.repository_id().clone();
     if plan.transaction.repository_id != repository_id {
@@ -936,19 +1222,21 @@ pub(crate) fn commit_session_workspace_admission(
             load_projection_entries(&authority, &plan.target_tree, &mut body_cache)?;
         let previous_entries =
             load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)?;
-        let (_, receipt) = kin_core::reconcile_source_tree_and_commit_repository_transaction(
-            layout.working_dir(),
-            &plan.previous_tree,
-            &plan.target_tree,
-            previous_entries
-                .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-            target_entries
-                .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-            &authority,
-            plan.transaction,
-        )?;
+        let (_, receipt) =
+            kin_core::reconcile_source_tree_and_commit_unproven_repository_transaction(
+                layout.working_dir(),
+                &plan.previous_tree,
+                &plan.target_tree,
+                previous_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                target_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                &authority,
+                plan.transaction,
+                owed,
+            )?;
         let replayed = receipt.outcome == RepositoryCommitOutcome::IdempotentReplay;
         (receipt, replayed)
     };
@@ -1002,12 +1290,19 @@ pub(crate) fn is_stale_plan_refusal(error: &DaemonError) -> bool {
 /// prior tree; re-deriving it against a newer workspace would publish a
 /// transition nobody observed, and would silently revert whatever moved
 /// authority in the meantime.
+///
+/// `owed` names the bodies this publication moves without their parse, and
+/// `legacy` what an earlier build's records still owe. The same
+/// compare-and-swap that publishes the tree records both in the workspace's
+/// owed derivation ledger, so a refused publication records nothing.
 pub(crate) fn publish_workspace_tree(
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
     admitted: &AdmittedWorkspaceTree,
     operation_id: OperationId,
     actor: AuthorId,
+    owed: &[(RepoPath, Hash256)],
+    legacy: &[(RepoPath, Hash256)],
 ) -> Result<Option<WorkspaceAdmissionResult>> {
     let desired_tree = &admitted.desired_tree;
     let repository_id = authority_context.repository_id().clone();
@@ -1055,10 +1350,10 @@ pub(crate) fn publish_workspace_tree(
     // path repository authority holds entities for carries their removal in the
     // same delta.
     //
-    // The set is authority's own, read from authority's own workspace snapshot.
-    // Entities no commit ever published are not here to retire: they live in the
-    // daemon's derived graph, which the watch loop and the purge evict for
-    // themselves after this returns.
+    // A serialized live admission carries the actually observed semantic
+    // predecessor, including bindings no native commit published. Its checked
+    // retirement crosses authority with this tree. Without that capture, the
+    // authority-only retirement remains useful but cannot qualify history.
     //
     // A move is not a vacancy. `exact_tree` plans one as a single `Updated` with
     // the artifact identity kept and the paths differing, so the entities on the
@@ -1069,36 +1364,85 @@ pub(crate) fn publish_workspace_tree(
     let vacated = VacatedPaths::from_deltas(&tree_deltas);
     let moves = session_artifact_moves(&tree_deltas);
     let module_relocations = plan_session_module_relocations(blobs, &authority, &tree_deltas)?;
-    let semantic_delta = if vacated.is_empty() && moves.is_empty() {
-        WorkspaceSemanticDelta::default()
-    } else {
-        match lease.workspace_graph_snapshot(&workspace_id)? {
-            Some(snapshot) => {
-                let retirement = retire_semantics_on_vacated(&snapshot, &vacated)?;
-                let mut entities = retirement.entity_deltas().to_vec();
-                if !moves.is_empty() {
-                    let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
-                    for (from, to) in &moves {
-                        entities.extend(plan_session_entity_relocations(&graph, from, to)?);
-                    }
-                    bind_session_module_relocations(&mut entities, &module_relocations)?;
-                }
-                WorkspaceSemanticDelta::new(entities, retirement.relation_deltas().to_vec())?
-            }
-            // A vacated set with no snapshot to retire from is nothing to carry.
-            // A MOVE with no snapshot is different: the identity is real, this
-            // publication cannot prove it survives, and publishing the tree
-            // anyway would strand it exactly as the missing retirement stranded
-            // a removal. Refusing leaves authority untouched.
-            None if !moves.is_empty() => {
+    let semantic_delta =
+        if let Some((observed, after)) = &admitted.observed_semantics {
+            if observed.resolved_tree != workspace.tree || after.resolved_tree != *desired_tree {
                 return Err(invalid(
+                    "captured live semantics do not bind the admitted tree transition",
+                ));
+            }
+            let snapshot = lease
+                .workspace_graph_snapshot(&workspace_id)?
+                .ok_or_else(|| invalid("observed workspace has no authority predecessor"))?;
+            let semantic = kin_core::diff_workspace_semantics(
+                &snapshot.entities,
+                &snapshot.relations,
+                &after.entities,
+                &after.relations,
+            )?;
+            let mut references = Vec::new();
+            for (id, old) in &snapshot.external_references {
+                match after.external_references.get(id) {
+                    None => references
+                        .push(kin_model::ExternalReferenceDelta::Removed { old: old.clone() }),
+                    Some(new) if old != new => {
+                        return Err(invalid(
+                            "live observation rewrote an immutable external reference identity",
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            for (id, new) in &after.external_references {
+                if !snapshot.external_references.contains_key(id) {
+                    references.push(kin_model::ExternalReferenceDelta::Added { new: new.clone() });
+                }
+            }
+            WorkspaceSemanticDelta::new_with_external_references(
+                semantic.entity_deltas().to_vec(),
+                semantic.relation_deltas().to_vec(),
+                references,
+            )?
+        } else if vacated.is_empty() && moves.is_empty() {
+            WorkspaceSemanticDelta::default()
+        } else {
+            match lease.workspace_graph_snapshot(&workspace_id)? {
+                Some(snapshot) => {
+                    let retirement = retire_semantics_on_vacated(&snapshot, &vacated)?;
+                    let mut entities = retirement.entity_deltas().to_vec();
+                    let mut relations = retirement.relation_deltas().to_vec();
+                    if !moves.is_empty() {
+                        let graph =
+                            kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
+                        relations.extend(plan_moved_source_coverage_withdrawals(&graph, &moves)?);
+                        plan_move_binding_transition(
+                            &graph,
+                            blobs,
+                            &authority,
+                            &moves,
+                            &mut relations,
+                        )?;
+                        kin_reconcile::relocate_binding_obligations(&graph, &moves, &mut relations)
+                            .map_err(|error| invalid(error.to_string()))?;
+                        for (from, to) in &moves {
+                            entities.extend(plan_session_entity_relocations(&graph, from, to)?);
+                        }
+                        bind_session_module_relocations(&mut entities, &module_relocations)?;
+                    }
+                    WorkspaceSemanticDelta::new(entities, relations)?
+                }
+                // A vacated set with no snapshot to retire from is nothing to carry.
+                // A MOVE with no snapshot is different: the identity is real, this
+                // publication cannot prove it survives, and publishing the tree
+                // anyway would strand it exactly as the missing retirement stranded
+                // a removal. Refusing leaves authority untouched.
+                None if !moves.is_empty() => return Err(invalid(
                     "repository authority holds no workspace graph snapshot to relocate a moved \
                      identity into, so publishing this tree would strand it",
-                ))
+                )),
+                None => WorkspaceSemanticDelta::default(),
             }
-            None => WorkspaceSemanticDelta::default(),
-        }
-    };
+        };
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&workspace.shared_admission_policy),
@@ -1205,13 +1549,36 @@ pub(crate) fn publish_workspace_tree(
             authority.save_source_blob(hash, body)?;
         }
     }
-    let receipt = authority.commit_repository_transaction(transaction)?;
+    let owing = kin_db::OwedDerivationUpdate::owe(workspace_id, owed.to_vec(), legacy.to_vec());
+    let receipt = if let Some((observed, _)) = &admitted.observed_semantics {
+        authority.commit_repository_transaction_with_observed_binding_history_owing(
+            transaction,
+            workspace_id,
+            observed,
+            &kin_index::binding_history::LocalBindingHistoryVerifier,
+            &owing,
+        )?
+    } else {
+        // An absent live observation cannot establish that no never-committed
+        // binding was withdrawn. Preserve publication, invalidate its witness.
+        authority.commit_repository_transaction_owing(transaction, &owing)?
+    };
     receipt.validate()?;
+    // Read out of the lease this commit left, so the daemon can disclose what
+    // the publication owes from the moment it lands.
+    let owed = authority
+        .read_authority()
+        .metadata()
+        .owed_derivations
+        .records_for(workspace_id)
+        .cloned()
+        .collect();
     Ok(Some(WorkspaceAdmissionResult {
         receipt,
         workspace_id,
         tree_hash,
         file_count: tree_deltas.len(),
+        owed,
     }))
 }
 
@@ -1384,6 +1751,41 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
         None,
         SemanticCurrency::AuthoritySnapshot,
         held,
+    )
+}
+
+/// Plan one exact native transaction from the daemon's live graph whose
+/// message states which of the files it publishes the caller did not author.
+///
+/// [`plan_native_commit_from_base_declaring_carry`] plans against the base a
+/// transaction captured when it began. An agent's toolchain run has no
+/// transaction: its admission has just been published into the live graph,
+/// and this records that admission as a change, declaring any other pending
+/// content the change carries exactly as an MCP commit does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_native_commit_declaring_carry(
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    author: AuthorId,
+    authored_files: &BTreeSet<RepoPath>,
+    message: &dyn Fn(&[RepoPath]) -> String,
+) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        graph,
+        blobs,
+        authority_context,
+        operation_id,
+        timestamp,
+        author,
+        Some(authored_files),
+        message,
+        None,
+        None,
+        SemanticCurrency::DaemonMaintained,
+        None,
     )
 }
 
@@ -1615,6 +2017,9 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
         if let kin_model::ParseState::Incomplete { error_ranges } = &indexed.parse_state {
             let mut stale = false;
             for entity in &held {
+                if entity.kind == kin_model::EntityKind::Module {
+                    continue;
+                }
                 let candidates: Vec<_> = indexed
                     .entities
                     .iter()
@@ -2189,6 +2594,8 @@ fn plan_native_commit_inner(
         target_tree: deltas.expected_tree,
         source_hashes: source_hashes.into_iter().collect(),
         authority,
+        owed_derivations: (currency == SemanticCurrency::DaemonMaintained)
+            .then(|| kin_db::OwedDerivationUpdate::pay(workspace_id)),
     })
 }
 
@@ -2313,7 +2720,9 @@ pub(crate) fn recover_native_commit(
                 "repository receipt for MCP operation {operation_id} references missing change {change_id}"
             ))
         })?;
+    let resolved_publication_base = publication_base_change(lease.metadata(), &receipt);
     Ok(Some(NativeCommitResult {
+        resolved_publication_base,
         entity_count: change.entity_deltas.len(),
         relation_count: change.relation_deltas.len(),
         file_count: change.tree_deltas.len(),
@@ -2348,9 +2757,15 @@ pub(crate) fn commit_native_plan(
             authority.save_source_blob(*hash, body)?;
         }
     }
-    let receipt = authority.commit_repository_transaction(plan.transaction)?;
+    let receipt = match &plan.owed_derivations {
+        Some(owed) => authority.commit_repository_transaction_owing(plan.transaction, owed)?,
+        None => authority.commit_repository_transaction(plan.transaction)?,
+    };
     receipt.validate()?;
+    let resolved_publication_base =
+        publication_base_change(authority.read_authority().metadata(), &receipt);
     Ok(NativeCommitResult {
+        resolved_publication_base,
         change: plan.change,
         receipt,
         target: plan.target,
@@ -2619,6 +3034,7 @@ fn commit_native_plan_with_working_copy_proof(
                     .map(|(path, entry, body)| (path, *entry, body.as_ref())),
                 &authority,
                 plan.transaction,
+                plan.owed_derivations.as_ref(),
             )
         })?
     } else {
@@ -2642,6 +3058,7 @@ fn commit_native_plan_with_working_copy_proof(
                             .map(|(path, entry, body)| (path, *entry, body.as_ref())),
                         &authority,
                         plan.transaction,
+                        plan.owed_derivations.as_ref(),
                     )
                 },
             )?,
@@ -2669,6 +3086,7 @@ fn commit_native_plan_with_working_copy_proof(
                                     &authority,
                                     plan.transaction,
                                     accepted,
+                                    plan.owed_derivations.as_ref(),
                                 )
                             }
                             None => kin_core::reconcile_source_tree_and_commit_repository_transaction(
@@ -2679,6 +3097,7 @@ fn commit_native_plan_with_working_copy_proof(
                                 target,
                                 &authority,
                                 plan.transaction,
+                                plan.owed_derivations.as_ref(),
                             ),
                         }
                     },
@@ -2700,7 +3119,10 @@ fn commit_native_plan_with_working_copy_proof(
         authority_context.workspace_id(),
         "native commit",
     );
+    let resolved_publication_base =
+        publication_base_change(authority.read_authority().metadata(), &receipt);
     Ok(NativeCommitResult {
+        resolved_publication_base,
         change: plan.change,
         receipt,
         target: plan.target,
@@ -2834,6 +3256,23 @@ fn resolve_commit_base(
     }
 }
 
+/// Resolve a publication's original base without reopening authority. Missing
+/// historical evidence makes reporting unavailable, never publication invalid.
+fn publication_base_change(
+    metadata: &kin_db::PersistedRepositoryAuthority,
+    receipt: &RepositoryCommitReceipt,
+) -> Option<SemanticChangeId> {
+    let WorkspaceExpectation::MustEqual { base_target, .. } =
+        &receipt.operation.workspace_mutation.as_ref()?.expected
+    else {
+        return None;
+    };
+    // Existing aliases cannot be retargeted by later publications. This is the
+    // same resolver that selected the commit parent; no current ref or working
+    // tree participates in reconstructing the historical publication's base.
+    parent_change_at(metadata, base_target.as_ref()?).ok()
+}
+
 /// The semantic change one resolved authority target names.
 ///
 /// A change names itself. An external Git commit names the change it was
@@ -2912,6 +3351,134 @@ mod tests {
         )
     }
 
+    #[test]
+    fn moved_source_coverage_withdrawal_is_atomic_and_keeps_other_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = kin_blobs::BlobStore::new(temp.path().join("blobs")).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let mut artifacts = Vec::new();
+        for file in ["old.py", "untouched.py"] {
+            let artifact = add_artifact(&graph, &blobs, file.as_bytes(), b"# empty\n", |hash| {
+                TreeEntry::blob(hash, false)
+            });
+            let certificate = kin_index::build_parse_coverage_relation(
+                &kin_index::FileParseData {
+                    file_path: file.into(),
+                    entities: vec![],
+                    relations: vec![],
+                    imports: vec![],
+                },
+                artifact.artifact_id,
+                &kin_model::ParseCompleteness::Full,
+                &std::collections::HashSet::<String>::new(),
+            );
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    relation_deltas: vec![kin_model::RelationDelta::Added { new: certificate }],
+                    ..Default::default()
+                })
+                .unwrap();
+            artifacts.push(artifact);
+        }
+        let moves = [(
+            kin_model::FilePathId::new("old.py"),
+            kin_model::FilePathId::new("new.py"),
+        )];
+        let withdrawals = plan_moved_source_coverage_withdrawals(&graph, &moves).unwrap();
+        assert_eq!(withdrawals.len(), 1);
+        let artifact = &artifacts[0];
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: withdrawals,
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id: artifact.artifact_id,
+                    old: artifact.located_entry(),
+                    new: LocatedEntry::new(RepoPath::from_utf8("new.py").unwrap(), artifact.entry),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(graph
+            .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(artifact.artifact_id))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            graph
+                .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(
+                    artifacts[1].artifact_id
+                ))
+                .unwrap()
+                .len(),
+            1
+        );
+        let swap = [
+            (
+                kin_model::FilePathId::new("new.py"),
+                kin_model::FilePathId::new("untouched.py"),
+            ),
+            (
+                kin_model::FilePathId::new("untouched.py"),
+                kin_model::FilePathId::new("new.py"),
+            ),
+        ];
+        assert_eq!(
+            plan_moved_source_coverage_withdrawals(&graph, &swap)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn moved_source_coverage_refuses_malformed_or_disguised_owned_evidence() {
+        for corruption in ["path", "marker", "endpoints"] {
+            let temp = tempfile::tempdir().unwrap();
+            let blobs = kin_blobs::BlobStore::new(temp.path().join("blobs")).unwrap();
+            let graph = kin_db::InMemoryGraph::new();
+            let artifact = add_artifact(&graph, &blobs, b"old.py", b"# empty\n", |hash| {
+                TreeEntry::blob(hash, false)
+            });
+            let mut certificate = kin_index::build_parse_coverage_relation(
+                &kin_index::FileParseData {
+                    file_path: "old.py".into(),
+                    entities: vec![],
+                    relations: vec![],
+                    imports: vec![],
+                },
+                artifact.artifact_id,
+                &kin_model::ParseCompleteness::Full,
+                &std::collections::HashSet::<String>::new(),
+            );
+            match corruption {
+                "marker" => certificate.evidence.clear(),
+                "endpoints" => {
+                    let other = add_artifact(&graph, &blobs, b"other.py", b"# other\n", |hash| {
+                        TreeEntry::blob(hash, false)
+                    });
+                    certificate.src = kin_model::GraphNodeId::Artifact(other.artifact_id);
+                    certificate.dst = certificate.src;
+                }
+                _ => certificate.evidence[0].source_path = Some("unrelated.py".into()),
+            }
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    relation_deltas: vec![kin_model::RelationDelta::Added { new: certificate }],
+                    ..Default::default()
+                })
+                .unwrap();
+            let before = graph.resolved_tree();
+            assert!(plan_moved_source_coverage_withdrawals(
+                &graph,
+                &[(
+                    kin_model::FilePathId::new("old.py"),
+                    kin_model::FilePathId::new("new.py")
+                )]
+            )
+            .is_err());
+            assert_eq!(graph.resolved_tree(), before);
+        }
+    }
+
     fn reopen(init: &kin_core::InitResult) -> RepositoryAuthorityManager<LocalFileBackend> {
         RepositoryAuthorityManager::open(
             init.repository_id.clone(),
@@ -2922,6 +3489,89 @@ mod tests {
 
     fn test_authority_context(layout: &kin_core::KinLayout) -> LocalRepositoryAuthorityContext {
         LocalRepositoryAuthorityContext::from_layout_for_test(layout).unwrap()
+    }
+
+    #[test]
+    fn live_observation_accepts_reordered_exact_deltas_but_refuses_changed_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let old = add_artifact(&graph, &blobs, b"retired.txt", b"retired\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let previous = graph.resolved_tree();
+        let body = blobs.write(b"retired.txt\n").unwrap();
+        let added = ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8(".kinignore").unwrap(),
+            TreeEntry::blob(Hash256::from_bytes(body.0), false),
+        );
+        let desired = ResolvedTree::from_artifacts([added]).unwrap();
+        let roots = test_authority_context(&init.layout)
+            .open()
+            .unwrap()
+            .read_authority()
+            .roots()
+            .clone();
+        let observation = || {
+            super::admitted_workspace_tree_for_test(
+                init.layout.working_dir(),
+                roots.clone(),
+                previous.clone(),
+                desired.clone(),
+            )
+        };
+        let canonical = kin_core::exact_tree_correction(&previous, &desired).unwrap();
+        let mut reordered = canonical.clone();
+        reordered.reverse();
+        assert_ne!(reordered, canonical);
+        let delta = TransactionDelta {
+            tree_deltas: reordered,
+            ..Default::default()
+        };
+        let admitted = observation().with_live_observation(&graph, &delta).unwrap();
+        assert_eq!(
+            admitted.observed_semantics.unwrap().1.resolved_tree,
+            desired
+        );
+        assert_eq!(
+            graph.resolved_tree(),
+            previous,
+            "preflight must not mutate the graph"
+        );
+
+        let mut duplicate = canonical.clone();
+        duplicate.push(canonical[0].clone());
+        let mut altered = canonical.clone();
+        let TreeDelta::Added { artifact_id, .. } = &mut altered[0] else {
+            panic!("rule file sorts first")
+        };
+        *artifact_id = ArtifactId::new();
+        for invalid in [vec![canonical[0].clone()], duplicate, altered] {
+            assert!(observation()
+                .with_live_observation(
+                    &graph,
+                    &TransactionDelta {
+                        tree_deltas: invalid,
+                        ..Default::default()
+                    }
+                )
+                .is_err());
+        }
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id: old.artifact_id,
+                    old: old.located_entry(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            observation().with_live_observation(&graph, &delta).is_err(),
+            "an exact delta for a stale predecessor must still refuse"
+        );
     }
 
     fn publish_workspace_tree(
@@ -2949,7 +3599,7 @@ mod tests {
             previous_tree,
             desired_tree.clone(),
         );
-        super::publish_workspace_tree(blobs, &context, &admitted, operation_id, actor)
+        super::publish_workspace_tree(blobs, &context, &admitted, operation_id, actor, &[], &[])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3103,6 +3753,8 @@ mod tests {
             &stale,
             OperationId::new(),
             AuthorId::new("stale-observer"),
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -3175,6 +3827,8 @@ mod tests {
             &admitted,
             OperationId::new(),
             AuthorId::new("foreign-base-observer"),
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(

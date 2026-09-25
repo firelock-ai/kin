@@ -39,6 +39,13 @@ pub struct RunArgs {
 
 /// Run one task. Returns the process exit code; the caller exits with it.
 pub fn run(args: RunArgs) -> Result<i32> {
+    // A false `KIN_AGENT_PURE_KIN` asked for the retired file tools. It is refused
+    // first, before the output directory exists or the endpoint is asked for its
+    // context window, so a run that will not start leaves nothing behind and
+    // contacts nothing. The agent loop refuses it as well, for a caller that
+    // reaches the loop without this command.
+    kin_agent::belt::refuse_file_tools(std::env::var("KIN_AGENT_PURE_KIN").ok().as_deref())
+        .map_err(anyhow::Error::msg)?;
     if let Some(tokens) = args.context_tokens {
         if tokens < MIN_CONTEXT_TOKENS {
             anyhow::bail!(
@@ -102,8 +109,6 @@ pub fn run(args: RunArgs) -> Result<i32> {
         deadline: Duration::from_secs(args.deadline.unwrap_or(DEFAULT_DEADLINE_S)),
         context,
         max_result_bytes: args.max_result_bytes,
-        // The belt follows `KIN_AGENT_PURE_KIN`; the CLI adds no flag of its own.
-        belt_file_tools: None,
         tool_profile: args.tool_profile,
     };
 
@@ -375,4 +380,134 @@ fn resolve_mcp_command(
         command.push(profile.to_string());
     }
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Marks a child process running one of these tests on its own.
+    const CHILD: &str = "KIN_CLI_AGENT_PURE_KIN_TEST_CHILD";
+
+    fn in_child(test: &str) -> bool {
+        std::env::var(CHILD).as_deref() == Ok(test)
+    }
+
+    /// Run `test` again in a child process with `KIN_AGENT_PURE_KIN` set to `value`, or
+    /// removed for `None`, and fail unless the child ran it and it passed.
+    ///
+    /// The variable is process-wide, so it is set only in a child that runs this one test,
+    /// never under tests running concurrently here.
+    fn run_in_child(test: &str, value: Option<&str>) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                &format!("commands::agent::tests::{test}"),
+                "--nocapture",
+            ])
+            .env(CHILD, test);
+        match value {
+            Some(value) => child.env("KIN_AGENT_PURE_KIN", value),
+            None => child.env_remove("KIN_AGENT_PURE_KIN"),
+        };
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child for {value:?} failed or ran nothing: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_args(repo: &Path, out: &Path, base_url: String, context_tokens: Option<u64>) -> RunArgs {
+        RunArgs {
+            task: "Rename greet.".into(),
+            model: "fixture-model".into(),
+            base_url,
+            api_key_env: None,
+            repo: vec![repo.to_path_buf()],
+            mcp_command: vec!["kin-agent-no-such-binary".into()],
+            out: Some(out.to_path_buf()),
+            max_tool_calls: Some(1),
+            deadline: Some(5),
+            context_tokens,
+            max_result_bytes: None,
+            system: None,
+            temperature: None,
+            tool_profile: None,
+        }
+    }
+
+    /// A false value stops `kin agent run` before it creates the output directory or asks
+    /// the endpoint for its context window, and says why.
+    #[test]
+    fn a_false_pure_kin_value_refuses_before_the_output_directory_or_the_endpoint() {
+        const TEST: &str =
+            "a_false_pure_kin_value_refuses_before_the_output_directory_or_the_endpoint";
+        if !in_child(TEST) {
+            for value in ["false", "0", " Off "] {
+                run_in_child(TEST, Some(value));
+            }
+            return;
+        }
+        let raw = std::env::var("KIN_AGENT_PURE_KIN").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        // No --context-tokens, so a run that got past the check would ask this endpoint
+        // for its window. It accepts nothing, and a connection waiting on it is the probe.
+        let endpoint = TcpListener::bind("127.0.0.1:0").unwrap();
+        endpoint.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", endpoint.local_addr().unwrap());
+
+        let refusal = run(run_args(dir.path(), &out, base_url, None))
+            .expect_err("a false value must not start a run");
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "KIN_AGENT_PURE_KIN={} no longer adds file tools: Kin agents change code through \
+                 entities, and the local file tools are retired. Unset KIN_AGENT_PURE_KIN, or set \
+                 it to true, to run.",
+                raw.trim()
+            )
+        );
+        assert!(
+            !out.exists(),
+            "a refused run must not create its output directory"
+        );
+        assert!(
+            matches!(endpoint.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a refused run must not ask the endpoint for its context window"
+        );
+    }
+
+    /// The control: a true value and no value at all get past the check, so the run
+    /// creates its output directory and ends on the failure this setup arranges, a graph
+    /// server that is not there.
+    #[test]
+    fn a_true_or_unset_pure_kin_value_gets_past_the_check() {
+        const TEST: &str = "a_true_or_unset_pure_kin_value_gets_past_the_check";
+        if !in_child(TEST) {
+            for value in [Some("true"), None] {
+                run_in_child(TEST, value);
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        // --context-tokens is named, so nothing asks the endpoint for its window.
+        let code = run(run_args(
+            dir.path(),
+            &out,
+            "http://127.0.0.1:9".into(),
+            Some(4_096),
+        ))
+        .expect("the run starts and reports its own failure");
+        assert_eq!(code, ExitStatus::McpError.code());
+        assert!(
+            out.exists(),
+            "a run that starts creates its output directory"
+        );
+    }
 }

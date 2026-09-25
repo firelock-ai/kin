@@ -10,6 +10,8 @@
 //! deltas are authored against its first parent, which is the branch being
 //! merged into. Nothing is read from the working copy to decide the merge.
 
+mod parse_coverage;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
@@ -126,14 +128,15 @@ pub(crate) fn settle_merged_graph(state: &DaemonState) -> Option<String> {
         state.filesystem_reconcile_disabled(),
         crate::api::enrichment_unavailable_reason_for(state),
     );
-    if !matches!(enrichment, MergeEnrichment::Silent) {
-        // Retired before the sweep is asked for, so the pass that answers this
-        // merge sees the retirement rather than skipping the files it names.
-        // Retired on the announcing row too: the evidence is equally stale
-        // there, and the sweep the line tells a reader to run is the one that
-        // would otherwise skip everything and report full coverage.
-        crate::daemon::retire_enrichment_evidence_for_merge(state);
-    }
+    // Retired in every case, before the sweep is asked for, so the pass that
+    // answers this merge sees the retirement rather than skipping the files it
+    // names. On the announcing row the sweep the line tells a reader to run is
+    // the one that would otherwise skip everything and report full coverage.
+    // On the silent row too: the merged graph replaced any language-server
+    // enrichment the workspace overlay held, so markers left standing would
+    // make the first sweep after filesystem reconcile comes back skip exactly
+    // the files whose edges this merge dropped.
+    crate::daemon::retire_enrichment_evidence_for_merge(state);
     match enrichment {
         MergeEnrichment::Sweep => {
             if state.request_lsp_sweep_after_merge() {
@@ -486,49 +489,66 @@ fn read_merge_plan(
             open.unresolved().count()
         )));
     }
-    if workspace.is_dirty() {
-        // `is_dirty` is two clauses and the old refusal named neither, so a
-        // caller met "has graph-owned changes" while `kin status` and the
-        // workspace tree both read clean, with nothing to act on. The rc062j
-        // stranger hit that twice. Say which clause refused and what clears it,
-        // because the two readers disagreeing is only a problem when the
-        // disagreement is invisible.
-        // Mirrors `WorkspaceState::is_dirty` clause for clause. Its second arm
-        // is a `map_or`, so an unborn head with any tree at all is dirty for a
-        // third reason that neither of the others names.
-        let overlay_pending = !workspace.semantic_overlay.is_empty();
+    // Language-server enrichment does not block a merge. After a commit the
+    // daemon's background pass derives relations from the committed tree and
+    // publishes them into this workspace's semantic overlay so they survive a
+    // restart. Refusing on that overlay made every merge after a commit fail
+    // with 409 on Kin's own activity, and the only way past it was a commit
+    // holding no entity and no file. A merge composes from committed history
+    // and publishes the merged graph as the workspace's new state, so the
+    // enrichment the overlay held is replaced rather than lost: publishing
+    // retires every enrichment marker and queues the sweep that re-derives
+    // the cross-file edges the merged tree implies (`settle_merged_graph`).
+    if workspace.holds_uncommitted_work() {
+        // `holds_uncommitted_work` is three clauses and the old refusal named
+        // none of them, so a caller met "has graph-owned changes" with nothing
+        // to act on. The rc062j stranger hit that twice. Say which clause
+        // refused and what clears it.
+        // Mirrors `WorkspaceState::holds_uncommitted_work` clause for clause.
+        // Its tree arm is a `map_or`, so an unborn head with any tree at all
+        // is uncommitted work for a reason neither of the others names.
+        let overlay_pending = !workspace.semantic_overlay.is_empty()
+            && !workspace
+                .semantic_overlay
+                .is_language_server_enrichment_only();
         let tree_moved = workspace
             .base_tree_hash
             .is_some_and(|base| base != workspace.tree_hash);
         let unborn_with_tree = workspace.base_tree_hash.is_none() && !workspace.tree.is_empty();
-        let commit_or_stash = "commit it with `kin commit`, or set it aside with `kin stash`";
+        // Committing is the one remedy named. Setting the work aside is not a
+        // way through a merge: `kin stash push` needs `--yes` without a
+        // terminal, and once the merge moves this workspace's base `kin stash
+        // pop` refuses to restore onto it, so work stashed to clear the way
+        // could not come back afterwards. The bare `kin stash` this used to
+        // name only prints its usage.
+        let commit_it = "commit it with `kin commit`";
         let (what, remedy) = match (overlay_pending, tree_moved, unborn_with_tree) {
             (true, true, _) => (
                 "a pending semantic overlay AND a working tree that has moved off its base change"
                     .to_string(),
-                "commit them with `kin commit`, or set them aside with `kin stash`",
+                "commit them with `kin commit`",
             ),
             (true, false, false) => (
-                "a pending semantic overlay, while its working tree still matches its base \
-                 change, which is why a tree-only reader such as `kin status` can call this \
-                 workspace clean at the same moment"
+                "a pending semantic overlay over a working tree that still matches its base \
+                 change; `kin diff` lists the entities and relations it holds"
                     .to_string(),
-                commit_or_stash,
+                commit_it,
             ),
             (true, _, true) => (
                 "a pending semantic overlay on a branch with no commit yet".to_string(),
-                commit_or_stash,
+                commit_it,
             ),
             (false, true, _) => (
                 "a working tree that has moved off its base change".to_string(),
-                commit_or_stash,
+                commit_it,
             ),
             (false, false, true) => (
                 "a working tree on a branch with no commit yet".to_string(),
-                commit_or_stash,
+                commit_it,
             ),
-            // Unreachable while `is_dirty` is those clauses. A wrong sentence
-            // here would be worse than an honest one, so it says so instead.
+            // Unreachable while `holds_uncommitted_work` is those clauses. A
+            // wrong sentence here would be worse than an honest one, so it says
+            // so instead.
             (false, false, false) => (
                 "graph-owned changes this refusal could not attribute to the semantic overlay, \
                  the working tree or an unborn head, which is a defect in the refusal rather \
@@ -793,16 +813,9 @@ fn three_way(
         entities_agree,
         &mut conflicts,
     )?;
-    let merged_relations = compose(
-        &base_state.relations,
-        &ours_state.relations,
-        &theirs_state.relations,
-        |relation| MergeConflictSubject::Relation {
-            relation: *relation,
-        },
-        MergeSideValue::relation,
-        |_| None,
-        |left, right| left == right,
+    let (mut merged_relations, deferred_coverage) = parse_coverage::compose_relations(
+        [&base_state, &ours_state, &theirs_state],
+        &BTreeSet::new(),
         &mut conflicts,
     )?;
     let merged_artifacts = compose(
@@ -872,6 +885,14 @@ fn three_way(
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
         .context("compose exact merged repository tree")?;
+    parse_coverage::rederive(
+        state,
+        authority,
+        [&base_state, &ours_state, &theirs_state],
+        &deferred_coverage,
+        &desired_tree,
+        &mut merged_relations,
+    )?;
     let (shared_policy, admission_policy_delta) = derive_policy(
         &state.blobs,
         &authority.manager,
@@ -1119,16 +1140,17 @@ pub(crate) fn publish_resolved_merge(
         entities_agree,
         &mut recomposed,
     )?;
-    let mut merged_relations = compose(
-        &base_state.relations,
-        &ours_state.relations,
-        &theirs_state.relations,
-        |relation| MergeConflictSubject::Relation {
-            relation: *relation,
-        },
-        MergeSideValue::relation,
-        |_| None,
-        |left, right| left == right,
+    let recorded_relations = record
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.subject {
+            MergeConflictSubject::Relation { relation } => Some(relation),
+            _ => None,
+        })
+        .collect();
+    let (mut merged_relations, deferred_coverage) = parse_coverage::compose_relations(
+        [&base_state, &ours_state, &theirs_state],
+        &recorded_relations,
         &mut recomposed,
     )?;
     let ours_artifacts = artifacts_by_id(&ours_state.tree);
@@ -1291,6 +1313,14 @@ pub(crate) fn publish_resolved_merge(
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
         .context("compose exact resolved repository tree")?;
+    parse_coverage::rederive(
+        state,
+        authority,
+        [&base_state, &ours_state, &theirs_state],
+        &deferred_coverage,
+        &desired_tree,
+        &mut merged_relations,
+    )?;
     let (shared_policy, admission_policy_delta) = derive_policy(
         &state.blobs,
         &authority.manager,
@@ -1489,6 +1519,14 @@ pub(crate) fn publish_resolved_merge(
     // transaction is moved into it. A fast-forward carries no change and
     // installs nothing.
     let published_changes = transaction.changes.clone();
+    // The merged state takes the incoming side's, which predates the store's
+    // last `kin upgrade` unless that side descends from one of its anchors.
+    crate::hydration_requalify::before_restoring(
+        state,
+        &graph,
+        record.binding.theirs_change,
+        "merge",
+    )?;
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_authored_transaction(
             state.layout.working_dir(),
@@ -2718,6 +2756,9 @@ fn publish(
     // transaction is moved into it. A fast-forward carries no change and
     // installs nothing.
     let published_changes = transaction.changes.clone();
+    // The merged state takes the incoming side's, which predates the store's
+    // last `kin upgrade` unless that side descends from one of its anchors.
+    crate::hydration_requalify::before_restoring(state, &plan.graph, plan.theirs_change, "merge")?;
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),
@@ -4654,6 +4695,47 @@ mod tests {
             "a file the merge did not touch can still have gained a cross-file edge through it, \
              and a sweep that skips the file cannot derive one; the evidence has to be retired so \
              the merge's own sweep visits it"
+        );
+    }
+
+    /// A merge on a store with filesystem reconcile off retires the evidence
+    /// too, while still queueing nothing and saying nothing.
+    ///
+    /// There is no sweep to run there, so silence is right. But the merge
+    /// replaced whatever language-server enrichment the workspace overlay held,
+    /// and a marker left standing would make the first sweep after reconcile
+    /// comes back skip the file whose edges the merge dropped.
+    #[test]
+    fn a_graph_only_merge_still_retires_the_enrichment_evidence_it_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, mut rx) = enriching_state(init.layout.clone());
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::daemon::mark_files_enriched(
+            &state,
+            &["ledger/printing.py".to_string()],
+            crate::daemon::current_marker_epoch(&state),
+        );
+        assert!(
+            crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "the fixture has to start marked, or the assertion below proves nothing"
+        );
+
+        assert_eq!(
+            settle_merged_graph(&state),
+            None,
+            "a graph-only store has no sweep to run and nothing to be told"
+        );
+
+        assert!(
+            !crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "the merge dropped this file's enrichment, so its marker has to go with it"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "filesystem-derived relations cannot mutate graph-only authority, so no sweep is queued"
         );
     }
 

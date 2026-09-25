@@ -1,6 +1,6 @@
 {
-  "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what a repository's past is said to contain the next time that repository is admitted. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together. Bumping the version records the decision and every surface now discloses it: kin_core::hydration_semantics persists the version into a store at creation, compares the record when the store is read, and admitting a native transfer pack discards that record because the wire carries no authoring version. Bumping still does not migrate, invalidate or re-enrich a repository that was already admitted.",
-  "hydration_semantics_version": 11,
+  "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what a repository's past is said to contain the next time that repository is admitted. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together. Bumping the version records the decision and every surface now discloses it: kin_core::hydration_semantics persists the version into a store at creation, compares the record when the store is read, and admitting a native transfer pack preserves that record only when the transported authoring version matches; absent or mismatched provenance discards it. Bumping marks every store an earlier build admitted as behind; it re-derives nothing by itself. `kin upgrade` re-derives the state such a store serves through rederive_tree_semantics, records each head's transition as a new change, and leaves the history before it as that history's own build authored it.",
+  "hydration_semantics_version": 31,
   "guarded": [
     {
       "file": "crates/kin-index/src/history.rs",
@@ -19,7 +19,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "semantic_state_for_tree",
-      "digest": "sha256:74a537ed84687ee2c2cfbacafa3e5121374cc960985999b27b8dc8975a89adf6",
+      "digest": "sha256:38e094d530dd61d69634e6e0bf13d282a4e1123927a36f4ba715930d8077e2ce",
       "reason": "Turns one exact resolved tree plus CAS bodies into the entity/relation state a change is diffed from and to. Its classification, parse, and cross-file linking order decide what the past is said to contain.",
       "owner": "kin-index"
     },
@@ -56,6 +56,20 @@
       "function": "stabilize_historical_entities",
       "digest": "sha256:ee7c9abc6215b230dc26f31f98f961e1d89f88e0bdb10e0004990d239d4375ff",
       "reason": "Carries entity identity across changes. Whether an entity is recognized as the same one decides whether history records a modification or an unrelated add and remove pair.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "rederive_tree_semantics",
+      "digest": "sha256:0b455f00d55aeda848e87853f60eda4be7818ce382f8a6ac0a43d0a81acb8937",
+      "reason": "The store upgrade's derivation: it re-runs the replay's state derivation for one head tree, repeating it over its own output until entity identities settle. Its output is the entity and relation state `kin upgrade` records as a head's checkpoint change, and the state the re-derivation verifier compares a committed graph against before it starts a binding-history lineage.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "derive_tree_semantics_once",
+      "digest": "sha256:5bd218c3cdf6d286a6a620bc84eac72c797778a5f7d47fceed874edb0335b5a5",
+      "reason": "Offers a store's held entities to the replay as the parent entities of each file, which decides which declarations keep their identity, lineage and creating change across an upgrade.",
       "owner": "kin-index"
     },
     {
@@ -113,6 +127,277 @@
       "digest": "sha256:bf7a5afa7762f4d0969222749db641216a899f06dd2e97689cf6a84ef32101cd",
       "reason": "Writes the exact source blob digest consumed by span coherence checks in both ingestion conversions; changing this field changes freshly derived historical entity payloads.",
       "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "resolve_import_pinned_target",
+      "digest": "sha256:d23cb4faf222a564e6692eacde1b5ae294eb3bbab918e00f6ffe747145372568",
+      "reason": "Confines an imported occurrence to its declared module during batch history replay; a pinned miss must not acquire an unrelated same-name target.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "resolve_one_file",
+      "digest": "sha256:0dad2579fcdbc0d4f8e12cd8e519f0952a84a0fc8dbad757716fae2aa063c617",
+      "reason": "Authors one historical file's cross-file relations, including source-owner selection, exact import resolution and guarded imported receiver dispatch.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "resolve_same_file_match",
+      "digest": "sha256:dda74ba8feecada83165ec7d9d09414ae47ab2467f2f2915486be5e53ba4abbd",
+      "reason": "Decides whether a relation that matched a same-file entity stops there or is also handed to same-named entities in other files as name-only candidates, and at what confidence the local entity is linked, so it decides which edges replay authors for every same-file match.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "definition_arity_bounds",
+      "digest": "sha256:e14a9dc8d5b56a8cfc9019db19c7bfbf1028f8b0d4da139a225781ff5bc0311a",
+      "reason": "Widens a C++ definition's minimum arity by its same-named declarations before the same-file tier judges a call against it, so it decides whether replay authors a local edge as parser-certain or as a candidate.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "carries_non_rust_import",
+      "digest": "sha256:283c7533fc6bb67ee8f9e024abb7702e9ee1bc09cade55e75c7cf2ae898b526a",
+      "reason": "Decides which same-file matches carry an import of the name they call. During replay such a call links its local match as a candidate rather than a fact and goes on to the import tiers, which resolve the imported binding.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "is_package_qualified_go_call",
+      "digest": "sha256:bc7037dfc0bf7d2dc31e3d513a1fe6ba956b538fe793039eb3819e2f5e2ea02d",
+      "reason": "Decides which Go calls name their callee through an imported package. The same-file tier skips them during replay, so a same-named function in the calling file is never linked as their callee.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "callee_is_declaration",
+      "digest": "sha256:5a4bccd46b571e18e799aad4ac35fee36415ada06e202c67b8f01ca2137811bb",
+      "reason": "Decides which entities are declarations whose bodies live elsewhere. The same-file tier hands a declaration's calls on and the name tiers prefer a definition over it, so it decides which edges replay authors.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "callee_arity_bounds",
+      "digest": "sha256:d63c79b5cf992b8846d66fa4c36fee3a1b097398716f543963aba8c5e1c1d153",
+      "reason": "Reads the C/C++ arity bounds every arity decision in replay linking rests on.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "parse_signature_arity",
+      "digest": "sha256:a79eb28d623e27a89bd4e33f229f31373670883c3df8c9c6d865e047f402db2a",
+      "reason": "Parses the parameter list the arity bounds come from, so a change here moves which overload and which same-file candidate replay links.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "arity_admits",
+      "digest": "sha256:c73c15cef68f004210ab402e458b77516a879b5b9eaf94fa52c7760ca3245dd1",
+      "reason": "Decides whether a callee's arity bounds admit a call's argument count, the test every arity-pruned tier and the same-file settle decision apply during replay.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "is_external_import_placeholder",
+      "digest": "sha256:cec4a3d74eac7254e36ac3de2d8ce6afe482f29f258e9b15970ef331f860849c",
+      "reason": "Decides which inferred imported crossings become persisted external target entities during historical replay; token, source-site and identity validation are semantic evidence.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "make_external_reference_relation",
+      "digest": "sha256:698da5914cb1deab5e83349de6361670c0ee7f67fa7828d247f70e7896f7e415",
+      "reason": "Authors the persisted relation identity and evidence of imported external crossings, including exact-site lazy-getter provenance.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "is_js_imported_getter_receiver",
+      "digest": "sha256:252b0884c7a5996de952f873d4b872ccef71cd2a943fb68eb8163a9688e2d75a",
+      "reason": "Validates the bounded imported-receiver shape that may author an inferred external crossing in history.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-parser/src/languages/javascript_imported_receiver.rs",
+      "function": "annotate",
+      "digest": "sha256:e45d01a3a9767f620c1f83f7e088a638362751185250f9d949140911dcc9454a",
+      "reason": "Attaches imported receiver provenance to exact parsed call occurrences that historical replay consumes; unsupported or contradictory bindings must stay unresolved.",
+      "owner": "kin-parser"
+    },
+    {
+      "file": "crates/kin-parser/src/languages/javascript_imported_receiver.rs",
+      "function": "owner_aliases",
+      "digest": "sha256:d39dc541863c72d219cf0e7166956dcfcabfad9bf0d66c597c9f82197a3b764f",
+      "reason": "Builds the conservative may-alias set used to withdraw imported getter provenance after local alias mutations; changing it changes replayed relations.",
+      "owner": "kin-parser"
+    },
+    {
+      "file": "crates/kin-parser/src/languages/javascript_imported_receiver.rs",
+      "function": "property_replaced",
+      "digest": "sha256:b6e569120b0ab7dd7dc09241d5bb0a171d6677f077aae4f9528fa163b75ed891",
+      "reason": "Vetoes imported getter provenance when supported owner or alias writes contradict the receiver; false acceptance would author an unsupported historical crossing.",
+      "owner": "kin-parser"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "bind_import_witness",
+      "digest": "sha256:323b8f29268ea3cb25594af909549275c473c6611145bc3087d6dd0780e09de0",
+      "reason": "Binds reserved parser controls to exact source entity digests and spans before named-import evidence can affect replay.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "witnessed_import_site",
+      "digest": "sha256:74b94412084162de8a02cd8c40226a85b1ba8a3675752a91b40dda1d69dd07d9",
+      "reason": "Requires the exact lexical site and declared import binding before new named-import resolution.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "resolve_witnessed_import",
+      "digest": "sha256:15bba3d7bb4e43d2ea5195f836f2820a1f05ab51ceb7b033a75f86b2feabbc88",
+      "reason": "Follows bounded source-bound Python reexports and independently justified same-file Rust self imports without a global-name fallback.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "resolve_exact_python_module",
+      "digest": "sha256:8aa6efce6ea4c9f1923df0b59089b96f08b2ac989d064ffc5867dde9d054def1",
+      "reason": "Refuses competing modules/packages/stubs and requires explicit parent package body witnesses.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "qualify_named_import",
+      "digest": "sha256:23428758a1e0051bb66f735794861adf1d4874dad268eaa4facd2a7d8c8cc1c2",
+      "reason": "Authors per-occurrence named-import provenance without changing call-shape certificates.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "qualify_named_import_occurrences",
+      "digest": "sha256:83f7f40e0f9edf93004051b8714e089b4aa04e11f9c3b33e886253714aa265b2",
+      "reason": "Shared writer of the identical source-bound named-import occurrence fields used by linking and exact lifecycle reproduction.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "exact_import_witnesses",
+      "digest": "sha256:91ce418d68b44def06f184850e04410b65352d3f733e32fef1b16287ea8e6d78",
+      "reason": "Refuses duplicate source slices instead of allowing input order to establish witness authority.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "link_cross_file_with_rust_project",
+      "digest": "sha256:3a7f7ecadd8456e7f866325f7e5267b1ec610ec1abf3ff71e2c15543ff7b2502",
+      "owner": "kin-index",
+      "reason": "Binds selected-tree Rust authority to the exact current entity universe before historical linking."
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "link_cross_file_against_entity_refs_with_project",
+      "digest": "sha256:d0624b2f5ebeb6b69ac8ceba3cbaadc156ebf218aebcb8e77f6dd4beece43a78",
+      "owner": "kin-index",
+      "reason": "Supplies shared selected-tree Rust authority to every batch-linked historical source."
+    },
+    {
+      "file": "crates/kin-core/src/ref_view.rs",
+      "function": "rebuild_entity_source_file_layouts",
+      "digest": "sha256:c37cedc9b31665c597afa2d245fafd6fa734f24956482f405e6b3d37140993b3",
+      "owner": "kin-core",
+      "reason": "Reconstructs selected historical semantics and resolves Cargo roots only against that exact selected tree and its CAS."
+    },
+    {
+      "file": "crates/kin-parser/src/import_witness.rs",
+      "function": "append_rust_import_witness",
+      "digest": "sha256:d56ef120a175ac93f5a351607afae7a0f22850b5627cacfd7350a241b24dd74d",
+      "reason": "Root Rust named-import occurrence custody excludes nested uses and supports inline module names without inventing module authority.",
+      "owner": "kin-parser"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "requires_rust_import_authority",
+      "digest": "sha256:3ae780b71bfe7fdcb1035f221fa0e70f56679733de5a747db45a12378b1b52f2",
+      "reason": "Imported Rust callable sites cannot bypass selected project proof through same-file or generic name tiers.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "module_entity_by_file",
+      "digest": "sha256:317b66e8e80ccd2ac2e8167701a957e91ec464ed15cb695a70046f24eb1fe132",
+      "reason": "Selects the Rust file module that owns historical import edges independently of entity identity order.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "make_relation",
+      "digest": "sha256:cc041f117b0b7a89730e2aca3fdc1eee0bd995857a4d133490fbc097ebd6252a",
+      "owner": "kin-index",
+      "reason": "Binds each fresh parser occurrence to its original resolution tier before logical-edge aggregation during replay."
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "qualify_self_dispatch",
+      "digest": "sha256:122c2c717ea38e7aec1cf093370a406a24e704297c1794cb2bf93e4e29d7b581",
+      "owner": "kin-index",
+      "reason": "Amends and rebinds only fresh source occurrences before aggregation of historical dispatch edges."
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "canonicalize_call_evidence",
+      "digest": "sha256:e675a2ae0cb350931c12b3a847eb6cdd344404ea59b0d4302eb13f6bf03233bd",
+      "owner": "kin-index",
+      "reason": "Canonicalizes original occurrence multiplicity and span-free authority records without counting metadata as calls."
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "go_receiver_owner_source",
+      "digest": "sha256:73853760de8761a6006acb9bc0edd7f7ac2fb52d12489793a50c20c408796aa0",
+      "owner": "kin-index",
+      "reason": "Binds Go methods to the unique receiver type in the admitted package and withholds ambiguous ownership during historical relation derivation."
+    },
+    {
+      "file": "crates/kin-index/src/linker.rs",
+      "function": "resolve_one_file_incremental",
+      "digest": "sha256:860e71d9c558ad5d53abe12b796a3f5816cb9a704385229e315cd6274d84e57e",
+      "owner": "kin-index",
+      "reason": "Maintains the live and restored-checkpoint authoring arm with the same admitted owner selection and occurrence authority as batch derivation."
+    }
+  ],
+  "guarded_files": [
+    {
+      "file": "crates/kin-index/src/rust_project.rs",
+      "digest": "sha256:c573e39f1c767380a7f0b69a887f752b8560eaf3f3e99c496b061df42296487a",
+      "owner": "kin-index",
+      "reason": "Authors exact admitted Cargo/module authority, semantic identity binding, visibility-aware named resolution and integrity versus unsupported observations; its method bodies change historical relations."
+    },
+    {
+      "file": "crates/kin-index/src/rust_project/targets.rs",
+      "digest": "sha256:4161e8af874cdfd771f42f4b4a4359f59750b5a1d8ad85a2d456c45263d7b17b",
+      "owner": "kin-index",
+      "reason": "Discovers Cargo target roots and workspace-edition membership from the complete selected tree; changes alter which crate contexts can author historical bindings."
+    },
+    {
+      "file": "crates/kin-index/src/rust_project/syntax.rs",
+      "digest": "sha256:1e554d2d85317f2ee6c7e38b1bc3cb95ed3da3b723635b75ca963627a54a1ac7",
+      "owner": "kin-index",
+      "reason": "Extracts exhaustive supported module/import/declaration facts from exact Rust bodies; refusal and visibility rules bound historical named-import authority."
+    },
+    {
+      "file": "crates/kin-index/src/occurrence.rs",
+      "digest": "sha256:492ff78d95be9a9af89923efd7cbaa931e448c4a8464ccb751fe4d20969a0bba",
+      "owner": "kin-index",
+      "reason": "Authors and validates durable per-occurrence resolution bound to original evidence, logical edge identity and endpoints, including deterministic canonical merge semantics."
+    }
+  ],
+  "same_epoch_changes": [
+    {
+      "file": "crates/kin-index/src/occurrence.rs",
+      "digest": "sha256:492ff78d95be9a9af89923efd7cbaa931e448c4a8464ccb751fe4d20969a0bba",
+      "reason": "The previously added certificate wrapper, proof retirement helper and tests do not change historical replay. The retirement helper is used only by the daemon's LSP union; existing replay functions are unchanged. Version 31 is independently required by the Python workspace-scope upgrade."
     }
   ]
 }

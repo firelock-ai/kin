@@ -20,9 +20,33 @@ async fn source_base_commit_operation(
     tool_result_payload(&result)
 }
 
+/// Explicit legacy conversion fixture boundary, compiled only in daemon tests.
+/// The production MCP route never accepts these source-tree operations.
+async fn source_tree_conversion_fixture(
+    state: &Arc<DaemonState>,
+    operation: serde_json::Value,
+) -> serde_json::Value {
+    let session = mcp_test_session(state);
+    let tx = mcp_lifecycle_begin(state, &session).await;
+    let _coordination = state.coordination_gate.lock().await;
+    let _authority = state.begin_graph_authority_mutation();
+    let sessions = mcp_session_registry_snapshot(state).unwrap();
+    let args = serde_json::from_value(serde_json::json!({
+        "transaction_id": tx, "operations": [operation]
+    })).unwrap();
+    let result = crate::mcp_commit::tests::commit_conversion_fixture(
+        state, &sessions, &args, None,
+    );
+    persist_mcp_lifecycle_transactions(state, &sessions).unwrap();
+    assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
+    // Mirror the served API's terminal eviction after fixture publication.
+    crate::api::forget_mcp_transaction(state, &tx);
+    tool_result_payload(&result)
+}
+
 async fn source_base_fixture() -> (tempfile::TempDir, Arc<DaemonState>, serde_json::Value) {
     let (dir, state) = mcp_lifecycle_fixture();
-    source_base_commit_operation(&state, serde_json::json!({
+    source_tree_conversion_fixture(&state, serde_json::json!({
         "verb": "create", "target": "src/value.rs", "body": SOURCE_BASE_ORIGINAL, "description": "original source"
     })).await;
     let entity = state
@@ -33,7 +57,7 @@ async fn source_base_fixture() -> (tempfile::TempDir, Arc<DaemonState>, serde_js
         })
         .unwrap()
         .into_iter()
-        .find(|entity| entity.name == "value")
+        .find(|entity| entity.name == "value" && entity.kind != kin_model::EntityKind::Module)
         .unwrap();
     let source = mcp_call(
         router(Arc::clone(&state)),
@@ -56,6 +80,77 @@ fn source_base_operation(source: &serde_json::Value) -> serde_json::Value {
         "verb": "update", "target": source["id"], "body": SOURCE_BASE_EDIT,
         "payload": { "EntitySourceBase": source["source_base"] }, "description": "guarded editor change"
     })
+}
+
+/// Read an entity's current source through the agent route. The payload
+/// carries its `id`, its `body` and the `source_base` a guarded whole-entity
+/// replacement sends back unchanged. A base names one workspace revision, so
+/// any commit after this read makes it stale.
+async fn source_base_read(
+    state: &Arc<DaemonState>,
+    entity_id: &serde_json::Value,
+) -> serde_json::Value {
+    let source = mcp_call(
+        router(Arc::clone(state)),
+        "get_entity_source",
+        serde_json::json!({ "entity_id": entity_id }),
+    )
+    .await;
+    assert_ne!(source.is_error, Some(true), "{}", mcp_result_text(&source));
+    let source = tool_result_payload(&source);
+    assert_eq!(
+        source["source_base"]["schema"], "kin.entity.source_base.v1",
+        "{source}"
+    );
+    source
+}
+
+/// Resolve the one declaration named exactly `name` to its entity, then read
+/// its current source. Resolving is the caller's step, as it is for an agent:
+/// a whole-entity replacement names its entity by id and carries the base the
+/// read returned.
+async fn source_base_read_named(state: &Arc<DaemonState>, name: &str) -> serde_json::Value {
+    let named = state
+        .graph
+        .query_entities(&kin_model::EntityFilter {
+            name_pattern: Some(name.into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .filter(|entity| entity.name == name && entity.kind != kin_model::EntityKind::Module)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named.len(),
+        1,
+        "exactly one declaration is named {name}: {named:?}"
+    );
+    source_base_read(state, &serde_json::json!(named[0].id)).await
+}
+
+/// A guarded whole-entity replacement: `body` becomes the complete source of
+/// the entity `source` was read from, admitted only while that read is current.
+fn source_base_replacement(
+    source: &serde_json::Value,
+    body: &str,
+    description: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "verb": "update", "target": source["id"], "body": body,
+        "payload": { "EntitySourceBase": source["source_base"] }, "description": description
+    })
+}
+
+/// Commit a guarded replacement of `entity_id` against a fresh read, the way an
+/// agent lands an edit after other work has moved the workspace.
+async fn source_base_commit_fresh(
+    state: &Arc<DaemonState>,
+    entity_id: &serde_json::Value,
+    body: &str,
+    description: &str,
+) -> serde_json::Value {
+    let current = source_base_read(state, entity_id).await;
+    source_base_commit_operation(state, source_base_replacement(&current, body, description)).await
 }
 
 async fn source_base_stage(state: &Arc<DaemonState>, operation: serde_json::Value) -> String {
@@ -135,12 +230,14 @@ async fn source_base_assert_conflict(
 async fn mcp_source_base_exact_read_stage_restart_commit_and_receipt_replay() {
     let (dir, state, source) = source_base_fixture().await;
     let tx = source_base_stage(&state, source_base_operation(&source)).await;
+    let owner = retained_transaction_value(&state, &tx)["session_id"].as_str().unwrap().to_string();
     let layout = state.layout.clone();
     drop(state);
     let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
     state
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    reregister_transaction_owner(&state, &owner).await;
     let result = mcp_call(
         router(Arc::clone(&state)),
         "kin_transaction_commit",
@@ -160,7 +257,13 @@ async fn mcp_source_base_exact_read_stage_restart_commit_and_receipt_replay() {
         std::fs::read_to_string(dir.path().join("src/value.rs")).unwrap(),
         SOURCE_BASE_ORIGINAL.replacen("{ 1 }", "{ 2 }", 1)
     );
-    source_base_commit_operation(&state, serde_json::json!({"verb":"update", "target":source["id"], "body":"pub fn value() -> u8 { 3 }", "description":"later work"})).await;
+    source_base_commit_fresh(
+        &state,
+        &source["id"],
+        "pub fn value() -> u8 { 3 }",
+        "later work",
+    )
+    .await;
     let later = source_base_roots(&state);
     drop(state);
     let reopened = Arc::new(DaemonState::open(layout).unwrap());
@@ -204,10 +307,16 @@ async fn mcp_source_base_refuses_stale_body_branch_and_deleted_entity_without_lo
         let tx = source_base_stage(&state, operation.clone()).await;
         match change {
             "body" => {
-                source_base_commit_operation(&state, serde_json::json!({"verb":"update", "target":source["id"], "body":"pub fn value() -> u8 { 9 }", "description":"concurrent edit"})).await;
+                source_base_commit_fresh(
+                    &state,
+                    &source["id"],
+                    "pub fn value() -> u8 { 9 }",
+                    "concurrent edit",
+                )
+                .await;
             }
             "delete" => {
-                source_base_commit_operation(&state, serde_json::json!({"verb":"delete", "target":"src/value.rs", "description":"retire source"})).await;
+                source_tree_conversion_fixture(&state, serde_json::json!({"verb":"delete", "target":"src/value.rs", "description":"retire source"})).await;
             }
             _ => {
                 let name = kin_model::RefName::branch(b"other").unwrap();
@@ -288,17 +397,20 @@ async fn mcp_source_base_replaced_repository_and_unknown_protocol_fail_closed() 
 
 #[tokio::test]
 async fn mcp_source_base_inline_conflict_durably_retains_the_attempted_body() {
-    let (_dir, state, source) = source_base_fixture().await;
+    let (dir, state, source) = source_base_fixture().await;
     let operation = source_base_operation(&source);
-    source_base_commit_operation(
+    source_base_commit_fresh(
         &state,
-        serde_json::json!({
-            "verb": "update", "target": source["id"], "body": "pub fn value() -> u8 { 9 }",
-            "description": "concurrent edit before inline attempt"
-        }),
+        &source["id"],
+        "pub fn value() -> u8 { 9 }",
+        "concurrent edit before inline attempt",
     )
     .await;
     let tx = mcp_lifecycle_begin(&state, &mcp_test_session(&state)).await;
+    let owner = retained_transaction_value(&state, &tx)["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let before = source_base_roots(&state);
     let result = mcp_call(
         router(Arc::clone(&state)),
@@ -323,6 +435,42 @@ async fn mcp_source_base_inline_conflict_durably_retains_the_attempted_body() {
             .len(),
         1
     );
+    let retained = retained_transaction_value(&reopened, &tx);
+    let mirror = crate::state::mcp_transactions_disk_path(&reopened.layout);
+    let persisted = std::fs::read(&mirror).unwrap();
+    let current_body = std::fs::read(dir.path().join("src/value.rs")).unwrap();
+    let owner_id = SessionId(Uuid::parse_str(&owner).unwrap());
+    assert!(reopened
+        .coordinator
+        .get_session(&owner_id)
+        .unwrap()
+        .is_none());
+    let refused = mcp_call_as(
+        router(Arc::clone(&reopened)),
+        "kin_transaction_commit",
+        serde_json::json!({"transaction_id":tx}),
+        owner_id,
+    )
+    .await;
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "{}",
+        mcp_result_text(&refused)
+    );
+    assert!(mcp_result_text(&refused).contains("Session not found"));
+    assert_eq!(retained_transaction_value(&reopened, &tx), retained);
+    assert_eq!(std::fs::read(&mirror).unwrap(), persisted);
+    assert_eq!(source_base_roots(&reopened), before);
+    assert_eq!(
+        std::fs::read(dir.path().join("src/value.rs")).unwrap(),
+        current_body
+    );
+    reregister_transaction_owner(&reopened, &owner).await;
+    assert_eq!(retained_transaction_value(&reopened, &tx), retained);
+    assert_eq!(std::fs::read(&mirror).unwrap(), persisted);
+    assert_eq!(source_base_roots(&reopened), before);
+    // Fresh ownership does not authorize publishing the stale source base.
     source_base_assert_conflict(&reopened, &tx, &operation).await;
 }
 
@@ -353,7 +501,7 @@ async fn mcp_source_base_historical_sessions_never_receive_a_current_write_expec
     )
     .unwrap();
     // The historical focal body and span still match HEAD byte-for-byte.
-    source_base_commit_operation(
+    source_tree_conversion_fixture(
         &state,
         serde_json::json!({
             "verb": "create", "target": "src/later.rs", "body": "pub fn later() {}\n",
@@ -436,12 +584,14 @@ async fn mcp_source_base_historical_sessions_never_receive_a_current_write_expec
     }
     assert_eq!(source_base_roots(&state), before);
 
-    source_base_commit_operation(
+    // The fixture's base predates the history advanced above, so the current
+    // edit reads the version it replaces again, as HEAD rather than as the
+    // historical session.
+    source_base_commit_fresh(
         &state,
-        serde_json::json!({
-            "verb":"update", "target":source["id"], "body":"pub fn value() -> u8 { 9 }",
-            "description":"make current source diverge from the selected historical revision"
-        }),
+        &source["id"],
+        "pub fn value() -> u8 { 9 }",
+        "make current source diverge from the selected historical revision",
     )
     .await;
     let before = source_base_roots(&state);
@@ -463,4 +613,36 @@ async fn mcp_source_base_historical_sessions_never_receive_a_current_write_expec
         }
     }
     assert_eq!(source_base_roots(&state), before);
+}
+
+#[tokio::test]
+async fn semantic_retained_conversion_refuses_validation_and_inline_append_without_growth() {
+    let (_dir, state, source) = source_base_fixture().await;
+    let session = mcp_test_session(&state);
+    let tx = mcp_lifecycle_begin(&state, &session).await;
+    let sessions = mcp_session_registry_snapshot(&state).unwrap();
+    let old = kin_mcp::session::parse_staged_operations(&serde_json::json!([{
+        "verb":"create", "target":"src/legacy.rs", "body":"pub fn legacy() {}\n",
+        "description":"retained work from an older client"
+    }])).unwrap();
+    sessions.stage_transaction(&tx, old).unwrap();
+    persist_mcp_lifecycle_transactions(&state, &sessions).unwrap();
+    let retained = retained_transaction_value(&state, &tx);
+    let mirror = crate::state::mcp_transactions_disk_path(&state.layout);
+    let bytes = std::fs::read(&mirror).unwrap();
+    let roots = source_base_roots(&state);
+    for tool in ["kin_transaction_validate", "kin_transaction_commit", "kin_transaction_commit"] {
+        let mut args = serde_json::json!({"transaction_id":tx});
+        if tool == "kin_transaction_commit" {
+            args["operations"] = serde_json::json!([source_base_operation(&source)]);
+        }
+        let result = mcp_call(router(Arc::clone(&state)), tool, args).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(mcp_result_text(&result).contains("semantic_operation_required"));
+        assert_eq!(retained_transaction_value(&state, &tx), retained);
+        assert_eq!(std::fs::read(&mirror).unwrap(), bytes);
+        assert_eq!(source_base_roots(&state), roots);
+    }
+    let reopened = DaemonState::open(state.layout.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&reopened.mcp_transactions.lock().unwrap()[&tx]).unwrap(), retained);
 }

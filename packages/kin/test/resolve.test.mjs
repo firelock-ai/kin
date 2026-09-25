@@ -59,6 +59,13 @@ test('compareVersions treats unparseable segments as 0 instead of throwing', () 
   assert.equal(compareVersions('1.x.0', '1.0.0'), 0);
 });
 
+test('compareVersions ignores build metadata for release and prerelease precedence', () => {
+  assert.equal(compareVersions('1.2.3+build.2', '1.2.3+build.1'), 0);
+  assert.equal(compareVersions('1.2.3-rc.1+build', '1.2.3-rc.1'), 0);
+  assert.equal(compareVersions('1.2.3-rc.1', '1.2.3-rc.1+build'), 0);
+  assert.equal(compareVersions('1.2.3-rc.1+build.99', '1.2.3-rc.2'), -1);
+});
+
 test('platformTarget maps every supported host to a Rust triple', () => {
   assert.equal(platformTarget('darwin', 'arm64'), 'aarch64-apple-darwin');
   assert.equal(platformTarget('darwin', 'x64'), 'x86_64-apple-darwin');

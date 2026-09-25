@@ -67,6 +67,12 @@ EMBED_WORKER_MARKER = "embedding worker started"
 # in which the old behavior was visible.
 WATCH_SECONDS = 45.0
 
+# Every fixture repository this run created, with the environment its kin ran
+# under, and every stop made in one. Filled before any init, so a repository
+# whose init failed is still stopped, and read by the cleanup row.
+OWNED_REPOS: dict[str, dict] = {}
+STOP_RECORDS: list[dict] = []
+
 
 def emit(check_id: str, status: str, detail: str) -> dict:
     print(f"CHECK {check_id} {TICKET} {status} {detail}", flush=True)
@@ -139,6 +145,7 @@ def build_fixture(root: Path, kin: str, env: dict) -> Path:
     """A committed repository with entities and no vectors."""
     repo = root / "repo"
     repo.mkdir(parents=True)
+    OWNED_REPOS[str(repo)] = env
     for i in range(24):
         (repo / f"mod_{i:02d}.py").write_text(
             f'"""Module {i}."""\n\n\n'
@@ -265,8 +272,7 @@ def session(kin: str, daemon_bin: str, repo: Path, kin_home: Path, cwd: Path,
         "stderr": (proc.stderr.read() or "")[-4000:],
         "stdout": "".join(stdout_lines)[-4000:],
     }
-    subprocess.run([kin, "daemon", "stop"], cwd=str(repo), env=env,
-                   capture_output=True, text=True)
+    stop_owned_repo(kin, repo, env)
     return result
 
 
@@ -454,11 +460,100 @@ def self_test() -> int:
     return 0
 
 
+def cleanup_result(status: str, detail: str, ident: str = "cleanup") -> dict:
+    row = emit(ident, status, detail)
+    row["title"] = "fixture workers stopped and endpoints retired"
+    return row
+
+
+def stop_confirmed(rc, report) -> bool:
+    """A successful exit alone does not prove that a worker was retired."""
+    if not isinstance(report, dict):
+        return False
+    stopped = report.get("stopped")
+    return (rc == 0 and isinstance(stopped, list)
+            and report.get("schema") == "kin.daemon-stop.v1"
+            and report.get("scope") == "current-repo"
+            and report.get("all_stopped") is True
+            and report.get("endpoints_retired", not stopped) is True
+            and all(isinstance(row, dict)
+                    and row.get("result") in ("stopped", "not-running")
+                    and "preserved_endpoint" not in row for row in stopped))
+
+
+def finish_run_root(workdir: Path, results: list[dict], keep: bool,
+                    explicit: bool = False) -> dict:
+    """Only a successful, stopped, disposable run may lose its fixtures."""
+    reasons = []
+    if keep:
+        reasons.append("--keep")
+    if explicit:
+        reasons.append("caller-owned workdir")
+    if not results or any(row["status"] != "PASS" for row in results):
+        reasons.append("failed or unreadable check or cleanup")
+    if not reasons:
+        try:
+            shutil.rmtree(workdir)
+        except OSError as error:
+            results.append(cleanup_result("FAIL", f"fixture removal failed: {error}",
+                                          ident="cleanup-root"))
+            reasons.append("fixture removal failed; remaining evidence retained")
+    if reasons:
+        print(f"fixtures kept at {workdir} ({'; '.join(reasons)})", flush=True)
+    return {"run_root": str(workdir), "run_root_retained": bool(reasons),
+            "run_root_retention_reason": "; ".join(reasons) if reasons
+            else "successful disposable run"}
+
+
+def stop_owned_repo(kin: str, repo: Path, env: dict) -> dict:
+    """Stop one fixture repository's daemon and record what the stop reported."""
+    record: dict = {"repo": str(repo)}
+    STOP_RECORDS.append(record)
+    # Never let discovery walk upward and select an unrelated repository.
+    if not (repo / ".kin" / "manifest.json").is_file():
+        record["error"] = "fixture manifest missing; stop was not attempted"
+        return record
+    try:
+        proc = subprocess.run([kin, "daemon", "stop", "--json"], cwd=str(repo), env=env,
+                              capture_output=True, text=True, timeout=60)
+        record.update({"returncode": proc.returncode, "stdout": proc.stdout,
+                       "stderr": proc.stderr})
+        report = json.loads(proc.stdout) if proc.returncode == 0 else None
+        if not stop_confirmed(proc.returncode, report):
+            record["error"] = "worker stop and endpoint retirement were not confirmed"
+    except Exception as error:  # noqa: BLE001  (a stop that raised is a cleanup FAIL)
+        record["error"] = f"{type(error).__name__}: {error}"
+    return record
+
+
+def shutdown(kin: str, workdir: Path) -> dict:
+    """Stop any owned repository no arm stopped, and report every stop.
+
+    Each arm stops its own repository inside `session`. A repository whose
+    initialization failed never reached one, so it is stopped here.
+    """
+    stopped = {record["repo"] for record in STOP_RECORDS}
+    for repo, env in sorted(OWNED_REPOS.items()):
+        if repo not in stopped:
+            stop_owned_repo(kin, Path(repo), env)
+    evidence = workdir / "daemon-cleanup.json"
+    with open(evidence, "w", encoding="utf-8") as handle:
+        json.dump(STOP_RECORDS, handle, indent=2)
+        handle.write("\n")
+    errors = [f"{record['repo']}: {record['error']}"
+              for record in STOP_RECORDS if "error" in record]
+    detail = ("; ".join(errors) + f"; see {evidence}" if errors else
+              f"{len(STOP_RECORDS)} owned fixture workers stopped and endpoints retired")
+    return cleanup_result("FAIL" if errors else "PASS", detail)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kin", help="path to the kin binary under test")
     parser.add_argument("--daemon", help="path to the kin-daemon binary under test")
     parser.add_argument("--json", dest="json_out", help="write the report here")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the run root whatever the result")
     parser.add_argument("--self-test", action="store_true",
                         help="falsify this suite's graders and exit")
     args = parser.parse_args()
@@ -472,6 +567,11 @@ def main() -> int:
     kin = str(Path(args.kin).resolve())
     daemon_bin = str(Path(args.daemon).resolve())
     workdir = Path(tempfile.mkdtemp(prefix="kin-fir3099-"))
+    print(f"run root: {workdir}", flush=True)
+    OWNED_REPOS.clear()
+    STOP_RECORDS.clear()
+    results: list[dict] | None = None
+    retention: dict = {}
     try:
         results = [
             check_handshake_starts_no_daemon(kin, daemon_bin, workdir),
@@ -483,11 +583,22 @@ def main() -> int:
         print(f"CHECK suite {TICKET} UNREADABLE could not start: {err}", flush=True)
         return 3
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        try:
+            cleanup = shutdown(kin, workdir)
+        except Exception as error:  # noqa: BLE001  (a cleanup that raised is a FAIL)
+            cleanup = cleanup_result("FAIL", f"cleanup raised: {error}")
+        if results is None:
+            graded = [emit_row("suite", "UNREADABLE", "could not start"), cleanup]
+        else:
+            results.append(cleanup)
+            graded = results
+        retention = finish_run_root(workdir, graded, args.keep)
 
     if args.json_out:
+        payload = report_payload(results)
+        payload.update(retention)
         with open(args.json_out, "w", encoding="utf-8") as handle:
-            json.dump(report_payload(results), handle, indent=2)
+            json.dump(payload, handle, indent=2)
 
     print(
         f"SUITE {TICKET} graded={sum(1 for r in results if r['status'] in ('PASS', 'FAIL'))}"

@@ -1933,6 +1933,13 @@ pub(crate) fn other_registered_worktrees(
 /// its commits arrive through `refs/heads/<branch>` like any other. A sibling
 /// at a detached HEAD, or holding its own refs, can anchor commits no shared
 /// ref reaches, and migrating away from that object database would drop them.
+/// So a detached sibling is judged by its commit, not its shape: when a walk
+/// from the same reference store and HEAD the capture reads reaches that
+/// commit, the capture already carries it and the sibling is tolerated like
+/// one on a shared branch. Only a commit nothing published reaches is refused,
+/// naming the commit and the one command that keeps it. That is the common
+/// case for every `git worktree add --detach`, a review checkout of a pushed
+/// commit and a pool entry parked at main, none of which anchors anything new.
 ///
 /// Concurrency needs no rule here. The capture re-reads refs and HEAD after
 /// walking the object closure, and [`preflight_git_migration`] observes the
@@ -1946,10 +1953,18 @@ pub(crate) fn classify_other_worktrees(
     repo: &gix::Repository,
     worktrees: Vec<RegisteredGitWorktreeFact>,
 ) -> Result<(Vec<RegisteredGitWorktreeFact>, Vec<UntolerableGitWorktree>)> {
+    let detached = worktrees
+        .iter()
+        .filter_map(|worktree| match read_worktree_head(&worktree.git_dir) {
+            Ok(WorktreeHead::Detached(id)) => Some(id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let reachable = reachable_from_published_refs(repo, &detached)?;
     let mut tolerated = Vec::new();
     let mut untolerable = Vec::new();
     for worktree in worktrees {
-        match untolerable_worktree_state(repo, &worktree)? {
+        match untolerable_worktree_state(repo, &worktree, &reachable)? {
             Some((reason, remedy)) => untolerable.push(UntolerableGitWorktree {
                 worktree,
                 reason,
@@ -1965,6 +1980,7 @@ pub(crate) fn classify_other_worktrees(
 fn untolerable_worktree_state(
     repo: &gix::Repository,
     worktree: &RegisteredGitWorktreeFact,
+    reachable: &BTreeSet<gix::ObjectId>,
 ) -> Result<Option<(String, String)>> {
     let git_dir = &worktree.git_dir;
     // A reftable worktree keeps its refs in a format this boundary does not
@@ -2004,12 +2020,17 @@ fn untolerable_worktree_state(
         )));
     }
     match read_worktree_head(git_dir)? {
-        WorktreeHead::Detached => Ok(Some((
-            "is checked out at a detached HEAD, which no shared ref names, so the capture cannot \
-             prove it carries that worktree's commits"
-                .to_string(),
-            "check that worktree out on a branch, or remove it with 'git worktree remove'"
-                .to_string(),
+        WorktreeHead::Detached(id) if reachable.contains(&id) => Ok(None),
+        WorktreeHead::Detached(id) => Ok(Some((
+            format!(
+                "is checked out at a detached HEAD, commit {id}, which no shared ref reaches, \
+                 so migrating away from this object database would drop that commit"
+            ),
+            format!(
+                "keep the commit on a branch with 'git -C {} switch -c <branch>', or remove \
+                 the worktree with 'git worktree remove', then run kin init again",
+                worktree.path.display()
+            ),
         ))),
         WorktreeHead::Branch(name) => {
             if shared_branch_exists(repo, &name) {
@@ -2038,7 +2059,7 @@ enum WorktreeHead {
     /// Symbolic at a full ref name.
     Branch(Vec<u8>),
     /// Directly at an object.
-    Detached,
+    Detached(gix::ObjectId),
     Unreadable(String),
 }
 
@@ -2059,7 +2080,13 @@ fn read_worktree_head(git_dir: &Path) -> Result<WorktreeHead> {
         .rposition(|byte| !matches!(byte, b'\n' | b'\r'))
         .map_or(&bytes[..0], |last| &bytes[..=last]);
     let Some(target) = trimmed.strip_prefix(b"ref: ") else {
-        return Ok(WorktreeHead::Detached);
+        return Ok(match gix::ObjectId::from_hex(trimmed) {
+            Ok(id) => WorktreeHead::Detached(id),
+            Err(_) => WorktreeHead::Unreadable(format!(
+                "detached HEAD {} is not an object id",
+                String::from_utf8_lossy(trimmed)
+            )),
+        });
     };
     let target = target.strip_prefix(b" ").unwrap_or(target);
     if !target.starts_with(b"refs/") {
@@ -2069,6 +2096,58 @@ fn read_worktree_head(git_dir: &Path) -> Result<WorktreeHead> {
         )));
     }
     Ok(WorktreeHead::Branch(target.to_vec()))
+}
+
+/// Which of `targets` a commit walk from the capture's own tips reaches.
+///
+/// The capture carries the closure of the source's reference store and its
+/// HEAD, so these are exactly the tips walked here. Refs that do not peel to a
+/// commit, such as a tag of a tree, anchor no commit and are skipped. The walk
+/// stops once every target is seen, so a sibling parked at a recent commit
+/// costs a few steps and only an unreachable one walks the whole history.
+fn reachable_from_published_refs(
+    repo: &gix::Repository,
+    targets: &BTreeSet<gix::ObjectId>,
+) -> Result<BTreeSet<gix::ObjectId>> {
+    let mut found = BTreeSet::new();
+    if targets.is_empty() {
+        return Ok(found);
+    }
+    let platform = repo
+        .references()
+        .map_err(|error| preflight_error(format!("open reference store: {error}")))?;
+    let references = platform
+        .all()
+        .map_err(|error| preflight_error(format!("iterate refs: {error}")))?;
+    let mut tips = BTreeSet::new();
+    for reference in references {
+        let mut reference =
+            reference.map_err(|error| preflight_error(format!("read ref: {error}")))?;
+        if let Ok(commit) = reference.peel_to_commit() {
+            tips.insert(commit.id);
+        }
+    }
+    if let Ok(head) = repo.head_id() {
+        tips.insert(head.detach());
+    }
+    if tips.is_empty() {
+        return Ok(found);
+    }
+    let walk = repo
+        .rev_walk(tips)
+        .all()
+        .map_err(|error| preflight_error(format!("walk published history: {error}")))?;
+    for info in walk {
+        let info =
+            info.map_err(|error| preflight_error(format!("walk published history: {error}")))?;
+        if targets.contains(&info.id) {
+            found.insert(info.id);
+            if found.len() == targets.len() {
+                break;
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Whether a branch the sibling names is one the capture's reference store
@@ -4996,6 +5075,11 @@ mod tests {
                 other.to_str().expect("utf8 test path"),
             ],
         );
+        // A commit made at that detached HEAD is anchored nowhere else.
+        git(
+            &other,
+            &["commit", "--allow-empty", "-m", "anchored only here"],
+        );
         let (snapshot, plan) = snapshot_plan(&worktrees.repo, &worktrees.store);
         let error = preflight_git_migration(&worktrees.repo, &snapshot, &plan, &worktrees.store)
             .expect_err("additional worktree blocker");
@@ -5009,7 +5093,7 @@ mod tests {
                     stable_path(&other)
                 );
                 assert!(worktrees[0].reason.contains("detached HEAD"), "{rendered}");
-                assert!(!worktrees[0].remedy.is_empty(), "{rendered}");
+                assert!(worktrees[0].remedy.contains("switch -c"), "{rendered}");
             }
             error => panic!("unexpected error: {error:?}"),
         }
@@ -5043,6 +5127,36 @@ mod tests {
         let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
         let proof = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
             .expect("an idle sibling worktree is tolerated");
+        assert_eq!(proof.compatibility.other_registered_worktrees.len(), 1);
+        assert_eq!(
+            stable_path(&proof.compatibility.other_registered_worktrees[0].path),
+            stable_path(&other)
+        );
+    }
+
+    /// A sibling at a detached HEAD the published refs reach is proved, not
+    /// refused.
+    ///
+    /// `git worktree add --detach` parks the sibling at the current commit, which
+    /// `refs/heads/*` already carries, so the capture misses nothing by admitting
+    /// the source beside it. This is also the shape of a pool entry parked at main.
+    #[test]
+    fn a_detached_linked_worktree_at_a_published_commit_is_proved_and_recorded() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("parked-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+
+        let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
+        let proof = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
+            .expect("a detached sibling at a published commit is tolerated");
         assert_eq!(proof.compatibility.other_registered_worktrees.len(), 1);
         assert_eq!(
             stable_path(&proof.compatibility.other_registered_worktrees[0].path),

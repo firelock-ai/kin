@@ -55,6 +55,14 @@ PORTED_VALIDATOR = (
     / "validate.mjs"
 )
 PREFLIGHT_DRIVER = ROOT / "scripts" / "release-proof" / "bin" / "kin-release-preflight"
+PORTED_PROOF_FLOW = (
+    ROOT
+    / "scripts"
+    / "release-proof"
+    / "bin"
+    / "kin-release-preflight.d"
+    / "proof-flow.sh"
+)
 
 # A release tag freezes the workflow that its run will execute. Keep every
 # runner selected by the pretag build, tag mint, tagged release, recovery and
@@ -1000,11 +1008,11 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/rc-build.yml",
         "build",
-    ): "ef55f31e1fbf929910766fe3b1cdfc964aeda3c56a35ec336772b7964e77ae93",
+    ): "3752b53d0a5a3297c2cca3c529999836d93e5502bcee2da04c592861ff7cdcce",
     (
         ".github/workflows/rc-build.yml",
         "capability",
-    ): "3e7512c3b44ab447531be464599f6237bff7efe798d54728c012676a7c3aed23",
+    ): "dfd5ec09bf9ff8cd1ad4bcba0801b372f9e9f32f54f165f5fc4c57046e6dd893",
     (
         ".github/workflows/release-cut.yml",
         "preflight",
@@ -1899,9 +1907,17 @@ VALIDATOR_HOME = "__VALIDATOR_HOME__"
 VALIDATOR_PROOF = "__VALIDATOR_PROOF__"
 
 
+# The profiles setup assigns, as the install proof's validators expect them:
+# Claude Code keeps agent-default, and every client that resends each tool with
+# every request gets the routed profile.
+DEFAULT_PROFILE = "agent-default"
+ROUTED_PROFILE = "agent-routed"
+
+
 def validator_mcp_entry(
     executable: str,
     *,
+    profile: str,
     repo: str | None = None,
     cwd: str | None = None,
     extra_env: dict[str, str] | None = None,
@@ -1914,7 +1930,7 @@ def validator_mcp_entry(
         "args": args,
         "env": {
             **(extra_env or {}),
-            "KIN_MCP_TOOL_PROFILE": "agent-default",
+            "KIN_MCP_TOOL_PROFILE": profile,
         },
     }
     if cwd is not None:
@@ -1926,16 +1942,34 @@ def validator_mcp_config(entry: dict[str, object]) -> dict[str, object]:
     return {"mcpServers": {"kin": entry}}
 
 
+def swapped_agent_profile(fixture: dict[str, object], path: str) -> str:
+    """Return the agent profile a fixture's MCP entry does not carry.
+
+    A `full` drift fails a validator that accepts any agent profile in every
+    entry just as it fails a correct one. Swapping the entry to the other agent
+    profile is what shows the validator holds each client to its own.
+    """
+
+    env = fixture[path]["mcpServers"]["kin"]["env"]  # type: ignore[index]
+    profile = env["KIN_MCP_TOOL_PROFILE"]  # type: ignore[index]
+    return ROUTED_PROFILE if profile == DEFAULT_PROFILE else DEFAULT_PROFILE
+
+
 def validator_windows_mcp_home_fixture() -> dict[str, object]:
     """Return every repo-free Windows JSON MCP config."""
 
     executable = f"{VALIDATOR_HOME}/.kin/bin/kin.exe"
-    config = validator_mcp_config(validator_mcp_entry(executable))
+    claude = validator_mcp_config(
+        validator_mcp_entry(executable, profile=DEFAULT_PROFILE)
+    )
+    routed = validator_mcp_config(
+        validator_mcp_entry(executable, profile=ROUTED_PROFILE)
+    )
     return {
-        ".claude.json": copy.deepcopy(config),
-        ".cursor/mcp.json": copy.deepcopy(config),
-        ".gemini/settings.json": copy.deepcopy(config),
-        ".codeium/windsurf/mcp_config.json": copy.deepcopy(config),
+        ".claude.json": claude,
+        ".cursor/mcp.json": copy.deepcopy(routed),
+        ".gemini/settings.json": copy.deepcopy(routed),
+        ".codeium/windsurf/mcp_config.json": copy.deepcopy(routed),
     }
 
 
@@ -1943,10 +1977,16 @@ def validator_unix_mcp_home_fixture() -> dict[str, object]:
     """Return every main-HOME Unix JSON MCP config."""
 
     executable = f"{VALIDATOR_HOME}/.kin/bin/kin"
-    ordinary = validator_mcp_config(validator_mcp_entry(executable))
+    claude = validator_mcp_config(
+        validator_mcp_entry(executable, profile=DEFAULT_PROFILE)
+    )
+    ordinary = validator_mcp_config(
+        validator_mcp_entry(executable, profile=ROUTED_PROFILE)
+    )
     repository = validator_mcp_config(
         validator_mcp_entry(
             executable,
+            profile=ROUTED_PROFILE,
             repo=VALIDATOR_PROOF,
             cwd=VALIDATOR_PROOF,
         )
@@ -1955,7 +1995,7 @@ def validator_unix_mcp_home_fixture() -> dict[str, object]:
     legacy["userPolicy"] = "preserve"
     legacy["mcpServers"]["kin"]["env"]["USER_POLICY"] = "preserve"
     return {
-        ".claude.json": copy.deepcopy(ordinary),
+        ".claude.json": claude,
         ".cursor/mcp.json": copy.deepcopy(ordinary),
         ".gemini/settings.json": copy.deepcopy(ordinary),
         ".codeium/windsurf/mcp_config.json": copy.deepcopy(ordinary),
@@ -2152,16 +2192,19 @@ def unix_node_validator_fixture() -> tuple[
     )
     fallback_report = validator_health_report({"mcp_client_claude": "healthy"})
     executable = f"{VALIDATOR_HOME}/.kin/bin/kin"
-    ordinary_config = validator_mcp_config(validator_mcp_entry(executable))
+    claude_fallback_config = validator_mcp_config(
+        validator_mcp_entry(executable, profile=DEFAULT_PROFILE)
+    )
     repository_config = validator_mcp_config(
         validator_mcp_entry(
             executable,
+            profile=ROUTED_PROFILE,
             repo=VALIDATOR_PROOF,
             cwd=VALIDATOR_PROOF,
         )
     )
     codex_config = validator_mcp_config(
-        validator_mcp_entry(executable, repo=VALIDATOR_PROOF)
+        validator_mcp_entry(executable, profile=ROUTED_PROFILE, repo=VALIDATOR_PROOF)
     )
     return (
         {
@@ -2199,7 +2242,7 @@ def unix_node_validator_fixture() -> tuple[
             "kin-doctor.json": copy.deepcopy(pre_embed_report),
             "kin-claude-fallback-health.json": copy.deepcopy(fallback_report),
             "kin-claude-fallback-doctor.json": copy.deepcopy(fallback_report),
-            "kin-claude-fallback-config.json": copy.deepcopy(ordinary_config),
+            "kin-claude-fallback-config.json": copy.deepcopy(claude_fallback_config),
             "kin-codex-config.json": copy.deepcopy(codex_config),
             ".agents/mcp_config.json": copy.deepcopy(repository_config),
             "kin-search.json": [
@@ -2588,6 +2631,15 @@ def assert_windows_node_validator_behavior(step: str) -> None:
                 "full",
             ),
         )
+        reject(
+            f"{config_path} MCP profile swapped for the other agent profile",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                swapped_agent_profile(home, config_path),
+            ),
+        )
 
     for forbidden_path in (
         ".gemini/config/mcp_config.json",
@@ -2595,7 +2647,9 @@ def assert_windows_node_validator_behavior(step: str) -> None:
     ):
         unexpected_home = copy.deepcopy(home)
         unexpected_home[forbidden_path] = validator_mcp_config(
-            validator_mcp_entry(f"{VALIDATOR_HOME}/.kin/bin/kin.exe")
+            validator_mcp_entry(
+                f"{VALIDATOR_HOME}/.kin/bin/kin.exe", profile=ROUTED_PROFILE
+            )
         )
         reject(
             f"repo-free Windows wrote {forbidden_path}",
@@ -3091,6 +3145,15 @@ def assert_unix_node_validator_behavior(step: str) -> None:
                 "full",
             ),
         )
+        reject(
+            f"{config_path} MCP profile swapped for the other agent profile",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                swapped_agent_profile(home, config_path),
+            ),
+        )
         entry = home[config_path]["mcpServers"]["kin"]  # type: ignore[index]
         if "cwd" in entry:
             reject(
@@ -3139,6 +3202,15 @@ def assert_unix_node_validator_behavior(step: str) -> None:
                 config_path,
                 ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
                 "full",
+            ),
+        )
+        reject(
+            f"{config_path} MCP profile swapped for the other agent profile",
+            fixture_with_json_value(
+                proof,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                swapped_agent_profile(proof, config_path),
             ),
         )
         entry = proof[config_path]["mcpServers"]["kin"]  # type: ignore[index]
@@ -3299,8 +3371,16 @@ def windows_public_support_notice(install_ps1: str) -> str:
         "Native Windows x86_64 support is early",
         "Repository admission works",
         "kin init imports a Git repository and publishes graph authority",
+        # The install proof's windows-latest row runs agent setup and the MCP
+        # tool-call step, and `assert_install_proof_repo_steps_cover_windows`
+        # keeps both on that row.
+        "runs agent setup on native Windows",
+        "gets graph-backed answers from the installed MCP server",
         "Transparent filesystem projection is not shipped on Windows",
-        "does not yet cover MCP or review workflows",
+        # No native Windows leg runs a review test, and the install proof runs
+        # review on no row at all, so this is a statement about Windows tests
+        # rather than about the install proof.
+        "review workflows are not yet tested there",
         "WSL2 remains the recommended path",
     ):
         if truth not in notice:
@@ -3393,15 +3473,23 @@ def assert_windows_public_support_contract(
         "native windows cannot admit a kin repository",
         "native windows cannot currently admit a repository",
         "while admission is unsupported",
-        # Overclaims in the other direction. Projection is not shipped on
-        # Windows and the install proof still does not cover MCP or review
-        # there, so these remain forbidden.
+        # Vector-free-era wording in the other direction. Each line comes from
+        # copy that called native Windows a vector-free build, and the platform
+        # table's line went on to claim review there. The archive carries
+        # vector search and review workflows are not yet tested on Windows, so
+        # none of these may return.
         "native windows is a supported vector-free subset",
         "native windows build is a supported vector-free runtime",
         "native windows supports graph + lexical workflows",
         "supported for graph, lexical retrieval, daemon, setup, mcp",
         "it ships the supported vector-free runtime",
         "the graph, lexical, daemon, setup, and mcp surfaces are release-tested",
+        # Understatements of what the install proof now runs there. Its
+        # windows-latest row runs agent setup and MCP tool calls, so no surface
+        # may say it does not.
+        "does not yet cover mcp",
+        "mcp on native windows is not yet covered",
+        "mcp and review workflows are not yet covered",
     ):
         if stale_claim in normalized:
             raise AssertionError(
@@ -3420,8 +3508,8 @@ def assert_windows_public_support_contract(
         "function Resolve-KinWindowsArchiveArchitecture",
         '"AMD64" { return "x86_64" }',
         '"ARM64" { throw "No native Windows ARM64 archive is published.',
-        "Not running repository setup: MCP and review workflows are not yet "
-        "covered on native Windows.",
+        "Not running repository setup: WSL2 remains the recommended path on "
+        "Windows.",
     ):
         require(install_active, policy, "truthful native-Windows installer")
     if "windows-aarch64" in install_ps1:
@@ -3430,8 +3518,8 @@ def assert_windows_public_support_contract(
         )
     if "& $KinExe setup" in install_active:
         raise AssertionError(
-            "native-Windows installer must not configure MCP/review workflows "
-            "the install proof does not yet cover there"
+            "native-Windows installer must not run setup while WSL2 remains the "
+            "recommended path there"
         )
 
     for policy in (
@@ -3444,20 +3532,38 @@ def assert_windows_public_support_contract(
             "compatibility MCP package native-Windows boundary",
         )
 
-    quickstart_active = "\n".join(active_lines(public_surfaces[QUICKSTART_DOC]))
+    # The npm command forwards `setup` on every supported platform. Only the
+    # PowerShell installer omits the wizard; WSL2's recommendation is not a
+    # blanket native-Windows setup refusal. Ignore prose wrapping, not content.
+    quickstart_active = " ".join(
+        " ".join(active_lines(public_surfaces[QUICKSTART_DOC])).split()
+    )
     for policy in (
         "on macOS and Linux, skip the `kin setup` wizard",
-        "Native Windows always skips repository setup because the install proof "
-        "does not yet cover MCP or review workflows there",
-        "`KIN_NO_SETUP` is accepted there only for CI compatibility",
-        "On macOS and Linux, `kin setup` is the guided wizard the installer launches",
-        "Native Windows does not launch repository setup",
+        "The PowerShell installer always installs without starting the wizard; "
+        "run `kin setup` afterwards.",
+        "It accepts `KIN_NO_SETUP` only for CI compatibility and selects the "
+        "CI-oriented skip message.",
+        "The recommended `npx -y @kinlab/kin setup` command launches it on "
+        "macOS, Linux, WSL2, and native Windows x64.",
+        "After using the PowerShell installer, run `kin setup` yourself.",
+        "WSL2 remains the recommended Windows route for the full experience",
+        "Native Windows ARM64 has no release archive",
     ):
         require(
             quickstart_active,
             policy,
             "quickstart platform-specific setup contract",
         )
+    for stale_claim in (
+        "Native Windows always skips repository setup",
+        "Native Windows does not launch repository setup",
+    ):
+        if stale_claim in quickstart_active:
+            raise AssertionError(
+                "quickstart conflates the PowerShell installer with native "
+                f"Windows setup: {stale_claim}"
+            )
 
 
 def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> None:
@@ -4269,6 +4375,36 @@ def assert_ported_validator_pin_tracks_install_proof(
                 "to the workflow the way this test mirrors, or the two agree "
                 f"only by luck; missing `{policy}`"
             )
+
+
+def assert_mcp_smoke_follows_the_launched_profile(source: str, context: str) -> None:
+    """Hold the MCP smoke's tools/list check to the call the smoke makes.
+
+    The smoke launches the entry setup wrote, and that entry's profile decides
+    what the server lists: one `kin` tool on a routed profile, `semantic_search`
+    by name otherwise. The call already followed the profile when the listing
+    check still looked for `semantic_search` by substring, which a routed
+    listing never contains, so every leg would have failed on the release's own
+    bytes. The workflow step and its preflight port both carry this smoke.
+    """
+
+    active = "\n".join(active_lines(source))
+    if 'includes("semantic_search")' in active:
+        raise AssertionError(
+            f"{context} must check tools/list for the tool the launched entry's "
+            "profile serves, not for semantic_search by name"
+        )
+    for policy in (
+        "const launchProfile = entry.env?.KIN_MCP_TOOL_PROFILE;",
+        "const launchCall = searchCall(launchProfile);",
+        'profile.startsWith("agent-routed")',
+        '{ name: "kin", arguments: { command: "search", args: searchArgs } }',
+        '{ name: "semantic_search", arguments: searchArgs }',
+        "listedTools.some((tool) => tool?.name === launchCall.name)",
+        "`MCP tools/list omitted ${launchCall.name}, the tool the launched ` +",
+        "params: launchCall,",
+    ):
+        require(active, policy, context)
 
 
 def assert_install_proof_first_run_never_pipes_the_daemon_spawner(
@@ -11272,8 +11408,8 @@ def main() -> None:
         (
             "RC build returns to a paid runner",
             RC_BUILD,
-            "          - os: ubuntu-latest\n",
-            "          - os: macos-15-large\n",
+            "          - os: ubuntu-latest\n            target: x86_64-unknown-linux-musl\n",
+            "          - os: macos-15-large\n            target: x86_64-unknown-linux-musl\n",
         ),
         (
             "tag mint moves onto a custom runner",
@@ -12930,6 +13066,38 @@ def main() -> None:
     assert_install_proof_captures_stay_out_of_the_admitted_tree(
         proof_steps, restore, restore_position
     )
+    # The MCP smoke lists and calls the tool the launched entry's profile
+    # serves, in the workflow and in the release preflight's port of it alike.
+    proof_flow = PORTED_PROOF_FLOW.read_text(encoding="utf-8")
+    for smoke_context, smoke_source in (
+        ("install-proof MCP smoke", graph_query),
+        ("release preflight MCP smoke", proof_flow),
+    ):
+        assert_mcp_smoke_follows_the_launched_profile(smoke_source, smoke_context)
+        expect_assertion(
+            f"the {smoke_context} looks for semantic_search whatever the profile",
+            "not for semantic_search by name",
+            lambda mutated=replace_exactly_once(
+                smoke_source,
+                "listedTools.some((tool) => tool?.name === launchCall.name)",
+                'JSON.stringify(listedTools).includes("semantic_search")',
+                f"{smoke_context} listing check",
+            ), context=smoke_context: assert_mcp_smoke_follows_the_launched_profile(
+                mutated, context
+            ),
+        )
+        expect_assertion(
+            f"the {smoke_context} calls semantic_search whatever the profile",
+            "is missing required policy: const launchCall = searchCall(launchProfile);",
+            lambda mutated=replace_exactly_once(
+                smoke_source,
+                "const launchCall = searchCall(launchProfile);",
+                'const launchCall = { name: "semantic_search", arguments: searchArgs };',
+                f"{smoke_context} call shape",
+            ), context=smoke_context: assert_mcp_smoke_follows_the_launched_profile(
+                mutated, context
+            ),
+        )
     for label, step_name, original, mutation in (
         (
             "a first-run capture reverts to a relative redirect",
@@ -13069,6 +13237,7 @@ def main() -> None:
     windows_public_surfaces = {
         README: readme,
         QUICKSTART_DOC: quickstart,
+        README_REFERENCE_DOC: readme_reference,
         WINDOWS_WSL2_DOC: WINDOWS_WSL2_DOC.read_text(encoding="utf-8"),
         UPDATE_TRUST: update_trust,
         NPM_CANONICAL_README: npm_canonical_readme,
@@ -13121,6 +13290,7 @@ def main() -> None:
         "kin init fails closed",
         "Native Windows cannot admit a Kin repository",
         "it ships the supported vector-free runtime",
+        "the end-to-end install proof does not yet cover MCP there",
     ):
         stale_surfaces = dict(windows_public_surfaces)
         stale_surfaces[LLMS_DOC] = (
@@ -13219,8 +13389,8 @@ def main() -> None:
         ),
     )
     expect_assertion(
-        "the installer configures workflows the install proof does not cover",
-        "must not configure MCP/review workflows",
+        "the installer runs setup while WSL2 is the recommended Windows path",
+        "must not run setup while WSL2 remains the recommended path",
         lambda: assert_windows_public_support_contract(
             windows_contract_source,
             install_ps1.replace(
@@ -13233,10 +13403,11 @@ def main() -> None:
         ),
     )
     quickstart_drift = dict(windows_public_surfaces)
-    quickstart_drift[QUICKSTART_DOC] = quickstart.replace(
-        "because the install proof does not yet cover MCP or review workflows there",
-        "while admission is unsupported",
-        1,
+    quickstart_drift[QUICKSTART_DOC] = replace_exactly_once(
+        quickstart,
+        "The PowerShell installer always installs without starting the wizard; run",
+        "The PowerShell installer skips setup while admission is unsupported; run",
+        "quickstart refusal-era setup reason",
     )
     expect_assertion(
         "the quickstart restores the refusal-era reason for skipping setup",
@@ -13248,6 +13419,68 @@ def main() -> None:
             compatibility_mcp_readme,
         ),
     )
+    for label, before, after in (
+        (
+            "the npm setup command omits native Windows",
+            "launches it on macOS, Linux, WSL2, and native Windows x64.",
+            "launches it on macOS, Linux, and WSL2.",
+        ),
+        (
+            "the PowerShell installer claims to launch the wizard",
+            "always installs without starting the wizard",
+            "always installs and starts the wizard",
+        ),
+        (
+            "the PowerShell instructions drop the manual setup step",
+            "installer, run `kin setup` yourself.",
+            "installer, setup has already run.",
+        ),
+        (
+            "KIN_NO_SETUP claims to control the PowerShell wizard",
+            "It accepts `KIN_NO_SETUP` only for CI compatibility",
+            "It accepts `KIN_NO_SETUP` to disable the wizard",
+        ),
+        (
+            "the guided setup section drops the WSL2 recommendation",
+            "WSL2 remains the recommended Windows route for",
+            "Native Windows is the recommended Windows route for",
+        ),
+        (
+            "the quickstart invents a native ARM64 archive",
+            "Native Windows ARM64 has no release archive",
+            "Native Windows ARM64 has a release archive",
+        ),
+    ):
+        drifted = dict(windows_public_surfaces)
+        drifted[QUICKSTART_DOC] = replace_exactly_once(
+            quickstart, before, after, label
+        )
+        expect_assertion(
+            label,
+            "quickstart platform-specific setup contract",
+            lambda mutated=drifted: assert_windows_public_support_contract(
+                windows_contract_source,
+                install_ps1,
+                mutated,
+                compatibility_mcp_readme,
+            ),
+        )
+    for stale_claim in (
+        "Native Windows always skips repository setup",
+        "Native Windows does not launch repository setup",
+    ):
+        drifted = dict(windows_public_surfaces)
+        drifted[QUICKSTART_DOC] = f"{quickstart}\n{stale_claim}.\n"
+        expect_assertion(
+            "the quickstart restores a blanket Windows setup refusal",
+            "quickstart conflates the PowerShell installer",
+            lambda mutated=drifted: assert_windows_public_support_contract(
+                windows_contract_source,
+                install_ps1,
+                mutated,
+                compatibility_mcp_readme,
+            ),
+        )
 
     expect_assertion(
         "the contract script counts stages where one can never appear",
@@ -13716,14 +13949,25 @@ def main() -> None:
     )
     windows_mcp_only_claude = replace_exactly_once(
         repo_free,
-        "          for (const configPath of jsonConfigs) {\n",
-        "          for (const configPath of jsonConfigs.slice(0, 1)) {\n",
+        "          for (const [configPath, profile] of jsonConfigs) {\n",
+        "          for (const [configPath, profile] of jsonConfigs.slice(0, 1)) {\n",
         "Windows selective MCP-config bypass",
     )
     expect_assertion(
         "the Windows validator checks MCP values only in Claude's config",
         "accepted a behaviorally invalid proof fixture",
         lambda: assert_windows_node_validator_behavior(windows_mcp_only_claude),
+    )
+    windows_any_agent_profile = replace_exactly_once(
+        repo_free,
+        "              entry.env?.KIN_MCP_TOOL_PROFILE !== profile\n",
+        '              !String(entry.env?.KIN_MCP_TOOL_PROFILE).startsWith("agent-")\n',
+        "Windows per-client MCP profile",
+    )
+    expect_assertion(
+        "the Windows validator accepts either agent profile in every config",
+        "MCP profile swapped for the other agent profile",
+        lambda: assert_windows_node_validator_behavior(windows_any_agent_profile),
     )
     blocked_repo_free = repo_free.replace(
         '          const fs = require("fs");\n',
@@ -13830,6 +14074,17 @@ def main() -> None:
         "the Unix validator checks MCP values only in Claude's config",
         "accepted a behaviorally invalid proof fixture",
         lambda: assert_unix_node_validator_behavior(unix_mcp_only_claude),
+    )
+    unix_any_agent_profile = replace_exactly_once(
+        validation,
+        "              entry.env?.KIN_MCP_TOOL_PROFILE !== expected.profile ||\n",
+        '              !String(entry.env?.KIN_MCP_TOOL_PROFILE).startsWith("agent-") ||\n',
+        "Unix per-client MCP profile",
+    )
+    expect_assertion(
+        "the Unix validator accepts either agent profile in every config",
+        "MCP profile swapped for the other agent profile",
+        lambda: assert_unix_node_validator_behavior(unix_any_agent_profile),
     )
     unix_full_sha_bypass = replace_exactly_once(
         validation,

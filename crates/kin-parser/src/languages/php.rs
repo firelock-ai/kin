@@ -46,9 +46,32 @@ impl LanguageAdapter for PhpAdapter {
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let root = tree.root_node();
-
         extract_php_children(&root, source, file_id, None, &mut entities, &mut relations);
         extract_php_imports(&root, source, file_id, &mut imports, &mut relations);
+
+        // The file module owns entity-level import edges, and it has to sit
+        // first so `module_entity_by_file` reads it rather than a declaration
+        // that happens to sit above the rest. A file that declared nothing and
+        // imported nothing contributes no entity: minting the synthetic module
+        // there reported the file as parsed, which is what kept a comment-only
+        // or unreadable file out of the parse-coverage census.
+        if !entities.is_empty() || !imports.is_empty() {
+            if let Some(module_name) = crate::adapter::file_module_surface_name(
+                crate::adapter::declared_package_coordinate(&root, source).as_deref(),
+                file_id,
+            ) {
+                entities.insert(
+                    0,
+                    crate::adapter::file_module_surface_entity(
+                        module_name,
+                        format!("namespace {}", file_id.0),
+                        &root,
+                        source,
+                        file_id,
+                    ),
+                );
+            }
+        }
 
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
@@ -88,6 +111,7 @@ impl LanguageAdapter for PhpAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -511,38 +535,55 @@ fn parse_php_use_declaration(node: &tree_sitter::Node, source: &[u8]) -> Option<
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "namespace_use_clause" {
-            let full_path = child.utf8_text(source).unwrap_or("").to_string();
+            // `use App\Models\Record as Row` puts the alias inside the use
+            // clause, so the CLAUSE's own text is `App\Models\Record as Row`.
+            // Reading it whole made the module path that whole string, which
+            // names nothing this repository could resolve, and made the
+            // original name the entire statement including the `use` keyword.
+            // The coordinate is the clause's qualified name and nothing else.
+            let alias_node = child.child_by_field_name("alias");
+            let mut clause_cursor = child.walk();
+            let path_node = child.children(&mut clause_cursor).find(|node| {
+                node.kind() == "qualified_name"
+                    || (node.is_named()
+                        && node.kind() == "name"
+                        && alias_node.is_none_or(|alias| alias.start_byte() != node.start_byte()))
+            });
+            let full_path = path_node
+                .and_then(|node| node.utf8_text(source).ok())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if full_path.is_empty() {
                 continue;
             }
 
-            // Check for alias (as)
-            let alias = child
-                .child_by_field_name("alias")
-                .and_then(|n| n.utf8_text(source).ok())
-                .map(|s| s.to_string());
+            let alias = alias_node
+                .and_then(|node| node.utf8_text(source).ok())
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_string);
 
-            let local_name = if let Some(ref a) = alias {
-                a.clone()
-            } else {
-                // Last segment of the namespace path
-                full_path
-                    .rsplit('\\')
-                    .next()
-                    .unwrap_or(&full_path)
-                    .to_string()
-            };
+            let leaf = full_path
+                .rsplit('\\')
+                .next()
+                .unwrap_or(&full_path)
+                .to_string();
+            let has_alias = alias.is_some();
+            let local_name = alias.unwrap_or_else(|| leaf.clone());
 
             return Some(FileImport {
                 site: crate::adapter::site_from_node(node),
                 module_path: full_path,
                 specifiers: vec![ImportedName {
                     local_name,
-                    original_name: alias.map(|_| {
-                        // If there's an alias, the original is the full path's last segment
-                        node.utf8_text(source).unwrap_or("").to_string()
-                    }),
+                    // The name the TARGET declares, so an edge minted from this
+                    // import points at a name some file actually writes.
+                    original_name: has_alias.then_some(leaf),
                     is_default: false,
+                    // The clause, not the declaration: `use\n    Foo\Bar;`
+                    // opens on the `use` line and names the type on the next.
+                    site: Some(crate::adapter::site_from_node(&child)),
                 }],
             });
         }
@@ -562,9 +603,23 @@ mod tests {
         let file_id = FilePathId::new("test.php");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         assert!(matches!(output.parse_state, ParseState::Valid));
-        assert_eq!(output.entities.len(), 1);
-        assert_eq!(output.entities[0].name, "greet");
-        assert_eq!(output.entities[0].kind, EntityKind::Function);
+        // The function, plus the file's own module surface: the entity an
+        // entity-level `Imports` edge from this file is sourced at.
+        assert_eq!(output.entities.len(), 2);
+        let functions: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "greet");
+        let modules: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "test");
     }
 
     #[test]
@@ -663,5 +718,63 @@ mod tests {
         assert_eq!(output.tests.len(), 1);
         assert_eq!(output.tests[0].name, "FooTest.testSomething");
         assert_eq!(output.tests[0].runner, "phpunit");
+    }
+
+    /// A file whose bytes declare nothing mints no module surface.
+    ///
+    /// The surface is synthetic: it stands for the file, not for anything the
+    /// file wrote. Minting it unconditionally made a comment-only or unreadable
+    /// file count as parsed, so the parse-coverage census read a clean row for a
+    /// repository holding a hole and could not name the file. Rust carried this
+    /// rule already; these adapters did not.
+    #[test]
+    fn comment_only_php_file_mints_no_module_surface() {
+        let adapter = PhpAdapter;
+        let source = b"<?php\n// nothing is declared here\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/Silent.php");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        // A comment is valid source, not a broken file. The census separates
+        // the two, and only a file that parses clean and declares nothing is
+        // the case this rule is about.
+        assert!(matches!(output.parse_state, ParseState::Valid));
+        assert!(
+            output.entities.is_empty(),
+            "expected no entity, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn php_file_with_one_declaration_mints_the_module_surface() {
+        let adapter = PhpAdapter;
+        let source = b"<?php\nfunction greet() {}\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/greet.php");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let modules: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "greet");
+        assert_eq!(output.entities[0].kind, EntityKind::Module);
+    }
+
+    /// An import alone is a surface too, and the edge is sourced at the module.
+    #[test]
+    fn php_file_with_only_an_import_mints_the_module_surface() {
+        let adapter = PhpAdapter;
+        let source = b"<?php\nuse App\\Storage\\Dog;\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/uses.php");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(!output.imports.is_empty());
+        assert_eq!(output.entities[0].kind, EntityKind::Module);
     }
 }

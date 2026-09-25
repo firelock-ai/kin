@@ -54,6 +54,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='hydration-pr-policy-') as directory:
         copy = Path(directory)
         files = {entry['file'] for entry in manifest['guarded']}
+        files.update(entry['file'] for entry in manifest.get('guarded_files', []))
         files.update(('scripts/verify-hydration-semantics.py', 'scripts/hydration-semantics-manifest.json',
                       'crates/kin-index/src/history.rs'))
         for name in files:
@@ -91,6 +92,7 @@ def main():
         (copy / 'scripts/hydration-semantics-manifest.json').write_text(json.dumps(manifest))
         result = run()
         assert result.returncode == 0, result.stdout + result.stderr
+    subprocess.run([sys.executable, str(ROOT / 'scripts/test-hydration-file-guards.py')], check=True)
     print('Hydration PR policy: unconditional coverage, five workflow mutations, poisoned replay and reviewed update verified.')
 
 

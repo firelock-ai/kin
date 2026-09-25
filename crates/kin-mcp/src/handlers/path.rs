@@ -375,6 +375,8 @@ pub struct PathHop {
     /// (`no_evidence_span`, `span_outside_caller_file`), and null when at
     /// least one line is present or the hop carries no edge.
     pub site_lines_absent_reason: Option<String>,
+    #[serde(default)]
+    pub site_lines_partial_reason: Option<String>,
 }
 
 /// One route, listed in the direction its edges run.
@@ -469,10 +471,13 @@ pub enum PathError {
         spec: String,
         detail: String,
     },
+    /// The end names no one entity. Answered with the candidates answer every
+    /// single-answer surface gives, by id and file and never by line.
     EndpointAmbiguous {
         which: &'static str,
         spec: String,
-        candidates: Vec<PathCandidate>,
+        reason: kin_ranking::entity_ranking::CandidateReason,
+        candidates: Vec<Entity>,
     },
     Graph(String),
 }
@@ -500,28 +505,12 @@ impl fmt::Display for PathError {
             PathError::EndpointAmbiguous {
                 which,
                 spec,
+                reason,
                 candidates,
             } => {
-                write!(
-                    f,
-                    "{which} '{spec}' names {} entities; pin one by id or name@file:",
-                    candidates.len()
-                )?;
-                for candidate in candidates {
-                    write!(
-                        f,
-                        " [{} {} {}:{} {}]",
-                        candidate.kind,
-                        candidate.name,
-                        candidate.file.as_deref().unwrap_or("<no file>"),
-                        candidate
-                            .start_line
-                            .map(|line| line.to_string())
-                            .unwrap_or_else(|| "?".to_string()),
-                        candidate.entity_id
-                    )?;
-                }
-                Ok(())
+                let lines =
+                    crate::handlers::entities::name_candidates_lines(spec, *reason, candidates);
+                write!(f, "{which}: {}", lines.join("\n"))
             }
             PathError::Graph(message) => write!(f, "graph store error: {message}"),
         }
@@ -749,6 +738,17 @@ fn resolve_end<G: GraphStore>(
         None => split_pinned(spec),
     };
     let matches = kin_core::query_trace_matches(store, name).map_err(graph_error)?;
+    // The name rule every surface shares: with no entity named it exactly, a
+    // bare name that owners carry as their member name (`get` for the method
+    // `Scaffold.get`) reaches every one of them, and several are refused with
+    // the candidates listed, never ranked down to one. An exact name is never
+    // pooled with members.
+    let members =
+        match kin_ranking::entity_ranking::reach_by_name(store, name).map_err(graph_error)? {
+            kin_ranking::entity_ranking::NameReach::Members(members) => members,
+            _ => Vec::new(),
+        };
+    let by_member = !members.is_empty();
     let exact: Vec<Entity> = matches
         .iter()
         .filter(|entity| entity.name == name)
@@ -783,6 +783,8 @@ fn resolve_end<G: GraphStore>(
         } else {
             exact_leaf
         }
+    } else if by_member {
+        members
     } else if exact.is_empty() {
         matches
     } else {
@@ -817,9 +819,22 @@ fn resolve_end<G: GraphStore>(
                 detail,
             });
         }
+        if by_member && pinned.len() > 1 {
+            return Err(PathError::EndpointAmbiguous {
+                which,
+                spec: spec.to_string(),
+                reason: kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                candidates: pinned,
+            });
+        }
         let chosen = strongest_definition(store, pinned)?;
         let twins = exact_name_matches(store, &chosen.name)?;
-        let endpoint = endpoint_record(&chosen, "name_and_file", &twins);
+        let addressed_by = if by_member {
+            "member_name_and_file"
+        } else {
+            "name_and_file"
+        };
+        let endpoint = endpoint_record(&chosen, addressed_by, &twins);
         return Ok(ResolvedEnd {
             entity: chosen,
             endpoint,
@@ -833,12 +848,30 @@ fn resolve_end<G: GraphStore>(
             detail: "no entity carries this name".to_string(),
         });
     }
+    if by_member {
+        if pool.len() > 1 {
+            return Err(PathError::EndpointAmbiguous {
+                which,
+                spec: spec.to_string(),
+                reason: kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                candidates: pool,
+            });
+        }
+        let chosen = pool.remove(0);
+        let twins = exact_name_matches(store, &chosen.name)?;
+        let endpoint = endpoint_record(&chosen, "member_name", &twins);
+        return Ok(ResolvedEnd {
+            entity: chosen,
+            endpoint,
+        });
+    }
     if leaf_only {
         if pool.len() > 1 {
             return Err(PathError::EndpointAmbiguous {
                 which,
                 spec: spec.to_string(),
-                candidates: pool.iter().map(candidate_record).collect(),
+                reason: kin_ranking::entity_ranking::CandidateReason::SameLeafName,
+                candidates: pool,
             });
         }
         let chosen = pool.remove(0);
@@ -920,9 +953,8 @@ fn containment_closure<G: GraphStore>(
     for _ in 0..CONTAINMENT_DEPTH {
         let mut next = Vec::new();
         'frontier: for node in frontier.drain(..) {
-            let relations = store
-                .get_all_relations_for_entity(&node)
-                .map_err(graph_error)?;
+            let relations =
+                kin_index::relation_read::relations_for_read(store, &node).map_err(graph_error)?;
             for relation in relations {
                 meter.charge_edge();
                 if relation.kind != RelationKind::Contains || relation.src.as_entity() != Some(node)
@@ -960,13 +992,13 @@ struct ParentEdge {
     resolution: RelationResolution,
     /// `(file, 1-based line)` of every syntax site the edge's evidence records.
     sites: Vec<(String, u32)>,
+    sites_withheld: bool,
 }
 
 fn evidence_sites(relation: &Relation) -> Vec<(String, u32)> {
-    let mut sites: Vec<(String, u32)> = relation
-        .evidence
+    let (proven, _) = kin_index::occurrence::proven_sites(relation);
+    let mut sites: Vec<(String, u32)> = proven
         .iter()
-        .filter_map(|evidence| evidence.source_span.as_ref())
         .map(|span| (span.file.0.clone(), presentation_line(span.start_line)))
         .collect();
     sites.sort();
@@ -982,6 +1014,7 @@ fn record_parent(parents: &mut Vec<ParentEdge>, edge: ParentEdge) {
             existing.kind = edge.kind;
             existing.resolution = edge.resolution;
         }
+        existing.sites_withheld |= edge.sites_withheld;
         existing.sites.extend(edge.sites);
         existing.sites.sort();
         existing.sites.dedup();
@@ -1063,8 +1096,7 @@ fn walk_outgoing<G: GraphStore>(
                     ceiling = Some(reason);
                     break 'level;
                 }
-                let relations = store
-                    .get_all_relations_for_entity(node)
+                let relations = kin_index::relation_read::relations_for_read(store, node)
                     .map_err(graph_error)?;
                 nodes += 1;
                 for relation in &relations {
@@ -1087,6 +1119,7 @@ fn walk_outgoing<G: GraphStore>(
                         kind: relation.kind,
                         resolution: RelationResolution::of(relation),
                         sites: evidence_sites(relation),
+                        sites_withheld: kin_index::occurrence::proven_sites(relation).1,
                     };
                     match depth_of.get(&neighbor).copied() {
                         None => {
@@ -1221,6 +1254,7 @@ struct HopEdge {
     outgoing: bool,
     resolution: Option<&'static str>,
     sites: Vec<(String, u32)>,
+    sites_withheld: bool,
 }
 
 fn hop_record(
@@ -1251,6 +1285,11 @@ fn hop_record(
         .unwrap_or_default();
     let site_lines_absent_reason = match edge {
         Some(_) if !site_lines.is_empty() => None,
+        Some(edge) if edge.sites_withheld => Some(
+            ReferenceLinesAbsent::UnconfirmedSitesWithheld
+                .as_str()
+                .to_string(),
+        ),
         Some(edge) if edge.sites.is_empty() => {
             Some(ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string())
         }
@@ -1285,6 +1324,9 @@ fn hop_record(
         resolution: edge.and_then(|edge| edge.resolution.map(str::to_string)),
         site_lines,
         site_lines_absent_reason,
+        site_lines_partial_reason: edge
+            .filter(|edge| edge.sites_withheld)
+            .map(|_| "unconfirmed_sites_withheld".into()),
     }
 }
 
@@ -1308,6 +1350,7 @@ fn render_route<G: GraphStore>(
                 outgoing: true,
                 resolution: None,
                 sites: Vec::new(),
+                sites_withheld: false,
             }),
         ));
     }
@@ -1317,6 +1360,7 @@ fn render_route<G: GraphStore>(
             outgoing: true,
             resolution: Some(edge.resolution.as_str()),
             sites: edge.sites.clone(),
+            sites_withheld: edge.sites_withheld,
         });
         chain.push((*node, edge));
     }
@@ -1328,6 +1372,7 @@ fn render_route<G: GraphStore>(
                 outgoing: false,
                 resolution: None,
                 sites: Vec::new(),
+                sites_withheld: false,
             });
         }
         chain.push((*node, None));
@@ -1644,6 +1689,11 @@ pub fn render_route_lines(route: &PathRoute) -> Vec<String> {
                         .join(",")
                 )
             };
+            let sites = if step.site_lines_partial_reason.is_some() {
+                format!("{sites}[unconfirmed sites withheld]")
+            } else {
+                sites
+            };
             pending = Some(if edge == "outgoing" {
                 format!("-{relation}{sites}->")
             } else {
@@ -1765,6 +1815,25 @@ pub fn handle_trace_path<G: GraphStore>(
             Ok(ToolCallResult::text(json))
         }
         Err(PathError::InvalidRequest(message)) => Err(McpError::InvalidParams(message)),
+        // An end that names no one entity answers the way every single-answer
+        // tool answers such a name, with every candidate by id, and says which
+        // end it was.
+        Err(PathError::EndpointAmbiguous {
+            which,
+            spec,
+            reason,
+            candidates,
+        }) => {
+            let mut value = crate::handlers::entities::name_candidates_json(
+                TOOL_NAME,
+                &spec,
+                reason,
+                &candidates,
+            );
+            value["end"] = serde_json::json!(which);
+            let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
         Err(error) if error.is_resolution_miss() => {
             Ok(ToolCallResult::error(format!("{TOOL_NAME}: {error}")))
         }
@@ -2554,10 +2623,17 @@ mod tests {
         let error = refused.expect_err("two leaf twins under a qualifier are refused");
         assert!(error.is_resolution_miss());
         let message = error.to_string();
-        assert!(message.contains("names 2 entities"), "{message}");
+        assert!(
+            message.contains("2 entities are named by its last segment"),
+            "{message}"
+        );
         assert!(
             message.contains("src/core/main.rs") && message.contains("src/core/search.rs"),
             "the refusal lists the twins so the caller can pin one: {message}"
+        );
+        assert!(
+            !message.contains("main.rs:") && !message.contains("search.rs:"),
+            "a candidate row is addressed by id, never by a file line: {message}"
         );
 
         let pinned =
@@ -2565,6 +2641,50 @@ mod tests {
                 .unwrap();
         assert_eq!(pinned.to.entity_id, search_b.id.to_string());
         assert_eq!(pinned.to.addressed_by, "name_and_file");
+    }
+
+    /// TypeScript names a class member by its class, so a bare member name was
+    /// no entity's whole name and fell to the substring ranking. A member only
+    /// one owner carries now resolves to it, and one several owners share is
+    /// refused with every candidate, the way a shared leaf already was.
+    #[test]
+    fn a_bare_member_name_takes_a_lone_owner_and_refuses_shared_ones() {
+        let store = InMemoryGraph::new();
+        let route = make_entity("Router.route", "src/router.ts", EntityKind::Method, 10);
+        let cousin = function("routeTable", "src/table.ts");
+        let get_a = make_entity("Router.get", "src/router.ts", EntityKind::Method, 20);
+        let get_b = make_entity("Cache.get", "src/cache.ts", EntityKind::Method, 5);
+        let caller = function("serve", "src/server.ts");
+        seed(
+            &store,
+            &[&route, &cousin, &get_a, &get_b, &caller],
+            &[
+                relation(&caller, &route, RelationKind::Calls),
+                relation(&caller, &cousin, RelationKind::Calls),
+            ],
+        );
+
+        let lone = build_path_response(&store, &request("serve", "route")).unwrap();
+        assert!(lone.found, "{lone:?}");
+        assert_eq!(lone.to.entity_id, route.id.to_string());
+        assert_eq!(lone.to.addressed_by, "member_name");
+
+        let shared = build_path_response(&store, &request("serve", "get"));
+        let error = shared.expect_err("two owners' members are refused, never ranked to one");
+        assert!(error.is_resolution_miss());
+        let message = error.to_string();
+        assert!(
+            message.contains("2 members of different owners carry it"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Router.get") && message.contains("Cache.get"),
+            "the refusal lists both owners' members so the caller can pick one: {message}"
+        );
+
+        let pinned = build_path_response(&store, &request("serve", "get@router.ts")).unwrap();
+        assert_eq!(pinned.to.entity_id, get_a.id.to_string());
+        assert_eq!(pinned.to.addressed_by, "member_name_and_file");
     }
 
     #[test]

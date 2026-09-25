@@ -5,7 +5,8 @@
 //!
 //! Every review mutation, whether it arrives through `POST /review` or one of the
 //! MCP review tools, is planned against the live graph and committed here as one
-//! collaboration-only repository transaction before the caller is answered. Only
+//! repository transaction before the caller is answered. A qualified live semantic
+//! lead is captured on the same admitted tree in that transaction. Only
 //! once authority holds the records are they applied to the live graph, so the
 //! graph never shows a review authority does not hold, and a daemon that reopens
 //! the store serves exactly the reviews it answered with: the workspace graph a
@@ -112,6 +113,7 @@ pub(crate) fn commit_review_event<A, E>(
         None => format!("{} {}", planned.action, planned.review_id),
     };
     let receipt = commit_collaboration(
+        state,
         &authority,
         delta,
         &reason,
@@ -133,6 +135,13 @@ pub(crate) fn commit_review_event<A, E>(
             generation: receipt.generation,
             detail: error.to_string(),
         })?;
+
+    crate::binding_history::restore_review_publication(state, &authority).map_err(|error| {
+        ReviewWriteRefusal::Diverged {
+            generation: receipt.generation,
+            detail: error.to_string(),
+        }
+    })?;
 
     state.bump_version();
     state.mark_dirty();
@@ -217,21 +226,27 @@ fn record_provenance<A, E>(
     Ok(())
 }
 
-/// Commit `delta` as a transaction whose only mutation it is.
-///
-/// A roots conflict means another process moved authority between the read and
-/// the compare-and-swap. The records do not depend on the roots they commit
-/// against, so one fresh attempt is safe; a second conflict is reported.
-fn commit_collaboration<E>(
-    authority: &ActiveLocalRepositoryAuthority,
-    delta: CollaborationDelta,
-    reason: &str,
-    actor: &AuthorId,
-) -> Result<RepositoryCommitReceipt, ReviewWriteRefusal<E>> {
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        let roots = authority.manager.read_authority().roots().clone();
+/// An exact internal publication plan. Keeping its operation and capture intact
+/// makes an uncertain reply replay the same transaction; no wire input can add
+/// checked history or substitute a new authority for the captured predecessor.
+pub(crate) struct ReviewPublication {
+    transaction: RepositoryTransaction,
+    capture: Option<crate::binding_history::SameTreeCapture>,
+}
+
+impl ReviewPublication {
+    pub(crate) fn prepare(
+        state: &DaemonState,
+        authority: &ActiveLocalRepositoryAuthority,
+        delta: CollaborationDelta,
+        reason: &str,
+        actor: &AuthorId,
+    ) -> Result<Self, kin_db::KinDbError> {
+        let mut capture = crate::binding_history::capture_review_predecessor(state, authority)?;
+        let roots = capture.as_ref().map_or_else(
+            || authority.manager.read_authority().roots().clone(),
+            |capture| capture.roots.clone(),
+        );
         let transaction = RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
             operation_id: OperationId::new(),
@@ -246,15 +261,67 @@ fn commit_collaboration<E>(
             aliases: Vec::new(),
             ref_mutations: Vec::new(),
             default_ref_mutation: None,
-            workspace_mutation: None,
+            workspace_mutation: capture.as_mut().and_then(|capture| capture.mutation.take()),
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
-            collaboration_delta: Some(delta.clone()),
+            collaboration_delta: Some(delta),
         };
-        match authority.manager.commit_repository_transaction(transaction) {
+        Ok(Self {
+            transaction,
+            capture,
+        })
+    }
+
+    pub(crate) fn commit(
+        &self,
+        authority: &ActiveLocalRepositoryAuthority,
+    ) -> Result<RepositoryCommitReceipt, kin_db::KinDbError> {
+        if let Some(capture) = &self.capture {
+            authority
+                .manager
+                .commit_repository_transaction_with_observed_binding_history(
+                    self.transaction.clone(),
+                    authority.workspace_id,
+                    &capture.observed,
+                    &kin_index::binding_history::LocalBindingHistoryVerifier,
+                )
+        } else {
+            authority
+                .manager
+                .commit_repository_transaction(self.transaction.clone())
+        }
+    }
+}
+
+/// Unknown collaboration records can retry once against fresh roots as before.
+/// A checked observation cannot: an intervening writer changed its authority,
+/// so the whole operation must be retried from an actually observed state.
+fn commit_collaboration<E>(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    delta: CollaborationDelta,
+    reason: &str,
+    actor: &AuthorId,
+) -> Result<RepositoryCommitReceipt, ReviewWriteRefusal<E>> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let publication =
+            ReviewPublication::prepare(state, authority, delta.clone(), reason, actor).map_err(
+                |error| ReviewWriteRefusal::Commit {
+                    conflict: matches!(
+                        error,
+                        kin_db::KinDbError::Model(kin_model::ModelError::Conflict(_))
+                    ),
+                    detail: error.to_string(),
+                },
+            )?;
+        match publication.commit(authority) {
             Ok(receipt) => return Ok(receipt),
-            Err(kin_db::KinDbError::Model(kin_model::ModelError::Conflict(_))) if attempts == 1 => {
+            Err(kin_db::KinDbError::Model(kin_model::ModelError::Conflict(_)))
+                if attempts == 1 && publication.capture.is_none() =>
+            {
                 continue
             }
             Err(error) => {

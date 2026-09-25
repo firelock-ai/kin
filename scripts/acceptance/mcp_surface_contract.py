@@ -37,6 +37,15 @@ Check 0 is the positive control and every other check depends on it. The server
 prints which tool profile it resolved, and a run that graded `full` would pass
 every assertion below while saying nothing about the surface an agent is served.
 
+Checks 13 and 14 run last, because they edit the fixture. Check 13 drives the
+write path on both write surfaces, `agent-default`'s named tools and
+`agent-routed`'s `session` and `mutate` commands: a session opened under the
+caller's own UUID, one committed entity edit, the exact body read back with no
+line offsets, and a mutate under an unopened session refused by `kin_mutate`
+itself. Check 14 reads the same entity on `agent-routed-query`, which numbers
+body lines as `+N`, and has every write refused with the sentence naming
+`agent-routed`.
+
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could
 not be read, and 3 when the run could not be set up. `--self-test` drives every
 grader against its inverse and needs no binary, so a grader that cannot fail is
@@ -49,9 +58,11 @@ import argparse
 import json
 import os
 import shutil
+import re
 import subprocess
 import sys
 import tempfile
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -72,10 +83,11 @@ UNREADABLE = "UNREADABLE"
 AGENT_DEFAULT_PROFILE = "agent-default"
 
 # The query profile and the exact names it serves, read out of
-# crates/kin-mcp/src/tools.rs::agent_query_tool_names on 2026-09-02. Written out
-# rather than derived: the served set is a public surface, and a check that
-# derived it from the binary under test would agree with any surface that
-# binary happened to serve.
+# crates/kin-mcp/src/tools.rs::agent_query_tool_names on 2026-09-02, with
+# lexical_lookup joining the profile when the literal lookup over the graph's
+# text index landed on 2026-09-19. Written out rather than derived: the served
+# set is a public surface, and a check that derived it from the binary under
+# test would agree with any surface that binary happened to serve.
 AGENT_QUERY_PROFILE = "agent-query"
 AGENT_QUERY_NAMES = (
     "find_references",
@@ -83,11 +95,9 @@ AGENT_QUERY_NAMES = (
     "get_entity_source",
     "graph_neighborhood",
     "impact_analysis",
-    "kin_artifact_list",
-    "kin_artifact_read",
     "kin_graph_status",
     "kin_provenance_query",
-    "list_file_entities",
+    "lexical_lookup",
     "semantic_locate",
     "semantic_search",
     "trace_data_flow",
@@ -112,6 +122,7 @@ AGENT_QUERY_LIST_CEILING_PERCENT = 65
 # from the binary under test would agree with any surface that binary served.
 AGENT_SEARCH_PROFILE = "agent-search"
 AGENT_SEARCH_NAMES = (
+    "kin_tool_call",
     "get_context_pack",
     "kin_graph_status",
     "kin_tool_search",
@@ -144,6 +155,26 @@ WITHHELD_BY_DESIGN = (
 # normal prose growth inside a ceiling that is still a third of agent-query's
 # 15,345 bytes.
 AGENT_SEARCH_LIST_CEILING_BYTES = 8_000
+
+# The routed profile: one tool whose commands reach the query belt, for a client
+# that loads every tool it is handed and re-sends them all with every request.
+# Read out of crates/kin-mcp/src/routed.rs on 2026-09-22, where the same ceiling
+# is ROUTED_LIST_CEILING_BYTES and a crate test holds it; this holds it on the
+# wire, and grades that a routed command reaches its named tool through a real
+# daemon.
+AGENT_ROUTED_PROFILE = "agent-routed"
+ROUTED_TOOL_NAME = "kin"
+ROUTED_LIST_CEILING_BYTES = 3_200
+AGENT_ROUTED_QUERY_PROFILE = "agent-routed-query"
+# The refusal a write gets on the read-only routed surface names the profile
+# that carries it (crates/kin-mcp/src/routed.rs, `refused_read_only`).
+ROUTED_WRITE_REFUSAL = "The agent-routed profile carries Kin's writes."
+# The note beside a numbered body (crates/kin-mcp/src/entity_lines.rs).
+NUMBERING_KEY = "about_body"
+NUMBERED_LINE = re.compile(r"^\+(\d+)\t")
+# What kin_mutate answers for a session it never registered: the handler's own
+# refusal, which a routed call must reach rather than a routing one.
+UNKNOWN_SESSION = "Session not found"
 
 # The tool names the two shipped proofs assert literally. Read out of
 # .github/workflows/install-proof.yml and scripts/prove-windows-npm-first-run.mjs
@@ -268,6 +299,9 @@ def grade_query_profile(query, default):
         return ["the agent-query profile listed no tools"]
     served = sorted(name for name in (tool.get("name") for tool in tools) if name)
     problems = []
+    for name in ("kin_artifact_read", "kin_artifact_list", "list_file_entities"):
+        if name in served:
+            problems.append("retired file-oriented tool is exposed: %s" % name)
     if served != sorted(AGENT_QUERY_NAMES):
         problems.append(
             "agent-query serves %s, not the set this suite grades (%s)"
@@ -323,6 +357,30 @@ def grade_search_call(payload):
     if missing:
         return ["semantic_search did not return the seeded entity: %s absent" % ", ".join(missing)]
     return []
+
+
+def grade_discovered_query(listing, lookup, frames):
+    """A discovered hidden query works without opening direct calls or writes."""
+    if len(frames) != 3:
+        return ["discovered query controls returned fewer than three frames"]
+    problems = grade_search_call(frames[0])
+    names = {tool.get("name") for tool in listing.get("tools") or []}
+    if "semantic_search" in names or "kin_tool_call" not in names:
+        problems.append("the query was not hidden behind the served dispatcher")
+    invocation = (lookup or {}).get("invocation") or {}
+    if (invocation.get("profile_enabled") or {}).get("semantic_search") is not False:
+        problems.append("discovery did not mark the hidden query directly disabled")
+    if (invocation.get("callable_via_dispatcher") or {}).get("semantic_search") is not True:
+        problems.append("discovery did not mark the hidden query callable through the dispatcher")
+    for label, frame, reason in (
+        ("direct hidden query", frames[1], "not enabled"),
+        ("wrapped mutation", frames[2], "read-only"),
+    ):
+        result = (frame or {}).get("result") or {}
+        refused = bool((frame or {}).get("error")) or result.get("isError") is True
+        if not refused or reason not in json.dumps(frame):
+            problems.append("%s was not refused for its expected boundary" % label)
+    return problems
 
 
 def search_payload(frame):
@@ -467,6 +525,181 @@ def grade_schema_fidelity(registry, lookups):
                 "%s: the schema the search returns is not the schema the full profile serves"
                 % name
             )
+    return problems
+
+
+# Every profile `kin mcp start` accepts, for the portability sweep. `benchmark`
+# and `context-bench` are served tools/list only: their bytes feed citable
+# results, and the sweep reads them rather than calling anything.
+ALL_PROFILES = [
+    "agent-default", "agent-query", "agent-search", "agent-routed", "agent-routed-query",
+    "benchmark", "context-bench", "full",
+]
+
+# The JSON-schema keywords a provider tool API refuses at the top of a tool's
+# input schema. A client loading tools for such an API drops the tool without a
+# word: Claude Code listed 19 of agent-default's 22 tools while three opened with
+# `anyOf` (crates/kin-mcp/src/input_contract.rs).
+TOP_LEVEL_COMBINATORS = ("oneOf", "anyOf", "allOf", "not", "if", "then", "else")
+
+
+def grade_portable_schemas(listings):
+    """Every tool on every profile serves a plain `type: object` input schema."""
+    problems = []
+    if not listings:
+        return ["no profile listing was read"]
+    for profile, listing in sorted(listings.items()):
+        tools = listing.get("tools")
+        if not isinstance(tools, list) or not tools:
+            problems.append("%s served no tools" % profile)
+            continue
+        for tool in tools:
+            schema = tool.get("inputSchema") or {}
+            found = [keyword for keyword in TOP_LEVEL_COMBINATORS if keyword in schema]
+            if found:
+                problems.append("%s/%s opens its input schema with %s"
+                                % (profile, tool.get("name"), ", ".join(found)))
+            if schema.get("type") != "object":
+                problems.append("%s/%s serves an input schema of type %r, not object"
+                                % (profile, tool.get("name"), schema.get("type")))
+    return problems
+
+
+def grade_routed_profile(listing, search_frame, describe_frame):
+    """The routed profile serves one tool, under its ceiling, that reaches the belt.
+
+    The search goes through the routed tool to `semantic_search` and must bring
+    back the seeded entity, graded by the same reader the install proof's
+    search is. `describe` must hand back the command's schemas.
+    """
+    tools = listing.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return ["the agent-routed profile listed no tools"]
+    problems = []
+    served = [tool.get("name") for tool in tools]
+    if served != [ROUTED_TOOL_NAME]:
+        problems.append("agent-routed serves %s, not the one routed tool" % served)
+    routed_bytes = listing_bytes(listing)
+    if routed_bytes > ROUTED_LIST_CEILING_BYTES:
+        problems.append(
+            "agent-routed's tools/list is %d bytes, over the %d-byte ceiling"
+            % (routed_bytes, ROUTED_LIST_CEILING_BYTES)
+        )
+    problems.extend("routed search: %s" % problem for problem in grade_search_call(search_frame))
+    described = search_payload(describe_frame)
+    variants = (described or {}).get("variants")
+    if not isinstance(variants, list) or not all(
+        isinstance(variant, dict) and isinstance(variant.get("args_schema"), dict)
+        for variant in variants or [None]
+    ):
+        problems.append("routed describe did not return the command's schemas")
+    return problems
+
+
+def entity_id_named(payload, name):
+    """The id of the first entity called `name` anywhere in a tool's answer."""
+    stack = [payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if node.get("name") == name and (node.get("id") or node.get("entity_id")):
+                return node.get("id") or node.get("entity_id")
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
+
+
+def refusal_text(frame):
+    """The text of a refused call, or None when the call was not refused."""
+    if frame is None:
+        return None
+    if frame.get("error"):
+        return json.dumps(frame["error"])
+    result = frame.get("result")
+    if not isinstance(result, dict) or result.get("isError") is not True:
+        return None
+    return json.dumps(result)
+
+
+def grade_write_family(label, frames, session_id, body, disk):
+    """One write surface, end to end: session, commit, exact read-back, refusal.
+
+    `frames` answer, in order: a session opened under the caller's own UUID, a
+    `kin_mutate` of one entity under it, that entity's source, and a mutate
+    under a UUID no session was opened for. The body read back must be the
+    committed text byte for byte, with no `+N` offsets, because an agent on a
+    write surface restates what it reads into its next edit.
+    """
+    if len(frames) != 4 or any(frame is None for frame in frames):
+        return ["%s: the server answered %d of the 4 calls" % (
+            label, len([frame for frame in frames if frame is not None]))]
+    problems = []
+    opened = search_payload(frames[0])
+    if opened is None:
+        problems.append("%s: the session did not open: %s" % (label, (refusal_text(frames[0]) or "")[:300]))
+    elif opened.get("session_id") != session_id:
+        problems.append("%s: the session opened as %r, not the caller's %r"
+                        % (label, opened.get("session_id"), session_id))
+    committed = search_payload(frames[1])
+    if committed is None:
+        problems.append("%s: the mutate was refused: %s" % (label, (refusal_text(frames[1]) or "")[:300]))
+    elif committed.get("status") != "committed":
+        problems.append("%s: the mutate answered status %r, not committed"
+                        % (label, committed.get("status")))
+    source = search_payload(frames[2])
+    if source is None:
+        problems.append("%s: the source read answered nothing" % label)
+    else:
+        if source.get("body") != body:
+            problems.append("%s: the body read back is not the committed text: %r"
+                            % (label, (source.get("body") or "")[:200]))
+        if NUMBERING_KEY in source:
+            problems.append("%s: a write surface served numbered lines" % label)
+    if disk is None or body not in disk:
+        problems.append("%s: the file on disk does not carry the committed body" % label)
+    refused = refusal_text(frames[3])
+    if refused is None or UNKNOWN_SESSION not in refused:
+        problems.append("%s: a mutate under an unopened session was not refused by kin_mutate "
+                        "itself: %s" % (label, (refused or json.dumps(frames[3]))[:300]))
+    return problems
+
+
+def grade_read_only_routed(frames, body, disk_before, disk_after):
+    """The read-only routed surface: numbered bodies, and every write refused.
+
+    `frames` answer, in order: an entity's source, a `mutate`, a `session`, and
+    a `call` of `kin_mutate`. The source must number every line as `+N` and a
+    tab, carry the note that says so, and strip back to the committed body. The
+    three writes must each be refused with the sentence naming the profile that
+    carries writes, and the file must be byte-identical afterwards.
+    """
+    if len(frames) != 4 or any(frame is None for frame in frames):
+        return ["the server answered %d of the 4 calls" % len(
+            [frame for frame in frames if frame is not None])]
+    problems = []
+    source = search_payload(frames[0])
+    if source is None:
+        problems.append("the source read answered nothing")
+    else:
+        lines = (source.get("body") or "").split("\n")
+        offsets = [NUMBERED_LINE.match(line) for line in lines]
+        if not lines or not all(offsets) or [int(m.group(1)) for m in offsets] != list(
+            range(len(lines))
+        ):
+            problems.append("the body is not numbered +0, +1, ... line by line: %r"
+                            % (source.get("body") or "")[:200])
+        elif "\n".join(NUMBERED_LINE.sub("", line) for line in lines) != body:
+            problems.append("the numbered body does not strip back to the committed text")
+        if not source.get(NUMBERING_KEY):
+            problems.append("the numbered body came without its %s note" % NUMBERING_KEY)
+    for label, frame in (("mutate", frames[1]), ("session", frames[2]), ("call kin_mutate", frames[3])):
+        refused = refusal_text(frame)
+        if refused is None or ROUTED_WRITE_REFUSAL not in refused:
+            problems.append("%s was not refused with the profile that carries writes: %s"
+                            % (label, (refused or json.dumps(frame))[:300]))
+    if disk_before is None or disk_before != disk_after:
+        problems.append("the file changed on the read-only surface")
     return problems
 
 
@@ -845,11 +1078,18 @@ def run_checks(suite, verbose=False):
     registered_names = sorted(
         name for name in (tool.get("name") for tool in (registry or {}).get("tools") or []) if name
     )
-    search_ids = ("8", "9", "10")
+    search_ids = ("8", "9", "10", "11")
     try:
         search, lookup_frames, search_stderr = suite.serve(
             AGENT_SEARCH_PROFILE,
-            [(TOOL_SEARCH_NAME, {"need": name}) for name in registered_names],
+            [(TOOL_SEARCH_NAME, {"need": name}) for name in registered_names]
+            + [
+                ("kin_tool_call", {"tool": "semantic_search", "arguments": {
+                    "query": "hello", "compact": True, "limit": 5,
+                }}),
+                ("semantic_search", {"query": "hello"}),
+                ("kin_tool_call", {"tool": "kin_mutate", "arguments": {}}),
+            ],
         )
     except McpError as error:
         search, search_stderr, lookup_frames = None, "", []
@@ -879,6 +1119,15 @@ def run_checks(suite, verbose=False):
             name: search_payload(frame)
             for name, frame in zip(registered_names, lookup_frames)
         }
+        record(
+            "11", "discovered query invocation",
+            "a hidden query executes while direct profile and write boundaries stay closed",
+            grade_discovered_query(
+                search, lookups.get("semantic_search"), lookup_frames[len(registered_names):]
+            ),
+            "the discovered query returned hello from probe.py; direct hidden calls and "
+            "wrapped writes were refused",
+        )
         if registry is None or not registered_names:
             for ident, source, title in [e for e in CHECK_TITLES if e[0] in ("9", "10")]:
                 res = Result(ident, source, title)
@@ -901,6 +1150,191 @@ def run_checks(suite, verbose=False):
                 % len(registered_names),
             )
 
+    try:
+        routed, routed_frames, routed_stderr = suite.serve(
+            AGENT_ROUTED_PROFILE,
+            [
+                (ROUTED_TOOL_NAME, {"command": "search", "args": {"query": "hello", "limit": 5}}),
+                (ROUTED_TOOL_NAME, {"command": "describe", "args": {"command": "search"}}),
+            ],
+        )
+    except McpError as error:
+        res = Result(*[entry for entry in CHECK_TITLES if entry[0] == "12"][0])
+        res.unknown("the agent-routed profile was unreadable: %s" % error)
+        results.append(res)
+    else:
+        record(
+            "12", "routed profile",
+            "the routed profile serves one tool under its ceiling and reaches the belt",
+            grade_routed_profile(routed, routed_frames[0], routed_frames[1]),
+            "agent-routed served %s in %d bytes, under the %d-byte ceiling, and its routed "
+            "search returned hello from probe.py"
+            % (ROUTED_TOOL_NAME, listing_bytes(routed), ROUTED_LIST_CEILING_BYTES),
+        )
+        if AGENT_ROUTED_PROFILE not in (routed_stderr or ""):
+            results[-1].unknown(
+                "the server printed no notice naming %r, so which surface was measured is "
+                "unknown" % AGENT_ROUTED_PROFILE
+            )
+
+    listings = {}
+    unreadable = []
+    for profile in ALL_PROFILES:
+        try:
+            listings[profile], _, _ = suite.serve(profile, [])
+        except McpError as error:
+            unreadable.append("%s: %s" % (profile, error))
+    if unreadable:
+        res = Result(*[entry for entry in CHECK_TITLES if entry[0] == "15"][0])
+        res.unknown("profiles were unreadable: %s" % "; ".join(unreadable))
+        results.append(res)
+    else:
+        record(
+            "15", "portable schemas",
+            "no tool on any profile opens its input schema with a combinator",
+            grade_portable_schemas(listings),
+            "every tool on all %d profiles serves a plain object schema; tools/list bytes: %s"
+            % (len(listings), ", ".join(
+                "%s %d" % (profile, listing_bytes(listing))
+                for profile, listing in sorted(listings.items())
+            )),
+        )
+
+    # The write path, last, because it edits the fixture every check above reads.
+    # Entity ids are stable across an edit, so the id check 2 found serves every
+    # call below.
+    focal = entity_id_named(search_payload(calls[0]), "hello")
+    probe = os.path.join(suite.repo, "src", "probe.py")
+
+    def disk():
+        try:
+            with open(probe) as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    def guarded(body, base, description):
+        """A whole-entity replacement carrying the source base it was written against."""
+        return {"verb": "update", "target": focal, "body": body,
+                "payload": {"EntitySourceBase": base}, "description": description}
+
+    committed_body = None
+    last_base = None
+    write_problems = [] if focal else ["check 2's search named no id for hello"]
+    for family, profile, wrap in (
+        ("named", AGENT_DEFAULT_PROFILE, lambda tool, command, args: (tool, args)),
+        ("routed", AGENT_ROUTED_PROFILE,
+         lambda tool, command, args: (ROUTED_TOOL_NAME, {"command": command, "args": args})),
+    ):
+        if not focal:
+            break
+        session_id = str(uuid.uuid4())
+        body = (
+            'def hello(name):\n    """Greet by name. The entity the shipped install proof '
+            'seeds and asserts."""\n    return "hello from the %s write path, " + name' % family
+        )
+        # A replacement names the version it replaces, and the frames below are
+        # written before any answer comes back, so the base is read first, per
+        # family: the named family's commit moves the one the routed family needs.
+        try:
+            _, based, _ = suite.serve(profile, [
+                wrap("get_entity_source", "source", {"entity_id": focal}),
+            ])
+        except McpError as error:
+            write_problems = None
+            write_unread = "the %s server was unreadable: %s" % (profile, error)
+            break
+        base = (search_payload(based[0]) or {}).get("source_base") if based else None
+        if not isinstance(base, dict):
+            write_problems.append("%s: get_entity_source served no source_base for hello: %s" % (
+                family, (refusal_text(based[0]) if based else None) or json.dumps(based)[:300]))
+            continue
+        last_base = base
+        try:
+            _, frames, _ = suite.serve(profile, [
+                wrap("kin_session_start", "session", {
+                    "vendor": "acceptance", "client_name": "kin-mcp-surface-contract",
+                    "cwd": suite.repo, "session_id": session_id,
+                }),
+                wrap("kin_mutate", "mutate", {
+                    "session_id": session_id,
+                    "operations": [guarded(body, base, "the %s write path" % family)],
+                    "summary": "mcp surface contract: the %s write path" % family,
+                }),
+                wrap("get_entity_source", "source", {"entity_id": focal}),
+                # Guarded as well, so it reaches the session check this frame grades
+                # instead of the refusal of an unguarded replacement.
+                wrap("kin_mutate", "mutate", {
+                    "session_id": str(uuid.uuid4()),
+                    "operations": [guarded(body, base, "never opened")],
+                    "summary": "never opened",
+                }),
+            ])
+        except McpError as error:
+            write_problems = None
+            write_unread = "the %s server was unreadable: %s" % (profile, error)
+            break
+        write_problems.extend(grade_write_family(family, frames, session_id, body, disk()))
+        committed_body = body
+    if write_problems is None:
+        res = Result(*[entry for entry in CHECK_TITLES if entry[0] == "13"][0])
+        res.unknown(write_unread)
+        results.append(res)
+    else:
+        record(
+            "13", "write surfaces",
+            "each write surface opens a session, commits an edit and reads back its exact body",
+            write_problems,
+            "agent-default's named tools and agent-routed's session and mutate commands each "
+            "committed an edit to hello under the caller's own session id, read the exact body "
+            "back, and refused a mutate under an unopened session",
+        )
+
+    before = disk()
+    read_only = None
+    if focal and committed_body:
+        try:
+            _, read_only, read_only_stderr = suite.serve(AGENT_ROUTED_QUERY_PROFILE, [
+                (ROUTED_TOOL_NAME, {"command": "source", "args": {"entity_id": focal}}),
+                # Guarded, so the profile's own refusal is what answers it.
+                (ROUTED_TOOL_NAME, {"command": "mutate", "args": {
+                    "session_id": str(uuid.uuid4()),
+                    "operations": [guarded("x", last_base or {}, "refused")],
+                }}),
+                (ROUTED_TOOL_NAME, {"command": "session", "args": {
+                    "vendor": "acceptance", "client_name": "kin-mcp-surface-contract",
+                    "cwd": suite.repo,
+                }}),
+                (ROUTED_TOOL_NAME, {"command": "call", "args": {
+                    "tool": "kin_mutate", "arguments": {"session_id": str(uuid.uuid4())},
+                }}),
+            ])
+        except McpError as error:
+            read_only_error = str(error)
+    if read_only is None:
+        res = Result(*[entry for entry in CHECK_TITLES if entry[0] == "14"][0])
+        res.unknown(
+            "the %s profile was not graded: %s" % (
+                AGENT_ROUTED_QUERY_PROFILE,
+                read_only_error if focal and committed_body else "check 13 committed nothing to read",
+            )
+        )
+        results.append(res)
+    else:
+        record(
+            "14", "read-only routed profile",
+            "the read-only routed profile numbers bodies and refuses every write",
+            grade_read_only_routed(read_only, committed_body, before, disk()),
+            "agent-routed-query numbered hello's body as +N lines that strip back to the "
+            "committed text, and refused mutate, session and a call of kin_mutate by naming "
+            "agent-routed",
+        )
+        if AGENT_ROUTED_QUERY_PROFILE not in (read_only_stderr or ""):
+            results[-1].unknown(
+                "the server printed no notice naming %r, so which surface was measured is "
+                "unknown" % AGENT_ROUTED_QUERY_PROFILE
+            )
+
     if verbose:
         for res in results:
             for note in res.notes:
@@ -921,6 +1355,16 @@ CHECK_TITLES = [
     ("8", "FIR-3112", "the always-on profile serves its exact set under its byte ceiling"),
     ("9", "FIR-3112", "every registered tool is findable through the served search"),
     ("10", "FIR-3112", "the schema the search returns is the schema the full profile serves"),
+    ("11", "discovered query invocation",
+     "a hidden query executes while direct profile and write boundaries stay closed"),
+    ("12", "routed profile",
+     "the routed profile serves one tool under its ceiling and reaches the belt"),
+    ("13", "write surfaces",
+     "each write surface opens a session, commits an edit and reads back its exact body"),
+    ("14", "read-only routed profile",
+     "the read-only routed profile numbers bodies and refuses every write"),
+    ("15", "portable schemas",
+     "no tool on any profile opens its input schema with a combinator"),
 ]
 
 
@@ -1001,6 +1445,22 @@ def self_test():
     expect("registration on a good listing", grade_served_names_are_registered(good, registry), False)
     expect("call on a good result",
            grade_search_call({"result": {"content": [{"text": "hello in probe.py"}]}}), False)
+    portable = json.loads(json.dumps(good))
+    for tool in portable["tools"]:
+        tool["inputSchema"]["type"] = "object"
+    expect("portable schemas on a good listing",
+           grade_portable_schemas({"agent-default": portable}), False)
+    expect("portable schemas on an untyped schema",
+           grade_portable_schemas({"agent-default": good}), True)
+    combinator = json.loads(json.dumps(portable))
+    combinator["tools"][0]["inputSchema"]["anyOf"] = [{"required": ["query"]}, {"required": ["cursor"]}]
+    expect("portable schemas on a top-level anyOf",
+           grade_portable_schemas({"agent-default": combinator}), True)
+    conditional = json.loads(json.dumps(portable))
+    conditional["tools"][0]["inputSchema"]["allOf"] = [{"if": {"required": ["request_id"]}}]
+    expect("portable schemas on a top-level allOf",
+           grade_portable_schemas({"full": conditional}), True)
+    expect("portable schemas on no listing", grade_portable_schemas({}), True)
 
     def profile_listing(names, padding=0):
         return {
@@ -1029,6 +1489,11 @@ def self_test():
     )
     expect("query profile on a good pair",
            grade_query_profile(profile_listing(AGENT_QUERY_NAMES), default_listing), False)
+
+    for retired in ("kin_artifact_read", "kin_artifact_list", "list_file_entities"):
+        expect("query profile exposes retired %s" % retired,
+               grade_query_profile(profile_listing(list(AGENT_QUERY_NAMES) + [retired]),
+                                   default_listing), True)
 
     # And one break per grader.
     expect("control on the full profile",
@@ -1079,9 +1544,12 @@ def self_test():
 
     # The whole point of the profile, and the break that would make it
     # pointless: a query listing that costs what the default costs.
+    equal_cost = profile_listing(AGENT_QUERY_NAMES)
+    equal_cost["tools"][0]["description"] += "d" * (
+        listing_bytes(default_listing) - listing_bytes(equal_cost)
+    )
     expect("query profile when it saves nothing",
-           grade_query_profile(profile_listing(AGENT_QUERY_NAMES, padding=400), default_listing),
-           True)
+           grade_query_profile(equal_cost, default_listing), True)
 
     # ── the tool-search surface ─────────────────────────────────────────────
     #
@@ -1189,6 +1657,28 @@ def self_test():
     expect("fidelity on an empty registry",
            grade_schema_fidelity({"tools": []}, good_lookups), True)
 
+    dispatch_listing = {"tools": [{"name": "kin_tool_call"}]}
+    dispatch_lookup = {"invocation": {
+        "profile_enabled": {"semantic_search": False},
+        "callable_via_dispatcher": {"semantic_search": True},
+    }}
+    dispatch_frames = [
+        {"result": {"content": [{"type": "text", "text": "hello probe.py"}]}},
+        {"error": {"message": "tool is not enabled in this MCP profile"}},
+        {"error": {"message": "kin_tool_call is read-only"}},
+    ]
+    expect("discovered query and closed boundaries",
+           grade_discovered_query(dispatch_listing, dispatch_lookup, dispatch_frames), False)
+    for index in range(3):
+        broken = list(dispatch_frames)
+        broken[index] = {"result": {"content": []}}
+        expect("discovered query broken control %d" % index,
+               grade_discovered_query(dispatch_listing, dispatch_lookup, broken), True)
+    expect("discovered query missing invocation metadata",
+           grade_discovered_query(dispatch_listing, {}, dispatch_frames), True)
+    expect("discovered query missing frame",
+           grade_discovered_query(dispatch_listing, dispatch_lookup, dispatch_frames[:2]), True)
+
     # The reader itself: an error frame, an isError result and a body that is
     # not JSON must all read as "no answer" rather than as an empty one.
     for label, frame in (
@@ -1199,6 +1689,101 @@ def self_test():
     ):
         if search_payload(frame) is not None:
             problems.append("payload reader read %s as an answer" % label)
+
+    # ── the routed surface ──────────────────────────────────────────────────
+    routed_listing = {"tools": [{"name": ROUTED_TOOL_NAME, "description": "d" * 400,
+                                 "inputSchema": {"properties": {"command": {}, "args": {}}}}]}
+    routed_search = {"result": {"content": [{"type": "text", "text": "hello in probe.py"}]}}
+    routed_describe = {"result": {"content": [{"type": "text", "text": json.dumps(
+        {"command": "search", "variants": [{"args_schema": {"type": "object"}}]})}]}}
+    expect("routed profile on a good surface",
+           grade_routed_profile(routed_listing, routed_search, routed_describe), False)
+    two_tools = {"tools": routed_listing["tools"] + [{"name": "semantic_locate"}]}
+    expect("routed profile when a second tool rides beside the router",
+           grade_routed_profile(two_tools, routed_search, routed_describe), True)
+    heavy = {"tools": [dict(routed_listing["tools"][0], description="d" * 4_000)]}
+    expect("routed profile over its ceiling",
+           grade_routed_profile(heavy, routed_search, routed_describe), True)
+    expect("routed profile when the routed search failed",
+           grade_routed_profile(routed_listing, {"error": {"code": -32602}}, routed_describe),
+           True)
+    expect("routed profile when describe answered nothing",
+           grade_routed_profile(routed_listing, routed_search, None), True)
+    expect("routed profile on an empty listing",
+           grade_routed_profile({"tools": []}, routed_search, routed_describe), True)
+
+    # ── the write surfaces ──────────────────────────────────────────────────
+    def answer(payload, is_error=False):
+        result = {"content": [{"type": "text", "text": json.dumps(payload)}]}
+        if is_error:
+            result["isError"] = True
+        return {"result": result}
+
+    session = "3f0c7a52-1111-4222-8333-944445555666"
+    body = 'def hello(name):\n    return "hi " + name'
+    write_frames = [
+        answer({"session_id": session, "status": "active"}),
+        answer({"status": "committed"}),
+        answer({"name": "hello", "body": body}),
+        answer({"message": "Session not found: 1. It was ended."}, is_error=True),
+    ]
+    disk_text = "x\n" + body + "\n"
+    expect("write family on a good run",
+           grade_write_family("routed", write_frames, session, body, disk_text), False)
+    for label, index, frame in (
+        ("a refused session", 0, answer({"message": "no"}, is_error=True)),
+        ("a session under another id", 0, answer({"session_id": "other"})),
+        ("a refused mutate", 1, answer({"message": "no"}, is_error=True)),
+        ("a staged but uncommitted mutate", 1, answer({"status": "staged"})),
+        ("a numbered body on a write surface", 2,
+         answer({"body": "+0\tdef hello(name):\n+1\t    return \"hi \" + name",
+                 "about_body": "note"})),
+        ("an old body", 2, answer({"body": "def hello(name):\n    return 1"})),
+        ("an unopened session that was accepted", 3, answer({"status": "committed"})),
+        ("an unopened session refused by routing", 3,
+         answer({"message": "Commands: locate, search."}, is_error=True)),
+    ):
+        broken = list(write_frames)
+        broken[index] = frame
+        expect("write family on %s" % label,
+               grade_write_family("routed", broken, session, body, disk_text), True)
+    expect("write family when the file kept the old text",
+           grade_write_family("routed", write_frames, session, body, "x\n"), True)
+    expect("write family on a missing frame",
+           grade_write_family("routed", write_frames[:3], session, body, disk_text), True)
+
+    refusal = answer({"message": "mutate writes, and this connection serves the read-only "
+                                 "agent-routed-query profile. " + ROUTED_WRITE_REFUSAL},
+                     is_error=True)
+    numbered = "\n".join("+%d\t%s" % (index, line) for index, line in enumerate(body.split("\n")))
+    read_only_frames = [
+        answer({"body": numbered, NUMBERING_KEY: "Each body line starts with +N."}),
+        refusal, refusal, refusal,
+    ]
+    expect("read-only routed on a good run",
+           grade_read_only_routed(read_only_frames, body, disk_text, disk_text), False)
+    for label, index, frame in (
+        ("an unnumbered body", 0, answer({"body": body, NUMBERING_KEY: "note"})),
+        ("a body with no note", 0, answer({"body": numbered})),
+        ("offsets out of order", 0,
+         answer({"body": numbered.replace("+1\t", "+2\t"), NUMBERING_KEY: "note"})),
+        ("a numbered body of other text", 0,
+         answer({"body": "+0\tdef other():", NUMBERING_KEY: "note"})),
+        ("an accepted mutate", 1, answer({"status": "committed"})),
+        ("a session refused without naming the write profile", 2,
+         answer({"message": "refused"}, is_error=True)),
+        ("an accepted call of kin_mutate", 3, answer({"status": "committed"})),
+    ):
+        broken = list(read_only_frames)
+        broken[index] = frame
+        expect("read-only routed on %s" % label,
+               grade_read_only_routed(broken, body, disk_text, disk_text), True)
+    expect("read-only routed when the file changed",
+           grade_read_only_routed(read_only_frames, body, disk_text, disk_text + "y"), True)
+    if entity_id_named({"results": [{"name": "hello", "entity_id": "e1"}]}, "hello") != "e1":
+        problems.append("the id reader missed a named entity")
+    if entity_id_named({"results": [{"name": "caller", "entity_id": "e2"}]}, "hello") is not None:
+        problems.append("the id reader returned an entity of another name")
 
     # An empty listing must never read as a clean surface.
     expect("names on an empty listing", grade_proof_asserted_names({"tools": []}), True)

@@ -45,7 +45,8 @@ pub fn relation_kind_rank(kind: &RelationKind) -> usize {
 /// The composite ranking key used to select the best entity match.
 ///
 /// Compared via tuple ordering (higher = better):
-/// 1. Exact name match
+/// 1. How the query meets the name ([`name_match_tier`]): the whole name, then
+///    the member segment of an owner's member, then anything else
 /// 2. Exported (public/internal)
 /// 3. Declaration kind rank
 /// 4. Direct call/import count (incoming)
@@ -53,7 +54,7 @@ pub fn relation_kind_rank(kind: &RelationKind) -> usize {
 /// 6. Has file origin
 /// 7. Shorter name preferred (Reverse)
 pub type EntityRankingKey = (
-    bool,
+    u8,
     bool,
     usize,
     usize,
@@ -71,7 +72,7 @@ pub fn entity_ranking_key(
 ) -> EntityRankingKey {
     let exported = matches!(entity.visibility, Visibility::Public | Visibility::Internal);
     (
-        entity.name == query,
+        name_match_tier(entity, query),
         exported,
         declaration_kind_rank(&entity.kind),
         direct_signal,
@@ -79,6 +80,320 @@ pub fn entity_ranking_key(
         entity.file_origin.is_some(),
         std::cmp::Reverse(entity.name.len()),
     )
+}
+
+/// How closely `query` meets an entity's name, strongest first: `2` when it is
+/// the whole name, `1` when it is the member name of an owner's member
+/// ([`is_member_name_match`]), and `0` when it only occurs inside the name.
+pub fn name_match_tier(entity: &Entity, query: &str) -> u8 {
+    if entity.name == query {
+        2
+    } else if is_member_name_match(entity, query) {
+        1
+    } else {
+        0
+    }
+}
+
+/// The kinds a bare member name can reach: a method, a field, or an enum
+/// variant.
+///
+/// This is the whole contract, and it is kind-qualified on purpose. Every
+/// language adapter names these three by the type that declares them, the
+/// method by its class, struct, trait, interface or receiver, the field by its
+/// struct, the variant by its enum, so the segment after the owner is the
+/// member's own declared name. No other kind qualifies, because for every other
+/// kind a dotted name's prefix can be a path, a package or a namespace rather
+/// than an owner, and its last segment is incidental: a file module named
+/// `app.py` would answer to `py`, and a shallow-parsed constant named
+/// `constant.Raspbian` to `Raspbian`. Those stay reachable by their whole name
+/// or their id.
+pub fn is_member_kind(kind: &EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Method | EntityKind::Field | EntityKind::EnumVariant
+    )
+}
+
+/// Whether `query` is the bare member name of `entity`: an eligible member
+/// kind ([`is_member_kind`]), an owner prefix, and a member segment exactly
+/// `query`. `get` is the member name of the method `Scaffold.get` and of the
+/// method `Router<S>::get`; it is not the member name of `get` itself, of
+/// `get_db`, or of `ConfigAttribute.__get__`.
+pub fn is_member_name_match(entity: &Entity, query: &str) -> bool {
+    is_member_kind(&entity.kind)
+        && qualified_owner_prefix(&entity.name).is_some()
+        && bare_member_name(&entity.name) == query
+}
+
+/// The name a bare lookup matches `entity` by, and the one a listing publishes
+/// as `member_name`: the member segment of an owner's member
+/// ([`is_member_kind`] with an owner prefix), and the whole name of anything
+/// else. A file module named `app.py` publishes `app.py`, not `py`.
+pub fn lookup_member_name(entity: &Entity) -> &str {
+    lookup_member_name_of(&entity.name, is_member_kind(&entity.kind))
+}
+
+/// [`lookup_member_name`] from a name and whether its kind is a member kind,
+/// for a record that carries the two apart.
+pub fn lookup_member_name_of(name: &str, member_kind: bool) -> &str {
+    if member_kind && qualified_owner_prefix(name).is_some() {
+        bare_member_name(name)
+    } else {
+        name
+    }
+}
+
+/// [`is_member_kind`] for a kind carried as its `Debug` spelling, the way a
+/// daemon search record carries it.
+pub fn is_member_kind_named(kind: &str) -> bool {
+    [
+        EntityKind::Method,
+        EntityKind::Field,
+        EntityKind::EnumVariant,
+    ]
+    .iter()
+    .any(|member| format!("{member:?}") == kind)
+}
+
+/// The owner of an owner's member, `Scaffold` for the method `Scaffold.get`,
+/// and `None` for anything that is not one ([`lookup_member_name`]).
+pub fn member_owner(entity: &Entity) -> Option<&str> {
+    if is_member_kind(&entity.kind) {
+        qualified_owner_prefix(&entity.name)
+    } else {
+        None
+    }
+}
+
+/// Whether an entity is one a name may resolve to: anything the repository
+/// holds a file for, and anything that is not an external reference target.
+/// The same test [`select_best_entity`] applies.
+fn addressable_by_name(entity: &Entity) -> bool {
+    entity.file_origin.is_some() || entity.role != EntityRole::External
+}
+
+/// What a name reaches before anything ranks it, in the tiers every surface
+/// that accepts a name applies.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NameReach {
+    /// Entities whose whole name is the query. This tier is never pooled with
+    /// members: `Entity` means the struct named `Entity`, not the enum variant
+    /// `GraphNodeId::Entity` beside it.
+    Exact(Vec<Entity>),
+    /// No entity's whole name is the query; these owners' members carry it as
+    /// their member name.
+    Members(Vec<Entity>),
+    /// Neither tier reaches anything.
+    Neither,
+}
+
+/// The one order every surface lists a name's candidates in: file, then name,
+/// then id. A choice is never made from it, so it carries no ranking signal,
+/// only a stable listing a caller can compare across surfaces.
+pub fn sort_name_candidates(candidates: &mut Vec<Entity>) {
+    candidates.sort_by(|left, right| {
+        left.file_origin
+            .as_ref()
+            .map(|path| path.0.as_str())
+            .cmp(&right.file_origin.as_ref().map(|path| path.0.as_str()))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates.dedup_by(|left, right| left.id == right.id);
+}
+
+/// [`NameReach`] over entities already in hand, such as a state replayed at a
+/// historical ref. `entities` must include every entity the name could reach;
+/// a whole state satisfies that.
+pub fn reach_among(entities: impl IntoIterator<Item = Entity>, query: &str) -> NameReach {
+    let mut exact = Vec::new();
+    let mut members = Vec::new();
+    for entity in entities {
+        if !addressable_by_name(&entity) {
+            continue;
+        }
+        if entity.name == query {
+            exact.push(entity);
+        } else if is_member_name_match(&entity, query) {
+            members.push(entity);
+        }
+    }
+    if !exact.is_empty() {
+        sort_name_candidates(&mut exact);
+        return NameReach::Exact(exact);
+    }
+    if !members.is_empty() {
+        sort_name_candidates(&mut members);
+        return NameReach::Members(members);
+    }
+    NameReach::Neither
+}
+
+/// [`NameReach`] over the store's own name index.
+///
+/// The whole name is asked for as itself, which the index answers exhaustively
+/// because it is keyed by name. A member is asked for by the suffix its owner
+/// separator leaves, `*.get` and `*::get`, which the index also answers whole.
+/// The bare pattern alone would not be enough for members: the index answers it
+/// with whole-name and token matches, falls back to substrings only when it has
+/// neither, and drops a token match set over its cap, which on pallets/flask
+/// hid `Request.blueprint` behind the two `Blueprint` classes.
+///
+/// A query carrying `*` is a glob, not a name, and reaches nothing here.
+pub fn reach_by_name<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<NameReach, <G as GraphStore>::Error> {
+    if query.is_empty() || query.contains('*') {
+        return Ok(NameReach::Neither);
+    }
+    let mut found = store.query_entities(&kin_model::graph::EntityFilter {
+        name_pattern: Some(query.to_string()),
+        ..Default::default()
+    })?;
+    if !found
+        .iter()
+        .any(|entity| entity.name == query && addressable_by_name(entity))
+        && !query.contains('.')
+        && !query.contains("::")
+    {
+        for pattern in [format!("*.{query}"), format!("*::{query}")] {
+            found.extend(store.query_entities(&kin_model::graph::EntityFilter {
+                name_pattern: Some(pattern),
+                ..Default::default()
+            })?);
+        }
+    }
+    Ok(reach_among(found, query))
+}
+
+/// What a name resolves to for a surface that answers about one entity and
+/// ranks when a name is ambiguous in the ways it already discloses.
+#[derive(Debug, Clone)]
+pub enum NameResolution {
+    /// One entity answers: the best-ranked whole-name match (the exact tier
+    /// always outranks everything else), the one owner's member the name
+    /// reaches, or, for a name that is neither, the best-ranked name that
+    /// contains it.
+    One(Entity),
+    /// No entity's whole name is the query, and several owners' members carry
+    /// it as their member name, so the name does not say which one is meant and
+    /// none was chosen. Listed in [`sort_name_candidates`] order.
+    SharedMemberName(Vec<Entity>),
+    /// Nothing the repository holds matches the name.
+    Missing,
+}
+
+/// Resolve `query` for a surface that answers about exactly one entity.
+///
+/// The exact tier comes first and is never pooled with members. Members are a
+/// fallback that runs only when no entity's whole name is the query: one
+/// member answers, several are returned whole as
+/// [`NameResolution::SharedMemberName`] for the surface to list, never ranked
+/// down to one. Every other name goes to [`select_best_entity`], whose own tier
+/// key keeps a whole-name match first; a surface that returns an editable body
+/// uses [`resolve_name_strictly`] instead, which never ranks.
+pub fn resolve_name<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<NameResolution, <G as GraphStore>::Error> {
+    match reach_by_name(store, query)? {
+        NameReach::Members(mut members) if members.len() == 1 => {
+            Ok(NameResolution::One(members.remove(0)))
+        }
+        NameReach::Members(members) => Ok(NameResolution::SharedMemberName(members)),
+        NameReach::Exact(_) | NameReach::Neither => Ok(match select_best_entity(store, query)? {
+            Some(entity) => NameResolution::One(entity),
+            None => NameResolution::Missing,
+        }),
+    }
+}
+
+/// Why a name answered with candidates instead of an entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateReason {
+    /// Several entities have the name as their whole name.
+    SameName,
+    /// No entity has it as its whole name, and several owners' members have it
+    /// as their member name.
+    SharedMemberName,
+    /// A qualified name that names nothing, whose last segment is the whole name
+    /// of several entities.
+    SameLeafName,
+    /// Neither a whole name nor a member name; these entities' names contain it.
+    PartialName,
+}
+
+impl CandidateReason {
+    /// The value a structured answer carries under `resolution`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameName => "same_name",
+            Self::SharedMemberName => "shared_member_name",
+            Self::SameLeafName => "same_leaf_name",
+            Self::PartialName => "partial_name",
+        }
+    }
+}
+
+/// What a name resolves to for a surface that returns an editable body or an
+/// edit base, where a guess is a wrong edit rather than a wrong answer.
+#[derive(Debug, Clone)]
+pub enum StrictNameResolution {
+    /// The one entity whose whole name is the query, or, when no entity has
+    /// it as its whole name, the one owner's member that carries it.
+    One(Entity),
+    /// Anything else the name reaches, listed and never chosen from.
+    Candidates(CandidateReason, Vec<Entity>),
+    /// Nothing the repository holds matches the name.
+    Missing,
+}
+
+/// Resolve `query` without ranking: one exact whole-name match, or one member
+/// when there is no exact match, and otherwise every candidate.
+///
+/// A partial name never selects a body here. `get_d` reached the tutorial's
+/// `get_db` through the ranked resolver and handed back its body and its edit
+/// base with nothing saying a choice was made; through this one it lists
+/// `get_db` as a candidate and answers about none.
+pub fn resolve_name_strictly<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<StrictNameResolution, <G as GraphStore>::Error> {
+    Ok(match reach_by_name(store, query)? {
+        NameReach::Exact(mut exact) if exact.len() == 1 => {
+            StrictNameResolution::One(exact.remove(0))
+        }
+        NameReach::Exact(exact) => {
+            StrictNameResolution::Candidates(CandidateReason::SameName, exact)
+        }
+        NameReach::Members(mut members) if members.len() == 1 => {
+            StrictNameResolution::One(members.remove(0))
+        }
+        NameReach::Members(members) => {
+            StrictNameResolution::Candidates(CandidateReason::SharedMemberName, members)
+        }
+        NameReach::Neither => {
+            if query.trim().is_empty() {
+                return Ok(StrictNameResolution::Missing);
+            }
+            let mut partial: Vec<Entity> = store
+                .query_entities(&kin_model::graph::EntityFilter {
+                    name_pattern: Some(query.to_string()),
+                    ..Default::default()
+                })?
+                .into_iter()
+                .filter(addressable_by_name)
+                .collect();
+            if partial.is_empty() {
+                StrictNameResolution::Missing
+            } else {
+                sort_name_candidates(&mut partial);
+                StrictNameResolution::Candidates(CandidateReason::PartialName, partial)
+            }
+        }
+    })
 }
 
 /// Select the best entity match for a query from a graph store.
@@ -180,6 +495,31 @@ pub fn qualified_owner_prefix(name: &str) -> Option<&str> {
     split
         .map(|idx| &name[..idx])
         .filter(|prefix| !prefix.is_empty())
+}
+
+/// The trailing, unqualified segment of a name: `embed_batch` for
+/// `CodeEmbedder::embed_batch`, `Raspbian` for `constant.Raspbian`, the whole
+/// name for one with no owner segment. The complement of
+/// [`qualified_owner_prefix`]: it steps past whatever prefix that function
+/// found, through whichever separator immediately follows it, so the two can
+/// never disagree about where a name splits.
+///
+/// This is what several owner-qualified declarations "share" when a caller
+/// addresses them by a bare name: `Flask.dispatch_request`,
+/// `View.dispatch_request` and `MethodView.dispatch_request` disagree on
+/// [`qualified_owner_prefix`] and agree here, on `dispatch_request`, which is
+/// the fact `find_references` sections a bare-name answer on rather than a
+/// substring or token overlap a name-pattern search would also match.
+pub fn bare_member_name(name: &str) -> &str {
+    match qualified_owner_prefix(name) {
+        Some(prefix) => {
+            let rest = &name[prefix.len()..];
+            rest.strip_prefix("::")
+                .or_else(|| rest.strip_prefix('.'))
+                .unwrap_or(rest)
+        }
+        None => name,
+    }
 }
 
 /// Relation count of one entity excluding temporal `CoChanges` edges, so the
@@ -1502,5 +1842,183 @@ mod tests {
         assert_eq!(qualified_owner_prefix("seal_change"), None);
         assert_eq!(qualified_owner_prefix("::rooted"), None);
         assert_eq!(qualified_owner_prefix(".hidden"), None);
+    }
+
+    #[test]
+    fn bare_member_name_steps_past_the_same_separator_qualified_owner_prefix_found() {
+        assert_eq!(bare_member_name("CodeEmbedder::embed_batch"), "embed_batch");
+        assert_eq!(bare_member_name("constant.Raspbian"), "Raspbian");
+        assert_eq!(bare_member_name("a::b::c"), "c");
+        assert_eq!(bare_member_name("&G::delete_work_item"), "delete_work_item");
+        // The three owner-qualified siblings `find_references` sections a
+        // bare-name answer over: distinct full names, one shared bare one.
+        assert_eq!(
+            bare_member_name("Flask.dispatch_request"),
+            "dispatch_request"
+        );
+        assert_eq!(
+            bare_member_name("View.dispatch_request"),
+            "dispatch_request"
+        );
+        assert_eq!(
+            bare_member_name("MethodView.dispatch_request"),
+            "dispatch_request"
+        );
+        // A bare name has nothing to step past, so it is its own answer --
+        // including the two cases where `qualified_owner_prefix` recognizes no
+        // usable prefix despite a separator being present.
+        assert_eq!(bare_member_name("seal_change"), "seal_change");
+        assert_eq!(bare_member_name("::rooted"), "::rooted");
+        assert_eq!(bare_member_name(".hidden"), ".hidden");
+    }
+
+    fn member(name: &str, kind: EntityKind, file: &str) -> Entity {
+        let mut entity = fanout_entity(name, Some(file));
+        entity.kind = kind;
+        entity
+    }
+
+    #[test]
+    fn a_member_name_match_needs_a_member_kind_an_owner_and_the_whole_segment() {
+        assert!(is_member_name_match(
+            &member("Scaffold.get", EntityKind::Method, "a.py"),
+            "get"
+        ));
+        assert!(is_member_name_match(
+            &member("Router<S>::route", EntityKind::Method, "a.rs"),
+            "route"
+        ));
+        assert!(is_member_name_match(
+            &member("User.Name", EntityKind::Field, "a.go"),
+            "Name"
+        ));
+        assert!(is_member_name_match(
+            &member("GraphNodeId::Entity", EntityKind::EnumVariant, "a.rs"),
+            "Entity"
+        ));
+        // The whole name is the exact tier, not the member tier.
+        assert!(!is_member_name_match(
+            &member("get", EntityKind::Function, "a.py"),
+            "get"
+        ));
+        // A member segment that only contains the query is not its member name.
+        assert!(!is_member_name_match(
+            &member("ConfigAttribute.__get__", EntityKind::Method, "a.py"),
+            "get"
+        ));
+        assert!(!is_member_name_match(
+            &member("get_db", EntityKind::Function, "a.py"),
+            "get"
+        ));
+        // An incidental last segment is not a member name: a file module, a
+        // shallow constant and a dotted function are not owners' members.
+        assert!(!is_member_name_match(
+            &member("app.py", EntityKind::Module, "app.py"),
+            "py"
+        ));
+        assert!(!is_member_name_match(
+            &member("constant.Raspbian", EntityKind::Constant, "c.go"),
+            "Raspbian"
+        ));
+        assert!(!is_member_name_match(
+            &member("exports.render", EntityKind::Function, "a.js"),
+            "render"
+        ));
+    }
+
+    #[test]
+    fn the_whole_name_outranks_the_member_segment_which_outranks_a_substring() {
+        let exact = member("get", EntityKind::Function, "a.py");
+        let method = member("Scaffold.get", EntityKind::Method, "a.py");
+        let cousin = member("get_db", EntityKind::Function, "a.py");
+        assert_eq!(name_match_tier(&exact, "get"), 2);
+        assert_eq!(name_match_tier(&method, "get"), 1);
+        assert_eq!(name_match_tier(&cousin, "get"), 0);
+
+        // A lone member beats a substring cousin that is exported, a better
+        // kind, and far more referenced: the pallets/flask shape where
+        // `template_global` answered with `Blueprint.app_template_global`.
+        let member_hit = member("App.template_global", EntityKind::Method, "app.py");
+        let cousin_hit = member(
+            "Blueprint.app_template_global",
+            EntityKind::Method,
+            "blueprints.py",
+        );
+        assert!(
+            entity_ranking_key(&member_hit, "template_global", 0, 0)
+                > entity_ranking_key(&cousin_hit, "template_global", 40, 40)
+        );
+    }
+
+    #[test]
+    fn an_exact_name_is_its_own_tier_and_is_never_pooled_with_members() {
+        let exact = member("Entity", EntityKind::Class, "src/entity.rs");
+        let variant = member(
+            "GraphNodeId::Entity",
+            EntityKind::EnumVariant,
+            "src/graph.rs",
+        );
+        let method = member("Store::Entity", EntityKind::Method, "src/store.rs");
+        assert_eq!(
+            reach_among(
+                vec![variant.clone(), exact.clone(), method.clone()],
+                "Entity"
+            ),
+            NameReach::Exact(vec![exact])
+        );
+        // With no whole-name match the members answer, in listing order.
+        match reach_among(vec![method.clone(), variant.clone()], "Entity") {
+            NameReach::Members(members) => {
+                let names: Vec<&str> = members.iter().map(|e| e.name.as_str()).collect();
+                assert_eq!(names, vec!["GraphNodeId::Entity", "Store::Entity"]);
+            }
+            other => panic!("members must answer when nothing is named exactly: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_twins_stay_twins_and_a_partial_name_reaches_neither_tier() {
+        let one = member("resolve", EntityKind::Function, "src/database.py");
+        let two = member("resolve", EntityKind::Function, "src/link_graph.py");
+        match reach_among(vec![two.clone(), one.clone()], "resolve") {
+            NameReach::Exact(exact) => assert_eq!(exact.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        let cousin = member("get_db", EntityKind::Function, "examples/db.py");
+        assert_eq!(reach_among(vec![cousin], "get_d"), NameReach::Neither);
+        // A file-less external reference target is never reached.
+        let mut external = member("Other.get", EntityKind::Method, "x.py");
+        external.file_origin = None;
+        external.role = EntityRole::External;
+        assert_eq!(reach_among(vec![external], "get"), NameReach::Neither);
+    }
+
+    #[test]
+    fn a_listing_publishes_member_names_only_for_members() {
+        let method = member("Scaffold.get", EntityKind::Method, "a.py");
+        assert_eq!(lookup_member_name(&method), "get");
+        assert_eq!(member_owner(&method), Some("Scaffold"));
+        let module = member("app.py", EntityKind::Module, "app.py");
+        assert_eq!(lookup_member_name(&module), "app.py");
+        assert_eq!(member_owner(&module), None);
+        let free = member("get_db", EntityKind::Function, "db.py");
+        assert_eq!(lookup_member_name(&free), "get_db");
+        assert_eq!(member_owner(&free), None);
+        assert!(is_member_kind_named("Method") && is_member_kind_named("EnumVariant"));
+        assert!(!is_member_kind_named("Module") && !is_member_kind_named("method"));
+        assert_eq!(lookup_member_name_of("Scaffold.get", true), "get");
+        assert_eq!(lookup_member_name_of("app.py", false), "app.py");
+    }
+
+    #[test]
+    fn candidate_reasons_have_stable_wire_names() {
+        for (reason, wire) in [
+            (CandidateReason::SameName, "same_name"),
+            (CandidateReason::SharedMemberName, "shared_member_name"),
+            (CandidateReason::SameLeafName, "same_leaf_name"),
+            (CandidateReason::PartialName, "partial_name"),
+        ] {
+            assert_eq!(reason.as_str(), wire);
+        }
     }
 }

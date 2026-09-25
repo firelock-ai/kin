@@ -12,7 +12,7 @@
 //! synchronously on Drop, before the next pass opens the same document.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -53,8 +53,13 @@ pub struct JsonRpcClient {
     ack_pause: AckPause,
     waiters: WaiterMap,
     next_id: AtomicI64,
+    /// Requests the server answered with a result rather than an error, a
+    /// timeout or silence. See [`JsonRpcClient::answered`].
+    answered: AtomicU64,
     /// Handle to the background reader task (kept alive with the client).
-    _reader_handle: tokio::task::JoinHandle<()>,
+    /// Finished once the server's stdout has closed. See
+    /// [`JsonRpcClient::is_disconnected`].
+    reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl JsonRpcClient {
@@ -164,8 +169,32 @@ impl JsonRpcClient {
             ack_pause,
             waiters,
             next_id: AtomicI64::new(1),
-            _reader_handle: reader_handle,
+            answered: AtomicU64::new(0),
+            reader_handle,
         }
+    }
+
+    /// Whether the connection to the server is gone: its stdout closed, or
+    /// a write to its stdin failed.
+    ///
+    /// Either way no request sent from now on can be answered. A server that
+    /// exits mid-session fails every later request at once rather than
+    /// hanging, which is exactly what lets a caller that never looks at this
+    /// ask a dead server about hundreds of files and record each failure as
+    /// an answer that did not arrive. A caller that asks first can stop.
+    pub fn is_disconnected(&self) -> bool {
+        self.failed.load(Ordering::Acquire) || self.reader_handle.is_finished()
+    }
+
+    /// How many requests this server has answered with a result.
+    ///
+    /// A caller that takes this before and after its work on one document
+    /// learns whether the server answered anything about it at all. A server
+    /// that cannot load a document refuses every request about it, and when
+    /// it phrases each refusal the way it phrases an ordinary decline, this
+    /// count is what still tells the two apart.
+    pub fn answered(&self) -> u64 {
+        self.answered.load(Ordering::Relaxed)
     }
 
     /// Send a request and wait for the response (with 10s timeout).
@@ -190,7 +219,25 @@ impl JsonRpcClient {
 
         // Wait for the background reader to dispatch our response.
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => match result {
+                Ok(value) => {
+                    self.answered.fetch_add(1, Ordering::Relaxed);
+                    Ok(value)
+                }
+                // The one place an error answer is read as a decline: here, where
+                // the method it answered is known. Every caller then classifies
+                // with `LspError::class` and never looks at the code itself.
+                Err(LspError::JsonRpc(error)) => {
+                    match crate::error::declined_answer(method, &error) {
+                        Some(message) => Err(LspError::Declined {
+                            method: method.to_string(),
+                            message,
+                        }),
+                        None => Err(LspError::JsonRpc(error)),
+                    }
+                }
+                Err(error) => Err(error),
+            },
             Ok(Err(_)) => Err(LspError::ServerDied), // Sender dropped (reader died)
             Err(_) => {
                 // Timeout — clean up the waiter.

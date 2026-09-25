@@ -1,32 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-fn keyed_mutation(session_id: &str, request_id: &str, name: &str) -> serde_json::Value {
+async fn seed_keyed_entities(state: &Arc<DaemonState>) {
+    for name in ["first", "second"] {
+        let receipt = source_tree_conversion_fixture(state, serde_json::json!({
+            "verb":"create", "target":format!("{name}.py"),
+            "body":format!("def {name}():\n    return 0\n"), "description":"explicit conversion test fixture"
+        })).await;
+        forget_mcp_transaction(state, receipt["transaction_id"].as_str().unwrap());
+    }
+    state
+        .mcp_commit_attempts
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+async fn keyed_mutation_fixture() -> (tempfile::TempDir, Arc<DaemonState>) {
+    let (dir, state) = mcp_lifecycle_fixture();
+    seed_keyed_entities(&state).await;
+    (dir, state)
+}
+
+/// A keyed request replacing the function `name` whole, guarded by the base of
+/// the version current when the request is built. A base names one workspace
+/// revision, so a request that must follow a commit is built after it, and a
+/// replay resends the value first sent, base included, unchanged.
+async fn keyed_mutation(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    request_id: &str,
+    name: &str,
+) -> serde_json::Value {
+    let source = source_base_read_named(state, name).await;
     serde_json::json!({
         "session_id": session_id,
         "request_id": request_id,
-        "summary": "create a durable source fixture",
-        "operations": [{
-            "verb": "create", "target": format!("{name}.py"),
-            "body": format!("def {name}():\n    return 1\n"),
-            "description": "create source"
-        }]
+        "summary": "update a durable semantic fixture",
+        "operations": [source_base_replacement(
+            &source,
+            &format!("def {name}():\n    return 1"),
+            "update existing function",
+        )]
     })
 }
 
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_keyed_retry_recovers_original_receipt_through_real_delegate() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session_id = mcp_test_session(&state);
+    let request = keyed_mutation(&state, &session_id, "receipt-é", "first").await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = router_with_auth(Arc::clone(&state), Some("mutate-test-token".to_string()));
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut env = kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", format!("http://{addr}"));
     env.apply("KIN_DAEMON_AUTH_TOKEN", Some("mutate-test-token"));
-    let args: HashMap<String, serde_json::Value> =
-        serde_json::from_value(keyed_mutation(&session_id, "receipt-é", "first")).unwrap();
+    let args: HashMap<String, serde_json::Value> = serde_json::from_value(request).unwrap();
     let first = kin_mcp::handlers::sessions::mutate_through_daemon(&args)
         .await
         .unwrap();
@@ -51,6 +80,15 @@ async fn mcp_mutate_keyed_retry_recovers_original_receipt_through_real_delegate(
         original["repository_generation"]
     );
     assert_eq!(replayed["already_applied"], true);
+    assert_eq!(original["publication_accounting"]["status"], "exact");
+    assert_eq!(
+        original["publication_accounting"]["requested"]["operation_count"],
+        1
+    );
+    assert_eq!(
+        replayed["publication_accounting"],
+        original["publication_accounting"]
+    );
 }
 
 async fn mutate_http(
@@ -111,6 +149,11 @@ fn mutation_receipt(result: &kin_mcp::ToolCallResult) -> serde_json::Value {
     assert_eq!(receipt["schema"], "kin.mutate.receipt.v1");
     assert!(receipt.get("new_root_hash").is_none());
     receipt.as_object_mut().unwrap().remove("already_applied");
+    // Keep exact v1 receipt comparisons separate from response accounting.
+    receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("publication_accounting");
     receipt
 }
 
@@ -132,9 +175,9 @@ fn mutation_published_body(state: &DaemonState, file: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn mcp_mutate_transport_drop_concurrent_retry_and_intervening_commit_recover_original() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "dropped-response", "first");
+    let args = keyed_mutation(&state, &session, "dropped-response", "first").await;
     let before = mutation_generation(&state);
     let (release, hold) = std::sync::mpsc::channel();
     *state.mcp_mutate_publication_hold.lock().unwrap() = Some(hold);
@@ -210,9 +253,11 @@ async fn mcp_mutate_transport_drop_concurrent_retry_and_intervening_commit_recov
         1
     );
     assert!(state.mcp_transactions.lock().unwrap().is_empty());
-    let mut intervening = keyed_mutation(&session, "intervening", "first");
-    intervening["operations"][0]["verb"] = serde_json::json!("replace");
-    intervening["operations"][0]["body"] = serde_json::json!("def first():\n    return 2\n");
+    // Built after the original published, so it reads the version that
+    // publication left. The original's replays below resend their first base.
+    let mut intervening = keyed_mutation(&state, &session, "intervening", "first").await;
+    intervening["operations"][0]["verb"] = serde_json::json!("update");
+    intervening["operations"][0]["body"] = serde_json::json!("def first():\n    return 2");
     mutation_receipt(&mutate_http(&state, "kin_mutate", intervening, &session).await);
     let latest = mutation_generation(&state);
     assert_eq!(latest, before + 2);
@@ -255,13 +300,14 @@ async fn mcp_mutate_transport_drop_concurrent_retry_and_intervening_commit_recov
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_full_payload_binding_and_lower_level_bypass_refusal() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let mut args = keyed_mutation(&session, "bound-fields", "first");
+    let mut args = keyed_mutation(&state, &session, "bound-fields", "first").await;
+    let unused = keyed_mutation(&state, &session, "unused", "second").await;
     args["operations"]
         .as_array_mut()
         .unwrap()
-        .push(keyed_mutation(&session, "unused", "second")["operations"][0].clone());
+        .push(unused["operations"][0].clone());
     let receipt =
         mutation_receipt(&mutate_http(&state, "kin_mutate", args.clone(), &session).await);
     let generation = mutation_generation(&state);
@@ -334,10 +380,10 @@ async fn mcp_mutate_full_payload_binding_and_lower_level_bypass_refusal() {
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_ownership_expiry_and_key_validation_fail_closed() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
     let other = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "owner", "first");
+    let args = keyed_mutation(&state, &session, "owner", "first").await;
     let receipt =
         mutation_receipt(&mutate_http(&state, "kin_mutate", args.clone(), &session).await);
     let wrong = mutate_http(&state, "kin_mutate", args.clone(), &other).await;
@@ -399,9 +445,9 @@ async fn mcp_mutate_ownership_expiry_and_key_validation_fail_closed() {
 #[serial_test::serial]
 async fn mcp_mutate_persistence_faults_reuse_reservation_across_restart() {
     for phase in [1_u8, 2, 3, 4, 5, 6, 8, 7, 11, 12, 13, 14] {
-        let (_dir, state) = mcp_lifecycle_fixture();
+        let (_dir, state) = keyed_mutation_fixture().await;
         let session = mcp_test_session(&state);
-        let args = keyed_mutation(&session, "persist-fault", "first");
+        let args = keyed_mutation(&state, &session, "persist-fault", "first").await;
         let before = mutation_generation(&state);
         state
             .mcp_mutate_fail_once
@@ -472,9 +518,9 @@ async fn mcp_mutate_persistence_faults_reuse_reservation_across_restart() {
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_corruption_retains_binding_and_staging_evidence() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "corrupt", "first");
+    let args = keyed_mutation(&state, &session, "corrupt", "first").await;
     let receipt =
         mutation_receipt(&mutate_http(&state, "kin_mutate", args.clone(), &session).await);
     let mirror = crate::state::mcp_transactions_disk_path(&state.layout);
@@ -506,13 +552,13 @@ async fn mcp_mutate_corruption_retains_binding_and_staging_evidence() {
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_admission_config_and_saturation_preserve_old_keys() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
     let mut env = kin_core::test_env::EnvVarGuard::set("KIN_MUTATE_MAX_REQUESTS", "1");
-    let first = keyed_mutation(&session, "quota-first", "first");
+    let first = keyed_mutation(&state, &session, "quota-first", "first").await;
     let receipt =
         mutation_receipt(&mutate_http(&state, "kin_mutate", first.clone(), &session).await);
-    let second = keyed_mutation(&session, "quota-second", "second");
+    let second = keyed_mutation(&state, &session, "quota-second", "second").await;
     let refused = mutate_http(&state, "kin_mutate", second.clone(), &session).await;
     assert_eq!(refused.is_error, Some(true));
     assert!(mcp_result_text(&refused).contains("request_admission_quota_exceeded"));
@@ -550,16 +596,10 @@ async fn mcp_mutate_admission_config_and_saturation_preserve_old_keys() {
 #[serial_test::serial]
 async fn mcp_mutate_bound_route_preserves_prior_staging_after_compound_recovery() {
     let (_dir, state, tx_id) = mcp_after_compound_cold_recovery_failure().await;
+    seed_keyed_entities(&state).await;
     let session = mcp_test_session(&state);
-    mutation_receipt(
-        &mutate_http(
-            &state,
-            "kin_mutate",
-            keyed_mutation(&session, "after-recovery", "first"),
-            &session,
-        )
-        .await,
-    );
+    let args = keyed_mutation(&state, &session, "after-recovery", "first").await;
+    mutation_receipt(&mutate_http(&state, "kin_mutate", args, &session).await);
     let disk = crate::state::load_persisted_mcp_transactions_checked(&state.layout).unwrap();
     assert_eq!(
         disk[&tx_id].staged_operations[0].body.as_deref(),
@@ -579,9 +619,9 @@ async fn mcp_mutate_bound_route_preserves_prior_staging_after_compound_recovery(
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_pending_expired_session_refuses_without_losing_reservation() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "pending-expiry", "first");
+    let args = keyed_mutation(&state, &session, "pending-expiry", "first").await;
     state
         .mcp_mutate_fail_once
         .store(5, std::sync::atomic::Ordering::SeqCst);
@@ -625,24 +665,18 @@ async fn mcp_mutate_pending_expired_session_refuses_without_losing_reservation()
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_session_repository_scopes_and_token_rotation_are_stable() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let first_session = mcp_test_session(&state);
     let second_session = mcp_test_session(&state);
-    let first_args = keyed_mutation(&first_session, "shared-key", "first");
+    let first_args = keyed_mutation(&state, &first_session, "shared-key", "first").await;
     let first = mutation_receipt(
         &mutate_http(&state, "kin_mutate", first_args.clone(), &first_session).await,
     );
-    let second = mutation_receipt(
-        &mutate_http(
-            &state,
-            "kin_mutate",
-            keyed_mutation(&second_session, "shared-key", "second"),
-            &second_session,
-        )
-        .await,
-    );
+    let second_args = keyed_mutation(&state, &second_session, "shared-key", "second").await;
+    let second =
+        mutation_receipt(&mutate_http(&state, "kin_mutate", second_args, &second_session).await);
     assert_ne!(first["transaction_id"], second["transaction_id"]);
-    let (_other_dir, other) = mcp_lifecycle_fixture();
+    let (_other_dir, other) = keyed_mutation_fixture().await;
     other
         .coordinator
         .register_session_with_id(
@@ -659,9 +693,12 @@ async fn mcp_mutate_session_repository_scopes_and_token_rotation_are_stable() {
             },
         )
         .unwrap();
-    let other_receipt = mutation_receipt(
-        &mutate_http(&other, "kin_mutate", first_args.clone(), &first_session).await,
-    );
+    // A source base names one repository, so the other repository's request
+    // carries its own read. The session and request key are the same, and
+    // they are what the scope is about.
+    let other_args = keyed_mutation(&other, &first_session, "shared-key", "first").await;
+    let other_receipt =
+        mutation_receipt(&mutate_http(&other, "kin_mutate", other_args, &first_session).await);
     assert_ne!(first["repository_id"], other_receipt["repository_id"]);
     assert_ne!(first["transaction_id"], other_receipt["transaction_id"]);
     let rotated = router_with_auth(Arc::clone(&state), Some("rotated-token".to_string()))
@@ -688,9 +725,9 @@ async fn mcp_mutate_session_repository_scopes_and_token_rotation_are_stable() {
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_closed_schema_refuses_ignored_constraints_before_reservation() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let base = keyed_mutation(&session, "closed", "first");
+    let base = keyed_mutation(&state, &session, "closed", "first").await;
     let before = mutation_generation(&state);
     let mut unsupported = Vec::new();
     for field in [
@@ -738,9 +775,9 @@ async fn mcp_mutate_closed_schema_refuses_ignored_constraints_before_reservation
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_pending_restart_resumes_original_owner_through_real_mcp_delegate() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "client-resume", "first");
+    let args = keyed_mutation(&state, &session, "client-resume", "first").await;
     state
         .mcp_mutate_fail_once
         .store(8, std::sync::atomic::Ordering::SeqCst);
@@ -807,9 +844,13 @@ async fn mcp_mutate_pending_restart_resumes_original_owner_through_real_mcp_dele
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_published_finalization_failure_reports_receipt_and_refuses_stale_writes() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "finalization", "first");
+    let args = keyed_mutation(&state, &session, "finalization", "first").await;
+    // Read before the publication below, so no read has to be served while the
+    // daemon lags authority. The daemon's freshness guard refuses this request
+    // before its source base is ever compared.
+    let fresh_args = keyed_mutation(&state, &session, "fresh-stale", "second").await;
     let before = mutation_generation(&state);
     state
         .mcp_fail_after_authority_once
@@ -831,10 +872,15 @@ async fn mcp_mutate_published_finalization_failure_reports_receipt_and_refuses_s
         before
     );
     let original = notice["receipt"].clone();
+    assert!(original.get("publication_accounting").is_none());
+    let accounting = notice["publication_accounting"].clone();
+    assert_eq!(accounting["status"], "exact");
+    let replay = mutate_http(&state, "kin_mutate", args.clone(), &session).await;
     assert_eq!(
-        mutation_receipt(&mutate_http(&state, "kin_mutate", args.clone(), &session).await),
-        original
+        tool_result_payload(&replay)["publication_accounting"],
+        accounting
     );
+    assert_eq!(mutation_receipt(&replay), original);
     // Receipt retrieval must not pretend it completed derived graph recovery.
     assert_eq!(
         state
@@ -842,13 +888,7 @@ async fn mcp_mutate_published_finalization_failure_reports_receipt_and_refuses_s
             .load(std::sync::atomic::Ordering::SeqCst),
         before
     );
-    let fresh = mutate_http(
-        &state,
-        "kin_mutate",
-        keyed_mutation(&session, "fresh-stale", "second"),
-        &session,
-    )
-    .await;
+    let fresh = mutate_http(&state, "kin_mutate", fresh_args, &session).await;
     assert_eq!(fresh.is_error, Some(true), "{}", mcp_result_text(&fresh));
     assert!(
         mcp_result_text(&fresh).contains("reopen"),
@@ -868,10 +908,12 @@ async fn mcp_mutate_published_finalization_failure_reports_receipt_and_refuses_s
             .load(std::sync::atomic::Ordering::SeqCst),
         before + 1
     );
+    let replay = mutate_http(&reopened, "kin_mutate", args, &session).await;
     assert_eq!(
-        mutation_receipt(&mutate_http(&reopened, "kin_mutate", args, &session).await),
-        original
+        tool_result_payload(&replay)["publication_accounting"],
+        accounting
     );
+    assert_eq!(mutation_receipt(&replay), original);
     assert_eq!(mutation_generation(&reopened), before + 1);
     assert_eq!(
         mutation_published_body(&reopened, "first.py"),
@@ -882,13 +924,14 @@ async fn mcp_mutate_published_finalization_failure_reports_receipt_and_refuses_s
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_completed_proof_is_bounded_and_tampering_refuses_without_erasing_it() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let mut args = keyed_mutation(&session, "proof", "first");
+    let mut args = keyed_mutation(&state, &session, "proof", "first").await;
+    let unused = keyed_mutation(&state, &session, "unused", "second").await;
     args["operations"]
         .as_array_mut()
         .unwrap()
-        .push(keyed_mutation(&session, "unused", "second")["operations"][0].clone());
+        .push(unused["operations"][0].clone());
     let original =
         mutation_receipt(&mutate_http(&state, "kin_mutate", args.clone(), &session).await);
     let generation = mutation_generation(&state);
@@ -896,6 +939,8 @@ async fn mcp_mutate_completed_proof_is_bounded_and_tampering_refuses_without_era
     assert_eq!(record["receipt"]["schema"], "kin.mutate.publication.v1");
     assert!(record["request"].is_null());
     assert!(record["receipt"].get("modified_files").is_none());
+    assert!(record["receipt"].get("publication_accounting").is_none());
+    assert!(record.get("publication_accounting").is_none());
     assert_eq!(original["modified_files"].as_array().unwrap().len(), 2);
     let intact = std::fs::read(&path).unwrap();
     record["receipt"]["generation"] = serde_json::json!(generation + 1);
@@ -909,7 +954,10 @@ async fn mcp_mutate_completed_proof_is_bounded_and_tampering_refuses_without_era
     // Even a freshly checksummed record cannot replace the authoritative
     // publication proof. The checksum is corruption detection, not authority.
     let mut digest_input = record.clone();
-    digest_input.as_object_mut().unwrap().remove("record_digest");
+    digest_input
+        .as_object_mut()
+        .unwrap()
+        .remove("record_digest");
     use sha2::Digest;
     let mut checksum = sha2::Sha256::new();
     checksum.update(b"kin-mutate-binding-v2\0");
@@ -933,20 +981,13 @@ async fn mcp_mutate_completed_proof_is_bounded_and_tampering_refuses_without_era
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_record_integrity_pending_transaction_corruption_cannot_republish() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    mutation_receipt(
-        &mutate_http(
-            &state,
-            "kin_mutate",
-            keyed_mutation(&session, "seed", "first"),
-            &session,
-        )
-        .await,
-    );
-    let mut args = keyed_mutation(&session, "uncached-publication", "first");
-    args["operations"][0]["verb"] = serde_json::json!("replace");
-    args["operations"][0]["body"] = serde_json::json!("def first():\n    return 2\n");
+    let seed = keyed_mutation(&state, &session, "seed", "first").await;
+    mutation_receipt(&mutate_http(&state, "kin_mutate", seed, &session).await);
+    let mut args = keyed_mutation(&state, &session, "uncached-publication", "first").await;
+    args["operations"][0]["verb"] = serde_json::json!("update");
+    args["operations"][0]["body"] = serde_json::json!("def first():\n    return 2");
     state
         .mcp_mutate_fail_once
         .store(11, std::sync::atomic::Ordering::SeqCst);
@@ -962,9 +1003,17 @@ async fn mcp_mutate_record_integrity_pending_transaction_corruption_cannot_repub
     assert!(record["receipt"].is_null());
     let intact = std::fs::read(&path).unwrap();
     let original_transaction = record["transaction_id"].clone();
-    let mut intervening = args.clone();
-    intervening["request_id"] = serde_json::json!("intervening-after-uncached-publication");
-    intervening["operations"][0]["body"] = serde_json::json!("def first():\n    return 3\n");
+    // The uncertain publication moved the workspace, so the intervening edit
+    // reads the version it replaces again rather than reusing the original's
+    // base, which that publication made stale.
+    let mut intervening = keyed_mutation(
+        &state,
+        &session,
+        "intervening-after-uncached-publication",
+        "first",
+    )
+    .await;
+    intervening["operations"][0]["body"] = serde_json::json!("def first():\n    return 3");
     mutation_receipt(&mutate_http(&state, "kin_mutate", intervening, &session).await);
     let latest = mutation_generation(&state);
     assert_eq!(latest, original_generation + 1);
@@ -1010,9 +1059,9 @@ async fn mcp_mutate_record_integrity_pending_transaction_corruption_cannot_repub
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_record_integrity_completed_count_corruption_cannot_change_receipt() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "completed-count", "first");
+    let args = keyed_mutation(&state, &session, "completed-count", "first").await;
     let original =
         mutation_receipt(&mutate_http(&state, "kin_mutate", args.clone(), &session).await);
     let generation = mutation_generation(&state);
@@ -1045,9 +1094,9 @@ async fn mcp_mutate_record_integrity_completed_count_corruption_cannot_change_re
 #[serial_test::serial]
 async fn mcp_mutate_preexisting_temp_links_preserve_owned_sentinel_and_recovery_evidence() {
     for hard_link in [false, true] {
-        let (_dir, state) = mcp_lifecycle_fixture();
+        let (_dir, state) = keyed_mutation_fixture().await;
         let session = mcp_test_session(&state);
-        let args = keyed_mutation(&session, "temp-link", "first");
+        let args = keyed_mutation(&state, &session, "temp-link", "first").await;
         state
             .mcp_mutate_fail_once
             .store(5, std::sync::atomic::Ordering::SeqCst);
@@ -1085,9 +1134,9 @@ async fn mcp_mutate_preexisting_temp_links_preserve_owned_sentinel_and_recovery_
 #[tokio::test]
 #[serial_test::serial]
 async fn mcp_mutate_record_integrity_checksum_free_legacy_records_require_explicit_recovery() {
-    let (_dir, state) = mcp_lifecycle_fixture();
+    let (_dir, state) = keyed_mutation_fixture().await;
     let session = mcp_test_session(&state);
-    let args = keyed_mutation(&session, "legacy-record", "first");
+    let args = keyed_mutation(&state, &session, "legacy-record", "first").await;
     let original =
         mutation_receipt(&mutate_http(&state, "kin_mutate", args.clone(), &session).await);
     let generation = mutation_generation(&state);
@@ -1124,8 +1173,9 @@ async fn mcp_mutate_record_integrity_checksum_free_legacy_records_require_explic
 #[serial_test::serial]
 async fn mcp_mutate_non_directory_or_symlink_request_store_refuses_before_publication() {
     for symlink in [false, true] {
-        let (_dir, state) = mcp_lifecycle_fixture();
+        let (_dir, state) = keyed_mutation_fixture().await;
         let session = mcp_test_session(&state);
+        let args = keyed_mutation(&state, &session, "directory", "first").await;
         let store = state.layout.root().join("mutate_requests");
         let outside = state.layout.root().join("owned-external-directory");
         if symlink {
@@ -1135,13 +1185,7 @@ async fn mcp_mutate_non_directory_or_symlink_request_store_refuses_before_public
             std::fs::write(&store, b"retain non-directory evidence").unwrap();
         }
         let before = mutation_generation(&state);
-        let refused = mutate_http(
-            &state,
-            "kin_mutate",
-            keyed_mutation(&session, "directory", "first"),
-            &session,
-        )
-        .await;
+        let refused = mutate_http(&state, "kin_mutate", args, &session).await;
         assert_eq!(
             refused.is_error,
             Some(true),
@@ -1162,4 +1206,396 @@ async fn mcp_mutate_non_directory_or_symlink_request_store_refuses_before_public
             );
         }
     }
+}
+
+fn legacy_keyed_arguments(session: &str, id: &str) -> serde_json::Value {
+    serde_json::json!({"session_id":session,"request_id":id,"summary":"retained legacy file work",
+        "operations":[{"verb":"create","target":"legacy.py","body":"def legacy():\n    return 7\n","description":"preserved legacy work"}]})
+}
+
+fn retain_legacy_keyed_request(
+    state: &Arc<DaemonState>,
+    arguments: &serde_json::Value,
+    fenced: bool,
+) -> kin_mcp::McpTransaction {
+    let sessions = mcp_session_registry_snapshot(state).unwrap();
+    let session = arguments["session_id"].as_str().unwrap();
+    let transaction = sessions.begin_transaction(session, "repository").unwrap();
+    let parsed = kin_mcp::session::parse_staged_operations(&arguments["operations"]).unwrap();
+    sessions
+        .stage_transaction(&transaction.transaction_id, parsed)
+        .unwrap();
+    if fenced {
+        let transaction = sessions
+            .get_transaction(&transaction.transaction_id)
+            .unwrap();
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"kin-exact-mcp-transaction-v1\0");
+        crate::mcp_commit::hash_canonical_json(
+            &mut hash,
+            &serde_json::json!({
+            "transaction_id":transaction.transaction_id,"session_id":transaction.session_id,
+            "scope":transaction.scope,"operations":transaction.staged_operations}),
+        );
+        sessions
+            .prepare_transaction_commit(&transaction.transaction_id, &hex::encode(hash.finalize()))
+            .unwrap();
+    }
+    persist_mcp_lifecycle_transactions(state, &sessions).unwrap();
+    crate::mcp_mutate::retain_legacy_request_fixture(
+        state,
+        arguments.clone(),
+        &transaction.transaction_id,
+    );
+    sessions
+        .get_transaction(&transaction.transaction_id)
+        .unwrap()
+}
+
+fn retained_refusal(result: &kin_mcp::ToolCallResult) -> serde_json::Value {
+    assert_eq!(result.is_error, Some(true), "{}", mcp_result_text(result));
+    let payload = tool_result_payload(result);
+    assert_eq!(payload["schema"], "kin.mutate.refusal.v1");
+    assert_eq!(payload["status"], "refused");
+    assert_eq!(payload["published"], false);
+    assert_eq!(payload["request_and_staging_preserved"], true);
+    payload
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_mutate_legacy_refusal_preserves_exact_work_releases_slots_and_replays_after_restart() {
+    for fenced in [false, true] {
+        let (_dir, state) = keyed_mutation_fixture().await;
+        let session = mcp_test_session(&state);
+        let arguments = legacy_keyed_arguments(&session, "legacy-refused");
+        let original = retain_legacy_keyed_request(&state, &arguments, fenced);
+        let (record_path, binding) = mutation_record(&state, "legacy-refused").unwrap();
+        assert!(
+            binding.get("terminal_refusal").is_none(),
+            "old v2 digest shape stays unchanged"
+        );
+        let before = mutation_generation(&state);
+        // Fill the per-session quota around the preserved obsolete request.
+        for _ in 1..kin_mcp::session::MAX_ACTIVE_TRANSACTIONS_PER_SESSION {
+            mcp_lifecycle_begin(&state, &session).await;
+        }
+        let refused =
+            retained_refusal(&mutate_http(&state, "kin_mutate", arguments.clone(), &session).await);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(saved["request"], binding["request"]);
+        assert_eq!(saved["request_hash"], binding["request_hash"]);
+        assert_eq!(
+            saved["terminal_refusal"]["transaction"],
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(saved["receipt"], serde_json::Value::Null);
+        assert_eq!(mutation_generation(&state), before);
+        assert!(!state.layout.working_dir().join("legacy.py").exists());
+        let mirror = crate::state::load_persisted_mcp_transactions_checked(&state.layout).unwrap();
+        assert_eq!(mirror[&original.transaction_id].state, "aborted");
+        assert!(mirror[&original.transaction_id]
+            .staged_operations
+            .is_empty());
+        // One unfinished slot and the unused reservation, not permanent identity,
+        // become available. The full terminal record still consumes actual bytes.
+        let retained_bytes = std::fs::metadata(&record_path).unwrap().len();
+        let mut env = kin_core::test_env::EnvVarGuard::set(
+            "KIN_MUTATE_MAX_STORAGE_BYTES",
+            (retained_bytes + 2 * 1024 * 1024).to_string(),
+        );
+        env.apply("KIN_MUTATE_MAX_REQUESTS", Some("2"));
+        let fresh = keyed_mutation(&state, &session, "fresh-semantic", "first").await;
+        mutation_receipt(&mutate_http(&state, "kin_mutate", fresh, &session).await);
+        assert_eq!(mutation_generation(&state), before + 1);
+        let mut changed = arguments.clone();
+        changed["summary"] = serde_json::json!("changed");
+        let mismatch = mutate_http(&state, "kin_mutate", changed, &session).await;
+        assert!(mcp_result_text(&mismatch).contains("request_id_payload_mismatch"));
+        let frozen = std::fs::read(&record_path).unwrap();
+        let layout = state.layout.clone();
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            retained_refusal(&mutate_http(&reopened, "kin_mutate", arguments, &session).await),
+            refused
+        );
+        assert_eq!(
+            std::fs::read(&record_path).unwrap(),
+            frozen,
+            "replay does not rewrite refusal evidence"
+        );
+        assert_eq!(mutation_generation(&reopened), before + 1);
+        let bytes_after_reload = std::fs::read_dir(reopened.layout.root().join("mutate_requests"))
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>();
+        env.apply("KIN_MUTATE_MAX_REQUESTS", Some("3"));
+        env.apply(
+            "KIN_MUTATE_MAX_STORAGE_BYTES",
+            Some(&(bytes_after_reload + 2 * 1024 * 1024).to_string()),
+        );
+        let fresh_owner = mcp_test_session(&reopened);
+        let fresh = keyed_mutation(&reopened, &fresh_owner, "fresh-after-restart", "second").await;
+        mutation_receipt(&mutate_http(&reopened, "kin_mutate", fresh, &fresh_owner).await);
+        assert_eq!(mutation_generation(&reopened), before + 2);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_mutate_legacy_refusal_persists_before_cleanup_and_recovers_faults() {
+    for phase in [11_u8, 12, 13, 14, 21, 22, 23, 24] {
+        let (_dir, state) = keyed_mutation_fixture().await;
+        let session = mcp_test_session(&state);
+        let arguments = legacy_keyed_arguments(&session, "legacy-fault");
+        let original = retain_legacy_keyed_request(&state, &arguments, true);
+        state
+            .mcp_mutate_fail_once
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
+        let failed = mutate_http(&state, "kin_mutate", arguments.clone(), &session).await;
+        assert_eq!(failed.is_error, Some(true));
+        assert!(
+            mcp_result_text(&failed).contains("injected"),
+            "phase {phase}: {}",
+            mcp_result_text(&failed)
+        );
+        let mirror = crate::state::load_persisted_mcp_transactions_checked(&state.layout).unwrap();
+        assert_eq!(
+            serde_json::to_value(&mirror[&original.transaction_id]).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        let (_, record) = mutation_record(&state, "legacy-fault").unwrap();
+        assert!(record["request"].is_object());
+        let before = mutation_generation(&state);
+        let layout = state.layout.clone();
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        retained_refusal(&mutate_http(&reopened, "kin_mutate", arguments, &session).await);
+        assert_eq!(mutation_generation(&reopened), before);
+        let (_, record) = mutation_record(&reopened, "legacy-fault").unwrap();
+        assert_eq!(
+            record["terminal_refusal"]["transaction"],
+            serde_json::to_value(&original).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_mutate_legacy_published_key_recovers_authority_before_semantic_refusal() {
+    for prior_refusal in [false, true] {
+        let (_dir, state) = keyed_mutation_fixture().await;
+        let session = mcp_test_session(&state);
+        let arguments = legacy_keyed_arguments(&session, "legacy-published");
+        let original = retain_legacy_keyed_request(&state, &arguments, true);
+        if prior_refusal {
+            retained_refusal(&mutate_http(&state, "kin_mutate", arguments.clone(), &session).await);
+        }
+        let saved_refusal = mutation_record(&state, "legacy-published").unwrap().1;
+        let sessions = mcp_session_registry_snapshot(&state).unwrap();
+        if prior_refusal {
+            // Test-only authority publication models a receipt appearing after the
+            // retained refusal. Recovery must still consult authority first.
+            let mut transactions = sessions.list_transactions();
+            *transactions
+                .iter_mut()
+                .find(|tx| tx.transaction_id == original.transaction_id)
+                .unwrap() = original.clone();
+            sessions.replace_transactions(transactions);
+        }
+        let commit = crate::mcp_commit::tests::commit_conversion_fixture(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".into(),
+                serde_json::json!(original.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(commit.is_error, Some(true), "{}", mcp_result_text(&commit));
+        persist_mcp_lifecycle_transactions(&state, &sessions).unwrap();
+        let generation = mutation_generation(&state);
+        let first =
+            mutation_receipt(&mutate_http(&state, "kin_mutate", arguments.clone(), &session).await);
+        assert_eq!(first["transaction_id"], original.transaction_id);
+        assert_eq!(first["repository_generation"], generation);
+        assert_eq!(
+            mutation_published_body(&state, "legacy.py"),
+            "def legacy():\n    return 7\n"
+        );
+        let (_, record) = mutation_record(&state, "legacy-published").unwrap();
+        if prior_refusal {
+            assert_eq!(
+                record, saved_refusal,
+                "authoritative recovery preserves prior refusal evidence"
+            );
+        } else {
+            assert!(record.get("terminal_refusal").is_none());
+        }
+        let layout = state.layout.clone();
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mutation_receipt(&mutate_http(&reopened, "kin_mutate", arguments, &session).await),
+            first
+        );
+        assert_eq!(mutation_generation(&reopened), generation);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_mutate_legacy_refusal_overflow_or_cleanup_failure_preserves_work() {
+    for overflow in [false, true] {
+        let (_dir, state) = keyed_mutation_fixture().await;
+        let session = mcp_test_session(&state);
+        let arguments = legacy_keyed_arguments(&session, "legacy-preservation");
+        let original = retain_legacy_keyed_request(&state, &arguments, true);
+        let (record_path, _) = mutation_record(&state, "legacy-preservation").unwrap();
+        let original_binding = std::fs::read(&record_path).unwrap();
+        if overflow {
+            let sessions = mcp_session_registry_snapshot(&state).unwrap();
+            let mut transactions = sessions.list_transactions();
+            let tx = transactions
+                .iter_mut()
+                .find(|tx| tx.transaction_id == original.transaction_id)
+                .unwrap();
+            tx.staged_operations[0].body = Some("retained staging bytes".repeat(110_000));
+            sessions.replace_transactions(transactions);
+            persist_mcp_lifecycle_transactions(&state, &sessions).unwrap();
+        } else {
+            state.mcp_lifecycle_persist_fail_once.store(
+                crate::state::McpTransactionWritePhase::FileSync as u8,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        let mirror = crate::state::mcp_transactions_disk_path(&state.layout);
+        let staged = std::fs::read(&mirror).unwrap();
+        let before = mutation_generation(&state);
+        let failed = mutate_http(&state, "kin_mutate", arguments.clone(), &session).await;
+        assert_eq!(failed.is_error, Some(true));
+        assert!(
+            mcp_result_text(&failed).contains("request_recovery_required"),
+            "{}",
+            mcp_result_text(&failed)
+        );
+        assert_eq!(std::fs::read(&mirror).unwrap(), staged);
+        assert_eq!(mutation_generation(&state), before);
+        if overflow {
+            assert!(mcp_result_text(&failed).contains("storage bound"));
+            assert_eq!(std::fs::read(&record_path).unwrap(), original_binding);
+        } else {
+            let (_, record) = mutation_record(&state, "legacy-preservation").unwrap();
+            assert_eq!(
+                record["terminal_refusal"]["transaction"],
+                serde_json::to_value(&original).unwrap()
+            );
+            retained_refusal(&mutate_http(&state, "kin_mutate", arguments, &session).await);
+            assert_eq!(mutation_generation(&state), before);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_mutate_publication_accounting_survives_later_roots_without_rewriting_historical_proof()
+{
+    let (_dir, state) = keyed_mutation_fixture().await;
+    let session = mcp_test_session(&state);
+    let mut args = keyed_mutation(&state, &session, "accounting-original", "first").await;
+    let candidates = state
+        .graph
+        .query_entities(&kin_model::EntityFilter {
+            name_pattern: Some("first".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    // The converted first.py module and its function intentionally share a
+    // name. The keyed entity UUID must identify the declaration being edited.
+    assert!(candidates
+        .iter()
+        .any(|entity| { entity.name == "first" && entity.kind == kin_model::EntityKind::Module }));
+    let entity = candidates
+        .into_iter()
+        .find(|entity| entity.name == "first" && entity.kind == kin_model::EntityKind::Function)
+        .expect("the conversion fixture must contain the first function");
+    args["operations"][0]["target"] = serde_json::json!(entity.id.to_string());
+    let first = mutate_http(&state, "kin_mutate", args.clone(), &session).await;
+    let original = mutation_receipt(&first);
+    let accounting = tool_result_payload(&first)["publication_accounting"].clone();
+    assert_eq!(accounting["status"], "exact");
+    assert_eq!(
+        accounting["requested"]["sample_operations"][0]["target"]["entity_id"],
+        entity.id.to_string()
+    );
+    assert_eq!(
+        accounting["entities"]["published_total"],
+        original["entity_deltas"]
+    );
+    assert_eq!(
+        accounting["relationships"]["published_total"],
+        original["relation_deltas"]
+    );
+    assert_eq!(accounting["source_units"]["publication_only"]["count"], 1);
+    assert_eq!(accounting["source_units"]["carried_unchanged"]["count"], 0);
+    let (path, _) = mutation_record(&state, "accounting-original").unwrap();
+    let proof_bytes = std::fs::read(&path).unwrap();
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+            .unwrap();
+    let operation = kin_model::OperationId::from_uuid(
+        Uuid::parse_str(original["transaction_id"].as_str().unwrap()).unwrap(),
+    );
+    let mut historical = crate::repository_commit::recover_native_commit(&context, operation)
+        .unwrap()
+        .unwrap();
+    historical.receipt.operation.workspace_mutation = None;
+    let unavailable = crate::publication_accounting::project(&historical, args.get("operations"));
+    assert_eq!(unavailable["status"], "unavailable");
+    assert!(
+        unavailable.get("entities").is_none(),
+        "unknown historical accounting is not zero"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), proof_bytes);
+    mutation_receipt(
+        &mutate_http(
+            &state,
+            "kin_mutate",
+            keyed_mutation(&state, &session, "accounting-later", "second").await,
+            &session,
+        )
+        .await,
+    );
+    let replay = mutate_http(&state, "kin_mutate", args.clone(), &session).await;
+    assert_eq!(mutation_receipt(&replay), original);
+    assert_eq!(
+        tool_result_payload(&replay)["publication_accounting"],
+        accounting
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), proof_bytes);
+    let layout = state.layout.clone();
+    drop(state);
+    let reopened = Arc::new(DaemonState::open(layout).unwrap());
+    reopened
+        .is_initialized
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let replay = mutate_http(&reopened, "kin_mutate", args, &session).await;
+    assert_eq!(mutation_receipt(&replay), original);
+    assert_eq!(
+        tool_result_payload(&replay)["publication_accounting"],
+        accounting
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), proof_bytes);
 }

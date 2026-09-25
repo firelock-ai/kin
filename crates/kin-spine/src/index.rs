@@ -8,6 +8,7 @@
 //! disambiguation for common names like Config, Error, init.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
 use hashbrown::HashMap;
 use kin_model::{Entity, EntityId, EntityKind, EntityRole, Relation, SemanticFingerprint};
@@ -15,6 +16,7 @@ use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 
 use crate::publication::SpineSourceCursor;
+use crate::xref::UnresolvedImport;
 
 /// A repo identifier (matches registry.toml entries).
 pub type RepoId = String;
@@ -453,6 +455,18 @@ struct SpineInner {
     /// outgoing cross-repo edges were last fully materialized.
     dirty_edge_repos: HashSet<RepoId>,
 
+    /// Each repo's unresolved cross-repo imports, as the last edge refresh
+    /// from its graph collected them, so its edges can be resolved again
+    /// without that graph.
+    ///
+    /// A registration marks every repo's edges dirty, because any of them may
+    /// import from the entity set that changed, and the caller registering one
+    /// repo rarely holds the others' graphs. An import set depends on its own
+    /// repo's graph alone, so it stays exact until that repo registers again
+    /// or is invalidated, and either drops it. Candidate repos are not kept:
+    /// they are the registered set at resolution time, and are filled in then.
+    retained_imports: HashMap<RepoId, Arc<[UnresolvedImport]>>,
+
     /// Monotonic generation for the registered repo/entity/root authority.
     /// A refresh may clear its dirty bit only when this value is unchanged
     /// from the start of that refresh.
@@ -516,6 +530,7 @@ impl SpineIndex {
             root_hashes: HashMap::new(),
             source_cursors: HashMap::new(),
             dirty_edge_repos: HashSet::new(),
+            retained_imports: HashMap::new(),
             authority_epoch: 0,
             active_edge_refreshes: 0,
             active_full_refresh_epoch: None,
@@ -616,6 +631,7 @@ impl SpineIndex {
             entries.retain(|entry| entry.repo_id != repo_id);
         });
         inner.by_id.retain(|(owner, _), _| owner != repo_id);
+        inner.retained_imports.remove(repo_id);
         for entry in entities {
             let key = (entry.name.to_lowercase(), entry.kind);
             inner.by_name.entry(key).or_default().push(entry.clone());
@@ -675,6 +691,8 @@ impl SpineIndex {
             entries.retain(|e| e.repo_id != repo_id);
         });
         inner.by_id.retain(|(rid, _), _| rid != repo_id);
+        // The imports kept for this repo came from the graph this replaces.
+        inner.retained_imports.remove(repo_id);
 
         // Insert new entries
         for entry in entities {
@@ -789,6 +807,18 @@ impl SpineIndex {
     #[cfg(any(test, feature = "test-support"))]
     pub fn dirty_edge_repos(&self) -> std::collections::BTreeSet<RepoId> {
         self.inner.read().dirty_edge_repos.iter().cloned().collect()
+    }
+
+    /// Whether one repository's outgoing cross-repo edges are stale: a
+    /// registration or an invalidation marked them after their last refresh,
+    /// and no refresh has materialized them since.
+    ///
+    /// The per-repository half of [`Self::authority_is_complete`]. A caller
+    /// that owns one repository's graph reads it to decide whether that
+    /// repository owes a refresh, which the global reading cannot say: it goes
+    /// false for any repository's staleness and for a refresh in flight.
+    pub fn cross_repo_edges_stale(&self, repo_id: &str) -> bool {
+        self.inner.read().dirty_edge_repos.contains(repo_id)
     }
 
     fn authority_complete(inner: &SpineInner, roots: &BTreeMap<RepoId, String>) -> bool {
@@ -1047,6 +1077,10 @@ impl SpineIndex {
     pub fn invalidate_cross_repo_edges(&self, repo_id: &str) {
         let mut inner = self.inner.write();
         inner.dirty_edge_repos.insert(repo_id.to_string());
+        // An invalidation says this repo's own derivation is no longer
+        // trusted, not only that the repos it resolves against moved, so it
+        // owes a refresh from its graph and keeps no imports to skip one.
+        inner.retained_imports.remove(repo_id);
         inner.authority_epoch = inner
             .authority_epoch
             .checked_add(1)
@@ -1190,15 +1224,67 @@ impl SpineIndex {
         relations: &[Relation],
         registry_repo_ids: &[String],
     ) -> Vec<CrossRepoEdge> {
-        use crate::xref::{collect_unresolved_imports, materialized_edges, resolve_imports};
+        let unresolved = crate::xref::collect_unresolved_imports(
+            entities,
+            relations,
+            repo_id,
+            registry_repo_ids,
+        );
+        self.edges_for_imports(&unresolved)
+    }
 
-        let unresolved =
-            collect_unresolved_imports(entities, relations, repo_id, registry_repo_ids);
+    /// Resolve a batch of unresolved imports against the registered repos and
+    /// materialize the edges they bind, without mutating the index.
+    fn edges_for_imports(&self, unresolved: &[UnresolvedImport]) -> Vec<CrossRepoEdge> {
         if unresolved.is_empty() {
             return Vec::new();
         }
-        let resolutions = resolve_imports(self, &unresolved);
-        materialized_edges(&unresolved, &resolutions)
+        let resolutions = crate::xref::resolve_imports(self, unresolved);
+        crate::xref::materialized_edges(unresolved, &resolutions)
+    }
+
+    /// Resolve one repo's outgoing cross-repo edges again from the imports its
+    /// last refresh kept, against the repos registered now, and replace its
+    /// outgoing edges with the result.
+    ///
+    /// This is the refresh a repo owes after another repo's registration marked
+    /// it dirty, for a caller that does not hold its graph: its imports depend
+    /// on that graph alone, so resolving them again binds exactly the edges a
+    /// refresh from the graph would. Its dirty mark clears under the same
+    /// authority epoch rule as any refresh.
+    ///
+    /// Returns `false`, changing nothing, when no imports are kept for
+    /// `repo_id`: no refresh from its graph has finished since it last
+    /// registered or was invalidated.
+    pub fn refresh_cross_repo_edges_from_retained_imports(
+        &self,
+        repo_id: &str,
+        registry_repo_ids: &[String],
+    ) -> bool {
+        let _serialized = self.edge_refresh_serialization.lock();
+        let (mut refresh, retained) = {
+            let mut inner = self.inner.write();
+            let Some(retained) = inner.retained_imports.get(repo_id).cloned() else {
+                return false;
+            };
+            (self.start_edge_refresh(&mut inner, repo_id), retained)
+        };
+        // The same candidates `collect_unresolved_imports` gives each import.
+        let candidate_repos = registry_repo_ids
+            .iter()
+            .filter(|repo| repo.as_str() != repo_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let unresolved = retained
+            .iter()
+            .map(|import| UnresolvedImport {
+                candidate_repos: candidate_repos.clone(),
+                ..import.clone()
+            })
+            .collect::<Vec<_>>();
+        let replacement = self.edges_for_imports(&unresolved);
+        self.install_refreshed_edges(&mut refresh, replacement, None);
+        true
     }
 
     fn refresh_cross_repo_edges_with_hook<F>(
@@ -1218,12 +1304,46 @@ impl SpineIndex {
         // Resolve into a detached replacement before taking the mutation lock.
         // Installing the full outgoing set in one write prevents readers from
         // seeing a partial or interleaved union.
-        let replacement =
-            self.derive_cross_repo_edges(repo_id, entities, relations, registry_repo_ids);
+        let unresolved = crate::xref::collect_unresolved_imports(
+            entities,
+            relations,
+            repo_id,
+            registry_repo_ids,
+        );
+        let replacement = self.edges_for_imports(&unresolved);
+        let retained = unresolved
+            .into_iter()
+            .map(|import| UnresolvedImport {
+                candidate_repos: Vec::new(),
+                ..import
+            })
+            .collect();
+        self.install_refreshed_edges(&mut refresh, replacement, Some(retained));
+    }
+
+    /// Replace the refreshing repo's outgoing edges with `replacement` under
+    /// one write lock, keeping `retained` as its import set.
+    ///
+    /// The imports are kept only when no authority change has happened since
+    /// the refresh began: a registration of the repo in that window replaced
+    /// the graph they were collected from, and an invalidation withdrew trust
+    /// in it.
+    fn install_refreshed_edges(
+        &self,
+        refresh: &mut EdgeRefreshGuard<'_>,
+        replacement: Vec<CrossRepoEdge>,
+        retained: Option<Arc<[UnresolvedImport]>>,
+    ) {
+        let repo_id = refresh.repo_id.as_str();
         let mut inner = self.inner.write();
         inner.cross_repo_edges.retain(|e| e.src_repo != repo_id);
         inner.cross_repo_edges.extend(replacement);
         inner.source_cursors.remove(repo_id);
+        if let Some(retained) = retained {
+            if inner.authority_epoch == refresh.authority_epoch {
+                inner.retained_imports.insert(repo_id.to_string(), retained);
+            }
+        }
         Self::recompute_cross_repo_metadata(&mut inner);
         drop(inner);
         refresh.mark_succeeded();
@@ -1243,6 +1363,12 @@ impl SpineIndex {
                 "",
             );
         }
+        self.start_edge_refresh(&mut inner, repo_id)
+    }
+
+    /// Count one refresh of `repo_id` in flight, bound to the authority epoch
+    /// it may clear the repo's dirty mark against.
+    fn start_edge_refresh(&self, inner: &mut SpineInner, repo_id: &str) -> EdgeRefreshGuard<'_> {
         inner.active_edge_refreshes += 1;
         EdgeRefreshGuard {
             index: self,
@@ -2381,6 +2507,162 @@ mod tests {
         );
         index.refresh_cross_repo_edges("alpha", &[], &[], &repos);
         assert!(index.cross_repo_edges_snapshot().complete);
+    }
+
+    /// A registration marks every registered repo's edges dirty, and the
+    /// caller that registered one repo rarely holds the others' graphs.
+    /// Resolving a dirty repo's kept imports again must bind exactly what a
+    /// refresh from its own graph binds against the new registration: the
+    /// unchanged call follows its target to the target's new identity, and the
+    /// call that resolved to nothing before now binds the function the
+    /// registration added.
+    #[test]
+    fn kept_imports_resolve_again_against_a_changed_registration() {
+        let caller_id = EntityId::from_content("src/a.rs", "caller", "function", 1);
+        let caller = test_entity(caller_id, "caller");
+        let calls = vec![
+            external_call(caller_id, "beta", "target"),
+            external_call(caller_id, "beta", "added"),
+        ];
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        let alpha_entries = || vec![test_entry_with_id("alpha", caller_id, "caller")];
+        let outgoing = |index: &SpineIndex| {
+            let mut edges = index.cross_repo_edges_from("alpha");
+            edges.sort_by(cross_repo_edge_order);
+            edges
+        };
+
+        let index = SpineIndex::new();
+        let target_before = test_entry("beta", "target", EntityKind::Function);
+        index.register_repo("alpha", alpha_entries(), "root-a");
+        index.register_repo("beta", vec![target_before.clone()], "root-b");
+        index.refresh_cross_repo_edges("alpha", std::slice::from_ref(&caller), &calls, &repos);
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        assert!(index.authority_is_complete());
+        assert_eq!(
+            outgoing(&index)
+                .iter()
+                .map(|edge| edge.dst_entity)
+                .collect::<Vec<_>>(),
+            vec![target_before.entity_id],
+            "the control: only the call into an existing target binds"
+        );
+
+        let target_after = test_entry("beta", "target", EntityKind::Function);
+        let added = test_entry("beta", "added", EntityKind::Function);
+        let beta_after = vec![target_after.clone(), added.clone()];
+        index.register_repo("beta", beta_after.clone(), "root-b-next");
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        assert!(
+            index.cross_repo_edges_stale("alpha"),
+            "beta's registration must mark alpha dirty"
+        );
+
+        assert!(index.refresh_cross_repo_edges_from_retained_imports("alpha", &repos));
+        assert!(!index.cross_repo_edges_stale("alpha"));
+        assert!(index.authority_is_complete());
+
+        let fresh = SpineIndex::new();
+        fresh.register_repo("alpha", alpha_entries(), "root-a");
+        fresh.register_repo("beta", beta_after, "root-b-next");
+        fresh.refresh_cross_repo_edges("alpha", std::slice::from_ref(&caller), &calls, &repos);
+        assert_eq!(
+            outgoing(&index),
+            outgoing(&fresh),
+            "resolving the kept imports again must bind what a refresh from the graph binds"
+        );
+        assert_eq!(
+            outgoing(&index)
+                .iter()
+                .map(|edge| edge.dst_entity)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([target_after.entity_id, added.entity_id])
+        );
+    }
+
+    /// A repo whose imports were never kept has nothing to resolve again, so
+    /// it stays dirty and the authority stays incomplete, rather than being
+    /// declared current over edges nobody resolved.
+    #[test]
+    fn a_repo_with_no_kept_imports_stays_stale() {
+        let index = SpineIndex::new();
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "root-b");
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+
+        assert!(!index.refresh_cross_repo_edges_from_retained_imports("alpha", &repos));
+        assert!(index.cross_repo_edges_stale("alpha"));
+        assert!(!index.authority_is_complete());
+    }
+
+    /// Registering a repo again replaces the graph its kept imports were
+    /// collected from, so they go with it, and a refresh that a registration
+    /// of its own repo raced keeps none.
+    #[test]
+    fn registering_a_repo_again_drops_its_kept_imports() {
+        let caller_id = EntityId::from_content("src/a.rs", "caller", "function", 1);
+        let caller = test_entity(caller_id, "caller");
+        let calls = vec![external_call(caller_id, "beta", "target")];
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        let alpha_entries = || vec![test_entry_with_id("alpha", caller_id, "caller")];
+        let index = SpineIndex::new();
+        index.register_repo("alpha", alpha_entries(), "root-a");
+        index.register_repo(
+            "beta",
+            vec![test_entry("beta", "target", EntityKind::Function)],
+            "root-b",
+        );
+        index.refresh_cross_repo_edges("alpha", std::slice::from_ref(&caller), &calls, &repos);
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+
+        index.register_repo("alpha", alpha_entries(), "root-a-next");
+        assert!(
+            !index.refresh_cross_repo_edges_from_retained_imports("alpha", &repos),
+            "imports collected from the graph a registration replaced must not be resolved"
+        );
+        assert!(index.cross_repo_edges_stale("alpha"));
+
+        index.refresh_cross_repo_edges_with_hook(
+            "alpha",
+            std::slice::from_ref(&caller),
+            &calls,
+            &repos,
+            || index.register_repo("alpha", alpha_entries(), "root-a-raced"),
+        );
+        assert!(
+            !index.refresh_cross_repo_edges_from_retained_imports("alpha", &repos),
+            "a refresh its own repo's registration raced must keep no imports"
+        );
+        assert!(index.cross_repo_edges_stale("alpha"));
+    }
+
+    /// Another repo's registration moves only what a repo resolves against,
+    /// so its kept imports survive it. An invalidation withdraws trust in the
+    /// repo's own derivation, which a caller does when it wants the repo
+    /// refreshed from its graph and could not do it, so it drops them and the
+    /// repo stays dirty rather than serving the watermark the caller refused.
+    #[test]
+    fn an_invalidation_drops_the_kept_imports() {
+        let index = SpineIndex::new();
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "root-b");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        index.register_repo("beta", vec![], "root-b-next");
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        assert!(
+            index.refresh_cross_repo_edges_from_retained_imports("alpha", &repos),
+            "the control: another repo's registration leaves alpha's imports kept"
+        );
+        assert!(index.authority_is_complete());
+
+        index.invalidate_cross_repo_edges("alpha");
+        assert!(!index.refresh_cross_repo_edges_from_retained_imports("alpha", &repos));
+        assert!(index.cross_repo_edges_stale("alpha"));
+        assert!(!index.authority_is_complete());
     }
 
     #[test]

@@ -43,6 +43,27 @@ KIN_EMBED_FLOOR_GRACE_SECS
 # than a read shape, so it also sees names that exist only inside a dependency's
 # own `#[cfg(test)]` module. These never reach a kin process.
 
+# kin-db storage/repository.rs: selects the bounded frozen-history recovery
+# subprocess and passes its parent-owned temporary directory. The read exists
+# only in the dependency's own test module, not in production recovery.
+KIN_DB_FROZEN_RECOVERY_CHILD
+
+# kin-db storage/repository/session_publication_tests.rs: selects an owned
+# prior-CLI fixture only for the ignored prepared_session_old_reader_fixture
+# test under cfg(test). No product runtime reads this variable.
+KIN_DB_PREPARED_SESSION_FIXTURE
+
+# kin-db storage/snapshot.rs: hands the parent's temporary store to the child
+# process that published_text_readback_failure_preserves_graph_edits_on_cold_reopen
+# spawns to reopen that store cold and verify it. The read exists only in the
+# dependency's own test module. No product runtime reads this variable.
+KIN_DB_TEXT_READBACK_REOPEN_ROOT
+
+# kin-db storage/snapshot.rs: selects the child of the model-free local-content
+# identity reopen test. This sentinel is read only by that #[test] function;
+# no product runtime reads it as an operator control.
+KIN_TEST_LOCAL_MODEL_IDENTITY_CHILD
+
 # kin-infer resource.rs: the deliberately-absent name its env_flag_override test
 # asserts parses to None.
 KIN_INFER_NONEXISTENT_FLAG_XYZ

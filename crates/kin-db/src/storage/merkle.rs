@@ -1067,6 +1067,8 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         // different the moment one of them wrote a section, which is the exact
         // spurious mismatch the four bindings above exist to avoid.
         materialized_graph: _,
+        // Runtime-only capability is reconstructed from admitted authority.
+        verified_binding_history: _,
     } = snapshot;
 
     let mut hasher = Sha256::new();

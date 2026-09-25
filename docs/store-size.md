@@ -126,6 +126,8 @@ cost by 1.74x, as the row below now shows.
 | Repository | Commits | Git object store | Kin store | Ratio | Version, date |
 | --- | --- | --- | --- | --- | --- |
 | ripgrep (Rust), at `e89fff89` | 2,261 | 5.7 MiB | 703.9 MiB | 122.7x | v0.7.2, 2026-09-07 |
+| psf/requests (Python) | not recorded (6,735 Kin changes) | 13.9 MiB | 1.5 GiB | 112.5x | v0.7.21, 2026-09-18 |
+| expressjs/express (JavaScript) | not recorded (6,425 Kin changes) | 10.6 MiB | 513.7 MiB | 48.5x | v0.7.21, 2026-09-18 |
 | a two-commit fixture (one Rust file) | 2 | 444 B | 16.0 KiB | 36.9x | synthetic fixture |
 | a fixture that reset away a 3 MB commit | 1 | 2.9 MiB | 10.6 KiB | `<0.01x` | synthetic fixture |
 
@@ -139,12 +141,23 @@ when a figure sits unstamped: the same-vintage number understated today's real
 cost by 1.74x. They are pending re-measurement on the shipped release rather
 than published as comparisons this page can no longer stand behind.
 
-This is a record of what has been measured, not a bound. Kin does not currently
-cap store size, warn above a threshold, or refuse to admit a repository for
-being large. Right now this page can stand behind one current ratio, ripgrep's
-122.7x under v0.7.2; the wider range this page used to quote came from the
-figures pulled above. If your own repository's ratio surprises you, the
-numbers `kin status` prints are what to report.
+The two v0.7.21 rows are `kin init`'s own closing lines from an isolated
+first-contact run on 2026-09-18, taken before any embedding pass had fetched
+its model.
+
+This is a record of what has been measured, not a bound. Kin does not cap store
+size or refuse to admit a repository for being large. What `kin init` does
+check, before it writes anything, is free space on the filesystem it stages
+on. A conversion holds every file version reachable from HEAD twice while it
+runs, once in the capture it reads Git into and once in the store it copies
+them to, and neither copy is compressed, so it refuses when free space is under
+twice those bytes. When free space clears that and is still under what the
+largest ratio above would come to next to the repository's Git object store, it
+says so in one line and carries on. On a filesystem that compresses or
+deduplicates, where those uncompressed figures overstate what it will use, set
+`KIN_INIT_DISK_FREE_BYTES` to the free space to judge against. If your own
+repository's ratio surprises you, the numbers `kin status` prints are what to
+report.
 
 One repository is deliberately absent from the table. psf/requests at
 `dae7ef63b` measures 178.0x under v0.7.0 and 208.7x under v0.7.2 (2026-09-06),

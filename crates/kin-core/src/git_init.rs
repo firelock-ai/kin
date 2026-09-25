@@ -20,7 +20,7 @@ use kin_git::{
     reprove_git_migration, reprove_git_migration_after_publication,
     seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
     GitMigrationPreflightProof, LosslessGitRepository, ProvedImportClosure,
-    SealedContentObservation, SealedContentSource,
+    SealedContentObservation, SealedContentSource, SemanticGitImportPlan,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
@@ -226,6 +226,10 @@ fn init_from_git_with_hooks(
         ))
     })?;
     let final_kin_dir = source.join(".kin");
+    // Before the post-mortem read and the admission checks, so a repository in
+    // a directory this user cannot write is told why in one sentence instead
+    // of reaching a raw error on the first staging create.
+    crate::init_staging::require_writable_init_directories(source_parent, &source)?;
 
     // Ahead of the ladder, because a conversion the kernel killed says nothing
     // for itself: `SIGKILL` runs no destructor and prints no error, so the only
@@ -293,6 +297,24 @@ fn init_from_git_with_hooks(
     if let Some(line) = budget.advisory_line() {
         crate::init_attempt::disclose_line(&line);
     }
+    // Disk, for the same reason and at the same point: a conversion that fills
+    // the disk fails partway, after minutes, and takes every other writer on
+    // that disk down with it. The history the memory forecast just walked is
+    // reused, so this costs one bounded walk of the Git object store.
+    let disk = crate::init_disk::assess(
+        &source,
+        source_parent,
+        budget.survey().map(|survey| survey.history_bytes),
+    );
+    if disk.refuses() {
+        for line in disk.refusal_lines() {
+            crate::init_attempt::disclose_line(&line);
+        }
+        return Err(KinError::ConversionDiskExceeded);
+    }
+    if let Some(line) = disk.advisory_line() {
+        crate::init_attempt::disclose_line(&line);
+    }
 
     // The ladder now stamps every phase it opens into the capture directory, so
     // the next command can name where a kill landed.
@@ -344,33 +366,35 @@ fn init_from_git_with_hooks(
         plan
     };
 
-    // What phase 1 could not see. Its forecast multiplies a per-artifact term
-    // by the commit count, so a one-commit snapshot of a wide tree forecasts
-    // one tree's worth of entries, stays silent, and dies in the phase below.
-    // The plan now holds the head tree it will admit and a recorded size for
-    // every object it captured, so the conversion's width is finally a number
-    // rather than a guess, and reading it costs one pass over structures that
-    // are already in hand.
+    // What phase 1 could not see, judged before the phase that spends it.
+    // Phase 1 walks HEAD's history, and the capture above took every ref under
+    // `refs/`, so on a repository whose other branches and tags carry history
+    // of their own the plan holds more than phase 1 forecast. The plan also
+    // holds the head tree it will admit and a recorded size for every object it
+    // captured, so a wide tree's bytes are finally a number rather than a
+    // guess. Reading all of it costs one pass over structures already in hand.
+    //
+    // Refused rather than warned about. The phase below is where this memory
+    // goes, and past it a kernel ends the run with no message or, on macOS,
+    // the machine pages until it stops answering. A refusal here gives up only
+    // the capture, which `capture_dir` removes as this returns, exactly as it
+    // does for any other error before the repository is staged.
     //
     // Reported as well as judged. The count is the phase's own size and is
     // worth a line whatever the machine has, because the phase after it is the
     // one that spends minutes and gigabytes on exactly this many files.
     {
-        let survey = crate::init_budget::ImportSurvey {
-            commits: semantic_plan.changes.len() as u64,
-            head_artifacts: semantic_plan.workspace_seed.base_tree.len() as u64,
-            object_bytes: semantic_plan
-                .external_objects
-                .iter()
-                .map(|record| record.body_len)
-                .sum(),
-        };
+        let survey = import_survey(&snapshot, &semantic_plan);
         progress.detail(format_args!(
             "{} files, {} commits",
             survey.head_artifacts, survey.commits
         ));
-        if let Some(line) = crate::init_budget::project_import(survey).advisory_line() {
-            crate::init_attempt::disclose_line(&line);
+        let projection = crate::init_budget::project_import(survey);
+        if projection.refuses() {
+            for line in projection.refusal_lines() {
+                crate::init_attempt::disclose_line(&line);
+            }
+            return Err(KinError::ConversionBudgetExceeded);
         }
     }
 
@@ -725,6 +749,29 @@ fn init_from_git_with_hooks(
     }
 
     Ok(result)
+}
+
+/// What the plan says this conversion is about to derive, counted from what
+/// the capture really took.
+///
+/// Every number comes from the capture's own result rather than from a second
+/// walk of the source, so it cannot drift from the refs the capture takes: one
+/// change per captured commit, every captured object, and every captured ref.
+/// Phase 1 walks HEAD alone, and this is what lets phase 4 see the rest.
+fn import_survey(
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+) -> crate::init_budget::ImportSurvey {
+    crate::init_budget::ImportSurvey {
+        commits: plan.changes.len() as u64,
+        head_artifacts: plan.workspace_seed.base_tree.len() as u64,
+        object_bytes: plan
+            .external_objects
+            .iter()
+            .map(|record| record.body_len)
+            .sum(),
+        refs: snapshot.refs.refs.len() as u64,
+    }
 }
 
 /// Re-derive the sealed all-content observation against a published repository.
@@ -2142,6 +2189,115 @@ mod tests {
         assert_no_staging_directories(root.path());
     }
 
+    /// Holds a directory read-only for the life of a test and gives write back
+    /// on drop, so a failing assertion cannot leave a tree the temporary
+    /// directory's own cleanup is refused on.
+    #[cfg(unix)]
+    struct ReadOnlyDirectory(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl ReadOnlyDirectory {
+        /// `None` when this user can still create entries after the mode
+        /// change, which is what root sees, so a test that needs a refusal
+        /// cannot stage one on this host.
+        fn hold(path: &Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let guard = Self(path.to_path_buf());
+            let probe = path.join(".kin-write-probe");
+            match std::fs::write(&probe, b"") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&probe);
+                    None
+                }
+                Err(_) => Some(guard),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDirectory {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn committed_source(root: &Path) -> std::path::PathBuf {
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        source
+    }
+
+    /// A repository under a directory this user cannot write, which is how
+    /// `/workspaces/<name>` and `/app` look to a non-root user in the common
+    /// devcontainer and Docker layouts, is turned away by name before any
+    /// work, rather than by a raw `Permission denied` on the first staging
+    /// create.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_under_a_read_only_parent_is_refused_by_name_before_any_work() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("workspaces");
+        std::fs::create_dir(&parent).unwrap();
+        let source = committed_source(&parent);
+        let Some(_read_only) = ReadOnlyDirectory::hold(&parent) else {
+            eprintln!("skipped: this user can write a mode 0555 directory, so no refusal exists");
+            return;
+        };
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        let parent_shown = parent.canonicalize().unwrap().display().to_string();
+        assert!(error.contains("kin init cannot start"), "{error}");
+        assert!(
+            error.contains(&format!("in {parent_shown}")),
+            "the refusal must name the directory it cannot write: {error}"
+        );
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(
+            error.contains("Clone or move the repository"),
+            "the refusal must say what to do: {error}"
+        );
+        assert!(
+            !error.starts_with("IO error"),
+            "a raw filesystem error is what this replaces: {error}"
+        );
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(&parent);
+    }
+
+    /// The publication half: a repository root that refuses new entries used
+    /// to run the whole conversion and fail only at the final rename.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_repository_root_is_refused_before_the_conversion_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = committed_source(root.path());
+        let Some(_read_only) = ReadOnlyDirectory::hold(&source) else {
+            eprintln!("skipped: this user can write a mode 0555 directory, so no refusal exists");
+            return;
+        };
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        let store = source.canonicalize().unwrap().join(".kin");
+        assert!(error.contains("kin init cannot start"), "{error}");
+        assert!(
+            error.contains(&format!("publishes the store as {}", store.display())),
+            "{error}"
+        );
+        assert!(!store.exists());
+        assert_no_staging_directories(root.path());
+    }
+
     /// An ambiguous source still refuses, and says so before deriving anything.
     #[test]
     fn an_in_progress_git_operation_still_refuses() {
@@ -3004,6 +3160,178 @@ mod tests {
         );
     }
 
+    /// The capture takes every ref under `refs/`, and the forecast phase 1
+    /// makes before it walks HEAD alone.
+    ///
+    /// The fixture puts history where only other refs reach it: a side branch,
+    /// an annotated tag on a commit no branch holds, a remote-tracking ref, and
+    /// a lightweight tag that names a blob outright. It also leaves a commit
+    /// and a blob that no ref names, which a capture that swept the object
+    /// store instead of walking refs would take. What the capture holds is
+    /// compared with Git's own answer to the same question, and the survey the
+    /// phase-4 check judges is compared with both. So that check is shown to
+    /// count exactly what the capture took, and phase 1 to count HEAD's share
+    /// of it and nothing more, which is the gap the phase-4 refusal closes.
+    #[test]
+    fn the_capture_takes_every_ref_and_the_phase_one_survey_walks_head_alone() {
+        use std::collections::BTreeSet;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("a.txt"), b"one\n").unwrap();
+        git(&source, ["add", "a.txt"]);
+        git(&source, ["commit", "-m", "one"]);
+        std::fs::write(source.join("a.txt"), b"two\n").unwrap();
+        git(&source, ["commit", "-am", "two"]);
+        for (branch, file, body) in [
+            ("side", "side.txt", "only a side branch reaches this\n"),
+            (
+                "release",
+                "release.txt",
+                "only an annotated tag reaches this\n",
+            ),
+            (
+                "feature",
+                "feature.txt",
+                "only a remote-tracking ref reaches this\n",
+            ),
+        ] {
+            git(&source, ["checkout", "-b", branch]);
+            std::fs::write(source.join(file), body).unwrap();
+            git(&source, ["add", file]);
+            git(&source, ["commit", "-m", branch]);
+            git(&source, ["checkout", "main"]);
+        }
+        git(
+            &source,
+            [
+                "tag",
+                "--annotate",
+                "v1",
+                "release",
+                "-m",
+                "a release no branch holds",
+            ],
+        );
+        git(&source, ["branch", "-D", "release"]);
+        git(
+            &source,
+            ["update-ref", "refs/remotes/origin/feature", "feature"],
+        );
+        git(&source, ["branch", "-D", "feature"]);
+
+        let raw_path = root.path().join("raw-blob.txt");
+        std::fs::write(&raw_path, b"a blob that only a tag names\n").unwrap();
+        let raw_blob = git_stdout(&source, ["hash-object", "-w", raw_path.to_str().unwrap()]);
+        let raw_blob = raw_blob.trim();
+        git(&source, ["update-ref", "refs/tags/raw-blob", raw_blob]);
+        let dangling_path = root.path().join("dangling.txt");
+        std::fs::write(&dangling_path, b"no ref names this blob\n").unwrap();
+        let dangling_blob = git_stdout(
+            &source,
+            ["hash-object", "-w", dangling_path.to_str().unwrap()],
+        );
+        let dangling_blob = dangling_blob.trim();
+        let dangling_commit = git_stdout(
+            &source,
+            [
+                "commit-tree",
+                "HEAD^{tree}",
+                "-m",
+                "no ref names this commit",
+            ],
+        );
+        let dangling_commit = dangling_commit.trim();
+        assert_eq!(
+            git_stdout(&source, ["status", "--porcelain"]),
+            "",
+            "the fixture has to leave main's working tree clean"
+        );
+
+        let store = BlobStore::new_ephemeral(root.path().join("capture")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &source,
+            RepositoryId::new("ref-universe").unwrap(),
+            &store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &store).unwrap();
+        let captured = import_survey(&snapshot, &plan);
+        let head = crate::init_budget::survey_history(&source).unwrap();
+
+        let git_refs = git_stdout(&source, ["for-each-ref", "--format=%(refname)"])
+            .lines()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let captured_refs = snapshot
+            .refs
+            .refs
+            .iter()
+            .map(|reference| String::from_utf8_lossy(reference.name.as_bytes()).into_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            captured_refs, git_refs,
+            "the capture did not take exactly the refs Git lists"
+        );
+        assert_eq!(captured_refs.len(), 5, "refs were {captured_refs:?}");
+
+        let git_objects = git_stdout(
+            &source,
+            ["rev-list", "--objects", "--all", "--no-object-names"],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+        let captured_objects = snapshot
+            .objects
+            .iter()
+            .map(|record| record.object.oid.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            captured_objects, git_objects,
+            "the capture did not take exactly the objects every ref reaches"
+        );
+        assert!(captured_objects.contains(raw_blob));
+        assert!(
+            captured_objects.contains(git_stdout(&source, ["rev-parse", "refs/tags/v1"]).trim())
+        );
+        assert!(!captured_objects.contains(dangling_blob));
+        assert!(!captured_objects.contains(dangling_commit));
+
+        let git_object_bytes = git_objects
+            .iter()
+            .map(|oid| {
+                git_stdout(&source, ["cat-file", "-s", oid.as_str()])
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .sum::<u64>();
+        let every_ref_commits = git_stdout(&source, ["rev-list", "--all", "--count"])
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        let head_commits = git_stdout(&source, ["rev-list", "HEAD", "--count"])
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!((every_ref_commits, head_commits), (5, 2));
+
+        // What phase 4 judges: the capture's own counts.
+        assert_eq!(captured.commits, every_ref_commits);
+        assert_eq!(captured.refs, 5);
+        assert_eq!(captured.object_bytes, git_object_bytes);
+        assert_eq!(captured.head_artifacts, 1, "main's tree holds a.txt alone");
+
+        // What phase 1 judged: HEAD's two commits and the two versions of
+        // a.txt, eight bytes, and none of what the other refs carry.
+        assert_eq!(head.commits, head_commits);
+        assert_eq!(head.history_bytes, 8);
+        assert!(captured.commits > head.commits && captured.object_bytes > head.history_bytes);
+    }
+
     fn initialize_git(source: &Path) {
         git(source, ["init", "--initial-branch=main"]);
         git(source, ["config", "user.email", "kin@example.invalid"]);
@@ -3185,8 +3513,12 @@ mod tests {
             };
             assert_eq!(
                 stamp.created_under,
-                hydration_semantics::binary_version(),
+                Some(hydration_semantics::binary_version()),
                 "{door} recorded a version this binary did not author"
+            );
+            assert!(
+                stamp.upgrade.is_none(),
+                "{door} recorded an upgrade on a store it created"
             );
             assert_eq!(
                 stamp.schema,

@@ -298,6 +298,29 @@ impl WorkspaceSemanticOverlay {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Whether everything this overlay holds is language-server enrichment.
+    ///
+    /// The daemon persists the relations a language server derives from the
+    /// committed tree by publishing them into this overlay, so they survive a
+    /// restart. That publication only ever adds a relation or refines one the
+    /// workspace already holds, and every relation it writes carries
+    /// [`RelationOrigin::Lsp`](crate::RelationOrigin::Lsp). An overlay that
+    /// holds exactly that is Kin's own derived state rather than work anyone
+    /// has not committed yet. An entity, an external reference, a removal, or
+    /// a relation of any other origin is something else, and makes this false.
+    /// An empty overlay holds no enrichment either, so it is false too.
+    pub fn is_language_server_enrichment_only(&self) -> bool {
+        !self.is_empty()
+            && self.entity_deltas().is_empty()
+            && self.external_reference_deltas().is_empty()
+            && self.relation_deltas().iter().all(|delta| match delta {
+                RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
+                    new.origin == crate::RelationOrigin::Lsp
+                }
+                RelationDelta::Removed { .. } => false,
+            })
+    }
 }
 
 /// One versioned digest in the repository authority root bundle.
@@ -578,6 +601,20 @@ impl WorkspaceState {
 
     pub fn is_dirty(&self) -> bool {
         !self.semantic_overlay.is_empty()
+            || self
+                .base_tree_hash
+                .map_or(!self.tree.is_empty(), |base| base != self.tree_hash)
+    }
+
+    /// Whether this workspace holds work nobody has committed yet.
+    ///
+    /// The same clauses as [`Self::is_dirty`] except one: an overlay that
+    /// holds only language-server enrichment is Kin's derived state, not
+    /// pending work, so it does not count. A tree off its base, a tree on an
+    /// unborn head, or an overlay holding anything else still does.
+    pub fn holds_uncommitted_work(&self) -> bool {
+        (!self.semantic_overlay.is_empty()
+            && !self.semantic_overlay.is_language_server_enrichment_only())
             || self
                 .base_tree_hash
                 .map_or(!self.tree.is_empty(), |base| base != self.tree_hash)
@@ -3751,6 +3788,136 @@ mod tests {
             serde_json::from_value::<WorkspaceState>(encoded).unwrap(),
             dirty
         );
+    }
+
+    /// Language-server enrichment in the overlay is derived state, and only
+    /// that shape is. The daemon publishes the relations a language server
+    /// derived after a commit into the overlay so they survive a restart, and
+    /// a merge that read that as uncommitted work refused with 409 until the
+    /// caller committed a change holding no entity and no file.
+    #[test]
+    fn language_server_enrichment_alone_is_not_uncommitted_work() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x94));
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let tree = ResolvedTree::default()
+            .apply(&[add_artifact(
+                ArtifactId(Uuid::from_u128(0x95)),
+                b"src/lib.rs".to_vec(),
+                0x42,
+                false,
+            )])
+            .unwrap();
+        let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        let base = RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x96; 32])));
+        let workspace = |base_tree_hash: Hash256, overlay: WorkspaceSemanticOverlay| {
+            WorkspaceState::new(
+                repository_id.clone(),
+                workspace_id,
+                1,
+                WorkspaceHead::Symbolic {
+                    target: RefName::branch(b"main").unwrap(),
+                },
+                Some(base.clone()),
+                Some(base_tree_hash),
+                tree.clone(),
+                overlay,
+                shared_policy.clone(),
+                policy,
+            )
+            .unwrap()
+        };
+        let caller = semantic_entity(0x97, "caller");
+        let callee = semantic_entity(0x98, "callee");
+        let edge = |origin: crate::RelationOrigin| crate::Relation {
+            id: crate::RelationId(Uuid::from_u128(0x99)),
+            kind: crate::RelationKind::Calls,
+            src: crate::GraphNodeId::Entity(caller.id),
+            dst: crate::GraphNodeId::Entity(callee.id),
+            confidence: 1.0,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let lsp = edge(crate::RelationOrigin::Lsp);
+        let parsed = edge(crate::RelationOrigin::Parsed);
+
+        assert!(!workspace(tree_hash, WorkspaceSemanticOverlay::default()).holds_uncommitted_work());
+        assert!(!WorkspaceSemanticOverlay::default().is_language_server_enrichment_only());
+
+        // What the enrichment publication writes: an edge it adds, and an edge
+        // the base already holds that it refines.
+        for (label, delta) in [
+            ("an added edge", RelationDelta::Added { new: lsp.clone() }),
+            (
+                "a refined edge",
+                RelationDelta::Modified {
+                    old: parsed.clone(),
+                    new: lsp.clone(),
+                },
+            ),
+        ] {
+            let overlay = WorkspaceSemanticOverlay::new(Vec::new(), vec![delta]).unwrap();
+            assert!(overlay.is_language_server_enrichment_only(), "{label}");
+            let enriched = workspace(tree_hash, overlay);
+            assert!(
+                enriched.is_dirty(),
+                "{label}: the overlay is still pending authority, which is all is_dirty says"
+            );
+            assert!(!enriched.holds_uncommitted_work(), "{label}");
+        }
+
+        // Anything else in the overlay is work of its own.
+        for (label, entity_deltas, relation_deltas) in [
+            (
+                "a parsed edge",
+                Vec::new(),
+                vec![RelationDelta::Added {
+                    new: parsed.clone(),
+                }],
+            ),
+            (
+                "a removed language-server edge",
+                Vec::new(),
+                vec![RelationDelta::Removed { old: lsp.clone() }],
+            ),
+            (
+                "an entity beside the enrichment",
+                vec![EntityDelta::Added {
+                    new: caller.clone(),
+                }],
+                vec![RelationDelta::Added { new: lsp.clone() }],
+            ),
+        ] {
+            let overlay = WorkspaceSemanticOverlay::new(entity_deltas, relation_deltas).unwrap();
+            assert!(!overlay.is_language_server_enrichment_only(), "{label}");
+            assert!(
+                workspace(tree_hash, overlay).holds_uncommitted_work(),
+                "{label}"
+            );
+        }
+
+        // So is an external reference beside the enrichment.
+        let referenced = WorkspaceSemanticOverlay::new_with_external_references(
+            Vec::new(),
+            vec![RelationDelta::Added { new: lsp.clone() }],
+            vec![ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge")
+                    .unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(!referenced.is_language_server_enrichment_only());
+        assert!(workspace(tree_hash, referenced).holds_uncommitted_work());
+
+        // A tree off its base is uncommitted work whatever the overlay holds.
+        let enrichment = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![RelationDelta::Added { new: lsp.clone() }],
+        )
+        .unwrap();
+        assert!(workspace(Hash256::from_bytes([0x9a; 32]), enrichment).holds_uncommitted_work());
     }
 
     #[test]

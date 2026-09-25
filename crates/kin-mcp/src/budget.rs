@@ -250,6 +250,14 @@ pub struct BudgetAccounting {
     /// documented default shape and is reported by `compact`, not here. What
     /// false does mean, always, is that the response fits `max_chars`; read
     /// `chars_after_budget` for the size it fits at.
+    ///
+    /// A cut the `trace_data_flow` walk made before any pass here counts too,
+    /// whether or not the reply then fits. The walk records the size it
+    /// measured before that cut as `chars_before_budget` on the trace payload,
+    /// and `chars_before_budget` here reports it when it is the larger. A walk
+    /// cut recorded without that size, as a daemon from before the walk
+    /// recorded one answers, counts once the reply still ships over
+    /// `max_chars`.
     pub bounded: bool,
     /// True when explanation and per-signal breakdowns were shed.
     pub compact: bool,
@@ -484,6 +492,25 @@ pub fn render(value: &Value) -> serde_json::Result<String> {
         serde_json::to_string(&emitted)
     } else {
         serde_json::to_string_pretty(value)
+    }
+}
+
+/// Re-serialize `value`, parsed from `previous`, in the format `previous` was
+/// served in.
+///
+/// Parsing drops the private format marker, so a caller that adds to an
+/// already rendered answer and renders it again would otherwise re-indent a
+/// compact answer. Compact serde JSON never contains a raw newline, because
+/// string newlines are escaped, so that is exactly how the format is read.
+pub fn render_in_format_of(value: &Value, previous: &str) -> serde_json::Result<String> {
+    let mut emitted = value.clone();
+    if let Some(object) = emitted.as_object_mut() {
+        object.remove(JSON_FORMAT_KEY);
+    }
+    if previous.contains('\n') {
+        serde_json::to_string_pretty(&emitted)
+    } else {
+        serde_json::to_string(&emitted)
     }
 }
 
@@ -932,6 +959,17 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             bulk_keys: &[],
             narrow_param: "limit",
         },
+        // Literal continuation is bound to matching stored contents. The
+        // rebase arm preserves that binding when budget pressure withholds rows.
+        crate::handlers::lexical::TOOL_NAME => ResponseShape {
+            collections: &["hits"],
+            body_keys: &["excerpt"],
+            explain_keys: &[],
+            top_explain_keys: &[],
+            duplicate_keys: &[],
+            bulk_keys: &[],
+            narrow_param: "limit",
+        },
         // `clipped_steps` sheds before `chain`, because the ladder trims from
         // the end of this list. A clip is a note about breadth the walk gave
         // up; the chain is the answer, and `spine_clipped_steps` beside it
@@ -1025,6 +1063,15 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             duplicate_keys: &[],
             bulk_keys: &[],
             narrow_param: "relation_kinds",
+        },
+        "entity_history" => ResponseShape {
+            collections: &["result"],
+            body_keys: &[],
+            explain_keys: &[],
+            top_explain_keys: &[],
+            duplicate_keys: &[],
+            bulk_keys: &[],
+            narrow_param: "limit",
         },
         "graph_neighborhood" => ResponseShape {
             collections: &["entities", "relations"],
@@ -1315,18 +1362,9 @@ fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
         record_elision_for(payload, "lines", 0, 1, reason);
         return true;
     }
-    let shape = shape_for("get_context_pack").expect("context shape");
-    let carrying = rows_carrying(payload, &shape, shape.body_keys);
-    let stripped = strip_keys_marking(payload, &shape, shape.body_keys, &[], true);
-    if stripped > 0 {
-        record_elision_for(
-            payload,
-            "body",
-            carrying.saturating_sub(stripped),
-            stripped,
-            reason,
-        );
-        payload["projection_measurement_scope"] = json!("focal and neighborhood token contributions were measured before final response projection cuts");
+    // Keep the code the caller asked about while shedding neighborhood detail.
+    // A route is also part of that answer, rather than an optional neighbor.
+    if trim_context_bodies(payload, reason, true) {
         return true;
     }
     for key in [
@@ -1376,6 +1414,130 @@ fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
         payload["projection_measurement_scope"] = json!("focal and neighborhood contributions describe admission before final response cuts; elisions report withheld output rows");
         return true;
     }
+    // The core's whole bodies go only after its optional neighborhood. Identity
+    // and route rows remain, and an impossible metadata floor still refuses.
+    trim_context_bodies(payload, reason, false)
+}
+
+fn trim_context_bodies(payload: &mut Value, reason: &str, preserve_core: bool) -> bool {
+    let shape = shape_for("get_context_pack").expect("context shape");
+    let carrying = rows_carrying(payload, &shape, shape.body_keys);
+    let stripped =
+        strip_keys_marking_scoped(payload, &shape, shape.body_keys, &[], true, preserve_core);
+    if stripped == 0 {
+        return false;
+    }
+    record_elision_for(
+        payload,
+        "body",
+        carrying.saturating_sub(stripped),
+        stripped,
+        reason,
+    );
+    payload["projection_measurement_scope"] = json!("focal and neighborhood token contributions were measured before final response projection cuts");
+    true
+}
+
+/// History advances past rows actually emitted, including a second envelope cut.
+fn repage_history(payload: &mut Value) {
+    let Some(rows) = payload.get("result").and_then(Value::as_array) else {
+        return;
+    };
+    let returned = rows.len();
+    let offset = payload.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let total = payload
+        .get("change_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let next = offset.saturating_add(returned as u64);
+    payload["returned"] = json!(returned);
+    payload["next_offset"] = json!((next < total).then_some(next));
+    payload["truncated"] = json!(offset > 0 || next < total);
+    if let Some(counted) = payload
+        .pointer_mut("/_kin/completeness/counted")
+        .and_then(Value::as_object_mut)
+    {
+        counted.insert("returned".into(), json!(returned));
+    }
+}
+
+/// Only summarize a single row that still cannot fit after compaction and page
+/// shortening. Whole detail fields go, never slices of serialized JSON; exact
+/// identity, ancestry, operations and original counts survive.
+fn summarize_history_under_pressure(payload: &mut Value, budget: &ResponseBudget) -> bool {
+    let before = measure(payload);
+    if before <= budget.max_chars {
+        return false;
+    }
+    let Some(rows) = payload.get_mut("result").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if rows.len() != 1 {
+        return false;
+    }
+    let mut summarized = 0;
+    for row in rows {
+        let mut omitted = Map::new();
+        if let Some(details) = row.get("entity_deltas").and_then(Value::as_array) {
+            if !details.is_empty() {
+                omitted.insert("entity_deltas".into(), json!(details.len()));
+                row["entity_deltas_omitted"] = json!(details.len());
+                row["entity_deltas"] = Value::Null;
+            }
+        }
+        for field in ["author", "message"] {
+            if let Some(bytes) = row.get(field).and_then(Value::as_str).map(str::len) {
+                if bytes > 512 {
+                    omitted.insert(format!("{field}_utf8_bytes"), json!(bytes));
+                    row[field] = Value::Null;
+                }
+            }
+        }
+        if !omitted.is_empty() {
+            // Keep a prior projection-limit disclosure alongside this later cut.
+            let previous = row.get("detail_summary").cloned();
+            row["detail_summary"] = json!({
+                "reason": "response_budget",
+                "omitted": omitted,
+                "recovery": "retry entity_history with the same entity_id and offset, limit=1 and max_chars up to 60000; details still summarized at that ceiling or above the focal-detail limit are unavailable in this bounded view",
+            });
+            if let Some(previous) = previous {
+                row["detail_summary"]["prior_summary"] = previous;
+            }
+            summarized += 1;
+        }
+    }
+    if summarized > 0 {
+        disclose(
+            payload,
+            budget,
+            before,
+            &[format!(
+                "optional detail fields summarized for {summarized} focal history entries"
+            )],
+            &["retry this focal history offset with limit=1 and max_chars up to 60000; detail that still cannot fit is unavailable in this bounded view".to_string()],
+            Some(before),
+        );
+    }
+    summarized > 0
+}
+
+/// History has a hard JSON-text UTF-8 byte ceiling, including the envelope when
+/// present, but excluding JSON-RPC escaping. Its irreducible ancestry or trust
+/// metadata is never silently clipped to satisfy an impossible budget.
+/// Both raw daemon and final stdio emitters call this after their last rewrite.
+pub fn fit_history_payload(payload: &mut Value, tool: &str, budget: &ResponseBudget) -> bool {
+    if tool != "entity_history" || measure(payload) <= budget.max_chars {
+        return true;
+    }
+    *payload = json!({"error": {
+        "code": "history_metadata_exceeds_budget",
+        "message": "history metadata cannot fit the requested payload budget; request fewer entries or a larger max_chars; no history answer was emitted",
+        "max_chars": budget.max_chars,
+        "unit": "utf8_payload_bytes",
+        "entity_id": payload.get("entity_id"),
+        "latest_change_id": payload.get("latest_change_id"),
+    }});
     false
 }
 
@@ -1404,11 +1566,16 @@ pub fn enforce(
     // discloses itself, so this reads that record rather than inventing a
     // channel to carry it.
     let prior = prior_bound(payload);
+    // The trace walk's own cut, with the size it measured before it. No pass
+    // here can measure that size, and it is the size the answer was built at.
+    let walked_from = walk_cut_size(payload);
     let mut accounting = BudgetAccounting {
         max_chars: budget.max_chars,
-        chars_before: chars_before.max(prior.unwrap_or(0)),
+        chars_before: chars_before
+            .max(prior.unwrap_or(0))
+            .max(walked_from.unwrap_or(0)),
         chars_after: chars_before,
-        bounded: prior.is_some(),
+        bounded: prior.is_some() || walked_from.is_some(),
         compact: budget.compact,
         primary_collection: primary.map(str::to_string),
         // Solved after the ladder, which is the only thing that can change it.
@@ -1450,9 +1617,32 @@ pub fn enforce(
     // the accounting reported a whole answer. The ceiling is not always
     // reachable, because a bound is not a refusal and every list keeps an entry,
     // but the caller has to be told which of the two it is holding.
+    if tool == "trace_data_flow" {
+        let before = measure(payload);
+        crate::handlers::entities::fit_trace_ambiguity_payload(payload, budget.max_chars);
+        accounting.bounded |= measure(payload) != before;
+    }
     reconcile_residual(payload, budget);
     accounting.chars_after = measure(payload);
     accounting.primary_rows = primary.map(|key| collection_rows(payload, key));
+    if tool == "entity_history" {
+        repage_history(payload);
+        accounting.chars_after = measure(payload);
+    }
+    // The negative counted the answer's rows before this pass cut any of them.
+    // Recounted by the rule that counted them, from the reply as it ships.
+    crate::negative::restate_result_count(payload, tool);
+    accounting.chars_after = measure(payload);
+    // A walk cut recorded without the walk's size, as a daemon from before the
+    // walk recorded one answers. A reply it cut from eight steps to one at
+    // 2,000 bytes still shipped over that budget and reported `bounded: false`,
+    // the one reading this field keeps for a reply that fits.
+    if !accounting.bounded
+        && accounting.chars_after > budget.max_chars
+        && walk_cut_recorded(payload)
+    {
+        accounting.bounded = true;
+    }
     Some(accounting)
 }
 
@@ -1470,9 +1660,7 @@ pub(crate) fn collection_rows(payload: &Value, key: &str) -> usize {
 /// The budgeted tools whose responses carry a `next_cursor`, and so the tools
 /// whose withheld rows a caller can be handed a way back to.
 ///
-/// Two producers mint one today: the daemon's locate route
-/// (`kin-daemon/src/api.rs`, a [`LocateCursor`]) and the file enumeration
-/// (`crate::handlers::file_entities`, a `PageCursor`). Every other budgeted tool
+/// Locate, file enumeration, and literal lookup mint continuations. Every other budgeted tool
 /// answers one question in one response, so a cut there is recoverable only by
 /// asking a smaller question, which is what the remediation says.
 ///
@@ -1481,7 +1669,12 @@ pub(crate) fn collection_rows(payload: &Value, key: &str) -> usize {
 /// added without an arm silently reintroduces FIR-3554: the rows go, the cursor
 /// does not move, and nothing in the response says the remainder became
 /// unreachable.
-const PAGED_TOOLS: [&str; 2] = ["semantic_locate", FILE_ENTITIES_TOOL];
+const PAGED_TOOLS: [&str; 4] = [
+    "semantic_locate",
+    "entity_history",
+    FILE_ENTITIES_TOOL,
+    crate::handlers::lexical::TOOL_NAME,
+];
 
 /// Re-point a paged tool's cursor after the ladder withheld a suffix of the
 /// primary collection, so the rows this response dropped stay reachable.
@@ -1490,7 +1683,7 @@ const PAGED_TOOLS: [&str; 2] = ["semantic_locate", FILE_ENTITIES_TOOL];
 /// means the caller has to be told so, which the remediation beside the call
 /// does, rather than being handed a token that skips past what it lost.
 ///
-/// The two paged tools rebase differently because their cursors mean different
+/// The paged tools rebase differently because their cursors mean different
 /// things. A locate cursor names a held ranking and an absolute offset into it,
 /// so the recovery is to move that offset back by exactly the suffix withheld.
 /// A file-enumeration cursor names a path and an absolute offset into a stable
@@ -1508,6 +1701,10 @@ fn repage_primary_after_cut(
         return false;
     }
     match tool {
+        "entity_history" => {
+            repage_history(payload);
+            payload.get("next_offset").is_some_and(Value::is_u64)
+        }
         "semantic_locate" => {
             let Some(cursor) = locate_cursor else {
                 return false;
@@ -1532,6 +1729,13 @@ fn repage_primary_after_cut(
             // the array it can see. The elision says how many went and why;
             // this keeps the plain count honest.
             payload["returned"] = json!(kept);
+            true
+        }
+        crate::handlers::lexical::TOOL_NAME => {
+            let Some(token) = crate::handlers::lexical::cursor_after_withheld(payload, kept) else {
+                return false;
+            };
+            payload["next_cursor"] = Value::String(token);
             true
         }
         _ => false,
@@ -1565,6 +1769,11 @@ fn run_ladder(
     // This one is not disclosed as a cut, because it is the documented default
     // shape rather than something the budget took away under pressure.
     if budget.compact {
+        // A compact response is compact on the wire too. Indentation carries no
+        // fact, and every proof/limitation field is kept, so the budget is not
+        // spent on whitespace. Reapply this after each wrapper parses the JSON:
+        // the private format marker is never emitted.
+        payload[JSON_FORMAT_KEY] = json!("compact");
         strip_keys(payload, shape, shape.explain_keys, shape.top_explain_keys);
         strip_keys(payload, shape, shape.bulk_keys, &[]);
     }
@@ -1691,6 +1900,17 @@ fn run_ladder(
     // emptied first and `"affected_tests": []` shipped beside a
     // `covering_tests: 16` that said sixteen tests cover it.
     let primary_found = primary.map_or(0, |key| collection_rows(payload, key));
+    // A trace's clip records as the walk handed them to this pass, before a cut
+    // here withholds any. A spine node whose record is withheld still ships, and
+    // what its record measured is what the reply goes on counting for it.
+    let walk_clips: Vec<Value> = if tool == "trace_data_flow" {
+        collection_of(payload, "clipped_steps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut locate_cursor = (tool == "semantic_locate")
         .then(|| {
             payload
@@ -1750,6 +1970,13 @@ fn run_ladder(
             cut_shape = shape_now;
             record_elision(payload, key, found.saturating_sub(withheld), more);
             payload["truncated"] = Value::Bool(true);
+            if tool == "trace_data_flow" && *key == "chain" {
+                restate_trace_step_counts(payload, more, shape_now, &walk_clips);
+            } else if tool == "trace_data_flow" && *key == "clipped_steps" {
+                // The chain still ships whole, but some of the clip records
+                // that describe its spine may not.
+                restate_trace_spine(payload, &walk_clips);
+            }
             if measure(payload) <= target {
                 break;
             }
@@ -1794,9 +2021,21 @@ fn run_ladder(
     if withheld_any {
         let kept = primary.map_or(0, |key| collection_rows(payload, key));
         if primary_withheld > 0 && cursor_rebased && kept > 0 {
-            remediations.push(format!(
-                "re-issue with `page_size: {kept}` and follow `next_cursor`"
-            ));
+            let page_param = if tool == crate::handlers::lexical::TOOL_NAME {
+                "limit"
+            } else {
+                "page_size"
+            };
+            if tool == "entity_history" {
+                remediations.push(
+                    "continue with offset=next_offset and compare change_count/latest_change_id"
+                        .to_string(),
+                );
+            } else {
+                remediations.push(format!(
+                    "re-issue with `{page_param}: {kept}` and follow `next_cursor`"
+                ));
+            }
         } else if PAGED_TOOLS.contains(&tool) && primary_withheld > 0 {
             // A paged tool whose cursor could not be re-pointed. Naming a cursor
             // here would be a recovery the response cannot provide. The two
@@ -1836,6 +2075,13 @@ fn run_ladder(
         &remediations,
         Some(answer_floor),
     );
+
+    // History gives up tail rows before any retained row's unique focal detail.
+    // The generic ladder keeps a one-row floor; only that oversized last row
+    // may become a structured summary, after counting the cut disclosure too.
+    if tool == "entity_history" && summarize_history_under_pressure(payload, budget) {
+        accounting.bounded = true;
+    }
 }
 
 /// The join every restatement of the limiting factor is built with.
@@ -2016,6 +2262,52 @@ fn prior_bound(payload: &Value) -> Option<usize> {
         })
 }
 
+/// The reasons a `trace_data_flow` walk records when the response budget cut it
+/// before any pass here saw the reply: `steps_omitted` when it dropped steps,
+/// and `bodies_omitted` when it dropped only inlined bodies. Both ride under
+/// `component: "response_budget"`, from the walk the daemon route serves and
+/// from the in-process arm.
+const WALK_CUT_REASONS: [&str; 2] = ["steps_omitted", "bodies_omitted"];
+
+/// Whether the trace walk recorded cutting this payload itself.
+///
+/// Read apart from [`prior_bound`], because the walk's record is its own
+/// `steps_omitted` or `bodies_omitted` disclosure, and the size it measured
+/// before the cut rides on the trace payload rather than on that entry (see
+/// [`walk_cut_size`]).
+fn walk_cut_recorded(payload: &Value) -> bool {
+    payload
+        .get("degradations")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("component").and_then(Value::as_str) == Some("response_budget")
+                    && entry
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| WALK_CUT_REASONS.contains(&reason))
+            })
+        })
+}
+
+/// The size a `trace_data_flow` walk measured before its own cut, when that
+/// cut is recorded.
+///
+/// The walk writes it as `chars_before_budget` on the trace payload, beside
+/// `max_response_chars`, because the degradation the daemon route's walk
+/// discloses its cut with has no field to carry a number. It is read only
+/// beside the walk's own disclosure: the number alone is not a record that
+/// anything was cut.
+fn walk_cut_size(payload: &Value) -> Option<usize> {
+    if !walk_cut_recorded(payload) {
+        return None;
+    }
+    payload
+        .get("chars_before_budget")
+        .and_then(Value::as_u64)
+        .map(|size| size as usize)
+}
+
 /// Record that the ladder finished with the payload still over its ceiling.
 ///
 /// Every list the budget cuts keeps at least one entry, so a response whose
@@ -2136,6 +2428,17 @@ fn strip_keys_marking(
     top_keys: &[&str],
     mark: bool,
 ) -> usize {
+    strip_keys_marking_scoped(payload, shape, keys, top_keys, mark, false)
+}
+
+fn strip_keys_marking_scoped(
+    payload: &mut Value,
+    shape: &ResponseShape,
+    keys: &[&str],
+    top_keys: &[&str],
+    mark: bool,
+    preserve_context_core: bool,
+) -> usize {
     let mut stripped = 0usize;
     for key in top_keys {
         if let Some(map) = payload.as_object_mut() {
@@ -2179,6 +2482,15 @@ fn strip_keys_marking(
             continue;
         };
         for entry in entries.iter_mut() {
+            if preserve_context_core
+                && *collection == "entities"
+                && matches!(
+                    entry.get("section").and_then(Value::as_str),
+                    Some("focal" | "route")
+                )
+            {
+                continue;
+            }
             let Some(map) = entry.as_object_mut() else {
                 continue;
             };
@@ -2191,13 +2503,16 @@ fn strip_keys_marking(
     // keys, so it is charged the same cuts. Leaving it whole would keep the
     // largest single body in a response that just dropped every other one.
     for focal in ["focal_entity", "focal"] {
+        if preserve_context_core {
+            continue;
+        }
         if let Some(map) = payload.get_mut(focal).and_then(Value::as_object_mut) {
             if strip_row(map) {
                 stripped += 1;
             }
         }
     }
-    if keys.contains(&"body") && stripped > 0 {
+    if !preserve_context_core && keys.contains(&"body") && stripped > 0 {
         if let Some(focals) = payload.get_mut("focals").and_then(Value::as_array_mut) {
             for focal in focals {
                 if focal.get("projection").and_then(Value::as_str) == Some("full_body") {
@@ -2447,6 +2762,416 @@ fn record_withheld(payload: &mut Value, key: &str, withheld: usize) {
     );
 }
 
+/// Restate the counters a `trace_data_flow` reply carries beside its chain,
+/// after a pass here withheld `withheld` more of the chain's steps.
+///
+/// The walk writes them for the cut it made: `total_steps`, the steps the chain
+/// carries; `steps_omitted`, the steps the budget withheld; and
+/// `fanout_narrowed`, how many of those went as whole branches rather than off
+/// the end. A cut made here on top of the walk's used to leave all three
+/// describing the walk's answer instead of the one that ships. At a 6,000-byte
+/// budget one step shipped beside `total_steps: 2`, `steps_omitted: 6` and an
+/// `elisions.chain` that withheld seven.
+///
+/// So each is restated from the reply as it now stands. `total_steps` is the
+/// chain's length and `steps_omitted` is `elisions.chain.elided`, which already
+/// adds every pass's cut to the walk's. `fanout_narrowed` grows by what this cut
+/// gave up as whole branches. `chain_withheld` keeps counting the share these
+/// passes withheld, and no more. `_kin.completeness.counted.reported` was read
+/// off `total_steps` before the envelope pass ran, so where the envelope is
+/// already attached it is restated with it. The `terminal_*_steps` counts are
+/// recounted from the shipped chain, and the count of omitted steps a
+/// qualification already carries is restated to `steps_omitted`. What the reply
+/// says about its spine is restated last, from `walk_clips`, the clip records
+/// the walk handed this pass (see [`restate_trace_spine`]).
+fn restate_trace_step_counts(
+    payload: &mut Value,
+    withheld: usize,
+    cut: CutShape,
+    walk_clips: &[Value],
+) {
+    let shipped = collection_rows(payload, "chain");
+    payload["total_steps"] = json!(shipped);
+    if let Some(elided) = payload
+        .get(ELISIONS_KEY)
+        .and_then(|map| map.get("chain"))
+        .and_then(|entry| entry.get("elided"))
+        .and_then(Value::as_u64)
+    {
+        payload["steps_omitted"] = json!(elided);
+    }
+    if cut != CutShape::Suffix {
+        let narrowed = payload
+            .get("fanout_narrowed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        payload["fanout_narrowed"] = json!(narrowed.saturating_add(withheld as u64));
+    }
+    if let Some(counted) = payload
+        .pointer_mut("/_kin/completeness/counted")
+        .and_then(Value::as_object_mut)
+    {
+        if counted.get("unit").and_then(Value::as_str) == Some("steps") {
+            counted.insert("reported".to_string(), json!(shipped));
+        }
+    }
+    // How each shipped step ends, recounted from the chain the reply now
+    // carries, the way both walks count it after their own cut: a step this cut
+    // took took its terminal with it. Zero is omitted, as both walks omit it.
+    let terminals: Vec<(&str, usize)> = TRACE_TERMINAL_COUNTS
+        .iter()
+        .map(|(key, terminal)| {
+            let ending = collection_of(payload, "chain")
+                .and_then(Value::as_array)
+                .map_or(0, |chain| {
+                    chain
+                        .iter()
+                        .filter(|step| {
+                            step.get("terminal").and_then(Value::as_str) == Some(terminal.as_str())
+                        })
+                        .count()
+                });
+            (*key, ending)
+        })
+        .collect();
+    for (key, ending) in terminals {
+        if ending > 0 {
+            payload[key] = json!(ending);
+        } else if let Some(map) = payload.as_object_mut() {
+            map.remove(key);
+        }
+    }
+    // The qualification already written for the walk counts the steps omitted
+    // from the response, and the count it carries is the walk's own. Restated
+    // wherever it appears, so it says what `steps_omitted` now says.
+    if let Some(omitted) = payload.get("steps_omitted").and_then(Value::as_u64) {
+        for pointer in [
+            "/negative/trust_reason",
+            "/negative/advice",
+            "/_kin/verdict/note",
+            "/_kin/completeness/note",
+        ] {
+            let restated = payload
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .and_then(|text| crate::negative::restate_omitted_steps(text, omitted));
+            if let (Some(restated), Some(field)) = (restated, payload.pointer_mut(pointer)) {
+                *field = Value::String(restated);
+            }
+        }
+    }
+    restate_trace_spine(payload, walk_clips);
+}
+
+/// Present, and `true`, when a trace reply's `spine_dropped_crossing_file` counts
+/// only some of its spine nodes, because the clip records of the others never
+/// reached the pass that restated it. The count is then a floor.
+pub(crate) const CROSSING_FLOOR_KEY: &str = "spine_dropped_crossing_file_is_floor";
+
+/// Restate what a `trace_data_flow` reply says about the clipped nodes its
+/// chain continues beneath, from the chain it now ships.
+///
+/// The walk writes `spine_clipped_steps`, `spine_dropped_crossing_file`, each
+/// clip record's `continued_below`, the `fanout_cap` / `spine_clipped`
+/// degradation and, through the negative, the `trace_spine_clipped` clause,
+/// all for the chain it handed over. A cut made here used to leave every one
+/// of them describing that chain. On the trace test fixture a tree cut to one
+/// step kept `spine_clipped_steps: 4` beside a focal that was the only node its
+/// chain still continued beneath, and named as the widest a node whose
+/// children the cut had taken.
+///
+/// A node is on the shipped spine when it ships, the cap cut its fan-out, and a
+/// shipped step names it as parent, which is the rule the walk applies to its
+/// own cut. `walk_clips` are the clip records the walk handed this pass, in the
+/// order it wrote them, so each node is read from its own record even when this
+/// pass withholds that record: what the node dropped, and how many of those
+/// lived outside its file. A clipped chain step with no record at all is read
+/// from the step, whose `fanout_truncated` and `fanout_dropped` say the cap cut
+/// it, and its crossing count is then unknown. From those nodes the spine count
+/// is restated, each shipped clip record's `continued_below` says whether a
+/// shipped step sits beneath it, and `spine_dropped_crossing_file` sums the
+/// nodes' module-crossing drops, marked a floor under [`CROSSING_FLOOR_KEY`]
+/// when a node's is unknown. The disclosure is rebuilt by the producer both
+/// walks use and states its crossing count only when every node's is known.
+/// The negative's clause is rebuilt to match.
+///
+/// When no shipped node is on the spine any more, the disclosure is withdrawn,
+/// and the negative, its degraded signals and the verdict's limiting factor say
+/// what they say for a walk that never continued beneath a clipped node. The
+/// cut itself is already disclosed through `truncated`, `elisions` and
+/// `steps_omitted`, so a missing hop is not read as one the walk looked for.
+///
+/// A reply whose walk continued beneath no clipped node is left as it is:
+/// there is no spine to restate, and any wording about one is the walk's own.
+fn restate_trace_spine(payload: &mut Value, walk_clips: &[Value]) {
+    let walked_spine = payload
+        .get("spine_clipped_steps")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0)
+        || walk_clips
+            .iter()
+            .any(|clip| clip.get("continued_below").and_then(Value::as_bool) == Some(true));
+    if !walked_spine {
+        return;
+    }
+    let chain: Vec<Value> = collection_of(payload, "chain")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let parents: BTreeSet<u64> = chain
+        .iter()
+        .filter_map(|step| step.get("parent_step").and_then(Value::as_u64))
+        .collect();
+    let shipped: BTreeSet<u64> = chain
+        .iter()
+        .filter_map(|step| step.get("step").and_then(Value::as_u64))
+        .collect();
+    let walk_limit = payload
+        .get("limit_per_step")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let text = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let count =
+        |value: &Value, key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
+    let mut nodes: Vec<crate::remediation::SpineNode> = Vec::new();
+    let mut recorded: BTreeSet<u64> = BTreeSet::new();
+    for record in walk_clips {
+        let Some(step) = record.get("step").and_then(Value::as_u64) else {
+            continue;
+        };
+        recorded.insert(step);
+        // The focal is step 0 and always ships.
+        if !(step == 0 || shipped.contains(&step)) || !parents.contains(&step) {
+            continue;
+        }
+        nodes.push(crate::remediation::SpineNode {
+            entity_id: text(record, "entity_id"),
+            entity_name: text(record, "entity_name"),
+            dropped: count(record, "dropped_callees") + count(record, "dropped_callers"),
+            dropped_crossing_file: Some(count(record, "dropped_crossing_file")),
+            limit_per_step: record
+                .get("limit_per_step")
+                .and_then(Value::as_u64)
+                .map_or(walk_limit, |limit| limit as usize),
+        });
+    }
+    for step in &chain {
+        let Some(id) = step.get("step").and_then(Value::as_u64) else {
+            continue;
+        };
+        if recorded.contains(&id)
+            || !parents.contains(&id)
+            || step.get("fanout_truncated").and_then(Value::as_bool) != Some(true)
+        {
+            continue;
+        }
+        nodes.push(crate::remediation::SpineNode {
+            entity_id: text(step, "entity_id"),
+            entity_name: text(step, "entity_name"),
+            dropped: count(step, "fanout_dropped"),
+            dropped_crossing_file: None,
+            limit_per_step: walk_limit,
+        });
+    }
+
+    if let Some(clips) = collection_of_mut(payload, "clipped_steps").and_then(Value::as_array_mut) {
+        for clip in clips.iter_mut() {
+            let beneath = clip
+                .get("step")
+                .and_then(Value::as_u64)
+                .is_some_and(|step| parents.contains(&step));
+            if let Some(clip) = clip.as_object_mut() {
+                clip.insert("continued_below".to_string(), Value::Bool(beneath));
+            }
+        }
+    }
+    let crossing: usize = nodes
+        .iter()
+        .filter_map(|node| node.dropped_crossing_file)
+        .sum();
+    // Stated in words only when it covers every node the spine count covers.
+    let crossing_exact: Option<u64> = nodes
+        .iter()
+        .map(|node| node.dropped_crossing_file.map(|crossing| crossing as u64))
+        .sum();
+    for (key, value) in [
+        ("spine_clipped_steps", nodes.len()),
+        ("spine_dropped_crossing_file", crossing),
+    ] {
+        if value > 0 {
+            payload[key] = json!(value);
+        } else if let Some(map) = payload.as_object_mut() {
+            map.remove(key);
+        }
+    }
+    // A spine node whose clip record never reached this pass has an unknown
+    // crossing count, so the sum counts only the nodes whose records did. An
+    // earlier pass that re-fits the reply after the walk withholds clip records
+    // before chain steps, which is how a shipped node loses its record.
+    if crossing_exact.is_none() {
+        payload[CROSSING_FLOOR_KEY] = json!(true);
+    } else if let Some(map) = payload.as_object_mut() {
+        map.remove(CROSSING_FLOOR_KEY);
+    }
+
+    let disclosure = crate::remediation::spine_clipped_disclosure(&nodes);
+    let mut emptied = false;
+    if let Some(entries) = payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    {
+        let at = entries.iter().position(|entry| {
+            entry.get("component").and_then(Value::as_str) == Some("fanout_cap")
+                && entry.get("reason").and_then(Value::as_str) == Some("spine_clipped")
+        });
+        match (at, disclosure) {
+            (Some(at), Some((detail, remediation))) => {
+                entries[at]["detail"] = json!(detail);
+                entries[at]["remediation"] = json!(remediation);
+            }
+            (Some(at), None) => {
+                entries.remove(at);
+            }
+            (None, _) => {}
+        }
+        emptied = entries.is_empty();
+    }
+    if emptied {
+        if let Some(map) = payload.as_object_mut() {
+            map.remove("degradations");
+        }
+    }
+
+    // The clause the negative already carries, restated for the chain that
+    // ships. With no spine left it becomes the two cap clauses the negative
+    // writes for a walk that never continued beneath a clipped node: this cut
+    // truncated the chain, and the reply discloses the cut as a degradation.
+    let replacement = if nodes.is_empty() {
+        crate::negative::trace_cap_clauses(true, true)
+    } else {
+        vec![crate::negative::spine_clipping_clause(
+            payload,
+            nodes.len() as u64,
+            crossing_exact,
+        )]
+    };
+    for pointer in [
+        "/negative/trust_reason",
+        "/negative/advice",
+        "/_kin/verdict/note",
+        "/_kin/completeness/note",
+    ] {
+        let restated = payload
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(|said| crate::negative::replace_spine_clause(said, &replacement));
+        if let (Some(restated), Some(field)) = (restated, payload.pointer_mut(pointer)) {
+            *field = Value::String(restated);
+        }
+    }
+    if !nodes.is_empty() {
+        return;
+    }
+    // No spine left, so nothing may still name the disclosure or the clause
+    // that described one.
+    const SPINE_SIGNAL: &str = "fanout_cap:spine_clipped";
+    if let Some(signals) = payload
+        .pointer_mut("/negative/degraded_signals")
+        .and_then(Value::as_array_mut)
+    {
+        signals.retain(|signal| signal.as_str() != Some(SPINE_SIGNAL));
+    }
+    let advice = payload
+        .pointer("/negative/advice")
+        .and_then(Value::as_str)
+        .and_then(|advice| crate::negative::withdraw_degraded_signal(advice, SPINE_SIGNAL));
+    if let (Some(advice), Some(field)) = (advice, payload.pointer_mut("/negative/advice")) {
+        *field = Value::String(advice);
+    }
+    let codes: Vec<String> = replacement
+        .iter()
+        .filter_map(|clause| clause.split_once(':').map(|(code, _)| code.to_string()))
+        .collect();
+    for pointer in [
+        "/_kin/verdict/limiting_factor",
+        "/_kin/verdict/note",
+        "/_kin/completeness/note",
+    ] {
+        let restated = payload
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(|said| replace_spine_code(said, &codes));
+        if let (Some(restated), Some(field)) = (restated, payload.pointer_mut(pointer)) {
+            *field = Value::String(restated);
+        }
+    }
+}
+
+/// `text` with the `trace_spine_clipped` code in its limiting factor replaced
+/// by `codes`, each once, or `None` when it carries no such code.
+///
+/// The verdict's `limiting_factor` is codes joined by the clause separator; a
+/// note restates it after the join [`LIMITING_FACTOR_JOIN`] marks, and may end
+/// it with a full stop, so only that tail, without the stop, is read as codes.
+fn replace_spine_code(text: &str, codes: &[String]) -> Option<String> {
+    let separator = crate::verdict::CLAUSE_SEPARATOR;
+    let (head, factor) = match text.rfind(LIMITING_FACTOR_JOIN) {
+        Some(at) => text.split_at(at + LIMITING_FACTOR_JOIN.len()),
+        None => ("", text),
+    };
+    let stop = &factor[factor.trim_end_matches('.').len()..];
+    let listed: Vec<&str> = factor.trim_end_matches('.').split(separator).collect();
+    let spine = crate::negative::TRACE_SPINE_CLIPPED_LIMITING_FACTOR;
+    if !listed.contains(&spine) {
+        return None;
+    }
+    let mut restated: Vec<&str> = Vec::new();
+    for code in listed {
+        let incoming: Vec<&str> = if code == spine {
+            codes.iter().map(String::as_str).collect()
+        } else {
+            vec![code]
+        };
+        for code in incoming {
+            if !restated.contains(&code) {
+                restated.push(code);
+            }
+        }
+    }
+    Some(format!("{head}{}{stop}", restated.join(separator)))
+}
+
+/// The step counts a `trace_data_flow` reply publishes beside its chain for the
+/// terminal each step carries, by the key each is published under.
+const TRACE_TERMINAL_COUNTS: [(&str, crate::handlers::common::TraceTerminal); 5] = [
+    (
+        "terminal_external_steps",
+        crate::handlers::common::TraceTerminal::ExternalReference,
+    ),
+    (
+        "terminal_annotation_steps",
+        crate::handlers::common::TraceTerminal::TypeAnnotation,
+    ),
+    (
+        "terminal_leaf_steps",
+        crate::handlers::common::TraceTerminal::Leaf,
+    ),
+    (
+        "terminal_bound_steps",
+        crate::handlers::common::TraceTerminal::BoundReached,
+    ),
+    (
+        "terminal_coverage_gap_steps",
+        crate::handlers::common::TraceTerminal::CoverageGap,
+    ),
+];
+
 /// Append the cuts to the `degradations` channel the retrieval tools already
 /// use, so a bounded response is attributable rather than merely short.
 ///
@@ -2537,6 +3262,162 @@ fn disclose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn focal_history_page(count: usize, body_chars: usize) -> Value {
+        let rows = (0..count).map(|index| {
+            let state = |revision: &str| json!({
+                "id": "focal-entity",
+                "name": "listRun",
+                "signature": format!("func listRun() // {revision}"),
+                "fingerprint": {
+                    "ast_hash": vec![0; 32], "signature_hash": vec![1; 32],
+                    "behavior_hash": vec![2; 32], "equivalence_hash": vec![3; 32],
+                },
+                "metadata": {"body": "史".repeat(body_chars)},
+            });
+            json!({
+                "id": vec![index as u8; 32], "change_id": format!("{index:064x}"),
+                "origin": {"type": "native"}, "parents": [vec![0; 32]],
+                "timestamp": "2026-09-22T21:00:00Z", "scope": "focal_entity",
+                "message": "A meaningful native edit. ".repeat(40),
+                "author": "History regression", "metadata_omissions": {},
+                "entity_deltas": [{"operation": "modified", "old": state("old"), "new": state("new")}],
+                "entity_deltas_omitted": 0, "focal_delta_count": 1,
+                "focal_delta_operations": {"modified": 1}, "entity_delta_count": 200,
+                "omitted_sections": {"unrelated_entity_deltas": 199},
+            })
+        }).collect::<Vec<_>>();
+        json!({
+            "entity_id": "focal-entity", "result": rows, "scope": "focal_entity",
+            "offset": 11, "limit": count, "returned": count, "change_count": 11 + count,
+            "latest_change_id": format!("{:064x}", count - 1), "next_offset": null,
+            "truncated": true, "ordering": "timestamp_ascending_then_change_id",
+        })
+    }
+
+    fn assert_history_details_survive(payload: &Value, original: &Value) {
+        let rows = payload["result"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        for (actual, expected) in rows.iter().zip(original["result"].as_array().unwrap()) {
+            assert_eq!(
+                actual, expected,
+                "budgeting must retain each emitted row whole"
+            );
+        }
+        assert_eq!(payload["returned"], rows.len());
+        assert_eq!(payload["latest_change_id"], original["latest_change_id"]);
+        assert_eq!(payload["change_count"], original["change_count"]);
+    }
+
+    #[test]
+    fn history_budget_compacts_a_full_page_before_summarizing_any_detail() {
+        let original = focal_history_page(3, 700);
+        let compact = serde_json::to_string(&original).unwrap().len();
+        let pretty = measure(&original);
+        let budget = ResponseBudget {
+            max_chars: (compact + pretty) / 2,
+            explicit_max_chars: true,
+            ..Default::default()
+        };
+        assert!(compact < budget.max_chars && budget.max_chars < pretty);
+        assert!(budget.max_chars <= RESPONSE_MAX_MAX_CHARS);
+        let mut payload = original.clone();
+        let accounting = enforce(&mut payload, "entity_history", &budget).unwrap();
+        assert_eq!(payload["result"].as_array().unwrap().len(), 3);
+        assert_history_details_survive(&payload, &original);
+        assert!(
+            !accounting.bounded,
+            "whitespace is not missing history detail"
+        );
+        assert!(measure(&payload) <= budget.max_chars);
+    }
+
+    #[test]
+    fn history_budget_cuts_tail_pages_before_summarizing_retained_rows() {
+        let original = focal_history_page(8, 700);
+        let mut payload = original.clone();
+        let budget = ResponseBudget {
+            max_chars: 20_000,
+            explicit_max_chars: true,
+            ..Default::default()
+        };
+        assert!(serde_json::to_string(&payload).unwrap().len() > budget.max_chars);
+        enforce(&mut payload, "entity_history", &budget).unwrap();
+        let kept = payload["result"].as_array().unwrap().len();
+        assert!(
+            kept > 1 && kept < 8,
+            "fixture must retain a real page: {kept}"
+        );
+        assert_history_details_survive(&payload, &original);
+        assert_eq!(payload["next_offset"], 11 + kept);
+        assert!(measure(&payload) <= budget.max_chars);
+        assert!(!render(&payload).unwrap().contains("semantic_diff"));
+    }
+
+    #[test]
+    fn history_budget_two_arms_preserve_focal_detail_and_actual_next_offset() {
+        let original = focal_history_page(8, 700);
+        let budget = ResponseBudget {
+            max_chars: 15_400,
+            explicit_max_chars: true,
+            ..Default::default()
+        };
+        let mut raw = original.clone();
+        enforce(&mut raw, "entity_history", &budget).unwrap();
+        assert!(fit_history_payload(&mut raw, "entity_history", &budget));
+        let raw_count = raw["result"].as_array().unwrap().len();
+        let result = crate::envelope::finalize_bounded(
+            crate::types::ToolCallResult::text(render(&raw).unwrap()),
+            crate::envelope::Envelope::daemon(),
+            "entity_history",
+            &budget,
+        );
+        assert_ne!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let final_page: Value = serde_json::from_str(text).unwrap();
+        let kept = final_page["result"].as_array().unwrap().len();
+        assert!(
+            kept < raw_count,
+            "fixture must exercise the envelope's second cut: {raw_count} -> {kept}; raw={} final={}", measure(&raw), text.len()
+        );
+        assert_history_details_survive(&final_page, &original);
+        assert_eq!(final_page["next_offset"], 11 + kept);
+        assert_eq!(
+            final_page["_kin"]["response"]["chars_after_budget"],
+            text.len()
+        );
+        assert_eq!(final_page["_kin"]["completeness"]["bound"], "at_least");
+        assert!(text.len() <= budget.max_chars);
+        assert!(text.len() > text.chars().count());
+    }
+
+    #[test]
+    fn history_budget_summarizes_only_an_oversized_single_row_with_bounded_recovery() {
+        let original = focal_history_page(3, 1200);
+        let mut payload = original.clone();
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            explicit_max_chars: true,
+            ..Default::default()
+        };
+        enforce(&mut payload, "entity_history", &budget).unwrap();
+        assert_eq!(payload["result"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["next_offset"], 12);
+        let row = &payload["result"][0];
+        assert_eq!(row["change_id"], original["result"][0]["change_id"]);
+        assert_eq!(row["parents"], original["result"][0]["parents"]);
+        assert_eq!(
+            row["focal_delta_operations"],
+            original["result"][0]["focal_delta_operations"]
+        );
+        assert!(row["entity_deltas"].is_null());
+        assert_eq!(row["entity_deltas_omitted"], 1);
+        let text = render(&payload).unwrap();
+        assert!(text.contains("entity_history") && text.contains("60000"));
+        assert!(text.contains("unavailable in this bounded view"));
+        assert!(!text.contains("semantic_diff"));
+        assert!(text.len() <= budget.max_chars, "{text}");
+    }
 
     /// The measured shape, in miniature: a focal with a WIDE fan-out and one
     /// narrow deep branch hanging off its first child.
@@ -3461,7 +4342,21 @@ mod tests {
                         page_size: Some(40),
                     }),
                 ),
+                "entity_history" => (
+                    json!({
+                        "result": (0..10).map(|id| json!({"id": id})).collect::<Vec<_>>(),
+                        "offset": 200, "change_count": 240, "next_offset": null,
+                    }),
+                    None,
+                ),
                 FILE_ENTITIES_TOOL => (file_entities_final_page(40, 200, 240, 600), None),
+                crate::handlers::lexical::TOOL_NAME => (
+                    json!({
+                        "literal": "needle", "kind": null, "page_offset": 200,
+                        "total_matching": 240, "matching_snapshot": "a".repeat(64),
+                    }),
+                    None,
+                ),
                 other => panic!("{other} is in PAGED_TOOLS with no case here"),
             };
             assert!(
@@ -3469,10 +4364,14 @@ mod tests {
                 "{tool} is listed as paged but could not re-point its cursor"
             );
             assert!(
-                payload["next_cursor"]
-                    .as_str()
-                    .is_some_and(|t| !t.is_empty()),
-                "{tool} reported a re-point and left no cursor"
+                if tool == "entity_history" {
+                    payload["next_offset"] == 210
+                } else {
+                    payload["next_cursor"]
+                        .as_str()
+                        .is_some_and(|t| !t.is_empty())
+                },
+                "{tool} reported a re-point and left no continuation"
             );
         }
 
@@ -4536,6 +5435,572 @@ mod tests {
         );
     }
 
+    /// The trace walk cuts before either arm here and records the cut under its
+    /// own reasons, not `response_bounded`. A reply the walk alone cut from eight
+    /// steps to one at 2,000 bytes shipped `bounded: false`, the reading reserved
+    /// for a reply that fits, while it was several times over its budget.
+    #[test]
+    fn a_trace_the_walk_cut_is_bounded_while_it_ships_over_its_budget() {
+        const BUDGET: usize = RESPONSE_MIN_MAX_CHARS;
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        // One step this pass cannot cut, over the budget on its own.
+        let over = || floor_case_payload(1, 3_000, 0);
+        for reason in WALK_CUT_REASONS {
+            let mut payload = over();
+            payload["degradations"] = json!([
+                {"component": "response_budget", "reason": reason, "detail": "the walk cut"},
+            ]);
+            let accounting = enforce(&mut payload, "trace_data_flow", &budget).expect("budgeted");
+            assert!(
+                payload.get("chain_withheld").is_none(),
+                "{reason}: this pass must cut nothing, or it grades its own cut: {payload}"
+            );
+            assert!(
+                accounting.chars_after > BUDGET,
+                "{reason}: the reply must ship over its budget: {payload}"
+            );
+            assert!(
+                accounting.bounded,
+                "{reason}: a reply the walk cut that ships over its budget is bounded: {payload}"
+            );
+        }
+        // The control: the same reply over its budget with no cut recorded
+        // anywhere is over, and not bounded.
+        let mut payload = over();
+        payload["degradations"] = json!([
+            {"component": "response_budget", "reason": RESTATEMENT_POINTED_REASON},
+        ]);
+        let accounting = enforce(&mut payload, "trace_data_flow", &budget).expect("budgeted");
+        assert!(accounting.chars_after > BUDGET, "{payload}");
+        assert!(
+            !accounting.bounded,
+            "nothing was withheld, so the reply is not bounded: {payload}"
+        );
+    }
+
+    /// A walk cut that the walk recorded its size for is bounded even when the
+    /// reply then fits, and the accounting reports the size the walk measured
+    /// before its cut, which no pass here can measure for itself.
+    #[test]
+    fn a_trace_the_walk_cut_reports_the_size_the_walk_recorded() {
+        const BUDGET: usize = 8_000;
+        const WALKED_FROM: usize = 23_385;
+        let mut payload = floor_case_payload(2, 100, 0);
+        payload["degradations"] = json!([
+            {"component": "response_budget", "reason": "steps_omitted", "detail": "the walk cut"},
+        ]);
+        payload["chars_before_budget"] = json!(WALKED_FROM);
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        let accounting = enforce(&mut payload, "trace_data_flow", &budget).expect("budgeted");
+        assert!(
+            accounting.chars_after <= BUDGET,
+            "the reply must fit, or this grades the over-budget case: {payload}"
+        );
+        assert!(
+            accounting.bounded,
+            "a reply the walk cut is bounded: {payload}"
+        );
+        assert_eq!(accounting.chars_before, WALKED_FROM, "{payload}");
+
+        // The control: the same size on a reply the walk did not cut claims no
+        // cut, because the size alone is not a record of one.
+        let mut uncut = floor_case_payload(2, 100, 0);
+        uncut["chars_before_budget"] = json!(WALKED_FROM);
+        let accounting = enforce(&mut uncut, "trace_data_flow", &budget).expect("budgeted");
+        assert!(!accounting.bounded, "{uncut}");
+    }
+
+    /// One trace chain as the walk hands it over after cutting it: `kept` steps
+    /// ship, `walked_off` more were withheld and recorded, and the envelope's
+    /// count of steps sits beside them.
+    fn walked_chain_payload(kept: usize, walked_off: usize, step_chars: usize) -> Value {
+        let mut payload = floor_case_payload(kept, step_chars, 0);
+        payload["steps_omitted"] = json!(walked_off);
+        payload["truncated"] = json!(true);
+        record_elision(&mut payload, "chain", kept, walked_off);
+        payload["_kin"] = json!({
+            "completeness": {"counted": {"unit": "steps", "reported": kept, "exact": false}},
+        });
+        payload
+    }
+
+    /// A cut made here on top of the walk's restates the counters the walk
+    /// wrote, so none of them keeps describing the walk's answer instead of the
+    /// one that ships. The chain is a line, so this cut comes off the end and
+    /// narrows no branch.
+    #[test]
+    fn a_second_cut_restates_the_trace_step_counters() {
+        const BUDGET: usize = 3_000;
+        let mut payload = walked_chain_payload(4, 6, 1_000);
+        assert!(
+            measure(&payload) > BUDGET,
+            "the fixture must overflow or nothing is cut"
+        );
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+
+        let shipped = payload["chain"].as_array().expect("a chain survives").len();
+        let withheld = payload["chain_withheld"]
+            .as_u64()
+            .expect("this pass must cut the chain, or it grades nothing")
+            as usize;
+        assert_eq!(shipped + withheld, 4, "{payload}");
+        assert_eq!(payload["total_steps"], json!(shipped), "{payload}");
+        assert_eq!(payload["steps_omitted"], json!(6 + withheld), "{payload}");
+        assert_eq!(
+            payload["elisions"]["chain"]["elided"], payload["steps_omitted"],
+            "{payload}"
+        );
+        assert_eq!(
+            payload["elisions"]["chain"]["total"],
+            json!(10),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["_kin"]["completeness"]["counted"]["reported"],
+            json!(shipped),
+            "{payload}"
+        );
+        assert!(
+            payload.get("fanout_narrowed").is_none(),
+            "a cut from the end narrowed no branch: {payload}"
+        );
+    }
+
+    /// A cut made here as whole branches adds to `fanout_narrowed`, on top of
+    /// the branches the walk narrowed itself.
+    #[test]
+    fn a_second_cut_by_branch_adds_to_fanout_narrowed() {
+        const BUDGET: usize = 4_000;
+        let mut payload = targeted_chain_payload(40, 40);
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("target_name");
+        // As the walk hands it over after narrowing three branches of its own.
+        payload["steps_omitted"] = json!(3);
+        payload["fanout_narrowed"] = json!(3);
+        record_elision(&mut payload, "chain", 40, 3);
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+
+        let detail = payload["degradations"]
+            .as_array()
+            .expect("a cut is disclosed")
+            .iter()
+            .filter(|cut| cut["reason"] == json!(BOUNDED_REASON))
+            .filter_map(|cut| cut["detail"].as_str())
+            .next()
+            .expect("the bounded cut carries a detail")
+            .to_string();
+        assert!(
+            detail.contains(CutShape::Branches.phrase()),
+            "the chain must be cut by branch, or this grades the end cut: {detail}"
+        );
+        let shipped = payload["chain"].as_array().expect("a chain survives").len();
+        let withheld = payload["chain_withheld"]
+            .as_u64()
+            .expect("this pass must cut the chain") as usize;
+        assert_eq!(shipped + withheld, 40, "{payload}");
+        assert_eq!(payload["fanout_narrowed"], json!(3 + withheld), "{payload}");
+        assert_eq!(payload["total_steps"], json!(shipped), "{payload}");
+        assert_eq!(payload["steps_omitted"], json!(3 + withheld), "{payload}");
+        assert_eq!(
+            payload["elisions"]["chain"]["elided"], payload["steps_omitted"],
+            "{payload}"
+        );
+    }
+
+    /// A cut made here takes the steps' terminals with the steps, and the count
+    /// of omitted steps a qualification already carries follows `steps_omitted`.
+    #[test]
+    fn a_second_cut_recounts_terminals_and_restates_the_omitted_steps() {
+        const BUDGET: usize = 3_000;
+        let mut payload = walked_chain_payload(4, 2, 1_000);
+        payload["chain"][3]["terminal"] = json!("bound_reached");
+        payload["terminal_bound_steps"] = json!(1);
+        payload["negative"] = json!({
+            "trust_reason": format!(
+                "trace_spine_clipped: the walk continued beneath 1 node (2{}, the walk hit a \
+                 per-step or total cap)",
+                crate::negative::OMITTED_STEPS_PHRASE
+            ),
+        });
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+
+        let shipped = payload["chain"].as_array().expect("a chain survives");
+        assert!(
+            shipped.iter().all(|step| step["terminal"].is_null()),
+            "the cut must take the bound step, or this grades nothing: {payload}"
+        );
+        assert!(
+            payload.get("terminal_bound_steps").is_none(),
+            "no shipped step ends at the bound: {payload}"
+        );
+        let omitted = payload["steps_omitted"]
+            .as_u64()
+            .expect("steps were omitted");
+        assert!(omitted > 2, "this pass must cut too: {payload}");
+        let reason = payload["negative"]["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&format!(
+                "({omitted}{}",
+                crate::negative::OMITTED_STEPS_PHRASE
+            )),
+            "the qualification must count what steps_omitted counts: {reason}"
+        );
+    }
+
+    /// The negative counts the rows it was handed, and the envelope's budget
+    /// pass runs after it. A trace reply that pass cut to two steps said
+    /// `result_count: 7`, the chain the walk handed over, beside
+    /// `_kin.completeness.counted.reported: 2`. The count is restated from the
+    /// reply that ships, by the rule the negative counts with.
+    #[test]
+    fn a_cut_restates_the_negative_result_count_to_the_rows_that_ship() {
+        const BUDGET: usize = 3_000;
+        let mut payload = walked_chain_payload(8, 2, 1_000);
+        let rows = payload["chain"].as_array().expect("a chain").len();
+        payload["negative"] = json!({ "result_count": rows, "trust_reason": "cut" });
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+
+        let shipped = payload["chain"].as_array().expect("a chain survives").len();
+        assert!(shipped < rows, "the pass must cut the chain: {payload}");
+        assert_eq!(
+            payload["negative"]["result_count"],
+            json!(shipped),
+            "{payload}"
+        );
+    }
+
+    /// A trace reply as the spine restatement receives it after a cut: the chain
+    /// and clip records it now ships, with the walk's spine disclosure, the
+    /// negative's clause and the verdict's code still describing the walk. A
+    /// step is `(step, parent, fanout_truncated, fanout_dropped)` and a clip
+    /// record `(step, name, dropped, crossing)`.
+    fn cut_spine_payload(
+        steps: &[(u64, u64, bool, u64)],
+        clips: &[(u64, &str, u64, u64)],
+        walk_spine: u64,
+    ) -> Value {
+        let chain: Vec<Value> = steps
+            .iter()
+            .map(|(step, parent, truncated, dropped)| {
+                json!({
+                    "step": step, "parent_step": parent, "entity_id": format!("id-{step}"),
+                    "entity_name": format!("node_{step}"), "fanout_truncated": truncated,
+                    "fanout_dropped": dropped, "terminal": null,
+                })
+            })
+            .collect();
+        let clipped: Vec<Value> = clips
+            .iter()
+            .map(|(step, name, dropped, crossing)| {
+                json!({
+                    "step": step, "entity_id": format!("id-{step}"), "entity_name": name,
+                    "dropped_callees": dropped, "dropped_callers": 0,
+                    "dropped_crossing_file": crossing, "continued_below": true,
+                    "limit_per_step": 3,
+                })
+            })
+            .collect();
+        let mut payload = json!({
+            "focal_name": "root", "limit_per_step": 3, "truncated": true, "steps_omitted": 9,
+            "total_steps": steps.len(), "chain": chain, "clipped_steps": clipped,
+            "spine_clipped_steps": walk_spine,
+            "degradations": [
+                {"component": "response_budget", "reason": "steps_omitted", "detail": "cut"},
+                {
+                    "component": "fanout_cap", "reason": "spine_clipped",
+                    "detail": "the walk continued beneath the walk's nodes; the widest was 'gone'",
+                    "remediation": "re-query 'gone'",
+                },
+            ],
+        });
+        let clause = crate::negative::spine_clipping_clause(&payload, walk_spine, None);
+        let reason = format!("response_bounded: cut; {clause}; substrate_partial: short");
+        payload["negative"] = json!({
+            "trust_reason": reason,
+            "advice": format!(
+                "rows, against a snapshot with coverage and degraded signals \
+                 [response_budget:steps_omitted, fanout_cap:spine_clipped, \
+                 edge_coverage:calls_absent]. Treat these rows as a lower bound. Limiting \
+                 factor: {reason}"
+            ),
+            "degraded_signals": [
+                "response_budget:steps_omitted", "fanout_cap:spine_clipped",
+                "edge_coverage:calls_absent",
+            ],
+        });
+        payload["_kin"] = json!({
+            "verdict": {"limiting_factor": "response_bounded; trace_spine_clipped; substrate_partial"},
+        });
+        payload
+    }
+
+    fn spine_disclosure(payload: &Value) -> Option<Value> {
+        payload["degradations"].as_array().and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["reason"] == json!("spine_clipped"))
+                .cloned()
+        })
+    }
+
+    /// A cut that leaves the chain continuing beneath the clipped focal alone
+    /// counts one spine node and names only it, wherever the reply says so.
+    #[test]
+    fn a_cut_spine_is_restated_to_the_nodes_that_ship() {
+        // The focal's record ships; the one shipped branch was clipped too, but
+        // nothing ships beneath it.
+        let mut payload = cut_spine_payload(&[(1, 0, true, 2)], &[(0, "root", 2, 0)], 4);
+        let handed = handed_clips(&payload);
+        restate_trace_spine(&mut payload, &handed);
+
+        assert_eq!(payload["spine_clipped_steps"], json!(1), "{payload}");
+        assert_eq!(payload["clipped_steps"][0]["continued_below"], json!(true));
+        let disclosure = spine_disclosure(&payload).expect("the focal is still on the spine");
+        let detail = disclosure["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with("the walk continued beneath 1 node(s)"),
+            "{detail}"
+        );
+        assert!(detail.contains("the widest was 'root'"), "{detail}");
+        assert!(
+            disclosure["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("re-query 'root'"),
+            "{disclosure}"
+        );
+        for pointer in ["/negative/trust_reason", "/negative/advice"] {
+            let said = payload.pointer(pointer).and_then(Value::as_str).unwrap();
+            assert!(
+                said.contains("trace_spine_clipped: the walk continued beneath 1 node whose"),
+                "{pointer}: {said}"
+            );
+            assert!(!said.contains("beneath 4 nodes"), "{pointer}: {said}");
+        }
+        assert_eq!(
+            payload["_kin"]["verdict"]["limiting_factor"],
+            json!("response_bounded; trace_spine_clipped; substrate_partial"),
+            "a spine is still there, so its code stays"
+        );
+    }
+
+    /// A cut that leaves the chain continuing beneath no clipped node withdraws
+    /// the spine disclosure, and every block that named it says what it says
+    /// for a walk that never continued beneath one.
+    #[test]
+    fn a_cut_that_leaves_no_spine_withdraws_every_word_of_it() {
+        // The focal was not clipped, and the one shipped branch was, with none
+        // of its children shipping.
+        let mut payload = cut_spine_payload(&[(1, 0, true, 2)], &[(1, "node_1", 2, 0)], 2);
+        let handed = handed_clips(&payload);
+        restate_trace_spine(&mut payload, &handed);
+
+        assert!(payload.get("spine_clipped_steps").is_none(), "{payload}");
+        assert_eq!(payload["clipped_steps"][0]["continued_below"], json!(false));
+        assert!(spine_disclosure(&payload).is_none(), "{payload}");
+        let reason = payload["negative"]["trust_reason"].as_str().unwrap();
+        assert_eq!(
+            reason,
+            format!(
+                "response_bounded: cut; {}; substrate_partial: short",
+                crate::negative::trace_cap_clauses(true, true).join("; ")
+            )
+        );
+        let advice = payload["negative"]["advice"].as_str().unwrap();
+        assert!(!advice.contains("spine"), "{advice}");
+        assert!(
+            advice.contains(
+                "degraded signals [response_budget:steps_omitted, edge_coverage:calls_absent]"
+            ),
+            "{advice}"
+        );
+        assert_eq!(
+            payload["negative"]["degraded_signals"],
+            json!([
+                "response_budget:steps_omitted",
+                "edge_coverage:calls_absent"
+            ])
+        );
+        assert_eq!(
+            payload["_kin"]["verdict"]["limiting_factor"],
+            json!("response_bounded; trace_walk_truncated; trace_walk_degraded; substrate_partial")
+        );
+    }
+
+    /// The spine's code in a limiting factor is replaced by the codes given,
+    /// each listed once, whether the factor is the verdict's own list or a
+    /// note's restatement of it ending in a full stop.
+    #[test]
+    fn replacing_the_spine_code_keeps_the_rest_of_the_factor() {
+        let codes = vec![
+            "trace_walk_truncated".to_string(),
+            "trace_walk_degraded".to_string(),
+        ];
+        assert_eq!(
+            replace_spine_code(
+                "response_bounded; trace_spine_clipped; substrate_partial",
+                &codes
+            )
+            .as_deref(),
+            Some("response_bounded; trace_walk_truncated; trace_walk_degraded; substrate_partial")
+        );
+        assert_eq!(
+            replace_spine_code("trace_walk_truncated; trace_spine_clipped", &codes).as_deref(),
+            Some("trace_walk_truncated; trace_walk_degraded")
+        );
+        let note = format!(
+            "The verdict is inconclusive.{LIMITING_FACTOR_JOIN}response_bounded; \
+             trace_spine_clipped."
+        );
+        assert_eq!(
+            replace_spine_code(&note, &codes),
+            Some(format!(
+                "The verdict is inconclusive.{LIMITING_FACTOR_JOIN}response_bounded; \
+                 trace_walk_truncated; trace_walk_degraded."
+            ))
+        );
+        assert_eq!(
+            replace_spine_code("response_bounded; substrate_partial", &codes),
+            None
+        );
+    }
+
+    /// The clip records a reply ships, as the walk handed them to the pass.
+    fn handed_clips(payload: &Value) -> Vec<Value> {
+        payload["clipped_steps"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A spine node whose clip record this pass withheld still ships, so it
+    /// still counts, and so does what its record measured. The crossing count
+    /// used to sum only the records that shipped, so a reply whose withheld
+    /// records carried every module-crossing drop lost the key, which reads as
+    /// a spine that cost only same-file breadth.
+    #[test]
+    fn a_spine_node_whose_clip_record_was_withheld_keeps_its_crossing_count() {
+        // The walk handed over both records; the budget withheld node_1's.
+        let walk = cut_spine_payload(&[], &[(0, "root", 2, 0), (1, "node_1", 3, 2)], 2);
+        let mut payload = cut_spine_payload(
+            &[(1, 0, true, 3), (2, 1, false, 0)],
+            &[(0, "root", 2, 0)],
+            2,
+        );
+        restate_trace_spine(&mut payload, &handed_clips(&walk));
+
+        assert_eq!(payload["spine_clipped_steps"], json!(2), "{payload}");
+        assert_eq!(
+            payload["spine_dropped_crossing_file"],
+            json!(2),
+            "node_1's record measured two crossing drops, and node_1 still ships: {payload}"
+        );
+        assert!(
+            payload.get(CROSSING_FLOOR_KEY).is_none(),
+            "every node's crossing is known: {payload}"
+        );
+        let detail = spine_disclosure(&payload).expect("a spine")["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            detail.starts_with(
+                "the walk continued beneath 2 node(s) whose fan-out limit_per_step 3 had already \
+                 cut, dropping 5 neighbor(s) that were never followed, 2 of which lived outside \
+                 the file of the node that offered them; the widest was 'node_1'"
+            ),
+            "{detail}"
+        );
+        let reason = payload["negative"]["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("beneath 2 nodes whose"), "{reason}");
+        assert!(
+            reason.contains(", 2 of the dropped neighbours lived outside the file"),
+            "{reason}"
+        );
+    }
+
+    /// A clipped chain step the walk handed over with no record at all is read
+    /// from the step, so it counts, the crossing count it never measured is not
+    /// stated in words as if it were, and the number beside it is marked a floor.
+    #[test]
+    fn a_clipped_step_without_any_record_counts_but_its_crossing_is_not_claimed() {
+        let mut payload = cut_spine_payload(
+            &[(1, 0, true, 2), (2, 1, false, 0)],
+            &[(0, "root", 2, 1)],
+            4,
+        );
+        let handed = handed_clips(&payload);
+        restate_trace_spine(&mut payload, &handed);
+
+        assert_eq!(payload["spine_clipped_steps"], json!(2), "{payload}");
+        assert_eq!(
+            payload["spine_dropped_crossing_file"],
+            json!(1),
+            "{payload}"
+        );
+        assert_eq!(
+            payload[CROSSING_FLOOR_KEY],
+            json!(true),
+            "node_1's crossing is unknown, so the count is a floor: {payload}"
+        );
+        let detail = spine_disclosure(&payload).expect("a spine")["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            detail.contains("beneath 2 node(s)") && detail.contains("dropping 4 neighbor(s)"),
+            "{detail}"
+        );
+        assert!(!detail.contains("of which lived outside"), "{detail}");
+        let reason = payload["negative"]["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("beneath 2 nodes whose"), "{reason}");
+        assert!(
+            !reason.contains("of the dropped neighbours lived outside"),
+            "{reason}"
+        );
+    }
+
+    /// A reply whose walk continued beneath no clipped node carries no spine,
+    /// so the restatement leaves every word as the walk wrote it, including a
+    /// clause it cannot read a spine into.
+    #[test]
+    fn a_reply_with_no_spine_is_left_as_the_walk_wrote_it() {
+        let mut payload = cut_spine_payload(&[(1, 0, true, 2)], &[(1, "node_1", 2, 0)], 0);
+        if let Some(clips) = payload["clipped_steps"].as_array_mut() {
+            for clip in clips {
+                clip["continued_below"] = json!(false);
+            }
+        }
+        let before = payload.clone();
+        let handed = handed_clips(&payload);
+        restate_trace_spine(&mut payload, &handed);
+        assert_eq!(payload, before);
+    }
+
     /// A response still over its ceiling says so once, however many arms reach
     /// that conclusion. Two copies of the same sentence spend the budget they
     /// are complaining about, and the release binary published two.
@@ -4731,18 +6196,49 @@ mod tests {
         })
     }
 
-    /// Every row of every listed collection, plus the focal, as objects.
-    fn rows_of(payload: &Value, keys: &[&str]) -> Vec<Map<String, Value>> {
-        let mut rows: Vec<Map<String, Value>> = keys
-            .iter()
-            .filter_map(|key| payload.get(*key))
-            .filter_map(Value::as_array)
-            .flat_map(|entries| entries.iter().filter_map(Value::as_object).cloned())
-            .collect();
-        if let Some(focal) = payload.get("focal_entity").and_then(Value::as_object) {
-            rows.push(focal.clone());
+    /// Re-rendering an answer after adding to it keeps the format it was
+    /// served in, and never emits the private format marker.
+    #[test]
+    fn a_re_rendered_answer_keeps_the_format_it_was_served_in() {
+        let value = json!({"a": {"b": "line one\nline two"}, JSON_FORMAT_KEY: "compact"});
+        let compact = render_in_format_of(&value, "{\"a\":1}").unwrap();
+        assert!(!compact.contains('\n'), "{compact}");
+        let pretty = render_in_format_of(&value, "{\n  \"a\": 1\n}").unwrap();
+        assert!(pretty.contains('\n'), "{pretty}");
+        for text in [&compact, &pretty] {
+            let served: Value = serde_json::from_str(text).unwrap();
+            assert!(served.get(JSON_FORMAT_KEY).is_none(), "{text}");
+            assert_eq!(served["a"], value["a"]);
         }
-        rows
+    }
+
+    #[test]
+    fn compact_context_transport_preserves_facts_before_budget_pressure() {
+        let mut original = pack_payload(3, 40);
+        original["focal_entity"]["body"] = json!("fn café() {\r\n    execute();\r\n}");
+        original["source_derivation"] = json!({"body_binding": "current"});
+        original["degradations"] = json!([{"reason": "references_are_incomplete"}]);
+        for tool in ["get_context_pack", "trace_computation"] {
+            for compact in [true, false] {
+                let budget = ResponseBudget {
+                    compact,
+                    ..ResponseBudget::default()
+                };
+                let mut payload = original.clone();
+                let accounting = enforce(&mut payload, tool, &budget).unwrap();
+                let before_token_accounting = render(&payload).unwrap();
+                assert_eq!(accounting.chars_after, before_token_accounting.len());
+                assert!(!accounting.bounded);
+                assert!(fit_context_payload(&mut payload, tool, &budget));
+                let text = render(&payload).unwrap();
+                let mut served: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(served["tokens_used"], kin_context::estimate_tokens(&text));
+                assert_eq!(text.contains('\n'), !compact);
+                assert!(served.get(JSON_FORMAT_KEY).is_none());
+                served.as_object_mut().unwrap().remove("tokens_used");
+                assert_eq!(served, original, "{tool}, compact={compact}");
+            }
+        }
     }
 
     #[test]
@@ -4785,14 +6281,18 @@ mod tests {
             let mut fitting = json!({"entities": [{"body": "whole\r\n", "projection": "FullBody", "body_complete": true}]});
             let before = fitting.clone();
             enforce(&mut fitting, "get_context_pack", &budget).unwrap();
-            assert_eq!(fitting, before);
+            // Compare the complete emitted facts, excluding only the private
+            // serialization control field that render never sends.
+            let served: Value = serde_json::from_str(&render(&fitting).unwrap()).unwrap();
+            assert_eq!(served, before);
         }
     }
 
     #[test]
     fn a_row_whose_body_the_budget_took_says_so() {
         let mut payload = pack_payload(24, 900);
-        // Sized so shedding the bodies alone brings the response under, and the
+        let focal_before = payload["focal_entity"].clone();
+        // Sized so shedding neighborhood bodies brings the response under, and the
         // ladder never reaches the rung that withholds rows. Both cuts are real
         // and both are disclosed, but mixing them here would leave the row
         // count and the body count describing different populations, and this
@@ -4808,9 +6308,9 @@ mod tests {
             "the body rung alone must have sufficed: {payload}"
         );
 
-        let rows = rows_of(&payload, &["dependencies"]);
-        assert_eq!(rows.len(), 25, "24 dependencies and the focal: {payload}");
-        for row in &rows {
+        let rows = payload["dependencies"].as_array().unwrap();
+        assert_eq!(rows.len(), 24, "every dependency row stays: {payload}");
+        for row in rows {
             // Removing the key outright is the shape of a `compact: true` call
             // and of an entity whose source the graph does not hold. A row that
             // lost its body to the budget must read as neither.
@@ -4831,8 +6331,68 @@ mod tests {
         }
         let elision = payload["elisions"]["body"].clone();
         assert_eq!(elision["elided"], json!(rows.len()), "{payload}");
-        assert_eq!(elision["kept"], json!(0), "{payload}");
+        assert_eq!(elision["kept"], json!(1), "{payload}");
         assert_eq!(elision["reason"], json!(ELISION_REASON_BUDGET), "{payload}");
+        assert_eq!(payload["focal_entity"], focal_before);
+    }
+
+    #[test]
+    fn compact_context_keeps_focals_and_routes_before_neighbor_bodies() {
+        let core_body = "function step() {\n    return next_step();\n}";
+        let mut entities: Vec<Value> = ["start", "middle", "end"]
+            .into_iter()
+            .map(|id| {
+                json!({
+                    "id": id, "name": id, "section": if id == "middle" { "route" } else { "focal" },
+                    "projection": "FullBody", "body": core_body, "body_complete": true,
+                })
+            })
+            .collect();
+        entities.extend((0..40).map(|n| {
+            json!({
+                "id": format!("neighbor-{n}"), "name": format!("neighbor-{n}"),
+                "section": "dependency", "projection": "FullBody",
+                "body": "neighbor detail ".repeat(100), "body_complete": true,
+            })
+        }));
+        let payload = json!({
+            "token_budget": 2500, "tokens_used": 0, "entities": entities,
+            "focals": [
+                {"entity_id": "start", "projection": "full_body"},
+                {"entity_id": "end", "projection": "full_body"},
+            ],
+            "routes": [{"from": "start", "to": "end", "entities": ["middle"]}],
+        });
+        let result = crate::envelope::finalize_bounded(
+            crate::types::ToolCallResult::text(payload.to_string()),
+            crate::envelope::Envelope::daemon(),
+            "get_context_pack",
+            &ResponseBudget {
+                max_chars: 9000,
+                ..ResponseBudget::default()
+            },
+        );
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let served: Value = serde_json::from_str(text).unwrap();
+        assert!(kin_context::estimate_tokens(text) <= 2500);
+        assert!(text.len() <= 9000);
+        assert_eq!(served["tokens_used"], kin_context::estimate_tokens(text));
+        assert_eq!(served["routes"], payload["routes"]);
+        assert_eq!(served["focals"], payload["focals"]);
+        for id in ["start", "middle", "end"] {
+            let row = served["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .unwrap();
+            assert_eq!(row["body"], core_body);
+            assert_eq!(row["body_complete"], true);
+            assert!(row.get("body_elided").is_none());
+        }
+        assert_eq!(served["elisions"]["body"]["elided"], 40);
+        assert_eq!(served["elisions"]["body"]["kept"], 3);
     }
 
     #[test]

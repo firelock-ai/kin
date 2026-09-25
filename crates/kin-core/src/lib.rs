@@ -30,11 +30,13 @@ pub mod identity;
 pub mod init;
 pub mod init_attempt;
 pub mod init_budget;
+pub mod init_disk;
 mod init_progress;
 pub use init_progress::report_admission_progress;
 mod init_staging;
 pub mod last_admission;
 pub mod layout;
+pub mod lsp_scope;
 pub mod manifest;
 pub mod memory_pressure;
 pub mod paging;
@@ -46,6 +48,8 @@ pub mod relation_census;
 pub mod repository_authority;
 pub mod resolver;
 pub mod retained_parse;
+#[cfg(any(test, feature = "test-support"))]
+pub mod session_publication_test_support;
 pub mod shims;
 pub mod sync_state;
 /// Scoped, restoring, serialized environment mutation for test code.
@@ -71,7 +75,7 @@ pub use assistant_sync::{
     SyncMode, SyncResult,
 };
 pub use config::{
-    ExecutionPolicyConfig, ExternalToolExecutionPolicy, GitBranchTrackingConfig,
+    AgentExecConfig, ExecutionPolicyConfig, ExternalToolExecutionPolicy, GitBranchTrackingConfig,
     GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig, KinConfig, RemoteConfig,
     RemoteHostKind, RemoteRefConfig, RemoteTransportKind, ResourcesConfig, WorldConfig,
     WorldPreset, RESOURCE_PROFILE_NAMES,
@@ -102,7 +106,8 @@ pub use sync_state::SyncStateStore;
 pub use tree::{
     materialize_source_entry, materialize_source_tree, prepare_source_tree, reconcile_source_tree,
     reconcile_source_tree_and_commit_authored_repository_transaction,
-    reconcile_source_tree_and_commit_repository_transaction, replace_source_tree,
+    reconcile_source_tree_and_commit_repository_transaction,
+    reconcile_source_tree_and_commit_unproven_repository_transaction, replace_source_tree,
     report_repository_workspace_projection_drift, resolve_change_tree,
     should_preserve_checkout_path, source_projection_disposition, validate_portable_source_paths,
     validate_portable_source_symlink, validate_source_entry, validate_source_paths,

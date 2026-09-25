@@ -103,6 +103,21 @@ KIN_FOLD_SPLIT_MODE
 # workspace source; before, the dependency scan saw it the same way.
 KIN_SEARCH_SOAK_SEED
 
+# The same soak test's other knobs, and kin-vector's in-crate distance benchmark
+# and kin-infer resource.rs's deliberately absent test flag, all read inside
+# `#[cfg(test)] mod tests` through helpers that take the name as an argument.
+# The scan counts helper reads now, so it sees them. Each already sits in
+# dependency_env_allowlist.txt with the same reason, and none reaches a running
+# kin or is anything an operator sets.
+KIN_SEARCH_SOAK_ROUNDS
+KIN_SEARCH_SOAK_CHECK_EVERY
+KIN_SEARCH_SOAK_MAX_LIVE
+KIN_SEARCH_SOAK_SECS
+KIN_VECTOR_BENCH_DIM
+KIN_VECTOR_BENCH_VECTORS
+KIN_VECTOR_BENCH_ITERS
+KIN_INFER_NONEXISTENT_FLAG_XYZ
+
 # kin-infer's own test binaries read these directly, in crates/kin-infer/tests/:
 # the embed scale-hang harness, the determinism probe and the batch probes. None
 # is compiled into a running kin, and nothing an operator sets. kin-infer moved
@@ -120,19 +135,24 @@ KIN_SCALE_SEQ_LEN
 KIN_SCALE_SPAWN_THREAD
 KIN_SCALE_STALL_SECS
 
-# Stays OUT of the registry, and this is the one of kin-infer's six embed
-# watchdog knobs that the workspace scan can see. All six are already in
-# dependency_env_allowlist.txt with a reachability note, and
+# kin-infer's six embed watchdog knobs stay OUT of the registry. All six are
+# already in dependency_env_allowlist.txt with a reachability note, and
 # `the_unreachable_watchdog_knobs_stay_out_of_the_registry` in env_registry.rs
 # asserts they are allowlisted AND unregistered, because neither kin nor the
 # pinned kin-db constructs EmbedConfig or EmbedWatchdog, so nothing in a kin
 # process reads any of them. Importing the crate did not change that; it changed
-# which scan reads the file. Only this one is visible here because
-# crates/kin-infer/src/watchdog.rs reads all six through helper functions that
-# take the name as an argument, while crates/kin-infer/tests/embed_scale_hang.rs
-# spells this one out. Register it in env_registry.rs on the day the watchdog is
-# wired up, which is what that test exists to remind the next reader to do.
+# which scan reads the file. crates/kin-infer/src/watchdog.rs reads all six
+# through helper functions that take the name as an argument, which this scan
+# now counts, and crates/kin-infer/tests/embed_scale_hang.rs spells out
+# KIN_EMBED_ORPHAN_CHECK. Register all six in env_registry.rs on the day the
+# watchdog is wired up, which is what that test exists to remind the next reader
+# to do.
 KIN_EMBED_ORPHAN_CHECK
+KIN_EMBED_WATCHDOG
+KIN_EMBED_MAX_SECS
+KIN_EMBED_MIN_RATE
+KIN_EMBED_FLOOR_WINDOW_SECS
+KIN_EMBED_FLOOR_GRACE_SECS
 
 # kin-db's own test code reads these fifteen directly, all under `#[cfg(test)]`
 # in crates/kin-db/src or in crates/kin-db/tests, so none reaches a running kin:
@@ -155,3 +175,13 @@ KIN_FIR2334_STORE
 KIN_FIR3064_REPO
 KIN_FIR3064_STORE
 KIN_REPLAYWALL_COMMITS
+
+# kin-db storage/repository/session_publication_tests.rs: selects an owned
+# prior-CLI fixture only for the ignored prepared_session_old_reader_fixture
+# test under cfg(test). No product runtime reads this variable.
+KIN_DB_PREPARED_SESSION_FIXTURE
+
+# kin-buildinfo src/relocation_test.rs: preserves the owned tiny Cargo fixture
+# and its logs when explicitly requested by the relocation regression test.
+# The module is compiled only under cfg(all(test, unix)); no product reads it.
+KIN_BUILDINFO_RELOCATION_EVIDENCE

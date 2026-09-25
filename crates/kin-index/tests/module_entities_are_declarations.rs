@@ -85,8 +85,15 @@ impl AdmittedRepository {
 /// against: `parts.join`, `raw.trim`, `text.split`, `seen.insert`, and the
 /// three string-literal receivers that produced the name fragments the ticket
 /// samples. `"a.rs".into()` is the one that made `rs"`.
+const RUST_CARGO_TOML: &str = r#"[package]
+name = "frag-rust"
+version = "0.1.0"
+edition = "2021"
+"#;
+
 const RUST_LIB: &str = r#"mod alpha;
 mod beta;
+mod caller;
 
 use std::collections::BTreeSet;
 
@@ -101,7 +108,11 @@ pub fn run(raw: &str) -> String {
     let owned: String = "structured".into();
     let suffixed: String = "a.rs".into();
     let padded = joined.to_uppercase();
-    format!("{padded}{owned}{suffixed}{}", seen.len())
+    if seen.len() > 0 {
+        padded
+    } else {
+        owned
+    }
 }
 "#;
 
@@ -135,6 +146,7 @@ fn a_method_call_contributes_no_module_entity() {
         &root.path().join("rust"),
         "frag-rust",
         &[
+            ("Cargo.toml", RUST_CARGO_TOML),
             ("src/lib.rs", RUST_LIB),
             ("src/alpha.rs", RUST_ALPHA),
             ("src/beta.rs", RUST_BETA),
@@ -183,16 +195,21 @@ fn a_method_call_contributes_no_module_entity() {
 
     // The call the repository really does define keeps its edge, so the fix is
     // a removal of fabrication and not a removal of resolution.
-    let caller = repo
-        .entities
-        .iter()
-        .find(|entity| entity.name == "caller")
-        .unwrap_or_else(|| panic!("the fixture declares `caller`:\n{}", repo.describe()));
-    let target = repo
-        .entities
-        .iter()
-        .find(|entity| entity.name == "alpha_helper")
-        .unwrap_or_else(|| panic!("the fixture declares `alpha_helper`:\n{}", repo.describe()));
+    // By kind as well as by name: `src/caller.rs` carries a function named
+    // `caller` and the file's own module surface, which takes the file's stem
+    // and is therefore also named `caller`. Python has had that collision since
+    // it started emitting a module per file, and the linker settles it the same
+    // way in both (`file_name_slot_admits`: a module never displaces a
+    // declaration on a `(file, name)` key). A lookup by name alone here would
+    // read the surface and report the function's call edge missing.
+    let declaration = |name: &str| {
+        repo.entities
+            .iter()
+            .find(|entity| entity.name == name && entity.kind == EntityKind::Function)
+            .unwrap_or_else(|| panic!("the fixture declares `{name}`:\n{}", repo.describe()))
+    };
+    let caller = declaration("caller");
+    let target = declaration("alpha_helper");
     assert!(
         repo.relations.iter().any(|relation| {
             relation.kind == RelationKind::Calls
@@ -228,14 +245,22 @@ fn a_repository_of_declarations_and_no_method_calls_is_unaffected() {
         .map(|entity| entity.name.clone())
         .collect();
 
+    // `crate` is `src/lib.rs`'s own module surface, and `gamma` and `delta` are
+    // each written twice: once by the `mod` declaration in `src/lib.rs` and once
+    // by the file that IS that module. A file's module surface is the endpoint
+    // an entity-level import edge is sourced at, so a language that emits none
+    // mints no such edge at all; every source file carries one for that reason.
+    // The claim this case grades is unchanged: every name here is a declaration
+    // with a file behind it, and none of them is an expression.
     assert_eq!(
         names,
-        ["delta", "gamma"]
+        ["crate", "delta", "gamma"]
             .into_iter()
             .map(str::to_string)
             .collect::<BTreeSet<_>>(),
-        "a file that declares two modules and calls no method contributes \
-         exactly those two module entities and nothing else:\n{}",
+        "a file that declares two modules and calls no method contributes those \
+         two module entities and the three files' own surfaces, and nothing \
+         else:\n{}",
         repo.describe()
     );
 }

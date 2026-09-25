@@ -58,6 +58,58 @@ use serde_json::Value;
 /// person can read.
 pub(crate) const ROUND_TRIP_TOOL: &str = "kin_graph_status";
 
+/// The one call a round trip makes, chosen by the profile the entry serves.
+///
+/// `kin setup` writes the routed profile for the clients that load every tool
+/// eagerly, and that profile serves one tool, so its round trip asks the same
+/// graph status through the routed tool's `status` command. The answer is the
+/// same payload either way, because a routed call is answered as its named
+/// tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoundTrip {
+    /// The tool the served list must carry and the call names.
+    tool: &'static str,
+    /// Whether the call goes through the routed tool.
+    routed: bool,
+}
+
+impl RoundTrip {
+    pub(crate) const NAMED: Self = Self {
+        tool: ROUND_TRIP_TOOL,
+        routed: false,
+    };
+    pub(crate) const ROUTED: Self = Self {
+        tool: kin_mcp::routed::TOOL_NAME,
+        routed: true,
+    };
+
+    /// The round trip for the profile the recorded entry names.
+    pub(crate) fn for_launch(launch: &McpLaunch) -> Self {
+        let routed = launch
+            .env
+            .get("KIN_MCP_TOOL_PROFILE")
+            .and_then(|value| value.to_str())
+            .is_some_and(|profile| {
+                let profile = profile.trim();
+                profile.eq_ignore_ascii_case("agent-routed")
+                    || profile.eq_ignore_ascii_case("agent-routed-query")
+            });
+        if routed {
+            Self::ROUTED
+        } else {
+            Self::NAMED
+        }
+    }
+
+    fn arguments(self) -> Value {
+        if self.routed {
+            serde_json::json!({"command": "status", "args": {}})
+        } else {
+            serde_json::json!({})
+        }
+    }
+}
+
 /// How long one client's launch may take before it is killed.
 ///
 /// The server answers `initialize` and `tools/list` immediately by design, and
@@ -269,14 +321,21 @@ pub(crate) fn launch_from_entry(entry: &Value) -> Result<McpLaunch, String> {
     })
 }
 
+/// The named round trip's session, for the tests that read it.
+#[cfg(test)]
+fn probe_frames() -> String {
+    probe_frames_for(RoundTrip::NAMED)
+}
+
 /// The session one round trip drives: initialize, the initialized
-/// notification, the tool list, and one real tool call.
+/// notification, the tool list, and one real tool call, the one `round_trip`
+/// names.
 ///
 /// No `roots` capability is advertised. A client that offers one is asked for
 /// its workspace roots by the server, and answering that is a conversation this
 /// check has no reason to hold: the launch directory is the repository under
 /// test, which is what a bare launch binds from anyway.
-fn probe_frames() -> String {
+fn probe_frames_for(round_trip: RoundTrip) -> String {
     let client = serde_json::json!({
         "name": "kin-setup-round-trip",
         "version": env!("CARGO_PKG_VERSION"),
@@ -298,7 +357,7 @@ fn probe_frames() -> String {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {"name": ROUND_TRIP_TOOL, "arguments": {}},
+            "params": {"name": round_trip.tool, "arguments": round_trip.arguments()},
         }),
     ];
     let mut session = String::new();
@@ -355,7 +414,7 @@ fn run_session(
 
     let written = match child.stdin.take() {
         Some(mut stdin) => stdin
-            .write_all(probe_frames().as_bytes())
+            .write_all(probe_frames_for(RoundTrip::for_launch(launch)).as_bytes())
             .and_then(|()| stdin.flush()),
         None => Ok(()),
     };
@@ -461,8 +520,15 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Classify one completed session into a verdict.
+/// Classify one completed session into a verdict, for the named round trip.
+#[cfg(test)]
 fn classify(session: &SessionOutput) -> McpProof {
+    classify_for(session, RoundTrip::NAMED)
+}
+
+/// Classify one completed session into a verdict, for the round trip the
+/// session actually made.
+fn classify_for(session: &SessionOutput, round_trip: RoundTrip) -> McpProof {
     let Some(initialize) = response_with_id(session, 1) else {
         return McpProof::Failed {
             stage: ProofStage::Handshake,
@@ -516,12 +582,13 @@ fn classify(session: &SessionOutput) -> McpProof {
             error: format!("tools/list served no named tools: {listed}"),
         };
     }
-    if !served.contains(&ROUND_TRIP_TOOL) {
+    if !served.contains(&round_trip.tool) {
         return McpProof::Failed {
             stage: ProofStage::ToolList,
             error: format!(
-                "the served tool list does not carry {ROUND_TRIP_TOOL}, so this client's agent \
+                "the served tool list does not carry {}, so this client's agent \
                  cannot call it; served: {}",
+                round_trip.tool,
                 served.join(", ")
             ),
         };
@@ -706,7 +773,7 @@ fn truncate(text: &str) -> String {
 /// Prove one recorded entry by launching it and calling one tool.
 pub(crate) fn prove_launch(launch: &McpLaunch, working_dir: &Path, budget: Duration) -> McpProof {
     match run_session(launch, working_dir, budget) {
-        Ok(session) => classify(&session),
+        Ok(session) => classify_for(&session, RoundTrip::for_launch(launch)),
         Err((stage, error)) => McpProof::Failed { stage, error },
     }
 }
@@ -1366,6 +1433,64 @@ mod tests {
             frames[3].pointer("/params/name").and_then(Value::as_str),
             Some(ROUND_TRIP_TOOL)
         );
+    }
+
+    /// An entry on the routed profile serves one tool, so its round trip asks
+    /// the graph status through that tool's `status` command, and the served
+    /// list it must carry is the routed tool, not the named one.
+    #[test]
+    fn a_routed_entry_round_trips_through_the_routed_status_command() {
+        let routed = launch_from_entry(&serde_json::json!({
+            "command": "kin",
+            "args": ["mcp", "start"],
+            "env": {"KIN_MCP_TOOL_PROFILE": "agent-routed"},
+        }))
+        .unwrap();
+        let named = launch_from_entry(&serde_json::json!({
+            "command": "kin",
+            "args": ["mcp", "start"],
+            "env": {"KIN_MCP_TOOL_PROFILE": "agent-default"},
+        }))
+        .unwrap();
+        assert_eq!(RoundTrip::for_launch(&routed), RoundTrip::ROUTED);
+        assert_eq!(RoundTrip::for_launch(&named), RoundTrip::NAMED);
+
+        let frames: Vec<Value> = probe_frames_for(RoundTrip::ROUTED)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every probe frame is JSON"))
+            .collect();
+        assert_eq!(
+            frames[3].pointer("/params/name").and_then(Value::as_str),
+            Some(kin_mcp::routed::TOOL_NAME)
+        );
+        assert_eq!(
+            frames[3].pointer("/params/arguments"),
+            Some(&serde_json::json!({"command": "status", "args": {}}))
+        );
+
+        // A routed server's list carries the routed tool, and that is what the
+        // routed round trip requires; the named requirement would fail it.
+        let listed = session(vec![
+            initialize_response(),
+            tools_response(&[kin_mcp::routed::TOOL_NAME]),
+        ]);
+        assert!(
+            !matches!(
+                classify_for(&listed, RoundTrip::ROUTED),
+                McpProof::Failed {
+                    stage: ProofStage::ToolList,
+                    ..
+                }
+            ),
+            "the routed list satisfies the routed round trip"
+        );
+        assert!(matches!(
+            classify_for(&listed, RoundTrip::NAMED),
+            McpProof::Failed {
+                stage: ProofStage::ToolList,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -648,14 +648,44 @@ where
             })
             .cloned()
             .collect::<Vec<_>>();
-        parsed_relations.extend(
+        let rust_project = if parsed_files
+            .iter()
+            .any(|file| file.file_path.ends_with(".rs"))
+        {
+            Some(kin_index::rust_project::RustProjectAuthority::observe_admitted_tree(
+                file_tree, kin_index::rust_project::RustProjectLimits::default(), |hash| {
+                    if build_start.elapsed().as_secs_f64() > build_timeout_secs {
+                        return Err("historical Rust project reconstruction deadline exceeded".into());
+                    }
+                    reader.authority.load_source_blob(hash).map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("selected historical tree has missing Rust project CAS body {hash}"))
+                },
+            ).map_err(|error| KinError::Graph(format!("selected Rust project: {error}")))?)
+        } else {
+            None
+        };
+        let linked = if let Some(project) = rust_project
+            .as_ref()
+            .and_then(|observation| observation.authority())
+        {
+            kin_index::linker::link_cross_file_with_rust_project(
+                &parsed_files.iter().collect::<Vec<_>>(),
+                &universe_entities.iter().collect::<Vec<_>>(),
+                &artifact_ids,
+                &parse_completeness,
+                project,
+            )
+        } else {
             link_cross_file_against_entities_with_completeness(
                 &parsed_files,
                 &universe_entities,
                 &artifact_ids,
                 &parse_completeness,
             )
-            .map_err(|error| KinError::Other(format!("cross-file linking failed: {error}")))?,
+        };
+        parsed_relations.extend(
+            linked
+                .map_err(|error| KinError::Other(format!("cross-file linking failed: {error}")))?,
         );
     }
 
@@ -1341,6 +1371,91 @@ mod tests {
                 kin_model::SourceRegion::EntityRef { entity_id, .. } if *entity_id == processor.id
             )),
             "historical file layouts should point at the persisted entity IDs"
+        );
+    }
+
+    #[test]
+    fn selected_cargo_manifest_controls_historical_named_imports() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let authority = test_authority(temp.path());
+        let manifest = b"[package]\nname='fixture'\nedition='2021'\nautolib=false\nautobins=false\n[lib]\npath='app.rs'\n";
+        let first_manifest = save_source_blob(&authority, manifest);
+        let mut tree = vec![added(0xc01, "Cargo.toml", first_manifest)];
+        for (id, path, source) in [
+            (0xc02, "app.rs", "pub mod owner; pub mod caller;"),
+            (0xc03, "owner.rs", "pub fn work() {}"),
+            (
+                0xc04,
+                "caller.rs",
+                "use crate::owner::work; pub fn run() { work(); }",
+            ),
+            (0xc05, "other.rs", "pub fn unrelated() {}"),
+            (0xc06, "decoy/owner.rs", "pub fn work() {}"),
+        ] {
+            tree.push(added(
+                id,
+                path,
+                save_source_blob(&authority, source.as_bytes()),
+            ));
+        }
+        let original = create_fixture_change(&graph, vec![], "exact Cargo target", vec![], tree);
+        let later_manifest = save_source_blob(
+            &authority,
+            &String::from_utf8(manifest.to_vec())
+                .unwrap()
+                .replace("app.rs", "other.rs")
+                .into_bytes(),
+        );
+        let later = create_fixture_change(
+            &graph,
+            vec![original],
+            "manifest-only different target",
+            vec![],
+            vec![modified(
+                0xc01,
+                "Cargo.toml",
+                first_manifest,
+                later_manifest,
+            )],
+        );
+        let calls = |view: &InMemoryGraph| {
+            let entities = view.list_all_entities().unwrap();
+            let caller = entities
+                .iter()
+                .find(|e| {
+                    e.name == "run" && e.file_origin.as_ref().is_some_and(|f| f.0 == "caller.rs")
+                })
+                .unwrap()
+                .id;
+            view.get_all_relations_for_entity(&caller)
+                .unwrap()
+                .into_iter()
+                .filter(|r| {
+                    r.src.as_entity() == Some(caller)
+                        && r.kind == kin_model::RelationKind::Calls
+                        && !kin_index::is_external_import_placeholder(r)
+                })
+                .collect::<Vec<_>>()
+        };
+        let earlier = build_graph_at_ref_from_graph(&graph, &authority, &original).unwrap();
+        let earlier_calls = calls(&earlier);
+        assert_eq!(
+            earlier_calls.len(),
+            1,
+            "selected earlier root must establish the exact caller binding"
+        );
+        let target = earlier
+            .get_entity(&earlier_calls[0].dst.as_entity().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.file_origin, Some(FilePathId::new("owner.rs")));
+        assert!(
+            calls(&build_graph_at_ref_from_graph(&graph, &authority, &later).unwrap()).is_empty()
+        );
+        assert_eq!(
+            calls(&build_graph_at_ref_from_graph(&graph, &authority, &original).unwrap()),
+            earlier_calls
         );
     }
 

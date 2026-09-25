@@ -32,10 +32,10 @@ kin --version
 kin setup --intent agent
 ```
 
-Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
 No native Windows ARM64 archive is published. An x64 Node process under Windows
-emulation can provision the x86_64 archive; use WSL2 for the repository workflow
-documented below.
+emulation can provision the x86_64 archive. On native Windows, use WSL2 for the agent
+setup documented below.
 
 ## If the global install is refused
 
@@ -84,27 +84,39 @@ prefix.
 
 The launcher and the shell installer (`scripts/install.sh`) share the same install
 contract (`$KIN_HOME`, default `~/.kin`): either lane satisfies the other, and neither
-silently downgrades an install the other made.
+downgrades an install the other made.
 
 On macOS, Linux, or WSL2, run `kin setup --intent agent` after provisioning. Setup writes the Kin MCP server into
 detected AI clients with the `agent-default` tool profile, adds the managed bin directory
 to your shell profile, installs the shell/session hook, and records the install ledger used
-by `kin setup status`, `kin doctor --fix`, and `kin setup uninstall`.
+by `kin setup status`, `kin doctor --fix`, and `kin setup uninstall`. On native Windows,
+provisioning installs the CLI, `kin init` and graph queries run there, and the install proof
+runs agent setup and graph-backed MCP tool calls there too. WSL2 remains the recommended
+path for the full Kin experience, so run agent setup inside WSL2. The PowerShell installer
+makes the same call and does not run setup at all.
 
 ## Version pinning
 
 Every `@kinlab/kin` release pins one managed `kin` release: its own package version.
+The pin is the oldest release the launcher runs. The launcher starts one extra process
+to check the installed executable's version, even if a receipt from an earlier
+installation exists. Updating Kin through another installer cannot make that old
+receipt authorize a downgrade or hide a needed upgrade.
+
 Each run compares that pin against whatever is already installed at `$KIN_HOME`:
 
 - **installed is older than the pin**: upgrades it automatically (a one-line notice
   on stderr, no prompt, no opt-in required).
-- **installed is newer than the pin**: refuses the downgrade and exits with an
-  actionable error instead of running anything; re-run with `KIN_LAUNCHER_ADOPT=1` to
-  force it on purpose (e.g. deliberately pinning to an older release).
+- **installed is newer than the pin**: runs the newer install. This is what `kin update`
+  and the shell installer leave behind, since they move `$KIN_HOME` forward without
+  touching the npm package. The first run prints a one-line notice on stderr and
+  records the version it confirmed, so later runs are quiet until it changes again.
+  `npm install -g @kinlab/kin@latest` brings the launcher forward too.
 - **installed matches the pin**: runs it as-is.
 
 `KIN_LAUNCHER_ADOPT=1` always forces a fresh provision of the pinned release, even when
-the installed version already matches.
+the installed version already matches or is newer. That is the one way to go back to an
+older release on purpose.
 
 ## Environment
 
@@ -113,7 +125,7 @@ the installed version already matches.
 | `KIN_HOME` | Root of the managed install (default `~/.kin`). |
 | `KIN_MANAGED_BIN` | Explicit path to a `kin` binary; disables provisioning entirely. |
 | `KIN_NO_PROVISION=1` | Never touch the network; fail loud if no binary is present. |
-| `KIN_LAUNCHER_ADOPT=1` | Force re-provisioning to the pinned release, including over a newer install that would otherwise be refused as a downgrade. |
+| `KIN_LAUNCHER_ADOPT=1` | Force re-provisioning to the pinned release, including over a newer install, which is a deliberate downgrade. |
 
 ## MCP setup
 

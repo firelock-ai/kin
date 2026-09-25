@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use kin_index::RelationResolution;
-use kin_mcp::handlers::common::ReferenceLinesAbsent;
+use kin_mcp::handlers::common::{ReferenceEdge, ReferenceLinesAbsent};
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
@@ -185,11 +185,45 @@ async fn run_daemon_bulk_refs(
         .context("daemon bulk refs failed")
 }
 
+/// The daemon's spine as one `kin refs` read found it, and the repository that
+/// read answers for.
+///
+/// Only an empty answer uses it: its absence is graded on the cross-repo
+/// authority `find_references` weighs, so a reference from another repository
+/// into the focal is not certified away.
+#[derive(Clone, Copy)]
+pub struct RefsSpine<'a> {
+    pub repo_id: &'a str,
+    pub spine: ::kin_spine::DaemonSpine<'a>,
+}
+
+impl RefsSpine<'static> {
+    /// No spine to consult, which is what a daemon whose spine is switched off
+    /// hands over.
+    pub fn absent() -> Self {
+        Self {
+            repo_id: "",
+            spine: ::kin_spine::DaemonSpine::Absent,
+        }
+    }
+}
+
+/// [`build_refs_response_with_spine`] for a caller that holds no spine read.
 pub fn build_refs_response(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     request: &RefsRequest,
     envelope: &kin_mcp::Envelope,
+) -> Result<RefsResponse> {
+    build_refs_response_with_spine(layout, graph, request, envelope, RefsSpine::absent())
+}
+
+pub fn build_refs_response_with_spine(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &RefsRequest,
+    envelope: &kin_mcp::Envelope,
+    spine: RefsSpine<'_>,
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
     let want_dispatch = strip_dispatch_modifier(&request.kind).1;
@@ -201,6 +235,19 @@ pub fn build_refs_response(
         &request.entity,
         &crate::entity_identity::IdentityQualifiers::default(),
     )?;
+    // A member name several owners share is answered for each of them, the way
+    // `find_references` sections the same name under `candidates_by_owner`,
+    // rather than refused or answered for one.
+    if resolution.shares_member_name() {
+        return build_shared_member_refs_response(
+            layout,
+            graph,
+            request,
+            &resolution,
+            envelope,
+            spine,
+        );
+    }
     let refusal = if resolution.name_matches.is_empty() {
         // Not an absence claim about references: the focal never resolved, so
         // nothing was walked and there is no coverage question to answer. A
@@ -251,6 +298,11 @@ pub fn build_refs_response(
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut lines = Vec::new();
+    // First, and on every answer, when a missing language server leaves out
+    // references this answer could otherwise have held: the rows below are
+    // then a lower bound, and a reader who stops at them must not read them as
+    // the whole set.
+    lines.extend(language_server_gap_line(target.language));
     lines.push(format!(
         "References to '{}' -> {} ({:?}) @ {}",
         resolution.reference.name, target.name, target.kind, target_path
@@ -272,14 +324,21 @@ pub fn build_refs_response(
         // How the CALLER addressed the focal decides the ambiguity rule, and
         // taking it against the winner's own name is FIR-2475. `kin refs` takes
         // a uuid or a name, and `resolved_by_name` recorded which.
-        let negative =
-            refs_absence_verdict(graph, target, &relation_kinds, resolved_by_name, envelope);
+        let negative = refs_absence_verdict(
+            graph,
+            target,
+            &relation_kinds,
+            resolved_by_name,
+            envelope,
+            spine,
+        );
         lines.extend(refs_absence_qualifier(
             graph,
             target,
             &relation_kinds,
             resolved_by_name,
             envelope,
+            spine,
         ));
         let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
         // The candidate note above already named every same-name identity, so
@@ -320,16 +379,21 @@ pub fn build_refs_response(
     // A caller with no file-reading tool cannot check sixteen fabricated
     // cross-package references against anything, so they must not be inside the
     // number the answer leads with.
+    //
+    // A counted caller is cut by its own edges, because one proven edge used to
+    // count every site the caller's other edges recorded. Its sites that only
+    // a held edge recorded go under the heading that edge earns, as a row that
+    // says its caller is counted above.
     let mut resolved: Vec<ReferenceEntry> = Vec::new();
     let mut receiver_candidates: Vec<ReferenceEntry> = Vec::new();
     let mut name_matches: Vec<ReferenceEntry> = Vec::new();
     for entry in refs {
-        if entry.receiver_name_guess {
-            receiver_candidates.push(entry);
-        } else if entry.is_name_match_only() {
-            name_matches.push(entry);
-        } else {
-            resolved.push(entry);
+        let (counted, held) = entry.split_held_sites();
+        resolved.extend(counted);
+        match held {
+            Some(held) if held.receiver_name_guess => receiver_candidates.push(held),
+            Some(held) => name_matches.push(held),
+            None => {}
         }
     }
     let unconfirmed_count = receiver_candidates.len() + name_matches.len();
@@ -345,8 +409,13 @@ pub fn build_refs_response(
             (Some(line), false) => format!("{file_path}:{line}"),
             (None, false) => file_path,
         };
+        let held_note = if entry.held_sites_of_counted_caller {
+            " (its proven sites are counted above)"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "  {} @ {} [{}] ({}) {}",
+            "  {} @ {} [{}] ({}) {}{held_note}",
             entry.name,
             location,
             relation_kinds_label(&entry.relation_kinds),
@@ -455,6 +524,111 @@ pub fn build_refs_response(
     })
 }
 
+/// `kin refs` for a member name several owners share: a full answer for each
+/// owner's member, each addressed by its id, under one lead that says why.
+///
+/// The CLI half of `find_references`' sectioned reply. Both surfaces reach the
+/// candidates through the one member rule, list them in the same order, and
+/// section at most the same number, so `kin refs get` and
+/// `find_references(query: "get")` answer about the same entities. Each section
+/// is the ordinary answer for one entity, produced by addressing it by id, so
+/// it is exactly what `kin refs <id>` prints for it.
+fn build_shared_member_refs_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &RefsRequest,
+    resolution: &crate::entity_identity::EntityResolution,
+    envelope: &kin_mcp::Envelope,
+    spine: RefsSpine<'_>,
+) -> Result<RefsResponse> {
+    let mut candidates = resolution.candidates.clone();
+    kin_ranking::entity_ranking::sort_name_candidates(&mut candidates);
+    let sectioned = candidates
+        .len()
+        .min(kin_mcp::handlers::entities::RESOLUTION_CANDIDATES_LISTED_MAX);
+    let scope = if sectioned < candidates.len() {
+        format!("the first {sectioned} of them, ordered by file and then name,")
+    } else {
+        "each of them".to_string()
+    };
+    let mut lines = vec![format!(
+        "{}, so this answer covers {scope} rather than choosing one. Name one by its \
+         owner-qualified name, or pass its id, to answer about it alone.",
+        kin_mcp::handlers::entities::name_candidates_situation(
+            &resolution.reference.name,
+            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            candidates.len(),
+        ),
+    )];
+    for candidate in candidates.iter().take(sectioned) {
+        let section = build_refs_response_with_spine(
+            layout,
+            graph,
+            &RefsRequest {
+                entity: candidate.id.to_string(),
+                kind: request.kind.clone(),
+            },
+            envelope,
+            spine,
+        )?;
+        lines.push(String::new());
+        lines.push(format!(
+            "== {} ({})",
+            candidate.name,
+            kin_review::StableEntityIdentity::from_entity(candidate).kind
+        ));
+        lines.extend(section.lines);
+    }
+    // Every candidate past the sections is still named, by id, the way
+    // `find_references` lists them under `unsectioned_candidates`.
+    let rest = &candidates[sectioned..];
+    if !rest.is_empty() {
+        let listed = rest
+            .len()
+            .min(kin_mcp::handlers::entities::NAME_CANDIDATES_LISTED_MAX);
+        lines.push(String::new());
+        lines.push(format!(
+            "Not answered above, {} more by id; pass one to answer about it:",
+            rest.len()
+        ));
+        for candidate in &rest[..listed] {
+            lines.push(format!("  {}  {}", candidate.name, candidate.id));
+        }
+        if listed < rest.len() {
+            lines.push(format!(
+                "  ... and {} more, not listed; name the owner to narrow",
+                rest.len() - listed
+            ));
+        }
+    }
+    Ok(RefsResponse {
+        lines,
+        negative: None,
+        error: None,
+    })
+}
+
+/// The line a refs answer leads with when a language server this host lacks
+/// would have linked references for `language`: what is missing and the
+/// command that adds it. The same sentence the MCP answer's `_kin.advice`
+/// carries, so the CLI and every MCP profile say it alike.
+///
+/// Read from the language-server readiness the daemon published, which is the
+/// fact the MCP answer's coverage observation is computed from. `None` where
+/// nothing was published or nothing is missing.
+fn language_server_gap_line(language: kin_model::LanguageId) -> Option<String> {
+    let readiness = kin_mcp::edge_coverage::published_language_server_readiness()?;
+    let enrichment = kin_core::reference_coverage::reference_enrichment_for(language, &readiness);
+    let observation = serde_json::json!({
+        "language": format!("{language:?}"),
+        "reference_enrichment": enrichment,
+    });
+    kin_mcp::first_contact::language_server_advice(
+        &observation,
+        kin_mcp::first_contact::Spelling::Kin,
+    )
+}
+
 /// What the header adds when the caller pinned which definition it meant.
 ///
 /// Empty when nothing was pinned, so an ordinary answer is unchanged. It exists
@@ -518,10 +692,11 @@ fn refs_absence_verdict(
     relation_kinds: &[RelationKind],
     addressed_by_name: Option<&str>,
     envelope: &kin_mcp::Envelope,
+    spine: RefsSpine<'_>,
 ) -> Option<serde_json::Value> {
     kin_mcp::negative::negative_for(
         "find_references",
-        &refs_absence_payload(graph, target, relation_kinds, addressed_by_name),
+        &refs_absence_payload(graph, target, relation_kinds, addressed_by_name, spine),
         envelope,
         &[],
     )
@@ -533,19 +708,32 @@ fn refs_absence_verdict(
 /// shared, because CLI surfaces answering absence questions differently is the
 /// defect rather than the implementation detail. See
 /// [`crate::commands::absence_qualifier`].
+///
+/// The one sentence of its own is for references another repository holds
+/// into the focal. They make this answer no absence at all, so it says so
+/// instead of explaining why an absence cannot be certified.
 fn refs_absence_qualifier(
     graph: &kin_db::InMemoryGraph,
     target: &Entity,
     relation_kinds: &[RelationKind],
     addressed_by_name: Option<&str>,
     envelope: &kin_mcp::Envelope,
+    spine: RefsSpine<'_>,
 ) -> Vec<String> {
-    crate::commands::absence_qualifier::qualify(
-        "find_references",
-        &refs_absence_payload(graph, target, relation_kinds, addressed_by_name),
-        envelope,
-        "",
-    )
+    let payload = refs_absence_payload(graph, target, relation_kinds, addressed_by_name, spine);
+    let federated = payload["references"].as_array().map_or(0, Vec::len);
+    if federated > 0 {
+        return vec![format!(
+            "{federated} reference{} from other repositories reach{} '{}', so this is not an \
+             absence; `kin xref {}` lists {}.",
+            if federated == 1 { "" } else { "s" },
+            if federated == 1 { "es" } else { "" },
+            target.name,
+            target.id,
+            if federated == 1 { "it" } else { "them" },
+        )];
+    }
+    crate::commands::absence_qualifier::qualify("find_references", &payload, envelope, "")
 }
 
 /// The observation `find_references`'s gate reads, scoped to the query this
@@ -569,24 +757,32 @@ fn refs_absence_payload(
     target: &Entity,
     relation_kinds: &[RelationKind],
     addressed_by_name: Option<&str>,
+    spine: RefsSpine<'_>,
 ) -> serde_json::Value {
     let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
         graph,
         &[target.language],
         relation_kinds,
     );
+    let (cross_repo, federated) = refs_cross_repo(graph, target, relation_kinds, spine);
     let mut payload = serde_json::json!({
-        "references": [],
+        // No local reference reached this path. What other repositories hold
+        // into the focal goes here, the way `find_references` merges its
+        // federated rows, so an answer they populate claims no absence.
+        "references": federated,
         "relation_kinds": relation_kinds
             .iter()
             .map(|kind| relation_kind_label(*kind))
             .collect::<Vec<_>>(),
-        // `kin refs` reads one local store and queries no spine, so this is the
-        // truthful value rather than a stub. It is also load-bearing: the gate
-        // REFUSES a `find_references` absence whose payload reports no
-        // cross-repo authority at all, and reporting none is a different claim
-        // from reporting that none is configured.
-        "cross_repo": { "status": "not_configured" },
+        // The cross-repo authority this read had, in the block
+        // `find_references` publishes. Load-bearing: the gate REFUSES a
+        // `find_references` absence whose payload reports no cross-repo
+        // authority at all, and a spine that is switched off still reports
+        // `not_configured`.
+        "cross_repo": cross_repo,
+        // The id alone, which is what the gate binds a spine's authority
+        // anchor to.
+        "focal_entity": { "id": target.id.to_string() },
         kin_mcp::EDGE_COVERAGE_KEY: coverage,
     });
     // Required, not optional. A payload with no `focal_resolution` is the
@@ -600,6 +796,87 @@ fn refs_absence_payload(
         payload["focal_resolution"] = resolution;
     }
     payload
+}
+
+/// The `cross_repo` block `find_references` publishes for `target` from this
+/// spine read, and the references into it from other repositories that the
+/// block counts.
+///
+/// The spine's state is read through `daemon_spine_xref`, the producer the MCP
+/// handler uses, so the two surfaces word a deferred, refused, stale or
+/// unregistered spine the same way. A federated reference counts only when the
+/// query asked for every relation class, as it does there, because a
+/// cross-repo edge does not record which class it was. One that cannot count
+/// leaves the relation subtype incomplete, which the gate refuses.
+fn refs_cross_repo(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    relation_kinds: &[RelationKind],
+    spine: RefsSpine<'_>,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    use kin_mcp::handlers::entities::{cross_repo_unavailable_json, daemon_spine_xref};
+    if matches!(spine.spine, ::kin_spine::DaemonSpine::Absent) {
+        return (
+            serde_json::json!({ "status": "not_configured" }),
+            Vec::new(),
+        );
+    }
+    let graph_root = hex::encode(graph.compute_root_hash());
+    let authority = kin_mcp::handlers::entities::FindReferencesAuthority {
+        repo_id: spine.repo_id,
+        graph_root: &graph_root,
+        spine: spine.spine,
+    };
+    let (repo_id, body) = match daemon_spine_xref(authority, &target.id) {
+        Ok((repo_id, ::kin_spine::SpineQuery::Found(body))) => (repo_id, body),
+        Ok((_, ::kin_spine::SpineQuery::Unavailable(reason))) | Err(reason) => {
+            return (cross_repo_unavailable_json(&reason), Vec::new())
+        }
+        Ok((_, ::kin_spine::SpineQuery::NotConfigured)) => {
+            return (
+                serde_json::json!({ "status": "not_configured" }),
+                Vec::new(),
+            )
+        }
+    };
+    let federated = body
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.dst_repo == repo_id && edge.dst_entity == target.id && edge.src_repo != repo_id
+        })
+        .map(|edge| {
+            let source = body.entities.iter().find(|entity| {
+                entity.repo_id == edge.src_repo && entity.entity_id == edge.src_entity
+            });
+            serde_json::json!({
+                "name": source.map_or_else(|| edge.src_entity.to_string(), |entity| entity.name.clone()),
+                "file_path": match source.and_then(|entity| entity.file_path.as_deref()) {
+                    Some(path) => format!("[{}] {path}", edge.src_repo),
+                    None => format!("[{}] {}", edge.src_repo, edge.src_entity),
+                },
+                "repo_id": edge.src_repo.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let every_class = kin_mcp::handlers::common::default_reference_kinds();
+    let relation_subtype_complete = federated.is_empty()
+        || (relation_kinds.len() == every_class.len()
+            && every_class.iter().all(|kind| relation_kinds.contains(kind)));
+    let counted = if relation_subtype_complete {
+        federated
+    } else {
+        Vec::new()
+    };
+    let block = serde_json::json!({
+        "status": "available",
+        "relation_subtype_complete": relation_subtype_complete,
+        "authority_complete": body.authority_complete_for(&repo_id, &target.id),
+        "authority_anchor": body.authority_anchor,
+        "authority_revision": body.authority_revision,
+        "authority_roots": body.authority_roots,
+    });
+    (block, counted)
 }
 
 fn reference_sites_label(entry: &ReferenceEntry) -> String {
@@ -813,34 +1090,53 @@ pub fn build_bulk_refs_response(
         // authority for both paths so the count cannot drift again.
         let collected = collect_graph_references(graph, &entity_id, &relation_kinds)?;
         let matched_kinds = collected.matched_kinds;
-        // Same split the human-readable surface prints, for the same reason
-        // (FIR-1552): a bare-leaf receiver-method match is not evidence of use.
-        // Reporting the total here while `kin refs` reported the caller count
-        // would put two numbers for one target on two surfaces that share a
-        // collector precisely so they cannot drift.
-        let (resolved, receiver_name): (Vec<_>, Vec<_>) = collected
+        // The callers `kin refs` counts, by the same per-edge rule, for the
+        // same reason: a bare-leaf receiver-method match is not evidence of
+        // use, and neither is a bare name match that is not a call. Counting
+        // every caller that was not all guesses put a caller holding one of
+        // each in this count while `kin refs` held it, two numbers for one
+        // target on two surfaces that share a collector so they cannot drift.
+        let reference_count = collected
             .references
             .iter()
-            .partition(|entry| !entry.receiver_name_guess);
-        let reference_count = resolved.len();
-        let receiver_name_candidate_count = receiver_name.len();
+            .filter(|entry| entry.counts())
+            .count();
+        let receiver_name_candidate_count = collected
+            .references
+            .iter()
+            .filter(|entry| entry.receiver_name_guess)
+            .count();
+        // Every caller `kin refs` holds whole under a candidate heading,
+        // receiver-name guesses and bare name matches alike. Any one of them may
+        // be a caller, so beside one the count is a floor and a zero is not an
+        // absence: the row says so rather than reading as a proved zero.
+        let unconfirmed_candidate_count = collected
+            .references
+            .iter()
+            .filter(|entry| !entry.counts())
+            .count();
 
         if !collected.missing_source_ids.is_empty() {
             incomplete_verdict_count += 1;
             let missing_source_count = collected.missing_source_ids.len();
-            let known_reference_count =
-                reference_count + receiver_name_candidate_count + missing_source_count;
+            // The known count is the callers this surface counts and nothing
+            // else, as on the complete path. A source whose record is missing
+            // and a caller held as a candidate are both stated beside it, apart,
+            // because adding them in made a held caller and a dangling source
+            // read as two known references where none was counted.
             let mut row = serde_json::json!({
                 "entity_id": entity_id.to_string(),
                 "has_references": null,
                 "reference_count": null,
-                "known_reference_count": known_reference_count,
+                "known_reference_count": reference_count,
                 "reference_count_complete": false,
                 "verdict_complete": false,
                 "verdict_reason": format!(
                     "graph reference authority incomplete: {missing_source_count} incoming source entity record(s) missing"
                 ),
                 "missing_source_entity_count": missing_source_count,
+                "receiver_name_candidate_count": receiver_name_candidate_count,
+                "unconfirmed_candidate_count": unconfirmed_candidate_count,
             });
             if !request.compact {
                 row["name"] = serde_json::json!(entity.name);
@@ -856,35 +1152,47 @@ pub fn build_bulk_refs_response(
             continue;
         }
 
-        let has_references = reference_count > 0;
-        if has_references {
-            with_references += 1;
+        let known_positive = reference_count > 0;
+        let reference_count_complete = unconfirmed_candidate_count == 0;
+        let has_references = if known_positive {
+            Some(true)
+        } else if reference_count_complete {
+            Some(false)
         } else {
-            without_references += 1;
+            None
+        };
+        match has_references {
+            Some(true) => with_references += 1,
+            Some(false) => without_references += 1,
+            None => incomplete_verdict_count += 1,
         }
 
-        if request.compact {
-            results.push(serde_json::json!({
-                "entity_id": entity_id.to_string(),
-                "has_references": has_references,
-                "reference_count": reference_count,
-                "receiver_name_candidate_count": receiver_name_candidate_count,
-            }));
-        } else {
-            results.push(serde_json::json!({
-                "entity_id": entity_id.to_string(),
-                "name": entity.name,
-                "kind": format!("{:?}", entity.kind),
-                "file_path": entity.file_origin.as_ref().map(|p| p.0.clone()),
-                "has_references": has_references,
-                "reference_count": reference_count,
-                "receiver_name_candidate_count": receiver_name_candidate_count,
-                "matched_kinds": matched_kinds
-                    .into_iter()
-                    .map(relation_kind_label)
-                    .collect::<Vec<_>>(),
-            }));
+        let mut row = serde_json::json!({
+            "entity_id": entity_id.to_string(),
+            "has_references": has_references,
+            "reference_count": reference_count_complete.then_some(reference_count),
+            "receiver_name_candidate_count": receiver_name_candidate_count,
+            "unconfirmed_candidate_count": unconfirmed_candidate_count,
+        });
+        if !reference_count_complete {
+            row["known_reference_count"] = serde_json::json!(reference_count);
+            row["reference_count_complete"] = serde_json::json!(false);
+            row["verdict_complete"] = serde_json::json!(has_references.is_some());
+            if !known_positive {
+                row["verdict_reason"] =
+                    serde_json::json!("unconfirmed candidate references remain");
+            }
         }
+        if !request.compact {
+            row["name"] = serde_json::json!(entity.name);
+            row["kind"] = serde_json::json!(format!("{:?}", entity.kind));
+            row["file_path"] = serde_json::json!(entity.file_origin.as_ref().map(|p| p.0.clone()));
+            row["matched_kinds"] = serde_json::json!(matched_kinds
+                .into_iter()
+                .map(relation_kind_label)
+                .collect::<Vec<_>>());
+        }
+        results.push(row);
     }
 
     let total_checked = request.entity_ids.len();
@@ -989,27 +1297,126 @@ pub(crate) struct ReferenceEntry {
     /// one candidate, which is an ordinary cross-file call. Only the receiver
     /// fan-out is a candidate rather than a reference (FIR-1552).
     pub(crate) receiver_name_guess: bool,
+    /// Every edge behind this row, each with its own strength and its own
+    /// sites: the record `find_references` cuts its rows by, so the two
+    /// surfaces hold the same sites back. See [`Self::split_held_sites`].
+    pub(crate) edges: Vec<ReferenceEdge>,
+    /// Whether this row is the held part of a caller counted above: the sites
+    /// only a weaker edge of that caller recorded.
+    pub(crate) held_sites_of_counted_caller: bool,
 }
 
 impl ReferenceEntry {
-    /// Whether this row is a bare name match and nothing more.
+    /// Whether one edge is held out of what this surface counts.
     ///
-    /// True when no edge behind it resolved past `name_only` and none of them is
-    /// a call. That pair is what a local variable or a parameter sharing a
-    /// function's name produces: the linker matched an identifier by name, the
-    /// site says nothing that settles which entity the name means, and the edge
-    /// is a `References` rather than a call. Counting those beside real callers
-    /// is how one Go function with one caller came back with seventeen
-    /// referencing entities, sixteen of them local variables in packages that
-    /// never import it.
+    /// Two grounds. A receiver-method call matched on its bare leaf name is a
+    /// candidate, not a caller: nothing at the site says the receiver holds
+    /// this type. And a bare name match that is not a call is what a
+    /// local variable or a parameter sharing a function's name produces: on
+    /// cli/cli v2.101.0 one Go function with one caller came back with
+    /// seventeen referencing entities, sixteen of them `References` edges at
+    /// `name_only` from locals in packages that never import it.
     ///
-    /// A call at `name_only` is deliberately not held out. The site is a call,
-    /// which is evidence of use even when the destination was chosen by name,
-    /// and the same store answers real cross-file calls that way: holding those
-    /// out would understate a function that is genuinely called, which is the
-    /// same defect facing the other direction.
-    fn is_name_match_only(&self) -> bool {
-        !self.resolution.is_proven() && !self.relation_kinds.contains(&RelationKind::Calls)
+    /// A call at `name_only` is deliberately counted. The site is a call, which
+    /// is evidence of use even when the destination was chosen by name, and the
+    /// same store answers real cross-file calls that way: holding those out
+    /// would understate a function that is genuinely called.
+    ///
+    /// `kin refs` cuts every caller by this and `kin refs --bulk-json` counts
+    /// callers by it, through [`Self::counts`], so the two surfaces count the
+    /// same callers.
+    fn edge_is_held(edge: &ReferenceEdge) -> bool {
+        edge.receiver_name_guess
+            || (!edge.resolution.is_proven() && edge.kind != RelationKind::Calls)
+    }
+
+    /// Whether this caller counts as a reference on this surface: one of the
+    /// edges behind it is not held.
+    pub(crate) fn counts(&self) -> bool {
+        self.edges.iter().any(|edge| !Self::edge_is_held(edge))
+    }
+
+    /// Cut a counted row into its proven sites and, when a weaker edge of the
+    /// same caller recorded sites no counted edge did, a held row carrying
+    /// those. A row none of whose edges this surface counts is held whole: the
+    /// row rule counted one whose only call was a receiver-name guess beside a
+    /// bare name match.
+    ///
+    /// A row used to print every site any of its edges recorded under its
+    /// strongest resolution, so one proven edge confirmed sites nothing proved.
+    /// On the gh CLI, `kin refs` printed `NewCreateContext ... (type_resolved)
+    /// sites 649,678,697,723` for `Repository.RepoOwner`, and 649 and 697 are
+    /// `RepoOwner()` calls on a `ghrepo.Interface` value that only the parser's
+    /// receiver fan-out recorded. The same rule [`split_reference_row`] applies
+    /// to `find_references`, under this surface's own grounds for holding a
+    /// row.
+    ///
+    /// [`split_reference_row`]: kin_mcp::handlers::common::split_reference_row
+    fn split_held_sites(self) -> (Option<ReferenceEntry>, Option<ReferenceEntry>) {
+        let (held, counted): (Vec<ReferenceEdge>, Vec<ReferenceEdge>) =
+            self.edges.iter().cloned().partition(Self::edge_is_held);
+        if held.is_empty() {
+            return (Some(self), None);
+        }
+        if counted.is_empty() {
+            return (None, Some(self));
+        }
+        let counted_lines: std::collections::HashSet<u32> = counted
+            .iter()
+            .flat_map(|edge| edge.lines.iter().copied())
+            .collect();
+        let held: Vec<ReferenceEdge> = held
+            .into_iter()
+            .filter_map(|mut edge| {
+                edge.lines.retain(|line| !counted_lines.contains(line));
+                (!edge.lines.is_empty()).then_some(edge)
+            })
+            .collect();
+        let counted_row = self.rebuilt_from(counted);
+        if held.is_empty() {
+            return (Some(counted_row), None);
+        }
+        let mut held_row = self.rebuilt_from(held);
+        held_row.held_sites_of_counted_caller = true;
+        (Some(counted_row), Some(held_row))
+    }
+
+    /// This caller's row, summarized again from `edges` alone.
+    fn rebuilt_from(&self, edges: Vec<ReferenceEdge>) -> ReferenceEntry {
+        let mut reference_lines: Vec<u32> = edges
+            .iter()
+            .flat_map(|edge| edge.lines.iter().copied())
+            .collect();
+        reference_lines.sort_unstable();
+        reference_lines.dedup();
+        let outside_caller_file: usize = edges.iter().map(|edge| edge.outside_caller_file).sum();
+        let mut relation_kinds = Vec::new();
+        for edge in &edges {
+            push_relation_kind(&mut relation_kinds, edge.kind);
+        }
+        relation_kinds.sort_by_key(relation_kind_rank);
+        ReferenceEntry {
+            reference_lines_absent: if !reference_lines.is_empty() {
+                None
+            } else if edges.iter().any(|edge| edge.site_contract_gap == Some(kin_mcp::handlers::common::ReferenceLinesPartial::OccurrenceQualificationUnavailable)) {
+                Some(ReferenceLinesAbsent::UnconfirmedSitesWithheld)
+            } else if outside_caller_file > 0 {
+                Some(ReferenceLinesAbsent::SpanOutsideCallerFile)
+            } else {
+                Some(ReferenceLinesAbsent::NoEvidenceSpan)
+            },
+            reference_lines,
+            relation_kinds,
+            resolution: edges
+                .iter()
+                .map(|edge| edge.resolution)
+                .max()
+                .unwrap_or(RelationResolution::NameOnly),
+            receiver_name_guess: edges.iter().all(|edge| edge.receiver_name_guess),
+            edges,
+            held_sites_of_counted_caller: false,
+            ..self.clone()
+        }
     }
 }
 
@@ -1080,7 +1487,7 @@ pub(crate) fn collect_graph_references(
     let mut edges_by_caller: HashMap<EntityId, Vec<kin_model::relation::Relation>> = HashMap::new();
     let mut matched_kinds = Vec::new();
 
-    for rel in graph.get_all_relations_for_entity(entity_id)? {
+    for rel in kin_index::relation_read::relations_for_read(graph, entity_id)? {
         if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
             continue;
         }
@@ -1121,13 +1528,14 @@ pub(crate) fn collect_graph_references(
         };
         let mut reference_lines = Vec::new();
         let mut spans_outside_caller_file = 0usize;
+        let mut edges = Vec::new();
         for rel in edges_by_caller.get(&source_id).into_iter().flatten() {
-            let tally = kin_mcp::handlers::common::relation_reference_lines(
-                rel,
-                entity.file_origin.as_ref(),
-            );
-            reference_lines.extend(tally.lines);
-            spans_outside_caller_file += tally.outside_caller_file;
+            for edge in kin_mcp::handlers::common::reference_edges(rel, entity.file_origin.as_ref())
+            {
+                reference_lines.extend(edge.lines.iter().copied());
+                spans_outside_caller_file += edge.outside_caller_file;
+                edges.push(edge);
+            }
         }
         reference_lines.sort_unstable();
         reference_lines.dedup();
@@ -1156,6 +1564,8 @@ pub(crate) fn collect_graph_references(
                 .get(&source_id)
                 .copied()
                 .unwrap_or(false),
+            edges,
+            held_sites_of_counted_caller: false,
         });
     }
     missing_source_ids.sort();
@@ -1636,7 +2046,13 @@ mod tests {
         let kinds = parse_relation_kinds("all").unwrap();
         let mcp = kin_mcp::negative::negative_for(
             "find_references",
-            &super::refs_absence_payload(&graph, &target, &kinds, Some("orphan")),
+            &super::refs_absence_payload(
+                &graph,
+                &target,
+                &kinds,
+                Some("orphan"),
+                super::RefsSpine::absent(),
+            ),
             &degraded,
             &[],
         );
@@ -2317,8 +2733,9 @@ mod tests {
     /// FIR-1552. The bulk row and the printed answer read one collector so their
     /// numbers cannot drift, and a bare-leaf receiver-method match is not
     /// evidence of use on either. Two real callers and three receiver-name
-    /// candidates give a row of `reference_count: 2` beside
-    /// `receiver_name_candidate_count: 3`, never a single `5`.
+    /// candidates give a row of `known_reference_count: 2` beside
+    /// `receiver_name_candidate_count: 3`, never a single `5`, and the total is
+    /// left open beside them.
     #[test]
     fn bulk_refs_counts_resolved_callers_and_names_the_candidates_apart() {
         use kin_db::InMemoryGraph;
@@ -2396,9 +2813,15 @@ mod tests {
         )
         .unwrap();
         let row = &response.results[0];
-        assert_eq!(row["reference_count"], 2, "{row}");
+        // Two, apart from the three candidates, and a floor beside them: any
+        // candidate may still be a caller, so the total is not claimed.
+        assert!(row["reference_count"].is_null(), "{row}");
+        assert_eq!(row["known_reference_count"], 2, "{row}");
+        assert_eq!(row["reference_count_complete"], false, "{row}");
         assert_eq!(row["receiver_name_candidate_count"], 3, "{row}");
+        assert_eq!(row["unconfirmed_candidate_count"], 3, "{row}");
         assert_eq!(row["has_references"], true, "{row}");
+        assert_eq!(row["verdict_complete"], true, "{row}");
         assert_eq!(response.with_references, 1);
     }
 
@@ -3215,10 +3638,14 @@ mod tests {
             let row = &response.results[0];
             assert!(row["has_references"].is_null());
             assert!(row["reference_count"].is_null());
-            assert_eq!(row["known_reference_count"], 2);
+            // The one materialized, parser-certain caller. The missing source is
+            // stated beside it rather than counted as a known caller.
+            assert_eq!(row["known_reference_count"], 1);
             assert_eq!(row["reference_count_complete"], false);
             assert_eq!(row["verdict_complete"], false);
             assert_eq!(row["missing_source_entity_count"], 1);
+            assert_eq!(row["unconfirmed_candidate_count"], 0);
+            assert_eq!(row["receiver_name_candidate_count"], 0);
             assert!(row["verdict_reason"]
                 .as_str()
                 .unwrap()

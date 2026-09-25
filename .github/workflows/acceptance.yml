@@ -140,6 +140,15 @@ jobs:
       - name: Falsify the hydration-semantics disclosure graders
         run: python3 scripts/acceptance/hydration_semantics_repro.py --self-test
 
+      # A store the last published release wrote, holding edits no commit
+      # recorded, must serve on this build. The graders decide whether a start
+      # served, whether `kin status` named what it re-derived, and whether an
+      # uncommitted edit answers at its current line, and each is handed the
+      # output that shipped: a daemon that exited during startup, a status with
+      # no disclosure, and a declaration answering at its previous position.
+      - name: Falsify the published-store upgrade graders
+        run: python3 scripts/acceptance/published_store_upgrade_repro.py --self-test
+
       # FIR-1826. The suite's verdicts are decided by two graders: one that reads
       # the callers out of a `kin graph inspect`, and one that turns a caller set
       # into PASS or FAIL. Both are driven against the input that must produce
@@ -690,6 +699,40 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=Hydration-semantics acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
+      # The one suite whose store is not written by the binary under test. It
+      # downloads the last published release, checks its pinned SHA-256, lets
+      # that release initialize a small repository and admit three uncommitted
+      # edits, then opens the store with this build. Every other suite builds
+      # its store with the binary it grades, which is why none of them could
+      # see a candidate whose daemon never served an upgraded store.
+      - name: Published-store upgrade suite (verdict comes from the gate step)
+        id: publishedstoreupgrade
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/published_store_upgrade_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/published_store_upgrade.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/published_store_upgrade.log 2>&1 || rc=$?
+          cat acceptance/published_store_upgrade.log
+          {
+            echo "### Published-store upgrade suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/published_store_upgrade.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Published-store upgrade suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
       # The end-to-end arm of FIR-1826. The unit arm drives the linker directly
@@ -1381,6 +1424,7 @@ jobs:
             --report trace_spine=acceptance/trace_spine.json \
             --report parsehole=acceptance/parsehole.json \
             --report hydration_semantics=acceptance/hydration_semantics.json \
+            --report published_store_upgrade=acceptance/published_store_upgrade.json \
             --report sameowner=acceptance/sameowner.json \
             --report memory_pressure=acceptance/memory_pressure.json \
             --report memory_footprint=acceptance/memory_footprint.json \

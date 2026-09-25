@@ -2251,12 +2251,26 @@ pub(crate) struct WindowsParentGuard {
 }
 
 impl WindowsParentGuard {
+    /// Retain a managed config's parent directory for one transaction.
+    ///
+    /// The handle is read for its identity and never written or renamed
+    /// through, so it asks for read access only. What retains the directory is
+    /// the share mode: read access makes the handle take part in Windows'
+    /// sharing checks, and withholding `FILE_SHARE_DELETE` then refuses any
+    /// later open that asks for `DELETE`, which renaming or removing the
+    /// directory needs. Asking for `DELETE` here as well added no retention
+    /// and cost the open itself: Windows holds a process's current directory
+    /// with a share mode that withholds `FILE_SHARE_DELETE`, so a `DELETE`
+    /// open of any directory a shell is sitting in is refused with a sharing
+    /// violation. A new shell sits in the profile root, which is the parent of
+    /// `~/.claude.json`, so the guard could not be taken there and `kin setup`
+    /// could not write Claude Code's config.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let path_wide = wide_null(path.as_os_str())?;
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
@@ -3301,5 +3315,92 @@ mod tests {
         drop(guard);
         drop(root);
         std::fs::remove_dir(container).unwrap();
+    }
+
+    /// Open a directory the way Windows holds a process's current directory:
+    /// traverse access, with a share mode that withholds `FILE_SHARE_DELETE`.
+    fn hold_as_current_directory(path: &Path) -> OwnedHandle {
+        let wide = wide_null(path.as_os_str()).unwrap();
+        // SAFETY: wide is a live NUL-terminated path for this call.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE
+                    | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        };
+        OwnedHandle::new(raw, "failed to hold the directory as a current directory").unwrap()
+    }
+
+    /// Open a directory for `DELETE`, the access renaming or removing it needs,
+    /// sharing everything, so only another handle's share mode can refuse it.
+    fn open_directory_for_delete(path: &Path) -> Result<OwnedHandle> {
+        let wide = wide_null(path.as_os_str())?;
+        // SAFETY: wide is a live NUL-terminated path for this call.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        OwnedHandle::new(raw, "failed to open the directory for DELETE")
+    }
+
+    /// The parent guard opens a directory a shell is sitting in, and still
+    /// retains it.
+    ///
+    /// `~/.claude.json` is the one client config whose parent is the profile
+    /// root, and a new shell starts there. The guard used to ask for `DELETE`,
+    /// which a current-directory handle refuses, so `kin setup` could not write
+    /// Claude Code's config on an interactive machine.
+    #[test]
+    fn windows_parent_guard_opens_a_directory_a_shell_holds_as_its_current_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+
+        let shell = hold_as_current_directory(&path);
+        // Control: the held directory refuses a DELETE open, which is exactly
+        // what the guard used to ask for. Without this the case below would
+        // pass on a host whose handle did not reproduce the refusal.
+        let refused = match open_directory_for_delete(&path) {
+            Ok(_) => panic!("a current-directory handle must refuse a DELETE open"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            windows_error_code(&refused),
+            Some(ERROR_SHARING_VIOLATION as i32),
+            "{refused:#}"
+        );
+
+        let guard = WindowsParentGuard::open(&path)
+            .expect("the parent guard must open a directory a shell is sitting in");
+        drop(shell);
+
+        // What the guard is for: while it is held, nothing may rename or remove
+        // the directory, and once it is dropped, that is allowed again.
+        let refused = match open_directory_for_delete(&path) {
+            Ok(_) => panic!("a held parent guard must refuse a DELETE open of its directory"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            windows_error_code(&refused),
+            Some(ERROR_SHARING_VIOLATION as i32),
+            "{refused:#}"
+        );
+        drop(guard);
+        drop(
+            open_directory_for_delete(&path)
+                .expect("a DELETE open must be granted once the guard is dropped"),
+        );
     }
 }

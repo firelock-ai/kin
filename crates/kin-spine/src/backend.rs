@@ -24,7 +24,8 @@ use crate::publication::{
     SpineRolloutFenceEvidence, SpineSourceCursor,
 };
 use crate::store::{
-    LoadedSpineRolloutFence, PreparedStorePublication, StoreHeadPrecondition, StoreRepoHeadGuard,
+    DurableReadStats, LoadedSpineRolloutFence, PreparedStorePublication, StoreHeadPrecondition,
+    StoreRepoHeadGuard,
 };
 
 /// Error type for spine backend operations.
@@ -107,6 +108,13 @@ impl PreparedRepoSpinePublication {
 /// SpineIndex call sites. The FirestoreSpineBackend uses `tokio::runtime::Handle`
 /// internally to bridge async HTTP calls.
 pub trait SpineBackend: Send + Sync {
+    /// Billable reads the durable store behind this backend has made, when it
+    /// counts them. An in-memory backend has no durable store and reports
+    /// `None`, which is not the same as having read nothing.
+    fn durable_read_stats(&self) -> Option<DurableReadStats> {
+        None
+    }
+
     /// Atomically create or advance the shared hosted rollout fence.
     fn advance_rollout_fence(
         &self,
@@ -313,6 +321,32 @@ pub trait SpineBackend: Send + Sync {
         registry_repo_ids: &[String],
     );
 
+    /// Resolve `repo_id`'s outgoing cross-repo edges again from the imports
+    /// its last [`Self::refresh_cross_repo_edges`] kept, against the repos
+    /// registered now, and report whether it did.
+    ///
+    /// A registration marks every registered repo's edges stale, because any
+    /// of them may import from the entity set that changed. A local daemon
+    /// holds only its own repo's graph, so when its repo registers at a new
+    /// root this is how a sibling's edges become current again: a sibling's
+    /// imports depend on the sibling's graph alone, and resolving them again
+    /// is the refresh that graph would produce.
+    ///
+    /// `false` means nothing was resolved and the repo's edges are exactly as
+    /// current as they were: no imports are kept for it, because no refresh
+    /// from its graph has finished since it last registered or was
+    /// invalidated, or the backend refuses the write. The default keeps
+    /// nothing, so a backend that does not override this leaves a stale repo
+    /// stale rather than guessing.
+    fn refresh_cross_repo_edges_from_retained_imports(
+        &self,
+        repo_id: &str,
+        registry_repo_ids: &[String],
+    ) -> bool {
+        let _ = (repo_id, registry_repo_ids);
+        false
+    }
+
     /// Fail closed after a refresh/load failure while preserving last-known
     /// positive edges for advisory use. This is required rather than a no-op
     /// default so a backend cannot advertise complete snapshots while silently
@@ -328,6 +362,22 @@ pub trait SpineBackend: Send + Sync {
     /// whether it is an observed zero or an unbuilt authority.
     fn authority_complete(&self) -> bool {
         self.cross_repo_edges_snapshot().complete
+    }
+
+    /// Whether `repo_id`'s outgoing cross-repo edges are stale: marked since
+    /// their last refresh and not materialized again.
+    ///
+    /// A daemon asks this about its own repository when the root it registered
+    /// already matches its live graph. Every graph mutation invalidates that
+    /// repository's edges before it runs, including one that leaves the root
+    /// where it was, so a root comparison alone never sees the refresh it owes.
+    ///
+    /// The default is conservative: a backend that cannot answer for one
+    /// repository reports its edges stale whenever its authority is incomplete,
+    /// so a caller never skips a refresh the backend could not rule out.
+    fn cross_repo_edges_stale(&self, repo_id: &str) -> bool {
+        let _ = repo_id;
+        !self.authority_complete()
     }
 
     /// Acquire one all-repo refresh lease against an exact registered root set.
@@ -549,6 +599,10 @@ impl SpineBackend for InMemorySpineBackend {
         self.index.authority_is_complete()
     }
 
+    fn cross_repo_edges_stale(&self, repo_id: &str) -> bool {
+        self.index.cross_repo_edges_stale(repo_id)
+    }
+
     fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str) {
         let mut publication_heads = self.publication_heads.lock();
         publication_heads.remove(repo_id);
@@ -629,6 +683,21 @@ impl SpineBackend for InMemorySpineBackend {
         publication_heads.remove(repo_id);
         self.index
             .refresh_cross_repo_edges(repo_id, entities, relations, registry_repo_ids);
+    }
+
+    fn refresh_cross_repo_edges_from_retained_imports(
+        &self,
+        repo_id: &str,
+        registry_repo_ids: &[String],
+    ) -> bool {
+        let mut publication_heads = self.publication_heads.lock();
+        let refreshed = self
+            .index
+            .refresh_cross_repo_edges_from_retained_imports(repo_id, registry_repo_ids);
+        if refreshed {
+            publication_heads.remove(repo_id);
+        }
+        refreshed
     }
 
     fn invalidate_cross_repo_edges(&self, repo_id: &str) {
@@ -766,6 +835,14 @@ mod tests {
         assert!(snapshot.roots.is_empty());
         assert!(snapshot.edges.is_empty());
         assert!(snapshot.revision.starts_with("sha256:"));
+    }
+
+    /// A backend that keeps no imports resolves nothing again, so a repo a
+    /// registration marked stale stays stale behind it.
+    #[test]
+    fn kept_import_refresh_default_is_patch_compatible_and_fail_closed() {
+        assert!(!PatchCompatibleBackend
+            .refresh_cross_repo_edges_from_retained_imports("repo", &["repo".to_string()]));
     }
 
     fn test_entry(repo: &str, name: &str, kind: EntityKind) -> EntityEntry {

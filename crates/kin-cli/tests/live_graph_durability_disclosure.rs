@@ -624,6 +624,13 @@ fn sample_is_live(status: &serde_json::Value) -> bool {
 /// LIVE sample that is still unlevelled ends the wait's patience with that body
 /// quoted, because a live reading of stale counters is the product answering
 /// and not this harness racing it.
+///
+/// A wait that ends on replays quotes the last one's `stale` block, because
+/// that is the daemon naming what held the live sample off and how old the
+/// reading it served was. The last hosted failure of this test reported only a
+/// count of replays, and finding the cause took a local reproduction: there the
+/// first embedding batch was fetching the embedding model under the lock status
+/// samples under, and every reading was the one settled before the fetch began.
 fn wait_for_a_fresh_recorded_sample(
     repo: &Path,
     home: &Path,
@@ -634,6 +641,7 @@ fn wait_for_a_fresh_recorded_sample(
     let mut reads = 0_u32;
     let mut replays = 0_u32;
     let mut live_but_unlevelled: Option<serde_json::Value> = None;
+    let mut last_replay = serde_json::Value::Null;
     loop {
         let session = settled_mcp_session(repo, home, port);
         let status = payload(&session, 2, "kin_graph_status");
@@ -648,6 +656,11 @@ fn wait_for_a_fresh_recorded_sample(
             live_but_unlevelled.get_or_insert_with(|| durability(&status));
         } else {
             replays += 1;
+            last_replay = serde_json::json!({
+                "entity_count": status["entity_count"],
+                "durable_entity_count": status["durable_entity_count"],
+                "stale": status["stale"],
+            });
         }
         deadline = widened_settle_deadline(deadline, started, retry_bound());
         assert!(
@@ -659,9 +672,9 @@ fn wait_for_a_fresh_recorded_sample(
                     "A LIVE sample read {block}, so the counters are behind in the daemon rather \
                      than the sampling being stale: this is the product, not the test"
                 ),
-                None => "No live sample was ever taken, so every reading replayed an instant \
-                         before the commit"
-                    .to_string(),
+                None => format!(
+                    "No live sample was ever taken. The last reading replayed {last_replay}"
+                ),
             }
         );
         thread::sleep(Duration::from_millis(200));
@@ -757,6 +770,43 @@ fn settled_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_j
     }
 }
 
+/// Wait for a LIVE reading of the uncommitted write before asserting on it.
+///
+/// The same rule [`wait_for_a_fresh_recorded_sample`] applies after the commit,
+/// for the read that comes before it. When three live attempts in a row see the
+/// graph changing, `kin_graph_status` answers from `last_settled_selected_graph`,
+/// and [`settled_mcp_session`] accepts that answer because it is not the one
+/// refusal it retries on. Measured under a load average between 25 and 40: the
+/// replay was the sample settled before the write, 3 entities against a live 7,
+/// and the first assertion below read it.
+///
+/// Only the sampling is waited out. Every assertion after this is unchanged, and
+/// a live sample that disagrees with the fixture still fails there.
+fn wait_for_a_live_uncommitted_sample(
+    repo: &Path,
+    home: &Path,
+    port: u16,
+) -> Vec<(u64, serde_json::Value)> {
+    let started = Instant::now();
+    let mut deadline = started + retry_bound();
+    let mut replays = 0_u32;
+    loop {
+        let session = settled_mcp_session(repo, home, port);
+        let status = payload(&session, 2, "kin_graph_status");
+        if sample_is_live(&status) {
+            return session;
+        }
+        replays += 1;
+        deadline = widened_settle_deadline(deadline, started, retry_bound());
+        assert!(
+            Instant::now() < deadline,
+            "kin_graph_status replayed an earlier settled sample {replays} time(s) and never \
+             sampled the uncommitted graph live: {status}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn durability(payload: &serde_json::Value) -> serde_json::Value {
     payload
         .get("_kin")
@@ -845,7 +895,7 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
         .expect("write the uncommitted source");
     let live = wait_for_live_growth(&daemon, &repo, &home, port, durable_at_init, before_write);
 
-    let uncommitted = settled_mcp_session(&repo, &home, port);
+    let uncommitted = wait_for_a_live_uncommitted_sample(&repo, &home, port);
     let status = payload(&uncommitted, 2, "kin_graph_status");
     let locate = payload(&uncommitted, 3, "semantic_locate");
 

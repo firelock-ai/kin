@@ -333,6 +333,7 @@ pub struct RepositoryIgnore {
     readmitted_names: BTreeSet<Vec<u8>>,
     readmitted_prefixes: Vec<RepoPath>,
     configured: bool,
+    captured_kinignore: Option<Vec<u8>>,
 }
 
 impl Default for RepositoryIgnore {
@@ -363,6 +364,7 @@ impl RepositoryIgnore {
             readmitted_names: BTreeSet::new(),
             readmitted_prefixes: Vec::new(),
             configured: false,
+            captured_kinignore: None,
         }
     }
 
@@ -396,9 +398,19 @@ impl RepositoryIgnore {
                 ));
             }
         };
+        Self::from_root_rule_bytes(&path, bytes)
+    }
+
+    /// Compile exact caller-owned root rule bytes without consulting the host.
+    /// `source_path` is diagnostic context, never a file read.
+    pub fn from_root_rule_bytes(
+        source_path: &Path,
+        bytes: Vec<u8>,
+    ) -> Result<Self, IncompleteRepositoryScan> {
+        let path = source_path;
         let content = std::str::from_utf8(&bytes).map_err(|error| {
             IncompleteRepositoryScan::io(
-                &path,
+                path,
                 "decode ignore rules",
                 error,
                 RepositoryScanDiagnostics::default(),
@@ -429,7 +441,7 @@ impl RepositoryIgnore {
             if pattern.contains('/') {
                 let prefix = RepoPath::from_utf8(pattern).map_err(|error| {
                     IncompleteRepositoryScan::io(
-                        &path,
+                        path,
                         "parse ignore rules",
                         format!("line {}: {error}", line_index + 1),
                         RepositoryScanDiagnostics::default(),
@@ -444,7 +456,15 @@ impl RepositoryIgnore {
         rules.prefixes.dedup();
         rules.readmitted_prefixes.sort();
         rules.readmitted_prefixes.dedup();
+        rules.captured_kinignore = Some(bytes);
         Ok(rules)
+    }
+
+    /// Exact root rule bytes this ingestion read used, or observed absence.
+    /// Admission may propose them as a replacement for an existing shared
+    /// source only while preserving their identity through scan and publish.
+    pub fn captured_kinignore_bytes(&self) -> Option<&[u8]> {
+        self.captured_kinignore.as_deref()
     }
 
     /// Whether this repository states its own admission rules in `.kinignore`.
@@ -861,6 +881,57 @@ pub fn scan_repository_preserving_graph_only<'a>(
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<CompleteRepositoryScan, IncompleteRepositoryScan> {
+    scan_repository_with_root_unignore(root, ignore, policy, None, tracked_paths, graph_only_paths)
+}
+
+/// The exact-tree ingestion boundary's prospective existing-root unignore.
+///
+/// The optional pair is (standing policy without its root source, standing
+/// policy with the exact observed root source). A standing allowance survives;
+/// a standing denial relaxes only when both alternatives allow. The ordinary
+/// `RepositoryIgnore` restriction/retraction layer still applies first. This
+/// is a scan proposal only: repository authority independently checks source
+/// and target CAS against its successor tree before publishing the result.
+/// Existing callers retain ordinary single-generation behavior above.
+pub fn scan_repository_with_root_unignore<'a>(
+    root: &Path,
+    ignore: &RepositoryIgnore,
+    policy: Option<&ResolvedAdmissionMatcher>,
+    root_unignore: Option<(&ResolvedAdmissionMatcher, &ResolvedAdmissionMatcher)>,
+    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
+) -> Result<CompleteRepositoryScan, IncompleteRepositoryScan> {
+    scan_repository_with_native_admission(
+        root,
+        ignore,
+        policy,
+        root_unignore,
+        None,
+        tracked_paths,
+        graph_only_paths,
+    )
+}
+
+/// An additional committed-parent boundary for a scan deferred into Native
+/// publication. Untracked paths must satisfy both boundaries; tracked paths
+/// keep the ordinary workspace-authority exemption. Each boundary permits its
+/// standing allowances or the intersection of its two root-rule alternatives.
+/// No supplied matcher authorizes publication, which independently checks CAS.
+#[derive(Clone, Copy)]
+pub struct NativeScanAdmission<'a> {
+    pub policy: &'a ResolvedAdmissionMatcher,
+    pub root_unignore: Option<(&'a ResolvedAdmissionMatcher, &'a ResolvedAdmissionMatcher)>,
+}
+
+pub fn scan_repository_with_native_admission<'a>(
+    root: &Path,
+    ignore: &RepositoryIgnore,
+    policy: Option<&ResolvedAdmissionMatcher>,
+    root_unignore: Option<(&ResolvedAdmissionMatcher, &ResolvedAdmissionMatcher)>,
+    native: Option<NativeScanAdmission<'_>>,
+    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
+) -> Result<CompleteRepositoryScan, IncompleteRepositoryScan> {
     let mut scanner = prepare_scanner(
         root,
         ignore,
@@ -869,6 +940,8 @@ pub fn scan_repository_preserving_graph_only<'a>(
         graph_only_paths,
         ScanMode::Content,
     )?;
+    scanner.root_unignore = root_unignore;
+    scanner.native = native;
     scanner.walk(root, false, true)?;
     scanner.diagnostics.admitted_entries = scanner.entries.len();
     scanner.diagnostics.graph_only_entries_preserved = scanner.graph_only_paths.len();
@@ -926,6 +999,8 @@ fn prepare_scanner<'a, 'b>(
         root,
         ignore,
         policy,
+        root_unignore: None,
+        native: None,
         tracked_paths,
         graph_only_paths,
         unverified_ignored_paths,
@@ -934,6 +1009,9 @@ fn prepare_scanner<'a, 'b>(
         diagnostics: RepositoryScanDiagnostics::default(),
         mode,
         modified: Vec::new(),
+        tracked_seen: BTreeSet::new(),
+        tracked_modified: Vec::new(),
+        never_met: Vec::new(),
     })
 }
 
@@ -948,71 +1026,302 @@ enum ScanMode {
     /// Read and hash every admissible leaf, producing byte-exact entries and a
     /// completion proof.
     Content,
-    /// Stat every admissible leaf and keep only the paths whose directory entry
-    /// was last modified at or after this instant. Opens nothing, hashes
-    /// nothing, and produces no completion proof, because it observed no
-    /// content and must never be mistaken for a walk that did. Narrower than
-    /// [`ScanMode::Content`] by two rules: a tracked path is never kept, and
-    /// neither is a leaf inside a directory graph truth has never met.
-    ModifiedSince(SystemTime),
+    /// Stat every admissible leaf and sort what moved after an instant into
+    /// the populations a catch-up owes: untracked leaves beside tracked
+    /// content whose entry was modified at or after `since`, every leaf inside
+    /// a directory graph truth has never met, and tracked leaves whose entry
+    /// was modified or changed at or after `tracked_since`. Tracked paths the
+    /// walk never reaches are what the host no longer holds.
+    ///
+    /// Opens nothing and hashes nothing, and produces no completion proof,
+    /// because it observed no content and must never be mistaken for a walk
+    /// that did. A tracked candidate is confirmed against its admitted entry by
+    /// [`scan_working_copy_changes_since`] after the walk, which is the only
+    /// place this pass reads a byte.
+    ChangesSince {
+        since: SystemTime,
+        tracked_since: SystemTime,
+    },
     /// Keep the path of every admissible leaf graph truth does not track, and
     /// nothing else. Opens nothing, hashes nothing, stats nothing beyond the
     /// directory entry the walk already read, and produces no completion proof.
     ///
-    /// This is the measurement [`ScanMode::ModifiedSince`] is deliberately not.
+    /// This is the measurement [`ScanMode::ChangesSince`] is deliberately not.
     /// That mode proposes work to admit with no operator in the loop, so it
-    /// declines a whole directory graph truth has never met, on the grounds
-    /// that modification times cannot tell a clone from authored work. Naming
-    /// content is the opposite obligation: a reader asking whether the graph is
-    /// level with the working copy has to be told about that directory, and its
-    /// own comment says the behind disclosure is what counts and names it.
+    /// keeps an untracked leaf only when modification time places it inside
+    /// the window. Naming content is the opposite obligation: a reader asking
+    /// whether the graph is level with the working copy has to be told about
+    /// every path the graph does not carry, whatever its age.
     Untracked,
+    /// Keep the path of every admissible leaf inside a directory graph truth
+    /// has never met, and nothing else. Opens nothing, hashes nothing, stats
+    /// nothing beyond the directory entry the walk already read, and produces
+    /// no completion proof.
+    ///
+    /// [`ScanMode::ChangesSince`] collects this same population in its own
+    /// walk, apart from its modification-time window, because modification
+    /// times cannot tell a directory arriving whole from authored work. This
+    /// mode is the population on its own, for a reader that wants nothing else.
+    NeverMet,
 }
 
-/// Repository paths whose host entry was last modified at or after `since`.
+/// How far before the last complete admission a tracked path's timestamps may
+/// fall and still be compared against graph truth.
 ///
-/// This is the cheap half of catching a graph up after a stretch with nobody
+/// The admission marker is stamped when the admission finishes, after its walk
+/// read every file, so a write that landed while that walk ran carries a time
+/// just before the marker. Coarse filesystem clocks round the same way. A tracked
+/// candidate is read and compared before it is proposed, so the margin costs one
+/// hash of each file touched just before the marker and can never propose an
+/// unchanged path.
+pub const TRACKED_CHANGE_WINDOW_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the working copy changed while nothing watched it, sorted into the
+/// populations a catch-up admits.
+///
+/// Every list is sorted, so a disclosure's bounded sample is stable between two
+/// readings of one unchanged working copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkingCopyChangesSince {
+    /// Untracked leaves beside content graph truth tracks whose entry was
+    /// modified at or after the window. A directory graph truth already tracks
+    /// is part of the tree the graph knows, so one file appearing there is an
+    /// edit to it.
+    pub untracked: Vec<RepoPath>,
+    /// Untracked leaves inside a directory graph truth has never met, whatever
+    /// their modification time. A directory arriving whole is a clone, a move
+    /// or an unpacked archive, and a move restamps nothing, so no window can
+    /// place it; a caller admits it under its own provenance.
+    pub never_met: Vec<RepoPath>,
+    /// Tracked paths whose host entry was modified or changed inside the
+    /// window and no longer carries the admitted entry: other bytes, another
+    /// kind, or another executable bit.
+    pub tracked_changed: Vec<RepoPath>,
+    /// Tracked paths the host no longer holds.
+    pub tracked_removed: Vec<RepoPath>,
+    /// Tracked candidates this pass read to confirm or refute a change, and
+    /// the bytes that cost. Every other leaf cost one stat.
+    pub tracked_candidates_read: usize,
+    pub tracked_bytes_read: u64,
+}
+
+impl WorkingCopyChangesSince {
+    /// Tracked paths whose graph truth no longer describes the working copy.
+    pub fn tracked(&self) -> impl Iterator<Item = &RepoPath> {
+        self.tracked_changed
+            .iter()
+            .chain(self.tracked_removed.iter())
+    }
+}
+
+/// What the working copy changed after `since`, for a graph that was last
+/// brought level with it then.
+///
+/// This is the whole of catching a graph up after a stretch with nobody
 /// watching. A daemon that starts holds authority that is complete as of its
 /// last admission and no evidence at all about what the host did afterwards,
-/// and the file watcher can only report edits it was alive for. Walking with
-/// the same rules the content scan uses, and stopping at the directory entry's
-/// modification time, names exactly the paths worth re-observing without
-/// reading a byte of the ones that did not move.
+/// and the file watcher can only report edits it was alive for. An idle
+/// timeout ends a daemon mid-session and the next command starts a fresh one,
+/// so that stretch is ordinary rather than rare. Walking with the same rules
+/// the content scan uses and stopping at each entry's timestamps names exactly
+/// the paths worth re-observing without reading a byte of the ones that did not
+/// move.
 ///
-/// A leaf whose modification time will not read counts as modified. The window
-/// exists to find work the graph missed, so losing a file is the worse error;
-/// re-observing an unchanged path costs one admission that plans nothing.
+/// Tracked paths are the half that decides whether an answer is still true. A
+/// file the graph holds that the host edited or deleted is not new content
+/// waiting beside the graph: the graph keeps answering from the old bytes, so a
+/// renamed function stays findable under its old name, the new one reads as
+/// authoritatively absent, and a deleted file stays the top hit. So a tracked
+/// path is proposed when its entry was modified or its inode changed inside the
+/// window and its bytes, kind or mode no longer match `admitted`, and when the
+/// host no longer holds it at all. The inode change time is read beside the
+/// modification time because a restore that preserves modification times (an
+/// archive extraction, `cp -p`) and a mode change both move only the change
+/// time.
+/// Reading the bytes before proposing is what keeps a touched but unchanged
+/// file from being re-admitted, and it is the only read this pass performs.
 ///
-/// What this names is bounded on both sides. Below, by `since`, so the pass is
-/// never a whole-working-copy sweep. Across, by two rules the content walk does
-/// not apply: a path graph truth already tracks stays projection drift for
-/// `kin doctor` to report and repair rather than being admitted from under it,
-/// and a leaf inside a directory graph truth has never met is left to the
-/// behind disclosure and to `kin admit`, because a directory arriving whole is
-/// a move or a clone and its entries carry fresh modification times whatever
-/// their content's age.
+/// Divergence older than the window is not proposed. The last admission
+/// observed the whole working copy, so a tracked path that differs from graph
+/// truth without having changed since is one the graph moved away from, which
+/// is projection drift for `kin doctor --drift` to report and `--heal` to
+/// restore, not an edit to admit over graph-owned content.
 ///
-/// A leaf that vanished between the directory read and the stat is left out. It
-/// is not there to admit, and if it comes back the watcher that is already
-/// armed reports its arrival.
-pub fn scan_repository_modified_since<'a>(
+/// Untracked content is split in two, as before. A leaf beside tracked content
+/// is kept when its entry was modified inside the window; a leaf inside a
+/// directory graph truth has never met is kept whatever its age, because a
+/// directory arriving whole carries timestamps that say nothing about its
+/// content, and the caller admits it under its own provenance.
+///
+/// A leaf whose timestamps will not read counts as modified: the window exists
+/// to find work the graph missed, and losing a file is the worse error.
+pub fn scan_working_copy_changes_since<'a>(
     root: &Path,
     ignore: &RepositoryIgnore,
     policy: Option<&ResolvedAdmissionMatcher>,
-    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    admitted: impl IntoIterator<Item = (&'a RepoPath, kin_model::TreeEntry)>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
     since: SystemTime,
-) -> Result<Vec<RepoPath>, IncompleteRepositoryScan> {
+) -> Result<WorkingCopyChangesSince, IncompleteRepositoryScan> {
+    let admitted = admitted.into_iter().collect::<BTreeMap<_, _>>();
+    let tracked_since = since
+        .checked_sub(TRACKED_CHANGE_WINDOW_MARGIN)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut scanner = prepare_scanner(
         root,
         ignore,
         policy,
-        tracked_paths,
+        admitted.keys().copied(),
         graph_only_paths,
-        ScanMode::ModifiedSince(since),
+        ScanMode::ChangesSince {
+            since,
+            tracked_since,
+        },
     )?;
     scanner.walk(root, false, true)?;
-    Ok(scanner.modified)
+
+    let mut changes = WorkingCopyChangesSince {
+        untracked: std::mem::take(&mut scanner.modified),
+        never_met: std::mem::take(&mut scanner.never_met),
+        ..WorkingCopyChangesSince::default()
+    };
+    // Every tracked path the walk could have reached and did not is gone from
+    // the host. Graph-only members and control paths are never walked, and a
+    // path the ignore rules cover is unobserved rather than absent, which is
+    // why it left the tracked set before the walk began.
+    //
+    // A deletion leaves no file to read a time from, so the window is read off
+    // the directory that lost it: removing an entry moves its directory's
+    // times, and the nearest directory still standing is the one a removal of
+    // a whole subtree moved. An absence that predates the window is one the
+    // last admission would already have taken had the file been missing then,
+    // so it is graph truth the working copy never received, which is drift for
+    // `kin doctor` and not a deletion to admit.
+    let mut directory_changed: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    for path in &scanner.tracked_paths {
+        if scanner.tracked_seen.contains(path)
+            || scanner.graph_only_paths.contains(path)
+            || is_repository_control_path(path)
+        {
+            continue;
+        }
+        let host_path = host_path_from_repo_path(root, path)
+            .map_err(|error| scanner.fail(root, "resolve tracked host path", error))?;
+        if removal_inside_window(root, &host_path, tracked_since, &mut directory_changed) {
+            changes.tracked_removed.push(path.clone());
+        }
+    }
+    for path in std::mem::take(&mut scanner.tracked_modified) {
+        let Some(expected) = admitted.get(&path).copied() else {
+            continue;
+        };
+        let host_path = host_path_from_repo_path(root, &path)
+            .map_err(|error| scanner.fail(root, "resolve tracked host path", error))?;
+        changes.tracked_candidates_read += 1;
+        match observe_host_tree_entry(&host_path) {
+            Ok(Some((observed, bytes))) => {
+                changes.tracked_bytes_read = changes.tracked_bytes_read.saturating_add(bytes);
+                if observed != expected {
+                    changes.tracked_changed.push(path);
+                }
+            }
+            Ok(None) => changes.tracked_removed.push(path),
+            // A candidate that cannot be read is proposed rather than dropped.
+            // Whether it changed is unknown, and the admission that takes it
+            // reads it again and refuses loudly if it still cannot, which is
+            // the failure a reader can see; dropping it here would be the
+            // silence this pass exists to end.
+            Err(_) => changes.tracked_changed.push(path),
+        }
+    }
+    changes.untracked.sort();
+    changes.never_met.sort();
+    changes.tracked_changed.sort();
+    changes.tracked_removed.sort();
+    Ok(changes)
+}
+
+/// Whether the nearest directory still standing above a vanished `host_path`
+/// was modified or changed at or after `since`, which is when removing an entry
+/// from it would have moved its times.
+///
+/// Answered once per directory, because a removed subtree names that directory
+/// for every path it held. A directory whose times will not read counts as
+/// changed, which is the direction that cannot lose a deletion.
+fn removal_inside_window(
+    root: &Path,
+    host_path: &Path,
+    since: SystemTime,
+    directory_changed: &mut BTreeMap<PathBuf, bool>,
+) -> bool {
+    let mut directory = host_path.parent();
+    while let Some(candidate) = directory {
+        if let Some(changed) = directory_changed.get(candidate) {
+            return *changed;
+        }
+        match host_entry_changed_since(candidate, since) {
+            Ok(Some(changed)) => {
+                directory_changed.insert(candidate.to_path_buf(), changed);
+                return changed;
+            }
+            // Gone as well: the removal reached this far up, so the directory
+            // above it is the one that recorded it.
+            Ok(None) if candidate != root => directory = candidate.parent(),
+            Ok(None) | Err(_) => return true,
+        }
+    }
+    true
+}
+
+/// The tree entry the host holds at `path` right now, and how many bytes
+/// reading it cost, or `None` when nothing is there.
+///
+/// Read without following a final symbolic link, exactly as the content walk
+/// reads, so a link compares by its target bytes and a regular file by its
+/// content and executable bit. A directory or special entry where graph truth
+/// holds a file is reported as an entry no admitted artifact can equal.
+pub fn observe_host_tree_entry(path: &Path) -> io::Result<Option<(kin_model::TreeEntry, u64)>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        let bytes = symlink_target_bytes(&target)?;
+        let entry =
+            kin_model::TreeEntry::symlink(kin_model::Hash256::from_bytes(sha256_bytes(&bytes)));
+        return Ok(Some((entry, bytes.len() as u64)));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a tracked path is no longer a regular file or a symbolic link",
+        ));
+    }
+    let mut file = match open_regular_file_nofollow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let executable = regular_file_is_executable(&file.metadata()?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        bytes_read = bytes_read.saturating_add(count as u64);
+    }
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&hasher.finalize());
+    Ok(Some((
+        kin_model::TreeEntry::blob(kin_model::Hash256::from_bytes(hash), executable),
+        bytes_read,
+    )))
 }
 
 /// Repository paths on the host that graph truth does not carry.
@@ -1056,6 +1365,41 @@ pub fn scan_repository_untracked_paths<'a>(
     Ok(scanner.modified)
 }
 
+/// Repository paths inside a directory graph truth has never met.
+///
+/// [`scan_working_copy_changes_since`] keeps this population apart from
+/// catch-up's ordinary modified-since window, on the grounds that modification
+/// times cannot tell a directory arriving whole -- a clone, a move, an unpacked
+/// archive, a renamed control directory -- from authored work. This is the
+/// population on its own: not a leaf beside files the graph already tracks,
+/// which the window governs, and not a leaf this walk's shared rules already
+/// exclude.
+///
+/// Opens nothing, hashes nothing, and produces no [`CompleteScanToken`]: this
+/// walk observed no content and must never be mistaken for one that did.
+pub fn scan_repository_never_met_directories<'a>(
+    root: &Path,
+    ignore: &RepositoryIgnore,
+    policy: Option<&ResolvedAdmissionMatcher>,
+    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
+) -> Result<Vec<RepoPath>, IncompleteRepositoryScan> {
+    let mut scanner = prepare_scanner(
+        root,
+        ignore,
+        policy,
+        tracked_paths,
+        graph_only_paths,
+        ScanMode::NeverMet,
+    )?;
+    scanner.walk(root, false, true)?;
+    // Sorted for the same reason the untracked measurement sorts: a caller
+    // that logs or persists a sample must not see it reshuffle between two
+    // readings of one unchanged working copy.
+    scanner.modified.sort();
+    Ok(scanner.modified)
+}
+
 /// Was this directory entry last modified at or after `since`?
 ///
 /// `None` means the entry is no longer there. An unreadable modification time
@@ -1070,10 +1414,46 @@ fn host_entry_modified_since(path: &Path, since: SystemTime) -> io::Result<Optio
     }
 }
 
+/// Was this directory entry modified, or its inode changed, at or after
+/// `since`?
+///
+/// The inode change time is the one a caller cannot set. Extracting an archive,
+/// `cp -p` and `rsync -t` all write old modification times onto new bytes, and
+/// `chmod` changes the mode without touching the modification time at all;
+/// each of those still moves the change time to now. Platforms that do not
+/// report one fall back to the modification time alone. `None` means the entry
+/// is no longer there, and an unreadable time reads as changed.
+fn host_entry_changed_since(path: &Path, since: SystemTime) -> io::Result<Option<bool>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let modified = metadata.modified().map(|at| at >= since).unwrap_or(true);
+    Ok(Some(modified || inode_changed_since(&metadata, since)))
+}
+
+#[cfg(unix)]
+fn inode_changed_since(metadata: &fs::Metadata, since: SystemTime) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (seconds, nanos) = (metadata.ctime(), metadata.ctime_nsec());
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return true;
+    }
+    SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds as u64, nanos as u32) >= since
+}
+
+#[cfg(not(unix))]
+fn inode_changed_since(_metadata: &fs::Metadata, _since: SystemTime) -> bool {
+    false
+}
+
 struct Scanner<'a> {
     root: &'a Path,
     ignore: &'a RepositoryIgnore,
     policy: Option<&'a ResolvedAdmissionMatcher>,
+    root_unignore: Option<(&'a ResolvedAdmissionMatcher, &'a ResolvedAdmissionMatcher)>,
+    native: Option<NativeScanAdmission<'a>>,
     tracked_paths: BTreeSet<RepoPath>,
     graph_only_paths: BTreeSet<RepoPath>,
     unverified_ignored_paths: BTreeSet<RepoPath>,
@@ -1083,6 +1463,15 @@ struct Scanner<'a> {
     mode: ScanMode,
     /// Paths a stat-only mode kept. Empty under [`ScanMode::Content`].
     modified: Vec<RepoPath>,
+    /// Tracked leaves [`ScanMode::ChangesSince`] reached, whatever their
+    /// timestamps, so the tracked paths it did not reach can be named as gone.
+    tracked_seen: BTreeSet<RepoPath>,
+    /// Tracked leaves [`ScanMode::ChangesSince`] found touched inside its
+    /// window, before their bytes are compared with graph truth.
+    tracked_modified: Vec<RepoPath>,
+    /// Leaves [`ScanMode::ChangesSince`] found inside a directory graph truth
+    /// has never met.
+    never_met: Vec<RepoPath>,
 }
 
 impl Scanner<'_> {
@@ -1109,10 +1498,22 @@ impl Scanner<'_> {
     /// `true` is only ever returned for a path this walk is about to skip, so
     /// the sample and the count describe the same set.
     fn policy_excludes_untracked(&mut self, path: &RepoPath, is_dir: bool) -> bool {
-        let Some(policy) = self.policy else {
-            return false;
+        let allows = |policy: Option<&ResolvedAdmissionMatcher>,
+                      alternatives: Option<(
+            &ResolvedAdmissionMatcher,
+            &ResolvedAdmissionMatcher,
+        )>| {
+            policy.is_none_or(|policy| !policy.decide(path, is_dir, false).is_ignored())
+                || alternatives.is_some_and(|(without_root, proposed_root)| {
+                    !without_root.decide(path, is_dir, false).is_ignored()
+                        && !proposed_root.decide(path, is_dir, false).is_ignored()
+                })
         };
-        if !policy.decide(path, is_dir, false).is_ignored() {
+        if allows(self.policy, self.root_unignore)
+            && self
+                .native
+                .is_none_or(|native| allows(Some(native.policy), native.root_unignore))
+        {
             return false;
         }
         self.diagnostics.policy_excluded_untracked_entries += 1;
@@ -1273,47 +1674,75 @@ impl Scanner<'_> {
             // admitted, minus the reads. Restricted to the two leaf kinds the
             // content walk admits so this mode invents no membership of its
             // own: a special entry is not admissible either way.
-            if let ScanMode::ModifiedSince(since) = self.mode {
-                // Two narrowings this mode applies and the content walk does
-                // not, because the two modes answer different questions. A
-                // content walk states what the working copy holds. This mode
-                // proposes what a daemon should re-observe after a stretch
-                // nobody watched, and a proposal is admitted with no operator
-                // in the loop, so it may only reach the population where
-                // admitting is the safe direction.
+            if let ScanMode::ChangesSince {
+                since,
+                tracked_since,
+            } = self.mode
+            {
+                // A tracked leaf is always reached, because the walk descends
+                // into every directory holding one, so a tracked path this pass
+                // never marks seen is one the host no longer holds. Whether a
+                // seen one changed is decided by its timestamps first and by its
+                // bytes afterwards, against graph truth rather than here.
                 //
-                // A path graph truth already tracks is never proposed.
-                // Repository authority holds bytes for it, so a host edit to it
-                // is projection drift: `kin doctor --drift` reports it, `kin
-                // doctor --heal` restores it from authority and `kin admit`
-                // takes it, and each of those is a seam somebody chose.
-                // Proposing it here would instead advance the workspace over
-                // graph-owned content at daemon start, behind the back of the
-                // report an operator is about to read.
-                //
-                // A leaf inside a directory graph truth has never met is not
-                // proposed either. One file appearing beside files the graph
-                // already tracks is an edit to a part of the tree the graph
-                // knows; a directory nobody has ever admitted, arriving whole,
-                // is a clone, a move, an unpacked archive or a renamed control
-                // directory, and modification times cannot tell those from
-                // authored work because a move restamps every entry it carries.
-                // Admitting one silently at startup is the working-copy sweep
-                // startup must never perform. Nothing is lost by declining:
-                // that content is exactly what the behind disclosure counts and
-                // names, so it is announced rather than hidden, and `kin admit`
-                // is the seam that takes it.
-                if self.tracked_paths.contains(&repo_path) || !directory_known_to_graph {
+                // Both timestamps are read. A restore that preserves the
+                // modification time and a change of mode both leave it alone
+                // and move only the inode change time, and either is an edit
+                // the graph has not taken. A special entry where graph truth
+                // holds a file is always a candidate: no admitted artifact can
+                // equal it, and the admission that takes the path refuses it
+                // loudly, exactly as a watched one would.
+                if self.tracked_paths.contains(&repo_path) {
+                    self.tracked_seen.insert(repo_path.clone());
+                    let touched = if file_type.is_file() || file_type.is_symlink() {
+                        host_entry_changed_since(&host_path, tracked_since).map_err(|error| {
+                            self.fail(&host_path, "read tracked entry timestamps", error)
+                        })? != Some(false)
+                    } else {
+                        true
+                    };
+                    if touched {
+                        self.tracked_modified.push(repo_path);
+                    }
                     continue;
                 }
-                if file_type.is_file() || file_type.is_symlink() {
-                    let modified =
-                        host_entry_modified_since(&host_path, since).map_err(|error| {
-                            self.fail(&host_path, "read entry modification time", error)
-                        })?;
-                    if modified == Some(true) {
-                        self.modified.push(repo_path);
-                    }
+                if !(file_type.is_file() || file_type.is_symlink()) {
+                    continue;
+                }
+                // A leaf inside a directory graph truth has never met is kept
+                // whatever its age. A directory nobody has ever admitted,
+                // arriving whole, is a clone, a move, an unpacked archive or a
+                // renamed control directory, and modification times cannot
+                // tell those from authored work because a move restamps
+                // nothing it carries, so the window has nothing to say about
+                // it. The caller admits it under its own provenance rather than
+                // folding it into the window's population.
+                if !directory_known_to_graph {
+                    self.never_met.push(repo_path);
+                    continue;
+                }
+                // One file appearing beside files the graph already tracks is
+                // an edit to a part of the tree the graph knows, and its
+                // modification time says whether it happened after the last
+                // admission observed the working copy.
+                let modified = host_entry_modified_since(&host_path, since).map_err(|error| {
+                    self.fail(&host_path, "read entry modification time", error)
+                })?;
+                if modified == Some(true) {
+                    self.modified.push(repo_path);
+                }
+                continue;
+            }
+
+            // The never-met population on its own: restricted, as every
+            // stat-only mode restricts itself, to the two leaf kinds the
+            // content walk admits, and to a directory graph truth has genuinely
+            // never met. A leaf beside files the graph already tracks is never
+            // kept here; it is ordinary catch-up's own population, which
+            // [`ScanMode::ChangesSince`] places by modification time.
+            if matches!(self.mode, ScanMode::NeverMet) {
+                if !directory_known_to_graph && (file_type.is_file() || file_type.is_symlink()) {
+                    self.modified.push(repo_path);
                 }
                 continue;
             }
@@ -1615,16 +2044,38 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn captured_root_rule_distinguishes_absence_empty_and_later_host_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            RepositoryIgnore::load(temp.path())
+                .unwrap()
+                .captured_kinignore_bytes(),
+            None
+        );
+        let path = temp.path().join(".kinignore");
+        std::fs::write(&path, b"").unwrap();
+        let empty = RepositoryIgnore::load(temp.path()).unwrap();
+        assert_eq!(empty.captured_kinignore_bytes(), Some(b"".as_slice()));
+        std::fs::write(&path, b"keep.py\n").unwrap();
+        assert_eq!(empty.captured_kinignore_bytes(), Some(b"".as_slice()));
+        assert_eq!(
+            RepositoryIgnore::load(temp.path())
+                .unwrap()
+                .captured_kinignore_bytes(),
+            Some(b"keep.py\n".as_slice())
+        );
+    }
+
     /// FIR-2820. The measurement every "is the graph level with the working
     /// copy" claim rests on, and the two rules that decide what it may name.
     ///
     /// A tracked path is not untracked and never appears. A leaf inside a
     /// directory graph truth has never met DOES appear, which is where this
-    /// parts company with [`scan_repository_modified_since`]: that mode
-    /// proposes work to admit with no operator in the loop and declines a whole
-    /// unmet directory on the grounds that a clone looks like authored work,
-    /// and its own comment says this reading is what counts and names that
-    /// content instead.
+    /// parts company with [`scan_working_copy_changes_since`]'s window: that
+    /// walk proposes work to admit with no operator in the loop and keeps an
+    /// unmet directory apart on the grounds that a clone looks like authored
+    /// work, while this reading names every path the graph does not carry.
     #[test]
     fn the_untracked_measurement_names_host_content_graph_truth_does_not_carry() {
         let temp = tempfile::tempdir().unwrap();
@@ -1673,6 +2124,283 @@ mod tests {
             .unwrap()
             .is_empty(),
             "a fully admitted working copy has nothing untracked to name"
+        );
+    }
+
+    /// [`scan_repository_never_met_directories`] names exactly the population
+    /// [`scan_working_copy_changes_since`] keeps apart from its window for the
+    /// directory reason, and nothing from ordinary catch-up's own population
+    /// beside it.
+    #[test]
+    fn never_met_directories_names_only_the_unmet_directory_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("known")).unwrap();
+        std::fs::write(root.join("known/tracked.py"), "TRACKED = 1\n").unwrap();
+        std::fs::write(root.join("known/fresh.py"), "FRESH = 2\n").unwrap();
+        // A directory nothing has ever admitted, arriving whole.
+        std::fs::create_dir_all(root.join("brand_new")).unwrap();
+        std::fs::write(root.join("brand_new/module.py"), "NEW = 3\n").unwrap();
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let tracked = [path("known/tracked.py")];
+        let never_met = scan_repository_never_met_directories(
+            root,
+            &ignore,
+            None,
+            tracked.iter(),
+            std::iter::empty::<&RepoPath>(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            never_met,
+            vec![path("brand_new/module.py")],
+            "only the leaf inside the directory graph truth has never met is named; the fresh \
+             leaf beside a tracked file is ordinary catch-up's own population, not this one"
+        );
+
+        // The control that keeps this narrow: once graph truth has met
+        // `brand_new` too -- one tracked leaf is enough to make the directory
+        // known -- nothing under it is proposed, even though `module.py`
+        // itself stays untracked.
+        let met_every_directory = [path("known/tracked.py"), path("brand_new/module.py")];
+        assert!(
+            scan_repository_never_met_directories(
+                root,
+                &ignore,
+                None,
+                met_every_directory.iter(),
+                std::iter::empty::<&RepoPath>(),
+            )
+            .unwrap()
+            .is_empty(),
+            "a directory graph truth has met, however partially, is not this population"
+        );
+    }
+
+    fn stamp_modified(path: &Path, at: SystemTime) {
+        let handle = fs::File::options().write(true).open(path).unwrap();
+        handle
+            .set_times(fs::FileTimes::new().set_accessed(at).set_modified(at))
+            .unwrap();
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap().modified().unwrap(),
+            at,
+            "the stamp has to apply, or the assertions below are about the file's real age"
+        );
+    }
+
+    /// Set a directory's modification time outright. Opened read-only, because
+    /// a directory cannot be opened for writing, and the owner may set explicit
+    /// times on a descriptor it can read.
+    fn stamp_directory_modified(path: &Path, at: SystemTime) {
+        let handle = fs::File::open(path).unwrap();
+        handle
+            .set_times(fs::FileTimes::new().set_accessed(at).set_modified(at))
+            .unwrap();
+        assert_eq!(fs::symlink_metadata(path).unwrap().modified().unwrap(), at);
+    }
+
+    fn admitted_entry(path: &Path) -> kin_model::TreeEntry {
+        observe_host_tree_entry(path)
+            .unwrap()
+            .expect("the fixture file exists")
+            .0
+    }
+
+    /// The case that decides whether an answer is still true: a tracked file
+    /// edited and another deleted while nothing watched. The graph keeps
+    /// answering from the old bytes unless this walk names both, so a renamed
+    /// function stays findable under its old name and a deleted file stays a
+    /// top hit.
+    ///
+    /// The controls sit beside it in the same directory and the same window. A
+    /// tracked file touched without a byte changing is read and not named, and
+    /// one whose bytes differ from graph truth without having moved since the
+    /// last admission is projection drift, never proposed. The untracked and
+    /// never-met populations keep their own rules.
+    #[test]
+    fn a_tracked_edit_and_a_tracked_deletion_made_while_nothing_watched_are_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let known = root.join("known");
+        fs::create_dir_all(&known).unwrap();
+        let settled = root.join("settled");
+        fs::create_dir_all(&settled).unwrap();
+        for (file, body) in [
+            (known.join("renamed.rs"), "pub fn old_name() {}\n"),
+            (known.join("doomed.rs"), "pub fn doomed() {}\n"),
+            (known.join("touched.rs"), "pub fn same() {}\n"),
+            (known.join("drifted.rs"), "pub fn drifted() {}\n"),
+            (settled.join("kept.rs"), "pub fn kept() {}\n"),
+            (
+                settled.join("never_projected.rs"),
+                "pub fn graph_only_so_far() {}\n",
+            ),
+        ] {
+            fs::write(file, body).unwrap();
+        }
+        let admitted = [
+            "known/renamed.rs",
+            "known/doomed.rs",
+            "known/touched.rs",
+            "known/drifted.rs",
+            "settled/kept.rs",
+            "settled/never_projected.rs",
+        ]
+        .map(|relative| (path(relative), admitted_entry(&root.join(relative))));
+        // Changed bytes nothing has touched since the last admission: the
+        // graph moved away from this file, the file did not move.
+        fs::write(known.join("drifted.rs"), b"pub fn drifted_elsewhere() {}\n").unwrap();
+        // Graph truth holds a file the working copy has not had since before
+        // the last admission: absent, in a directory nothing touched since.
+        fs::remove_file(settled.join("never_projected.rs")).unwrap();
+
+        // The last complete admission, placed ahead of every real timestamp in
+        // this fixture so the stamps below decide which side of it each path is.
+        let since = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let after = since + std::time::Duration::from_secs(60);
+        fs::write(known.join("renamed.rs"), b"pub fn new_name() {}\n").unwrap();
+        stamp_modified(&known.join("renamed.rs"), after);
+        fs::remove_file(known.join("doomed.rs")).unwrap();
+        stamp_modified(&known.join("touched.rs"), after);
+        fs::write(known.join("fresh.rs"), b"pub fn fresh() {}\n").unwrap();
+        stamp_modified(&known.join("fresh.rs"), after);
+        fs::create_dir_all(root.join("brand_new")).unwrap();
+        fs::write(root.join("brand_new/module.rs"), b"pub fn arrived() {}\n").unwrap();
+        // The deletion inside the window, as the directory that lost the file
+        // records it.
+        stamp_directory_modified(&known, after);
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let changes = scan_working_copy_changes_since(
+            root,
+            &ignore,
+            None,
+            admitted.iter().map(|(path, entry)| (path, *entry)),
+            std::iter::empty::<&RepoPath>(),
+            since,
+        )
+        .unwrap();
+
+        assert_eq!(
+            changes.tracked_changed,
+            vec![path("known/renamed.rs")],
+            "the tracked edit is named, and neither the touched nor the drifted file is: \
+             {changes:?}"
+        );
+        assert_eq!(
+            changes.tracked_removed,
+            vec![path("known/doomed.rs")],
+            "the deletion inside the window is named, and the absence that predates it is \
+             drift rather than a deletion: {changes:?}"
+        );
+        assert_eq!(
+            changes.untracked,
+            vec![path("known/fresh.rs")],
+            "a new file beside tracked content keeps its own window: {changes:?}"
+        );
+        assert_eq!(
+            changes.never_met,
+            vec![path("brand_new/module.rs")],
+            "a directory graph truth has never met is collected whatever its age: {changes:?}"
+        );
+        assert_eq!(
+            changes.tracked_candidates_read, 2,
+            "only the two tracked files touched inside the window are read: {changes:?}"
+        );
+    }
+
+    /// A restore that writes old modification times onto new bytes, and a
+    /// mode change, move only the inode change time. Either one is an edit the
+    /// graph has not taken, so the walk reads the change time too.
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_that_keeps_an_old_modification_time_and_a_mode_change_are_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("restored.rs"), b"pub fn before() {}\n").unwrap();
+        fs::write(root.join("script.sh"), b"echo hi\n").unwrap();
+        fs::write(root.join("untouched.rs"), b"pub fn untouched() {}\n").unwrap();
+        let admitted = [
+            (
+                path("restored.rs"),
+                admitted_entry(&root.join("restored.rs")),
+            ),
+            (path("script.sh"), admitted_entry(&root.join("script.sh"))),
+            (
+                path("untouched.rs"),
+                admitted_entry(&root.join("untouched.rs")),
+            ),
+        ];
+        // Every write below lands after the last admission, which is what the
+        // inode change time records whatever the modification time says.
+        let since =
+            SystemTime::now() - TRACKED_CHANGE_WINDOW_MARGIN - std::time::Duration::from_secs(60);
+        let long_before = since - std::time::Duration::from_secs(86_400);
+        fs::write(root.join("restored.rs"), b"pub fn after() {}\n").unwrap();
+        stamp_modified(&root.join("restored.rs"), long_before);
+        let mut permissions = fs::metadata(root.join("script.sh")).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(root.join("script.sh"), permissions).unwrap();
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let changes = scan_working_copy_changes_since(
+            root,
+            &ignore,
+            None,
+            admitted.iter().map(|(path, entry)| (path, *entry)),
+            std::iter::empty::<&RepoPath>(),
+            since,
+        )
+        .unwrap();
+
+        assert_eq!(
+            changes.tracked_changed,
+            vec![path("restored.rs"), path("script.sh")],
+            "new bytes under an old modification time, and a new mode, are both edits: \
+             {changes:?}"
+        );
+        assert!(changes.tracked_removed.is_empty(), "{changes:?}");
+    }
+
+    /// The walk only names a tracked path gone when it could have reached it. A
+    /// path the ignore rules cover is unobserved rather than absent, and a
+    /// graph-only member is never walked, so neither is ever named removed.
+    #[test]
+    fn a_tracked_path_the_walk_does_not_observe_is_never_named_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".kinignore"), b"generated\n").unwrap();
+        fs::write(root.join("kept.rs"), b"pub fn kept() {}\n").unwrap();
+        let kept = admitted_entry(&root.join("kept.rs"));
+        let admitted = [
+            (path("kept.rs"), kept),
+            // Covered by the ignore rules and absent from the host.
+            (path("generated/out.rs"), kept),
+            // A graph-only member with no host materialization at all.
+            (path("vendor/submodule"), kept),
+        ];
+        let graph_only = [path("vendor/submodule")];
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        // The window opens before the fixture was written, so every directory
+        // it touched is inside it and only the two exclusions keep these
+        // paths from being named removed. A window that opened after the
+        // fixture would pass with neither exclusion in place.
+        let changes = scan_working_copy_changes_since(
+            root,
+            &ignore,
+            None,
+            admitted.iter().map(|(path, entry)| (path, *entry)),
+            graph_only.iter(),
+            SystemTime::now() - std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(
+            changes.tracked_removed.is_empty() && changes.tracked_changed.is_empty(),
+            "neither an ignored nor a graph-only tracked path is a deletion: {changes:?}"
         );
     }
 
@@ -2513,6 +3241,8 @@ mod tests {
             root,
             ignore: &ignore,
             policy: None,
+            root_unignore: None,
+            native: None,
             tracked_paths: BTreeSet::new(),
             graph_only_paths: BTreeSet::new(),
             unverified_ignored_paths: BTreeSet::new(),
@@ -2521,6 +3251,9 @@ mod tests {
             diagnostics: RepositoryScanDiagnostics::default(),
             mode: ScanMode::Content,
             modified: Vec::new(),
+            tracked_seen: BTreeSet::new(),
+            tracked_modified: Vec::new(),
+            never_met: Vec::new(),
         };
 
         let error = scanner
@@ -2704,6 +3437,8 @@ mod tests {
             root,
             ignore: &ignore,
             policy: None,
+            root_unignore: None,
+            native: None,
             tracked_paths: BTreeSet::new(),
             graph_only_paths: BTreeSet::new(),
             unverified_ignored_paths: BTreeSet::new(),
@@ -2712,6 +3447,9 @@ mod tests {
             diagnostics: RepositoryScanDiagnostics::default(),
             mode: ScanMode::Content,
             modified: Vec::new(),
+            tracked_seen: BTreeSet::new(),
+            tracked_modified: Vec::new(),
+            never_met: Vec::new(),
         };
 
         let error = scanner

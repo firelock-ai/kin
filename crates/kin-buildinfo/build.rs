@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,14 +26,29 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    // Keep one explicit input inside this package. Cargo stores its fingerprint
+    // relative to the package, while the saved build-script output carries the
+    // absolute path. Relocating a warm target to another checkout therefore
+    // changes those instructions and refreshes the identity and Git watches.
+    // The manifest is always present and cannot contain our build output.
+    watch(&manifest_dir.join("Cargo.toml"));
+    // The workspace this crate builds in: the nearest ancestor carrying both
+    // Cargo.toml and Cargo.lock. Its lock is the dependency provenance. It is
+    // the repository root only when the workspace sits at the top of the
+    // repository; when it sits in a subdirectory, the root has no Cargo.lock.
+    let workspace_root = find_workspace_root(&manifest_dir);
     let root = git(&manifest_dir, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
         // Docker and source archives intentionally omit `.git`; retain the
         // workspace Cargo.lock authority by walking to the nearest ancestor
         // that carries both workspace files instead of falling back to this
         // crate directory (which would make dependency provenance unknown).
-        .or_else(|| find_workspace_root(&manifest_dir))
+        .or_else(|| workspace_root.clone())
         .unwrap_or_else(|| manifest_dir.clone());
+    let root = fs::canonicalize(&root).unwrap_or(root);
+    // This build's own output directory, which cargo creates before running
+    // this script. Its target directory can sit inside the repository.
+    let out_dir = std::env::var_os("OUT_DIR").and_then(|dir| fs::canonicalize(dir).ok());
 
     // `git rev-parse --git-path` answers RELATIVE to the repository in a normal
     // checkout and ABSOLUTE in a linked worktree, and cargo resolves a relative
@@ -53,25 +69,39 @@ fn main() {
     // It is invisible in a linked worktree, where the path comes back absolute
     // and resolves, which is every lane checkout in the fleet and is why this
     // survived so long.
-    let watch = |path: String| {
-        let path = PathBuf::from(path);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
-        };
-        println!("cargo:rerun-if-changed={}", path.display());
+    //
+    // Every path below follows from the same fact, so each one is watched only
+    // while it exists. Two more inputs went missing in real checkouts, the
+    // repository root's Cargo.lock when the workspace sits in a subdirectory and
+    // a branch ref that `git gc` packed, and a third could never read fresh: a
+    // watched directory holding the target directory the build writes into. Each
+    // made cargo rerun this script, and relink every binary that embeds it, on
+    // every build of an unchanged tree. A missing input gets a watch that exists
+    // rather than none, because none would leave the identity stale instead.
+    let git_path = |name: &str| {
+        git(&root, &["rev-parse", "--git-path", name]).map(|path| {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
     };
 
-    if let Some(head) = git(&root, &["rev-parse", "--git-path", "HEAD"]) {
-        watch(head);
-    }
-    if let Some(index) = git(&root, &["rev-parse", "--git-path", "index"]) {
-        watch(index);
-    }
+    watch_existing(git_path("HEAD"));
+    watch_existing(git_path("index"));
+    // HEAD's reflog gains a line on every commit, checkout and reset in this
+    // checkout, which is the signal that still moves when the branch's own ref
+    // lives in packed-refs.
+    watch_existing(git_path("logs/HEAD"));
     if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = git(&root, &["rev-parse", "--git-path", &reference]) {
-            watch(path);
+        match git_path(&reference) {
+            Some(loose) if loose.is_file() => watch(&loose),
+            // `git gc` and `git pack-refs` move a ref into packed-refs and delete
+            // its loose file, which stays absent until the next commit on the
+            // branch writes it back.
+            _ => watch_existing(git_path("packed-refs")),
         }
     }
 
@@ -80,20 +110,17 @@ fn main() {
     // another workspace crate changes without touching kin-buildinfo. Watch
     // every tracked top-level source subtree (but never target/) so any source
     // edit, newly created file below a tracked subtree, stage, commit, or
-    // checkout reruns this build script before a binary is linked.
-    if let Some(files) = git(&root, &["ls-files"]) {
-        let mut watched = BTreeSet::new();
-        for file in files.lines().filter(|line| !line.is_empty()) {
-            let path = Path::new(file);
-            let top = path.components().next().map(|part| part.as_os_str());
-            if let Some(top) = top {
-                watched.insert(root.join(top));
-            }
-        }
-        for path in watched {
-            if path.file_name().and_then(|name| name.to_str()) != Some("target") {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
+    // checkout reruns this build script before a binary is linked. A subtree
+    // holding this build's target directory is watched through its tracked
+    // children instead, since the build itself writes below it.
+    if let Some(files) = git(&root, &["ls-files", "-z"]) {
+        let tracked: Vec<&Path> = files
+            .split('\0')
+            .filter(|file| !file.is_empty())
+            .map(Path::new)
+            .collect();
+        for path in source_watch_set(&root, &tracked, out_dir.as_deref()) {
+            watch_existing(Some(path));
         }
     }
 
@@ -125,7 +152,7 @@ fn main() {
             source_identity_known,
         )
     };
-    let dependency_provenance = dependency_provenance(&root);
+    let dependency_provenance = dependency_provenance(workspace_root.as_deref().unwrap_or(&root));
     let source_known = source_identity_known && dependency_provenance.is_some();
     let dependency_provenance = dependency_provenance.unwrap_or_else(|| "unknown".to_string());
     let built_at = Command::new("date")
@@ -238,11 +265,57 @@ fn git_allow_empty(cwd: &Path, args: &[&str]) -> Option<String> {
     Some(value.trim().to_string())
 }
 
-fn dependency_provenance(root: &Path) -> Option<String> {
-    let lock_path = root.join("Cargo.lock");
-    println!("cargo:rerun-if-changed={}", lock_path.display());
-    let bytes = fs::read(lock_path).ok()?;
+fn dependency_provenance(workspace_root: &Path) -> Option<String> {
+    let lock_path = workspace_root.join("Cargo.lock");
+    let bytes = fs::read(&lock_path).ok()?;
+    watch(&lock_path);
     Some(hex_sha256(&bytes))
+}
+
+fn watch(path: &Path) {
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn watch_existing(path: Option<PathBuf>) {
+    if let Some(path) = path.filter(|path| path.exists()) {
+        watch(&path);
+    }
+}
+
+/// Each tracked top-level entry of the repository, except that an entry holding
+/// `out_dir` is replaced by its tracked children, and so on down. Untracked
+/// directories, a target directory among them, never appear.
+fn source_watch_set(root: &Path, tracked: &[&Path], out_dir: Option<&Path>) -> BTreeSet<PathBuf> {
+    let mut watched = BTreeSet::new();
+    collect_source_watches(root, Path::new(""), tracked, out_dir, &mut watched);
+    watched
+}
+
+fn collect_source_watches(
+    root: &Path,
+    prefix: &Path,
+    tracked: &[&Path],
+    out_dir: Option<&Path>,
+    watched: &mut BTreeSet<PathBuf>,
+) {
+    let children: BTreeSet<&OsStr> = tracked
+        .iter()
+        .filter_map(|file| file.strip_prefix(prefix).ok())
+        .filter_map(|rest| rest.components().next())
+        .map(|component| component.as_os_str())
+        .collect();
+    for child in children {
+        if prefix.as_os_str().is_empty() && child == OsStr::new("target") {
+            continue;
+        }
+        let relative = prefix.join(child);
+        let path = root.join(&relative);
+        if out_dir.is_some_and(|out_dir| out_dir.starts_with(&path)) {
+            collect_source_watches(root, &relative, tracked, out_dir, watched);
+        } else {
+            watched.insert(path);
+        }
+    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

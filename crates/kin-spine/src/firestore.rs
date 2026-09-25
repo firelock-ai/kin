@@ -72,12 +72,12 @@ use crate::publication::SpineRolloutRepositoryFence;
 // denied.
 #[cfg(all(test, not(feature = "firestore")))]
 use crate::store::PreparedStorePublication;
-use crate::store::{LoadedRepoPublication, LoadedSpineRolloutFence, SpineStore};
 #[cfg(feature = "firestore")]
 use crate::store::{
-    PreparedStorePublication, RepoPublicationCleanupProgress, StoreHeadPrecondition,
-    StorePublicationStageGuard, StoreRepoHeadGuard,
+    DurableReadMeter, PreparedStorePublication, RepoPublicationCleanupProgress,
+    StoreHeadPrecondition, StorePublicationStageGuard, StoreRepoHeadGuard,
 };
+use crate::store::{DurableReadStats, LoadedRepoPublication, LoadedSpineRolloutFence, SpineStore};
 
 const CLEANUP_DOCUMENTS_PER_COMMIT: usize = 100;
 const CLEANUP_PASSES_PER_TERMINAL_OUTCOME: usize = 4;
@@ -1186,6 +1186,10 @@ impl FirestoreSpineBackend {
 }
 
 impl SpineBackend for FirestoreSpineBackend {
+    fn durable_read_stats(&self) -> Option<DurableReadStats> {
+        self.store.read_stats()
+    }
+
     fn advance_rollout_fence(
         &self,
         fence: SpineRolloutFence,
@@ -1409,6 +1413,10 @@ impl SpineBackend for FirestoreSpineBackend {
         self.cache.authority_complete()
     }
 
+    fn cross_repo_edges_stale(&self, repo_id: &str) -> bool {
+        self.cache.cross_repo_edges_stale(repo_id)
+    }
+
     fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
         self.cache.cross_repo_edges_snapshot()
     }
@@ -1474,6 +1482,21 @@ impl SpineBackend for FirestoreSpineBackend {
         );
     }
 
+    fn refresh_cross_repo_edges_from_retained_imports(
+        &self,
+        repo_id: &str,
+        registry_repo_ids: &[String],
+    ) -> bool {
+        // Refused like every cursorless edge write. The answer says nothing
+        // was resolved, so nothing here needs invalidating to stay honest.
+        let _ = registry_repo_ids;
+        error!(
+            repo_id,
+            "refusing cursorless Firestore spine edge refresh; publish a complete cursor-bound edge phase"
+        );
+        false
+    }
+
     fn invalidate_cross_repo_edges(&self, repo_id: &str) {
         self.cache.invalidate_cross_repo_edges(repo_id);
     }
@@ -1524,6 +1547,11 @@ pub struct FirestoreStore {
     /// Re-reads the hosted lease before every transient retry; see
     /// [`TransientRetryGate`]. Absent for a store nobody bound a lease to.
     transient_retry_gate: Option<TransientRetryGate>,
+    /// Every answered read, counted the way Firestore bills it. From
+    /// 2026-09-05 to 2026-09-20 the hosted spine read about 46 million
+    /// documents a day and nothing in the process could say so; this is what
+    /// the daemon reports now.
+    read_meter: DurableReadMeter,
 }
 
 /// Whether a successful Firestore response needs its body before the caller
@@ -1561,6 +1589,7 @@ impl FirestoreStore {
             token: parking_lot::RwLock::new(None),
             endpoint,
             transient_retry_gate: None,
+            read_meter: DurableReadMeter::default(),
         }
     }
 
@@ -1796,7 +1825,10 @@ impl FirestoreStore {
                 SpineError::Serialization(format!("failed to parse {collection} list: {e}"))
             })?;
 
-            if let Some(docs) = body.get("documents").and_then(|d| d.as_array()) {
+            // One page is one billed request, at one read per document on it.
+            let page = body.get("documents").and_then(|d| d.as_array());
+            self.read_meter.record(page.map_or(0, Vec::len));
+            if let Some(docs) = page {
                 documents.extend(docs.iter().cloned());
             }
 
@@ -1824,6 +1856,9 @@ impl FirestoreStore {
             || self.client.get(&url).bearer_auth(&token),
         )?;
         if status == reqwest::StatusCode::NOT_FOUND {
+            // A proved absence is still an answered read, and Firestore
+            // charges one for it.
+            self.read_meter.record(0);
             return Ok(None);
         }
         if !status.is_success() {
@@ -1831,6 +1866,7 @@ impl FirestoreStore {
                 "read {collection}/{document_id} failed ({status}): {body}"
             )));
         }
+        self.read_meter.record(1);
         serde_json::from_str(&body).map(Some).map_err(|error| {
             SpineError::Serialization(format!(
                 "failed to parse {collection}/{document_id}: {error}"
@@ -1876,10 +1912,13 @@ impl FirestoreStore {
         let results: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|error| {
             SpineError::Serialization(format!("failed to parse {collection} query: {error}"))
         })?;
-        Ok(results
+        let documents = results
             .into_iter()
             .filter_map(|result| result.get("document").cloned())
-            .collect())
+            .collect::<Vec<_>>();
+        // An empty answer is one `readTime`-only entry and still bills a read.
+        self.read_meter.record(documents.len());
+        Ok(documents)
     }
 
     /// Commit staged row writes or bounded cleanup deletes in batches limited
@@ -3390,6 +3429,10 @@ fn loaded_repos_from_documents(
 
 #[cfg(feature = "firestore")]
 impl SpineStore for FirestoreStore {
+    fn read_stats(&self) -> Option<DurableReadStats> {
+        Some(self.read_meter.snapshot())
+    }
+
     fn load_rollout_fence(&self) -> Result<Option<LoadedSpineRolloutFence>, SpineError> {
         self.read_rollout_fence()
     }
@@ -4251,6 +4294,118 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].src_repo, "consumer");
         assert!(!reader.cross_repo_edges_snapshot().complete);
+    }
+
+    /// What a reader's two durable reads cost, in Firestore's billing unit.
+    ///
+    /// A hydration reads every committed row. From 2026-09-05 to 2026-09-20
+    /// the hosted daemon's background refresh called it once a minute plus
+    /// the pass time on a fleet of 41,496 entity rows and 1,489 edge rows, so
+    /// each call billed about 43,000 reads whether or not a head had moved. An
+    /// identity read, the active fence and the committed heads, bills one read
+    /// per head plus one. The fake charges each call the requests
+    /// `FirestoreStore` sends for it, so both formulas are pinned here.
+    #[test]
+    fn a_hydration_bills_every_committed_row_and_an_identity_read_bills_only_heads() {
+        let store = Arc::new(FakeSpineStore::default());
+        let writer = FirestoreSpineBackend::with_store(store.clone());
+        let provider_entries = (0..3)
+            .map(|index| {
+                test_entry(
+                    "provider",
+                    &format!("provide_{index}"),
+                    EntityKind::Function,
+                )
+            })
+            .collect::<Vec<_>>();
+        let consumer = test_entry("consumer", "consume", EntityKind::Function);
+        let consumer_peer = test_entry("consumer", "consume_again", EntityKind::Function);
+        publish_success(
+            &writer,
+            metadata_publication("provider", 21, "provider-root", provider_entries.clone()),
+        );
+        publish_success(
+            &writer,
+            edge_publication(
+                "consumer",
+                22,
+                "consumer-root",
+                vec![consumer.clone(), consumer_peer],
+                vec![CrossRepoEdge {
+                    src_repo: "consumer".to_string(),
+                    src_entity: consumer.entity_id,
+                    dst_repo: "provider".to_string(),
+                    dst_entity: provider_entries[0].entity_id,
+                    confidence: 0.9,
+                }],
+                [("consumer", "consumer-root"), ("provider", "provider-root")],
+            ),
+        );
+        seal_fake_for_current_heads(&store);
+        let reader = FirestoreSpineBackend::with_store(store.clone());
+
+        let before = reader
+            .durable_read_stats()
+            .expect("the fake meters its reads");
+        reader.hydrate().expect("hydrate");
+        let hydration = reader.durable_read_stats().unwrap().since(before);
+        let heads = 2;
+        let entity_rows = 3 + 2;
+        // The provider has no edge rows, and its empty edge query still bills
+        // one read; the consumer has one edge row.
+        let edge_reads = 1 + 1;
+        assert_eq!(
+            hydration.document_reads,
+            // The fence before and after the load, the heads listed before and
+            // after it, one manifest per head, every entity and edge row, and
+            // the legacy seal check's fence and seal gets.
+            2 + 2 * heads + heads + entity_rows + edge_reads + 2,
+            "{hydration:?}"
+        );
+
+        let before = reader.durable_read_stats().unwrap();
+        reader.active_rollout_fence().expect("active fence");
+        reader
+            .committed_head_identities()
+            .expect("committed head identities");
+        let identity = reader.durable_read_stats().unwrap().since(before);
+        assert_eq!(
+            identity,
+            DurableReadStats {
+                requests: 2,
+                document_reads: 1 + heads,
+            },
+            "an identity read must bill the fence and the heads and not one row"
+        );
+
+        // The single-repository load a commit reconciles through bills that
+        // repository's head twice, its manifest and its own rows, never the
+        // rest of the fleet.
+        let before = reader.durable_read_stats().unwrap();
+        let provider = store
+            .load_repo_publication("provider")
+            .expect("load one repository")
+            .expect("the provider has a committed head");
+        assert_eq!(provider.entries.len(), 3);
+        assert_eq!(
+            reader.durable_read_stats().unwrap().since(before),
+            DurableReadStats {
+                requests: 5,
+                // Head, manifest, three entity rows, an empty edge query that
+                // still bills one, and the head again.
+                document_reads: 1 + 1 + 3 + 1 + 1,
+            }
+        );
+        let before = reader.durable_read_stats().unwrap();
+        assert!(store.load_repo_publication("absent").unwrap().is_none());
+        assert_eq!(
+            reader.durable_read_stats().unwrap().since(before),
+            DurableReadStats {
+                requests: 1,
+                document_reads: 1,
+            },
+            "a missing head is one billed get and nothing after it"
+        );
     }
 
     #[test]
@@ -6114,6 +6269,9 @@ mod tests {
             confidence: 0.5,
         });
         backend.refresh_cross_repo_edges("repo", &[], &[], &["repo".to_string()]);
+        assert!(
+            !backend.refresh_cross_repo_edges_from_retained_imports("repo", &["repo".to_string()])
+        );
         assert_eq!(backend.repo_count(), 0);
         assert_eq!(backend.edge_count(), 0);
         assert!(store.load_repos().unwrap().is_empty());
@@ -7510,6 +7668,84 @@ mod transient_retry_tests {
         assert_eq!(
             production.base_url(),
             "https://firestore.googleapis.com/v1/projects/p/databases/(default)/documents"
+        );
+    }
+
+    /// The production store counts reads the way Firestore bills them: one per
+    /// document returned and at least one per answered request, over the real
+    /// request paths.
+    #[test]
+    fn the_read_meter_bills_documents_returned_and_at_least_one_per_answered_request() {
+        let document = |id: &str| {
+            serde_json::json!({
+                "name": format!(
+                    "projects/fixture-project/databases/(default)/documents/spine_repo_heads_v2/{id}"
+                ),
+                "fields": { "payload": { "stringValue": "{}" } },
+                "updateTime": "2026-09-22T12:00:00.000000Z"
+            })
+        };
+        let first_page = serde_json::json!({
+            "documents": [document("a"), document("b")],
+            "nextPageToken": "next"
+        });
+        let last_page = serde_json::json!({ "documents": [document("c")] });
+        let no_match = serde_json::json!([{ "readTime": "2026-09-22T12:00:00.000000Z" }]);
+        let two_rows = serde_json::json!([
+            { "document": document("a"), "readTime": "2026-09-22T12:00:00.000000Z" },
+            { "document": document("b"), "readTime": "2026-09-22T12:00:00.000000Z" }
+        ]);
+        let server = ScriptedServer::serve(vec![
+            respond(200, &document("a").to_string()),
+            respond(404, &status_body("NOT_FOUND")),
+            respond(403, &status_body("PERMISSION_DENIED")),
+            respond(200, &first_page.to_string()),
+            respond(200, &last_page.to_string()),
+            respond(200, &no_match.to_string()),
+            respond(200, &two_rows.to_string()),
+        ]);
+        let store = store_against(&server);
+
+        assert!(store
+            .get_document("spine_repo_heads_v2", "a")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_document("spine_repo_heads_v2", "missing")
+            .unwrap()
+            .is_none());
+        store
+            .get_document("spine_repo_heads_v2", "denied")
+            .expect_err("a refused read is an error");
+        assert_eq!(
+            store
+                .list_all_documents("spine_repo_heads_v2")
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(store
+            .query_documents("spine_edges_v2", "publication_id", "none", None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .query_documents("spine_entities_v2", "publication_id", "two", None)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert_eq!(server.requests().len(), 7);
+        assert_eq!(
+            store.read_stats(),
+            Some(DurableReadStats {
+                // The refused get got no answer and is not counted.
+                requests: 6,
+                // Found get 1, missing get 1, two list pages 2 + 1, the empty
+                // query 1, the two-row query 2.
+                document_reads: 1 + 1 + 2 + 1 + 1 + 2,
+            })
         );
     }
 

@@ -101,7 +101,11 @@ this graph could have seen the impact it reports missing: the verdicts are read 
 cross-file call, import and reference edges, so on a language whose reference edges this \
 build cannot produce, or on a graph holding none of them, an empty blast radius means \
 the query could not observe what it was asked about rather than that nothing depends on \
-the change. Check it before reading a zero consumer count as safe to change.";
+the change. Every entity reported with no consumers is also read in the top-level \
+`caller_arrival` block, the reading `find_references` publishes: when a file that can \
+reach it holds call sites that became no edge, the verdict is inconclusive and names that \
+file rather than certifying the zero. Check `safe_to_conclude_absent` before reading a \
+zero consumer count as safe to change.";
 
 /// The field a serialized impact row carries beside `covering_tests`, and the
 /// one value it takes.
@@ -193,7 +197,7 @@ pub async fn handle_impact_analysis<G: GraphStore>(
     let impact =
         kin_review::analyze_impact(store, &diff).map_err(|e| McpError::Review(e.to_string()))?;
 
-    let mut result = serde_json::to_value(&impact).map_err(McpError::Json)?;
+    let mut result = semantic_metadata_json(&impact)?;
     annotate_impact_presentation_lines(&mut result, &impact);
     if names_files(args) {
         record_files_deprecation(&mut result, "impact_analysis");
@@ -286,6 +290,21 @@ pub async fn handle_impact_analysis<G: GraphStore>(
             &IMPACT_REFERENCE_KINDS,
         );
 
+    // Whether a caller could have reached an entity this answer reports with no
+    // consumers through a call the graph holds no edge for. Coverage above says
+    // the graph holds edges of each class; it cannot see a caller whose own call
+    // became no edge, which is how a live export came back `consumer_count: 0`
+    // under a certified verdict. The negative gate reads this block before it
+    // certifies any of those zeros, the way it reads `find_references`'s own.
+    let without_consumers: Vec<kin_model::EntityId> = impact
+        .entity_impacts
+        .iter()
+        .filter(|row| row.consumer_count == 0)
+        .map(|row| row.entity_id)
+        .collect();
+    result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
+        crate::caller_arrival::observe_impact_arrival(store, &without_consumers);
+
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
@@ -331,7 +350,7 @@ pub fn handle_semantic_review<G: GraphStore>(
     let formatted = format_review(&review);
 
     if format.eq_ignore_ascii_case("json") {
-        let mut result = serde_json::to_value(&review).map_err(McpError::Json)?;
+        let mut result = semantic_metadata_json(&review)?;
         // `semantic_review format=json` carries the same impact buckets
         // `impact_analysis` returns, so it gets the same 1-based presentation
         // lines. Annotating one and not the other left two agent surfaces
@@ -521,18 +540,85 @@ pub fn handle_shadow_gate_report<G: GraphStore>(
     let report = kin_review::build_shadow_report(store, &request)
         .map_err(|e| McpError::Review(e.to_string()))?;
 
-    let json = serde_json::to_string_pretty(&report).map_err(McpError::Json)?;
+    let json =
+        serde_json::to_string_pretty(&semantic_metadata_json(&report)?).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
 pub const ENTITY_HISTORY_DESC: &str = "\
-Return the change history of a single entity — the ordered list of semantic changes \
-that created, modified, or superseded it over time. Reach for it to answer \"how did \
-this declaration get to its current form?\", to find the change IDs you can feed into \
-semantic_diff/impact_analysis, or as a starting point for provenance questions. For \
-who-made-the-change and approval status, kin_provenance_query builds on this. \
-When no history comes back, the additive `negative` object's `safe_to_conclude_absent` \
-flag says whether \"no recorded history\" is authoritative or merely \"not indexed yet\".";
+Return a bounded, chronological page of changes to one entity, oldest first with \
+change-ID tie breaks. result contains focal-entity projections, not replayable whole \
+commits: original IDs, origins and parents are exact; unrelated change payloads are \
+represented by counts. change_id is the printable native semantic ID for semantic_diff \
+or impact_analysis. offset/limit page through history (default 20, maximum 100); follow \
+next_offset and compare change_count/latest_change_id between calls to detect concurrent \
+changes. An offset, limit or max_chars outside its bounds, or not an integer, is refused. Oversized focal details become an explicit summary, never silently empty history. \
+max_chars bounds serialized JSON payload UTF-8 bytes (including the MCP envelope, excluding \
+JSON-RPC escaping), default 45000, maximum 60000. Budget cuts retain their disclosures and \
+next_offset advances only past rows actually returned. An impossible metadata budget is \
+an error. Read negative.safe_to_conclude_absent before concluding no history exists; \
+retired entities with recorded history remain queryable.";
+
+/// The page and budget fields `entity_history` takes, with the bounds its
+/// registered schema declares: `(name, minimum, maximum)`. In name order, the
+/// order the routed tool's schema check reports problems in.
+const HISTORY_BOUNDED_FIELDS: [(&str, u64, Option<u64>); 3] = [
+    ("limit", 1, Some(100)),
+    (
+        "max_chars",
+        crate::budget::RESPONSE_MIN_MAX_CHARS as u64,
+        Some(crate::budget::RESPONSE_MAX_MAX_CHARS as u64),
+    ),
+    ("offset", 0, None),
+];
+
+/// Everything wrong with `entity_history`'s page and budget fields, in the
+/// words the routed tool's schema check uses for the same field, so a call is
+/// refused the same way by whichever name reached it. A value out of range, or
+/// not an integer, is refused rather than clamped: a clamped page answers a
+/// different question than the one asked. A null reads as absent.
+fn history_parameter_problems(args: &HashMap<String, serde_json::Value>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, minimum, maximum) in HISTORY_BOUNDED_FIELDS {
+        let Some(value) = args.get(name).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if !(value.is_i64() || value.is_u64()) {
+            problems.push(format!("{name} must be an integer"));
+        } else if value.as_i64().is_some_and(|number| number < minimum as i64) {
+            problems.push(format!("{name} must be at least {minimum}"));
+        } else if let (Some(number), Some(maximum)) = (value.as_u64(), maximum) {
+            if number > maximum {
+                problems.push(format!("{name} must be at most {maximum}"));
+            }
+        }
+    }
+    problems
+}
+
+/// The structured refusal for page or budget fields that are out of range or
+/// the wrong type. Its message is the sentence the routed tool refuses with.
+fn history_parameter_refusal(problems: &[String]) -> ToolCallResult {
+    ToolCallResult::error(
+        serde_json::json!({"error": {
+            "code": "history_parameters_out_of_range",
+            // The tool's name first, as the routed tool's refusal names it.
+            "message": format!("{}: {}.", "entity_history", problems.join("; ")),
+            "problems": problems,
+            "accepted": {
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": crate::budget::RESPONSE_MIN_MAX_CHARS,
+                    "maximum": crate::budget::RESPONSE_MAX_MAX_CHARS,
+                    "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+                },
+            },
+        }})
+        .to_string(),
+    )
+}
 
 pub fn handle_entity_history<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -540,13 +626,111 @@ pub fn handle_entity_history<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
-
-    let history = store
-        .get_entity_history(&entity_id)
+    let problems = history_parameter_problems(args);
+    if !problems.is_empty() {
+        return Ok(history_parameter_refusal(&problems));
+    }
+    let offset = usize::try_from(get_optional_u64(args, "offset", 0)).unwrap_or(usize::MAX);
+    let limit = get_optional_u64(args, "limit", 20) as usize;
+    let page = store
+        .get_entity_history_page(&entity_id, offset, limit)
         .map_err(McpError::graph)?;
-
-    let json = serde_json::to_string_pretty(&history).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    if page.change_count == 0
+        && store
+            .get_entity(&entity_id)
+            .map_err(McpError::graph)?
+            .is_none()
+    {
+        return Ok(ToolCallResult::error(format!(
+            "no entity exists with ID '{id_str}' and no change history is recorded against it; \
+             resolve the entity ID before requesting history"
+        )));
+    }
+    if let Some((index, entry)) = page
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.parents.is_none())
+    {
+        // Named by its place in the history, with the pages around it, so a
+        // caller reads every row it can rather than losing the whole page.
+        let offending = offset.saturating_add(index);
+        let mut around = Vec::new();
+        if index > 0 {
+            around.push(serde_json::json!({"offset": offset, "limit": index}));
+        }
+        if offending.saturating_add(1) < page.change_count {
+            around.push(serde_json::json!({"offset": offending + 1, "limit": limit}));
+        }
+        return Ok(ToolCallResult::error(serde_json::json!({"error": {
+            "code": "history_ancestry_exceeds_limit",
+            "change_id": entry.id.to_string(),
+            "parent_count": entry.metadata_omissions.get("parents"),
+            "requested_offset": offset,
+            "requested_limit": limit,
+            "offending_offset": offending,
+            "pages_around_it": around,
+            "message": format!(
+                "the change at offset {offending} has more parents than bounded history metadata \
+                 can carry exactly, so this page was not emitted rather than emitted with partial \
+                 ancestry; pages_around_it reads every other row"
+            ),
+        }}).to_string()));
+    }
+    let rows = page.entries.iter().enumerate().map(|(index, entry)| {
+        let mut row = semantic_metadata_json(entry)?;
+        row["change_id"] = serde_json::json!(entry.id.to_string());
+        row["scope"] = serde_json::json!("focal_entity");
+        row["omitted_sections"] = serde_json::json!({
+            "unrelated_entity_deltas": entry.entity_delta_count.saturating_sub(entry.focal_delta_count),
+            "relation_deltas": entry.relation_delta_count,
+            "tree_deltas": entry.tree_delta_count,
+            "external_reference_deltas": entry.external_reference_delta_count,
+            "projected_files": entry.projected_file_count,
+            "evidence": entry.evidence_count,
+            "admission_policy_delta": usize::from(entry.admission_policy_changed),
+            "risk_summary": usize::from(entry.risk_summary_present),
+        });
+        if entry.entity_deltas_omitted > 0 {
+            row["detail_summary"] = serde_json::json!({
+                "reason": "focal_detail_limit",
+                "omitted_entity_deltas": entry.entity_deltas_omitted,
+                "detail_limit_bytes": 12000,
+                "largest_view": {
+                    "tool": "entity_history",
+                    "arguments": {
+                        "entity_id": id_str,
+                        "offset": offset.saturating_add(index),
+                        "limit": 1,
+                        "max_chars": crate::budget::RESPONSE_MAX_MAX_CHARS,
+                    },
+                },
+                "disclosure": "the focal detail past 12,000 bytes is not available from history at \
+                    any budget; the largest view of this row is the one-row page above, and its \
+                    operations and original counts are exact",
+            });
+        }
+        Ok(row)
+    }).collect::<Result<Vec<_>>>()?;
+    let returned = rows.len();
+    let next = offset.saturating_add(returned);
+    let payload = serde_json::json!({
+        "result": rows,
+        "entity_id": entity_id.to_string(),
+        "scope": "focal_entity",
+        "ordering": "timestamp_ascending_then_change_id",
+        "change_count": page.change_count,
+        "latest_change_id": page.latest_change_id.map(|id| id.to_string()),
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "next_offset": (next < page.change_count).then_some(next),
+        "truncated": offset > 0 || next < page.change_count,
+        "snapshot_check": "compare change_count and latest_change_id before combining pages",
+    });
+    Ok(ToolCallResult::text(
+        serde_json::to_string_pretty(&payload).map_err(McpError::Json)?,
+    ))
 }
 
 // ── Review mutation handlers (Phase 11) ──
@@ -1600,6 +1784,219 @@ mod tests {
         );
     }
 
+    /// An export whose caller's call never became an edge, driven through the
+    /// real handler and the whole envelope path an MCP response takes.
+    ///
+    /// `note_body` is defined in `storage.py`, and `test_storage.py` imports that
+    /// module and calls it. The parser read two call sites in the test file and
+    /// the linker recorded an edge for one of them, the call to `find_note`, so
+    /// `note_body` holds no inbound edge and its row reports `consumer_count: 0`.
+    /// Every other gate reads a healthy graph: the store links calls, imports and
+    /// references across files and the daemon is ready. The zero used to come
+    /// back certified here, `safe_to_conclude_absent: true`, while
+    /// `find_references` refused the same absence on the same graph.
+    ///
+    /// The control is the same store with the test file's one parsed call site
+    /// accounted for, which must still certify, so the gate cannot pass by
+    /// refusing every zero.
+    #[tokio::test]
+    async fn a_zero_consumer_count_a_caller_may_not_have_reached_is_not_certified() {
+        use kin_model::graph::EntityStore as _;
+        use kin_model::relation::{Relation, RelationEvidence, RelationKind, RelationOrigin};
+        use kin_model::{EntityId, FilePathId, GraphNodeId, RelationId, SourceSpan};
+
+        const FOCAL_FILE: &str = "src/notekeeper/storage.py";
+        const CALLER_FILE: &str = "tests/test_storage.py";
+
+        fn python_entity(
+            name: &str,
+            file: &str,
+            kind: kin_model::EntityKind,
+            parsed_call_sites: u64,
+        ) -> kin_model::Entity {
+            let mut metadata = kin_model::entity::EntityMetadata::default();
+            metadata.extra.insert(
+                kin_parser::FILE_PARSED_CALL_SITES_KEY.into(),
+                serde_json::json!(parsed_call_sites),
+            );
+            kin_model::Entity {
+                id: EntityId::from_content(file, name, &format!("{kind:?}"), 0),
+                kind,
+                name: name.to_string(),
+                language: kin_model::LanguageId::Python,
+                fingerprint: kin_model::entity::SemanticFingerprint {
+                    algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: kin_model::Hash256::from_bytes([7; 32]),
+                    signature_hash: kin_model::Hash256::from_bytes([8; 32]),
+                    behavior_hash: kin_model::Hash256::from_bytes([9; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(file)),
+                span: None,
+                signature: format!("def {name}()"),
+                visibility: kin_model::entity::Visibility::Public,
+                role: kin_model::entity::EntityRole::Source,
+                doc_summary: None,
+                metadata,
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        fn edge(kind: RelationKind, src: &kin_model::Entity, dst: &kin_model::Entity) -> Relation {
+            let mut relation = Relation {
+                id: RelationId::from_content(
+                    &src.id.to_string(),
+                    &dst.id.to_string(),
+                    &format!("{kind:?}"),
+                ),
+                kind,
+                src: GraphNodeId::Entity(src.id),
+                dst: GraphNodeId::Entity(dst.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            };
+            if kind == RelationKind::Calls {
+                // The call site the parser read, so the arrival reading can
+                // join this edge to one parsed site.
+                relation.evidence.push(RelationEvidence {
+                    source_span: Some(SourceSpan {
+                        file: FilePathId::new(CALLER_FILE),
+                        start_byte: 120,
+                        end_byte: 140,
+                        start_line: 6,
+                        start_col: 4,
+                        end_line: 6,
+                        end_col: 24,
+                    }),
+                    occurrence_count: 1,
+                    ..RelationEvidence::default()
+                });
+            }
+            relation
+        }
+
+        async fn impact_verdict(caller_parsed_call_sites: u64) -> (serde_json::Value, EntityId) {
+            use kin_model::EntityKind::{Function, Module};
+            let store = kin_db::InMemoryGraph::new();
+            let storage = python_entity("storage", FOCAL_FILE, Module, 0);
+            let note_body = python_entity("note_body", FOCAL_FILE, Function, 0);
+            let find_note = python_entity("find_note", FOCAL_FILE, Function, 0);
+            let test_module = python_entity(
+                "test_storage",
+                CALLER_FILE,
+                Module,
+                caller_parsed_call_sites,
+            );
+            let test_fn = python_entity(
+                "test_bodies_round_trip",
+                CALLER_FILE,
+                Function,
+                caller_parsed_call_sites,
+            );
+            for entity in [&storage, &note_body, &find_note, &test_module, &test_fn] {
+                store.upsert_entity(entity).unwrap();
+            }
+            for relation in [
+                edge(RelationKind::Imports, &test_module, &storage),
+                edge(RelationKind::Calls, &test_fn, &find_note),
+                edge(RelationKind::References, &test_fn, &find_note),
+            ] {
+                store.upsert_relation(&relation).unwrap();
+            }
+
+            // A host that resolves Python, stated rather than inherited from
+            // whoever runs the suite, so the only gate left to decide is the one
+            // this test is about.
+            let _host = crate::edge_coverage::test_support::scoped_language_servers(&[
+                kin_model::LanguageId::Python,
+            ]);
+            let args = HashMap::from([
+                (
+                    "entity_ids".to_string(),
+                    serde_json::json!([note_body.id.to_string()]),
+                ),
+                ("include_traffic".to_string(), serde_json::json!(false)),
+            ]);
+            let sessions = SessionRegistry::empty_for_test();
+            let result = handle_impact_analysis(&args, &store, &sessions)
+                .await
+                .expect("impact answers");
+            let envelope = crate::envelope::Envelope::daemon().with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "reconciliation_status": "clean",
+            }));
+            let annotated = crate::envelope::finalize_bounded(
+                result,
+                envelope,
+                "impact_analysis",
+                &crate::budget::ResponseBudget::default(),
+            );
+            let crate::types::ContentBlock::Text { text } =
+                annotated.content.first().expect("one content block");
+            (serde_json::from_str(text).expect("JSON"), note_body.id)
+        }
+
+        let (refused, note_body) = impact_verdict(2).await;
+        let row = &refused["entity_impacts"][0];
+        assert_eq!(row["entity_id"], serde_json::json!(note_body.to_string()));
+        assert_eq!(
+            row["consumer_count"], 0,
+            "the fixture reproduces the zero: {refused}"
+        );
+        let arrival = &refused[crate::caller_arrival::CALLER_ARRIVAL_KEY];
+        assert_eq!(arrival["state"], "unaccounted", "{arrival}");
+        assert_eq!(
+            arrival["entities"][0]["entity_id"],
+            serde_json::json!(note_body.to_string()),
+            "the reading is taken for the entity the zero is about: {arrival}"
+        );
+        let negative = &refused["negative"];
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "a caller may sit in a call site that became no edge, so the zero is a floor: \
+             {negative}"
+        );
+        let reason = negative["trust_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR)
+                && reason.contains(CALLER_FILE)
+                && reason.contains("note_body"),
+            "the refusal names the gap, the entity and the file its caller may be in: {reason}"
+        );
+        let verdict = &refused["_kin"]["verdict"];
+        assert_eq!(verdict["state"], "inconclusive", "{verdict}");
+        assert!(
+            verdict["limiting_factor"]
+                .as_str()
+                .is_some_and(|factor| factor
+                    .contains(crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR)),
+            "the one verdict names the limiting factor: {verdict}"
+        );
+
+        let (certified, _) = impact_verdict(1).await;
+        assert_eq!(
+            certified[crate::caller_arrival::CALLER_ARRIVAL_KEY]["state"],
+            "accounted",
+            "{certified}"
+        );
+        assert_eq!(
+            certified["negative"]["safe_to_conclude_absent"],
+            serde_json::json!(true),
+            "every call site the importing file parsed became an edge, so the zero is \
+             whole and the gate must let it certify: {}",
+            certified["negative"]
+        );
+        assert_eq!(certified["_kin"]["verdict"]["state"], "certified");
+    }
+
     /// A review scope spelled in none of the documented forms is refused. Dropping
     /// it instead would fall through to `file_path`, or to no scope, and the note
     /// would anchor somewhere the caller did not ask for; a `scopes` entry would
@@ -1830,5 +2227,614 @@ mod tests {
             err.to_string().contains("no imported repository alias"),
             "unimported git sha must error, got: {err}"
         );
+    }
+    fn history_change(
+        parent: Option<SemanticChangeId>,
+        deltas: Vec<kin_model::change::EntityDelta>,
+        message: &str,
+        second: usize,
+    ) -> kin_model::change::SemanticChange {
+        let mut change = kin_model::change::SemanticChange {
+            id: SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
+            origin: kin_model::change::ChangeOrigin::Native,
+            parents: parent.into_iter().collect(),
+            timestamp: serde_json::from_value(serde_json::json!(format!(
+                "2026-09-22T21:00:{second:02}Z"
+            )))
+            .unwrap(),
+            author: kin_model::AuthorId::new("History regression"),
+            message: message.into(),
+            entity_deltas: deltas,
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: parent.is_none().then(|| {
+                kin_model::AdmissionPolicyDelta::initialize(
+                    kin_model::SharedAdmissionPolicy::empty(0),
+                )
+            }),
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            external_reference_deltas: vec![],
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn history_query(
+        store: &kin_db::InMemoryGraph,
+        id: kin_model::EntityId,
+        extra: &[(&str, serde_json::Value)],
+    ) -> (ToolCallResult, serde_json::Value) {
+        let mut args = HashMap::from([("entity_id".into(), serde_json::json!(id.to_string()))]);
+        args.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone())),
+        );
+        let raw = handle_entity_history(&args, store).unwrap();
+        let mut envelope = crate::envelope::Envelope::daemon();
+        envelope.graph_state.loaded = Some(true);
+        envelope.graph_state.initialized = Some(true);
+        let result = crate::envelope::finalize_bounded(
+            raw,
+            envelope,
+            "entity_history",
+            &crate::budget::ResponseBudget::from_arguments(&args),
+        );
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let value = serde_json::from_str(text).unwrap();
+        (result, value)
+    }
+
+    #[test]
+    fn history_and_provenance_metadata_withhold_stored_source_previews() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::ChangeStore;
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = entity_spanning("bounded_history", "history.rs", 0, 1);
+        for key in [
+            "embedding_body_preview",
+            "file_import_context",
+            "file_surface_context",
+        ] {
+            focal.metadata.extra.insert(
+                key.into(),
+                serde_json::json!(format!("private_source_{key}")),
+            );
+        }
+        focal
+            .metadata
+            .extra
+            .insert("retained_fact".into(), serde_json::json!(true));
+        let change = history_change(
+            None,
+            vec![EntityDelta::Added { new: focal.clone() }],
+            "metadata history",
+            0,
+        );
+        store.create_change(&change).unwrap();
+        let (history, value) = history_query(&store, focal.id, &[]);
+        assert_ne!(history.is_error, Some(true), "{value}");
+        let args = HashMap::from([
+            ("entity_id".into(), serde_json::json!(focal.id)),
+            ("compact".into(), serde_json::json!(false)),
+        ]);
+        let provenance = super::super::provenance::handle_provenance_query(&args, &store).unwrap();
+        assert_ne!(provenance.is_error, Some(true));
+        for result in [&history, &provenance] {
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            assert!(text.contains("retained_fact"), "{text}");
+            assert!(!text.contains("private_source_"), "{text}");
+        }
+        assert!(
+            serde_json::to_string(&store.get_change(&change.id).unwrap())
+                .unwrap()
+                .contains("private_source_")
+        );
+    }
+
+    #[test]
+    fn entity_history_imported_snapshot_is_focal_and_preserves_native_identity() {
+        use kin_model::change::{ChangeOrigin, EntityDelta};
+        use kin_model::graph::ChangeStore;
+        let store = kin_db::InMemoryGraph::new();
+        let focal = entity_spanning("listRun", "list.go", 122, 211);
+        let mut deltas = vec![EntityDelta::Added { new: focal.clone() }];
+        for n in 0..1000 {
+            let mut unrelated = entity_spanning(&format!("unrelated_{n}"), "other.go", 0, 1);
+            unrelated.metadata.extra.insert(
+                "body".into(),
+                serde_json::json!("unrelated-body-marker".repeat(400)),
+            );
+            deltas.push(EntityDelta::Added { new: unrelated });
+        }
+        let mut imported = history_change(None, deltas, "Imported snapshot", 0);
+        imported.origin = ChangeOrigin::GitCommit {
+            oid: kin_model::ids::GitObjectId::sha1([3; 20]),
+        };
+        imported.id = kin_model::compute_semantic_change_id(&imported).unwrap();
+        let mut revised = focal.clone();
+        revised.signature = "fn listRun(new_options)".into();
+        let native = history_change(
+            Some(imported.id),
+            vec![EntityDelta::Modified {
+                old: focal.clone(),
+                new: revised,
+            }],
+            "Native edit",
+            1,
+        );
+        store.create_change(&imported).unwrap();
+        store.create_change(&native).unwrap();
+        let page = store.get_entity_history_page(&focal.id, 0, 1).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].entity_delta_count, 1001);
+        assert_eq!(page.entries[0].entity_deltas.as_ref().unwrap().len(), 1);
+        assert_eq!(page.latest_change_id, Some(native.id));
+        let (result, value) = history_query(&store, focal.id, &[]);
+        assert_ne!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        assert!(
+            text.len() < 45_000,
+            "focal history payload was {} bytes",
+            text.len()
+        );
+        assert!(!text.contains("unrelated-body-marker"));
+        assert_eq!(value["result"][0]["id"], serde_json::json!(imported.id));
+        assert_eq!(
+            value["result"][0]["origin"],
+            serde_json::json!(imported.origin)
+        );
+        assert_eq!(
+            value["result"][0]["omitted_sections"]["unrelated_entity_deltas"],
+            1000
+        );
+        assert_eq!(
+            value["result"][1]["parents"],
+            serde_json::json!(native.parents)
+        );
+        assert_eq!(value["result"][1]["change_id"], native.id.to_string());
+        assert_eq!(value["latest_change_id"], native.id.to_string());
+        assert_eq!(value["change_count"], 2);
+        assert_eq!(value["_kin"]["completeness"]["bound"], "exact");
+    }
+
+    #[test]
+    fn entity_history_budget_pagination_reaches_every_change_and_latest_native() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::ChangeStore;
+        let store = kin_db::InMemoryGraph::new();
+        let focal = entity_spanning("listRun", "list.go", 0, 1);
+        let mut expected = Vec::new();
+        let mut parent = None;
+        let mut previous = focal.clone();
+        for n in 0..35 {
+            let delta = if n == 0 {
+                EntityDelta::Added { new: focal.clone() }
+            } else {
+                let mut revised = previous.clone();
+                revised.signature = format!("fn listRun(revision_{n})");
+                let old = std::mem::replace(&mut previous, revised.clone());
+                EntityDelta::Modified { old, new: revised }
+            };
+            let change =
+                history_change(parent, vec![delta], &format!("{n}:{}", "界".repeat(150)), n);
+            parent = Some(change.id);
+            expected.push(change.id.to_string());
+            store.create_change(&change).unwrap();
+        }
+        let mut offset = 0;
+        let mut observed = Vec::new();
+        for _ in 0..40 {
+            let (result, value) = history_query(
+                &store,
+                focal.id,
+                &[
+                    ("offset", serde_json::json!(offset)),
+                    ("max_chars", serde_json::json!(8000)),
+                ],
+            );
+            assert_ne!(result.is_error, Some(true), "{value}");
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            assert!(text.len() <= 8000, "actual payload bytes {}", text.len());
+            assert!(
+                text.len() > text.chars().count(),
+                "non-ASCII fixture must exercise UTF-8 byte accounting"
+            );
+            assert_eq!(value["_kin"]["response"]["chars_after_budget"], text.len());
+            let rows = value["result"].as_array().unwrap();
+            assert!(!rows.is_empty());
+            assert_eq!(value["returned"], rows.len());
+            assert_eq!(
+                value["_kin"]["completeness"]["counted"]["returned"],
+                rows.len()
+            );
+            assert_eq!(value["latest_change_id"], expected.last().unwrap().as_str());
+            assert_eq!(value["change_count"], 35);
+            assert_eq!(value["_kin"]["completeness"]["bound"], "at_least");
+            observed.extend(
+                rows.iter()
+                    .map(|row| row["change_id"].as_str().unwrap().to_string()),
+            );
+            match value["next_offset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(next, offset + rows.len() as u64);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(observed, expected);
+        let (_, beyond) = history_query(&store, focal.id, &[("offset", serde_json::json!(1000))]);
+        assert_eq!(beyond["result"], serde_json::json!([]));
+        assert!(
+            beyond.get("negative").is_none(),
+            "an empty page is not no history"
+        );
+    }
+
+    #[test]
+    fn entity_history_empty_unknown_retired_and_timestamp_ties_are_distinct() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::{ChangeStore, EntityStore};
+        let store = kin_db::InMemoryGraph::new();
+        let focal = entity_spanning("retired", "old.rs", 0, 1);
+        let (missing, _) = history_query(&store, focal.id, &[]);
+        assert_eq!(missing.is_error, Some(true));
+        store.upsert_entity(&focal).unwrap();
+        let (empty_result, empty) = history_query(&store, focal.id, &[]);
+        assert_ne!(empty_result.is_error, Some(true));
+        assert_eq!(empty["change_count"], 0);
+        assert_eq!(empty["negative"]["kind"], "no_history");
+        let first = history_change(
+            None,
+            vec![EntityDelta::Added { new: focal.clone() }],
+            "one",
+            0,
+        );
+        let second = history_change(
+            Some(first.id),
+            vec![EntityDelta::Removed { old: focal.clone() }],
+            "two",
+            0,
+        );
+        store.create_change(&first).unwrap();
+        store.create_change(&second).unwrap();
+        store.remove_entity(&focal.id).unwrap();
+        let (retired_result, retired) = history_query(&store, focal.id, &[]);
+        assert_ne!(retired_result.is_error, Some(true));
+        let mut expected = vec![first.id.to_string(), second.id.to_string()];
+        expected.sort();
+        let observed = retired["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["change_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+    }
+
+    /// A page or budget field out of range, or not an integer, is refused with
+    /// the sentence the routed tool's schema check uses, never clamped; the
+    /// bounds themselves are accepted.
+    #[test]
+    fn entity_history_refuses_out_of_range_and_non_integer_page_fields() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::ChangeStore;
+        let store = kin_db::InMemoryGraph::new();
+        let focal = entity_spanning("paged", "paged.rs", 0, 1);
+        store
+            .create_change(&history_change(
+                None,
+                vec![EntityDelta::Added { new: focal.clone() }],
+                "added",
+                0,
+            ))
+            .unwrap();
+        let refused = |extra: &[(&str, serde_json::Value)], expected: &str| {
+            let (result, value) = history_query(&store, focal.id, extra);
+            assert_eq!(result.is_error, Some(true), "{extra:?}: {value}");
+            assert_eq!(
+                value["error"]["code"], "history_parameters_out_of_range",
+                "{extra:?}: {value}"
+            );
+            assert_eq!(value["error"]["message"], expected, "{extra:?}: {value}");
+            assert!(value.get("result").is_none(), "{value}");
+        };
+        refused(
+            &[("limit", serde_json::json!(0))],
+            "entity_history: limit must be at least 1.",
+        );
+        refused(
+            &[("limit", serde_json::json!(500))],
+            "entity_history: limit must be at most 100.",
+        );
+        refused(
+            &[("limit", serde_json::json!("ten"))],
+            "entity_history: limit must be an integer.",
+        );
+        refused(
+            &[("limit", serde_json::json!(20.5))],
+            "entity_history: limit must be an integer.",
+        );
+        refused(
+            &[("max_chars", serde_json::json!(1999))],
+            "entity_history: max_chars must be at least 2000.",
+        );
+        refused(
+            &[("max_chars", serde_json::json!(60001))],
+            "entity_history: max_chars must be at most 60000.",
+        );
+        refused(
+            &[("max_chars", serde_json::json!("big"))],
+            "entity_history: max_chars must be an integer.",
+        );
+        refused(
+            &[("offset", serde_json::json!(-1))],
+            "entity_history: offset must be at least 0.",
+        );
+        refused(
+            &[
+                ("offset", serde_json::json!(-1)),
+                ("limit", serde_json::json!(0)),
+            ],
+            "entity_history: limit must be at least 1; offset must be at least 0.",
+        );
+        // Every bound itself is accepted: whatever the answer is, it is not a
+        // parameter refusal. At max_chars 2,000 the answer is the budget's own
+        // refusal, because this change's metadata alone does not fit.
+        for (field, bound) in [
+            ("limit", 1),
+            ("limit", 100),
+            ("max_chars", 2000),
+            ("max_chars", 60000),
+            ("offset", 0),
+        ] {
+            let (_, value) = history_query(&store, focal.id, &[(field, serde_json::json!(bound))]);
+            assert_ne!(
+                value["error"]["code"], "history_parameters_out_of_range",
+                "{field} {bound}: {value}"
+            );
+        }
+        let (result, accepted) =
+            history_query(&store, focal.id, &[("limit", serde_json::json!(100))]);
+        assert_ne!(result.is_error, Some(true), "{accepted}");
+        assert_eq!(accepted["change_count"], 1);
+        let (_, null_limit) =
+            history_query(&store, focal.id, &[("limit", serde_json::Value::Null)]);
+        assert_eq!(
+            null_limit["limit"], 20,
+            "a null reads as absent: {null_limit}"
+        );
+    }
+
+    /// The handler's own page: 20 rows by default and 100 at most, with
+    /// next_offset following the rows returned.
+    #[test]
+    fn entity_history_pages_default_to_twenty_and_stop_at_one_hundred() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::ChangeStore;
+        let store = kin_db::InMemoryGraph::new();
+        let focal = entity_spanning("hundreds", "hundreds.rs", 0, 1);
+        let mut parent = None;
+        let mut previous = focal.clone();
+        for n in 0..120 {
+            let delta = if n == 0 {
+                EntityDelta::Added { new: focal.clone() }
+            } else {
+                let mut revised = previous.clone();
+                revised.signature = format!("fn hundreds(revision_{n})");
+                let old = std::mem::replace(&mut previous, revised.clone());
+                EntityDelta::Modified { old, new: revised }
+            };
+            // The helper's clock is one minute of seconds; ties order by id,
+            // which leaves the counts this test reads unchanged.
+            let change = history_change(parent, vec![delta], &format!("{n}"), n % 60);
+            parent = Some(change.id);
+            store.create_change(&change).unwrap();
+        }
+        let raw = |extra: &[(&str, serde_json::Value)]| -> serde_json::Value {
+            let mut args =
+                HashMap::from([("entity_id".into(), serde_json::json!(focal.id.to_string()))]);
+            args.extend(
+                extra
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.clone())),
+            );
+            let result = handle_entity_history(&args, &store).unwrap();
+            assert_ne!(result.is_error, Some(true));
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str(text).unwrap()
+        };
+        let first = raw(&[]);
+        assert_eq!(
+            (first["limit"].as_u64(), first["returned"].as_u64()),
+            (Some(20), Some(20))
+        );
+        assert_eq!(first["next_offset"], 20);
+        assert_eq!(first["change_count"], 120);
+        let widest = raw(&[("limit", serde_json::json!(100))]);
+        assert_eq!(widest["result"].as_array().unwrap().len(), 100);
+        assert_eq!(widest["next_offset"], 100);
+        let last = raw(&[
+            ("offset", serde_json::json!(100)),
+            ("limit", serde_json::json!(100)),
+        ]);
+        assert_eq!(last["returned"], 20);
+        assert!(last["next_offset"].is_null());
+        assert_eq!(last["latest_change_id"], first["latest_change_id"]);
+    }
+
+    /// A change whose ancestry cannot be carried exactly is named by its place
+    /// in the history, with the pages that read every other row.
+    #[test]
+    fn entity_history_names_the_offending_offset_and_the_pages_around_it() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::ChangeStore;
+        let store = kin_db::InMemoryGraph::new();
+        let focal = entity_spanning("merged", "merged.rs", 0, 1);
+        let root = history_change(
+            None,
+            vec![EntityDelta::Added { new: focal.clone() }],
+            "root",
+            0,
+        );
+        store.create_change(&root).unwrap();
+        let mut revised = focal.clone();
+        revised.signature = "fn merged(wide)".into();
+        let mut wide = history_change(
+            Some(root.id),
+            vec![EntityDelta::Modified {
+                old: focal.clone(),
+                new: revised.clone(),
+            }],
+            "a merge too wide to carry",
+            1,
+        );
+        wide.parents = std::iter::once(root.id)
+            .chain((0..200u64).map(|seed| {
+                let mut bytes = [0x77; 32];
+                bytes[..8].copy_from_slice(&seed.to_le_bytes());
+                SemanticChangeId::from_hash(kin_model::Hash256::from_bytes(bytes))
+            }))
+            .collect();
+        wide.id = kin_model::compute_semantic_change_id(&wide).unwrap();
+        store.create_change(&wide).unwrap();
+        let mut last = revised.clone();
+        last.signature = "fn merged(after)".into();
+        let after = history_change(
+            Some(wide.id),
+            vec![EntityDelta::Modified {
+                old: revised,
+                new: last,
+            }],
+            "after",
+            2,
+        );
+        store.create_change(&after).unwrap();
+
+        let (result, value) = history_query(&store, focal.id, &[]);
+        assert_eq!(result.is_error, Some(true), "{value}");
+        let error = &value["error"];
+        assert_eq!(error["code"], "history_ancestry_exceeds_limit");
+        assert_eq!(error["change_id"], wide.id.to_string());
+        assert_eq!(error["requested_offset"], 0);
+        assert_eq!(error["requested_limit"], 20);
+        assert_eq!(error["offending_offset"], 1);
+        assert_eq!(error["parent_count"], 201);
+        assert_eq!(
+            error["pages_around_it"],
+            serde_json::json!([{"offset": 0, "limit": 1}, {"offset": 2, "limit": 20}])
+        );
+        for page in error["pages_around_it"].as_array().unwrap() {
+            let (result, value) = history_query(
+                &store,
+                focal.id,
+                &[
+                    ("offset", page["offset"].clone()),
+                    ("limit", page["limit"].clone()),
+                ],
+            );
+            assert_ne!(result.is_error, Some(true), "{page}: {value}");
+            assert_eq!(value["returned"], 1, "{page}: {value}");
+        }
+    }
+
+    #[test]
+    fn entity_history_large_focal_message_and_author_are_summarized_before_clone() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::ChangeStore;
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = entity_spanning("large", "large.rs", 0, 1);
+        focal
+            .metadata
+            .extra
+            .insert("body".into(), serde_json::json!("巨".repeat(100_000)));
+        let message = "史".repeat(100_000);
+        let mut change = history_change(
+            None,
+            vec![EntityDelta::Added { new: focal.clone() }],
+            &message,
+            0,
+        );
+        change.author = kin_model::AuthorId::new("名".repeat(100_000));
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        store.create_change(&change).unwrap();
+        let page = store.get_entity_history_page(&focal.id, 0, 20).unwrap();
+        let entry = &page.entries[0];
+        assert!(entry.entity_deltas.is_none());
+        assert!(entry.message.is_none());
+        assert!(entry.author.is_none());
+        assert_eq!(
+            entry.metadata_omissions["message_utf8_bytes"],
+            message.len()
+        );
+        let (result, value) = history_query(&store, focal.id, &[]);
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            value["result"][0]["detail_summary"]["reason"],
+            "focal_detail_limit"
+        );
+        // The pointer is a bounded history call, and it says plainly that the
+        // detail past the focal limit is not available at any budget.
+        assert_eq!(
+            value["result"][0]["detail_summary"]["largest_view"],
+            serde_json::json!({"tool": "entity_history", "arguments": {
+                "entity_id": focal.id.to_string(), "offset": 0, "limit": 1,
+                "max_chars": crate::budget::RESPONSE_MAX_MAX_CHARS}})
+        );
+        assert!(value["result"][0]["detail_summary"]["disclosure"]
+            .as_str()
+            .unwrap()
+            .contains("not available from history at any budget"));
+        assert!(
+            !value["result"][0]["detail_summary"]
+                .to_string()
+                .contains("semantic_diff"),
+            "no unbounded recovery is promised"
+        );
+        assert_eq!(value["result"][0]["entity_deltas_omitted"], 1);
+        assert_eq!(value["result"][0]["focal_delta_operations"]["added"], 1);
+        assert_eq!(value["result"][0]["change_id"], change.id.to_string());
+        let mut ancestry = change.clone();
+        ancestry.parents = (0..1000).map(|_| change.id).collect();
+        let entry =
+            kin_model::change::EntityHistoryEntry::for_entity(&ancestry, &focal.id).unwrap();
+        assert!(entry.parents.is_none());
+        assert_eq!(entry.metadata_omissions["parents"], 1000);
+    }
+
+    #[test]
+    fn entity_history_irreducible_budget_refuses_on_raw_and_enveloped_surfaces() {
+        let budget = crate::budget::ResponseBudget {
+            max_chars: 2000,
+            explicit_max_chars: true,
+            ..Default::default()
+        };
+        let payload = serde_json::json!({"entity_id": "focal", "result": [{"id": "a".repeat(64),
+            "parents": vec!["b".repeat(64); 1000]}], "change_count": 1, "latest_change_id": "a".repeat(64), "offset": 0 });
+        let mut raw = payload.clone();
+        crate::budget::enforce(&mut raw, "entity_history", &budget);
+        assert!(!crate::budget::fit_history_payload(
+            &mut raw,
+            "entity_history",
+            &budget
+        ));
+        assert_eq!(raw["error"]["code"], "history_metadata_exceeds_budget");
+        assert!(crate::budget::measure(&raw) <= 2000);
+        let result = crate::envelope::finalize_bounded(
+            ToolCallResult::text(payload.to_string()),
+            crate::envelope::Envelope::daemon(),
+            "entity_history",
+            &budget,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        assert!(text.len() <= 2000);
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["code"], "history_metadata_exceeds_budget");
+        assert!(error.get("result").is_none());
     }
 }

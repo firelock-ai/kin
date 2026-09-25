@@ -78,7 +78,7 @@ pub struct CompactEntity {
     pub id: String,
     /// Repo-relative path of an artifact hit: a tracked file the parsers
     /// produced no entities for. Present only when [`Self::id`] is absent, and
-    /// it is the handle `kin_artifact_read` takes.
+    /// retained only on the operator projection. MCP omits artifact candidates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
     pub name: String,
@@ -109,6 +109,13 @@ pub struct CompactEntity {
     /// from a daemon predating the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched: Option<String>,
+    /// How many more module rows of this package were folded into this one, at
+    /// least: a fused ranking can meet two kept rows of one package that each
+    /// folded others, and it keeps the larger count rather than risk counting
+    /// a file twice. Omitted when none were, which is every row but a
+    /// package's first.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub collapsed_rows: usize,
 }
 
 /// The one-object answer to "how much of the semantic signal was behind this
@@ -141,6 +148,19 @@ pub struct CompactKinEnvelope {
     /// result is attributable at a glance and `--surface full` has the rest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
+}
+
+/// One degradation a query reported, reduced to the pair every verdict reader
+/// keys on.
+///
+/// `kin-mcp` names a degraded run `component:reason`, and that label is what its
+/// verdict, its absence gate and its `degraded_signals` read. The detail and
+/// remediation prose are the bulk of a full entry, so they stay on the full
+/// surface.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CompactDegradation {
+    pub component: String,
+    pub reason: String,
 }
 
 /// The projected surface.
@@ -191,6 +211,20 @@ pub struct CompactLocate {
     /// on the CLI projection; see the type docs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_coverage: Option<SemanticCoverage>,
+    /// Every degradation the query reported, as `component` and `reason`. On the
+    /// MCP projection only.
+    ///
+    /// `kin-mcp` learns that a retrieval ran degraded from a payload's
+    /// `degradations` array and from nowhere else. This shape used to carry
+    /// none, so on the surface the `agent-default` profile asks for, a locate
+    /// that answered without its text index, its vector index or any other
+    /// signal came back with `_kin.verdict` certified, while the same query on
+    /// the full surface read inconclusive. The pair is exactly what that reader
+    /// needs, and `surface: "full"` still carries each entry's detail and
+    /// remediation. The CLI projection names the same components under
+    /// `_kin.degraded` instead, beside the envelope that surface has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<CompactDegradation>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -293,6 +327,7 @@ fn project_entity(entity: &LocateEntity) -> CompactEntity {
         signature: entity.signature.clone(),
         score: round_score(entity.score),
         matched: entity.match_kind.map(|kind| kind.as_str().to_string()),
+        collapsed_rows: entity.collapsed_rows,
     }
 }
 
@@ -307,7 +342,21 @@ fn project_common(result: &LocateResult) -> CompactLocate {
         ranked_by: ranked_by_clause(observed_state(result)).to_string(),
         kin: None,
         semantic_coverage: None,
+        degradations: Vec::new(),
     }
+}
+
+/// Every degradation the query reported, in the order it reported them, as the
+/// pair the verdict reads.
+fn project_degradations(result: &LocateResult) -> Vec<CompactDegradation> {
+    result
+        .degradations
+        .iter()
+        .map(|degradation| CompactDegradation {
+            component: degradation.component.clone(),
+            reason: degradation.reason.clone(),
+        })
+        .collect()
 }
 
 /// Project onto the CLI compact surface: coverage summarized under `_kin`.
@@ -320,10 +369,15 @@ pub fn project(result: &LocateResult) -> CompactLocate {
 
 /// Project onto the MCP compact surface: the coverage object carried unchanged
 /// under its own name, so `kin-mcp`'s envelope builder lifts it into the `_kin`
-/// it attaches rather than finding a second one already there.
+/// it attaches rather than finding a second one already there, and the
+/// degradations as the array its verdict reads.
 pub fn project_for_mcp(result: &LocateResult) -> CompactLocate {
     CompactLocate {
+        // Entity provenance stays on each hit; a parallel file catalog is not
+        // an agent answer, including the compact list of bare paths.
+        files: Vec::new(),
         semantic_coverage: result.semantic_coverage.clone(),
+        degradations: project_degradations(result),
         ..project_common(result)
     }
 }
@@ -376,6 +430,8 @@ mod tests {
                 cosine: None,
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         }
     }
 
@@ -500,6 +556,20 @@ mod tests {
         assert!(hit.get("span").is_none(), "the end line must not survive");
     }
 
+    /// A package's folded module rows are counted on the row that stands for
+    /// them, and a row that folded nothing carries no count at all.
+    #[test]
+    fn a_folded_package_row_carries_its_count_and_no_other_row_does() {
+        let mut result = fixture(2, 1);
+        result.entities[0].collapsed_rows = 3;
+        let value = serde_json::to_value(project(&result)).unwrap();
+        assert_eq!(value["entities"][0]["collapsed_rows"], 3);
+        assert!(
+            value["entities"][1].get("collapsed_rows").is_none(),
+            "a row that folded nothing stays the shape it was"
+        );
+    }
+
     /// The file roll-up is paths only. This is where 69 percent of the payload
     /// went.
     #[test]
@@ -552,6 +622,16 @@ mod tests {
         assert!(text.contains("\"embedding_state\":\"absent\""), "{text}");
     }
 
+    #[test]
+    fn the_mcp_projection_omits_file_catalogs_and_keeps_entity_provenance() {
+        let result = fixture(2, 2);
+        let mcp = serde_json::to_value(project_for_mcp(&result)).unwrap();
+        assert!(mcp.get("files").is_none());
+        assert_eq!(mcp["entities"].as_array().unwrap().len(), 2);
+        assert_eq!(mcp["entities"][0]["file"], "async.c");
+        assert_eq!(project(&result).files.len(), 2);
+    }
+
     /// The two projections must not both write `_kin`. The MCP envelope builder
     /// lifts `semantic_coverage` into the `_kin` it attaches, so the MCP
     /// projection carries the coverage object and no envelope of its own; the
@@ -577,6 +657,58 @@ mod tests {
         );
         // The clause both boundaries publish.
         assert_eq!(cli["ranked_by"], mcp["ranked_by"]);
+    }
+
+    /// The MCP projection carries every degradation the query reported, as the
+    /// pair `kin-mcp`'s verdict reads, in the order they were reported, and
+    /// drops only the prose.
+    ///
+    /// It used to carry none, so the verdict on this surface certified answers
+    /// the full surface called degraded. The CLI projection keeps naming the
+    /// components under `_kin.degraded` and gains no second copy.
+    #[test]
+    fn the_mcp_projection_carries_every_degradation_the_verdict_reads() {
+        let mut result = fixture(2, 2);
+        result.degradations.push(RetrievalDegradation {
+            component: "text_index".into(),
+            reason: "unavailable".into(),
+            detail: "the text index's committed image could not be mapped back".into(),
+            remediation: "retry the query".into(),
+        });
+
+        let mcp = serde_json::to_value(project_for_mcp(&result)).unwrap();
+        assert_eq!(
+            mcp["degradations"],
+            serde_json::json!([
+                {"component": "vector_index", "reason": "empty"},
+                {"component": "text_index", "reason": "unavailable"},
+            ]),
+            "{mcp}"
+        );
+        let text = mcp.to_string();
+        for prose in [
+            "no entity in this graph carries an embedding",
+            "could not be mapped back",
+            "run 'kin embed'",
+        ] {
+            assert!(
+                !text.contains(prose),
+                "the compact surface carries {prose}: {text}"
+            );
+        }
+
+        let cli = serde_json::to_value(project(&result)).unwrap();
+        assert!(cli.get("degradations").is_none(), "{cli}");
+        assert_eq!(
+            cli["_kin"]["degraded"],
+            serde_json::json!(["text_index", "vector_index"])
+        );
+
+        // A query that reported nothing carries no key at all.
+        let mut clean = fixture(1, 1);
+        clean.degradations.clear();
+        let clean = serde_json::to_value(project_for_mcp(&clean)).unwrap();
+        assert!(clean.get("degradations").is_none(), "{clean}");
     }
 
     /// Each state gets its own clause. A partial store and an unembedded one

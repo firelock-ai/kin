@@ -116,7 +116,7 @@ fn change_summary(change: &SemanticChange, include_deltas: bool) -> Result<serde
             .expect("change summary is constructed as a JSON object");
         object.insert(
             "entity_deltas".into(),
-            serde_json::to_value(&change.entity_deltas).map_err(McpError::Json)?,
+            semantic_metadata_json(&change.entity_deltas)?,
         );
         object.insert(
             "relation_deltas".into(),

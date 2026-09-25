@@ -154,6 +154,38 @@ impl LiveRepo {
             .id
     }
 
+    /// The file's own module surface, absent when the file declared nothing.
+    ///
+    /// Looked up by kind rather than by name, because a file whose package
+    /// clause and whose top-level declaration share a name holds two entities
+    /// the name cannot tell apart.
+    fn module_surface(&self, file: &str) -> Option<EntityId> {
+        self.graph
+            .list_all_entities()
+            .expect("list entities")
+            .into_iter()
+            .find(|entity| {
+                entity.kind == kin_model::EntityKind::Module
+                    && entity.file_origin.as_ref().map(|f| f.0.as_str()) == Some(file)
+            })
+            .map(|entity| entity.id)
+    }
+
+    /// Every entity the graph still holds for one file, named for an assertion
+    /// that has to print what survived.
+    fn entities_in(&self, file: &str) -> Vec<String> {
+        let mut found: Vec<String> = self
+            .graph
+            .list_all_entities()
+            .expect("list entities")
+            .into_iter()
+            .filter(|entity| entity.file_origin.as_ref().map(|f| f.0.as_str()) == Some(file))
+            .map(|entity| format!("{:?} {}", entity.kind, entity.name))
+            .collect();
+        found.sort();
+        found
+    }
+
     fn relations_of(&self, id: EntityId) -> Vec<Relation> {
         self.graph
             .get_all_relations_for_entity(&id)
@@ -177,6 +209,17 @@ impl LiveRepo {
     fn call_edge(&self, src: EntityId, dst: EntityId) -> Option<Relation> {
         self.relations_of(src).into_iter().find(|relation| {
             relation.kind == RelationKind::Calls
+                && relation.src == GraphNodeId::Entity(src)
+                && relation.dst == GraphNodeId::Entity(dst)
+        })
+    }
+
+    /// The entity-rooted `Imports` edge between two entities, which is the one
+    /// `find_references` can read. The artifact edge beside it hangs off no
+    /// entity and answers a different question.
+    fn entity_import_edge(&self, src: EntityId, dst: EntityId) -> Option<Relation> {
+        self.relations_of(src).into_iter().find(|relation| {
+            relation.kind == RelationKind::Imports
                 && relation.src == GraphNodeId::Entity(src)
                 && relation.dst == GraphNodeId::Entity(dst)
         })
@@ -255,6 +298,240 @@ impl LiveRepo {
         }
         seen.len()
     }
+}
+
+fn go_receiver_owners(repo: &LiveRepo, method: EntityId) -> Vec<EntityId> {
+    let mut owners: Vec<_> = repo
+        .relations_of(method)
+        .iter()
+        .filter(|r| r.kind == RelationKind::Contains && r.dst.as_entity() == Some(method))
+        .filter_map(|r| r.src.as_entity())
+        .collect();
+    owners.sort();
+    owners.dedup();
+    owners
+}
+
+#[test]
+fn go_cross_file_receiver_owner_follows_type_edits_with_method_unchanged() {
+    for type_first in [false, true] {
+        let mut repo = LiveRepo::new();
+        let files = [
+            ("api/type.go", "package api\ntype Issue struct{}\n"),
+            (
+                "api/export.go",
+                "package api\nfunc (i *Issue) ExportData() {}\n",
+            ),
+        ];
+        for index in if type_first { [0, 1] } else { [1, 0] } {
+            repo.commit(files[index].0, files[index].1);
+        }
+        let method = repo.entity("api/export.go", "Issue.ExportData");
+        assert_eq!(
+            go_receiver_owners(&repo, method),
+            vec![repo.entity("api/type.go", "Issue")]
+        );
+
+        // A process restart must recover the receiver dependency from admitted
+        // bytes, even after it was successfully bound on the previous pass.
+        repo.reconciler = Reconciler::new(repo.dir.path().to_path_buf());
+        repo.reconciler
+            .seed_cross_file_linker_from_graph(&repo.graph);
+        repo.commit("api/type.go", "package api\ntype Renamed struct{}\n");
+        assert!(go_receiver_owners(&repo, method).is_empty());
+        repo.commit(
+            "api/type.go",
+            "package api\ntype Issue struct{ Number int }\n",
+        );
+        assert_eq!(
+            go_receiver_owners(&repo, method),
+            vec![repo.entity("api/type.go", "Issue")]
+        );
+        repo.remove("api/type.go");
+        assert!(go_receiver_owners(&repo, method).is_empty());
+        repo.commit("other/type.go", "package api\ntype Issue struct{}\n");
+        repo.commit(
+            "api/type_test.go",
+            "package api_test\ntype Issue struct{}\n",
+        );
+        assert!(go_receiver_owners(&repo, method).is_empty());
+        assert_eq!(repo.entity("api/export.go", "Issue.ExportData"), method);
+        assert_eq!(
+            std::fs::read_to_string(repo.abs("api/export.go")).unwrap(),
+            files[1].1
+        );
+    }
+}
+
+#[test]
+fn go_cross_file_receiver_owner_withdraws_when_a_competing_type_is_admitted() {
+    let mut repo = LiveRepo::new();
+    repo.commit("api/type.go", "package api\ntype Issue struct{}\n");
+    repo.commit(
+        "api/export.go",
+        "package api\nfunc (i *Issue) ExportData() {}\n",
+    );
+    let method = repo.entity("api/export.go", "Issue.ExportData");
+    assert_eq!(
+        go_receiver_owners(&repo, method),
+        vec![repo.entity("api/type.go", "Issue")]
+    );
+    repo.commit("api/duplicate.go", "package api\ntype Issue struct{}\n");
+    assert!(
+        go_receiver_owners(&repo, method).is_empty(),
+        "two declarations cannot pick whichever type the method linked to first"
+    );
+    repo.remove("api/duplicate.go");
+    assert_eq!(
+        go_receiver_owners(&repo, method),
+        vec![repo.entity("api/type.go", "Issue")],
+        "removing the competing type restores the only remaining owner"
+    );
+    assert_eq!(repo.entity("api/export.go", "Issue.ExportData"), method);
+    assert_eq!(
+        std::fs::read_to_string(repo.abs("api/export.go")).unwrap(),
+        "package api\nfunc (i *Issue) ExportData() {}\n"
+    );
+}
+
+#[test]
+fn go_cross_file_receiver_owner_incomplete_method_cannot_withdraw_last_good_owner() {
+    let mut repo = LiveRepo::new();
+    repo.commit("api/type.go", "package api\ntype Issue struct{}\n");
+    repo.commit(
+        "api/export.go",
+        "package api\nfunc (i *Issue) ExportData() {}\n",
+    );
+    let method = repo.entity("api/export.go", "Issue.ExportData");
+    let owner = repo.entity("api/type.go", "Issue");
+    repo.commit(
+        "api/export.go",
+        "package api\nfunc (i *Issue) ExportData() {\n",
+    );
+    assert_eq!(go_receiver_owners(&repo, method), vec![owner]);
+    // A valid edit of another file nominates this method again, but its
+    // incomplete admitted bytes cannot authorize withdrawing last-good edges.
+    repo.commit("api/duplicate.go", "package api\ntype Issue struct{}\n");
+    assert_eq!(go_receiver_owners(&repo, method), vec![owner]);
+    repo.remove("api/duplicate.go");
+    assert_eq!(go_receiver_owners(&repo, method), vec![owner]);
+}
+
+#[test]
+fn go_receiver_removal_keeps_held_parser_identity_and_foreign_evidence() {
+    let mut repo = LiveRepo::new();
+    let source = "package api\ntype Issue struct{}\nfunc (i Issue) ExportData() {}\n";
+    repo.commit("api/export.go", source);
+    repo.commit("other/type.go", "package other\ntype Issue struct{}\n");
+    repo.commit(
+        "unrelated.py",
+        "class Issue:\n    def ExportData(self):\n        pass\n",
+    );
+    let method = repo.entity("api/export.go", "Issue.ExportData");
+    let owner = repo.entity("api/export.go", "Issue");
+    let mut held: Vec<_> = repo
+        .relations_of(method)
+        .into_iter()
+        .filter(|relation| {
+            relation.kind == RelationKind::Contains && relation.dst.as_entity() == Some(method)
+        })
+        .collect();
+    assert_eq!(held.len(), 1);
+    let mut parsed = held.remove(0);
+    assert_eq!(
+        parsed.id,
+        kin_model::RelationId::from_content(&owner.to_string(), &method.to_string(), "Contains"),
+        "fixture holds the actual pipeline identity"
+    );
+
+    // Establish the real alternate producer identity, without inventing one.
+    let indexed = kin_index::IndexPipeline::new()
+        .index_file_content_with_tests(
+            &kin_model::FilePathId::new("api/export.go"),
+            source.as_bytes(),
+            kin_blobs::digest(source.as_bytes()),
+        )
+        .unwrap()
+        .indexed_file;
+    let linked = kin_index::link_cross_file(
+        &[kin_index::FileParseData {
+            file_path: "api/export.go".into(),
+            entities: indexed.entities,
+            relations: indexed.extracted_relations,
+            imports: indexed.imports,
+        }],
+        &std::collections::HashMap::from([("api/export.go".to_owned(), ArtifactId::new())]),
+    )
+    .unwrap();
+    let alternate = linked
+        .iter()
+        .find(|relation| {
+            relation.kind == RelationKind::Contains
+                && relation.src.as_entity() == Some(owner)
+                && relation.dst.as_entity() == Some(method)
+        })
+        .unwrap();
+    assert_ne!(
+        parsed.id, alternate.id,
+        "the real pipeline and linker identities differ"
+    );
+
+    parsed.created_in = Some(kin_model::SemanticChangeId(Hash256::from_bytes([7; 32])));
+    repo.graph.upsert_relation(&parsed).unwrap();
+    let mut expected = vec![parsed.clone()];
+    for origin in [
+        kin_model::RelationOrigin::Manual,
+        kin_model::RelationOrigin::Lsp,
+    ] {
+        let mut foreign = parsed.clone();
+        foreign.id = kin_model::RelationId::new();
+        foreign.origin = origin;
+        repo.graph.upsert_relation(&foreign).unwrap();
+        expected.push(foreign);
+    }
+    expected.sort_by_key(|relation| relation.id);
+    let python_owner = repo.entity("unrelated.py", "Issue");
+    let mut python_before = repo.relations_of(python_owner);
+    python_before.sort_by_key(|relation| relation.id);
+
+    repo.remove("other/type.go");
+    let mut actual: Vec<_> = repo
+        .relations_of(method)
+        .into_iter()
+        .filter(|relation| {
+            relation.kind == RelationKind::Contains && relation.dst.as_entity() == Some(method)
+        })
+        .collect();
+    actual.sort_by_key(|relation| relation.id);
+    assert_eq!(
+        actual, expected,
+        "unrelated removal must retain the parser identity and all foreign evidence exactly"
+    );
+    let mut python_after = repo.relations_of(python_owner);
+    python_after.sort_by_key(|relation| relation.id);
+    assert_eq!(
+        python_after, python_before,
+        "non-Go ownership is unaffected"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.abs("api/export.go")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn go_cross_file_receiver_owner_does_not_publish_a_local_type_when_ambiguous() {
+    let mut repo = LiveRepo::new();
+    repo.commit("api/duplicate.go", "package api\ntype Issue struct{}\n");
+    repo.commit(
+        "api/export.go",
+        "package api\ntype Issue struct{}\nfunc (i *Issue) ExportData() {}\n",
+    );
+    let method = repo.entity("api/export.go", "Issue.ExportData");
+    assert!(
+        go_receiver_owners(&repo, method).is_empty(),
+        "the per-file parse must not bypass the complete package's refusal"
+    );
 }
 
 const PARSING: &str = "def parse_note(raw):\n    return {\"raw\": raw}\n";
@@ -540,17 +817,35 @@ fn removing_the_destination_file_retires_its_edges_and_a_replacement_rebinds() {
 }
 
 #[test]
-fn a_third_party_import_binds_to_nothing() {
+fn a_third_party_import_names_an_external_boundary_without_a_local_definition() {
     let mut repo = LiveRepo::new();
     repo.commit(
         "client.py",
         "from requests import get\n\ndef fetch(url):\n    return get(url)\n",
     );
+    let fetch = repo.entity("client.py", "fetch");
+    let edges: Vec<_> = repo
+        .relations_of(fetch)
+        .into_iter()
+        .filter(kin_index::is_external_import_placeholder)
+        .collect();
     assert_eq!(
-        repo.cross_file_call_count(),
-        0,
-        "a name no file in the repository defines must not acquire a cross-file edge"
+        edges.len(),
+        1,
+        "the imported symbol has an explicit external boundary"
     );
+    assert_eq!(edges[0].import_source.as_deref(), Some("requests"));
+    assert_eq!(
+        kin_index::RelationResolution::of(&edges[0]),
+        kin_index::RelationResolution::NameOnly
+    );
+    let target = repo
+        .graph
+        .get_entity(&edges[0].dst.as_entity().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(kin_index::is_external_reference_target(&target));
+    assert!(target.file_origin.is_none() && target.signature.is_empty());
     assert!(
         repo.artifact_imports().is_empty(),
         "a third-party module path resolves to no repository file"
@@ -612,5 +907,423 @@ fn a_repository_written_one_file_at_a_time_reports_cross_file_relations() {
         repo.artifact_imports().len(),
         2,
         "and two artifact Imports edges"
+    );
+}
+
+#[test]
+fn derived_member_candidates_and_generator_evidence_survive_live_edit_and_reopen() {
+    use kin_model::derivation::generator_relation_matches;
+    let mut repo = LiveRepo::new();
+    let source =
+        "export const app = {}; for (const key of ['get','post']) { app[key] = () => {}; }";
+    repo.commit("members.js", source);
+    repo.commit(
+        "caller.js",
+        "import { app } from './members'; export function run() { app.get(); }",
+    );
+    let verify = |repo: &LiveRepo| {
+        let id = repo.entity("members.js", "app.get");
+        let member = repo.graph.get_entity(&id).unwrap().unwrap();
+        assert!(member.span.is_none());
+        let artifact = repo
+            .graph
+            .artifact_id_at_path(&RepoPath::from_utf8("members.js").unwrap())
+            .unwrap();
+        let hash = match repo
+            .graph
+            .get_tree_entry(&kin_model::FilePathId::new("members.js"))
+            .unwrap()
+            .unwrap()
+        {
+            TreeEntry::Blob { hash, .. } => hash.to_string(),
+            _ => panic!("blob"),
+        };
+        let edges = repo
+            .graph
+            .traverse(&GraphNodeId::Entity(id), &[], 1)
+            .unwrap()
+            .relations;
+        assert!(
+            edges
+                .iter()
+                .any(|r| generator_relation_matches(&member, r, artifact, &hash)),
+            "{edges:?}"
+        );
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert!(!calls.is_empty(), "candidate remains useful to callers");
+        assert!(calls.iter().all(
+            |r| kin_index::RelationResolution::of(r) == kin_index::RelationResolution::NameOnly
+        ));
+        assert!(kin_model::require_independent_source(&member).is_err());
+        id
+    };
+    let previous = verify(&repo);
+    // Restored graph + fresh linker seed, then caller-only edit.
+    repo.graph = InMemoryGraph::from_snapshot_without_text_index(repo.graph.to_snapshot()).unwrap();
+    repo.reconciler = Reconciler::new(repo.dir.path().to_path_buf());
+    repo.reconciler
+        .seed_cross_file_linker_from_graph(&repo.graph);
+    repo.commit(
+        "caller.js",
+        "import { app } from './members'; export function run() { app.get(); app.post(); }",
+    );
+    verify(&repo);
+    // Generator-only source movement and new RHS; provenance must bind new bytes.
+    repo.commit(
+        "members.js",
+        &format!(
+            "// moved generator\n{}",
+            source.replace("() => {}", "() => 1")
+        ),
+    );
+    verify(&repo);
+    repo.commit(
+        "members.js",
+        "export const app = {}; app.ready = () => true;",
+    );
+    assert!(repo.graph.get_entity(&previous).unwrap().is_none());
+    assert!(!repo
+        .graph
+        .list_all_entities()
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "app.get"));
+}
+
+#[test]
+fn derived_member_file_removal_collects_generator_edges_and_projection_refuses_metadata_stripping()
+{
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "members.js",
+        "export const app={}; for(const key of ['get']) { app[key]=()=>1; }",
+    );
+    let candidate = repo
+        .graph
+        .get_entity(&repo.entity("members.js", "app.get"))
+        .unwrap()
+        .unwrap();
+    let mut stripped = candidate.clone();
+    stripped.metadata.extra.clear();
+    let delta = TransactionDelta {
+        entity_deltas: vec![kin_model::EntityDelta::Modified {
+            old: candidate.clone(),
+            new: stripped,
+        }],
+        ..Default::default()
+    };
+    let error = repo
+        .reconciler
+        .project_transaction_to_files(
+            &delta,
+            &std::collections::HashMap::from([(candidate.id, b"() => 2".to_vec())]),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("generator"), "{error}");
+    repo.remove("members.js");
+    assert!(repo.graph.get_entity(&candidate.id).unwrap().is_none());
+    assert!(repo
+        .graph
+        .traverse(&GraphNodeId::Entity(candidate.id), &[], 1)
+        .unwrap()
+        .relations
+        .is_empty());
+}
+
+/// A Python base written `module.Class` has to be decided by the import the
+/// declaring file wrote, on this path as much as on a cold index. A class
+/// merely sharing the base's leaf name in the SAME file used to outrank it, and
+/// the resulting `Overrides` edge was minted at full parser confidence onto the
+/// wrong class.
+///
+/// Commit order is the hard direction on purpose: the subclass is written
+/// before the module it imports, so the base binding has to survive until the
+/// base file arrives.
+#[test]
+fn a_qualified_python_base_resolves_through_the_import_on_the_live_path() {
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "pkg/rows.py",
+        "import pkg.models as models\n\n\nclass Model:\n    def save(self):\n        return 'decoy'\n\n\nclass Row(models.Model):\n    def save(self):\n        return 'row'\n",
+    );
+    repo.commit(
+        "pkg/models.py",
+        "class Model:\n    def save(self):\n        return 'real'\n",
+    );
+    // The subclass is relinked once its base exists, which is the step where
+    // the binding is read back.
+    repo.commit(
+        "pkg/rows.py",
+        "import pkg.models as models\n\n\nclass Model:\n    def save(self):\n        return 'decoy'\n\n\nclass Row(models.Model):\n    def save(self):\n        return 'row'\n",
+    );
+
+    let row_save = repo.entity("pkg/rows.py", "Row.save");
+    let real_save = repo.entity("pkg/models.py", "Model.save");
+    let decoy_save = repo.entity("pkg/rows.py", "Model.save");
+
+    let overrides: Vec<Relation> = repo
+        .relations_of(row_save)
+        .into_iter()
+        .filter(|relation| {
+            relation.kind == RelationKind::Overrides
+                && relation.src == GraphNodeId::Entity(row_save)
+        })
+        .collect();
+    assert!(
+        overrides
+            .iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(real_save)),
+        "the live path must reach the `Model` the import named: {overrides:#?}"
+    );
+    assert!(
+        !overrides
+            .iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(decoy_save)),
+        "and must not reach the same-file class that only shares its leaf name: {overrides:#?}"
+    );
+}
+
+/// A base a third-party module owns reaches the linker's external-import
+/// placeholder, whose destination is deliberately absent from this repository's
+/// entity set. The live path publishes no half-bound endpoint: it withholds the
+/// edge the same way it withholds an external call or reference, rather than
+/// admitting an edge into a node the graph does not hold.
+///
+/// This is the documented divergence between the batch path, which binds the
+/// placeholder target in the same transaction, and this one. It is asserted
+/// here so the divergence is a stated contract rather than something a reader
+/// discovers from a missing row.
+#[test]
+fn an_external_python_base_is_withheld_rather_than_half_bound_on_the_live_path() {
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "pkg/cli.py",
+        "from click import Group\n\n\nclass AppGroup(Group):\n    def get_command(self, ctx, name):\n        return None\n",
+    );
+
+    let get_command = repo.entity("pkg/cli.py", "AppGroup.get_command");
+    let published: Vec<Relation> = repo
+        .relations_of(get_command)
+        .into_iter()
+        .filter(|relation| relation.kind == RelationKind::Overrides)
+        .collect();
+    assert!(
+        published.is_empty(),
+        "an unbound external endpoint must not be published: {published:#?}"
+    );
+
+    // Nothing was published, so nothing dangles: every relation this repository
+    // holds names endpoints it also holds.
+    let known: Vec<EntityId> = repo
+        .graph
+        .list_all_entities()
+        .expect("list entities")
+        .into_iter()
+        .map(|entity| entity.id)
+        .collect();
+    for entity_id in &known {
+        for relation in repo.relations_of(*entity_id) {
+            if let Some(dst) = relation.dst.as_entity() {
+                assert!(
+                    known.contains(&dst),
+                    "relation {:?} names a destination the graph does not hold",
+                    relation.id
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entity-level import edges, on the live path
+// ---------------------------------------------------------------------------
+
+const GO_STORE_LIVE: &str = "package store\n\nfunc Open() int {\n\treturn 1\n}\n";
+
+const GO_MAIN_LIVE: &str = "package main\n\nimport \"example.com/app/internal/store\"\n\n\
+                            func Run() int {\n\treturn store.Open()\n}\n";
+
+const RUST_STORE_LIVE: &str = "pub struct Store;\n\npub fn open() -> usize {\n    1\n}\n";
+
+const RUST_APP_LIVE: &str = "use crate::store::Store;\n\npub fn run(_: Store) -> usize {\n    \
+                             crate::store::open()\n}\n";
+
+/// The easy write order: the imported package exists before the file that
+/// imports it.
+///
+/// Go minted no entity-level import edge at all before this, so `find_references`
+/// on a Go package had nothing to walk. The daemon path has to mint it too, or
+/// a repository that grew one file at a time holds what a cold `kin init` would
+/// not.
+#[test]
+fn a_go_package_import_reaches_the_package_entity_on_the_live_path() {
+    let mut repo = LiveRepo::new();
+    repo.commit("internal/store/store.go", GO_STORE_LIVE);
+    repo.commit("cmd/app/main.go", GO_MAIN_LIVE);
+
+    let importer = repo.entity("cmd/app/main.go", "main");
+    let package = repo.entity("internal/store/store.go", "store");
+    let edge = repo
+        .entity_import_edge(importer, package)
+        .unwrap_or_else(|| {
+            panic!(
+                "no entity-level Imports edge from the importing file's module surface to the \
+                 package it named; relations = {:?}",
+                repo.relations_of(importer)
+                    .iter()
+                    .map(|relation| (relation.kind, relation.dst))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        kin_index::RelationResolution::of(&edge).as_str(),
+        "import_scoped",
+        "a package representative is a settled scope, not a proven destination"
+    );
+    // The artifact edge is unaffected and still answers "which file imports
+    // which file". Both exist; neither stands in for the other.
+    assert!(
+        repo.artifact_imports().contains(&(
+            "cmd/app/main.go".to_string(),
+            "internal/store/store.go".to_string()
+        )),
+        "the artifact edge must survive beside the entity one: {:?}",
+        repo.artifact_imports()
+    );
+}
+
+/// The hard write order: the importing file is committed before the module it
+/// names exists.
+///
+/// This is the direction a real build takes, because the module you are working
+/// in usually exists before the one it will reach for. A linker that binds
+/// imports only at the importer's own commit leaves the edge missing forever.
+#[test]
+fn a_rust_use_reaches_its_module_when_the_importer_is_committed_first() {
+    let mut repo = LiveRepo::new();
+    repo.commit("src/app.rs", RUST_APP_LIVE);
+    repo.commit("src/store.rs", RUST_STORE_LIVE);
+    // Re-committing the importer is what the daemon does when a dependency
+    // lands: the watch loop reconciles the file whose unresolved import now has
+    // a destination. Without it this case would be asserting that a commit of
+    // one file rewrites another file's edges, which the live path does not do.
+    repo.commit("src/app.rs", RUST_APP_LIVE);
+
+    let importer = repo.entity("src/app.rs", "app");
+    let imported = repo.entity("src/store.rs", "Store");
+    let edge = repo
+        .entity_import_edge(importer, imported)
+        .unwrap_or_else(|| {
+            panic!(
+                "no entity-level Imports edge from `src/app.rs`'s module surface to `Store`; \
+                 relations = {:?}",
+                repo.relations_of(importer)
+                    .iter()
+                    .map(|relation| (relation.kind, relation.dst))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        kin_index::RelationResolution::of(&edge).as_str(),
+        "import_scoped"
+    );
+}
+
+/// An import of a crate this repository does not hold mints nothing on the live
+/// path either, and mints nothing dangling in particular.
+///
+/// The live path withholds an edge whose endpoint the graph does not hold, the
+/// same way it already withholds an external call. This walks every relation in
+/// the store afterwards to show nothing dangles, because a dangling endpoint is
+/// what admission fails closed on.
+#[test]
+fn a_rust_use_of_a_crate_outside_the_repository_leaves_no_dangling_edge() {
+    let mut repo = LiveRepo::new();
+    repo.commit(
+        "src/app.rs",
+        "use serde::Deserialize;\n\npub fn run() -> usize {\n    1\n}\n",
+    );
+
+    let known: Vec<EntityId> = repo
+        .graph
+        .list_all_entities()
+        .expect("list entities")
+        .into_iter()
+        .map(|entity| entity.id)
+        .collect();
+    for id in &known {
+        for relation in repo.relations_of(*id) {
+            if let Some(dst) = relation.dst.as_entity() {
+                assert!(
+                    known.contains(&dst),
+                    "relation {:?} names a destination the store does not hold",
+                    relation.kind
+                );
+            }
+            if let Some(src) = relation.src.as_entity() {
+                assert!(
+                    known.contains(&src),
+                    "relation {:?} is sourced at an entity the store does not hold",
+                    relation.kind
+                );
+            }
+        }
+    }
+}
+
+/// A file that stops declaring anything retires its module surface, and the
+/// entity-level import edge sourced there goes with it.
+///
+/// The surface is minted only for a file that produced a declaration or an
+/// import, so an edit that empties a file has to remove it rather than leave a
+/// module standing for bytes that declare nothing. Nothing else in this suite
+/// drives a file from entities to zero, and a surface that survived would keep
+/// answering "who imports this" from a file that imports nothing.
+#[test]
+fn emptying_a_file_retires_its_module_surface_and_the_edge_it_sourced() {
+    let mut repo = LiveRepo::new();
+    repo.commit("internal/store/store.go", GO_STORE_LIVE);
+    repo.commit("cmd/app/main.go", GO_MAIN_LIVE);
+
+    let importer = repo
+        .module_surface("cmd/app/main.go")
+        .expect("the importing file carries a module surface");
+    let package = repo
+        .module_surface("internal/store/store.go")
+        .expect("the imported package carries a module surface");
+    assert!(
+        repo.entity_import_edge(importer, package).is_some(),
+        "the case starts from a real entity-level import edge"
+    );
+
+    // The same path, holding a comment and nothing else.
+    repo.commit("cmd/app/main.go", "// nothing is declared here\n");
+
+    assert!(
+        repo.module_surface("cmd/app/main.go").is_none(),
+        "the module surface survived a file that declares nothing: {:?}",
+        repo.entities_in("cmd/app/main.go")
+    );
+    assert_eq!(
+        repo.entities_in("cmd/app/main.go"),
+        Vec::<String>::new(),
+        "an emptied file must hold no entity at all"
+    );
+    assert!(
+        repo.entity_import_edge(importer, package).is_none(),
+        "the import edge sourced at the retired module surface survived it: {:?}",
+        repo.relations_of(importer)
+            .iter()
+            .map(|relation| (relation.kind, relation.src, relation.dst))
+            .collect::<Vec<_>>()
+    );
+    // The destination is untouched: retiring the importer is not a reason to
+    // retire what it named.
+    assert!(
+        repo.module_surface("internal/store/store.go").is_some(),
+        "the imported package's own surface must survive the importer emptying"
     );
 }

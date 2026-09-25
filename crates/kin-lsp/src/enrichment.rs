@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::debug;
 
@@ -23,8 +23,8 @@ use crate::protocol::{
     TypeHierarchyPrepareParams, TypeHierarchySupertypesParams,
 };
 use kin_model::{
-    EntityId, FilePathId, GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind,
-    RelationOrigin, SourceSpan,
+    EntityId, GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+    SourceSpan,
 };
 
 /// Result of enriching a single file via LSP.
@@ -49,19 +49,58 @@ pub struct EntityRef {
     pub end_line: u32,
     /// Position of the entity NAME (not declaration start).
     /// LSP prepareCallHierarchy needs cursor on the name, not the fn keyword.
+    ///
+    /// A hint derived from the signature. A per-entity query is asked where the
+    /// captured source spells the name, which is here when it does and
+    /// elsewhere on the declaration line when it does not (see
+    /// `SourcePositions::name_position`).
     pub name_line: u32,
     pub name_col: u32,
+    /// Whether the entity's own name is written in its declaration.
+    ///
+    /// False for a module or file surface, whose name is its file's. No token
+    /// in the file names it, so a query asked for it lands on whatever the file
+    /// opens with, and every answer about that token would be attributed to the
+    /// module. The per-entity name queries skip such an entity.
+    pub declares_name: bool,
+    /// The graph entity's kind.
+    ///
+    /// A server's reference answer can depend on it: gopls answers a method's
+    /// references with those of every method related to it through interface
+    /// satisfaction as well, so a Go method's reference sites are proven one
+    /// by one before any is recorded (see [`enrich_entity_references`]).
+    pub kind: kin_model::EntityKind,
+}
+
+impl EntityRef {
+    /// Whether an entity of `kind` writes its own name in its declaration.
+    pub fn kind_declares_name(kind: kin_model::EntityKind) -> bool {
+        !matches!(
+            kind,
+            kin_model::EntityKind::Module
+                | kin_model::EntityKind::Package
+                | kin_model::EntityKind::File
+        )
+    }
 }
 
 /// Spatial index: given a file URI and line number, find the matching entity.
+///
+/// Files are held by repository-relative path, the graph's own spelling, and a
+/// server names a file by an absolute URI. The two are joined by stripping the
+/// workspace root from the URI's path and looking up what is left exactly (see
+/// [`Self::repository_file`]).
 pub struct EntityIndex {
-    /// Map from file path → sorted list of (start_line, end_line, EntityRef)
+    /// Repository-relative file path → that file's entities, by start line.
     by_file: HashMap<String, Vec<EntityRef>>,
+    /// The workspace root, spelled as a `file:` URI decodes on this host.
+    root: PathBuf,
 }
 
 impl EntityIndex {
-    /// Build an index from entity refs.
-    pub fn new(entities: Vec<EntityRef>) -> Self {
+    /// Build an index from entity refs whose `file_path` is relative to
+    /// `workspace_root`, the root the language server was started at.
+    pub fn new(entities: Vec<EntityRef>, workspace_root: &Path) -> Self {
         let mut by_file: HashMap<String, Vec<EntityRef>> = HashMap::new();
         for entity in entities {
             by_file
@@ -73,15 +112,76 @@ impl EntityIndex {
         for entries in by_file.values_mut() {
             entries.sort_by_key(|e| e.start_line);
         }
-        Self { by_file }
+        // Respelled the way a server's answer decodes, so the two compare in
+        // the one spelling `require_source_uri` compares them in. On Windows
+        // `std::fs::canonicalize` returns `\\?\C:\repo`, and a server answers
+        // `file:///c%3A/repo/...`, which decodes to `C:/repo/...`. On Unix an
+        // absolute root comes back byte for byte.
+        let root = protocol::uri_to_path(&protocol::path_to_uri(workspace_root))
+            .unwrap_or_else(|| workspace_root.to_path_buf());
+        Self { by_file, root }
     }
 
-    fn entries_for_path(&self, path: &str) -> Option<&Vec<EntityRef>> {
-        self.by_file.get(path).or_else(|| {
+    /// The repository-relative path a `file:` URI names: its path below the
+    /// workspace root, `/`-separated as the graph spells paths.
+    ///
+    /// `None` for a URI outside the root, including a dependency's source in
+    /// a module cache or a sibling checkout whose path merely ends the same
+    /// way, for a remainder that is empty, climbs out of the root or is not
+    /// UTF-8, and for anything that is not a local `file:` URI. The result is
+    /// the file's path whether or not this index holds it.
+    pub fn repository_file(&self, uri: &str) -> Option<String> {
+        let path = protocol::uri_to_path(uri)?;
+        let relative = path.strip_prefix(&self.root).ok()?;
+        let mut file = String::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(part) = component else {
+                return None;
+            };
+            if !file.is_empty() {
+                file.push('/');
+            }
+            file.push_str(part.to_str()?);
+        }
+        (!file.is_empty()).then_some(file)
+    }
+
+    /// Whether a URI outside the workspace lands, at `line`, in a declaration
+    /// of an admitted file whose repository path is a whole-component tail of
+    /// the URI's path, like `/foreign/types.py` for an admitted `types.py`.
+    ///
+    /// Such a location names no admitted file and is placed nowhere. The
+    /// suffix placement used to put it in the admitted file, and the
+    /// references arm refused an answer holding one rather than reading it as
+    /// a site outside the admitted inventory. This keeps that refusal
+    /// without placing anything, and it looks each tail up exactly, so no
+    /// hash seed takes part in the verdict.
+    pub fn admitted_source_outside(&self, uri: &str, line: u32) -> bool {
+        if self.repository_file(uri).is_some() {
+            return false;
+        }
+        let Some(path) = protocol::uri_to_path(uri) else {
+            return false;
+        };
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {}
+                std::path::Component::Normal(part) => match part.to_str() {
+                    Some(part) => parts.push(part),
+                    None => return false,
+                },
+                _ => return false,
+            }
+        }
+        (0..parts.len()).any(|start| {
             self.by_file
-                .iter()
-                .find(|(k, _)| path.ends_with(k.as_str()) || k.ends_with(path))
-                .map(|(_, v)| v)
+                .get(&parts[start..].join("/"))
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|e| line >= e.start_line && line <= e.end_line)
+                })
         })
     }
 
@@ -108,10 +208,20 @@ impl EntityIndex {
     /// because it currently holds by convention on both sides and a one-line
     /// change to either would silently shift every lookup by a line, which on
     /// `def` lines means resolving the enclosing scope instead of the method.
+    ///
+    /// The file is the one whose repository path is exactly the URI's path
+    /// below the workspace root. The lookup used to take the absolute path
+    /// itself as the key, which no repository-relative key ever equals, and
+    /// then fall back to the first key the path ended with. Where one
+    /// repository path ends another, both keys matched: cli/cli's
+    /// `api/client_test.go` ends `pkg/cmd/attestation/api/client_test.go`, and
+    /// whichever of the two a `HashMap` iterated to first won, so each index's
+    /// random seed picked the file. A wrong pick put a site in a file that does
+    /// not hold it, which wrote false edges and, once sources were checked,
+    /// refused the whole answer. A dependency's source in a module cache ended
+    /// in a repository path just as well, and matched a file that is not it.
     pub fn find_at(&self, uri: &str, line: u32) -> Option<&EntityRef> {
-        let path = protocol::uri_to_path(uri)?;
-        let path_str = path.to_string_lossy();
-        let entries = self.entries_for_path(path_str.as_ref())?;
+        let entries = self.by_file.get(&self.repository_file(uri)?)?;
 
         entries
             .iter()
@@ -127,19 +237,32 @@ impl EntityIndex {
             })
     }
 
-    /// Return every entity known to live in a file path.
+    /// Return every entity in the file at repository-relative `file_path`.
+    ///
+    /// Only that exact path names the file. A path another one merely ends
+    /// with names no file here, for the reason [`Self::find_at`] gives.
     pub fn entities_in_file(&self, file_path: &str) -> Vec<&EntityRef> {
-        self.entries_for_path(file_path)
+        self.by_file
+            .get(file_path)
             .map(|entries| entries.iter().collect())
             .unwrap_or_default()
     }
 
-    /// Find entity by name match (fallback when position doesn't match).
+    /// The one entity named `name`, or whose name ends in `.name`.
+    ///
+    /// `None` when no entity matches and when several do. This returned
+    /// whichever match a `HashMap` iterated to first, so a name two entities
+    /// answer to, like cli/cli's `GetByRepoAndDigest` on both `LiveClient` and
+    /// `MockClient`, named one of them at random.
     pub fn find_by_name(&self, name: &str) -> Option<&EntityRef> {
-        self.by_file
+        let member = format!(".{name}");
+        let mut matches = self
+            .by_file
             .values()
-            .flat_map(|entries| entries.iter())
-            .find(|e| e.name == name || e.name.ends_with(&format!(".{}", name)))
+            .flatten()
+            .filter(|e| e.name == name || e.name.ends_with(&member));
+        let found = matches.next()?;
+        matches.next().is_none().then_some(found)
     }
 }
 
@@ -156,10 +279,55 @@ impl EntityIndex {
 /// display surfaces add one.
 pub(crate) fn query_position_evidence(
     rule: &'static str,
-    file: &str,
-    range: &protocol::Range,
+    span: SourceSpan,
 ) -> Vec<RelationEvidence> {
-    vec![position_evidence(rule, file, range)]
+    vec![position_evidence(rule, span)]
+}
+
+fn admitted_text(documents: Option<DocumentProvider<'_>>, file: &str) -> Result<String> {
+    documents
+        .and_then(|provider| provider(file))
+        .ok_or_else(|| LspError::Protocol(format!("repository source unavailable for LSP: {file}")))
+}
+
+/// Refuse an answer whose URI names a file other than the admitted one.
+///
+/// Compared as files rather than as strings: a server may spell the same path
+/// with other escapes, or a Windows drive as `c%3A`, and that is still the file
+/// Kin opened.
+fn require_source_uri(uri: &str, file: &str, root: &Path) -> Result<()> {
+    if !protocol::same_file_uri(uri, &protocol::path_to_uri(&root.join(file))) {
+        return Err(LspError::Protocol(format!(
+            "LSP source URI does not identify admitted file {file}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod source_uri_tests {
+    use super::*;
+
+    /// A server that escapes `@` or a space names the admitted file all the
+    /// same, and one that names a sibling is still refused.
+    #[test]
+    fn a_differently_escaped_uri_still_identifies_the_admitted_file() {
+        let root = Path::new("/repo");
+        require_source_uri(
+            "file:///repo/packages/%40scope/my%20dir/a.ts",
+            "packages/@scope/my dir/a.ts",
+            root,
+        )
+        .expect("the same file, escaped differently");
+        require_source_uri(
+            &protocol::path_to_uri(&root.join("src/a.py")),
+            "src/a.py",
+            root,
+        )
+        .expect("Kin's own spelling");
+        assert!(require_source_uri("file:///repo/src/b.py", "src/a.py", root).is_err());
+        assert!(require_source_uri("file:///elsewhere/src/a.py", "src/a.py", root).is_err());
+    }
 }
 
 /// The most positions one enrichment edge records.
@@ -184,9 +352,9 @@ pub const MAX_SITES_PER_EDGE: usize = 64;
 /// ones the server happened to name first.
 pub(crate) fn query_positions_evidence(
     rule: &'static str,
-    file: &str,
+    source: &crate::source_positions::SourcePositions<'_>,
     ranges: impl IntoIterator<Item = protocol::Range>,
-) -> Vec<RelationEvidence> {
+) -> Result<Vec<RelationEvidence>> {
     fn key(range: &protocol::Range) -> (u32, u32, u32, u32) {
         (
             range.start.line,
@@ -198,30 +366,26 @@ pub(crate) fn query_positions_evidence(
     let mut ordered: Vec<protocol::Range> = ranges.into_iter().collect();
     ordered.sort_by_key(key);
     ordered.dedup_by_key(|range| key(range));
-    ordered.truncate(MAX_SITES_PER_EDGE);
-    ordered
+    // The retained list is a floor, but truncation must not hide malformed
+    // observations and turn a failed query into a successful completion.
+    let mut evidence = ordered
         .iter()
-        .map(|range| position_evidence(rule, file, range))
-        .collect()
+        .map(|range| {
+            source
+                .range(range)
+                .map(|span| position_evidence(rule, span))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    evidence.truncate(MAX_SITES_PER_EDGE);
+    Ok(evidence)
 }
 
-fn position_evidence(rule: &'static str, file: &str, range: &protocol::Range) -> RelationEvidence {
+fn position_evidence(rule: &'static str, span: SourceSpan) -> RelationEvidence {
     RelationEvidence {
-        source_span: Some(SourceSpan {
-            file: FilePathId::new(file),
-            start_byte: 0,
-            end_byte: 0,
-            start_line: range.start.line,
-            start_col: range.start.character,
-            end_line: range.end.line,
-            end_col: range.end.character,
-        }),
+        source_span: Some(span),
         parser_rule: Some(rule.to_string()),
-        token: None,
-        source_path: None,
-        resolved_path: None,
         occurrence_count: 1,
-        call_shape: None,
+        ..Default::default()
     }
 }
 
@@ -254,6 +418,7 @@ pub async fn enrich_entity_calls(
     caller: &EntityRef,
     index: &EntityIndex,
     workspace_root: &Path,
+    documents: Option<DocumentProvider<'_>>,
 ) -> Result<Vec<Relation>> {
     if !server.has_call_hierarchy() {
         return Ok(Vec::new());
@@ -262,6 +427,12 @@ pub async fn enrich_entity_calls(
     let file_path = workspace_root.join(&caller.file_path);
     let uri = protocol::path_to_uri(&file_path);
 
+    let text = admitted_text(documents, &caller.file_path)?;
+    let positions = crate::source_positions::SourcePositions::new(&caller.file_path, &text);
+    let Some(request_position) = positions.name_position(caller)? else {
+        return Ok(Vec::new());
+    };
+
     // Step 1: Prepare call hierarchy at the entity's position.
     let prepare_result = server
         .client
@@ -269,10 +440,7 @@ pub async fn enrich_entity_calls(
             "textDocument/prepareCallHierarchy",
             protocol::CallHierarchyPrepareParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: Position {
-                    line: caller.name_line,
-                    character: caller.name_col,
-                },
+                position: request_position.clone(),
             },
         )
         .await;
@@ -283,8 +451,40 @@ pub async fn enrich_entity_calls(
         return Ok(Vec::new());
     }
 
-    // Step 2: Query outgoing calls for the first item (the entity itself).
+    // Step 2: Require one prepared source matching the queried entity.
+    if items.len() != 1 {
+        return Err(LspError::Protocol(
+            "ambiguous prepared call hierarchy source".into(),
+        ));
+    }
     let item = &items[0];
+    require_source_uri(&item.uri, &caller.file_path, workspace_root)?;
+    let enclosing = positions.range(&item.range)?;
+    let selection = positions.range(&item.selection_range)?;
+    let binding_initializer =
+        selection.start_byte < enclosing.start_byte || selection.end_byte > enclosing.end_byte;
+    if binding_initializer
+        && !crate::typescript_call_hierarchy::proves_binding_initializer(
+            caller,
+            &text,
+            &request_position,
+            &selection,
+            &enclosing,
+        )
+    {
+        return Err(LspError::Protocol(
+            "prepared call hierarchy selection is outside its source range".into(),
+        ));
+    }
+    if index
+        .find_at(&item.uri, item.selection_range.start.line)
+        .map(|e| e.id)
+        != Some(caller.id)
+    {
+        return Err(LspError::Protocol(
+            "prepared call hierarchy source is not the queried entity".into(),
+        ));
+    }
     let outgoing_result = server
         .client
         .request(
@@ -299,6 +499,34 @@ pub async fn enrich_entity_calls(
     // Step 3: Match each outgoing call target to a graph entity.
     let mut relations = Vec::new();
     for call in &outgoing {
+        if call.from_ranges.is_empty()
+            || call.from_ranges.iter().any(|range| {
+                range.start.line < caller.start_line || range.end.line > caller.end_line
+            })
+        {
+            return Err(LspError::Protocol(
+                "outgoing call has no proven site within queried caller lines".into(),
+            ));
+        }
+        // A binding's initializer is narrower than its declaration line. A
+        // second declarator may share that line, so its call sites must not be
+        // attributed to this binding. Validate every site before the evidence
+        // cap can omit any of them.
+        if binding_initializer {
+            for range in &call.from_ranges {
+                let span = positions.range(range)?;
+                if span.start_byte < enclosing.start_byte || span.end_byte > enclosing.end_byte {
+                    return Err(LspError::Protocol(
+                        "outgoing call is outside the proven binding initializer".into(),
+                    ));
+                }
+            }
+        }
+        let evidence = query_positions_evidence(
+            "lsp_call_hierarchy",
+            &positions,
+            call.from_ranges.iter().cloned(),
+        )?;
         let target_line = call.to.selection_range.start.line;
         let target_uri = &call.to.uri;
 
@@ -328,11 +556,7 @@ pub async fn enrich_entity_calls(
                     // answers with one range per call it saw, and taking only
                     // the head reported a caller that calls the target five
                     // times as calling it once.
-                    evidence: query_positions_evidence(
-                        "lsp_call_hierarchy",
-                        &caller.file_path,
-                        call.from_ranges.iter().cloned(),
-                    ),
+                    evidence,
                 });
             }
             None => {
@@ -355,6 +579,7 @@ pub async fn enrich_entity_overrides(
     method: &EntityRef,
     index: &EntityIndex,
     workspace_root: &Path,
+    documents: Option<DocumentProvider<'_>>,
 ) -> Result<Vec<Relation>> {
     if !server.has_type_hierarchy() {
         return Ok(Vec::new());
@@ -370,6 +595,12 @@ pub async fn enrich_entity_overrides(
     let file_path = workspace_root.join(&method.file_path);
     let uri = protocol::path_to_uri(&file_path);
 
+    let text = admitted_text(documents, &method.file_path)?;
+    let positions = crate::source_positions::SourcePositions::new(&method.file_path, &text);
+    let Some(request_position) = positions.name_position(method)? else {
+        return Ok(Vec::new());
+    };
+
     // Step 1: Prepare type hierarchy at the method's position.
     let prepare_result = server
         .client
@@ -377,10 +608,7 @@ pub async fn enrich_entity_overrides(
             "textDocument/prepareTypeHierarchy",
             TypeHierarchyPrepareParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: Position {
-                    line: method.name_line,
-                    character: method.start_col,
-                },
+                position: request_position,
             },
         )
         .await;
@@ -568,18 +796,110 @@ pub(crate) async fn locations_at(
 /// receiver whose definition is a declaration in the file being enriched is a
 /// value in that file; one whose definition is another file's module entry is a
 /// reference to that module.
+///
+/// The file being enriched is the one whose repository path is exactly
+/// `enriched_path`, read the way [`EntityIndex::repository_file`] reads a URI,
+/// and a file outside the workspace is always another file. Compared by
+/// suffix, any file whose path ended in `enriched_path` read as this one: in
+/// cli/cli's root `api/client.go`, a receiver resolved into
+/// `pkg/cmd/attestation/api/client.go`, or into a module cache path ending in
+/// `api/client.go`, was taken for a value here and its member was never
+/// joined. An answer that names no local file makes no module, as before.
 pub(crate) fn receiver_names_a_module(
     definitions: &[protocol::Location],
+    index: &EntityIndex,
     enriched_path: &str,
 ) -> bool {
     definitions.iter().any(|location| {
-        protocol::uri_to_path(&location.uri)
-            .map(|path| {
-                let path = path.to_string_lossy().to_string();
-                !(path.ends_with(enriched_path) || enriched_path.ends_with(path.as_str()))
-            })
-            .unwrap_or(false)
+        protocol::uri_to_path(&location.uri).is_some()
+            && index.repository_file(&location.uri).as_deref() != Some(enriched_path)
     })
+}
+
+/// A declined location request located nothing. Every other failure stays one.
+fn declined_as_empty(answer: Result<Vec<protocol::Location>>) -> Result<Vec<protocol::Location>> {
+    match answer {
+        Err(error) if error.is_declined() => Ok(Vec::new()),
+        other => other,
+    }
+}
+
+/// The declarations a receiver names when the server resolved it to values of
+/// that same name in other files, which makes it an imported value rather than
+/// a module.
+///
+/// [`receiver_names_a_module`] reads every definition in another file as a
+/// module. That holds for `express` in `express.Router()`, whose definition is
+/// the module entry `./index.js:10` and maps to `createApplication`. It does not
+/// hold for an imported value: Flask's `current_app.config[...]` resolves
+/// `current_app` to its own declaration in `flask/globals.py`, and read as a
+/// module it minted no edge, so no file that uses an imported constant as a
+/// receiver was recorded as referencing it.
+///
+/// `Some` only when every answer is a non-empty range on an entity's
+/// declaration line and that entity declares the receiver's own name. A module
+/// answers with an empty range at the top of its file and a module surface
+/// declares no name, so `flask` in `flask.Blueprint(...)`, and `settings` in
+/// `settings.DEBUG` even where `settings.py` opens by declaring `settings`, stay
+/// modules. An alias, an answer on an import line, an answer inside a body and
+/// a differently named declaration on the same line all refuse.
+pub(crate) fn receiver_declared_values<'a>(
+    definitions: &[protocol::Location],
+    index: &'a EntityIndex,
+    receiver: &str,
+) -> Option<Vec<&'a EntityRef>> {
+    if definitions.is_empty() {
+        return None;
+    }
+    definitions
+        .iter()
+        .map(|location| {
+            let range = &location.range;
+            let empty =
+                (range.start.line, range.start.character) == (range.end.line, range.end.character);
+            index
+                .find_at(&location.uri, range.start.line)
+                .filter(|entity| {
+                    !empty
+                        && entity.declares_name
+                        && entity.name_line == range.start.line
+                        && entity.name.rsplit('.').next() == Some(receiver)
+                })
+        })
+        .collect()
+}
+
+/// Whether `path` is Python source, whose entities carry their exact
+/// declaration line: a decorated definition records it below its decorators.
+pub(crate) fn is_python_source(path: &str) -> bool {
+    path.ends_with(".py") || path.ends_with(".pyi")
+}
+
+/// Whether an answer at `range`, which `find_at` placed in `dst`, names `dst`
+/// itself.
+///
+/// Only Python destinations are read this way, because pyright's answers have
+/// two shapes that make it decidable. A named declaration answers with its name
+/// token, on the line the entity records as declaring that name. A module
+/// answers with an empty range at the top of its file.
+///
+/// So an answer on another line of `dst`'s span names something declared
+/// inside it: pyright answers `_static_folder` with the class attribute and
+/// with `self._static_folder = value` inside a property setter, and the second
+/// answer made the attribute's own line read as a reference to the setter. And
+/// an empty answer names a module, which `find_at` turns into whatever the
+/// file's first line declares, so `from .globals import current_app` read as a
+/// reference to the class `globals.py` opens with. A module surface declares
+/// no name, and it is the only entity such an answer can name.
+pub(crate) fn answer_names_entity(dst: &EntityRef, range: &protocol::Range) -> bool {
+    if !is_python_source(&dst.file_path) {
+        return true;
+    }
+    let empty = (range.start.line, range.start.character) == (range.end.line, range.end.character);
+    if empty {
+        return !dst.declares_name;
+    }
+    range.start.line == dst.name_line
 }
 
 /// Whether two answers name the same place.
@@ -646,6 +966,7 @@ pub(crate) struct ScopedDocuments<'a> {
     server: &'a LspServer,
     provider: Option<DocumentProvider<'a>>,
     open: std::collections::HashSet<String>,
+    texts: std::collections::HashMap<String, String>,
 }
 
 impl<'a> ScopedDocuments<'a> {
@@ -654,7 +975,19 @@ impl<'a> ScopedDocuments<'a> {
             server,
             provider,
             open: std::collections::HashSet::new(),
+            texts: std::collections::HashMap::new(),
         }
+    }
+
+    pub(crate) fn remember(&mut self, file: &str, text: &str) {
+        self.texts.insert(file.to_owned(), text.to_owned());
+    }
+
+    fn text(&self, file: &str) -> Result<&str> {
+        self.texts
+            .get(file)
+            .map(String::as_str)
+            .ok_or_else(|| LspError::Protocol(format!("captured LSP document unavailable: {file}")))
     }
 
     /// Hand `rel_path` to the server if it is not already open, and report
@@ -681,6 +1014,7 @@ impl<'a> ScopedDocuments<'a> {
             );
             return Ok(false);
         };
+        self.texts.insert(rel_path.to_owned(), text.clone());
         // Ownership precedes the notification await: the frame can reach the
         // server even when its caller is cancelled before the write ack.
         self.open.insert(uri.to_string());
@@ -783,25 +1117,34 @@ pub(crate) async fn member_export_bindings<'a>(
     receiver_col: u32,
     member_col: u32,
     member_name: &str,
-) -> Result<Vec<&'a EntityRef>> {
-    let module_locations = locations_at(
-        server,
-        "textDocument/typeDefinition",
-        uri,
-        line,
-        receiver_col,
-    )
-    .await?;
-    let member_definitions =
-        locations_at(server, "textDocument/definition", uri, line, member_col).await?;
+) -> Result<MemberBindings<'a>> {
+    // A declined answer on any leg proves no binding, so it binds nothing
+    // rather than failing the caller's whole pass. gopls declines
+    // typeDefinition at a package-level value of an unnamed struct type, and
+    // failing there cost every definition edge of the file asking.
+    let module_locations = declined_as_empty(
+        locations_at(
+            server,
+            "textDocument/typeDefinition",
+            uri,
+            line,
+            receiver_col,
+        )
+        .await,
+    )?;
+    let member_definitions = declined_as_empty(
+        locations_at(server, "textDocument/definition", uri, line, member_col).await,
+    )?;
     let mut bound: Vec<&EntityRef> = Vec::new();
+    let mut unasked = 0usize;
 
     for module_location in &module_locations {
-        let Some(module_path) = protocol::uri_to_path(&module_location.uri) else {
+        // A module outside the workspace holds no candidate, however its
+        // path ends.
+        let Some(module_file) = index.repository_file(&module_location.uri) else {
             continue;
         };
-        let module_path = module_path.to_string_lossy().to_string();
-        for candidate in index.entities_in_file(&module_path) {
+        for candidate in index.entities_in_file(&module_file) {
             if candidate.name != member_name {
                 continue;
             }
@@ -813,14 +1156,35 @@ pub(crate) async fn member_export_bindings<'a>(
             {
                 continue;
             }
-            let candidate_definitions = locations_at(
-                server,
-                "textDocument/definition",
-                &candidate_uri,
-                candidate.name_line,
-                candidate.name_col,
-            )
-            .await?;
+            let candidate_text = documents.text(&candidate.file_path)?;
+            let candidate_positions =
+                crate::source_positions::SourcePositions::new(&candidate.file_path, candidate_text);
+            let candidate_position = match candidate_positions.name_position(candidate) {
+                Ok(Some(position)) => position,
+                Ok(None) => continue,
+                // The candidate's declaration line does not spell its name, so
+                // its token cannot be asked about. That leaves this one join
+                // unfinished, not the file that asked for it.
+                Err(error) => {
+                    unasked += 1;
+                    debug!(
+                        candidate = %candidate.name,
+                        %error,
+                        "a member join could not ask about a candidate export"
+                    );
+                    continue;
+                }
+            };
+            let candidate_definitions = declined_as_empty(
+                locations_at(
+                    server,
+                    "textDocument/definition",
+                    &candidate_uri,
+                    candidate_position.line,
+                    candidate_position.character,
+                )
+                .await,
+            )?;
             if !candidate_is_proven(&candidate_definitions, &member_definitions) {
                 continue;
             }
@@ -830,7 +1194,17 @@ pub(crate) async fn member_export_bindings<'a>(
             bound.push(candidate);
         }
     }
-    Ok(bound)
+    Ok(MemberBindings { bound, unasked })
+}
+
+/// What a member join proved, and what it could not ask.
+pub(crate) struct MemberBindings<'a> {
+    /// The in-tree exports the member binds to.
+    pub(crate) bound: Vec<&'a EntityRef>,
+    /// Same-named candidate exports whose own name could not be located, so
+    /// the join could not ask about them. Nonzero means the join did not
+    /// finish, and a caller that reports completeness has to count it.
+    pub(crate) unasked: usize,
 }
 
 /// Query type definitions for entities referenced in a function's signature/body.
@@ -860,6 +1234,7 @@ pub async fn enrich_entity_uses_type(
                 entity.file_path
             ))
         })?;
+    let positions = crate::source_positions::SourcePositions::new(&entity.file_path, &file_content);
     let lines: Vec<&str> = file_content.lines().collect();
 
     // Sample positions within the entity's span to discover type usages.
@@ -868,12 +1243,22 @@ pub async fn enrich_entity_uses_type(
     let mut relations = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
     let mut scoped_documents = ScopedDocuments::new(server, documents);
+    scoped_documents.remember(&entity.file_path, &file_content);
 
     let result = async {
         for line in entity.start_line..=entity.end_line {
             let Some(line_text) = lines.get(line as usize) else {
                 continue;
             };
+            // A module surface declares no name and spans its whole file, so
+            // every line a declaration inside it owns would be asked about twice
+            // and the module credited with its members' types. It asks about its
+            // own top-level lines only.
+            if !entity.declares_name
+                && index.find_at(&uri, line).map(|owner| owner.id) != Some(entity.id)
+            {
+                continue;
+            }
 
             for col in identifier_positions_in_line(line_text) {
                 // A member expression on a MODULE receiver is answered by its
@@ -890,10 +1275,22 @@ pub async fn enrich_entity_uses_type(
                 if let Some((_receiver, member_col, member_name)) =
                     member_expression_at(line_text, col)
                 {
-                    let receiver_definitions =
-                        locations_at(server, "textDocument/definition", &uri, line, col).await?;
-                    if receiver_names_a_module(&receiver_definitions, &entity.file_path) {
-                        for candidate in member_export_bindings(
+                    let receiver_definitions = match locations_at(
+                        server,
+                        "textDocument/definition",
+                        &uri,
+                        line,
+                        positions.scalar_position(line, col)?.character,
+                    )
+                    .await
+                    {
+                        Ok(locations) => locations,
+                        // Declined at this position: nothing here, next one.
+                        Err(error) if error.is_declined() => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if receiver_names_a_module(&receiver_definitions, index, &entity.file_path) {
+                        let bindings = member_export_bindings(
                             server,
                             index,
                             workspace_root,
@@ -901,12 +1298,22 @@ pub async fn enrich_entity_uses_type(
                             &entity.file_path,
                             &uri,
                             line,
-                            col,
-                            member_col,
+                            positions.scalar_position(line, col)?.character,
+                            positions.scalar_position(line, member_col)?.character,
                             &member_name,
                         )
-                        .await?
-                        {
+                        .await?;
+                        // This arm reports no partial answer, so a join it
+                        // could not finish is the entity's failure, as it
+                        // was when the unlocated name ended the join.
+                        if bindings.unasked > 0 {
+                            return Err(LspError::Protocol(format!(
+                                "`{member_name}` has {} candidate export(s) whose name could not \
+                                 be located to ask about",
+                                bindings.unasked
+                            )));
+                        }
+                        for candidate in bindings.bound {
                             if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
                                 continue;
                             }
@@ -925,17 +1332,7 @@ pub async fn enrich_entity_uses_type(
                                 import_source: None,
                                 evidence: query_position_evidence(
                                     "lsp_member_on_module",
-                                    &entity.file_path,
-                                    &protocol::Range {
-                                        start: Position {
-                                            line,
-                                            character: member_col,
-                                        },
-                                        end: Position {
-                                            line,
-                                            character: member_col,
-                                        },
-                                    },
+                                    positions.token(line, member_col)?,
                                 ),
                             });
                             debug!(
@@ -958,15 +1355,19 @@ pub async fn enrich_entity_uses_type(
                         "textDocument/typeDefinition",
                         protocol::TextDocumentPositionParams {
                             text_document: TextDocumentIdentifier { uri: uri.clone() },
-                            position: Position {
-                                line,
-                                character: col,
-                            },
+                            position: positions.scalar_position(line, col)?,
                         },
                     )
                     .await;
 
-                let locations = decode_locations(type_def_result?)?;
+                // A declined position has no type to find, and says nothing about
+                // the next one. Stopping here, as this arm used to, ended every Go
+                // entity's pass at its `func` keyword.
+                let locations = match type_def_result {
+                    Ok(value) => decode_locations(value)?,
+                    Err(error) if error.is_declined() => continue,
+                    Err(error) => return Err(error),
+                };
 
                 for loc in &locations {
                     let target_line = loc.range.start.line;
@@ -977,6 +1378,12 @@ pub async fn enrich_entity_uses_type(
                     let target = index.find_at(&loc.uri, target_line);
 
                     if let Some(target_ref) = target {
+                        // The definitions pass reads a Python answer the same
+                        // way: one inside a body, or an empty one naming a
+                        // module, is not about the entity it landed in.
+                        if !answer_names_entity(target_ref, &loc.range) {
+                            continue;
+                        }
                         // Skip self-references and duplicates.
                         if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
                             continue;
@@ -995,13 +1402,11 @@ pub async fn enrich_entity_uses_type(
                             origin: RelationOrigin::Lsp,
                             created_in: None,
                             import_source: None,
-                            // The reference SITE the server reported, which is the
-                            // line a reader needs and what `reference_lines`
-                            // publishes.
+                            // The queried caller token, not the returned definition
+                            // range in the target's document.
                             evidence: query_position_evidence(
                                 "lsp_references",
-                                &entity.file_path,
-                                &loc.range,
+                                positions.token(line, col)?,
                             ),
                         });
                         debug!(
@@ -1027,13 +1432,128 @@ pub async fn enrich_entity_uses_type(
     }
 }
 
+/// Whether `path` is Go source, whose language server widens a method's
+/// references to the methods related to it through interface satisfaction.
+pub fn is_go_source(path: &str) -> bool {
+    path.ends_with(".go")
+}
+
+/// Whether a Go declaration line declares a method with a receiver,
+/// `func (r T) Name(`, rather than an interface's method spec, `Name(`.
+fn declares_a_receiver(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("func")
+        .is_some_and(|rest| rest.trim_start().starts_with('('))
+}
+
+/// Whether the server's `references` answer for `entity` can hold sites that
+/// resolve to some other declaration, so that each site has to be proven
+/// before it is recorded as a reference to `entity`.
+///
+/// gopls widens a method's references by design. Its documentation says "the
+/// references to a method of a concrete type include references to
+/// corresponding interface methods", and an interface method's include those
+/// of the concrete methods that implement it. Those sites are real uses of a
+/// related method, and not one of them is resolved to `entity` by the Go type
+/// checker: `repo.RepoOwner()` on a `ghrepo.Interface` value is a call of the
+/// interface method, whatever the value holds at run time.
+///
+/// An interface method spec is always proven, because its answer is also
+/// widened by the methods of related interfaces, which `implementation` does
+/// not name. A concrete method's answer is widened only by the interface
+/// methods it corresponds to, and those are exactly what gopls answers
+/// `textDocument/implementation` with there. When that answer is empty the
+/// references answer is the method's own and stands as given, which keeps a
+/// method nothing dispatches to, like a test registry's `Register` with 1,484
+/// call sites on the gh CLI, from paying one definition query per site.
+async fn references_may_name_related_methods(
+    server: &LspServer,
+    entity: &EntityRef,
+    positions: &crate::source_positions::SourcePositions<'_>,
+    uri: &str,
+    request_position: &Position,
+) -> Result<bool> {
+    if entity.kind != kin_model::EntityKind::Method || !is_go_source(&entity.file_path) {
+        return Ok(false);
+    }
+    if !declares_a_receiver(positions.line_text(entity.name_line)?) {
+        return Ok(true);
+    }
+    if !server.has_implementation() {
+        return Ok(true);
+    }
+    let answer = server
+        .client
+        .request(
+            "textDocument/implementation",
+            protocol::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.to_string(),
+                },
+                position: request_position.clone(),
+            },
+        )
+        .await;
+    match answer {
+        Ok(value) => Ok(!decode_locations(value)?.is_empty()),
+        // A server that can answer nothing more ends the arm. Any other
+        // failure leaves the widening unknown, so every site is proven.
+        Err(error) if error.ends_the_session() => Err(error),
+        Err(_) => Ok(true),
+    }
+}
+
+/// Whether the server resolves the reference at `site` to `entity` itself:
+/// its definition there lands in `entity`'s own declaration.
+///
+/// The site is asked at the position the server reported it at, so the
+/// question and the answer being proven share one view of the document. A
+/// definition of a site in a method's references answer is a method's name,
+/// and no other method is declared inside one, so the innermost entity it
+/// lands in is the method it resolves to. A declined or empty definition
+/// proves nothing, and the site is not recorded.
+async fn site_resolves_to(
+    server: &LspServer,
+    site: &protocol::Location,
+    entity: &EntityRef,
+    index: &EntityIndex,
+) -> Result<bool> {
+    let definitions = declined_as_empty(
+        locations_at(
+            server,
+            "textDocument/definition",
+            &site.uri,
+            site.range.start.line,
+            site.range.start.character,
+        )
+        .await,
+    )?;
+    Ok(definitions.iter().any(|definition| {
+        index
+            .find_at(&definition.uri, definition.range.start.line)
+            .map(|found| found.id)
+            == Some(entity.id)
+    }))
+}
+
 /// Query textDocument/references for an entity to find all references to it.
 /// Returns References relations from the referencing entity to this entity.
+///
+/// A site is recorded only when it resolves to `entity`. A server that widens
+/// its answer past that, as gopls does for a method (see
+/// [`references_may_name_related_methods`]), has each site proven by its
+/// definition first. Recording the widened answer as it came made every call
+/// through an interface a confirmed caller of each concrete method behind it:
+/// on the gh CLI, `Repository.RepoOwner` went from 4 confirmed call sites to
+/// 137, and the 133 added were `RepoOwner()` calls on a `ghrepo.Interface`
+/// value. Those callers belong to the interface method, where the dispatch
+/// candidates of a concrete method are read from.
 pub async fn enrich_entity_references(
     server: &LspServer,
     entity: &EntityRef,
     index: &EntityIndex,
     workspace_root: &Path,
+    documents: Option<DocumentProvider<'_>>,
 ) -> Result<Vec<Relation>> {
     if !server.has_references() {
         return Ok(Vec::new());
@@ -1042,6 +1562,12 @@ pub async fn enrich_entity_references(
     let file_path = workspace_root.join(&entity.file_path);
     let uri = protocol::path_to_uri(&file_path);
 
+    let text = admitted_text(documents, &entity.file_path)?;
+    let positions = crate::source_positions::SourcePositions::new(&entity.file_path, &text);
+    let Some(request_position) = positions.name_position(entity)? else {
+        return Ok(Vec::new());
+    };
+
     // Query references at the entity's name position.
     let result = server
         .client
@@ -1049,10 +1575,7 @@ pub async fn enrich_entity_references(
             "textDocument/references",
             serde_json::json!({
                 "textDocument": { "uri": uri },
-                "position": {
-                    "line": entity.name_line,
-                    "character": entity.name_col,
-                },
+                "position": request_position,
                 "context": { "includeDeclaration": false }
             }),
         )
@@ -1060,56 +1583,119 @@ pub async fn enrich_entity_references(
 
     let locations: Vec<protocol::Location> = decode_optional_array(result?)?;
 
-    // One relation per referencing entity, carrying every position the server
-    // named inside it. The reference locations arrive as a flat list and several
-    // of them can land in the same entity, so they are grouped here: an edge is
-    // keyed on (kind, source, destination) and a second relation for the same
-    // pair would overwrite the first rather than add to it.
-    let mut relations: Vec<Relation> = Vec::new();
-    let mut row_for: std::collections::HashMap<EntityId, usize> = std::collections::HashMap::new();
-    let mut sites_for: Vec<(String, Vec<protocol::Range>)> = Vec::new();
+    // Validate every returned in-root occurrence before entity/self filtering:
+    // an invalid start line must not disappear as a successful empty answer.
+    // Group by exact path so each captured source and line index is loaded once.
+    let mut by_file: std::collections::BTreeMap<String, Vec<&protocol::Location>> =
+        Default::default();
     for location in &locations {
-        // Find the entity that contains this reference location.
-        let ref_line = location.range.start.line;
-        if let Some(referencing) = index.find_at(&location.uri, ref_line) {
-            // Skip self-references.
+        let mapped = index.find_at(&location.uri, location.range.start.line);
+        let Some(path) = protocol::uri_to_path(&location.uri) else {
+            if mapped.is_some() {
+                return Err(LspError::Protocol("invalid local reference URI".into()));
+            }
+            continue;
+        };
+        let Ok(relative) = path.strip_prefix(workspace_root) else {
+            if mapped.is_some()
+                || index.admitted_source_outside(&location.uri, location.range.start.line)
+            {
+                return Err(LspError::Protocol(
+                    "foreign reference URI matched a local source".into(),
+                ));
+            }
+            continue; // External source is outside the admitted inventory.
+        };
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(LspError::Protocol(
+                "noncanonical local reference path".into(),
+            ));
+        }
+        let file = relative
+            .to_str()
+            .ok_or_else(|| LspError::Protocol("non-UTF8 local reference path".into()))?;
+        require_source_uri(&location.uri, file, workspace_root)?;
+        by_file.entry(file.to_owned()).or_default().push(location);
+    }
+    // Decided once, and only for an answer holding a site that would become
+    // evidence, so an entity nothing references asks nothing more.
+    let mut proven_sites_only: Option<bool> = None;
+    let rule = references_evidence_rule(entity);
+    let mut relations = Vec::new();
+    for (file, locations) in by_file {
+        let text = if file == entity.file_path {
+            text.clone()
+        } else {
+            admitted_text(documents, &file)?
+        };
+        let site_positions = crate::source_positions::SourcePositions::new(&file, &text);
+        let mut by_entity: std::collections::BTreeMap<EntityId, Vec<protocol::Range>> =
+            Default::default();
+        for location in locations {
+            site_positions.range(&location.range)?;
+            let Some(referencing) = index.find_at(&location.uri, location.range.start.line) else {
+                continue;
+            };
+            require_source_uri(&location.uri, &referencing.file_path, workspace_root)?;
             if referencing.id == entity.id {
                 continue;
             }
-            match row_for.get(&referencing.id) {
-                Some(&row) => sites_for[row].1.push(location.range.clone()),
+            let prove = match proven_sites_only {
+                Some(prove) => prove,
                 None => {
-                    row_for.insert(referencing.id, relations.len());
-                    sites_for.push((referencing.file_path.clone(), vec![location.range.clone()]));
-                    relations.push(Relation {
-                        id: deterministic_relation_id(
-                            RelationKind::References,
-                            referencing.id,
-                            entity.id,
-                        ),
-                        kind: RelationKind::References,
-                        src: GraphNodeId::Entity(referencing.id),
-                        dst: GraphNodeId::Entity(entity.id),
-                        confidence: 0.95,
-                        origin: RelationOrigin::Lsp,
-                        created_in: None,
-                        import_source: None,
-                        // Filled below, once every location for this entity has
-                        // been collected. The reference SITE is inside the
-                        // REFERENCING entity's file, which is why the span is
-                        // built against that file and not against the file the
-                        // declaration was queried in.
-                        evidence: Vec::new(),
-                    });
+                    let prove = references_may_name_related_methods(
+                        server,
+                        entity,
+                        &positions,
+                        &uri,
+                        &request_position,
+                    )
+                    .await?;
+                    *proven_sites_only.insert(prove)
                 }
+            };
+            if prove && !site_resolves_to(server, location, entity, index).await? {
+                continue;
             }
+            by_entity
+                .entry(referencing.id)
+                .or_default()
+                .push(location.range.clone());
         }
-    }
-    for (relation, (file, ranges)) in relations.iter_mut().zip(sites_for.iter_mut()) {
-        relation.evidence = query_positions_evidence("lsp_references", file, ranges.drain(..));
+        for (source, ranges) in by_entity {
+            relations.push(Relation {
+                id: deterministic_relation_id(RelationKind::References, source, entity.id),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(source),
+                dst: GraphNodeId::Entity(entity.id),
+                confidence: 0.95,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: query_positions_evidence(rule, &site_positions, ranges)?,
+            });
+        }
     }
 
     Ok(relations)
+}
+
+/// The evidence rule `entity`'s reference sites are recorded under.
+///
+/// A Go method's sites are proven one by one before any is recorded, and builds
+/// that recorded gopls's widened answer as it came wrote the same edges under
+/// [`kin_model::LSP_REFERENCES_RULE`]. Those records are still in the stores
+/// such builds enriched, so the proven sites carry a rule of their own, which is
+/// what lets a reader tell the two apart and a re-derivation replace the old.
+fn references_evidence_rule(entity: &EntityRef) -> &'static str {
+    if entity.kind == kin_model::EntityKind::Method && is_go_source(&entity.file_path) {
+        kin_model::LSP_PROVEN_METHOD_REFERENCES_RULE
+    } else {
+        kin_model::LSP_REFERENCES_RULE
+    }
 }
 
 #[cfg(test)]
@@ -1138,11 +1724,11 @@ mod tests {
     /// evidence span.
     #[test]
     fn every_reported_position_becomes_one_site() {
-        let evidence = query_positions_evidence(
-            "lsp_references",
-            "pkg/caller.go",
-            [range(4, 8), range(9, 2)],
-        );
+        let text = "                    \n".repeat(100);
+        let source = crate::source_positions::SourcePositions::new("pkg/caller.go", &text);
+        let evidence =
+            query_positions_evidence("lsp_references", &source, [range(4, 8), range(9, 2)])
+                .unwrap();
         let spans: Vec<(String, u32, u32)> = evidence
             .iter()
             .map(|record| {
@@ -1163,11 +1749,11 @@ mod tests {
     /// cannot inflate an edge's site count.
     #[test]
     fn a_repeated_position_is_one_site() {
-        let evidence = query_positions_evidence(
-            "lsp_references",
-            "pkg/caller.go",
-            [range(4, 8), range(4, 8)],
-        );
+        let text = "                    \n".repeat(100);
+        let source = crate::source_positions::SourcePositions::new("pkg/caller.go", &text);
+        let evidence =
+            query_positions_evidence("lsp_references", &source, [range(4, 8), range(4, 8)])
+                .unwrap();
         assert_eq!(evidence.len(), 1);
     }
 
@@ -1180,7 +1766,9 @@ mod tests {
             .rev()
             .map(|line| range(line, 0))
             .collect();
-        let evidence = query_positions_evidence("lsp_references", "pkg/caller.go", ranges);
+        let text = "                    \n".repeat(100);
+        let source = crate::source_positions::SourcePositions::new("pkg/caller.go", &text);
+        let evidence = query_positions_evidence("lsp_references", &source, ranges).unwrap();
         assert_eq!(evidence.len(), MAX_SITES_PER_EDGE);
         let lines: Vec<u32> = evidence
             .iter()
@@ -1194,17 +1782,13 @@ mod tests {
     /// the same edge.
     #[test]
     fn the_site_list_does_not_depend_on_arrival_order() {
-        let forward = query_positions_evidence(
-            "lsp_references",
-            "pkg/caller.go",
-            [range(4, 8), range(9, 2)],
-        );
-        let backward = query_positions_evidence(
-            "lsp_references",
-            "pkg/caller.go",
-            [range(9, 2), range(4, 8)],
-        );
-        assert_eq!(forward, backward);
+        let text = "                    \n".repeat(100);
+        let source = crate::source_positions::SourcePositions::new("pkg/caller.go", &text);
+        let forward =
+            query_positions_evidence("lsp_references", &source, [range(4, 8), range(9, 2)]);
+        let backward =
+            query_positions_evidence("lsp_references", &source, [range(9, 2), range(4, 8)]);
+        assert_eq!(forward.unwrap(), backward.unwrap());
     }
 
     #[test]
@@ -1219,6 +1803,8 @@ mod tests {
                 end_line: 20,
                 name_line: 10,
                 name_col: 3,
+                declares_name: true,
+                kind: kin_model::EntityKind::Function,
             },
             EntityRef {
                 id: EntityId::new(),
@@ -1229,9 +1815,11 @@ mod tests {
                 end_line: 35,
                 name_line: 25,
                 name_col: 3,
+                declares_name: true,
+                kind: kin_model::EntityKind::Function,
             },
         ];
-        let index = EntityIndex::new(entities);
+        let index = EntityIndex::new(entities, Path::new("/project"));
 
         let found = index.find_at("file:///project/src/lib.rs", 15);
         assert!(found.is_some());
@@ -1257,8 +1845,10 @@ mod tests {
             end_line: 10,
             name_line: 5,
             name_col: 7,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
         }];
-        let index = EntityIndex::new(entities);
+        let index = EntityIndex::new(entities, Path::new("/project"));
 
         assert!(index.find_by_name("Config.new").is_some());
         assert!(index.find_by_name("new").is_some()); // suffix match
@@ -1292,6 +1882,8 @@ mod innermost_span_tests {
             end_line: end,
             name_line: start,
             name_col: 4,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
         }
     }
 
@@ -1299,13 +1891,16 @@ mod innermost_span_tests {
     /// spans the whole file and sorts first, the class sits inside it, and the
     /// method inside that.
     fn adapters_file() -> EntityIndex {
-        EntityIndex::new(vec![
-            at("adapters", 0, 400),
-            at("BaseAdapter", 121, 155),
-            at("BaseAdapter.send", 127, 140),
-            at("HTTPAdapter", 157, 399),
-            at("HTTPAdapter.send", 633, 700),
-        ])
+        EntityIndex::new(
+            vec![
+                at("adapters", 0, 400),
+                at("BaseAdapter", 121, 155),
+                at("BaseAdapter.send", 127, 140),
+                at("HTTPAdapter", 157, 399),
+                at("HTTPAdapter.send", 633, 700),
+            ],
+            Path::new("/repo"),
+        )
     }
 
     /// The defect, as a test. A position inside a method must resolve to the
@@ -1387,13 +1982,260 @@ mod innermost_span_tests {
     /// whose only member starts with it does not swallow that member.
     #[test]
     fn a_tie_on_the_start_line_prefers_the_smaller_span() {
-        let index = EntityIndex::new(vec![at("Outer", 5, 40), at("Outer.only", 5, 12)]);
+        let index = EntityIndex::new(
+            vec![at("Outer", 5, 40), at("Outer.only", 5, 12)],
+            Path::new("/repo"),
+        );
         assert_eq!(
             index
                 .find_at("file:///repo/src/requests/adapters.py", 6)
                 .map(|e| e.name.as_str()),
             Some("Outer.only")
         );
+    }
+}
+
+/// Files whose repository paths end the same way.
+///
+/// A server names a file by an absolute URI, and the index holds files by
+/// repository-relative path. cli/cli has two pairs whose relative paths end
+/// each other: `api/client.go` ends `pkg/cmd/attestation/api/client.go`, and
+/// `api/client_test.go` ends `pkg/cmd/attestation/api/client_test.go`. A
+/// suffix join finds both files of a pair for the longer path, and taking
+/// whichever match a `HashMap` iterates to first let each index's random seed
+/// pick the file.
+#[cfg(test)]
+mod colliding_path_tests {
+    use super::*;
+
+    /// Where the checkout sits in these tests. Nothing reads it.
+    const ROOT: &str = "/work/cli";
+
+    /// Fresh indexes per property. Each hashes its keys under its own random
+    /// seed, and a lookup that depends on the seed answers a colliding pair
+    /// right in about half of them, so passing all 64 by luck has a chance of
+    /// about 2^-64.
+    const BUILDS: usize = 64;
+
+    fn uri(file: &str) -> String {
+        protocol::path_to_uri(&Path::new(ROOT).join(file))
+    }
+
+    fn declared(name: &str, file: &str, start: u32, end: u32) -> EntityRef {
+        EntityRef {
+            id: EntityId::new(),
+            name: name.to_string(),
+            file_path: file.to_string(),
+            start_line: start,
+            start_col: 0,
+            end_line: end,
+            name_line: start,
+            name_col: 5,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
+        }
+    }
+
+    fn build(entities: &[EntityRef]) -> EntityIndex {
+        EntityIndex::new(entities.to_vec(), Path::new(ROOT))
+    }
+
+    /// The declaration holding 0-based line 59 in each colliding file, with
+    /// its span, as cli/cli c033f2961 has them.
+    fn cli_client_files() -> Vec<EntityRef> {
+        vec![
+            declared("Client.GraphQL", "api/client.go", 55, 63),
+            declared("TestGraphQLError", "api/client_test.go", 46, 75),
+            declared(
+                "LiveClient.BuildOwnerAndDigestURL",
+                "pkg/cmd/attestation/api/client.go",
+                57,
+                60,
+            ),
+            declared(
+                "TestGetByDigest",
+                "pkg/cmd/attestation/api/client_test.go",
+                57,
+                72,
+            ),
+        ]
+    }
+
+    /// Each lookup, over [`BUILDS`] fresh indexes, of every `expected`
+    /// entity's own file at `line` that did not name that entity.
+    fn misread(entities: &[EntityRef], expected: &[&EntityRef], line: u32) -> Vec<String> {
+        let mut wrong = Vec::new();
+        for build_number in 0..BUILDS {
+            let index = build(entities);
+            for entity in expected {
+                let found = index.find_at(&uri(&entity.file_path), line);
+                if found.map(|found| found.id) != Some(entity.id) {
+                    wrong.push(format!(
+                        "build {build_number}: {}:{line} named {:?}",
+                        entity.file_path,
+                        found.map(|found| format!("{} in {}", found.name, found.file_path)),
+                    ));
+                }
+            }
+        }
+        wrong
+    }
+
+    fn report(wrong: &[String], lookups: usize) -> String {
+        format!(
+            "{} of {lookups} lookups named another file's entity or none:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        )
+    }
+
+    /// The defect. Every file, the longer path of each pair included,
+    /// resolves to its own declaration, whatever seed the index drew.
+    #[test]
+    fn a_file_whose_path_ends_another_resolves_to_itself_under_every_seed() {
+        let entities = cli_client_files();
+        let expected: Vec<&EntityRef> = entities.iter().collect();
+        let wrong = misread(&entities, &expected, 59);
+        assert!(
+            wrong.is_empty(),
+            "{}",
+            report(&wrong, BUILDS * expected.len())
+        );
+    }
+
+    /// A shared tail that starts inside a path component names no other
+    /// file: `xapi/client.go` is not `api/client.go`, whether or not the index
+    /// also holds `xapi/client.go`.
+    #[test]
+    fn a_suffix_that_starts_inside_a_component_is_not_the_file() {
+        let api = declared("Client.GraphQL", "api/client.go", 55, 63);
+        let xapi = declared("Client.Do", "xapi/client.go", 50, 70);
+        let both = [api.clone(), xapi.clone()];
+        let wrong = misread(&both, &[&api, &xapi], 59);
+        assert!(wrong.is_empty(), "{}", report(&wrong, BUILDS * 2));
+
+        let index = build(std::slice::from_ref(&api));
+        assert_eq!(
+            index
+                .find_at(&uri("xapi/client.go"), 59)
+                .map(|found| found.file_path.as_str()),
+            None,
+            "a file the index does not hold resolves to nothing"
+        );
+        assert!(
+            index.entities_in_file("client.go").is_empty(),
+            "a partial path names no file"
+        );
+    }
+
+    /// A location outside the checkout is no repository file, however its
+    /// path ends. gopls answers a dependency's declaration with a module
+    /// cache path, and go-gh's `pkg/api/client.go` ends in `api/client.go`.
+    ///
+    /// Such a location is still recognised as landing where an admitted file
+    /// declares something, which is what lets the references arm refuse it
+    /// rather than read it as a site outside the admitted inventory.
+    #[test]
+    fn a_location_outside_the_workspace_names_no_repository_file() {
+        let index = build(&[declared("Client.GraphQL", "api/client.go", 55, 63)]);
+        for outside in [
+            "file:///home/dev/go/pkg/mod/github.com/cli/go-gh/v2@v2.11.2/pkg/api/client.go",
+            "file:///work/other/cli/api/client.go",
+            "file:///work/cli2/api/client.go",
+        ] {
+            assert_eq!(
+                index
+                    .find_at(outside, 59)
+                    .map(|found| found.file_path.as_str()),
+                None,
+                "{outside}"
+            );
+            assert_eq!(index.repository_file(outside), None, "{outside}");
+            assert!(index.admitted_source_outside(outside, 59), "{outside}");
+            assert!(
+                !index.admitted_source_outside(outside, 10),
+                "{outside}: no admitted declaration holds line 10"
+            );
+        }
+        assert!(
+            !index.admitted_source_outside("file:///elsewhere/xapi/client.go", 59),
+            "a tail that starts inside a component is not an admitted path"
+        );
+        assert!(
+            !index.admitted_source_outside(&uri("api/client.go"), 59),
+            "a location inside the workspace is not outside it"
+        );
+        assert_eq!(
+            index.repository_file(&uri("api/client.go")).as_deref(),
+            Some("api/client.go")
+        );
+    }
+
+    /// The positive control: a file no other path ends with still resolves,
+    /// including from a URI that escapes characters Kin's own spelling keeps.
+    #[test]
+    fn a_file_with_no_colliding_path_still_resolves() {
+        let config = declared("Config.Get", "internal/config/config.go", 10, 20);
+        let scoped = declared("render", "packages/@scope/my dir/a.ts", 0, 4);
+        let index = build(&[config.clone(), scoped.clone()]);
+        assert_eq!(
+            index
+                .find_at(&uri("internal/config/config.go"), 12)
+                .map(|found| found.id),
+            Some(config.id)
+        );
+        assert_eq!(
+            index
+                .find_at("file:///work/cli/packages/%40scope/my%20dir/a.ts", 2)
+                .map(|found| found.id),
+            Some(scoped.id),
+            "the decoded path is what names the file"
+        );
+        assert_eq!(
+            index
+                .entities_in_file("internal/config/config.go")
+                .iter()
+                .map(|found| found.id)
+                .collect::<Vec<_>>(),
+            [config.id]
+        );
+    }
+
+    /// A name several entities answer to names none of them. The lookup
+    /// returned whichever match iteration reached first, and cli/cli declares
+    /// `GetByRepoAndDigest` on both `LiveClient` and `MockClient`.
+    #[test]
+    fn a_name_two_entities_answer_to_names_neither() {
+        let live = declared(
+            "LiveClient.GetByRepoAndDigest",
+            "pkg/cmd/attestation/api/client.go",
+            52,
+            55,
+        );
+        let mock = declared(
+            "MockClient.GetByRepoAndDigest",
+            "pkg/cmd/attestation/api/mock_client.go",
+            14,
+            16,
+        );
+        let graphql = declared("Client.GraphQL", "api/client.go", 55, 63);
+        let index = build(&[live.clone(), mock, graphql.clone()]);
+        assert!(
+            index.find_by_name("GetByRepoAndDigest").is_none(),
+            "two methods answer to the bare name"
+        );
+        assert_eq!(
+            index
+                .find_by_name("LiveClient.GetByRepoAndDigest")
+                .map(|found| found.id),
+            Some(live.id)
+        );
+        assert_eq!(
+            index.find_by_name("GraphQL").map(|found| found.id),
+            Some(graphql.id),
+            "a bare name one entity answers to still resolves"
+        );
+        assert!(index.find_by_name("Missing").is_none());
     }
 }
 
@@ -1410,6 +2252,12 @@ mod member_on_module_tests {
                 end: Position { line, character: 0 },
             },
         }
+    }
+
+    /// An index that holds nothing, rooted where a test's URIs put the
+    /// checkout. Which file a URI names needs only the root.
+    fn rooted_at(root: &str) -> super::EntityIndex {
+        super::EntityIndex::new(Vec::new(), std::path::Path::new(root))
     }
 
     /// The express case: asked at the receiver, the member is what matters.
@@ -1450,20 +2298,154 @@ mod member_on_module_tests {
     fn a_definition_in_another_file_names_a_module() {
         assert!(receiver_names_a_module(
             &[location("file:///w/index.js", 10)],
+            &rooted_at("/w"),
             "examples/multi-router/controllers/api_v1.js"
         ));
+    }
+
+    fn declared(name: &str, file: &str, line: u32, declares_name: bool) -> super::EntityRef {
+        super::EntityRef {
+            id: kin_model::EntityId::new(),
+            name: name.into(),
+            file_path: file.into(),
+            start_line: line,
+            start_col: 0,
+            end_line: line + 2,
+            name_line: line,
+            name_col: 0,
+            declares_name,
+            kind: kin_model::EntityKind::Function,
+        }
+    }
+
+    fn spanning(uri: &str, line: u32, start: u32, end: u32) -> Location {
+        Location {
+            uri: uri.to_string(),
+            range: Range {
+                start: Position {
+                    line,
+                    character: start,
+                },
+                end: Position {
+                    line,
+                    character: end,
+                },
+            },
+        }
+    }
+
+    /// Flask's `current_app.config[...]`: the receiver answers from another
+    /// file with its own declaration's name, which makes it a value. Every
+    /// other shape keeps the module reading.
+    #[test]
+    fn only_an_imported_value_declaration_is_a_receiver_value() {
+        use super::receiver_declared_values;
+        let current_app = declared("current_app", "src/flask/globals.py", 43, true);
+        let current_app_id = current_app.id;
+        let index = super::EntityIndex::new(
+            vec![
+                declared("flask", "src/flask/__init__.py", 0, false),
+                current_app,
+                declared("createApplication", "lib/express.js", 9, true),
+                declared("settings", "conf/settings.py", 0, true),
+            ],
+            std::path::Path::new("/w"),
+        );
+        let globals = "file:///w/src/flask/globals.py";
+        let value = [spanning(globals, 43, 0, 11)];
+        assert!(receiver_names_a_module(
+            &value,
+            &index,
+            "examples/tutorial/flaskr/db.py"
+        ));
+        let found = receiver_declared_values(&value, &index, "current_app").expect("a value");
+        assert_eq!(
+            found.iter().map(|entity| entity.id).collect::<Vec<_>>(),
+            [current_app_id]
+        );
+        for (answers, receiver, why) in [
+            (vec![spanning(globals, 43, 0, 11)], "g", "an alias"),
+            (
+                vec![spanning(globals, 44, 4, 8)],
+                "current_app",
+                "an answer inside the declaration's body",
+            ),
+            (
+                vec![location("file:///w/src/flask/__init__.py", 0)],
+                "flask",
+                "a module surface",
+            ),
+            (
+                vec![spanning("file:///w/lib/express.js", 9, 0, 17)],
+                "express",
+                "a differently named export",
+            ),
+            (
+                vec![location("file:///w/conf/settings.py", 0)],
+                "settings",
+                "a module's empty answer on a line that declares its name",
+            ),
+            (
+                vec![
+                    spanning(globals, 43, 0, 11),
+                    spanning("file:///w/lib/express.js", 9, 0, 17),
+                ],
+                "current_app",
+                "one answer that is not the value's declaration",
+            ),
+            (vec![], "current_app", "no answer at all"),
+        ] {
+            assert!(
+                receiver_declared_values(&answers, &index, receiver).is_none(),
+                "{why}"
+            );
+        }
     }
 
     #[test]
     fn a_definition_in_this_file_names_a_value() {
         let here = "examples/multi-router/controllers/api_v1.js";
+        let index = rooted_at("/w");
         assert!(!receiver_names_a_module(
             &[location(&format!("file:///w/{here}"), 6)],
+            &index,
             here
         ));
         assert!(
-            !receiver_names_a_module(&[], here),
+            !receiver_names_a_module(&[], &index, here),
             "a receiver the server said nothing about is not promoted to a module"
+        );
+    }
+
+    /// Another file is another file however its path ends. Enriching cli/cli's
+    /// root `api/client.go`, a definition in `pkg/cmd/attestation/api/client.go`,
+    /// or in a module cache path that also ends in `api/client.go`, named a
+    /// module all the same, and matched by suffix it read as this file's own
+    /// value, which skipped the member join.
+    #[test]
+    fn a_definition_in_a_file_whose_path_ends_like_this_one_names_a_module() {
+        let here = "api/client.go";
+        let index = rooted_at("/work/cli");
+        for elsewhere in [
+            "file:///work/cli/pkg/cmd/attestation/api/client.go",
+            "file:///home/dev/go/pkg/mod/github.com/cli/go-gh/v2@v2.11.2/pkg/api/client.go",
+        ] {
+            assert!(
+                receiver_names_a_module(&[location(elsewhere, 0)], &index, here),
+                "{elsewhere} is not {here}"
+            );
+        }
+        assert!(
+            !receiver_names_a_module(
+                &[location("file:///work/cli/api/client.go", 12)],
+                &index,
+                here
+            ),
+            "a definition in the enriched file itself names a value"
+        );
+        assert!(
+            !receiver_names_a_module(&[location("jdt://contents/api/client.go", 0)], &index, here),
+            "an answer that names no local file promotes nothing to a module"
         );
     }
 

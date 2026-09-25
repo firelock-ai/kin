@@ -704,6 +704,11 @@ fn plan_and_commit(
         sealed_observation: None,
         collaboration_delta: None,
     };
+    // The selected path takes the target change's state, which predates the
+    // store's last `kin upgrade` unless the target descends from one of its
+    // anchors.
+    crate::hydration_requalify::before_restoring(state, &graph, target_change_id, "path checkout")
+        .map_err(CheckoutCommandError::internal)?;
     let (projected_entries, receipt, authority_freeze) =
         kin_core::tree::checkout_repository_workspace_subtree_and_commit_repository_transaction(
             layout.working_dir(),

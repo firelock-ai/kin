@@ -25,22 +25,61 @@ edits to these functions (a rename, a perf refactor) do not change replay
 semantics, and forcing a bump on each one trains the reflex this guard exists
 to prevent. What it forces is an explicit, reviewed decision.
 
-Usage: verify-hydration-semantics.py [repo_root]
+Given the base branch's manifest, the guard also holds each version number to
+one meaning. Two changes cut from one base can each move the replay surface
+and each claim the next number, and each passes alone. A merge that keeps both
+passes too, with two meanings under one number, so a store stamped with it
+would claim a replay it never ran. Against a base, a head that changes the
+pinned surface must record a higher version than the base does. A change that
+leaves replay semantics alone (a rename, a comment, a refactor) may keep the
+base's number when `same_epoch_changes` records it: each entry names the
+guarded function or file, the exact digest it now has, and why replay is
+unchanged, so a later edit to the same function is not excused by it.
+
+Usage: verify-hydration-semantics.py [repo_root] [--base-manifest PATH | --base-ref REF]
+       verify-hydration-semantics.py [repo_root] --write
 
 The optional repo_root selects the tree to scan (default: the repo containing
 this script). The manifest always travels with the script — it is the policy,
 not a property of the tree under test — which lets CI point the guard at a
-deliberately poisoned copy and assert that it fails.
+deliberately poisoned copy and assert that it fails. `--base-ref` reads the
+base manifest from git at REF, beside this script's own path; a base that
+predates the manifest has nothing to compare and is reported, not failed.
 """
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
+# Flags that take the next argument as their value, so the repository root is
+# the first argument that is neither a flag nor a flag's value.
+VALUE_FLAGS = ("--base-manifest", "--base-ref")
+
+
+def positional_args(argv):
+    positional = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg in VALUE_FLAGS:
+            skip = True
+        elif not arg.startswith("--"):
+            positional.append(arg)
+    return positional
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-KIN_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(SCRIPT_DIR)
+_POSITIONAL = positional_args(sys.argv[1:])
+KIN_ROOT = os.path.abspath(_POSITIONAL[0]) if _POSITIONAL else os.path.dirname(SCRIPT_DIR)
 MANIFEST_PATH = os.path.join(SCRIPT_DIR, "hydration-semantics-manifest.json")
+MANIFEST_NAME = os.path.basename(MANIFEST_PATH)
+
+# What a same-epoch entry records for a guarded function or file that the head
+# no longer pins at all.
+REMOVED = "removed"
 
 # Every entry names an accountable owner and says why the function is part of
 # the replay-semantics surface, so the guarded set cannot grow or shrink
@@ -245,7 +284,189 @@ def live_version(errors):
     return int(m.group(1))
 
 
-def main():
+def verify_guarded_files(manifest, errors, refresh=False):
+    """Exact source pins for dedicated authoring modules with method bodies."""
+    entries = manifest.get("guarded_files", [])
+    if not isinstance(entries, list):
+        errors.append("guarded_files must be an array")
+        return 0
+    seen = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or any(
+            not isinstance(entry.get(field), str) or not entry[field].strip()
+            for field in ("file", "digest", "reason", "owner")
+        ):
+            errors.append(f"guarded_files[{index}] has missing/malformed required fields")
+            continue
+        relative = entry["file"]
+        if (os.path.isabs(relative) or "\\" in relative or "\0" in relative
+                or any(part in ("", ".", "..") for part in relative.split("/"))):
+            errors.append(f"guarded_files[{index}] has malformed repository-relative path")
+            continue
+        if relative in seen:
+            errors.append(f"duplicate guarded file path: {relative}")
+            continue
+        seen.add(relative)
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", entry["digest"]):
+            errors.append(f"guarded file {relative} has malformed SHA-256 digest")
+            continue
+        path = os.path.join(KIN_ROOT, relative)
+        if os.path.commonpath([os.path.realpath(KIN_ROOT), os.path.realpath(path)]) != os.path.realpath(KIN_ROOT):
+            errors.append(f"guarded file {relative} resolves outside repository")
+            continue
+        try:
+            with open(path, "rb") as source:
+                actual = "sha256:" + hashlib.sha256(source.read()).hexdigest()
+        except OSError as error:
+            errors.append(f"cannot read guarded file {relative}: {error}")
+            continue
+        if refresh:
+            entry["digest"] = actual
+        elif actual != entry["digest"]:
+            errors.append(f"guarded source file {relative} changed: recorded {entry['digest']}, actual {actual}. Decide whether replay semantics changed and explicitly update the version/digest; no migration is implied.")
+    return len(entries)
+
+
+def pinned_surface(manifest):
+    """Every pin in a manifest, keyed by (file, function), with its digest.
+
+    A whole-file pin is keyed with no function. Malformed entries are skipped
+    here: the digest checks report them against the head, and a base that
+    carried one can only make the comparison stricter.
+    """
+    surface = {}
+    for entry in manifest.get("guarded", []) or []:
+        if isinstance(entry, dict) and isinstance(entry.get("file"), str) and isinstance(entry.get("function"), str):
+            surface[(entry["file"], entry["function"])] = entry.get("digest")
+    for entry in manifest.get("guarded_files", []) or []:
+        if isinstance(entry, dict) and isinstance(entry.get("file"), str):
+            surface[(entry["file"], None)] = entry.get("digest")
+    return surface
+
+
+def surface_label(key):
+    path, function = key
+    return f"`{function}` in {path}" if function else f"guarded file {path}"
+
+
+def same_epoch_excuses(manifest, errors):
+    """The `same_epoch_changes` entries, keyed like `pinned_surface`."""
+    entries = manifest.get("same_epoch_changes", [])
+    if not isinstance(entries, list):
+        errors.append("same_epoch_changes must be an array")
+        return {}
+    excuses = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or any(
+            not isinstance(entry.get(field), str) or not entry[field].strip()
+            for field in ("file", "digest", "reason")
+        ) or ("function" in entry and (not isinstance(entry["function"], str) or not entry["function"].strip())):
+            errors.append(
+                f"same_epoch_changes[{index}] needs a file, the exact digest it excuses (or "
+                f'"{REMOVED}") and a reason, and a function name when it excuses a function'
+            )
+            continue
+        excuses[(entry["file"], entry.get("function"))] = entry["digest"]
+    return excuses
+
+
+def compare_with_base(manifest, base, base_label, errors):
+    """Hold the head's version to one meaning against the base's manifest."""
+    head_version = manifest.get("hydration_semantics_version")
+    base_version = base.get("hydration_semantics_version")
+    if not isinstance(base_version, int):
+        errors.append(f"the manifest at {base_label} records no integer `hydration_semantics_version` to compare against")
+        return
+    if not isinstance(head_version, int):
+        return
+    if head_version < base_version:
+        errors.append(
+            f"{VERSION_CONST} is {head_version}, below the {base_version} that {base_label} "
+            "already records. A store stamped with the higher number would read as current "
+            "under a replay older than the one it ran; take a number above the base's."
+        )
+        return
+    excuses = same_epoch_excuses(manifest, errors)
+    if head_version > base_version:
+        return
+    head = pinned_surface(manifest)
+    prior = pinned_surface(base)
+    changed = sorted(
+        (key for key in head.keys() | prior.keys() if head.get(key) != prior.get(key)),
+        key=lambda key: (key[0], key[1] or ""),
+    )
+    unexcused = [key for key in changed if excuses.get(key) != head.get(key, REMOVED)]
+    if not unexcused:
+        return
+    listing = "\n".join(f"      - {surface_label(key)}" for key in unexcused)
+    template = json.dumps(
+        [
+            {
+                "file": key[0],
+                **({"function": key[1]} if key[1] else {}),
+                "digest": head.get(key, REMOVED),
+                "reason": "why replay semantics are unchanged",
+            }
+            for key in unexcused
+        ],
+        indent=2,
+    )
+    errors.append(
+        f"{VERSION_CONST} stays at {head_version}, the number {base_label} already records, "
+        "but the replay surface pinned under it changed:\n"
+        f"{listing}\n"
+        "    A version names one replay. Two changes that each took the next number from one "
+        "base collide here, and a merge that keeps both must move one of them up.\n"
+        f"      - if replay semantics changed, set {VERSION_CONST} and "
+        f"`hydration_semantics_version` above {base_version};\n"
+        "      - if they did not, record each entry under `same_epoch_changes` in "
+        f"scripts/{MANIFEST_NAME}:\n{template}"
+    )
+
+
+def read_base_manifest(path=None, ref=None):
+    """Load the base manifest from a file or from git at `ref`.
+
+    Returns (manifest or None, label, error or None). A git base that has no
+    manifest at this path predates the guard, which leaves nothing to compare.
+    """
+    if path is not None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f), f"the base manifest {path}", None
+        except Exception as e:
+            return None, path, f"cannot load base manifest {path}: {e}"
+    label = f"the base {ref}"
+    prefix = subprocess.run(
+        ["git", "-C", SCRIPT_DIR, "rev-parse", "--show-prefix"],
+        capture_output=True,
+        text=True,
+    )
+    if prefix.returncode != 0:
+        return None, label, f"cannot locate this script in git to read {label}: {prefix.stderr.strip()}"
+    commit = subprocess.run(
+        ["git", "-C", SCRIPT_DIR, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if commit.returncode != 0:
+        return None, label, f"{ref} does not name a commit here, so the version cannot be compared with its base"
+    blob = f"{commit.stdout.strip()}:{prefix.stdout.strip()}{MANIFEST_NAME}"
+    exists = subprocess.run(
+        ["git", "-C", SCRIPT_DIR, "cat-file", "-e", blob], capture_output=True, text=True
+    )
+    if exists.returncode != 0:
+        return None, label, None
+    shown = subprocess.run(["git", "-C", SCRIPT_DIR, "show", blob], capture_output=True, text=True)
+    if shown.returncode != 0:
+        return None, label, f"cannot read the manifest at {ref}: {shown.stderr.strip()}"
+    try:
+        return json.loads(shown.stdout), label, None
+    except ValueError as e:
+        return None, label, f"the manifest at {ref} is not JSON: {e}"
+
+
+def main(base_manifest=None, base_ref=None):
     manifest = load_manifest()
     entries = manifest.get("guarded", [])
     errors = []
@@ -321,6 +542,24 @@ def main():
                 "python3 scripts/verify-hydration-semantics.py --write"
             )
 
+    file_count = verify_guarded_files(manifest, errors)
+
+    compared = ""
+    if base_manifest is not None or base_ref is not None:
+        base, base_label, base_error = read_base_manifest(base_manifest, base_ref)
+        if base_error:
+            errors.append(base_error)
+        elif base is None:
+            compared = f" {base_label} has no manifest, so there is no earlier version to hold it above."
+        else:
+            compare_with_base(manifest, base, base_label, errors)
+            compared = (
+                f" Against {base_label}, at {base.get('hydration_semantics_version')}, "
+                "the version names one replay."
+            )
+    else:
+        same_epoch_excuses(manifest, errors)
+
     if errors:
         print(f"Hydration replay-semantics guard FAILED ({len(errors)} problem(s)):\n")
         for e in errors:
@@ -329,7 +568,8 @@ def main():
 
     print(
         f"Hydration replay-semantics guard passed: {len(entries)} guarded function(s) "
-        f"match the manifest at {VERSION_CONST}={recorded_version}."
+        f"and {file_count} guarded file(s) match the manifest at {VERSION_CONST}={recorded_version}."
+        + compared
     )
     return 0
 
@@ -360,6 +600,23 @@ def write_digests():
             return 1
         entry["digest"] = digest_of(text)
 
+    verify_guarded_files(manifest, errors, refresh=True)
+    if errors:
+        for error in errors:
+            fail(error)
+        return 1
+
+    # A same-epoch entry excuses one exact digest. One that no longer matches
+    # what the tree pins can never excuse anything again, so it goes.
+    if isinstance(manifest.get("same_epoch_changes"), list):
+        surface = pinned_surface(manifest)
+        manifest["same_epoch_changes"] = [
+            entry
+            for entry in manifest["same_epoch_changes"]
+            if isinstance(entry, dict)
+            and entry.get("digest") == surface.get((entry.get("file"), entry.get("function")), REMOVED)
+        ]
+
     with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
@@ -367,9 +624,31 @@ def write_digests():
     return 0
 
 
+def flag_value(argv, flag):
+    if flag not in argv:
+        return None
+    index = argv.index(flag)
+    if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+        fail(f"{flag} needs a value")
+        sys.exit(2)
+    return argv[index + 1]
+
+
 if __name__ == "__main__":
-    if "--write" in sys.argv:
-        sys.argv = [a for a in sys.argv if a != "--write"]
-        KIN_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(SCRIPT_DIR)
+    arguments = sys.argv[1:]
+    known = {"--write", *VALUE_FLAGS}
+    unknown = [arg for arg in arguments if arg.startswith("--") and arg not in known]
+    if unknown or len(positional_args(arguments)) > 1:
+        fail(f"unrecognized arguments: {' '.join(unknown or positional_args(arguments)[1:])}")
+        sys.exit(2)
+    base_manifest = flag_value(arguments, "--base-manifest")
+    base_ref = flag_value(arguments, "--base-ref")
+    if base_manifest is not None and base_ref is not None:
+        fail("pass --base-manifest or --base-ref, not both")
+        sys.exit(2)
+    if "--write" in arguments:
+        if base_manifest is not None or base_ref is not None:
+            fail("--write records the tree as it is and compares with no base")
+            sys.exit(2)
         sys.exit(write_digests())
-    sys.exit(main())
+    sys.exit(main(base_manifest, base_ref))

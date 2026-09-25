@@ -596,6 +596,17 @@ fn idle_outcome(status: &str, health: &Value) -> Option<String> {
     let unadmitted = reconcile
         .get("untracked_path_count")
         .and_then(Value::as_u64)?;
+    // An owed parse is outstanding work too, and a loop that calls itself
+    // settled while one is recorded is the same all-clear one object over. So
+    // is a tracked path the startup catch-up has not taken yet.
+    let underived = reconcile
+        .get("underived_path_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + reconcile
+            .get("changed_path_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
     let measured = reconcile
         .get("untracked_observed_age_seconds")
         .and_then(Value::as_u64)
@@ -605,7 +616,7 @@ fn idle_outcome(status: &str, health: &Value) -> Option<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     Some(
-        match (unadmitted, measured || not_applicable) {
+        match (unadmitted + underived, measured || not_applicable) {
             (0, true) => RECONCILIATION_SETTLED,
             (0, false) => RECONCILIATION_UNMEASURED,
             _ => RECONCILIATION_WORK_OUTSTANDING,
@@ -867,6 +878,44 @@ pub struct GraphBehind {
     /// field-versus-prose split this whole ticket is about, one object over from
     /// where it was fixed, so the block now states it positively.
     pub measured: bool,
+    /// Repository paths whose bytes are admitted and whose parse is still owed.
+    ///
+    /// A second way for graph truth to sit behind the working copy, and it must
+    /// not borrow the first one's words. `unadmitted_paths` sends a reader to
+    /// `kin admit`; these paths are already admitted, so that command takes
+    /// nothing and clears nothing. Only their semantics are missing, which is
+    /// why an entity count cannot see them and why an answer built from one
+    /// reads as an all-clear.
+    #[serde(default)]
+    pub underived_paths: u64,
+    /// A bounded sample of the paths above, on the same terms as `sample`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub underived_sample: Vec<String>,
+    /// Tracked paths the working copy edited or removed while no daemon
+    /// watched, that no admission has taken yet.
+    ///
+    /// A third way for graph truth to sit behind the working copy, and the one
+    /// that makes a populated answer wrong rather than incomplete: the graph
+    /// still holds these paths' old bytes, so it serves a renamed function
+    /// under its old name and ranks a deleted file as a hit. The daemon admits
+    /// them on its own, so this reading clears without anyone acting.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub changed_paths: u64,
+    /// A bounded sample of `changed_paths`, on the same terms as `sample`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_sample: Vec<String>,
+    /// Whether the daemon's startup check for such paths could not run, which
+    /// leaves whether any exist unknown rather than none.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub changed_unchecked: bool,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl GraphBehind {
@@ -887,6 +936,24 @@ impl GraphBehind {
     pub fn from_health(health: &Value) -> Option<Self> {
         let reconcile = health.get("reconcile")?;
         let unadmitted_paths = reconcile.get("untracked_path_count")?.as_u64()?;
+        // A second, independent count. The zero gate below has to see it, or a
+        // daemon whose only gap is an owed parse publishes no disclosure at all
+        // and the durability block all-clears over it.
+        let underived_paths = reconcile
+            .get("underived_path_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        // A third count, and the zero gate below has to see it for the same
+        // reason: a daemon whose only gap is a tracked file edited while no
+        // daemon watched would otherwise publish no disclosure at all over an
+        // answer served from that file's old bytes.
+        let changed_paths = reconcile
+            .get("changed_path_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let changed_unchecked = reconcile
+            .get("changed_paths_unchecked")
+            .is_some_and(|reason| !reason.is_null());
         let measured_age_seconds = reconcile
             .get("untracked_observed_age_seconds")
             .and_then(Value::as_u64);
@@ -898,7 +965,12 @@ impl GraphBehind {
             .get("untracked_observation_not_applicable")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if unadmitted_paths == 0 && (measured_age_seconds.is_some() || observation_not_applicable) {
+        if unadmitted_paths == 0
+            && underived_paths == 0
+            && changed_paths == 0
+            && !changed_unchecked
+            && (measured_age_seconds.is_some() || observation_not_applicable)
+        {
             return None;
         }
         let since = reconcile
@@ -916,12 +988,39 @@ impl GraphBehind {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let underived_sample = reconcile
+            .get("underived_paths_sample")
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let changed_sample = reconcile
+            .get("changed_paths_sample")
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Some(Self {
             unadmitted_paths,
             since,
             sample,
             measured_age_seconds,
             measured: measured_age_seconds.is_some(),
+            underived_paths,
+            underived_sample,
+            changed_paths,
+            changed_sample,
+            changed_unchecked,
         })
     }
 
@@ -934,7 +1033,46 @@ impl GraphBehind {
     /// `kin admit`. A consumer asks this before naming that remedy, because on
     /// the unmeasured shape there is no path to admit.
     pub fn unmeasured(&self) -> bool {
-        !self.measured && self.unadmitted_paths == 0
+        !self.measured
+            && self.unadmitted_paths == 0
+            && self.underived_paths == 0
+            && self.changed_paths == 0
+            && !self.changed_unchecked
+    }
+
+    /// The reason EVERY answer over this store is inconclusive, populated or
+    /// not, or `None` when no tracked file is owed.
+    ///
+    /// The other two counts qualify only a claim of absence, because content
+    /// the graph has not taken can only be missing from an answer. A tracked
+    /// file edited while no daemon watched is different in kind: the graph
+    /// still holds its old bytes and keeps answering from them, so a populated
+    /// answer can name a function the file no longer declares or a file the
+    /// host no longer holds. That is a wrong answer rather than a short one,
+    /// and it is why this reason rides the verdict and not only the absence.
+    pub fn tracked_changes_limiting_factor(&self) -> Option<String> {
+        if self.changed_paths > 0 {
+            let sample = if self.changed_sample.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", self.changed_sample.join(", "))
+            };
+            return Some(format!(
+                "tracked_changes_unadmitted: {} tracked path(s) changed or removed while no \
+                 daemon was watching are not admitted yet{sample}, so this answer may describe \
+                 bytes the working copy no longer holds and none of its absences is \
+                 authoritative; the daemon's catch-up takes them on its own, and `kin admit` \
+                 takes them now",
+                self.changed_paths
+            ));
+        }
+        self.changed_unchecked.then(|| {
+            "tracked_changes_unchecked: the daemon could not check whether tracked files \
+             changed while no daemon was watching, so this answer may describe bytes the \
+             working copy no longer holds; `kin admit` reads the whole working copy and \
+             settles it"
+                .to_string()
+        })
     }
 
     /// The machine-stable reason an absence claim cannot be certified over this
@@ -956,7 +1094,7 @@ impl GraphBehind {
         if self.unmeasured() {
             return format!(
                 "working_copy_unmeasured: nothing has measured this working copy, so whether \
-                 graph truth is level with it is unknown and {clock}; an absence here cannot be \
+                 graph truth is level with it is unknown and {clock}, so an absence here cannot be \
                  told apart from content the graph has not taken yet"
             );
         }
@@ -967,11 +1105,55 @@ impl GraphBehind {
         // one that does: it takes the complete exact working tree into graph
         // authority, which is precisely the case "waiting for churn that is not
         // coming" describes.
+        //
+        // Two counts, two remedies, and naming the wrong one is worse than
+        // naming none: a reader told to admit a path that is already admitted
+        // runs a command that clears nothing and reads the unchanged answer as
+        // confirmation. So each gap present states its own lever, and a reading
+        // that carries both states both.
+        let mut gaps = Vec::new();
+        if self.unadmitted_paths > 0 {
+            gaps.push(format!(
+                "{} host path(s) on disk have never been admitted, and `kin admit` takes the \
+                 complete working tree now",
+                self.unadmitted_paths
+            ));
+        }
+        if self.underived_paths > 0 {
+            gaps.push(format!(
+                "{} admitted path(s) are still owed their parse, so their bytes are authority \
+                 and their entities are not, and the next commit records that parse",
+                self.underived_paths
+            ));
+        }
+        if self.changed_paths > 0 {
+            gaps.push(format!(
+                "{} tracked path(s) changed or removed while no daemon was watching are not \
+                 admitted yet, so the graph still holds their old bytes, and the daemon's \
+                 catch-up takes them on its own",
+                self.changed_paths
+            ));
+        }
+        if self.changed_unchecked {
+            gaps.push(
+                "whether tracked files changed while no daemon was watching is unknown, \
+                 because the daemon's check for them could not run, and `kin admit` settles it"
+                    .to_string(),
+            );
+        }
+        if gaps.is_empty() {
+            // Unreachable through `from_health`, which returns `None` for this
+            // shape, and reachable for a caller that builds one by hand. A
+            // fabricated count is not a reason to invent a remedy.
+            gaps.push(
+                "graph truth is behind the working copy for a reason this reading does not name"
+                    .to_string(),
+            );
+        }
         format!(
-            "graph_behind_working_tree: {} host path(s) on disk have never been admitted and \
-             {clock}, so an absence here cannot be told apart from content the graph has not \
-             taken yet; `kin admit` takes the complete working tree now",
-            self.unadmitted_paths
+            "graph_behind_working_tree: {} and {clock}, so an absence here cannot be told apart \
+             from content the graph has not taken yet",
+            gaps.join("; ")
         )
     }
 }
@@ -1286,8 +1468,9 @@ const STATE_PARTIAL: &str = "partial";
 /// `decided_by` is a subset of `classes`, and the gap between them is
 /// deliberate. `classes` DISCLOSES every class the query read; `decided_by`
 /// carries only the ones whose absence would actually have hidden an answer.
-/// Kin mints no entity-level `Imports` edge at all, so requiring every requested
-/// class to be present would report every answer on every healthy graph as
+/// An entity-level `Imports` edge exists only where the importing file carries a
+/// module entity and the coordinate lands in this repository, so requiring every
+/// requested class to be present would report plenty of healthy graphs as
 /// partial, which is the "mark everything uncertain" regression FIR-2357 item 4
 /// bars by test. [`crate::negative::load_bearing_classes`] is the same narrowing
 /// the absence verdict already uses, and it is reused here rather than
@@ -1346,9 +1529,19 @@ impl Completeness {
     /// registries live in [`crate::negative`], so a new retrieval tool earns a
     /// completeness signal by declaring what it reads, exactly as it earns an
     /// absence verdict.
-    fn for_tool(tool: &str, payload: &Value, envelope: &Envelope) -> Option<Self> {
+    fn for_tool(
+        tool: &str,
+        payload: &Value,
+        envelope: &Envelope,
+        resolution_miss: bool,
+    ) -> Option<Self> {
         let edge_classes = crate::negative::absence_cross_file_classes(tool, payload);
-        let substrate = if !edge_classes.is_empty() {
+        // A recognized name-resolution miss searched the entity index. No
+        // reference or path walk ran, so absent edge coverage cannot qualify
+        // that different answer. Only the error classifier selects this arm.
+        let substrate = if resolution_miss {
+            CoverageSubstrate::Graph
+        } else if !edge_classes.is_empty() {
             CoverageSubstrate::Edges
         } else {
             match crate::negative::negative_class_for(tool)? {
@@ -1765,8 +1958,21 @@ fn merge_file_coverage_classes(
     // declined, and not the same as `not_applicable`, which is a checkout that is
     // a projection of graph truth and has no divergence to have.
     let bytes_unchecked = host_bytes == Some("unchecked");
+    // The bulk computed-member-loop disclosure: the
+    // extractor read a `obj[loopVar] = ...` site inside a loop whose iterated
+    // list it could not read statically, so real members exist that this
+    // enumeration never saw. A `full` parse is not a present class over that,
+    // the same way it is not one over a stale span: the handler's own
+    // `certifies_enumeration` already refuses for the identical reason, and
+    // this is that refusal read back into one class rather than a second,
+    // disagreeing computation of it.
+    let dynamic_members_disclosed = coverage
+        .and_then(|coverage| coverage.get("dynamic_members_disclosed"))
+        .and_then(Value::as_bool)
+        == Some(true);
     let raw_parsed = parsed;
-    let parsed = if spans_stale || bytes_unadmitted || bytes_unchecked {
+    let parsed = if spans_stale || bytes_unadmitted || bytes_unchecked || dynamic_members_disclosed
+    {
         STATE_ABSENT
     } else {
         parsed
@@ -1809,6 +2015,12 @@ fn merge_file_coverage_classes(
                 None => format!("file_parsed_{raw_parsed}"),
             },
         );
+    } else if dynamic_members_disclosed {
+        // Named only once the parse itself is healthy, so a file that both
+        // failed to parse and disclosed a dynamic-members site reports the
+        // parse failure a reader can act on first rather than a floor that
+        // would still apply after they fixed it.
+        limits.push("file_dynamic_members_disclosed".to_string());
     }
 
     let enriched = match coverage
@@ -1865,6 +2077,10 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
         .and_then(Value::as_str);
     let bytes_unadmitted = host_bytes == Some("diverged");
     let bytes_unchecked = host_bytes == Some("unchecked");
+    let dynamic_members_disclosed = coverage
+        .and_then(|coverage| coverage.get("dynamic_members_disclosed"))
+        .and_then(Value::as_bool)
+        == Some(true);
 
     let mut counted = json!({
         "unit": "entities_in_file",
@@ -1891,6 +2107,12 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
         counted["floor_reason"] = json!("file_bytes_unchecked");
     } else if spans_stale {
         counted["floor_reason"] = json!("file_spans_stale");
+    } else if dynamic_members_disclosed {
+        // A `full` parse with a disclosed dynamic-members site: express's own
+        // case, where every OTHER floor here reads healthy and the count is
+        // still short by however many `methods.forEach(...)` minted no member
+        // for because it could not read the list.
+        counted["floor_reason"] = json!("file_dynamic_members_disclosed");
     } else if shifted {
         counted["floor_reason"] = json!("enumeration_shifted");
     } else if !whole_file {
@@ -1907,6 +2129,18 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
 /// says whether the finer number is whole), and recomputing it in the envelope
 /// is how two counters come to disagree about one answer.
 fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
+    if tool == "entity_history" {
+        let total = payload.get("change_count").and_then(Value::as_u64)?;
+        let returned = payload.get("result").and_then(Value::as_array)?.len();
+        let whole =
+            payload.get("offset").and_then(Value::as_u64) == Some(0) && returned as u64 == total;
+        let mut counted = json!({"unit": "entity_history_changes", "reported": total,
+            "returned": returned, "exact": whole});
+        if !whole {
+            counted["floor_reason"] = json!("page_bounded");
+        }
+        return Some(counted);
+    }
     if tool == crate::handlers::file_entities::TOOL_NAME {
         return file_entities_counted(payload);
     }
@@ -2027,11 +2261,11 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
 ///
 /// A boolean was the whole defect. `Behind`, `Ahead`, `Unstamped` and
 /// `Unreadable` need four different actions and only one of them is safe to
-/// re-ingest directly: an `Ahead` store was made by a NEWER build than the one
-/// answering, so re-ingesting with this binary would overwrite a store this
-/// build cannot author, and an unknown record could be either. Publishing all
-/// four under a field named `stale` told automation the one thing that is wrong
-/// in three of the four cases.
+/// upgrade in place with this build: an `Ahead` store was recorded by a NEWER
+/// build than the one answering, so re-deriving it with this binary would
+/// replace state this build cannot author, and an unknown record could be
+/// either. Publishing all four under a field named `stale` told automation the
+/// one thing that is wrong in three of the four cases.
 ///
 /// Present for agreement as well as for every gap, whenever the comparison was
 /// actually made. An object that appeared only on failure could not prove the
@@ -2051,9 +2285,43 @@ pub struct HydrationSemanticsObservation {
     /// and could be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_under: Option<u32>,
+    /// The version `kin upgrade` last re-derived the served state under, when
+    /// one ran. The standing compares this, not the creation version, and
+    /// history recorded before that upgrade keeps the creation version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgraded_under: Option<u32>,
     /// The concrete read failure for an unreadable record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// The limiting factor for a store an older build wrote, in the words every
+/// CLI surface uses for its remedy: `kin upgrade` in this repository, and the
+/// npm form pinned to the build that answered.
+fn store_semantics_behind_reason() -> &'static str {
+    static REASON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REASON.get_or_init(|| {
+        format!(
+            "store_semantics_behind: this store serves state an older Kin build derived, so no \
+             answer over it can be certified until it is re-derived. To re-derive it, run \
+             `kin upgrade` in this repository (`{}` when Kin runs through npm)",
+            kin_core::hydration_semantics::npm_upgrade_command()
+        )
+    })
+}
+
+/// The limiting factor for a store whose replay-semantics record is missing or
+/// unreadable, naming the newest build first as the CLI remedy does.
+fn store_semantics_unknown_reason() -> &'static str {
+    static REASON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REASON.get_or_init(|| {
+        format!(
+            "store_semantics_unknown: this store's replay-semantics record is missing or \
+             unreadable, so no answer over it can be certified. Upgrade Kin to the newest build, \
+             then run `kin upgrade` in this repository (`{}` when Kin runs through npm)",
+            kin_core::hydration_semantics::NPM_LATEST_UPGRADE_COMMAND
+        )
+    })
 }
 
 impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemanticsObservation {
@@ -2065,8 +2333,8 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
         use kin_core::hydration_semantics::HydrationStanding as Standing;
         // One arm per variant, so a new standing has to be projected here
         // rather than silently inheriting whichever default it fell through to.
-        let (created_under, derives, reason) = match standing {
-            Standing::Current { version } => (Some(*version), *version, None),
+        let (created_under, upgraded_under, derives, reason) = match standing {
+            Standing::Current { version } => (Some(*version), None, *version, None),
             Standing::Behind {
                 created_under,
                 derives,
@@ -2074,14 +2342,22 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
             | Standing::Ahead {
                 created_under,
                 derives,
-            } => (Some(*created_under), *derives, None),
-            Standing::Unstamped { derives } => (None, *derives, None),
-            Standing::Unreadable { derives, reason } => (None, *derives, Some(reason.clone())),
+            } => (Some(*created_under), None, *derives, None),
+            Standing::Rederived {
+                under,
+                created_under,
+                derives,
+            } => (*created_under, Some(*under), *derives, None),
+            Standing::Unstamped { derives } => (None, None, *derives, None),
+            Standing::Unreadable { derives, reason } => {
+                (None, None, *derives, Some(reason.clone()))
+            }
         };
         Self {
             standing: standing.label().to_string(),
             derives,
             created_under,
+            upgraded_under,
             reason,
         }
     }
@@ -2133,6 +2409,9 @@ pub struct Envelope {
     /// certifying an all-clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<GraphFreshness>,
+    /// Bounded source evidence for the exact graph selected by the query producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_derivation: Option<crate::source_derivation::SourceDerivationObservation>,
     /// Whether the watcher that fed graph truth admits it lost events, beside
     /// `freshness` rather than inside it because the two answer different
     /// questions. `freshness` answers "was the graph ever brought level"; this
@@ -2179,6 +2458,21 @@ pub struct Envelope {
     /// [`AnsweringDaemon`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_by: Option<AnsweringDaemon>,
+    /// Which Kin repository answered, on every answer a repository daemon
+    /// gave, and the client's own folder with a warning when it is not that
+    /// repository. See [`crate::first_contact::repository_identity`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<crate::first_contact::RepositoryIdentity>,
+    /// The plain sentences a reader acts on before anything else in the
+    /// answer: which repository answered when it is not the client's folder,
+    /// and what a missing language server leaves out and the command that adds
+    /// it. Absent when neither holds.
+    ///
+    /// Named so it sorts first in the envelope, which sorts first in every
+    /// answer: this workspace's `serde_json` writes an object's keys in sorted
+    /// order, so the first line a reader meets is decided by the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice: Option<String>,
 }
 
 impl Envelope {
@@ -2193,6 +2487,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            source_derivation: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2204,6 +2499,8 @@ impl Envelope {
             verdict: None,
             response: None,
             answered_by: None,
+            repository: None,
+            advice: None,
         }
     }
 
@@ -2222,6 +2519,7 @@ impl Envelope {
             durability: None,
             behind: self.behind,
             freshness: None,
+            source_derivation: None,
             watcher_loss: self.watcher_loss,
             graph_state: GraphState::default(),
             degraded: self.degraded,
@@ -2230,6 +2528,10 @@ impl Envelope {
             verdict: None,
             response: None,
             answered_by: None,
+            // Which repository a write went to bears on the call as much as on
+            // any read.
+            repository: self.repository,
+            advice: self.advice,
         }
     }
 
@@ -2245,6 +2547,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            source_derivation: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
@@ -2253,6 +2556,8 @@ impl Envelope {
             verdict: None,
             response: None,
             answered_by: None,
+            repository: None,
+            advice: None,
         }
     }
 
@@ -2507,6 +2812,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            source_derivation: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2518,6 +2824,8 @@ impl Envelope {
             verdict: None,
             response: None,
             answered_by: None,
+            repository: None,
+            advice: None,
         }
     }
 
@@ -2536,6 +2844,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            source_derivation: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2547,6 +2856,8 @@ impl Envelope {
             verdict: None,
             response: None,
             answered_by: None,
+            repository: None,
+            advice: None,
         }
     }
 
@@ -2567,6 +2878,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            source_derivation: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2578,6 +2890,8 @@ impl Envelope {
             verdict: None,
             response: None,
             answered_by: None,
+            repository: None,
+            advice: None,
         }
     }
 
@@ -2699,6 +3013,28 @@ impl Envelope {
         self
     }
 
+    /// Stamp which repository answered, from the answering daemon's own
+    /// `/health`, beside the folder the client works in. Nothing is stamped
+    /// when the daemon did not name its repository.
+    ///
+    /// `canonicalize` is the launcher's, the same one the client's folder went
+    /// through, so the two compare equal when they name one folder.
+    pub fn with_repository(
+        mut self,
+        health: &Value,
+        client_root: Option<&std::path::Path>,
+        canonicalize: fn(&std::path::Path) -> std::path::PathBuf,
+    ) -> Self {
+        if let Some(root) = health.get("repo_root").and_then(Value::as_str) {
+            let root = canonicalize(std::path::Path::new(root));
+            self.repository = Some(crate::first_contact::repository_identity(
+                &root,
+                client_root,
+            ));
+        }
+        self
+    }
+
     /// Stamp the daemon storage capability without importing HEAD-scoped
     /// graph observations from `/health`.
     ///
@@ -2724,6 +3060,14 @@ impl Envelope {
     /// so the older shape still lifts rather than reporting coverage unknown next
     /// to a coverage figure the same response had just printed.
     pub fn with_payload_metadata(mut self, payload: &Value) -> Self {
+        if let Some(value) = payload.get(crate::source_derivation::KEY) {
+            self.source_derivation =
+                Some(serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+                    crate::source_derivation::SourceDerivationObservation::unavailable(
+                        "invalid_source_observation",
+                    )
+                }));
+        }
         if self.semantic_coverage.is_none() {
             if let Some(coverage) = ["semantic_coverage", "semantic_coverage_detail"]
                 .into_iter()
@@ -2755,6 +3099,53 @@ impl Envelope {
             }
         }
         self
+    }
+
+    /// The replay-semantics reason an answer cannot be certified, when there is
+    /// one, naming the action that removes it.
+    ///
+    /// Ahead of every other gate because it is the one a reader can act on and
+    /// the one that explains the rest: a store an older build wrote also reads
+    /// `local_binding_unproven`, since binding history did not exist when it
+    /// was written, and `kin upgrade` is what clears both. Each standing gets
+    /// its own code, because the four gaps need different actions and one of
+    /// them, an ahead store, must never be re-derived by the older build.
+    ///
+    /// A store `kin upgrade` brought current still qualifies an answer that
+    /// reads history recorded before that upgrade: entity history, and any
+    /// answer from a temporal scope. That history keeps the replay version
+    /// that authored it, and the upgrade's binding-history lineage starts at
+    /// the upgrade, so neither answer inherits the certification the upgraded
+    /// state earned.
+    fn hydration_semantics_trust_reason(
+        &self,
+        substrate: AbsenceSubstrate,
+    ) -> Option<&'static str> {
+        let observation = self.hydration_semantics.as_ref()?;
+        match observation.standing.as_str() {
+            "behind" => Some(store_semantics_behind_reason()),
+            "ahead" => Some(
+                "store_semantics_ahead: a newer Kin build recorded this store's semantics, so \
+                 this older build cannot certify an answer over it. Upgrade Kin itself",
+            ),
+            "unstamped" | "unreadable" => Some(store_semantics_unknown_reason()),
+            "current"
+                if observation.upgraded_under.is_some()
+                    && (substrate == AbsenceSubstrate::History
+                        || self.source_derivation.as_ref().is_some_and(|observation| {
+                            observation.scope
+                                == crate::source_derivation::SourceObservationScope::SelectedHistorical
+                        })) =>
+            {
+                Some(
+                    "history_predates_upgrade: this answer reads the store's history, and history \
+                     recorded before its last `kin upgrade` keeps the replay version that \
+                     authored it and carries no checked binding history, so the answer cannot be \
+                     certified against this build's semantics",
+                )
+            }
+            _ => None,
+        }
     }
 
     /// Whether an "absent" answer from a tool of the given [`NegativeClass`] can
@@ -2795,6 +3186,16 @@ impl Envelope {
                 false,
                 "offline_fallback: answered by the in-process graph, a fallback surface — not authoritative graph truth",
             );
+        }
+        if let Some(reason) = self.hydration_semantics_trust_reason(substrate) {
+            return (false, reason);
+        }
+        if let Some(reason) = self
+            .source_derivation
+            .as_ref()
+            .and_then(|observation| observation.limiting_factor(substrate))
+        {
+            return (false, reason);
         }
         if self.degraded.bounds(substrate) {
             return (
@@ -2911,6 +3312,10 @@ fn annotate_inner(
     edge_coverage_limits: &[String],
 ) -> ToolCallResult {
     let envelope_value = envelope.to_value();
+    let mut annotation_budget = *budget;
+    if result.is_error == Some(true) {
+        annotation_budget.answer_only = false;
+    }
     let content = result
         .content
         .into_iter()
@@ -2920,7 +3325,7 @@ fn annotate_inner(
                 &envelope_value,
                 negative,
                 tool_name,
-                budget,
+                &annotation_budget,
                 edge_coverage_limits,
             )
         })
@@ -2984,7 +3389,7 @@ pub fn finalize_bounded(
     tool_name: &str,
     budget: &ResponseBudget,
 ) -> ToolCallResult {
-    let payload = first_payload_value(&result);
+    let mut payload = first_payload_value(&result);
     let context_limit = matches!(tool_name, "get_context_pack" | "trace_computation")
         .then(|| {
             payload
@@ -2998,12 +3403,33 @@ pub fn finalize_bounded(
         Some(payload) => base.with_payload_metadata(payload),
         None => base,
     };
-    // Built for every retrieval answer that carried a payload at all, empty or
-    // full. A call that failed before producing one has no substrate to report
-    // on, and the `negative` synthesized for it below is the signal that case
-    // needs.
+    let resolution_miss = (result.is_error == Some(true))
+        .then(|| {
+            payload
+                .as_ref()
+                .and_then(|payload| payload.get("message").and_then(Value::as_str))
+                .or_else(|| {
+                    payload
+                        .is_none()
+                        .then(|| first_message_text(&result))
+                        .flatten()
+                })
+                .and_then(|message| {
+                    crate::negative::resolution_miss_for(tool_name, message, &envelope)
+                })
+        })
+        .flatten();
+    // Plain and metadata-bearing name misses assert the same entity-index
+    // fact. Give the plain form the same internal verdict input, retaining its
+    // original error bytes for annotation and excluding unrelated failures.
+    if payload.is_none() && resolution_miss.is_some() {
+        payload = first_message_text(&result).map(|message| json!({"message": message}));
+    }
+    // Completeness follows the answer that actually ran, including recognized
+    // name misses, rather than the edge walk the caller would have requested.
     if let Some(payload) = &payload {
-        envelope.completeness = Completeness::for_tool(tool_name, payload, &envelope);
+        envelope.completeness =
+            Completeness::for_tool(tool_name, payload, &envelope, resolution_miss.is_some());
     }
     let negative = match &payload {
         Some(payload) => crate::negative::negative_for(
@@ -3011,10 +3437,8 @@ pub fn finalize_bounded(
             payload,
             &envelope,
             &crate::verdict::Verdict::pre_negative_gaps(payload),
-        ),
-        None if result.is_error == Some(true) => first_message_text(&result).and_then(|message| {
-            crate::negative::resolution_miss_for(tool_name, message, &envelope)
-        }),
+        )
+        .or(resolution_miss),
         None => None,
     };
     // The one verdict is computed last, because every block it reads has to
@@ -3032,12 +3456,13 @@ pub fn finalize_bounded(
             envelope.verdict = Some(verdict.to_value());
         }
     }
+    envelope.advice = advice_for(&envelope, payload.as_ref());
     // A tool that changes state reads no graph answer, so the readings that
     // qualify one would ride every session and transaction call for nothing.
     if changes_state(tool_name) {
         envelope = envelope.for_state_change();
     }
-    let annotated = annotate_inner(
+    let mut annotated = annotate_inner(
         result,
         &envelope,
         negative.as_ref(),
@@ -3045,12 +3470,85 @@ pub fn finalize_bounded(
         budget,
         &edge_coverage_limits,
     );
+    if tool_name == "trace_data_flow" {
+        for block in &mut annotated.content {
+            let ContentBlock::Text { text } = block;
+            if let Ok(mut payload) = serde_json::from_str::<Value>(text) {
+                if payload.get("ambiguous_focal") != Some(&json!(true))
+                    && payload.get("ambiguous_target") != Some(&json!(true))
+                    && payload.get("target_ambiguity").is_none()
+                {
+                    continue;
+                }
+                // Preserve an already compact wire representation when parsing
+                // strips the private format marker used by the budget renderer.
+                if !text.contains('\n') {
+                    payload[crate::budget::JSON_FORMAT_KEY] = json!("compact");
+                }
+                if !crate::handlers::entities::fit_trace_ambiguity_payload(
+                    &mut payload,
+                    budget.max_chars,
+                ) {
+                    annotated.is_error = Some(true);
+                }
+                *text = crate::budget::render(&payload).expect("trace ambiguity is JSON");
+            }
+        }
+    }
+    if tool_name == "entity_history" {
+        for block in &annotated.content {
+            let ContentBlock::Text { text } = block;
+            // Check the bytes already rendered. Re-parsing loses the private
+            // compact-format marker, so measuring that Value would charge for
+            // pretty-print whitespace that the client never receives.
+            if text.len() <= budget.max_chars {
+                continue;
+            }
+            if let Ok(mut payload) = serde_json::from_str::<Value>(text) {
+                // Preserve an already compact wire representation when parsing
+                // strips the private format marker used by the budget renderer.
+                if !text.contains('\n') {
+                    payload[crate::budget::JSON_FORMAT_KEY] = json!("compact");
+                }
+                if !crate::budget::fit_history_payload(&mut payload, tool_name, budget) {
+                    return ToolCallResult::error(
+                        crate::budget::render(&payload).expect("history refusal is JSON"),
+                    );
+                }
+            }
+        }
+    }
     match context_limit {
         Some(limit) if annotated.is_error != Some(true) => {
-            fit_context_output(annotated, tool_name, budget, limit)
+            fit_context_output(annotated, tool_name, budget, limit, &envelope)
         }
         _ => annotated,
     }
+}
+
+/// The envelope's `advice`: the repository warning, then what a missing
+/// language server leaves out of this answer and the command that adds it.
+fn advice_for(envelope: &Envelope, payload: Option<&Value>) -> Option<String> {
+    let mut sentences: Vec<String> = Vec::new();
+    if let Some(warning) = envelope
+        .repository
+        .as_ref()
+        .and_then(|repository| repository.warning.clone())
+    {
+        sentences.push(warning);
+    }
+    if let Some(advice) = payload
+        .and_then(|payload| payload.get(crate::edge_coverage::EDGE_COVERAGE_KEY))
+        .and_then(|coverage| {
+            crate::first_contact::language_server_advice(
+                coverage,
+                crate::first_contact::Spelling::here(),
+            )
+        })
+    {
+        sentences.push(advice);
+    }
+    (!sentences.is_empty()).then(|| sentences.join(" "))
 }
 
 /// Whether `tool` changes state rather than reading graph truth, by its own
@@ -3081,6 +3579,7 @@ fn fit_context_output(
     tool: &str,
     budget: &ResponseBudget,
     token_limit: usize,
+    base: &Envelope,
 ) -> ToolCallResult {
     for block in &mut result.content {
         let ContentBlock::Text { text } = block;
@@ -3089,6 +3588,38 @@ fn fit_context_output(
         };
         loop {
             apply_response_budget(&mut payload, tool, budget);
+            // Final fitting can remove callers after the original absence
+            // qualification was built. Recompute from the rows that remain,
+            // preserving the original repository observations and every cut.
+            let mut envelope = base.clone().with_payload_metadata(&payload);
+            envelope.completeness = Completeness::for_tool(tool, &payload, &envelope, false);
+            let negative = crate::negative::negative_for(
+                tool,
+                &payload,
+                &envelope,
+                &crate::verdict::Verdict::pre_negative_gaps(&payload),
+            );
+            if let Some(verdict) =
+                crate::verdict::Verdict::compute(tool, &payload, &envelope, negative.as_ref())
+            {
+                verdict.project_onto_completeness(&mut envelope.completeness);
+                payload[ENVELOPE_KEY]["verdict"] = verdict.to_value();
+            }
+            if let Some(completeness) = envelope.completeness {
+                payload[ENVELOPE_KEY]["completeness"] =
+                    serde_json::to_value(completeness).expect("context completeness is JSON");
+            }
+            if let Some(negative) = negative {
+                payload[crate::negative::NEGATIVE_KEY] = negative;
+            }
+            // Refreshing the observations must not erase the canonical reason
+            // that this response is partial: its budget withheld content.
+            if payload.pointer("/_kin/response/bounded") == Some(&Value::Bool(true)) {
+                if let Some(completeness) = payload.pointer_mut("/_kin/completeness") {
+                    Completeness::mark_response_bounded(completeness);
+                }
+                crate::verdict::mark_response_bounded(&mut payload);
+            }
             let mut settled = false;
             for _ in 0..16 {
                 let rendered = crate::budget::render(&payload).expect("JSON value serialization");
@@ -3163,7 +3694,7 @@ fn stamp_edge_coverage_limits(map: &mut serde_json::Map<String, Value>, limits: 
     );
 }
 
-/// The `_kin` an `answer_only` reply carries: the verdict, and nothing else.
+/// The answer verdict and the repository state against which it was computed.
 ///
 /// `_kin.verdict` is the one field this server's instructions tell an agent to
 /// read first, and it is what stops a row list reading as a complete set. It
@@ -3175,7 +3706,7 @@ fn stamp_edge_coverage_limits(map: &mut serde_json::Map<String, Value>, limits: 
 /// `negative` is not attached. Its unique content is prose around the same codes
 /// `verdict.limiting_factor` carries, which is why this file already collapses
 /// `negative.advice` into a pointer once a response is over its ceiling. A
-/// caller who wants those sentences omits the parameter and gets them.
+/// caller who wants those sentences sets `answer_only: false`.
 ///
 /// `shape` is what tells a reader this is a narrowed reply rather than a whole
 /// one that happened to carry little. Without it an agent cannot tell the two
@@ -3197,6 +3728,23 @@ fn answer_only_envelope(envelope_value: &Value) -> Value {
         Value::String(crate::budget::ANSWER_ONLY_PARAM.to_string()),
     );
     envelope.insert("verdict".to_string(), Value::Object(verdict));
+    // Freshness and persisted-state observations are not all verdict inputs.
+    // Keep them even when the reference diagnostics are omitted.
+    for key in [
+        "envelope_version",
+        "runtime",
+        "graph_as_of",
+        "graph_state",
+        "freshness",
+        "source_derivation",
+        "hydration_semantics",
+        "durability",
+        "degraded",
+    ] {
+        if let Some(value) = envelope_value.get(key) {
+            envelope.insert(key.to_string(), value.clone());
+        }
+    }
     Value::Object(envelope)
 }
 
@@ -3213,7 +3761,10 @@ fn annotate_block(
     let annotated = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut map)) => {
             stamp_edge_coverage_limits(&mut map, edge_coverage_limits);
-            if answer_only {
+            if answer_only
+                && map.get("references").is_some_and(Value::is_array)
+                && map.contains_key("focal_entity")
+            {
                 // Narrowed HERE, after `finalize_bounded` computed the verdict
                 // from the whole payload. The blocks this drops are the blocks
                 // the verdict was computed from, so narrowing any earlier would
@@ -3349,6 +3900,12 @@ fn disclose_self_contradictions(annotated: &mut Value, tool_name: &str) {
 fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &ResponseBudget) {
     if !crate::budget::is_budgeted(tool_name) {
         disclose_self_contradictions(annotated, tool_name);
+        // A tool without a size budget still honours the call's wire format:
+        // `compact` is on unless the caller asked for `explain` or
+        // `compact: false`, and it changes whitespace only.
+        if budget.compact && annotated.is_object() {
+            annotated[crate::budget::JSON_FORMAT_KEY] = json!("compact");
+        }
         return;
     }
     let chars_before = crate::budget::measure(annotated);
@@ -3455,6 +4012,82 @@ fn write_response_accounting(annotated: &mut Value, accounting: &crate::budget::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_only_keeps_error_and_non_answer_payloads() {
+        for is_error in [true, false] {
+            let payload =
+                json!({"message": "invalid entity_id: expected UUID", "retryable": false});
+            let mut raw = ToolCallResult::text(payload.to_string());
+            raw.is_error = is_error.then_some(true);
+            let result = finalize_bounded(
+                raw,
+                Envelope::offline(),
+                "find_references",
+                &ResponseBudget {
+                    answer_only: true,
+                    ..ResponseBudget::default()
+                },
+            );
+            let value = annotated_value(&result);
+            assert_eq!(result.is_error, is_error.then_some(true));
+            assert_eq!(value["message"], payload["message"]);
+            assert_eq!(value["retryable"], false);
+            assert!(value["_kin"].get("shape").is_none());
+        }
+        let raw = ToolCallResult::error(
+            json!({"message": "source unavailable",
+            "references": [], "focal_entity": {"name": "call"}})
+            .to_string(),
+        );
+        let result = finalize_bounded(
+            raw,
+            Envelope::offline(),
+            "find_references",
+            &ResponseBudget {
+                answer_only: true,
+                ..ResponseBudget::default()
+            },
+        );
+        assert_eq!(annotated_value(&result)["message"], "source unavailable");
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn answer_only_keeps_durable_and_degraded_repository_observations() {
+        let payload = conservative_reference_fixture();
+        let whole = roomy_reference_response(&payload);
+        let narrow = annotated_value(&finalize_bounded(
+            ToolCallResult::text(payload.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &ResponseBudget {
+                answer_only: true,
+                max_chars: 60_000,
+                ..ResponseBudget::default()
+            },
+        ));
+        assert!(whole["_kin"]["durability"].is_object());
+        assert_eq!(whole["_kin"]["degraded"]["memory_pressure"], true);
+        for key in [
+            "durability",
+            "degraded",
+            "graph_state",
+            "freshness",
+            "graph_as_of",
+        ] {
+            assert_eq!(
+                narrow["_kin"].get(key),
+                whole["_kin"].get(key),
+                "lost {key}"
+            );
+        }
+        assert_eq!(narrow["references"], whole["references"]);
+        assert_eq!(
+            narrow["_kin"]["verdict"]["state"],
+            whole["_kin"]["verdict"]["state"]
+        );
+    }
 
     fn envelope_of(result: &ToolCallResult) -> Value {
         let ContentBlock::Text { text } = result.content.first().expect("one content block");
@@ -4257,6 +4890,124 @@ mod tests {
         assert_ne!(state_of(&not_applicable), state_of(&unchecked));
     }
 
+    /// A bulk computed-member-loop disclosure, express's own case, reaches
+    /// the one verdict, not just the handler's own `certifies_enumeration`
+    /// flag.
+    ///
+    /// Every field here reads exactly as healthy as `admitted` above except
+    /// `dynamic_members_disclosed`: the graph is healthy, the parse is full,
+    /// the spans are digest verified, and the host bytes are admitted. If
+    /// this test passed with the assertions swapped, the handler's own gate
+    /// would be the only thing standing between a caller and a certified
+    /// verdict over a floor.
+    #[test]
+    fn a_dynamic_members_disclosure_reaches_the_verdict_as_inconclusive() {
+        let health = serde_json::json!({
+            "graph_entity_count": 21,
+            "durable_entity_count": 21,
+            "graph_relation_count": 21,
+            "durable_relation_count": 21,
+            "reconciliation_status": "idle",
+            "graph_loaded": true,
+            "initialized": true,
+        });
+        let note = "Kin dynamic members: members are created at runtime from `methods`; the \
+                    enumeration is not complete";
+        let reading_of = |disclosed: bool| -> Value {
+            let payload = serde_json::json!({
+                "path": "lib/application.js",
+                "entities": [],
+                "returned": 21,
+                "total_in_file": 21,
+                "page_size": 200,
+                "offset": 0,
+                "next_cursor": Value::Null,
+                "truncated": false,
+                "enumeration_shifted": false,
+                crate::handlers::file_entities::FILE_COVERAGE_KEY: {
+                    "path": "lib/application.js",
+                    "tracked_in_graph": true,
+                    "tier": "entity_source",
+                    "content_opaque": false,
+                    "opaque_reason": Value::Null,
+                    "parsed": "full",
+                    "parse_detail": Value::Null,
+                    "layout_entity_regions": 21,
+                    "enriched": "absent",
+                    "embedded": "not_measured_per_file",
+                    "span_provenance": "digest_verified",
+                    "stale_spans": 0,
+                    "host_bytes": "admitted",
+                    "whole_file_in_response": true,
+                    "dynamic_members_disclosed": disclosed,
+                    "dynamic_members_note": if disclosed { serde_json::json!(note) } else { Value::Null },
+                    // The handler's own gate, computed the same way the real
+                    // handler computes it: healthy on every other reading, and
+                    // refusing on this one alone.
+                    "certifies_enumeration": !disclosed,
+                },
+            });
+            envelope_of(&finalize(
+                ToolCallResult::text(payload.to_string()),
+                Envelope::daemon().with_health(&health),
+                crate::handlers::file_entities::TOOL_NAME,
+            ))
+        };
+
+        let certified = reading_of(false);
+        assert_eq!(
+            certified["verdict"]["state"],
+            serde_json::json!("certified")
+        );
+        assert_eq!(
+            certified["completeness"]["classes"]["file_parsed"],
+            serde_json::json!(STATE_PRESENT)
+        );
+        assert_eq!(
+            certified["completeness"]["counted"]["exact"],
+            serde_json::json!(true)
+        );
+
+        let disclosed = reading_of(true);
+        assert_eq!(
+            disclosed["verdict"]["state"],
+            serde_json::json!("inconclusive"),
+            "a disclosed dynamic-members site must not carry a certified verdict: {disclosed:#?}"
+        );
+        let factor = disclosed["verdict"]["limiting_factor"]
+            .as_str()
+            .expect("an inconclusive verdict names its factor");
+        assert!(
+            factor.contains("substrate_partial"),
+            "the completeness input's own code names the substrate reading: {factor:?}"
+        );
+        assert_eq!(
+            disclosed["completeness"]["classes"]["file_parsed"],
+            serde_json::json!(STATE_ABSENT)
+        );
+        assert!(
+            disclosed["completeness"]["limits"]
+                .as_array()
+                .expect("limits")
+                .iter()
+                .any(|limit| limit == "file_dynamic_members_disclosed"),
+            "the limit names the disclosure: {:#?}",
+            disclosed["completeness"]
+        );
+        assert_eq!(
+            disclosed["completeness"]["counted"]["floor_reason"],
+            serde_json::json!("file_dynamic_members_disclosed")
+        );
+        assert_eq!(
+            disclosed["completeness"]["counted"]["exact"],
+            serde_json::json!(false),
+            "the count must read as a floor, not as the file's whole surface: {:#?}",
+            disclosed["completeness"]["counted"]
+        );
+
+        assert_ne!(certified["verdict"]["state"], disclosed["verdict"]["state"]);
+    }
+
     /// A tool that changes state carries the minimal envelope, and a read keeps
     /// the store readings. The session end is the shape the ruling named.
     #[test]
@@ -4311,6 +5062,11 @@ mod tests {
             sample: Vec::new(),
             measured_age_seconds: Some(9),
             measured: true,
+            underived_paths: 0,
+            underived_sample: Vec::new(),
+            changed_paths: 0,
+            changed_sample: Vec::new(),
+            changed_unchecked: false,
         };
         assert!(
             !stamped.unmeasured(),
@@ -4336,6 +5092,84 @@ mod tests {
         assert!(
             !counted.unmeasured(),
             "a count with no stamp is still a count, and `kin admit` is still the remedy"
+        );
+    }
+
+    /// A path whose bytes are admitted and whose parse is owed is a gap, and it
+    /// is not the gap `kin admit` closes.
+    ///
+    /// The first cut of this disclosure added those paths to
+    /// `untracked_path_count`, so the agent was told a file it had just
+    /// admitted had never been admitted and was sent to a command that takes an
+    /// already-taken path. The gap is graded here on both halves: the
+    /// disclosure still fires, and it names the parse rather than an admission.
+    #[test]
+    fn an_owed_parse_is_disclosed_without_claiming_the_path_was_never_admitted() {
+        let health = serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 4,
+                "underived_path_count": 1,
+                "underived_paths_sample": ["linkgraph/predicates.py"],
+                "last_admission_success_at": "2026-09-22T00:00:00Z",
+            },
+        });
+        let behind = GraphBehind::from_health(&health)
+            .expect("a stamped empty untracked walk beside an owed parse is still a gap");
+        assert_eq!(behind.unadmitted_paths, 0);
+        assert_eq!(behind.underived_paths, 1);
+        assert_eq!(behind.underived_sample, vec!["linkgraph/predicates.py"]);
+        assert!(
+            !behind.unmeasured(),
+            "the walk was stamped and the owed parse is a count, not an absent reading"
+        );
+        let factor = behind.limiting_factor();
+        assert!(
+            factor.starts_with("graph_behind_working_tree:"),
+            "the machine-stable gap name does not move: {factor}"
+        );
+        assert!(
+            factor.contains("still owed their parse"),
+            "the factor has to name the gap it is about: {factor}"
+        );
+        assert!(
+            !factor.contains("never been admitted"),
+            "these paths were admitted, and saying otherwise is the bent label: {factor}"
+        );
+        assert!(
+            !factor.contains("kin admit"),
+            "`kin admit` takes an already-taken path and clears nothing here: {factor}"
+        );
+
+        // The control, on the same object: a reading with both gaps names both
+        // levers, so the split cannot be satisfied by dropping either sentence.
+        let mut both = behind.clone();
+        both.unadmitted_paths = 2;
+        let factor = both.limiting_factor();
+        assert!(
+            factor.contains("never been admitted") && factor.contains("`kin admit`"),
+            "the unadmitted half keeps its own lever: {factor}"
+        );
+        assert!(
+            factor.contains("still owed their parse"),
+            "and the owed parse is still named beside it: {factor}"
+        );
+    }
+
+    /// A stamped zero with nothing owed is still an all-clear, so the gate this
+    /// widened cannot be satisfied by reporting every store as behind.
+    #[test]
+    fn a_stamped_zero_with_no_owed_parse_still_reports_nothing() {
+        let health = serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 4,
+                "underived_path_count": 0,
+            },
+        });
+        assert!(
+            GraphBehind::from_health(&health).is_none(),
+            "a measured zero with no debt is the all-clear this object exists to allow"
         );
     }
 
@@ -4950,6 +5784,147 @@ mod tests {
     }
 
     #[test]
+    fn context_compact_transport_survives_envelope_reparse_with_exact_accounting() {
+        let payload = json!({
+            "token_budget": 8000, "tokens_used": 0,
+            "focal_entity": {"id": "focal", "name": "focal", "body": "fn café() {\r\n    execute();\r\n}", "body_complete": true},
+            "dependencies": [{"id": "dependency", "name": "dependency", "signature": "fn dependency()"}],
+            "dependents": [],
+            "degradations": [{"reason": "references_are_incomplete"}]
+        });
+        for tool in ["get_context_pack", "trace_computation"] {
+            for args in [
+                std::collections::HashMap::new(),
+                std::collections::HashMap::from([("compact".into(), json!(true))]),
+                std::collections::HashMap::from([("compact".into(), json!(false))]),
+                std::collections::HashMap::from([("explain".into(), json!(true))]),
+            ] {
+                let budget = ResponseBudget::from_arguments(&args);
+                // Exercise direct stdio and daemon-payload forwarding. The
+                // private format marker is deliberately absent from both wires.
+                for forwarded in [false, true] {
+                    let mut raw = payload.clone();
+                    if forwarded {
+                        crate::budget::enforce(&mut raw, tool, &budget);
+                        assert!(crate::budget::fit_context_payload(&mut raw, tool, &budget));
+                    }
+                    let result = finalize_bounded(
+                        ToolCallResult::text(crate::budget::render(&raw).unwrap()),
+                        ready_daemon_envelope(),
+                        tool,
+                        &budget,
+                    );
+                    assert_ne!(result.is_error, Some(true));
+                    let text = first_message_text(&result).unwrap();
+                    let output: Value = serde_json::from_str(text).unwrap();
+                    assert_eq!(text.contains('\n'), !budget.compact);
+                    assert!(output.get(crate::budget::JSON_FORMAT_KEY).is_none());
+                    assert_eq!(output["tokens_used"], kin_context::estimate_tokens(text));
+                    assert_eq!(output["_kin"]["response"]["chars_after_budget"], text.len());
+                    assert_eq!(output["_kin"]["response"]["compact"], budget.compact);
+                    assert_eq!(output["_kin"]["response"]["bounded"], false);
+                    assert!(text.len() <= budget.max_chars);
+                    assert!(kin_context::estimate_tokens(text) <= 8000);
+                    for key in ["focal_entity", "dependencies", "dependents", "degradations"] {
+                        assert_eq!(output[key], payload[key], "{tool}: {key}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every reply is compact on the wire unless the call asked for `explain`
+    /// or `compact: false`, whether or not its tool has a response shape, and
+    /// the format is whitespace only: the served facts, the envelope and the
+    /// `negative` are the ones the pretty reply carries, the response
+    /// accounting counts the bytes that ship, and the private format marker
+    /// never ships.
+    #[test]
+    fn every_reply_is_compact_on_the_wire_by_default_and_keeps_every_fact() {
+        let payload = json!({
+            "entity_id": "a",
+            "detail": {"nested": [1, 2, {"deep": "line one\nline two"}], "empty": {}},
+            "note": "café ✓ \u{2028} tab\there",
+        });
+        let tools = [
+            // Tools with a response shape.
+            "semantic_search",
+            "semantic_locate",
+            "find_references",
+            "graph_neighborhood",
+            "impact_analysis",
+            "entity_history",
+            "find_dead_code_seeded",
+            "bulk_check_references",
+            // Tools without one, which leave the budget early.
+            "get_entity_source",
+            "kin_session_start",
+            "kin_mutate",
+            "kin_graph_status",
+        ];
+        let calls = [
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([("compact".to_string(), json!(true))]),
+            std::collections::HashMap::from([("compact".to_string(), json!(false))]),
+            std::collections::HashMap::from([("explain".to_string(), json!(true))]),
+        ];
+        for tool in tools {
+            let budgeted = crate::budget::is_budgeted(tool);
+            let mut served = Vec::new();
+            for args in &calls {
+                let budget = ResponseBudget::from_arguments(args);
+                let result = finalize_bounded(
+                    ToolCallResult::text(serde_json::to_string_pretty(&payload).unwrap()),
+                    ready_daemon_envelope(),
+                    tool,
+                    &budget,
+                );
+                assert_ne!(result.is_error, Some(true), "{tool} {args:?}");
+                let text = first_message_text(&result).unwrap();
+                assert_eq!(
+                    text.contains('\n'),
+                    !budget.compact,
+                    "{tool} {args:?} is served in the call's format: {text}"
+                );
+                let value: Value = serde_json::from_str(text).unwrap();
+                assert!(
+                    value.get(crate::budget::JSON_FORMAT_KEY).is_none(),
+                    "{tool} {args:?}: the private format marker shipped"
+                );
+                for key in ["entity_id", "detail", "note"] {
+                    assert_eq!(value[key], payload[key], "{tool} {args:?}: {key}");
+                }
+                if budgeted {
+                    assert_eq!(
+                        value["_kin"]["response"]["chars_after_budget"],
+                        text.len(),
+                        "{tool} {args:?}: accounting counts the served bytes"
+                    );
+                    assert_eq!(value["_kin"]["response"]["compact"], budget.compact);
+                }
+                served.push((budget.compact, value));
+            }
+            // The two compact calls and the two pretty calls serve the same
+            // object, and across formats only the response accounting, which
+            // counts each format's own bytes, may differ.
+            assert_eq!(served[0], served[1], "{tool}: default is compact");
+            assert_eq!(served[2], served[3], "{tool}: explain is pretty");
+            let without_accounting = |value: &Value| {
+                let mut value = value.clone();
+                if let Some(kin) = value.get_mut("_kin").and_then(Value::as_object_mut) {
+                    kin.remove("response");
+                }
+                value
+            };
+            assert_eq!(
+                without_accounting(&served[0].1),
+                without_accounting(&served[2].1),
+                "{tool}: compact and pretty serve the same facts"
+            );
+        }
+    }
+
+    #[test]
     fn context_final_ceiling_counts_envelope_and_preserves_named_route() {
         let mut payload = serde_json::json!({
             "token_budget": 8000, "tokens_used": 0,
@@ -5007,6 +5982,65 @@ mod tests {
     }
 
     #[test]
+    fn context_agent_default_retains_realistic_qualification_and_whole_source() {
+        // Synthetic identities and paths, with a realistic daemon envelope,
+        // arrival-file observations and source qualification. A bare test
+        // envelope misses the metadata floor this regression exercises.
+        let fixture: Value =
+            serde_json::from_str(include_str!("testdata/context_qualified.json")).unwrap();
+        let mut args = std::collections::HashMap::new();
+        crate::agent_belt::apply_belt_defaults("get_context_pack", &mut args);
+        let default_limit = args["token_budget"].as_u64().unwrap();
+        assert_eq!(default_limit, 4000);
+        let budget = ResponseBudget::from_arguments(&args);
+        for limit in [default_limit, 3000, 2500] {
+            let mut payload = fixture.clone();
+            payload["token_budget"] = json!(limit);
+            let result = finalize_bounded(
+                ToolCallResult::text(payload.to_string()),
+                ready_daemon_envelope(),
+                "get_context_pack",
+                &budget,
+            );
+            let text = first_message_text(&result).unwrap();
+            if limit == 2500 {
+                assert_eq!(result.is_error, Some(true), "{text}");
+                assert!(text.contains("effective 2500 token"), "{text}");
+                continue;
+            }
+            assert_ne!(result.is_error, Some(true), "{text}");
+            let served: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(served["token_budget"], limit);
+            assert_eq!(served["tokens_used"], kin_context::estimate_tokens(text));
+            assert!(kin_context::estimate_tokens(text) <= limit as usize);
+            assert_eq!(served["_kin"]["response"]["chars_after_budget"], text.len());
+            assert!(text.len() <= budget.max_chars);
+            assert_eq!(served["focal_entity"], fixture["focal_entity"]);
+            assert_eq!(served["caller_arrival"], fixture["caller_arrival"]);
+            assert_eq!(served["source_derivation"], fixture["source_derivation"]);
+            assert_eq!(served["negative"]["safe_to_conclude_absent"], false);
+            if limit == default_limit {
+                for field in ["dependencies", "dependents", "transitive_deps"] {
+                    assert_eq!(served[field], fixture[field]);
+                }
+                assert_eq!(served["_kin"]["response"]["bounded"], false);
+                assert_eq!(served["_kin"]["verdict"]["state"], "certified");
+            } else {
+                assert_eq!(served["_kin"]["response"]["bounded"], true);
+                assert_eq!(served["_kin"]["verdict"]["state"], "inconclusive");
+                assert_eq!(
+                    served["_kin"]["verdict"]["inputs"]["response_budget"],
+                    "inconclusive"
+                );
+                assert!(served["_kin"]["verdict"]["limiting_factor"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("response_bounded"));
+            }
+        }
+    }
+
+    #[test]
     fn context_final_ceiling_refuses_an_impossible_metadata_floor() {
         let payload = serde_json::json!({"token_budget": 1, "tokens_used": 0, "focal_entity": {"id": "start", "name": "start"}});
         let result = finalize(
@@ -5024,6 +6058,102 @@ mod tests {
             "graph_loaded": true,
             "reconciliation_status": "clean",
         }))
+    }
+
+    #[test]
+    fn resolution_miss_finalization_uses_entity_index_evidence() {
+        for tool in [
+            "find_references",
+            "trace_data_flow",
+            crate::handlers::path::TOOL_NAME,
+            "impact_analysis",
+            "semantic_diff",
+            "semantic_review",
+            "kin_provenance_query",
+        ] {
+            for structured in [true, false] {
+                let message = "Entity not found";
+                let result = ToolCallResult::error(if structured {
+                    json!({"message": message}).to_string()
+                } else {
+                    message.to_string()
+                });
+                let served = annotated_value(&finalize(
+                    result,
+                    Envelope::daemon().with_health(&json!({
+                        "initialized": true,
+                        "graph_loaded": true,
+                        "graph_entity_count": 10,
+                    })),
+                    tool,
+                ));
+                assert_eq!(served["negative"]["interpretation"], "name_not_resolved");
+                assert_eq!(served["negative"]["safe_to_conclude_absent"], true);
+                assert_eq!(
+                    served["_kin"]["completeness"]["substrate"], "graph",
+                    "{tool}: {served}"
+                );
+                assert_eq!(
+                    served["_kin"]["verdict"]["state"], "certified",
+                    "{tool}: {served}"
+                );
+                assert_eq!(served["_kin"]["verdict"]["absence_claim"], "authoritative");
+                assert_eq!(served["_kin"]["verdict"]["safe_to_conclude_absent"], true);
+                assert!(
+                    served["_kin"].get("self_check").is_none(),
+                    "{tool}: {served}"
+                );
+                assert!(served.get("references").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn resolution_miss_finalization_keeps_unread_graphs_inconclusive() {
+        for health in [
+            json!({"initialized": false, "graph_loaded": true, "graph_entity_count": 10}),
+            json!({"initialized": true, "graph_loaded": false, "graph_entity_count": 10}),
+            json!({"initialized": true, "graph_loaded": true, "graph_entity_count": 0}),
+            json!({"initialized": true, "graph_loaded": true, "graph_entity_count": 10,
+                "reconcile": {"untracked_path_count": 1,
+                    "untracked_paths_sample": ["pending.py"],
+                    "last_admission_success_at": "2026-09-25T07:00:00Z"}}),
+        ] {
+            let served = annotated_value(&finalize(
+                ToolCallResult::error(json!({"message": "Entity not found"}).to_string()),
+                Envelope::daemon().with_health(&health),
+                "find_references",
+            ));
+            assert_eq!(
+                served["negative"]["safe_to_conclude_absent"], false,
+                "{served}"
+            );
+            assert_eq!(
+                served["_kin"]["verdict"]["state"], "inconclusive",
+                "{served}"
+            );
+            assert_eq!(served["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+            assert!(served["_kin"].get("self_check").is_none(), "{served}");
+        }
+    }
+
+    #[test]
+    fn resolution_miss_finalization_does_not_certify_transport_or_authority_errors() {
+        for message in [
+            "connection refused".to_string(),
+            format!(
+                "{}Entity not found",
+                crate::negative::UNANSWERED_READ_PREFIX
+            ),
+        ] {
+            let served = annotated_value(&finalize(
+                ToolCallResult::error(json!({"message": message}).to_string()),
+                ready_daemon_envelope(),
+                "find_references",
+            ));
+            assert!(served.get("negative").is_none(), "{served}");
+            assert_ne!(served["_kin"]["verdict"]["safe_to_conclude_absent"], true);
+        }
     }
 
     fn completeness_of(result: &ToolCallResult) -> Value {
@@ -7122,7 +8252,20 @@ mod tests {
             let (trusted, reason) =
                 flagged.negative_trust(NegativeClass::Semantic, AbsenceSubstrate::Vectors);
             assert!(!trusted);
-            assert!(reason.contains("degraded"), "{reason}");
+            let code = match standing.label() {
+                "behind" => "store_semantics_behind",
+                "ahead" => "store_semantics_ahead",
+                _ => "store_semantics_unknown",
+            };
+            assert!(
+                reason.starts_with(code),
+                "a hydration gap must name its own action, not a generic degraded signal: {reason}"
+            );
+            if standing.label() == "ahead" {
+                assert!(!reason.contains("kin upgrade`"), "{reason}");
+            } else {
+                assert!(reason.contains("`kin upgrade`"), "{reason}");
+            }
             for substrate in [
                 AbsenceSubstrate::Vectors,
                 AbsenceSubstrate::EntityIndex,
@@ -7148,11 +8291,174 @@ mod tests {
         assert_eq!(outside.degraded.hydration_semantics_stale, None);
     }
 
+    /// A store `kin upgrade` brought current certifies what it serves, and only
+    /// that. An answer that reads its history, by substrate or by a temporal
+    /// scope, reaches changes recorded before the upgrade, which keep the replay
+    /// version that authored them and sit outside the lineage the upgrade
+    /// started, so it is qualified by `history_predates_upgrade`. A store this
+    /// build created has no such past and is not.
+    #[test]
+    fn history_answers_over_an_upgraded_store_stay_qualified() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let upgraded = HydrationStanding::Rederived {
+            under: 10,
+            created_under: Some(9),
+            derives: 10,
+        };
+        let envelope = Envelope::daemon().with_hydration_semantics_observation(Some(&upgraded));
+        assert_eq!(
+            envelope.degraded.hydration_semantics_stale, None,
+            "an upgraded store that matches this build is not a gap"
+        );
+        let (trusted, reason) =
+            envelope.negative_trust(NegativeClass::Structural, AbsenceSubstrate::History);
+        assert!(!trusted);
+        assert!(reason.starts_with("history_predates_upgrade:"), "{reason}");
+        for substrate in [
+            AbsenceSubstrate::Vectors,
+            AbsenceSubstrate::EntityIndex,
+            AbsenceSubstrate::Relations,
+        ] {
+            let (_, reason) = envelope.negative_trust(NegativeClass::Structural, substrate);
+            assert!(
+                !reason.starts_with("history_predates_upgrade")
+                    && !reason.starts_with("store_semantics"),
+                "an answer over the upgraded state must not be qualified by the upgrade: \
+                 {substrate:?} {reason}"
+            );
+        }
+
+        let mut temporal = envelope.clone();
+        temporal.source_derivation =
+            Some(crate::source_derivation::SourceDerivationObservation::historical());
+        let (trusted, reason) =
+            temporal.negative_trust(NegativeClass::Structural, AbsenceSubstrate::Relations);
+        assert!(!trusted);
+        assert!(reason.starts_with("history_predates_upgrade:"), "{reason}");
+
+        let created = Envelope::daemon().with_hydration_semantics_observation(Some(
+            &HydrationStanding::Current { version: 10 },
+        ));
+        let (_, reason) =
+            created.negative_trust(NegativeClass::Structural, AbsenceSubstrate::History);
+        assert!(!reason.starts_with("history_predates_upgrade"), "{reason}");
+    }
+
+    /// Every store-semantics gap names the same command the CLI's remedy does,
+    /// including the npm form pinned to this build for a store behind it.
+    #[test]
+    fn the_store_semantics_limiting_factor_names_the_cli_remedy() {
+        use kin_core::hydration_semantics::{HydrationStanding, NPM_LATEST_UPGRADE_COMMAND};
+
+        let reason = |standing: &HydrationStanding| {
+            Envelope::daemon()
+                .with_hydration_semantics_observation(Some(standing))
+                .negative_trust(NegativeClass::Structural, AbsenceSubstrate::Relations)
+                .1
+        };
+        let behind = reason(&HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        });
+        assert!(
+            behind.contains("run `kin upgrade` in this repository")
+                && behind.contains(&kin_core::hydration_semantics::npm_upgrade_command()),
+            "{behind}"
+        );
+        let unknown = reason(&HydrationStanding::Unstamped { derives: 10 });
+        assert!(
+            unknown.contains("run `kin upgrade` in this repository")
+                && unknown.contains(NPM_LATEST_UPGRADE_COMMAND),
+            "{unknown}"
+        );
+    }
+
+    /// No store-semantics reason carries the string that divides clauses.
+    ///
+    /// `negative.trust_reason` is a wire join of clauses, and the verdict
+    /// splits it back on that separator. A reason whose own prose held one
+    /// reached the verdict as a labelled clause plus a fragment it could only
+    /// send as `unlisted_clause`. The last half drives `finalize`, so the factor
+    /// checked is the one an agent reads.
+    #[test]
+    fn no_hydration_semantics_reason_carries_the_clause_separator() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let ours = [
+            "store_semantics_behind",
+            "store_semantics_ahead",
+            "store_semantics_unknown",
+            "history_predates_upgrade",
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for standing in [
+            HydrationStanding::Behind {
+                created_under: 9,
+                derives: 10,
+            },
+            HydrationStanding::Ahead {
+                created_under: 11,
+                derives: 10,
+            },
+            HydrationStanding::Unstamped { derives: 10 },
+            HydrationStanding::Unreadable {
+                reason: "truncated".to_string(),
+                derives: 10,
+            },
+            HydrationStanding::Rederived {
+                under: 10,
+                created_under: Some(9),
+                derives: 10,
+            },
+        ] {
+            let envelope = Envelope::daemon().with_hydration_semantics_observation(Some(&standing));
+            for substrate in [AbsenceSubstrate::History, AbsenceSubstrate::Relations] {
+                let (_, reason) = envelope.negative_trust(NegativeClass::Structural, substrate);
+                let label = reason.split(':').next().unwrap_or_default();
+                if !ours.contains(&label) {
+                    continue;
+                }
+                seen.insert(label.to_string());
+                assert!(
+                    !reason.contains(crate::verdict::CLAUSE_SEPARATOR),
+                    "{} {substrate:?}: {reason}",
+                    standing.label()
+                );
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            ours.len(),
+            "a store-semantics reason was never produced, so it was not checked: {seen:?}"
+        );
+
+        let behind = HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        };
+        let value = annotated_value(&finalize(
+            reference_payload(1, "present"),
+            ready_daemon_envelope().with_hydration_semantics_observation(Some(&behind)),
+            "find_references",
+        ));
+        let factor = value["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .unwrap_or_default();
+        let codes: Vec<&str> = factor.split(crate::verdict::CLAUSE_SEPARATOR).collect();
+        assert_eq!(codes.first(), Some(&"store_semantics_behind"), "{value}");
+        assert!(
+            !codes.contains(&crate::verdict::UNLISTED_CLAUSE_CODE),
+            "{value}"
+        );
+    }
+
     /// The four gaps need four different actions and only one of them is safe to
-    /// re-ingest directly, so the wire has to separate them. Each arm asserts
-    /// the exact projection rather than "some observation is present", because a
-    /// builder that stamped every store `behind` would satisfy the weaker check
-    /// and mislead the agent in exactly the direction that destroys a store.
+    /// upgrade in place with this build, so the wire has to separate them. Each
+    /// arm asserts the exact projection rather than "some observation is
+    /// present", because a builder that stamped every store `behind` would
+    /// satisfy the weaker check and mislead the agent in exactly the direction
+    /// that destroys a store.
     #[test]
     fn every_standing_projects_its_own_direction_and_versions() {
         use kin_core::hydration_semantics::HydrationStanding;
@@ -7379,6 +8685,62 @@ mod self_check_tests {
             value["_kin"].get("self_check").is_none(),
             "an agreeing response disclosed a contradiction: {value}"
         );
+    }
+
+    fn focal_choice_payload() -> Value {
+        // The source-read ambiguity shape: the choices are a function and an
+        // importer-created module with the same name. Neither is selected.
+        json!({
+            "ambiguous_focal": true,
+            "query": "mutable",
+            "resolution": "same_name",
+            "candidate_count": 2,
+            "candidates": [
+                {"entity_id": "00000000-0000-0000-0000-000000000001", "name": "mutable", "kind": "function"},
+                {"entity_id": "00000000-0000-0000-0000-000000000002", "name": "mutable", "kind": "module"},
+            ],
+            "degradations": [{"component": "focal_resolution", "reason": "ambiguous_name"}],
+        })
+    }
+
+    #[test]
+    fn ambiguous_source_choices_remain_inconclusive_without_a_false_self_check() {
+        let payload = focal_choice_payload();
+        let result = finalize(
+            ToolCallResult::text(payload.to_string()),
+            Envelope::daemon(),
+            "get_entity_source",
+        );
+        let value = first_payload_value(&result).expect("finalized source choices are JSON");
+        assert_eq!(value["candidates"], payload["candidates"]);
+        assert_eq!(value["candidate_count"], 2);
+        assert_eq!(value["ambiguous_focal"], true);
+        assert!(value.get("body").is_none() && value.get("source_base").is_none());
+        assert_eq!(value["_kin"]["verdict"]["state"], "inconclusive");
+        assert_eq!(value["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+        assert!(value["_kin"].get("self_check").is_none(), "{value}");
+    }
+
+    #[test]
+    fn ambiguous_source_choice_count_skew_is_disclosed_to_the_client() {
+        let mut payload = focal_choice_payload();
+        payload["candidate_count"] = json!(1);
+        let result = finalize(
+            ToolCallResult::text(payload.to_string()),
+            Envelope::daemon(),
+            "get_entity_source",
+        );
+        let value = first_payload_value(&result).expect("finalized source choices are JSON");
+        assert_eq!(value["_kin"]["self_check"]["status"], "contradicted");
+        let found = value["_kin"]["self_check"]["disagreements"]
+            .as_array()
+            .unwrap();
+        assert!(found.iter().any(|entry| entry
+            .as_str()
+            .is_some_and(|entry| entry.contains("candidate_count reads 1 against 2"))));
+        assert_eq!(value["candidates"], payload["candidates"]);
+        assert_eq!(value["_kin"]["verdict"]["state"], "inconclusive");
+        assert_eq!(value["_kin"]["verdict"]["safe_to_conclude_absent"], false);
     }
 
     #[test]
