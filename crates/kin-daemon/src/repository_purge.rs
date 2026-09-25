@@ -149,6 +149,18 @@ pub(crate) fn execute(
         previous.clone(),
         desired_tree,
     );
+    let vacated = crate::repository_commit::VacatedPaths::from_deltas(&deltas);
+    let (entity_deltas, relation_deltas) =
+        crate::repository_commit::retire_live_semantics_on_vacated(state.graph.as_ref(), &vacated)?;
+    let admitted = admitted.with_live_observation(
+        state.graph.as_ref(),
+        &TransactionDelta {
+            entity_deltas,
+            relation_deltas,
+            tree_deltas: deltas.clone(),
+            ..Default::default()
+        },
+    )?;
 
     // Raise the graph-authority writer guard before touching the live graph.
     // The handler's coordination gate excludes other writers, but the seqlock
@@ -170,6 +182,7 @@ pub(crate) fn execute(
         tree_deltas: deltas.clone(),
         ..TransactionDelta::default()
     })?;
+    crate::binding_history::restore_exact_authority(state);
     drop(graph_mutation);
     // VFS paging cursors, the /vfs/version endpoint, and the version half of the
     // xref read check all key on this. Skipping it after the single largest tree

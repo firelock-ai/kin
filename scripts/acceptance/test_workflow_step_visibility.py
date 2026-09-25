@@ -73,6 +73,11 @@ EXPECTED_SUITES = (
         "acceptance/hydration_semantics.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/published_store_upgrade_repro.py",
+        "published_store_upgrade",
+        "acceptance/published_store_upgrade.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/same_owner_call_repro.py",
         "sameowner",
         "acceptance/sameowner.json",

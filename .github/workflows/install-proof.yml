@@ -827,19 +827,22 @@ jobs:
           }
 
           const home = os.homedir();
+          // Each entry carries the profile setup assigns its client: Claude Code
+          // keeps agent-default, and the clients that resend every tool with
+          // each request get the routed profile.
           const jsonConfigs = [
-            path.join(home, ".claude.json"),
-            path.join(home, ".cursor", "mcp.json"),
-            path.join(home, ".gemini", "settings.json"),
-            path.join(home, ".codeium", "windsurf", "mcp_config.json"),
+            [path.join(home, ".claude.json"), "agent-default"],
+            [path.join(home, ".cursor", "mcp.json"), "agent-routed"],
+            [path.join(home, ".gemini", "settings.json"), "agent-routed"],
+            [path.join(home, ".codeium", "windsurf", "mcp_config.json"), "agent-routed"],
           ];
-          for (const configPath of jsonConfigs) {
+          for (const [configPath, profile] of jsonConfigs) {
             const entry = JSON.parse(fs.readFileSync(configPath, "utf8"))?.mcpServers?.kin;
             if (
               !entry ||
               entry.command !== installedKin ||
               JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) ||
-              entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default"
+              entry.env?.KIN_MCP_TOOL_PROFILE !== profile
             ) {
               throw new Error(`${configPath}: Kin MCP entry is missing or malformed`);
             }
@@ -1199,19 +1202,25 @@ jobs:
           // startup itself must find the sibling binary without a PATH rescue.
           stopDaemons("before MCP startup");
 
+          const searchArgs = { query: "hello", compact: true, limit: 5 };
+          // The call takes the shape the launched entry's profile serves: a
+          // routed profile lists one `kin` tool, and search goes through it.
+          // Any other profile lists `semantic_search` and is called by name.
+          // tools/list must serve the tool the call names, so the listing
+          // check below follows the same profile.
+          const searchCall = (profile) => (
+            typeof profile === "string" && profile.startsWith("agent-routed")
+              ? { name: "kin", arguments: { command: "search", args: searchArgs } }
+              : { name: "semantic_search", arguments: searchArgs }
+          );
+          // What a failure calls the search it made.
+          const searchLabel = (call) => (
+            call.name === "kin" ? `kin ${call.arguments.command}` : call.name
+          );
           const requests = [
             { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
             { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
             { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
-            {
-              jsonrpc: "2.0",
-              id: 3,
-              method: "tools/call",
-              params: {
-                name: "semantic_search",
-                arguments: { query: "hello", compact: true, limit: 5 },
-              },
-            },
           ];
 
           // Launch through the exact Antigravity workspace entry emitted by
@@ -1223,6 +1232,9 @@ jobs:
           if (!entry || typeof entry.command !== "string" || !Array.isArray(entry.args) || typeof entry.cwd !== "string") {
             throw new Error(`${configPath}: captured MCP launch entry is missing`);
           }
+          const launchProfile = entry.env?.KIN_MCP_TOOL_PROFILE;
+          const launchCall = searchCall(launchProfile);
+          const launchLabel = searchLabel(launchCall);
           // kin records the canonicalized repository root, which on Windows
           // carries the `\\?\` verbatim prefix that CreateProcessW rejects as
           // a working directory, so strip it before handing the path to spawn.
@@ -1274,20 +1286,17 @@ jobs:
                 if (!line.trim().startsWith("{")) continue;
                 const message = JSON.parse(line);
                 if (message.id === 3 && !revivalRequested) {
-                  validateSearch(message, "initial MCP semantic_search");
+                  validateSearch(message, `initial MCP ${launchLabel}`);
                   stopDaemons("between MCP calls");
                   revivalRequested = true;
                   child.stdin.write(`${JSON.stringify({
                     jsonrpc: "2.0",
                     id: 4,
                     method: "tools/call",
-                    params: {
-                      name: "semantic_search",
-                      arguments: { query: "hello", compact: true, limit: 5 },
-                    },
+                    params: launchCall,
                   })}\n`);
                 } else if (message.id === 4) {
-                  validateSearch(message, "revived MCP semantic_search");
+                  validateSearch(message, `revived MCP ${launchLabel}`);
                   child.stdin.end();
                 }
               }
@@ -1309,16 +1318,26 @@ jobs:
                 .map((line) => JSON.parse(line));
               const byId = new Map(messages.filter((message) => message.id != null).map((message) => [message.id, message]));
               if (!byId.get(1)?.result) throw new Error("MCP initialize response missing");
-              if (!JSON.stringify(byId.get(2)?.result ?? {}).includes("semantic_search")) {
-                throw new Error("MCP tools/list omitted semantic_search");
+              const listedTools = byId.get(2)?.result?.tools;
+              if (!Array.isArray(listedTools) || !listedTools.some((tool) => tool?.name === launchCall.name)) {
+                throw new Error(
+                  `MCP tools/list omitted ${launchCall.name}, the tool the launched ` +
+                  `${launchProfile ?? "default"} profile serves`
+                );
               }
-              validateSearch(byId.get(3), "initial MCP semantic_search");
+              validateSearch(byId.get(3), `initial MCP ${launchLabel}`);
               if (!revivalRequested) throw new Error("MCP daemon revival was not exercised");
-              validateSearch(byId.get(4), "revived MCP semantic_search");
+              validateSearch(byId.get(4), `revived MCP ${launchLabel}`);
               finish();
             } catch (error) {
               finish(error);
             }
+          });
+          requests.push({
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: launchCall,
           });
           child.stdin.write(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
           NODE
@@ -2017,16 +2036,18 @@ jobs:
           const repoRoot = fs.realpathSync(process.cwd());
           const ordinaryArgs = ["mcp", "start"];
           const repositoryArgs = ["mcp", "start", "--repo", repoRoot];
+          // Profiles as setup assigns them: Claude Code keeps agent-default,
+          // and Cursor, Gemini, Windsurf, Codex and Antigravity get agent-routed.
           const mcpConfigs = [
-            { path: path.join(home, ".claude.json"), args: ordinaryArgs },
-            { path: path.join(home, ".cursor", "mcp.json"), args: ordinaryArgs },
-            { path: path.join(home, ".gemini", "settings.json"), args: ordinaryArgs },
-            { path: path.join(home, ".codeium", "windsurf", "mcp_config.json"), args: ordinaryArgs },
-            { path: "kin-claude-fallback-config.json", args: ordinaryArgs },
-            { path: "kin-codex-config.json", args: repositoryArgs },
-            { path: path.join(home, ".gemini", "config", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
-            { path: path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
-            { path: path.join(repoRoot, ".agents", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
+            { path: path.join(home, ".claude.json"), args: ordinaryArgs, profile: "agent-default" },
+            { path: path.join(home, ".cursor", "mcp.json"), args: ordinaryArgs, profile: "agent-routed" },
+            { path: path.join(home, ".gemini", "settings.json"), args: ordinaryArgs, profile: "agent-routed" },
+            { path: path.join(home, ".codeium", "windsurf", "mcp_config.json"), args: ordinaryArgs, profile: "agent-routed" },
+            { path: "kin-claude-fallback-config.json", args: ordinaryArgs, profile: "agent-default" },
+            { path: "kin-codex-config.json", args: repositoryArgs, profile: "agent-routed" },
+            { path: path.join(home, ".gemini", "config", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot, profile: "agent-routed" },
+            { path: path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot, profile: "agent-routed" },
+            { path: path.join(repoRoot, ".agents", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot, profile: "agent-routed" },
           ];
           // kin records canonicalized repository paths, which on Windows carry
           // the `\\?\` verbatim prefix; the expectations above are built from
@@ -2040,7 +2061,7 @@ jobs:
               !entry ||
               entry.command !== installedKin ||
               JSON.stringify(entryArgs) !== JSON.stringify(expected.args) ||
-              entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default" ||
+              entry.env?.KIN_MCP_TOOL_PROFILE !== expected.profile ||
               (expected.cwd !== undefined && stripVerbatim(entry.cwd) !== expected.cwd)
             ) {
               throw new Error(`${expected.path}: Kin MCP entry is missing or malformed`);

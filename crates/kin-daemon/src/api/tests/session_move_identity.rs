@@ -13,12 +13,16 @@ fn sole_entity(state: &DaemonState, path: &str) -> Entity {
             ..Default::default()
         })
         .unwrap();
+    let declarations: Vec<_> = entities
+        .into_iter()
+        .filter(|e| e.kind != kin_model::EntityKind::Module)
+        .collect();
     assert_eq!(
-        entities.len(),
+        declarations.len(),
         1,
-        "one parsed entity at {path}: {entities:?}"
+        "one parsed declaration at {path}: {declarations:?}"
     );
-    entities[0].clone()
+    declarations[0].clone()
 }
 
 fn assert_moved_identity(
@@ -81,7 +85,15 @@ fn assert_moved_identity(
 async fn session_move_preserves_path_named_module_identity() {
     let repo = tempfile::tempdir().unwrap();
     let layout = kin_core::init(repo.path()).unwrap().layout;
+    let singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
+        .unwrap()
+        .expect("fixture owns the real daemon singleton");
     let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+    let runtime = state
+        .prepared_publication
+        .register(&singleton, state.layout.root())
+        .unwrap();
+
     state
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -118,8 +130,18 @@ async fn session_move_preserves_path_named_module_identity() {
     }
     reconcile_session_through_api(&app, &session).await;
     drop(app);
+    drop(runtime);
     drop(state);
+    drop(singleton);
+    let singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
+        .unwrap()
+        .expect("fixture owns the real daemon singleton");
     let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+    let runtime = state
+        .prepared_publication
+        .register(&singleton, state.layout.root())
+        .unwrap();
+
     state
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -129,7 +151,12 @@ async fn session_move_preserves_path_named_module_identity() {
     let app = router(Arc::clone(&state));
     commit_through_api(&app, kin_model::OperationId::new(), "publish module move").await;
     drop(app);
+    drop(runtime);
     drop(state);
+    drop(singleton);
+    let _singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
+        .unwrap()
+        .expect("fixture owns the real daemon singleton");
     let cold = DaemonState::open(layout).unwrap();
     for original in &before {
         let moved = cold
@@ -148,10 +175,63 @@ async fn session_move_preserves_path_named_module_identity() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn session_move_refuses_live_coverage_corruption_before_authority_publication() {
+    let repo = tempfile::tempdir().unwrap();
+    let layout = kin_core::init(repo.path()).unwrap().layout;
+    let singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
+        .unwrap()
+        .expect("fixture owns the real daemon singleton");
+    let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+    let _runtime = state
+        .prepared_publication
+        .register(&singleton, state.layout.root())
+        .unwrap();
+
+    state
+        .is_initialized
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    std::fs::write(repo.path().join("old.rs"), "pub fn moved() {}\n").unwrap();
+    let app = router(Arc::clone(&state));
+    commit_through_api(&app, kin_model::OperationId::new(), "publish move fixture").await;
+    let session = layout.runs_dir().join("session-corrupt-coverage");
+    materialize_session_through_api(&app, &session).await;
+    std::fs::rename(session.join("old.rs"), session.join("new.rs")).unwrap();
+    let tree = state.graph.resolved_tree();
+    let artifact = tree
+        .artifact_at_path(&RepoPath::from_utf8("old.rs").unwrap())
+        .unwrap()
+        .artifact_id;
+    let original = state
+        .graph
+        .get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(artifact))
+        .unwrap()
+        .into_iter()
+        .find(|relation| kin_index::is_parse_coverage_relation(relation, "old.rs", artifact))
+        .unwrap();
+    let mut corrupted = original.clone();
+    corrupted.evidence[0].source_path = Some("wrong.rs".into());
+    state.graph.upsert_relation(&corrupted).unwrap();
+    assert_session_refused_without_advancing(&state, &app, &session, "live coverage corruption")
+        .await;
+    assert_eq!(state.graph.resolved_tree(), tree);
+    assert!(repo.path().join("old.rs").exists());
+    assert!(!repo.path().join("new.rs").exists());
+    state.graph.upsert_relation(&original).unwrap();
+    reconcile_session_through_api(&app, &session).await;
+    assert!(state
+        .graph
+        .resolved_tree()
+        .artifact_at_path(&RepoPath::from_utf8("new.rs").unwrap())
+        .is_some());
+}
+
 async fn assert_session_refused_without_advancing(
     state: &Arc<DaemonState>,
     app: &axum::Router,
     session: &PathBuf,
+    case: &str,
 ) {
     let roots = ActiveApiRepositoryAuthority::open(state)
         .unwrap()
@@ -177,7 +257,7 @@ async fn assert_session_refused_without_advancing(
         .unwrap();
     assert!(
         status.is_client_error(),
-        "changed or superseded session must be refused: {status} {}",
+        "changed or superseded session must be refused ({case}): {status} {}",
         String::from_utf8_lossy(&body)
     );
     assert_eq!(
@@ -196,7 +276,15 @@ async fn assert_session_refused_without_advancing(
 async fn session_move_preserves_identity_through_admission_commit_and_two_cold_reopens() {
     let repo = tempfile::tempdir().unwrap();
     let layout = kin_core::init(repo.path()).unwrap().layout;
+    let singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
+        .unwrap()
+        .expect("fixture owns the real daemon singleton");
     let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+    let runtime = state
+        .prepared_publication
+        .register(&singleton, state.layout.root())
+        .unwrap();
+
     state
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -264,8 +352,9 @@ async fn session_move_preserves_identity_through_admission_commit_and_two_cold_r
 
     let original_body = std::fs::read(session_dir.join("new.rs")).unwrap();
     std::fs::write(session_dir.join("new.rs"), b"pub fn moved() -> u32 { 9 }\n").unwrap();
-    assert_session_refused_without_advancing(&state, &app, &session_dir).await;
-    std::fs::write(session_dir.join("new.rs"), original_body).unwrap();
+    assert_session_refused_without_advancing(&state, &app, &session_dir, "changed session body")
+        .await;
+    std::fs::write(session_dir.join("new.rs"), &original_body).unwrap();
     assert_eq!(
         (summary.added, summary.modified, summary.removed),
         (0, 1, 1)
@@ -281,8 +370,17 @@ async fn session_move_preserves_identity_through_admission_commit_and_two_cold_r
     assert_moved_identity(&state, &original, artifact, &incoming, &deleted);
 
     drop(app);
+    drop(runtime);
     drop(state);
+    drop(singleton);
+    let singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
+        .unwrap()
+        .expect("fixture owns the real daemon singleton");
     let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+    let runtime = reopened
+        .prepared_publication
+        .register(&singleton, reopened.layout.root())
+        .unwrap();
     reopened
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -294,9 +392,47 @@ async fn session_move_preserves_identity_through_admission_commit_and_two_cold_r
     let app = router(Arc::clone(&reopened));
     commit_through_api(&app, kin_model::OperationId::new(), "commit session move").await;
     assert_moved_identity(&reopened, &original, artifact, &incoming, &deleted);
-    assert_session_refused_without_advancing(&reopened, &app, &session_dir).await;
+    // The retained session still holds the acknowledged target, so after a cold
+    // reopen and a later commit it is an exact retry rather than a superseded
+    // request. It must return the original receipt and rewind nothing.
+    let generation = reopened
+        .snapshot_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let replayed = reconcile_session_through_api(&app, &session_dir).await;
+    assert!(replayed.idempotent_replay);
+    assert_eq!(replayed.operation_id, summary.operation_id);
+    assert_eq!(replayed.authority_generation, summary.authority_generation);
+    assert_eq!(replayed.desired_tree_hash, summary.desired_tree_hash);
+    assert_eq!(
+        reopened
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        generation
+    );
+    assert_moved_identity(&reopened, &original, artifact, &incoming, &deleted);
+    // Only a session whose bytes no longer match that target is refused, and
+    // the refusal holds across the reopen exactly as it did before it.
+    std::fs::write(
+        session_dir.join("new.rs"),
+        b"pub fn moved() -> u32 { 11 }\n",
+    )
+    .unwrap();
+    assert_session_refused_without_advancing(
+        &reopened,
+        &app,
+        &session_dir,
+        "changed session body after a cold reopen",
+    )
+    .await;
+    std::fs::write(session_dir.join("new.rs"), &original_body).unwrap();
+    assert_moved_identity(&reopened, &original, artifact, &incoming, &deleted);
     drop(app);
+    drop(runtime);
     drop(reopened);
+    drop(singleton);
+    let _singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
+        .unwrap()
+        .expect("fixture owns the real daemon singleton");
     let cold = Arc::new(DaemonState::open(layout).unwrap());
     assert_moved_identity(&cold, &original, artifact, &incoming, &deleted);
 }

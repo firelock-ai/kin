@@ -83,14 +83,21 @@ impl Run {
 }
 
 fn kin_init(repo: &Path, home: &Path, ceiling: &str) -> Run {
-    let output = Command::new(env!("CARGO_BIN_EXE_kin"))
+    kin_init_with(repo, home, ceiling, &[])
+}
+
+fn kin_init_with(repo: &Path, home: &Path, ceiling: &str, extra_env: &[(&str, &str)]) -> Run {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+    command
         .arg("init")
         .arg(repo)
         .env("HOME", home)
         .env("KIN_HOME", home.join("kin-home"))
-        .env(CEILING_ENV, ceiling)
-        .output()
-        .expect("run kin init");
+        .env(CEILING_ENV, ceiling);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let output = command.output().expect("run kin init");
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Run {
@@ -263,5 +270,179 @@ fn an_empty_ceiling_override_is_refused() {
         run.contains(CEILING_ENV),
         "the refusal does not name the variable: {}",
         run.text
+    );
+}
+
+/// The ceiling the ref-universe tests pin, 16 MiB. The fixture's HEAD history
+/// forecasts about 2 MB and its off-HEAD history projects about 33 MB, so this
+/// sits between them and away from both.
+const REF_UNIVERSE_CEILING: &str = "16777216";
+
+/// Pins the memory-pressure level, so nothing on this host is charged against
+/// the ceiling above.
+///
+/// Once a conversion has planned what it captured, it is judged against the
+/// ceiling less what the machine already uses. Pinning the level gives that
+/// check no reading of the host, so it charges nothing, and the room it judges
+/// against is the pinned ceiling on every host rather than whatever this one
+/// happens to have free. `nominal` is the level that refuses no other work.
+const PRESSURE_ENV: &str = "KIN_MEMORY_PRESSURE";
+
+/// Bytes of the one file only the side branch and its tag reach.
+const OFF_HEAD_BYTES: usize = 1 << 20;
+
+/// Three commits on `main`, plus a side branch and an annotated tag that carry
+/// a commit HEAD never reaches.
+///
+/// The side commit holds one file of `OFF_HEAD_BYTES`, and checking `main` out
+/// again leaves the working tree clean, which is what admission requires. The
+/// history HEAD reaches stays as small as `seed_git_repo`'s, so the forecast
+/// taken before capture, which walks HEAD alone, has nothing to say about the
+/// side commit.
+fn seed_git_repo_with_history_off_head(path: &Path) {
+    seed_git_repo(path);
+    run_git(path, &["checkout", "-b", "side"]);
+    let line = "a line of history that only a side branch and its tag reach\n";
+    let body = line.repeat(OFF_HEAD_BYTES.div_ceil(line.len()));
+    fs::write(path.join("side-history.txt"), body).expect("write the off-HEAD file");
+    run_git(path, &["add", "side-history.txt"]);
+    run_git(path, &["commit", "-m", "history HEAD does not reach"]);
+    run_git(
+        path,
+        &["tag", "-a", "v1", "-m", "a release HEAD does not reach"],
+    );
+    run_git(path, &["checkout", "main"]);
+    assert!(
+        !path.join("side-history.txt").exists(),
+        "the fixture has to leave main's working tree clean"
+    );
+}
+
+fn stranded_staging(workspace: &Path) -> Vec<String> {
+    fs::read_dir(workspace)
+        .expect("read workspace")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".kin-git-capture-") || name.starts_with(".kin.init-"))
+        .collect()
+}
+
+/// History that only other refs reach is judged before it is derived, and a
+/// conversion without the memory for it is refused rather than started.
+///
+/// A conversion captures every ref under `refs/`, not only the history HEAD
+/// reaches, while the forecast taken before capture walks HEAD alone. On a
+/// clone carrying 1,227 refs that forecast came to 34.5 GiB and passed, the
+/// plan then projected 96.4 GiB against 68.5 GiB free, and the conversion
+/// carried on into the phase that spends it with nothing but a warning. This
+/// is that shape at the size of a test: HEAD's history fits the pinned ceiling
+/// with room to spare, and a side branch and an annotated tag carry the rest.
+///
+/// Four things are graded. The run is refused. The forecast before capture let
+/// it through, since that refusal's own wording is absent. The refusal counts
+/// the four commits and three refs the capture took, which is the proof that
+/// the side branch and the tag were captured. And nothing is left behind,
+/// neither a store nor the capture the run took before it stopped.
+#[test]
+fn history_only_other_refs_reach_is_refused_before_it_is_derived() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let repo = workspace.path().join("repo");
+    seed_git_repo_with_history_off_head(&repo);
+
+    let run = kin_init_with(
+        &repo,
+        home.path(),
+        REF_UNIVERSE_CEILING,
+        &[(PRESSURE_ENV, "nominal")],
+    );
+
+    assert_ne!(
+        run.code,
+        Some(0),
+        "a conversion whose captured refs project past the room it has exited 0: {}",
+        run.text
+    );
+    assert!(
+        run.contains("needs more memory"),
+        "the refusal printed no memory sentence: {}",
+        run.text
+    );
+    assert!(
+        !run.contains("this refusal happens before any capture"),
+        "the forecast before capture refused, so this run never reached the refs it exists \
+         to judge: {}",
+        run.text
+    );
+    for phrase in [
+        "4 commits",
+        "from 3 refs",
+        "every branch, tag and other ref",
+        "--single-branch --no-tags",
+        CEILING_ENV,
+        "nothing was published",
+    ] {
+        assert!(
+            run.contains(phrase),
+            "the refusal omits {phrase:?}; it printed: {}",
+            run.text
+        );
+    }
+    assert!(
+        !repo.join(".kin").exists(),
+        "a refused conversion left a store behind"
+    );
+    let stranded = stranded_staging(workspace.path());
+    assert!(
+        stranded.is_empty(),
+        "a refused conversion stranded its capture: {stranded:?}"
+    );
+}
+
+/// The same repository, under the same pins, converts once those refs are gone.
+///
+/// The control for the test above, and the proof that the refs alone moved
+/// its verdict: the commit they carried is still in the object store, and with
+/// no ref naming it the capture does not take it. A check wired to refuse
+/// everything under a small ceiling would pass the test above and fail here.
+#[test]
+fn the_same_repository_without_those_refs_converts_under_the_same_pins() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let repo = workspace.path().join("repo");
+    seed_git_repo_with_history_off_head(&repo);
+    run_git(&repo, &["branch", "-D", "side"]);
+    run_git(&repo, &["tag", "-d", "v1"]);
+
+    let run = kin_init_with(
+        &repo,
+        home.path(),
+        REF_UNIVERSE_CEILING,
+        &[(PRESSURE_ENV, "nominal")],
+    );
+
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a conversion with room exited {:?}: {}",
+        run.code,
+        run.text
+    );
+    assert!(repo.join(".kin").exists(), "no store was written");
+    for phrase in [
+        "needs more memory",
+        "is expected to hold about",
+        "is projected to hold about",
+    ] {
+        assert!(
+            !run.contains(phrase),
+            "a conversion with room narrated its memory with {phrase:?}: {}",
+            run.text
+        );
+    }
+    let stranded = stranded_staging(workspace.path());
+    assert!(
+        stranded.is_empty(),
+        "a finished conversion stranded staging: {stranded:?}"
     );
 }

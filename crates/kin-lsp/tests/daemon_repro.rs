@@ -54,6 +54,7 @@ async fn daemon_flow_reproduction() {
         &[],
         &workspace,
         adapter.initialization_options(&workspace),
+        None,
     )
     .await
     .expect("server start failed");

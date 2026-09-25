@@ -114,13 +114,16 @@
 //!   broadcast, and any persistence failure makes health `attention` and the
 //!   stream ineligible rather than reporting a misleading success.
 
+pub(crate) mod accepted_enrichment;
 pub mod api;
 pub mod auth_rotation;
 pub mod background_work;
+mod binding_history;
 pub mod commit_deltas;
 pub mod commit_liveness;
 pub mod daemon;
 mod entity_drafts;
+mod entity_lifecycle;
 pub mod error;
 pub mod gcs_endpoint;
 pub mod graph_only_members;
@@ -130,7 +133,9 @@ pub mod graph_only_members;
 /// test.
 #[cfg(test)]
 mod graph_status_first_contact;
+pub mod hosted_spine_cost;
 pub mod hosted_start;
+mod hydration_requalify;
 mod language_server_command;
 pub mod lifecycle;
 mod local_repository_authority;
@@ -138,7 +143,10 @@ pub mod loop_runner;
 mod mcp_commit;
 mod mcp_mutate;
 mod mcp_source_base;
+pub(crate) mod owed_enrichment;
 mod pending_commits;
+pub(crate) mod prepared_publication;
+mod publication_accounting;
 pub mod publication_lease;
 pub mod replica_adoption;
 pub mod repo_blob;
@@ -159,13 +167,17 @@ mod repository_tag;
 mod review_transfer;
 mod review_write;
 mod semantic_debt;
+pub(crate) mod session_publication;
+pub(crate) mod session_publication_plan;
 pub mod session_registry;
 pub mod source_body_memo;
 mod source_cas;
+mod source_entity_guard;
 pub mod state;
 pub mod storage_delegate;
 pub mod supervisor;
 pub mod traffic_adapter;
+mod unit_lifecycle;
 pub mod watcher_loss;
 pub mod write_veto;
 

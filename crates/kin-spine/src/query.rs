@@ -64,9 +64,100 @@ pub fn classify_spine_probe(configured: bool, status: Option<u16>) -> SpineProbe
     }
 }
 
+/// The daemon's own spine as one read found it, for a handler that consults it
+/// in-process rather than over `/spine/*`.
+///
+/// The daemon builds its spine on first use, and a pass that finds a writer
+/// holding graph authority steps aside rather than publish a capture its root
+/// does not back. The read that asked then has no spine to consult, and neither
+/// does a read on a daemon whose spine is switched off. The two are opposite
+/// facts. A spine that is off means cross-repo authority does not apply to this
+/// install. A deferred one means it applies and has not been established yet,
+/// so an answer read in that window lacks whatever other repositories would
+/// have added to it. One `None` for both is how such an answer came to report
+/// `not_configured` and certify.
+#[derive(Clone, Copy)]
+pub enum DaemonSpine<'a> {
+    /// A spine built and proved for this read.
+    Ready(&'a dyn crate::SpineBackend),
+    /// No spine, because its initialization stepped aside while graph authority
+    /// was changing. Carries the reason the daemon recorded. A later read
+    /// retries the initialization.
+    Deferred(&'a str),
+    /// No spine, because it refused this repository's graph for a standing
+    /// reason a drained writer does not change. Carries the reason the daemon
+    /// recorded, which opens with [`SPINE_CANDIDATE_REPRESENTATION_GAP`].
+    Refused(&'a str),
+    /// No spine and none pending: the spine is switched off.
+    Absent,
+}
+
+/// The code a daemon opens its recorded reason with when the spine refuses a
+/// graph that holds an inferred member, whose candidate authority the spine
+/// format cannot carry. The refusal stands for as long as the graph holds the
+/// member.
+pub const SPINE_CANDIDATE_REPRESENTATION_GAP: &str = "spine_candidate_representation_gap";
+
+impl<'a> DaemonSpine<'a> {
+    /// Classify one read's spine from what its read-authority acquisition
+    /// returned and the reason the daemon recorded for having none.
+    ///
+    /// A spine in hand wins. A reason an earlier pass recorded says nothing
+    /// about a read that got a spine. A reason that opens with
+    /// [`SPINE_CANDIDATE_REPRESENTATION_GAP`] is a refusal, and any other is a
+    /// deferral.
+    pub fn from_read(
+        backend: Option<&'a dyn crate::SpineBackend>,
+        reason: Option<&'a str>,
+    ) -> Self {
+        match (backend, reason) {
+            (Some(backend), _) => Self::Ready(backend),
+            (None, Some(reason)) if reason.starts_with(SPINE_CANDIDATE_REPRESENTATION_GAP) => {
+                Self::Refused(reason)
+            }
+            (None, Some(reason)) => Self::Deferred(reason),
+            (None, None) => Self::Absent,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spine_in_hand_wins_over_a_recorded_deferral() {
+        // An earlier pass's deferral must not demote a read that got a spine,
+        // and only a read with neither a spine nor a deferral is absent.
+        let backend = crate::InMemorySpineBackend::new();
+        assert!(matches!(
+            DaemonSpine::from_read(Some(&backend), Some("an earlier pass stepped aside")),
+            DaemonSpine::Ready(_)
+        ));
+        assert!(matches!(
+            DaemonSpine::from_read(None, Some("a writer held graph authority")),
+            DaemonSpine::Deferred("a writer held graph authority")
+        ));
+        assert!(matches!(
+            DaemonSpine::from_read(None, None),
+            DaemonSpine::Absent
+        ));
+    }
+
+    #[test]
+    fn a_standing_refusal_is_told_apart_from_a_deferral() {
+        let refusal = "spine_candidate_representation_gap: repo r contains inferred member m";
+        assert!(matches!(
+            DaemonSpine::from_read(None, Some(refusal)),
+            DaemonSpine::Refused(reason) if reason == refusal
+        ));
+        // A spine in hand still wins over a refusal an earlier pass recorded.
+        let backend = crate::InMemorySpineBackend::new();
+        assert!(matches!(
+            DaemonSpine::from_read(Some(&backend), Some(refusal)),
+            DaemonSpine::Ready(_)
+        ));
+    }
 
     #[test]
     fn unconfigured_is_quiet_regardless_of_status() {

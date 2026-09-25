@@ -30,7 +30,7 @@
 //!   its own checkpoint, exactly as trace cancellation does. Nothing is killed
 //!   mid-write, and a pass holding a lock releases it on its own terms.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
@@ -190,6 +190,15 @@ impl BackgroundPass {
         if inner.working_since.is_none() {
             inner.working_since = Some(now);
         }
+    }
+
+    /// Whether this pass is in a working stretch right now.
+    ///
+    /// False once the pass is halted, because [`halt`](Self::halt) ends the
+    /// stretch, so a wedged pass the supervisor stopped cannot hold a daemon
+    /// open forever.
+    pub fn is_working(&self) -> bool {
+        self.lock().working_since.is_some()
     }
 
     /// Declare that this pass has nothing to do.
@@ -663,6 +672,33 @@ struct LevelledRecord {
     at: RecordedFault,
 }
 
+/// How many re-derived files a startup re-derivation record names outright.
+const STARTUP_REDERIVATION_SAMPLE_LIMIT: usize = 5;
+
+/// What one startup re-derivation owed, by cause, and what it cost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupRederivationCounts {
+    /// Files re-derived, counted once however many causes named them.
+    pub files: u64,
+    pub owed_parse: u64,
+    pub missing_entities: u64,
+    pub stale_declarations: u64,
+    /// Withdrawn cross-file bindings dropped without a withdrawal record.
+    pub withdrawn_bindings_unrecorded: u64,
+    /// Stored external-import edges retired because this build's parser does
+    /// not reproduce them from the bytes they were recorded against.
+    pub external_edges_unreproduced: u64,
+    /// Every re-derived file, sorted; the record keeps a bounded sample.
+    pub paths: Vec<String>,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct StartupRederivationRecord {
+    counts: StartupRederivationCounts,
+    at: RecordedFault,
+}
+
 /// Persist the durable last-admission marker after a complete pass succeeded.
 ///
 /// Called beside [`ReconcileProbes::record_admission_success`] rather than from
@@ -847,6 +883,21 @@ struct ReconcileProbesInner {
     authority_split: Option<(RecordedFault, u64)>,
     /// The most recent levelling that landed.
     authority_levelled: Option<LevelledRecord>,
+    /// Tracked paths the working copy edited or removed while no daemon
+    /// watched, that no admission has taken yet.
+    ///
+    /// Planned once, when the daemon starts and before its endpoint is
+    /// published, and drained as the ticks carrying them land. Until then the
+    /// graph answers about these paths from bytes the host no longer holds, so
+    /// every surface built from this report qualifies its answers by them.
+    changed_paths: BTreeSet<String>,
+    /// Why the startup check for such paths could not run, when it could not.
+    /// A check that did not run is not a working copy with nothing to take,
+    /// so it qualifies answers exactly as a count would until a complete
+    /// admission reads the whole working copy.
+    changed_paths_unchecked: Option<String>,
+    /// What this daemon re-derived at startup before it served.
+    startup_rederivation: Option<StartupRederivationRecord>,
 }
 
 /// Host content one complete walk declined to observe at all.
@@ -1041,6 +1092,18 @@ impl ReconcileProbes {
         });
     }
 
+    /// The startup repair re-derived these files before the daemon served.
+    ///
+    /// Reported for the life of the daemon, because a reader asking why the
+    /// first start after an upgrade took minutes, or why an answer moved with
+    /// nobody editing, needs this and nothing else records it.
+    pub fn record_startup_rederivation(&self, counts: StartupRederivationCounts, now: Instant) {
+        self.lock().startup_rederivation = Some(StartupRederivationRecord {
+            counts,
+            at: RecordedFault::new(String::new(), now),
+        });
+    }
+
     /// Whether the loop finished a tick still holding work.
     ///
     /// Called every tick with the loop's own backlog predicate. The first tick
@@ -1153,6 +1216,57 @@ impl ReconcileProbes {
         inner.untracked_observed = Some(RecordedFault::new(String::new(), Instant::now()));
     }
 
+    /// Record the tracked paths the startup catch-up found edited or removed
+    /// while no daemon watched, replacing whatever an earlier plan recorded.
+    pub fn record_changed_paths<T: std::fmt::Display>(&self, paths: impl IntoIterator<Item = T>) {
+        let paths = paths.into_iter().map(|path| path.to_string()).collect();
+        let mut inner = self.lock();
+        inner.changed_paths = paths;
+        inner.changed_paths_unchecked = None;
+    }
+
+    /// Record that the startup check for tracked paths changed while no daemon
+    /// watched could not run, and why.
+    pub fn record_changed_paths_unchecked(&self, reason: impl Into<String>) {
+        let mut inner = self.lock();
+        inner.changed_paths.clear();
+        inner.changed_paths_unchecked = Some(reason.into());
+    }
+
+    /// Whether the startup check for tracked paths changed while no daemon
+    /// watched could not run, and no complete admission has read the working
+    /// copy since.
+    ///
+    /// Nothing then vouches for the stretch nothing watched, so the durable
+    /// last-admission marker must not move past it: a daemon that stamped it
+    /// on its first ordinary tick would hand the next one a window that opens
+    /// after edits nobody took, and those would be served certified.
+    pub fn changed_paths_unchecked(&self) -> bool {
+        self.lock().changed_paths_unchecked.is_some()
+    }
+
+    /// Stop owing the paths a landed tick admitted.
+    pub fn settle_changed_paths<T: std::fmt::Display>(
+        &self,
+        admitted: impl IntoIterator<Item = T>,
+    ) {
+        let mut inner = self.lock();
+        if inner.changed_paths.is_empty() {
+            return;
+        }
+        for path in admitted {
+            inner.changed_paths.remove(&path.to_string());
+        }
+    }
+
+    /// Stop owing everything: a complete admission read the whole working copy
+    /// and took what it found.
+    pub fn clear_changed_paths(&self) {
+        let mut inner = self.lock();
+        inner.changed_paths.clear();
+        inner.changed_paths_unchecked = None;
+    }
+
     /// Record that measuring the working copy cannot mean anything here.
     ///
     /// The third producer of an absent reading, and the one that is not a
@@ -1198,6 +1312,20 @@ impl ReconcileProbes {
                 .as_ref()
                 .map(|observed| observed.wall_clock.to_rfc3339()),
             untracked_observation_not_applicable: inner.untracked_observation_not_applicable,
+            // Zero here always. This tracker records what a working-copy walk
+            // saw; a path whose bytes are admitted and whose parse is owed is
+            // in no walk, and the durable debt record is layered on by
+            // `answered_reconcile_health` when a surface is about to speak.
+            underived_path_count: 0,
+            underived_paths_sample: Vec::new(),
+            changed_path_count: inner.changed_paths.len() as u64,
+            changed_paths_sample: inner
+                .changed_paths
+                .iter()
+                .take(UNTRACKED_SAMPLE_LIMIT)
+                .cloned()
+                .collect(),
+            changed_paths_unchecked: inner.changed_paths_unchecked.clone(),
             ignored_path_count: inner.excluded.ignored,
             unsupported_path_count: inner.excluded.unsupported,
             policy_excluded_path_count: inner.excluded.policy_excluded,
@@ -1234,6 +1362,27 @@ impl ReconcileProbes {
                     paths: record.paths,
                     dropped_relations: record.dropped_relations,
                     dropped_relations_sample: record.dropped_relations_sample.clone(),
+                    age_seconds: age(&record.at),
+                    at: Some(record.at.wall_clock.to_rfc3339()),
+                }
+            }),
+            startup_rederivation: inner.startup_rederivation.as_ref().map(|record| {
+                kin_cli::commands::resources::StartupRederivation {
+                    files: record.counts.files,
+                    owed_parse: record.counts.owed_parse,
+                    missing_entities: record.counts.missing_entities,
+                    stale_declarations: record.counts.stale_declarations,
+                    withdrawn_bindings_unrecorded: record.counts.withdrawn_bindings_unrecorded,
+                    external_edges_unreproduced: record.counts.external_edges_unreproduced,
+                    sample: record
+                        .counts
+                        .paths
+                        .iter()
+                        .take(STARTUP_REDERIVATION_SAMPLE_LIMIT)
+                        .cloned()
+                        .collect(),
+                    elapsed_ms: u64::try_from(record.counts.elapsed.as_millis())
+                        .unwrap_or(u64::MAX),
                     age_seconds: age(&record.at),
                     at: Some(record.at.wall_clock.to_rfc3339()),
                 }

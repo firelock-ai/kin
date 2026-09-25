@@ -106,6 +106,71 @@ impl Drop for GitCaptureStaging {
     }
 }
 
+/// Refuse before any work when init cannot write where it stages or where it
+/// publishes.
+///
+/// Init stages its conversion beside the repository, in `parent`, and
+/// publishes it with one rename into `repository`, so both directories have to
+/// accept new entries. A repository under a root-owned parent, which is how
+/// `/workspaces/<name>` and `/app` look to a non-root user in the common
+/// devcontainer and Docker layouts, used to get as far as the first staging
+/// create and die there with a bare `Permission denied` on a path the user
+/// never chose. A repository root that refused writes was worse: the whole
+/// conversion ran first and only the publication rename failed.
+///
+/// Asked with `access(2)` because it writes nothing. A probe file would be
+/// debris of its own if the process died between creating and removing it, and
+/// one left in the repository root would read as an untracked file and block
+/// the next init's admission.
+///
+/// Only a refusal the kernel names as permission or a read-only filesystem is
+/// turned into this message. Anything else is left to the staging code, whose
+/// own errors already name the path.
+pub(crate) fn require_writable_init_directories(parent: &Path, repository: &Path) -> Result<()> {
+    if let Some(reason) = write_refusal(parent) {
+        return Err(KinError::Other(format!(
+            "kin init cannot start: it stages the conversion beside the repository, in {parent}, \
+             and this user cannot create entries there ({reason}). Nothing was changed. Clone or \
+             move the repository into a directory you can write, such as one under your home \
+             directory, or make {parent} writable, then run `kin init` again",
+            parent = parent.display(),
+        )));
+    }
+    if let Some(reason) = write_refusal(repository) {
+        return Err(KinError::Other(format!(
+            "kin init cannot start: it publishes the store as {store}, and this user cannot \
+             create entries in {repository} ({reason}). Nothing was changed. Make {repository} \
+             writable, then run `kin init` again",
+            store = repository.join(".kin").display(),
+            repository = repository.display(),
+        )));
+    }
+    Ok(())
+}
+
+/// Why this process could not create an entry in `directory`, when the answer
+/// is a permission or read-only refusal.
+#[cfg(unix)]
+fn write_refusal(directory: &Path) -> Option<std::io::Error> {
+    use rustix::fs::Access;
+
+    let error = std::io::Error::from(
+        rustix::fs::access(directory, Access::WRITE_OK | Access::EXEC_OK).err()?,
+    );
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    )
+    .then_some(error)
+}
+
+/// Windows grants directory writes through ACLs that `access` does not model,
+/// so the staging code's own errors stay the report there.
+#[cfg(not(unix))]
+fn write_refusal(_directory: &Path) -> Option<std::io::Error> {
+    None
+}
+
 /// Take this init's lease on one capture directory, held on return.
 ///
 /// The lease is created and locked under [`CAPTURE_LEASE_PENDING_NAME`] and

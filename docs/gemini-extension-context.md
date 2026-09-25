@@ -1,8 +1,8 @@
 # Kin: read the repository from the graph
 
 Kin parses a repository into entities, relationships, changes, and provenance, and answers
-from that graph. Prefer these tools over grep and whole-file reads. Fall back to raw search
-only for what the graph does not model, such as prose in comments and unparsed file types.
+from that graph. Work on targeted semantic entities. Missing parsed coverage is a graph
+gap to report or repair at conversion, never a reason to read or search whole files.
 
 ## Pick the tool by what you know
 
@@ -23,8 +23,8 @@ only for what the graph does not model, such as prose in comments and unparsed f
   downstream entities the change can reach.
 - **You need history.** `kin_provenance_query` reports an entity's changes, its latest
   change, and recorded approvals.
-- **You need repository contents.** `kin_artifact_list` and `kin_artifact_read` cover every
-  tracked object by artifact id, including lockfiles, configuration, and binary assets.
+- **The graph has no matching entity.** Check the coverage in the response. Report missing
+  conversion coverage instead of substituting a whole artifact or file-module body.
 
 ## Trust the envelope, not the emptiness
 
@@ -47,6 +47,24 @@ soon as admission finishes. `kin graph status` reports coverage at any time.
 
 ## A working order
 
-One `semantic_search` or `semantic_locate` to find the entity, one `get_context_pack` on
-the best hit, then `find_references` or `impact_analysis` if the change is shared. Two or
-three calls is usually enough. Stop and answer rather than sweeping the tree.
+Find the entity with `semantic_search` or `semantic_locate`. Choose `get_entity_source`
+for its body or `get_context_pack` for its bounded neighborhood; do not fetch both when
+one already answered the question. Use `find_references` or `impact_analysis` when the
+change is shared. Reuse the returned body and source base; do not sweep the repository.
+
+## Make a guarded entity edit
+
+Read `get_entity_source` and retain its complete `source_base` unchanged. For a
+localized change in a large entity, use `kin_mutate` (or routed `mutate`) with
+`verb: "patch"`, `target: source.id`, and
+`payload: {EntitySourcePatch: {source_base: source.source_base, edits:
+[{old_text: "unique exact text", new_text: "replacement"}]}}` plus a description.
+Omit `body` and `destination`. Every anchor must occur exactly once in the
+original entity body; all anchors address that original body and must not
+overlap. Use one operation per entity. A stale base or a missing/ambiguous anchor
+refuses the transaction without partially applying it.
+
+For a tiny entity or broad rewrite, a guarded full-body `update` can be smaller:
+use `payload: {EntitySourceBase: source.source_base}` and the complete new `body`.
+Neither form may silently discard the source guard or fall back to raw-file
+semantic edits. [Guarded source edits](mcp-source-bases.md) gives the full contract.

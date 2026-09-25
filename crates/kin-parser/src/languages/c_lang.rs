@@ -382,6 +382,7 @@ impl LanguageAdapter for CAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -882,6 +883,9 @@ fn extract_c_include(
                     local_name,
                     original_name: Some("default".to_string()),
                     is_default: true,
+                    // An `#include` binds every name the header declares and
+                    // writes none of them; the directive's span is all there is.
+                    site: None,
                 }],
             });
         }

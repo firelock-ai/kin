@@ -167,7 +167,7 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
         return Some(format!(
             "file_spans_stale: {stale} entity span(s) in this file were derived from bytes the \
              repository tree no longer holds at this path, so the enumeration describes an \
-             earlier state of the file; the graph has admitted the new source and not yet \
+             earlier state of the file, and the graph has admitted the new source and not yet \
              re-derived these entities"
         ));
     }
@@ -405,6 +405,27 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             always: true,
             class: NegativeClass::Structural,
         },
+        // Structural for the same reason `semantic_search` is: this tool reads
+        // the entity index's own stored text fields through a bounded lexical
+        // scan, never the vector index and never a relation edge.
+        //
+        // `always: false`, deliberately, even though a POPULATED answer still
+        // needs its caution attached. `always: true` is for a tool whose whole
+        // output IS a set of verdicts (`impact_analysis`,
+        // `bulk_check_references`), and it makes every answer, populated or
+        // not, claim an absence -- wrong for this tool, whose populated answer
+        // is an ordinary hit list that asserts nothing is missing.
+        // `qualifies_populated_answers` below is what attaches the caution to a
+        // populated answer without also making it claim one; the unconditional
+        // `lexical_lookup_not_structural` gap further down is what the caution
+        // actually says.
+        crate::handlers::lexical::TOOL_NAME => RetrievalSpec {
+            field: "hits",
+            kind: "no_lexical_match",
+            subject: "no stored graph field contained the literal",
+            always: false,
+            class: NegativeClass::Structural,
+        },
         _ => return None,
     };
     Some(spec)
@@ -431,9 +452,10 @@ pub(crate) fn negative_class_for(tool: &str) -> Option<NegativeClass> {
 fn absence_substrate(tool: &str, class: NegativeClass) -> AbsenceSubstrate {
     match (class, tool) {
         (NegativeClass::Semantic, _) => AbsenceSubstrate::Vectors,
-        (NegativeClass::Structural, FILE_ENTITIES_TOOL | "semantic_search") => {
-            AbsenceSubstrate::EntityIndex
-        }
+        (
+            NegativeClass::Structural,
+            FILE_ENTITIES_TOOL | "semantic_search" | crate::handlers::lexical::TOOL_NAME,
+        ) => AbsenceSubstrate::EntityIndex,
         (NegativeClass::Structural, "entity_history") => AbsenceSubstrate::History,
         (NegativeClass::Structural, _) => AbsenceSubstrate::Relations,
     }
@@ -502,6 +524,7 @@ pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<Str
 /// | tool | language-scoped | why |
 /// |---|---|---|
 /// | `semantic_search` | yes | "no declaration carries this name/kind" is a claim about what the extractor admitted as an entity for that language |
+/// | `lexical_lookup` | yes | "no stored graph field carries this literal" is the same claim, over the stored graph text fields rather than its name/kind fields |
 /// | `find_dead_code_seeded` | yes | its seed match is the same name/kind filter over the same entity index |
 /// | `graph_neighborhood` | yes | an empty neighborhood for a focal that IS in the graph claims nothing reaches it, which is a claim about that language's edges |
 /// | `find_references`, `bulk_check_references`, `trace_data_flow`, `impact_analysis` | yes | already gated this way by FIR-2404; the flag records the fact rather than changing it |
@@ -522,6 +545,7 @@ fn absence_is_language_scoped(tool: &str) -> bool {
             | "find_dead_code_seeded"
             | "graph_neighborhood"
             | "get_context_pack"
+            | crate::handlers::lexical::TOOL_NAME
             | TRACE_PATH_TOOL
     )
 }
@@ -544,14 +568,16 @@ fn reference_classes() -> Vec<String> {
 ///
 /// Only `calls` qualifies, and the reason is measured rather than assumed. Kin's
 /// linker resolves an import statement to a cross-file `Calls` edge between the
-/// importing entity and the imported one, plus an artifact-level import edge that
-/// entity queries never reach. It mints no entity-level `Imports` edge at all: a
-/// converted Python repository whose imports resolve cleanly reports
-/// `Entity-to-entity relation kinds: Calls, Contains` and `imports 0/2 (0%)` on
-/// `kin graph status`, with `Cross-file entity relations: 4 of 9`. So `imports`
-/// reads `absent` on every language including the ones that work, and requiring
-/// it would report every absence on every real graph as inconclusive, which is
-/// the failure mode opposite to FIR-2353 and no more useful. `references` is the
+/// importing entity and the imported one, plus an artifact-level import edge
+/// that entity queries never reach. It mints an entity-level `Imports` edge only
+/// where the importing file carries a module entity and the coordinate reaches
+/// this repository, which is why a converted Python repository whose imports
+/// resolve cleanly once reported `Entity-to-entity relation kinds: Calls,
+/// Contains` and `imports 0/2 (0%)` on `kin graph status`, with `Cross-file
+/// entity relations: 4 of 9`. So `imports` reads `absent` on plenty of healthy
+/// graphs, and requiring it would report those absences as inconclusive, which
+/// is the failure mode opposite to the uncertified-absence one below and no
+/// more useful. `references` is the
 /// same story for a different reason: it needs a resolved program from a language
 /// server and is legitimately absent wherever one has not run.
 ///
@@ -1060,6 +1086,9 @@ fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
     let Some(spec) = spec_for(tool) else {
         return false;
     };
+    if context_dependents_withheld(tool, payload) > 0 {
+        return false;
+    }
     // A walk that expanded edges is reporting what it found, whatever its
     // entity collection reads: `graph_neighborhood` returns the focal itself in
     // that collection, so the count alone cannot tell a populated walk from an
@@ -1082,7 +1111,29 @@ fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
         return locate_result_count(payload).is_none_or(|count| count == 0)
             || locate_ranking_names_nothing(payload);
     }
+    if tool == "entity_history" && payload.is_object() {
+        return payload.get("change_count").and_then(Value::as_u64) == Some(0);
+    }
     collection_len(payload, spec.field).is_none_or(|count| count == 0)
+}
+
+/// An empty shipped group is not an empty finding when response limits
+/// withheld callers. Both disclosures describe the same loss, so never sum
+/// them or count an elided body as an elided caller.
+fn context_dependents_withheld(tool: &str, payload: &Value) -> u64 {
+    if tool != "get_context_pack" {
+        return 0;
+    }
+    payload
+        .get("dependents_withheld")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            payload
+                .pointer("/elisions/dependents/elided")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
 }
 
 /// Whether a POPULATED answer from `tool` carries the response's verdict too,
@@ -1102,7 +1153,7 @@ fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
 /// |---|---|---|
 /// | `find_references`, `bulk_check_references`, `trace_data_flow`, `graph_neighborhood`, `semantic_search`, `find_dead_code_seeded`, `get_context_pack` | yes | each answers from the graph, and whether its rows are the whole set is exactly the question a caller acts on |
 /// | `semantic_locate` | NO | its page is a bounded ranking rather than an enumeration, so its verdict can never be authoritative at any coverage, and the module already refuses to certify one. Attaching a verdict to every page is the defect FIR-2430 found wearing the opposite costume: a real symbol and a fabricated one came back under the IDENTICAL envelope, so a qualifier there teaches a reader to read a page as a graph claim when it is not one |
-/// | `entity_history` | NO | reads recorded change history, where a populated answer is the history and there is no whole-set question about the graph to answer |
+/// | `entity_history` | NO | reads recorded change history; paging completeness is carried by `_kin.completeness` and `change_count`, without an additional absence claim |
 /// | `dead_code` | NO | its result is the INVERSE claim, and rows are candidates to check rather than an answer whose completeness licenses an action |
 ///
 /// An exemption bars the verdict from `negative` only. `_kin.verdict` is still
@@ -1304,6 +1355,56 @@ fn omits_its_answer_group(tool: &str, payload: &Value) -> bool {
             .get("focal_entity")
             .is_some_and(|focal| !focal.is_null()),
         _ => false,
+    }
+}
+
+/// How many rows `tool`'s answer carries, which `negative.result_count`
+/// publishes, or `None` when `tool` is not retrieval or the payload does not
+/// carry the answer this rule reads.
+///
+/// One rule for the count [`negative_for`] writes and for the count the
+/// response-budget pass restates after it cuts rows the negative had already
+/// counted, so the two can never count different things.
+pub(crate) fn result_count(tool: &str, payload: &Value) -> Option<usize> {
+    let spec = spec_for(tool)?;
+    if tool == "entity_history" && payload.is_object() {
+        return Some(payload.get("result").and_then(Value::as_array)?.len());
+    }
+    if tool == "semantic_locate" {
+        return locate_result_count(payload);
+    }
+    match collection_len(payload, spec.field) {
+        Some(count) => Some(count),
+        // An omitted group makes the same claim as an empty one, and it is
+        // the more dangerous of the two: `[]` at least names the question,
+        // while a missing key reads as a question the tool does not answer.
+        // Bailing out here would leave the shape with no verdict at all,
+        // which is the defect this module exists to prevent wearing its
+        // sharpest costume. `get_context_pack` shipped exactly that in
+        // 0.5.42, where the pack carried no `dependents` key, and nothing
+        // qualified it.
+        None if omits_its_answer_group(tool, payload) => Some(0),
+        None => None,
+    }
+}
+
+/// Restate `negative.result_count` from the reply as it now ships, after a
+/// response-budget pass cut rows the negative had already counted.
+///
+/// The negative is built before the stdio envelope's budget pass runs, so a
+/// reply that pass cut kept the count of the rows it arrived with. A trace
+/// that shipped two steps said `result_count: 7`, the chain the walk handed
+/// over, beside `_kin.completeness.counted.reported: 2`.
+pub(crate) fn restate_result_count(payload: &mut Value, tool: &str) {
+    let Some(count) = result_count(tool, payload) else {
+        return;
+    };
+    if let Some(negative) = payload
+        .get_mut(NEGATIVE_KEY)
+        .and_then(Value::as_object_mut)
+        .filter(|negative| negative.contains_key("result_count"))
+    {
+        negative.insert("result_count".to_string(), json!(count));
     }
 }
 
@@ -1849,26 +1950,42 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
 
     // A walk cut short by its own caps or work ceilings stopped before it could
     // observe what it is being read as having ruled out.
-    if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
-        gaps.push(
+    gaps.extend(trace_cap_clauses(
+        payload.get("truncated").and_then(Value::as_bool) == Some(true),
+        payload
+            .get("degradations")
+            .and_then(Value::as_array)
+            .is_some_and(|degradations| !degradations.is_empty()),
+    ));
+
+    gaps
+}
+
+/// The clauses a trace that did not continue beneath a clipped node reports
+/// for its caps: `trace_walk_truncated` when it stopped early and
+/// `trace_walk_degraded` when it reported degradations.
+///
+/// Shared with the response-budget pass, which puts these in place of the
+/// spine clause when its cut leaves the chain continuing beneath no clipped
+/// node, so a reply qualified after that cut reads as one qualified by its own
+/// walk would.
+pub(crate) fn trace_cap_clauses(truncated: bool, degraded: bool) -> Vec<String> {
+    let mut clauses = Vec::new();
+    if truncated {
+        clauses.push(
             "trace_walk_truncated: the walk hit a per-step or total cap, so it stopped before \
              examining everything an empty chain would have to rule out"
                 .to_string(),
         );
     }
-    if payload
-        .get("degradations")
-        .and_then(Value::as_array)
-        .is_some_and(|degradations| !degradations.is_empty())
-    {
-        gaps.push(
+    if degraded {
+        clauses.push(
             "trace_walk_degraded: the walk reported degradations, so it did not complete under \
              its own work bounds"
                 .to_string(),
         );
     }
-
-    gaps
+    clauses
 }
 
 /// The limiting factor for a chain the walk continued beneath a clipped node.
@@ -1891,12 +2008,36 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
 /// clauses; a separator INSIDE one clause is what reaches a reader as a labelled
 /// clause plus an unlabelled fragment.
 fn spine_clipping_gap(payload: &Value, spine_clipped: u64) -> String {
+    // A count the reply marks as a floor sums only the spine nodes whose clip
+    // records reached the pass that restated it. A reply finalized again, as the
+    // stdio server finalizes a daemon's, rebuilds this clause from the payload
+    // with no cut to restate it, so the floor must be honoured here too.
+    let floor = payload.get(crate::budget::CROSSING_FLOOR_KEY) == Some(&Value::Bool(true));
+    let crossing = if floor {
+        None
+    } else {
+        payload
+            .get("spine_dropped_crossing_file")
+            .and_then(Value::as_u64)
+    };
+    spine_clipping_clause(payload, spine_clipped, crossing)
+}
+
+/// [`spine_clipping_gap`] with the module-crossing count given rather than read,
+/// so the response-budget pass can restate the clause for the chain it ships
+/// and leave the count out when the reply no longer carries every clip record
+/// the count would cover.
+pub(crate) fn spine_clipping_clause(
+    payload: &Value,
+    spine_clipped: u64,
+    crossing: Option<u64>,
+) -> String {
     let nodes = if spine_clipped == 1 { "node" } else { "nodes" };
     // The two facts the superseded clauses carried, absorbed rather than lost.
     let mut absorbed: Vec<String> = Vec::new();
     if let Some(dropped) = payload.get("steps_omitted").and_then(Value::as_u64) {
         if dropped > 0 {
-            absorbed.push(format!("{dropped} step(s) were omitted from the response"));
+            absorbed.push(format!("{dropped}{OMITTED_STEPS_PHRASE}"));
         }
     }
     if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
@@ -1914,10 +2055,7 @@ fn spine_clipping_gap(payload: &Value, spine_clipped: u64) -> String {
     } else {
         format!(" ({})", absorbed.join(", "))
     };
-    let crossing = match payload
-        .get("spine_dropped_crossing_file")
-        .and_then(Value::as_u64)
-    {
+    let crossing = match crossing {
         Some(count) if count > 0 => {
             format!(", {count} of the dropped neighbours lived outside the file that offered them")
         }
@@ -1933,6 +2071,59 @@ fn spine_clipping_gap(payload: &Value, spine_clipped: u64) -> String {
          Name the symbol you are after as `target` so the cap ranks toward it, or re-query the \
          clipped node with a larger `limit_per_step`"
     )
+}
+
+/// `text` with its spine clause replaced by the clauses in `replacement`,
+/// joined as clauses are, or `None` when it carries no spine clause or already
+/// says that.
+///
+/// The spine clause runs from its label to the next clause separator, and it
+/// never carries the separator itself (see
+/// `the_spine_clause_never_carries_the_clause_separator`), so the separator is
+/// its end. The response-budget pass uses this to restate the clause for the
+/// chain it ships, or to put the cap clauses in its place when that chain no
+/// longer continues beneath a clipped node. Either way something takes its
+/// place: `replacement` is never empty there.
+pub(crate) fn replace_spine_clause(text: &str, replacement: &[String]) -> Option<String> {
+    let label = format!("{TRACE_SPINE_CLIPPED_LIMITING_FACTOR}: ");
+    let start = text.find(&label)?;
+    let end = text[start..]
+        .find(crate::verdict::CLAUSE_SEPARATOR)
+        .map_or(text.len(), |offset| start + offset);
+    let restated = format!(
+        "{}{}{}",
+        &text[..start],
+        replacement.join(crate::verdict::CLAUSE_SEPARATOR),
+        &text[end..]
+    );
+    (restated != text).then_some(restated)
+}
+
+/// The words the spine-clipping clause counts a reply's omitted steps with,
+/// after the count itself.
+///
+/// Shared with the response-budget pass, which cuts the chain after this clause
+/// is written and restates the count with [`restate_omitted_steps`], so the
+/// clause and `steps_omitted` cannot disagree about the reply both describe.
+pub(crate) const OMITTED_STEPS_PHRASE: &str = " step(s) were omitted from the response";
+
+/// `text` with the count before every [`OMITTED_STEPS_PHRASE`] replaced by
+/// `omitted`, or `None` when it carries no such count or already says so.
+pub(crate) fn restate_omitted_steps(text: &str, omitted: u64) -> Option<String> {
+    if !text.contains(OMITTED_STEPS_PHRASE) {
+        return None;
+    }
+    let mut restated = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(OMITTED_STEPS_PHRASE) {
+        let head = &rest[..at];
+        restated.push_str(head.trim_end_matches(|c: char| c.is_ascii_digit()));
+        restated.push_str(&omitted.to_string());
+        restated.push_str(OMITTED_STEPS_PHRASE);
+        rest = &rest[at + OMITTED_STEPS_PHRASE.len()..];
+    }
+    restated.push_str(rest);
+    (restated != text).then_some(restated)
 }
 
 /// Stable label for guidance about a description-shaped query.
@@ -2166,12 +2357,43 @@ fn build_advice(
         None => "an unversioned graph snapshot".to_string(),
     };
     let degraded = if degraded.is_empty() {
-        "no degraded signals".to_string()
+        NO_DEGRADED_SIGNALS.to_string()
     } else {
-        format!("degraded signals [{}]", degraded.join(", "))
+        format!("{DEGRADED_SIGNALS_OPEN}{}]", degraded.join(", "))
     };
 
     format!("{subject}, against {as_of} with {coverage} and {degraded}. {consequence}")
+}
+
+/// How [`build_advice`] opens the list of degraded signals it names, and what
+/// it says when there are none.
+const DEGRADED_SIGNALS_OPEN: &str = "degraded signals [";
+const NO_DEGRADED_SIGNALS: &str = "no degraded signals";
+
+/// `advice` with `label` taken out of the degraded signals it lists, in the form
+/// [`build_advice`] writes, or `None` when it does not list it.
+///
+/// The response-budget pass withdraws a degradation when its cut leaves the
+/// reply nothing the degradation describes, and the sentence naming it goes
+/// with it.
+pub(crate) fn withdraw_degraded_signal(advice: &str, label: &str) -> Option<String> {
+    let open = advice.find(DEGRADED_SIGNALS_OPEN)?;
+    let start = open + DEGRADED_SIGNALS_OPEN.len();
+    let end = start + advice[start..].find(']')?;
+    let listed: Vec<&str> = advice[start..end].split(", ").collect();
+    if !listed.contains(&label) {
+        return None;
+    }
+    let kept: Vec<&str> = listed.into_iter().filter(|item| *item != label).collect();
+    Some(if kept.is_empty() {
+        format!(
+            "{}{NO_DEGRADED_SIGNALS}{}",
+            &advice[..open],
+            &advice[end + 1..]
+        )
+    } else {
+        format!("{}{}{}", &advice[..start], kept.join(", "), &advice[end..])
+    })
 }
 
 /// The consequence sentence for a retrieval tool that ran and came back empty.
@@ -2230,6 +2452,37 @@ fn absence_advice_consequence(
     } else {
         format!("{consequence} Limiting factor: {trust_reason}")
     }
+}
+
+/// Apply a late source observation to a previously built qualifier. Re-render
+/// the advice from its interpretation rather than patching old authoritative
+/// prose. The original coverage/freshness fields remain available beside it.
+pub(crate) fn qualify_source_observation(negative: &mut Value, reason: &str) {
+    let Some(negative) = negative.as_object_mut() else {
+        return;
+    };
+    let prior = negative
+        .get("trust_reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let reason = if prior.contains(reason) {
+        prior.to_string()
+    } else if prior.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}; {prior}")
+    };
+    let populated =
+        negative.get("interpretation").and_then(Value::as_str) == Some("qualified_answer");
+    let advice = if populated {
+        populated_advice_consequence(false, &reason)
+    } else {
+        absence_advice_consequence("", false, false, &reason)
+    };
+    negative.insert("trust".into(), json!("inconclusive"));
+    negative.insert("safe_to_conclude_absent".into(), json!(false));
+    negative.insert("trust_reason".into(), json!(reason));
+    negative.insert("advice".into(), json!(advice));
 }
 
 /// The consequence an answer that RETURNED rows carries.
@@ -2550,24 +2803,17 @@ pub fn negative_for(
     envelope: &Envelope,
     response_gaps: &[String],
 ) -> Option<Value> {
+    // An empty page past the end is not an assertion of no entity history.
+    if tool == "entity_history"
+        && payload
+            .get("change_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+    {
+        return None;
+    }
     let spec = spec_for(tool)?;
-    let count = if tool == "semantic_locate" {
-        locate_result_count(payload)?
-    } else {
-        match collection_len(payload, spec.field) {
-            Some(count) => count,
-            // An omitted group makes the same claim as an empty one, and it is
-            // the more dangerous of the two: `[]` at least names the question,
-            // while a missing key reads as a question the tool does not answer.
-            // Bailing out here would leave the shape with no verdict at all,
-            // which is the defect this module exists to prevent wearing its
-            // sharpest costume. `get_context_pack` shipped exactly that in
-            // 0.5.42, where the pack carried no `dependents` key, and nothing
-            // qualified it.
-            None if omits_its_answer_group(tool, payload) => 0,
-            None => return None,
-        }
-    };
+    let count = result_count(tool, payload)?;
     // A locate page has a second way of being a negative: it came back full, and
     // not one hit is the symbol the query named. Qualifying that page is the
     // whole point — the rows are real neighbors and stay exactly as ranked, so
@@ -2624,6 +2870,40 @@ pub fn negative_for(
         if let Some(gap) = crate::query_tokens::absence_gap(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, gap);
         }
+    } else if let Some(gap) = envelope
+        .behind
+        .as_ref()
+        .and_then(crate::envelope::GraphBehind::tracked_changes_limiting_factor)
+    {
+        // The one way a store being behind DOES bound a populated answer. A
+        // tracked file the host edited or removed while no daemon watched is
+        // still answered from its old bytes, so the rows here can name code the
+        // file no longer declares or a file the host no longer holds. The
+        // absence arm above already carries this inside the behind reason.
+        push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
+    // This tool's whole contract is narrower than the structural tools beside
+    // it, on a populated answer as much as an empty one: a hit is a literal
+    // occurring in the graph's OWN stored text fields (name, signature, doc
+    // summary, a body preview capped at 8000 characters, file import and
+    // surface context), never a resolved call or reference edge, and a miss is
+    // bounded by those same fields rather than by the repository. Unconditional
+    // on purpose, unlike every gap above it: a page of real hits is exactly
+    // where a reader is tempted to read "lexical_lookup found it" as
+    // "find_references would find it too", and the two can disagree, so the
+    // caution has to ride every response this tool sends, not only its empty
+    // ones.
+    if tool == crate::handlers::lexical::TOOL_NAME {
+        push_gap(
+            &mut trustworthy,
+            &mut trust_reason,
+            "lexical_lookup_not_structural: a hit or a miss here is lexical evidence over this \
+             tool's own stored graph fields, never a resolved call or reference edge, so it \
+             cannot certify or refute what find_references or trace_data_flow would answer for \
+             the same entity"
+                .to_string(),
+        );
     }
 
     // Gaps the response carries that this function cannot observe from the
@@ -2692,6 +2972,19 @@ pub fn negative_for(
     // which is the disagreement the method gate was widened to end.
     if matches!(tool, "find_references" | "get_context_pack") && claims_absence {
         if let Some(gap) = crate::caller_arrival::arrival_gap(payload) {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
+    }
+
+    // The same gate on `impact_analysis`, which answers the same question per
+    // changed entity: a `consumer_count: 0` row says nothing reaches that entity,
+    // read off the same `Calls` edges. Without it the tool certified a zero for a
+    // live export whose caller's call became no edge, while `find_references`
+    // refused the identical absence on the identical graph. The answer carries
+    // one reading per entity it found no consumers for, so the gate reads those
+    // and not the rows that did find some.
+    if tool == "impact_analysis" && claims_absence {
+        for gap in crate::caller_arrival::impact_arrival_gaps(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, gap);
         }
     }
@@ -2913,6 +3206,8 @@ pub fn negative_for(
         );
     }
 
+    let withheld_dependents = context_dependents_withheld(tool, payload);
+    let withheld_subject;
     let interpretation = if ranking_names_nothing {
         "unnamed_ranking"
     } else if relevance_unverified {
@@ -2929,6 +3224,19 @@ pub fn negative_for(
         subject = "this answer returned rows, so it asserts no absence; the verdict below says \
                    how far those rows can be trusted as the whole set";
     }
+    if withheld_dependents > 0 {
+        withheld_subject = format!(
+            "{withheld_dependents} dependent rows were found but withheld by the response limits; \
+             {count} are returned, so this answer asserts no absence"
+        );
+        kind = "qualified_answer";
+        subject = &withheld_subject;
+        push_gap(
+            &mut trustworthy,
+            &mut trust_reason,
+            "response_bounded: response limits withheld known dependents".to_string(),
+        );
+    }
     let consequence = if ranking_names_nothing {
         unnamed_ranking_consequence().to_string()
     } else if relevance_unverified {
@@ -2942,6 +3250,16 @@ pub fn negative_for(
     let degraded_signals = degraded_signals(tool, payload, envelope);
     let coverage_clause = coverage_clause(spec.class, payload, envelope);
     let trust_reason = if trustworthy {
+        // An absence the caller-arrival gate above let through was certified
+        // over that reading, and the reading does not see everything: the
+        // reason names it and says what it counts and what it cannot read, so
+        // a certified zero is not taken for more than it is.
+        let trust_reason = match crate::caller_arrival::arrival_certification_clause(tool, payload)
+            .filter(|_| claims_absence)
+        {
+            Some(arrival) => format!("{trust_reason}, and {arrival}"),
+            None => trust_reason,
+        };
         qualify_clean_trust_reason(trust_reason, &degraded_signals)
     } else {
         trust_reason
@@ -3094,6 +3412,18 @@ fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The words that begin every daemon refusal for a read it could not answer at
+/// all, for a reason that is not the named entity being absent: an in-flight
+/// write window, a session scope that changed under the read, or a graph that
+/// could not be rebuilt to read.
+///
+/// A marker rather than a phrase to match. Those refusals can quote a lower
+/// layer's error text, and [`is_resolution_miss`] matches phrases, so a quoted
+/// "entity not found" inside a graph fault would otherwise be published as a
+/// focal miss, which reads as an absence. Every producer writes this constant
+/// and the classifier checks it first, so the two cannot drift apart.
+pub const UNANSWERED_READ_PREFIX: &str = "no settled graph authority for ";
+
 /// True when an error message reports that the thing the caller named was not
 /// found, rather than a malformed request or a transport failure.
 ///
@@ -3104,7 +3434,13 @@ fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
 /// qualifier that only fires for the wording it was written against would go
 /// quiet the moment one of them is reworded, which looks exactly like the tool
 /// having no miss to qualify.
+///
+/// A refusal that starts with [`UNANSWERED_READ_PREFIX`] is never a miss,
+/// whatever it quotes.
 fn is_resolution_miss(message: &str) -> bool {
+    if message.trim_start().starts_with(UNANSWERED_READ_PREFIX) {
+        return false;
+    }
     let message = message.to_ascii_lowercase();
     message.contains("no entity") || message.contains("entity not found")
 }
@@ -3281,9 +3617,10 @@ mod tests {
     ///
     /// The absent `imports` is not a weakness of the fixture, it is what a real
     /// graph reports: Kin resolves an import to a cross-file `Calls` edge and an
-    /// artifact-level edge, and mints no entity-level `Imports` edge for any
-    /// language. A converted Python repository whose imports resolve cleanly
-    /// reports exactly this shape.
+    /// artifact-level edge, and reaches the entity level only where the
+    /// importing file carries a module entity and the coordinate lands in this
+    /// repository. A repository whose imports all leave it reports exactly this
+    /// shape.
     /// A graph whose enrichment actually delivered, which is the only shape in
     /// which Kin certifies a deletion.
     ///
@@ -3299,8 +3636,8 @@ mod tests {
     /// kinds: Calls: 945, Contains: 483, References: 438, ...` with
     /// `Cross-file entity relations: 699 of 1943`. The broken express arm on the
     /// same binary read `Calls: 254, Contains: 75` and no References at all.
-    /// `imports` stays absent because Kin's linker mints no entity-level
-    /// `Imports` relation on any language, healthy or not.
+    /// `imports` stayed absent on that run because every import in it named a
+    /// module outside the repository, which is `absent` and not a build gap.
     fn cross_file_edges_observed() -> Value {
         // Every requested class present. This fixture used to read `imports:
         // absent` and still stand for a healthy graph, because the verdict
@@ -3506,6 +3843,147 @@ mod tests {
             .expect("empty references yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    /// A certified absence rests on the caller-arrival reading, and the reading
+    /// has two blind spots: a call bound to a same-named definition in the
+    /// caller's own file counts as arrived, and a caller with no import edge
+    /// into the focal's file is never read. The reason a reader acts on names
+    /// the reading and says both, and the verdict cites the reading as an input
+    /// of its own rather than folding it into the absence gate unnamed.
+    #[test]
+    fn a_certified_absence_names_the_arrival_reading_and_what_it_cannot_see() {
+        let payload = authoritative_empty_references("function");
+        let envelope = structural_ready_envelope();
+        let negative = negative_for("find_references", &payload, &envelope)
+            .expect("empty references yields a negative");
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        for said in [
+            "structural_authoritative",
+            "caller_arrival reading",
+            "2 file(s) that import the focal's file",
+            "a same-named definition in the caller's own file",
+            "a caller that reaches the focal without one is not read",
+            "no degraded signals",
+        ] {
+            assert!(reason.contains(said), "missing {said:?}: {reason}");
+        }
+        assert!(
+            !reason.contains(crate::verdict::CLAUSE_SEPARATOR),
+            "one certified sentence, not a clause list: {reason}"
+        );
+        let verdict = crate::verdict::Verdict::compute(
+            "find_references",
+            &payload,
+            &envelope,
+            Some(&negative),
+        )
+        .expect("a retrieval answer carries a verdict")
+        .to_value();
+        assert_eq!(verdict["state"], json!("certified"), "{verdict}");
+        assert_eq!(verdict["inputs"]["caller_arrival"], json!("certified"));
+
+        // Refusing, it is named as an input that refused, and its code is said
+        // once although the absence gate carries the same gap.
+        let mut refused = payload.clone();
+        refused[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "unaccounted",
+            "family_files": 1,
+            "family_measured": 1,
+            "unaccounted_file_count": 1,
+            "unaccounted_files": [{
+                "file": "tests/test_storage.py",
+                "parsed_call_sites": 3,
+                "resolved_call_edges": 2,
+                "unaccounted_call_sites": 1,
+            }],
+            "unmeasured_reason": null,
+        });
+        let negative = negative_for("find_references", &refused, &envelope)
+            .expect("empty references yields a negative");
+        assert!(
+            !negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("caller_arrival reading found"),
+            "a refused reading is not recited as a certification: {negative}"
+        );
+        let verdict = crate::verdict::Verdict::compute(
+            "find_references",
+            &refused,
+            &envelope,
+            Some(&negative),
+        )
+        .expect("a retrieval answer carries a verdict")
+        .to_value();
+        assert_eq!(verdict["state"], json!("inconclusive"), "{verdict}");
+        assert_eq!(verdict["inputs"]["caller_arrival"], json!("inconclusive"));
+        let factor = verdict["limiting_factor"].as_str().unwrap();
+        assert_eq!(
+            factor
+                .split(crate::verdict::CLAUSE_SEPARATOR)
+                .filter(|code| *code == crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR)
+                .count(),
+            1,
+            "{factor}"
+        );
+
+        // An answer with rows claims no absence, so the reading has nothing to
+        // certify or refuse there, and says so.
+        let mut populated = refused;
+        populated["total_upstream"] = json!(1);
+        populated["references"] = json!([{ "name": "caller", "file_path": "app.py" }]);
+        let negative = negative_for("find_references", &populated, &envelope)
+            .expect("a populated reference answer is still qualified");
+        let verdict = crate::verdict::Verdict::compute(
+            "find_references",
+            &populated,
+            &envelope,
+            Some(&negative),
+        )
+        .expect("a retrieval answer carries a verdict")
+        .to_value();
+        assert_eq!(verdict["inputs"]["caller_arrival"], json!("not_applicable"));
+    }
+
+    /// The impact form of the same recital: a zero consumer count certified
+    /// over the reading says what the reading counts and what it cannot read,
+    /// and an answer with no zero to qualify says nothing about it.
+    #[test]
+    fn a_certified_impact_zero_names_the_arrival_reading_and_what_it_cannot_see() {
+        let mut payload = json!({
+            "entity_impacts": [],
+            "edge_coverage": express_deletion_coverage("present", "available")
+        });
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "accounted",
+            "entities_examined": 1,
+            "unaccounted_entity_count": 0,
+            "unmeasured_entity_count": 0,
+            "entities": [],
+            "entities_truncated": false,
+        });
+        let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
+            .expect("impact_analysis always qualifies");
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("each of the 1 entities reported with no consumers")
+                && reason.contains("a same-named definition in the caller's own file"),
+            "{reason}"
+        );
+
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY]["state"] =
+            json!(crate::caller_arrival::IMPACT_ARRIVAL_NOT_APPLICABLE);
+        let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
+            .expect("impact_analysis always qualifies");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("caller_arrival reading"),
+            "no zero was certified over the reading: {reason}"
+        );
     }
 
     /// An arrival the reading could not take is not an arrival it cleared. The
@@ -4365,6 +4843,77 @@ mod tests {
         );
     }
 
+    /// A tracked file edited or removed while no daemon watched bounds every
+    /// answer, not only an absence, and that is where it parts company with
+    /// untracked content one test up.
+    ///
+    /// The graph still holds the file's old bytes, so an empty answer about the
+    /// renamed function's new name is not an absence and a populated answer can
+    /// carry the old name as a row. Both are withheld and both say why. The
+    /// level store is the control on each half.
+    #[test]
+    fn an_answer_over_an_unadmitted_tracked_edit_certifies_nothing_either_way() {
+        let empty = empty_search_page(scope_with_a_measured_class(Some(29)));
+        let certified = negative_for("semantic_search", &empty, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(
+            certified["safe_to_conclude_absent"],
+            json!(true),
+            "the control: the same empty page certifies over a level store"
+        );
+        let negative = negative_for("semantic_search", &empty, &tracked_changes_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("tracked path(s) changed or removed while no daemon was watching"),
+            "the absence names the tracked files it is withheld for: {reason}"
+        );
+
+        let mut populated = empty_search_page(resolvable_language_scope(Some(29)));
+        populated["results"] = json!([{ "entity_id": "e1", "name": "old_name" }]);
+        populated["total_matches"] = json!(1);
+        let level = negative_for("semantic_search", &populated, &structural_ready_envelope())
+            .expect("a populated semantic search is qualified");
+        assert!(
+            !level["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tracked_changes_unadmitted"),
+            "the control: a level store adds no tracked-change caveat: {level}"
+        );
+        let behind = negative_for("semantic_search", &populated, &tracked_changes_envelope())
+            .expect("a populated semantic search is qualified");
+        assert_eq!(behind["trust"], json!("inconclusive"), "{behind}");
+        assert!(
+            behind["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tracked_changes_unadmitted"),
+            "a row may describe bytes the working copy no longer holds, so the populated answer \
+             says so too: {behind}"
+        );
+    }
+
+    /// A daemon envelope that is otherwise authoritative over a store whose
+    /// startup catch-up has not yet taken two tracked files the host edited or
+    /// removed while no daemon watched.
+    fn tracked_changes_envelope() -> Envelope {
+        Envelope::daemon().with_health(&json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_generation": 12,
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+                "changed_path_count": 2,
+                "changed_paths_sample": ["src/doomed.rs", "src/lib.rs"],
+                "last_admission_success_at": "2026-08-20T13:00:00Z",
+            },
+        }))
+    }
+
     /// A daemon envelope that is otherwise authoritative over a store holding
     /// host paths no admission has taken.
     fn behind_envelope(unadmitted_paths: u64) -> Envelope {
@@ -4896,6 +5445,49 @@ mod tests {
             "a graph that links this language's calls across files can answer: {negative}"
         );
         assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    #[test]
+    fn context_withheld_dependents_are_found_results_not_absence() {
+        for kept in [0, 1] {
+            for disclosure in ["count", "elision", "both"] {
+                let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+                payload["dependents"] = json!(vec![json!({"name": "caller"}); kept]);
+                if disclosure != "elision" {
+                    payload["dependents_withheld"] = json!(3);
+                }
+                if disclosure != "count" {
+                    payload["elisions"] = json!({"dependents": {
+                        "kept": kept, "elided": 3, "total": kept + 3,
+                        "reason": "token_budget"
+                    }});
+                }
+                let negative =
+                    negative_for("get_context_pack", &payload, &structural_ready_envelope())
+                        .expect("withheld findings still need a qualification");
+                assert_eq!(negative["kind"], "qualified_answer");
+                assert_eq!(negative["interpretation"], "qualified_answer");
+                assert_eq!(negative["result_count"], kept);
+                assert_eq!(negative["safe_to_conclude_absent"], false);
+                assert_eq!(negative["trust"], "inconclusive");
+                for field in ["subject", "advice"] {
+                    let text = negative[field].as_str().unwrap();
+                    assert!(
+                        text.contains("3 dependent rows were found but withheld"),
+                        "{text}"
+                    );
+                    assert!(!text.contains("nothing was found"), "{text}");
+                }
+            }
+        }
+        // Losing a source body does not mean a caller was found and withheld.
+        let mut payload = empty_pack_dependents("function", cross_file_edges_observed());
+        payload["elisions"] = json!({"body": {"elided": 3, "kept": 0, "total": 3,
+            "reason": "token_budget"}});
+        let negative =
+            negative_for("get_context_pack", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["kind"], "no_dependents");
+        assert_eq!(negative["interpretation"], "absent_as_indexed");
     }
 
     /// The pack inherits the reference surface's gap along with its authority.
@@ -6748,6 +7340,63 @@ mod tests {
         payload
     }
 
+    /// A crossing count the reply marks as a floor is never stated as the whole,
+    /// whether the negative is built directly or when a finalized reply is
+    /// finalized again under a budget that cuts nothing.
+    #[test]
+    fn a_floor_marked_crossing_count_is_not_stated_as_the_whole() {
+        const EXACT: &str = "11 of the dropped neighbours lived outside";
+        let reason = |payload: &Value| {
+            negative_for("trace_data_flow", payload, &structural_ready_envelope())
+                .expect("a qualified trace answer yields a negative")["trust_reason"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let known = spine_clipped_trace();
+        assert!(reason(&known).contains(EXACT), "{}", reason(&known));
+        let mut floor = spine_clipped_trace();
+        floor[crate::budget::CROSSING_FLOOR_KEY] = json!(true);
+        let floored = reason(&floor);
+        assert!(!floored.contains(EXACT), "{floored}");
+        assert!(
+            floored.contains(TRACE_SPINE_CLIPPED_LIMITING_FACTOR),
+            "the spine clause itself stays: {floored}"
+        );
+
+        let refinalized = |payload: &Value| {
+            let result = crate::types::ToolCallResult {
+                content: vec![crate::types::ContentBlock::Text {
+                    text: payload.to_string(),
+                }],
+                is_error: None,
+            };
+            let finalized = crate::envelope::finalize_bounded(
+                result,
+                structural_ready_envelope(),
+                "trace_data_flow",
+                &crate::budget::ResponseBudget::default(),
+            );
+            let crate::types::ContentBlock::Text { text } = &finalized.content[0];
+            let reply: Value = serde_json::from_str(text).unwrap();
+            assert_ne!(reply["_kin"]["response"]["bounded"], json!(true), "{reply}");
+            reply[NEGATIVE_KEY]["trust_reason"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            refinalized(&known).contains(EXACT),
+            "{}",
+            refinalized(&known)
+        );
+        assert!(
+            !refinalized(&floor).contains(EXACT),
+            "{}",
+            refinalized(&floor)
+        );
+    }
+
     /// The refusal itself: a spine-clipped answer may not be read as evidence
     /// that the focal cannot reach something, and the sentence has to say so in
     /// words a caller cannot hear as a mere lower bound.
@@ -6958,6 +7607,80 @@ mod tests {
             );
         }
         assert!(seen > 0, "no clause was produced, so this asserted nothing");
+    }
+
+    /// The cap clauses a trace that continued beneath no clipped node reports
+    /// follow what its walk did: one for a walk cut short, one for a walk that
+    /// ran degraded, in that order, and none for a walk that did neither.
+    #[test]
+    fn the_cap_clauses_follow_what_the_walk_did() {
+        assert!(trace_cap_clauses(false, false).is_empty());
+        let both = trace_cap_clauses(true, true);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both[0].starts_with("trace_walk_truncated: "), "{both:?}");
+        assert!(both[1].starts_with("trace_walk_degraded: "), "{both:?}");
+        assert_eq!(trace_cap_clauses(true, false), vec![both[0].clone()]);
+        assert_eq!(trace_cap_clauses(false, true), vec![both[1].clone()]);
+        for clause in &both {
+            assert!(
+                !clause.contains(crate::verdict::CLAUSE_SEPARATOR),
+                "a cap clause carries the separator: {clause}"
+            );
+        }
+    }
+
+    /// Only the spine clause is replaced, from its label to the next clause
+    /// separator or the end of the text, and the clauses around it stay word
+    /// for word. A text with no spine clause, or one that already says the
+    /// replacement, is left alone.
+    #[test]
+    fn replacing_the_spine_clause_leaves_every_other_clause_as_it_was() {
+        let clause = spine_clipping_clause(&spine_clipped_trace(), 2, Some(1));
+        let replacement = vec!["a: one".to_string(), "b: two".to_string()];
+        let text = format!("response_bounded: cut; {clause}; substrate_partial: short");
+        assert_eq!(
+            replace_spine_clause(&text, &replacement).as_deref(),
+            Some("response_bounded: cut; a: one; b: two; substrate_partial: short")
+        );
+        let last = format!("response_bounded: cut; {clause}");
+        assert_eq!(
+            replace_spine_clause(&last, &replacement).as_deref(),
+            Some("response_bounded: cut; a: one; b: two")
+        );
+        assert_eq!(
+            replace_spine_clause("response_bounded: cut", &replacement),
+            None
+        );
+        assert_eq!(replace_spine_clause(&text, &[clause]), None);
+    }
+
+    /// Withdrawing a degraded signal takes it out of the list the advice
+    /// states, says there are none when it was the only one, and leaves advice
+    /// that never listed it alone.
+    #[test]
+    fn withdrawing_a_degraded_signal_rewrites_only_the_list() {
+        let listed = "rows against coverage and degraded signals [response_budget:steps_omitted, \
+                      fanout_cap:spine_clipped, edge_coverage:calls_absent]. Treat these rows";
+        assert_eq!(
+            withdraw_degraded_signal(listed, "fanout_cap:spine_clipped").as_deref(),
+            Some(
+                "rows against coverage and degraded signals [response_budget:steps_omitted, \
+                 edge_coverage:calls_absent]. Treat these rows"
+            )
+        );
+        let only = "rows against coverage and degraded signals [fanout_cap:spine_clipped]. Treat";
+        assert_eq!(
+            withdraw_degraded_signal(only, "fanout_cap:spine_clipped").as_deref(),
+            Some("rows against coverage and no degraded signals. Treat")
+        );
+        assert_eq!(
+            withdraw_degraded_signal(listed, "edge_coverage:imports_absent"),
+            None
+        );
+        assert_eq!(
+            withdraw_degraded_signal("no list here", "fanout_cap:spine_clipped"),
+            None
+        );
     }
 
     /// A walk stopped by its own caps or work bounds did not examine what an
@@ -7256,6 +7979,31 @@ mod tests {
                 "must not be read as an absence: {message}"
             );
         }
+    }
+
+    /// A read the daemon could not answer names why, and the why can quote a
+    /// lower layer's error text. Behind the marker, a quoted "entity not found"
+    /// is part of a fault report, not an absence, whatever the tool.
+    #[test]
+    fn a_refusal_behind_the_unanswered_read_marker_is_never_a_resolution_miss() {
+        let quoted_fault = format!(
+            "{UNANSWERED_READ_PREFIX}find_references: a snapshot of the selected graph held still \
+             but could not be rebuilt into a graph to read (entity not found: 7). No entity was \
+             looked up."
+        );
+        for tool in ["find_references", "trace_data_flow", "kin_provenance_query"] {
+            assert!(
+                resolution_miss_for(tool, &quoted_fault, &structural_ready_envelope()).is_none(),
+                "{tool} must not read a graph fault as an absence"
+            );
+        }
+        // The control: the same quoted phrase without the marker is a miss.
+        assert!(resolution_miss_for(
+            "find_references",
+            "entity not found: 7",
+            &structural_ready_envelope()
+        )
+        .is_some());
     }
 
     #[test]
@@ -8553,5 +9301,109 @@ mod tests {
         .unwrap();
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(!reason.contains("walk_depth_bounded"), "{reason}");
+    }
+
+    /// The negative-gate review the design for this tool flagged by name:
+    /// `lexical_lookup`'s caution has to ride a POPULATED answer exactly as it
+    /// rides an empty one, unlike every other qualifier above, which is why it
+    /// is wired as its own unconditional gap rather than folded into the
+    /// `claims_absence` branch the others share. A hit list on a fully healthy
+    /// graph must still read as lexical evidence, never a resolved reference.
+    #[test]
+    fn lexical_lookup_populated_answer_still_carries_its_caution_and_claims_no_absence() {
+        let populated = json!({
+            "literal": "fetchCodespaces",
+            "hits": [{ "entity_id": "e1", "matched_field": "body_preview" }],
+            "total_matching": 1,
+            "truncated": false,
+        });
+        let negative = negative_for(
+            crate::handlers::lexical::TOOL_NAME,
+            &populated,
+            &structural_ready_envelope(),
+        )
+        .expect("every retrieval answer carries the response verdict");
+        assert_eq!(negative["interpretation"], json!("qualified_answer"));
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a hit list asserts no absence, so there is nothing to certify absent: {negative}"
+        );
+        assert_eq!(
+            negative["trust"],
+            json!("inconclusive"),
+            "a hit here can never certify as a resolved reference: {negative}"
+        );
+        // Joined with `answer_coverage_unreported`, the same caveat
+        // `a_search_that_returned_rows_is_not_qualified_by_a_caveat_about_absences`
+        // proves for `semantic_search`: neither handler attaches `edge_coverage`
+        // on its populated path, only its empty one, so a fixture payload with
+        // no block reads exactly the way a real populated response does.
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("lexical_lookup_not_structural"), "{reason}");
+    }
+
+    /// The same gate's other half: an empty page must not read as an
+    /// authoritative "the literal is not used", however healthy the graph is,
+    /// because the substrate this tool reads is a lexical index over indexed
+    /// fields, not the graph's structural truth.
+    #[test]
+    fn lexical_lookup_empty_answer_never_certifies_absence() {
+        let empty = json!({
+            "literal": "fetchCodespaces",
+            "hits": [],
+            "total_matching": 0,
+            "truncated": false,
+        });
+        let negative = negative_for(
+            crate::handlers::lexical::TOOL_NAME,
+            &empty,
+            &structural_ready_envelope(),
+        )
+        .expect("empty results yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "{negative}"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("lexical_lookup_not_structural"));
+    }
+
+    /// The full verdict, not just the negative object: a `lexical_lookup`
+    /// answer can never read `state: certified`, on a healthy graph, with real
+    /// hits, precisely because the unconditional gap above always refuses. This
+    /// is the mechanism that keeps `find_references` and `trace_data_flow` the
+    /// answer of record: nothing this tool returns can outrank them in
+    /// `_kin.verdict`.
+    #[test]
+    fn lexical_lookup_verdict_never_certifies_even_with_real_hits_on_a_healthy_graph() {
+        let populated = json!({
+            "literal": "fetchCodespaces",
+            "hits": [{ "entity_id": "e1", "matched_field": "body_preview" }],
+            "total_matching": 1,
+            "truncated": false,
+        });
+        let envelope = structural_ready_envelope();
+        let negative = negative_for(crate::handlers::lexical::TOOL_NAME, &populated, &envelope);
+        let verdict = crate::verdict::Verdict::compute(
+            crate::handlers::lexical::TOOL_NAME,
+            &populated,
+            &envelope,
+            negative.as_ref(),
+        )
+        .expect("a populated lexical_lookup answer has inputs to compute a verdict from");
+        let value = verdict.to_value();
+        assert_eq!(value["state"], json!("inconclusive"), "{value}");
+        let limiting_factor = value["limiting_factor"].as_str().unwrap();
+        assert!(
+            limiting_factor.contains("lexical_lookup_not_structural"),
+            "{value}"
+        );
+        assert_eq!(value["absence_claim"], json!("not_applicable"), "{value}");
+        assert_eq!(value["safe_to_conclude_absent"], json!(false), "{value}");
     }
 }

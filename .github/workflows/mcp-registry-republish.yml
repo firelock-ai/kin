@@ -51,9 +51,9 @@ jobs:
           # The registry refuses the publish unless package.json's mcpName is
           # exactly server.json's name, and it reports that as a package
           # validation failure rather than as the mismatch it is.
-          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+          jq -e --slurpfile pkg packages/kin/package.json \
             '.name == $pkg[0].mcpName' server.json > /dev/null
-          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+          jq -e --slurpfile pkg packages/kin/package.json \
             '.packages[0].identifier == $pkg[0].name' server.json > /dev/null
 
       - name: Confirm npm serves the published version
@@ -61,8 +61,8 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ "$(npm view "@kinlab/kin-mcp@${VERSION}" version 2>/dev/null)" != "$VERSION" ]; then
-            echo "::error::npm does not serve @kinlab/kin-mcp@${VERSION}; the registry validates against live npm, so this publish would be refused"
+          if [ "$(npm view "@kinlab/kin@${VERSION}" version 2>/dev/null)" != "$VERSION" ]; then
+            echo "::error::npm does not serve @kinlab/kin@${VERSION}; the registry validates against live npm, so this publish would be refused"
             exit 1
           fi
 

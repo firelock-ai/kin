@@ -3,7 +3,7 @@
 Kin repository workflows are fully supported on **Linux and macOS**. Native
 Windows admits repositories, but does not yet carry the whole workflow.
 
-Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
 
 Use **WSL2 (Windows Subsystem for Linux 2)** running a Linux distribution for
 the supported Windows-hosted experience.
@@ -16,11 +16,12 @@ Two parts of Kin are built around Unix runtime mechanics:
   calls via `LD_PRELOAD` (Linux) / `DYLD_INSERT_LIBRARIES` (macOS). That
   interception model does not exist on native Windows, so the "any tool sees
   graph-backed files as normal files" experience is Linux/macOS only.
-- **MCP and review workflows** are not yet covered end to end on native Windows
-  by the public install proof, so WSL2 is the supported path for connecting
-  agents and running review. Repository admission itself is not the blocker:
-  `kin init` admits a Git repository on native Windows and publishes graph
-  authority, and graph, lexical, and daemon-backed queries answer from it.
+- **Review workflows** are not yet tested on native Windows, so WSL2 is the
+  supported path for running review. Repository admission and agent setup are
+  not the blocker. `kin init` admits a Git repository on native Windows and
+  publishes graph authority, and graph, lexical, and daemon-backed queries
+  answer from it. The public install proof also runs agent setup there and
+  gets graph-backed answers from the installed MCP server.
 - **Semantic vector search** ships enabled on every published platform. The
   native Windows CLI artifact (`kin-windows-x86_64.zip`, published as
   `kin-windows-x86_64.tar.gz` as well) is built with the same
@@ -93,11 +94,12 @@ report repository, daemon, and semantic-query readiness as missing because they
 are repo-scoped; run them from inside an admitted repository.
 
 Git for Windows sets `core.autocrlf=true` in its system config, which rewrites
-line endings on checkout. `kin init` admits only a worktree whose bytes match
-the committed tree, so it refuses a repository cloned that way with `tracked
-blob ... bytes differ from the committed tree`. Run `git config --global
-core.autocrlf false` and clone again.
+line endings on checkout. `kin init` admits the committed tree, so a repository
+cloned that way still admits, and init reports the rewritten files under
+`Uncommitted worktree state:` rather than treating them as your edits. To make
+the worktree match what Kin admitted, run `git config --global core.autocrlf
+false` and clone again.
 
 No native Windows ARM64 archive is published. Use WSL2, or run x64 PowerShell
-under Windows x64 emulation to install the x86_64 archive for repository-free
-diagnostics. WSL2 remains required for usable Kin repository workflows.
+under Windows x64 emulation to install the x86_64 archive, which carries the same
+native Windows boundary described above.

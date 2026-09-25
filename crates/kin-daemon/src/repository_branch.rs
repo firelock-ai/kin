@@ -1107,6 +1107,19 @@ fn switch(
         ))
         .into());
     }
+    // A switch serves the branch head's state, which predates the store's last
+    // `kin upgrade` unless that head descends from one of its anchors: a
+    // branch created afterwards at an older change is the way to reach one.
+    // Following a ref that an admission moved is not a switch the reader
+    // chose, and a transfer settles the record on its own.
+    if policy == TransitionPolicy::Switch {
+        crate::hydration_requalify::before_restoring(
+            state,
+            &graph,
+            target_change_id,
+            "branch switch",
+        )?;
+    }
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),

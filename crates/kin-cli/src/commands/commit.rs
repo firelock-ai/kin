@@ -286,6 +286,9 @@ async fn run_daemon_commit(
     if let Some(token) = crate::daemon_client::resolve_daemon_auth_token() {
         request = request.bearer_auth(token);
     }
+    if let Some(session_id) = commit_session_header() {
+        request = request.header("X-Kin-Session", session_id);
+    }
 
     let kin_root = layout.root().to_path_buf();
     // Opened before the request so the first phase the daemon enters is already
@@ -346,6 +349,21 @@ fn commit_reply_deadline() -> Option<std::time::Duration> {
     None
 }
 
+/// The Kin session this commit runs in, for the daemon to hold it to that
+/// session's capabilities.
+///
+/// `kin with` exports `KIN_SESSION_ID` to the process it starts, and the daemon
+/// client sends it on every other command as `X-Kin-Session`. The commit
+/// used a client of its own and sent nothing, so a read-only session could
+/// commit through the CLI. Only a well-formed id is sent: a stale or malformed
+/// value left in a shell must not turn every commit into a bad request.
+fn commit_session_header() -> Option<String> {
+    let value = std::env::var("KIN_SESSION_ID").ok()?;
+    let value = value.trim();
+    uuid::Uuid::parse_str(value).ok()?;
+    Some(value.to_string())
+}
+
 /// The HTTP client a commit is sent with.
 ///
 /// The connect timeout stays: refusing to connect is an immediate, local fact
@@ -375,7 +393,10 @@ fn build_commit_client(deadline: Option<std::time::Duration>) -> reqwest::Result
 fn commit_refusal_message(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
     let kind = parsed.get("error")?.as_str()?;
-    if !matches!(kind, "nothing_to_commit" | "projection_blocked") {
+    if !matches!(
+        kind,
+        "nothing_to_commit" | "projection_blocked" | "read_only_session"
+    ) {
         return None;
     }
     Some(parsed.get("message")?.as_str()?.to_string())
@@ -1015,6 +1036,40 @@ mod tests {
             "another refusal keeps the envelope its own reader parses"
         );
         assert!(commit_refusal_message("daemon is starting").is_none());
+    }
+
+    /// A commit run inside a Kin session names that session to the daemon, which
+    /// is what lets the daemon refuse it for a session that declared itself
+    /// read-only, and the refusal reaches the caller as its own sentence.
+    #[test]
+    fn a_commit_names_its_session_and_reports_a_read_only_refusal_in_words() {
+        let session = "3f9c2a1e-7b4d-4c8e-9a6f-2d1b0e5c7a93";
+        let mut env = kin_core::test_env::EnvVarGuard::set("KIN_SESSION_ID", session);
+        assert_eq!(commit_session_header().as_deref(), Some(session));
+        env.apply("KIN_SESSION_ID", Some(format!("  {session}\n")));
+        assert_eq!(commit_session_header().as_deref(), Some(session));
+        for unusable in ["", "   ", "not-a-session"] {
+            env.apply("KIN_SESSION_ID", Some(unusable));
+            assert_eq!(
+                commit_session_header(),
+                None,
+                "{unusable:?} names no session and must not become a header"
+            );
+        }
+        env.apply::<_, &str>("KIN_SESSION_ID", None);
+        assert_eq!(commit_session_header(), None);
+        drop(env);
+
+        let body = serde_json::json!({
+            "error": "read_only_session",
+            "session_id": session,
+            "message": "read_only_session: kin commit writes, and session is read-only",
+        })
+        .to_string();
+        assert_eq!(
+            commit_refusal_message(&body).as_deref(),
+            Some("read_only_session: kin commit writes, and session is read-only")
+        );
     }
 
     /// `kin commit` is not a git commit and nothing said so, while `git status`

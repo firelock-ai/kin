@@ -93,6 +93,7 @@ impl LanguageAdapter for CppAdapter {
         extract_cpp_tests(&root, source, &mut tests);
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -1461,6 +1462,9 @@ fn extract_include(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport
                         local_name,
                         original_name: Some("default".to_string()),
                         is_default: true,
+                        // An `#include` binds every name the header declares and
+                        // writes none of them; the directive's span is all there is.
+                        site: None,
                     }],
                 });
             }

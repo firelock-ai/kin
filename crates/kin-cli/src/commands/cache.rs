@@ -228,13 +228,26 @@ fn scan_cache_streaming(
     limit: Option<u64>,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> (CacheStats, ScanBound) {
+    scan_cache_streaming_with_interval(base, now, limit, SCAN_PROGRESS_INTERVAL, on_progress)
+}
+
+/// Keep callback-boundary tests independent of the production reporting cadence.
+#[cfg(feature = "embeddings")]
+fn scan_cache_streaming_with_interval(
+    base: &Path,
+    now: SystemTime,
+    limit: Option<u64>,
+    progress_interval: u64,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> (CacheStats, ScanBound) {
+    assert!(progress_interval > 0);
     let mut total_bytes = 0u64;
     let mut entry_count = 0u64;
     let mut oldest: Option<SystemTime> = None;
     let mut newest: Option<SystemTime> = None;
     let mut bands: Vec<(u64, u64)> = vec![(0, 0); AGE_BANDS.len()];
     let mut schema_versions = Vec::new();
-    let mut next_report = SCAN_PROGRESS_INTERVAL;
+    let mut next_report = progress_interval;
 
     let mut remaining = limit;
     let mut truncated = false;
@@ -266,7 +279,7 @@ fn scan_cache_streaming(
                     band.1 += 1;
                     if entry_count >= next_report {
                         on_progress(entry_count, total_bytes);
-                        next_report += SCAN_PROGRESS_INTERVAL;
+                        next_report += progress_interval;
                     }
                 },
             );
@@ -754,34 +767,38 @@ mod tests {
     /// point: the command was unusable because it printed only on completion.
     #[test]
     fn progress_reports_during_the_walk_and_counts_up() {
-        let entries: Vec<(String, u64)> = (0..SCAN_PROGRESS_INTERVAL * 2 + 10)
-            .map(|i| (format!("{i:08x}"), 1))
-            .collect();
+        assert_eq!(SCAN_PROGRESS_INTERVAL, 25_000);
         let dir = tempfile::tempdir().expect("tempdir");
         let shard = dir.path().join("v2").join("sh");
         std::fs::create_dir_all(&shard).expect("mkdir");
-        for (name, _) in &entries {
-            std::fs::write(shard.join(format!("{name}.bin")), b"x").expect("write");
+        for i in 0..8 {
+            std::fs::write(shard.join(format!("{i:08x}.bin")), b"x").expect("write");
         }
 
+        let now = SystemTime::now();
         let mut seen: Vec<(u64, u64)> = Vec::new();
-        let (stats, _) =
-            scan_cache_streaming(dir.path(), SystemTime::now(), None, &mut |count, bytes| {
+        let (stats, bound) =
+            scan_cache_streaming_with_interval(dir.path(), now, None, 3, &mut |count, bytes| {
                 seen.push((count, bytes))
             });
 
-        assert_eq!(
-            seen.len(),
-            2,
-            "one report per {SCAN_PROGRESS_INTERVAL} entries: {seen:?}"
-        );
-        assert_eq!(seen[0].0, SCAN_PROGRESS_INTERVAL);
-        assert_eq!(seen[1].0, SCAN_PROGRESS_INTERVAL * 2);
+        assert_eq!(seen, [(3, 3), (6, 6)]);
+        assert_eq!(stats.entry_count, 8);
+        assert_eq!(stats.total_bytes, 8);
+        assert_eq!(bound, ScanBound::Complete);
         assert!(
             seen[0].0 < stats.entry_count,
             "the first report must land before the walk ends"
         );
-        assert!(seen[1].1 > seen[0].1, "bytes must accumulate: {seen:?}");
+
+        let mut production_seen = Vec::new();
+        let (production_stats, production_bound) =
+            scan_cache_streaming(dir.path(), now, None, &mut |count, bytes| {
+                production_seen.push((count, bytes))
+            });
+        assert!(production_seen.is_empty());
+        assert_eq!(production_stats, stats);
+        assert_eq!(production_bound, bound);
     }
 
     #[test]

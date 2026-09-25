@@ -84,14 +84,49 @@
 //! build older than this wire field declares nothing, so both leave the receiver
 //! unstamped exactly as every transfer did before.
 //!
+//! ## What `kin upgrade` adds to the record
+//!
+//! A store's past cannot be re-derived in place. A change's identity hashes its
+//! deltas and its parents, so replaying history under a newer build would rename
+//! every change, and with it every ref, review, alias, receipt and replica that
+//! names one. What can be brought current is the state a store SERVES: `kin
+//! upgrade` re-derives the state of every local branch head, and of the
+//! workspace, under this build's replay, and records each head's transition as
+//! one new native change on top of it. Those changes are the upgrade's anchors.
+//!
+//! The record then carries a [`HydrationUpgrade`] beside the creation version,
+//! and [`standing_of`] reads [`HydrationStanding::Rederived`] from it: the
+//! served state is current when the upgrade's version is this build's, and the
+//! creation version is still stated rather than overwritten, because history
+//! recorded before the anchors keeps the replay version that authored it.
+//!
+//! The claim holds only while the served state descends from an anchor. Three
+//! things end it, and each drops the upgrade before it commits, which returns
+//! the store to its creation record (or to no record, for a store that had
+//! none) and so to a gap whose remedy is `kin upgrade` again:
+//!
+//! 1. A rollback, path checkout, stash restore, merge or branch switch that
+//!    installs state from a change whose first-parent line reaches no anchor.
+//!    That state was derived by whichever build recorded it.
+//!    [`state_reaches_an_anchor`] is the test.
+//! 2. Admitting transported history, which can carry state from any build: see
+//!    [`HydrationStampCapability::reconcile_after_transfer`].
+//! 3. A later build with a newer replay version, which reads the upgrade as
+//!    behind like any other record.
+//!
+//! An older build cannot parse a record that carries an upgrade, because the
+//! record denies unknown fields, so it reads [`HydrationStanding::Unreadable`]
+//! and advises upgrading Kin rather than certifying state a newer build derived.
+//!
 //! ## What this module deliberately does not do
 //!
-//! It does not migrate, re-derive, or refuse. A gap is disclosed and the reader
-//! decides. Auto-migration and refusal are later phases and carry their own
-//! decisions.
+//! It does not re-derive, and it does not refuse to answer. A gap is disclosed
+//! and the reader decides. The re-derivation is `kin upgrade`, which writes this
+//! record only after its own repository transaction is durable.
 
 use crate::layout::KinLayout;
 use chrono::{DateTime, Utc};
+use kin_model::SemanticChangeId;
 use serde::{Deserialize, Serialize};
 
 /// Schema token carried in the record so a future format change is legible
@@ -117,24 +152,86 @@ pub fn binary_version() -> u32 {
     kin_index::history::HYDRATION_SEMANTICS_VERSION
 }
 
-/// The replay-semantics version a store was created under.
+/// The replay-semantics version a store was created under, and the last
+/// `kin upgrade` that re-derived the state it serves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HydrationSemanticsStamp {
     pub schema: String,
     /// The value of `HYDRATION_SEMANTICS_VERSION` in the binary that created
     /// this store.
-    pub created_under: u32,
+    ///
+    /// `None` only in a record `kin upgrade` wrote over a store that carried
+    /// no creation record. A record with neither this nor an upgrade reads as
+    /// unreadable, because it establishes no version at all.
+    pub created_under: Option<u32>,
     pub at: DateTime<Utc>,
+    /// The last `kin upgrade`, when one ran.
+    ///
+    /// Omitted when absent, so a creation record serializes exactly as it did
+    /// before upgrades existed and a build older than this field keeps reading
+    /// it. A build older than this field refuses a record that carries it,
+    /// which is the direction wanted: that build did not derive what it would
+    /// otherwise certify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<HydrationUpgrade>,
 }
 
 impl HydrationSemanticsStamp {
     pub fn new(created_under: u32, at: DateTime<Utc>) -> Self {
         Self {
             schema: HYDRATION_SEMANTICS_SCHEMA.to_string(),
-            created_under,
+            created_under: Some(created_under),
             at,
+            upgrade: None,
         }
+    }
+
+    /// This record without its upgrade: the creation record alone, or nothing
+    /// when the store never had one.
+    ///
+    /// What a store falls back to when its served state stops descending from
+    /// the upgrade's anchors.
+    pub fn without_upgrade(&self) -> Option<Self> {
+        self.created_under.map(|created_under| Self {
+            schema: self.schema.clone(),
+            created_under: Some(created_under),
+            at: self.at,
+            upgrade: None,
+        })
+    }
+}
+
+/// One `kin upgrade`: the version the served state was re-derived under, what
+/// the store recorded before it, and the changes whose state it established.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HydrationUpgrade {
+    /// The replay version the served state was re-derived under.
+    pub under: u32,
+    /// The version the store recorded before this upgrade, from its creation
+    /// or from an earlier upgrade. `None` when it recorded none.
+    pub from: Option<u32>,
+    pub at: DateTime<Utc>,
+    /// The changes whose state this upgrade derived: one per head it
+    /// re-derived, as lowercase hex change ids. A state descends from this
+    /// upgrade's semantics only through one of these.
+    pub anchors: Vec<String>,
+}
+
+impl HydrationUpgrade {
+    /// The anchors as change ids, or the one that does not parse.
+    pub fn anchor_ids(&self) -> Result<std::collections::BTreeSet<SemanticChangeId>, String> {
+        self.anchors
+            .iter()
+            .map(|anchor| {
+                kin_model::Hash256::from_hex(anchor)
+                    .ok()
+                    .filter(|hash| hash.to_string() == *anchor)
+                    .map(SemanticChangeId::from_hash)
+                    .ok_or_else(|| format!("upgrade anchor {anchor:?} is not a change id"))
+            })
+            .collect()
     }
 }
 
@@ -159,7 +256,15 @@ impl HydrationSemanticsRead {
     /// variants beside it exist to prevent.
     pub fn created_under(&self) -> Option<u32> {
         match self {
-            Self::Recorded(stamp) => Some(stamp.created_under),
+            Self::Recorded(stamp) => stamp.created_under,
+            Self::Absent | Self::Unreadable(_) => None,
+        }
+    }
+
+    /// The last `kin upgrade` this read records, when it records one.
+    pub fn upgrade(&self) -> Option<&HydrationUpgrade> {
+        match self {
+            Self::Recorded(stamp) => stamp.upgrade.as_ref(),
             Self::Absent | Self::Unreadable(_) => None,
         }
     }
@@ -181,12 +286,39 @@ pub enum HydrationStanding {
     /// The store was created under a newer version than this binary derives, so
     /// this binary is older than the build that made the store.
     Ahead { created_under: u32, derives: u32 },
+    /// `kin upgrade` re-derived the state this store serves under `under`.
+    ///
+    /// Its own variant rather than a reuse of the three above, because what it
+    /// claims differs: the served state was derived under `under`, and history
+    /// recorded before the upgrade keeps the creation version, which is stated
+    /// beside it rather than overwritten. It agrees with this build exactly
+    /// when `under` equals `derives`, and it falls behind or ahead of a later
+    /// or earlier build the way a creation record does.
+    Rederived {
+        under: u32,
+        created_under: Option<u32>,
+        derives: u32,
+    },
     /// The store carries no record, so no creation-time comparison can be made.
     /// See the producer enumeration in the module doc.
     Unstamped { derives: u32 },
     /// A record exists and could not be read. Never treated as agreement.
     Unreadable { reason: String, derives: u32 },
 }
+
+/// The command that brings a store behind this build to this build's replay
+/// semantics, as a reader launching Kin through npm types it.
+///
+/// Pinned to this build's own version rather than to whatever npm resolves
+/// today, because this is the build that measured the gap and derives the
+/// version the advice promises. Every crate in the workspace carries the
+/// release version, and the npm launcher of a release provisions that release.
+pub fn npm_upgrade_command() -> String {
+    format!("npx -y @kinlab/kin@{} upgrade", env!("CARGO_PKG_VERSION"))
+}
+
+/// The same command for a reader told to move to the newest build first.
+pub const NPM_LATEST_UPGRADE_COMMAND: &str = "npx -y @kinlab/kin@latest upgrade";
 
 impl HydrationStanding {
     /// Whether the store's creation-time record differs from this binary or
@@ -196,15 +328,29 @@ impl HydrationStanding {
     /// not "they agree", and a surface that silently treated it as agreement
     /// would reintroduce the defect this record exists to end.
     pub fn is_gap(&self) -> bool {
-        !matches!(self, Self::Current { .. })
+        match self {
+            Self::Current { .. } => false,
+            Self::Rederived { under, derives, .. } => under != derives,
+            Self::Behind { .. } | Self::Ahead { .. } | Self::Unstamped { .. } => true,
+            Self::Unreadable { .. } => true,
+        }
     }
 
     /// A stable machine label for the standing, for a structured report.
+    ///
+    /// An upgraded store reads with the same three labels a created one does,
+    /// because the label answers how the recorded version compares with this
+    /// build and not how the record came to hold it.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Current { .. } => "current",
             Self::Behind { .. } => "behind",
             Self::Ahead { .. } => "ahead",
+            Self::Rederived { under, derives, .. } => match under.cmp(derives) {
+                std::cmp::Ordering::Equal => "current",
+                std::cmp::Ordering::Less => "behind",
+                std::cmp::Ordering::Greater => "ahead",
+            },
             Self::Unstamped { .. } => "unstamped",
             Self::Unreadable { .. } => "unreadable",
         }
@@ -229,9 +375,8 @@ impl HydrationStanding {
                 derives,
             } => format!(
                 "this store records hydration semantics version {created_under} at creation and \
-                 this build derives version {derives}, so the store cannot certify that its \
-                 persisted history reflects this build's replay semantics and no path re-derives \
-                 that history in place"
+                 this build derives version {derives}, so the store cannot certify that the state \
+                 it serves reflects this build's replay semantics until `kin upgrade` re-derives it"
             ),
             Self::Ahead {
                 created_under,
@@ -241,6 +386,35 @@ impl HydrationStanding {
                  this build derives the older version {derives}, so this binary predates the \
                  store's recorded semantics"
             ),
+            Self::Rederived {
+                under,
+                created_under,
+                derives,
+            } => {
+                let creation = match created_under {
+                    Some(version) => format!("it records version {version} at creation"),
+                    None => "it recorded no version at creation".to_string(),
+                };
+                match under.cmp(derives) {
+                    std::cmp::Ordering::Equal => format!(
+                        "`kin upgrade` re-derived the state this store serves under hydration \
+                         semantics version {under} ({creation}), matching the version this build \
+                         derives; changes recorded before that upgrade keep the replay version \
+                         that authored them"
+                    ),
+                    std::cmp::Ordering::Less => format!(
+                        "`kin upgrade` re-derived the state this store serves under hydration \
+                         semantics version {under} ({creation}) and this build derives version \
+                         {derives}, so the store cannot certify that the state it serves reflects \
+                         this build's replay semantics until `kin upgrade` re-derives it again"
+                    ),
+                    std::cmp::Ordering::Greater => format!(
+                        "`kin upgrade` re-derived the state this store serves under hydration \
+                         semantics version {under} ({creation}) and this build derives the older \
+                         version {derives}, so this binary predates the store's recorded semantics"
+                    ),
+                }
+            }
             Self::Unstamped { derives } => format!(
                 "this store records no hydration semantics version, so its persisted history \
                  cannot be shown to match the version {derives} this build derives"
@@ -255,58 +429,86 @@ impl HydrationStanding {
 
     /// What the reader can do about it, when there is anything to do.
     ///
-    /// Re-ingest only when the record proves this binary is newer. An ahead,
-    /// absent or unreadable record can belong to a newer store, so those cases
-    /// name upgrade-first advice and preserve the original store until the
+    /// `kin upgrade` only when the record proves this binary is newer. An
+    /// ahead, absent or unreadable record can belong to a newer store, so those
+    /// cases name the build upgrade first and preserve the store until the
     /// direction is known.
     ///
-    /// The unknown-provenance arm also refuses to presume a source. A native
-    /// store is its own only source, so telling one to re-ingest names no
-    /// reachable action; it says what re-ingesting actually does instead, and
-    /// says first that the store keeps working. That is the sentence a store
-    /// minutes old reads after its first sync with a peer it cannot match.
+    /// None of them names a re-ingest. A native store is its own only source,
+    /// so a fresh store built from source files drops every native commit,
+    /// branch and review it held, and `kin upgrade` carries all of them.
     pub fn remedy(&self) -> Option<String> {
         match self {
             Self::Current { .. } => None,
-            Self::Behind { .. } => Some(
-                "re-ingest the repository with `kin init` into a fresh store recorded under this \
-                 build's replay semantics"
-                    .to_string(),
-            ),
-            Self::Ahead { .. } => Some(
-                "upgrade this Kin build to at least the one that created the store, rather than \
-                 re-ingesting with the older replay version"
-                    .to_string(),
-            ),
-            Self::Unstamped { .. } | Self::Unreadable { .. } => Some(
+            Self::Behind { .. } => Some(upgrade_remedy()),
+            Self::Ahead { .. } => Some(AHEAD_REMEDY.to_string()),
+            Self::Rederived { under, derives, .. } => match under.cmp(derives) {
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Less => Some(upgrade_remedy()),
+                std::cmp::Ordering::Greater => Some(AHEAD_REMEDY.to_string()),
+            },
+            Self::Unstamped { .. } => Some(format!(
+                "upgrade Kin to the newest build first, because a store a newer build created can \
+                 have lost its record. Then run `kin upgrade` in this repository \
+                 (`{NPM_LATEST_UPGRADE_COMMAND}` when Kin runs through npm), which re-derives the \
+                 state this store serves under that build's replay semantics, records its \
+                 version, and keeps every native commit, branch, review and history record"
+            )),
+            Self::Unreadable { .. } => Some(format!(
                 "upgrade Kin to the newest build first, because a record this build cannot read \
-                 can belong to a store a newer build created. If the newest build still reads no \
-                 record, nothing recovers one in place: this store keeps serving its history with \
-                 its creation-time version unknown, and re-ingesting builds a fresh store from \
-                 source files rather than carrying this store's own history over"
-                    .to_string(),
-            ),
+                 can belong to a store a newer build created. If the newest build still cannot \
+                 read it, the record is damaged: remove `.kin/kindb/hydration-semantics` and run \
+                 `kin upgrade` with that build (`{NPM_LATEST_UPGRADE_COMMAND}` when Kin runs \
+                 through npm), which re-derives the state this store serves, records its version \
+                 again, and keeps every native commit, branch, review and history record"
+            )),
         }
     }
 }
+
+/// The advice for a store whose recorded version this build is newer than.
+fn upgrade_remedy() -> String {
+    format!(
+        "run `kin upgrade` in this repository (`{}` when Kin runs through npm), which re-derives \
+         the state this store serves under this build's replay semantics and keeps every native \
+         commit, branch, review and history record",
+        npm_upgrade_command()
+    )
+}
+
+/// The advice for a store a newer build recorded.
+const AHEAD_REMEDY: &str = "upgrade this Kin build to at least the one that recorded this \
+     store's replay semantics; an older build neither certifies nor re-derives state a newer \
+     build recorded";
 
 /// Compare `read` against `derives`.
 ///
 /// Split from the filesystem so every branch is testable without a store.
 pub fn standing_of(read: &HydrationSemanticsRead, derives: u32) -> HydrationStanding {
     match read {
-        HydrationSemanticsRead::Recorded(stamp) if stamp.created_under == derives => {
-            HydrationStanding::Current { version: derives }
-        }
-        HydrationSemanticsRead::Recorded(stamp) if stamp.created_under < derives => {
-            HydrationStanding::Behind {
-                created_under: stamp.created_under,
+        HydrationSemanticsRead::Recorded(stamp) => match (&stamp.upgrade, stamp.created_under) {
+            (Some(upgrade), created_under) => HydrationStanding::Rederived {
+                under: upgrade.under,
+                created_under,
                 derives,
+            },
+            (None, Some(created_under)) if created_under == derives => {
+                HydrationStanding::Current { version: derives }
             }
-        }
-        HydrationSemanticsRead::Recorded(stamp) => HydrationStanding::Ahead {
-            created_under: stamp.created_under,
-            derives,
+            (None, Some(created_under)) if created_under < derives => HydrationStanding::Behind {
+                created_under,
+                derives,
+            },
+            (None, Some(created_under)) => HydrationStanding::Ahead {
+                created_under,
+                derives,
+            },
+            // Validated away by the reader; kept total so a record built in
+            // memory cannot present as agreement either.
+            (None, None) => HydrationStanding::Unreadable {
+                reason: "the record names neither a creation version nor an upgrade".to_string(),
+                derives,
+            },
         },
         HydrationSemanticsRead::Absent => HydrationStanding::Unstamped { derives },
         HydrationSemanticsRead::Unreadable(reason) => HydrationStanding::Unreadable {
@@ -342,13 +544,26 @@ fn read_from(load: impl FnOnce() -> std::io::Result<String>) -> HydrationSemanti
         Err(error) => return HydrationSemanticsRead::Unreadable(error.to_string()),
     };
     match serde_json::from_str::<HydrationSemanticsStamp>(&raw) {
-        Ok(stamp) if stamp.schema == HYDRATION_SEMANTICS_SCHEMA => {
-            HydrationSemanticsRead::Recorded(stamp)
+        Ok(stamp) if stamp.schema != HYDRATION_SEMANTICS_SCHEMA => {
+            HydrationSemanticsRead::Unreadable(format!(
+                "schema {} is not {HYDRATION_SEMANTICS_SCHEMA}",
+                stamp.schema
+            ))
         }
-        Ok(stamp) => HydrationSemanticsRead::Unreadable(format!(
-            "schema {} is not {HYDRATION_SEMANTICS_SCHEMA}",
-            stamp.schema
-        )),
+        // A record that establishes no version is not a record of one. Only an
+        // upgrade may stand without a creation version, and only because it
+        // states the version it derived under itself.
+        Ok(stamp) if stamp.created_under.is_none() && stamp.upgrade.is_none() => {
+            HydrationSemanticsRead::Unreadable(
+                "the record names neither a creation version nor an upgrade".to_string(),
+            )
+        }
+        // An upgrade over a store with no history names no anchor, and that is
+        // a complete record: there is no earlier state to restore from.
+        Ok(stamp) => match stamp.upgrade.as_ref().map(HydrationUpgrade::anchor_ids) {
+            Some(Err(reason)) => HydrationSemanticsRead::Unreadable(reason),
+            _ => HydrationSemanticsRead::Recorded(stamp),
+        },
         Err(error) => HydrationSemanticsRead::Unreadable(error.to_string()),
     }
 }
@@ -429,6 +644,90 @@ pub fn transfer_preserves_creation_record(recorded: Option<u32>, declared: Optio
     recorded.is_some() && recorded == declared
 }
 
+/// The record `kin upgrade` writes once its repository transaction is durable.
+///
+/// Keeps what the store already recorded at creation and states the upgrade
+/// beside it. `previous` is the read the upgrade was planned from, and only a
+/// read that establishes the direction may be upgraded: a record this build
+/// cannot read can belong to a store a newer build created, and one that is
+/// ahead was recorded by a newer build, so both are refused here as well as in
+/// the command that plans the upgrade.
+pub fn upgraded_stamp(
+    previous: &HydrationSemanticsRead,
+    under: u32,
+    anchors: &[SemanticChangeId],
+    at: DateTime<Utc>,
+) -> Result<HydrationSemanticsStamp, String> {
+    let (created_under, created_at, from) = match previous {
+        HydrationSemanticsRead::Recorded(stamp) => {
+            let recorded = stamp
+                .upgrade
+                .as_ref()
+                .map(|upgrade| upgrade.under)
+                .or(stamp.created_under);
+            if recorded.is_some_and(|recorded| recorded > under) {
+                return Err(format!(
+                    "the store records hydration semantics version {} and this build derives the \
+                     older version {under}",
+                    recorded.unwrap_or_default()
+                ));
+            }
+            (stamp.created_under, stamp.at, recorded)
+        }
+        HydrationSemanticsRead::Absent => (None, at, None),
+        HydrationSemanticsRead::Unreadable(reason) => {
+            return Err(format!(
+                "the store's hydration semantics record could not be read ({reason})"
+            ))
+        }
+    };
+    let mut anchors = anchors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    anchors.sort();
+    anchors.dedup();
+    Ok(HydrationSemanticsStamp {
+        schema: HYDRATION_SEMANTICS_SCHEMA.to_string(),
+        created_under,
+        at: created_at,
+        upgrade: Some(HydrationUpgrade {
+            under,
+            from,
+            at,
+            anchors,
+        }),
+    })
+}
+
+/// Whether the state at `restored` descends from one of `anchors` through its
+/// first-parent line, which is the line material state follows.
+///
+/// The test every path that installs historical state applies before it
+/// commits. A change is the state its first parent published plus its own
+/// deltas, so a state reaches the upgrade's semantics exactly when an anchor
+/// sits on that line, and one that reaches genesis without meeting one was
+/// derived by whichever build recorded it. A change the history does not hold
+/// reaches nothing, which errs toward disclosure.
+pub fn state_reaches_an_anchor<E>(
+    anchors: &std::collections::BTreeSet<SemanticChangeId>,
+    restored: SemanticChangeId,
+    mut first_parent: impl FnMut(&SemanticChangeId) -> Result<Option<Option<SemanticChangeId>>, E>,
+) -> Result<bool, E> {
+    let mut current = restored;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if anchors.contains(&current) {
+            return Ok(true);
+        }
+        if !visited.insert(current) {
+            return Ok(false);
+        }
+        // `None` is a change the history does not hold; `Some(None)` is a root.
+        match first_parent(&current)? {
+            Some(Some(parent)) => current = parent,
+            Some(None) | None => return Ok(false),
+        }
+    }
+}
+
 /// Which of the two removal outcomes the invalidation observed.
 ///
 /// Named rather than folded into a bool because the sync that follows must
@@ -484,6 +783,35 @@ pub fn invalidate_for_unversioned_transfer(layout: &KinLayout) -> std::io::Resul
         |_| sync_directory_metadata(&parent),
     )
 }
+
+/// Why a restoring path could not settle the record before its commit.
+#[derive(Debug)]
+pub enum DropUpgradeError<E> {
+    /// The history walk that decides whether the restored state descends from
+    /// an anchor failed.
+    History(E),
+    /// Dropping the upgrade failed, so the commit must not proceed.
+    Io(std::io::Error),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for DropUpgradeError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::History(error) => write!(
+                formatter,
+                "could not tell whether the restored state descends from the last `kin upgrade`: \
+                 {error}"
+            ),
+            Self::Io(error) => write!(
+                formatter,
+                "could not record that the restored state predates the last `kin upgrade`: \
+                 {error}"
+            ),
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for DropUpgradeError<E> {}
 
 /// A retained handle to one store's `.kin/kindb` directory, for the daemon path
 /// that must not resolve it again at request time.
@@ -543,11 +871,88 @@ impl HydrationStampCapability {
     /// before the authority commit that publishes the transported history, and a
     /// commit that proceeded over a failed discard would leave exactly the false
     /// `Current` the discard exists to prevent.
+    ///
+    /// An upgrade is dropped first, whatever was declared. It claims the state
+    /// this store serves descends from its anchors, and transported history can
+    /// move a ref to state any build derived, so the store falls back to its
+    /// creation record and the comparison below is made against that.
     pub fn reconcile_after_transfer(&self, declared: Option<u32>) -> std::io::Result<()> {
+        self.drop_upgrade()?;
         if transfer_preserves_creation_record(self.read().created_under(), declared) {
             return Ok(());
         }
         self.invalidate_for_unversioned_transfer()
+    }
+
+    /// Drop the record's upgrade before a commit installs state from
+    /// `restored`, unless that state descends from one of the upgrade's
+    /// anchors.
+    ///
+    /// Returns whether the upgrade was dropped. A store with no upgrade is left
+    /// exactly as it is. A record whose upgrade names an anchor that does not
+    /// parse was already unreadable and is left for the reader to report.
+    ///
+    /// Called before the authority commit rather than after it. A commit that
+    /// then fails leaves the store reading behind when it did not have to,
+    /// which costs a `kin upgrade`; the other order leaves a window where a
+    /// crash keeps certifying state the upgrade never derived.
+    pub fn drop_upgrade_unless_restoring_upgraded_state<E>(
+        &self,
+        restored: SemanticChangeId,
+        first_parent: impl FnMut(&SemanticChangeId) -> Result<Option<Option<SemanticChangeId>>, E>,
+    ) -> Result<bool, DropUpgradeError<E>> {
+        let read = self.read();
+        let Some(upgrade) = read.upgrade() else {
+            return Ok(false);
+        };
+        let Ok(anchors) = upgrade.anchor_ids() else {
+            return Ok(false);
+        };
+        if state_reaches_an_anchor(&anchors, restored, first_parent)
+            .map_err(DropUpgradeError::History)?
+        {
+            return Ok(false);
+        }
+        self.drop_upgrade().map_err(DropUpgradeError::Io)?;
+        Ok(true)
+    }
+
+    /// Drop the record's upgrade, durably: the creation record alone when the
+    /// store had one, no record when it did not.
+    pub fn drop_upgrade(&self) -> std::io::Result<()> {
+        let HydrationSemanticsRead::Recorded(stamp) = self.read() else {
+            return Ok(());
+        };
+        if stamp.upgrade.is_none() {
+            return Ok(());
+        }
+        match stamp.without_upgrade() {
+            Some(creation) => self.write_through(&creation),
+            None => self.invalidate_for_unversioned_transfer(),
+        }
+    }
+
+    /// [`write`], through the retained handle: staged beside the record,
+    /// synced, renamed over it and the directory synced, so a crash leaves the
+    /// old record or the new one and never a truncated file.
+    fn write_through(&self, stamp: &HydrationSemanticsStamp) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let staged = format!("{HYDRATION_SEMANTICS_FILE_NAME}.tmp-{}", std::process::id());
+        let body = serde_json::to_vec(stamp).map_err(std::io::Error::other)?;
+        {
+            let mut file = self.kindb.create(&staged)?;
+            file.write_all(&body)?;
+            file.sync_all()?;
+        }
+        if let Err(error) = self
+            .kindb
+            .rename(&staged, &self.kindb, HYDRATION_SEMANTICS_FILE_NAME)
+        {
+            let _ = self.kindb.remove_file(&staged);
+            return Err(error);
+        }
+        self.sync_kindb_metadata()
     }
 
     /// [`invalidate_for_unversioned_transfer`], through the retained handle.
@@ -765,11 +1170,15 @@ mod tests {
             created_under: 11,
             derives: 10,
         };
-        assert!(behind.remedy().unwrap().contains("re-ingest"));
+        let behind_advice = behind.remedy().unwrap();
+        assert!(
+            behind_advice.starts_with("run `kin upgrade`"),
+            "a store this build is newer than is upgraded in place: {behind_advice}"
+        );
         let advice = ahead.remedy().unwrap();
         assert!(
-            advice.contains("upgrade") && !advice.contains("re-ingest the repository"),
-            "an ahead store must not be told to re-ingest: {advice}"
+            advice.starts_with("upgrade this Kin build") && !advice.contains("kin upgrade"),
+            "an ahead store must be told to upgrade the build, not the store: {advice}"
         );
     }
 
@@ -789,21 +1198,23 @@ mod tests {
             assert!(advice.starts_with("upgrade Kin to the newest build"));
             assert!(!advice.contains("rewrite the record"));
             // A native store is its own only source, so the advice may not name
-            // re-ingest as a step that keeps this store's history. The journey
-            // run that produced this change read the old sentence on a native
-            // store minutes old, where "re-ingest the repository into a separate
-            // fresh store" named nothing the reader could do.
+            // re-ingest at all: a fresh store built from source files drops
+            // every native commit, branch and review. The journey run that
+            // produced the first version of this test read "re-ingest the
+            // repository into a separate fresh store" on a native store minutes
+            // old, where it named nothing the reader could do.
             assert!(
-                !advice.contains("re-ingest the repository into a separate fresh store"),
-                "unknown provenance must not presume a source outside the store: {advice}"
+                !advice.contains("re-ingest") && !advice.contains("kin init"),
+                "unknown provenance must not advise rebuilding the store: {advice}"
             );
+            // The newest build's `kin upgrade` is what establishes a version in
+            // place, and the advice says what it keeps.
             assert!(
-                advice.contains("keeps serving its history"),
-                "the advice must say the store still works: {advice}"
-            );
-            assert!(
-                advice.contains("rather than carrying this store's own history over"),
-                "the advice must say what re-ingesting costs: {advice}"
+                advice.contains("`kin upgrade`")
+                    && advice.contains(NPM_LATEST_UPGRADE_COMMAND)
+                    && advice
+                        .contains("keeps every native commit, branch, review and history record"),
+                "the advice must name the in-place upgrade and what it keeps: {advice}"
             );
         }
     }
@@ -878,9 +1289,9 @@ mod tests {
         // The scan reads the file it means to read. Without this, every
         // assertion below is satisfied by an empty string.
         assert!(
-            ACCEPTANCE.contains("REMEDY_UNKNOWN = ("),
-            "the acceptance suite no longer declares REMEDY_UNKNOWN, so this guard is reading the \
-             wrong file or a file that has moved"
+            ACCEPTANCE.contains("REMEDY_UNSTAMPED = ("),
+            "the acceptance suite no longer declares REMEDY_UNSTAMPED, so this guard is reading \
+             the wrong file or a file that has moved"
         );
         // Python wraps a long constant across adjacent string literals, so the
         // sentence exists in the file only once the wrapping is removed.
@@ -909,9 +1320,12 @@ mod tests {
                 },
             ),
         ] {
+            // The suite formats the npm command with the version the binary
+            // under test reports, so it declares the advice with `%s` there.
             let remedy = standing
                 .remedy()
-                .expect("every gap standing carries advice");
+                .expect("every gap standing carries advice")
+                .replace(env!("CARGO_PKG_VERSION"), "%s");
             assert!(
                 joined.contains(&remedy),
                 "the acceptance suite's {label} remedy is not the one this build emits, so a \
@@ -1157,5 +1571,401 @@ mod tests {
         .expect_err("a refused removal reported success");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!synced, "the sync ran after a refused removal");
+    }
+
+    fn change(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([byte; 32]))
+    }
+
+    /// The record `kin upgrade` writes keeps the creation record it found and
+    /// states the upgrade beside it, and the standing reads current from it.
+    #[test]
+    fn an_upgraded_record_keeps_its_creation_version_and_reads_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        write(&layout, &HydrationSemanticsStamp::new(11, at(100))).unwrap();
+        let before = read(&layout);
+        assert_eq!(
+            standing_of(&before, 20),
+            HydrationStanding::Behind {
+                created_under: 11,
+                derives: 20
+            }
+        );
+
+        let upgraded = upgraded_stamp(&before, 20, &[change(2), change(1), change(2)], at(500))
+            .expect("a behind store upgrades");
+        write(&layout, &upgraded).unwrap();
+        let after = read(&layout);
+        assert_eq!(
+            after.created_under(),
+            Some(11),
+            "the creation version moved"
+        );
+        let upgrade = after.upgrade().expect("the upgrade was not recorded");
+        assert_eq!(upgrade.under, 20);
+        assert_eq!(upgrade.from, Some(11));
+        assert_eq!(
+            upgrade.anchor_ids().unwrap(),
+            [change(1), change(2)].into_iter().collect(),
+            "anchors are recorded once each"
+        );
+        let HydrationSemanticsRead::Recorded(stamp) = &after else {
+            panic!("the upgraded record did not read back: {after:?}");
+        };
+        assert_eq!(stamp.at, at(100), "the creation time moved");
+
+        let standing = standing_of(&after, 20);
+        assert_eq!(
+            standing,
+            HydrationStanding::Rederived {
+                under: 20,
+                created_under: Some(11),
+                derives: 20
+            }
+        );
+        assert!(!standing.is_gap());
+        assert_eq!(standing.label(), "current");
+        assert!(standing.remedy().is_none());
+        let sentence = standing.sentence();
+        assert!(
+            sentence.contains(
+                "re-derived the state this store serves under hydration semantics version 20"
+            ) && sentence.contains("it records version 11 at creation")
+                && sentence.contains("keep the replay version that authored them"),
+            "{sentence}"
+        );
+    }
+
+    /// An upgraded store falls behind a later build and ahead of an earlier
+    /// one exactly as a created store does, and names the upgrade, not a
+    /// creation it did not have.
+    #[test]
+    fn an_upgraded_record_compares_with_later_and_earlier_builds() {
+        let standing = |derives| HydrationStanding::Rederived {
+            under: 20,
+            created_under: Some(11),
+            derives,
+        };
+        let behind = standing(21);
+        assert!(behind.is_gap());
+        assert_eq!(behind.label(), "behind");
+        assert!(
+            behind.sentence().contains("cannot certify"),
+            "{}",
+            behind.sentence()
+        );
+        assert!(!behind
+            .sentence()
+            .contains("records hydration semantics version 20 at creation"));
+        assert!(behind.remedy().unwrap().starts_with("run `kin upgrade`"));
+
+        let ahead = standing(19);
+        assert!(ahead.is_gap());
+        assert_eq!(ahead.label(), "ahead");
+        assert!(
+            ahead.sentence().contains("predates"),
+            "{}",
+            ahead.sentence()
+        );
+        assert!(ahead
+            .remedy()
+            .unwrap()
+            .starts_with("upgrade this Kin build"));
+    }
+
+    /// A store with no creation record can be upgraded, because re-deriving
+    /// its served state is what establishes a version, and the record says it
+    /// recorded none rather than inventing one.
+    #[test]
+    fn an_unstamped_store_upgrades_without_inventing_a_creation_version() {
+        let upgraded = upgraded_stamp(&HydrationSemanticsRead::Absent, 20, &[change(7)], at(9))
+            .expect("an unstamped store upgrades");
+        assert_eq!(upgraded.created_under, None);
+        assert_eq!(upgraded.upgrade.as_ref().unwrap().from, None);
+        let read = HydrationSemanticsRead::Recorded(upgraded);
+        let standing = standing_of(&read, 20);
+        assert!(!standing.is_gap());
+        assert!(
+            standing
+                .sentence()
+                .contains("it recorded no version at creation"),
+            "{}",
+            standing.sentence()
+        );
+    }
+
+    /// An upgrade never overwrites what it cannot place: a record a newer
+    /// build wrote, or one this build cannot read.
+    #[test]
+    fn an_upgrade_refuses_a_newer_or_unreadable_record() {
+        let newer = HydrationSemanticsRead::Recorded(HydrationSemanticsStamp::new(21, at(1)));
+        let error = upgraded_stamp(&newer, 20, &[change(1)], at(2)).unwrap_err();
+        assert!(error.contains("older version 20"), "{error}");
+        let unreadable = HydrationSemanticsRead::Unreadable("truncated".to_string());
+        let error = upgraded_stamp(&unreadable, 20, &[change(1)], at(2)).unwrap_err();
+        assert!(error.contains("could not be read (truncated)"), "{error}");
+    }
+
+    /// A build that predates the upgrade field refuses a record carrying one,
+    /// so it reads a gap instead of certifying state a newer build derived.
+    /// Checked against the exact shape that build parses.
+    #[test]
+    fn a_build_older_than_the_upgrade_field_cannot_read_an_upgraded_record() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct PreUpgradeStamp {
+            schema: String,
+            created_under: u32,
+            at: DateTime<Utc>,
+        }
+        let creation = serde_json::to_string(&HydrationSemanticsStamp::new(11, at(1))).unwrap();
+        serde_json::from_str::<PreUpgradeStamp>(&creation)
+            .expect("a creation record must stay readable to an older build");
+        let upgraded = upgraded_stamp(
+            &HydrationSemanticsRead::Recorded(HydrationSemanticsStamp::new(11, at(1))),
+            20,
+            &[change(3)],
+            at(2),
+        )
+        .unwrap();
+        let upgraded = serde_json::to_string(&upgraded).unwrap();
+        assert!(
+            serde_json::from_str::<PreUpgradeStamp>(&upgraded).is_err(),
+            "an older build parsed an upgraded record: {upgraded}"
+        );
+        let unstamped = serde_json::to_string(
+            &upgraded_stamp(&HydrationSemanticsRead::Absent, 20, &[], at(2)).unwrap(),
+        )
+        .unwrap();
+        assert!(serde_json::from_str::<PreUpgradeStamp>(&unstamped).is_err());
+    }
+
+    /// A record that names no version at all, or an anchor that is not a
+    /// change id, establishes nothing and reads unreadable.
+    #[test]
+    fn a_record_that_establishes_no_version_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        std::fs::write(
+            layout.kindb_hydration_semantics_path(),
+            br#"{"schema":"kin.hydration-semantics.v1","created_under":null,"at":"2026-09-23T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            read(&layout),
+            HydrationSemanticsRead::Unreadable(_)
+        ));
+        std::fs::write(
+            layout.kindb_hydration_semantics_path(),
+            br#"{"schema":"kin.hydration-semantics.v1","created_under":11,"at":"2026-09-23T00:00:00Z","upgrade":{"under":20,"from":11,"at":"2026-09-23T00:00:00Z","anchors":["not-a-change"]}}"#,
+        )
+        .unwrap();
+        let read_back = read(&layout);
+        assert!(
+            matches!(&read_back, HydrationSemanticsRead::Unreadable(reason) if reason.contains("not-a-change")),
+            "{read_back:?}"
+        );
+    }
+
+    /// The first-parent walk: an anchor anywhere on the line counts, a root or
+    /// a change the history does not hold does not, and a cycle ends.
+    #[test]
+    fn a_restored_state_reaches_an_anchor_only_along_its_first_parent_line() {
+        let parents: std::collections::HashMap<SemanticChangeId, Option<SemanticChangeId>> = [
+            (change(1), None),
+            (change(2), Some(change(1))),
+            (change(3), Some(change(2))),
+            (change(4), Some(change(3))),
+            (change(8), Some(change(9))),
+            (change(9), Some(change(8))),
+        ]
+        .into_iter()
+        .collect();
+        let first_parent = |id: &SemanticChangeId| -> Result<_, std::convert::Infallible> {
+            Ok(parents.get(id).copied())
+        };
+        let anchors = [change(2)].into_iter().collect();
+        assert!(state_reaches_an_anchor(&anchors, change(4), first_parent).unwrap());
+        assert!(state_reaches_an_anchor(&anchors, change(2), first_parent).unwrap());
+        assert!(!state_reaches_an_anchor(&anchors, change(1), first_parent).unwrap());
+        assert!(!state_reaches_an_anchor(&anchors, change(5), first_parent).unwrap());
+        assert!(!state_reaches_an_anchor(&anchors, change(8), first_parent).unwrap());
+    }
+
+    /// Installing state from before the upgrade returns the store to its
+    /// creation record, through the handle the daemon holds, and installing
+    /// state that descends from an anchor leaves the upgrade in place byte for
+    /// byte.
+    #[test]
+    fn restoring_pre_upgrade_state_drops_the_upgrade_and_upgraded_state_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        let creation = HydrationSemanticsStamp::new(11, at(1));
+        let upgraded = upgraded_stamp(
+            &HydrationSemanticsRead::Recorded(creation.clone()),
+            20,
+            &[change(2)],
+            at(2),
+        )
+        .unwrap();
+        write(&layout, &upgraded).unwrap();
+        let path = layout.kindb_hydration_semantics_path();
+        let bytes = std::fs::read(&path).unwrap();
+        let first_parent = |id: &SemanticChangeId| -> Result<_, std::convert::Infallible> {
+            Ok(Some(match *id {
+                id if id == change(3) => Some(change(2)),
+                id if id == change(2) => Some(change(1)),
+                _ => None,
+            }))
+        };
+        let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
+
+        assert!(!capability
+            .drop_upgrade_unless_restoring_upgraded_state(change(3), first_parent)
+            .unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "upgraded state rewrote the record"
+        );
+
+        assert!(capability
+            .drop_upgrade_unless_restoring_upgraded_state(change(1), first_parent)
+            .unwrap());
+        assert_eq!(read(&layout), HydrationSemanticsRead::Recorded(creation));
+        assert_eq!(
+            standing_of(&read(&layout), 20),
+            HydrationStanding::Behind {
+                created_under: 11,
+                derives: 20
+            }
+        );
+    }
+
+    /// A store that had no creation record returns to having none.
+    #[test]
+    fn dropping_the_upgrade_of_an_unstamped_store_leaves_it_unstamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        write(
+            &layout,
+            &upgraded_stamp(&HydrationSemanticsRead::Absent, 20, &[change(2)], at(2)).unwrap(),
+        )
+        .unwrap();
+        HydrationStampCapability::open(&layout.kindb_dir())
+            .unwrap()
+            .drop_upgrade()
+            .unwrap();
+        assert_eq!(read(&layout), HydrationSemanticsRead::Absent);
+    }
+
+    /// Transported history can move a ref to state any build derived, so an
+    /// upgraded receiver drops its upgrade whatever the sender declared, and
+    /// then keeps its creation record only for a matching declaration.
+    #[test]
+    fn a_transfer_into_an_upgraded_store_drops_the_upgrade_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        let creation = HydrationSemanticsStamp::new(11, at(1));
+        let upgraded = |layout: &KinLayout| {
+            write(
+                layout,
+                &upgraded_stamp(
+                    &HydrationSemanticsRead::Recorded(creation.clone()),
+                    20,
+                    &[change(2)],
+                    at(2),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
+
+        upgraded(&layout);
+        capability.reconcile_after_transfer(Some(20)).unwrap();
+        assert_eq!(
+            read(&layout),
+            HydrationSemanticsRead::Absent,
+            "a declaration matching only the upgrade kept a record"
+        );
+
+        upgraded(&layout);
+        capability.reconcile_after_transfer(Some(11)).unwrap();
+        assert_eq!(read(&layout), HydrationSemanticsRead::Recorded(creation));
+    }
+
+    /// No hydration remedy tells anyone to rebuild the store, and the one for a
+    /// store this build is newer than names the upgrade and the exact npm
+    /// command for this build.
+    #[test]
+    fn no_remedy_advises_rebuilding_the_store() {
+        for standing in [
+            HydrationStanding::Behind {
+                created_under: 11,
+                derives: 20,
+            },
+            HydrationStanding::Ahead {
+                created_under: 21,
+                derives: 20,
+            },
+            HydrationStanding::Rederived {
+                under: 19,
+                created_under: Some(11),
+                derives: 20,
+            },
+            HydrationStanding::Rederived {
+                under: 21,
+                created_under: None,
+                derives: 20,
+            },
+            HydrationStanding::Unstamped { derives: 20 },
+            HydrationStanding::Unreadable {
+                reason: "truncated".to_string(),
+                derives: 20,
+            },
+        ] {
+            let advice = standing.remedy().expect("every gap carries advice");
+            assert!(
+                !advice.contains("re-ingest") && !advice.contains("kin init"),
+                "{} advice rebuilds the store: {advice}",
+                standing.label()
+            );
+        }
+        let behind = HydrationStanding::Behind {
+            created_under: 11,
+            derives: 20,
+        }
+        .remedy()
+        .unwrap();
+        assert!(
+            behind.contains(&format!(
+                "npx -y @kinlab/kin@{} upgrade",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{behind}"
+        );
+    }
+
+    /// The docs an agent reads for the envelope observation say what the
+    /// binary says. They are prose rather than a constant, so this pins the
+    /// two facts that matter: the upgrade is named and no re-ingest is.
+    #[test]
+    fn the_mcp_docs_name_the_upgrade_and_no_re_ingest() {
+        const DOCS: &str = include_str!("../../../docs/mcp-tools.md");
+        let start = DOCS
+            .find("- `hydration_semantics`:")
+            .expect("docs/mcp-tools.md no longer describes the hydration_semantics observation");
+        let paragraph = &DOCS[start..];
+        let paragraph = &paragraph[..paragraph[2..]
+            .find("\n- ")
+            .map_or(paragraph.len(), |end| end + 2)];
+        assert!(paragraph.contains("kin upgrade"), "{paragraph}");
+        assert!(
+            !paragraph.contains("re-ingest") && !paragraph.contains("kin init"),
+            "{paragraph}"
+        );
     }
 }

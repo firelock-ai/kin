@@ -17,6 +17,7 @@ use crate::capability::{CapabilityDetection, LocateProfile};
 /// hashing keeps fusion/resolution iteration order stable across processes so
 /// float score accumulation and tie-breaks are bit-reproducible.
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 #[cfg(feature = "vector")]
 type EntityStableKey = (String, String, EntityKind);
 type ResolveEntitiesOutput = (
@@ -67,6 +68,8 @@ pub struct LocateResult {
     /// answers to hide wrong ones. This reports; the caller decides.
     #[serde(default, skip_serializing_if = "is_false")]
     pub all_fallback: bool,
+    /// Legacy conversion/projection roll-up, absent on semantic MCP answers.
+    #[serde(default)]
     pub files: Vec<LocateFileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<LocateDebugInfo>,
@@ -668,13 +671,832 @@ fn query_tokens(query: &str) -> impl Iterator<Item = &str> {
         .filter(|token| !token.is_empty())
 }
 
+/// A name query spells at most this many names.
+///
+/// One unit is one word, one qualified path spelled whole (`search::quote`,
+/// `Query.String`, `crate::Type::method`) or one file name (`locate.rs`),
+/// because each is how a caller writes a single name. English connectives,
+/// question words and the words a caller uses to say what kind of code they
+/// want ([`is_code_kind_word`]) spell no name and are not counted, so "who
+/// calls parse", "the search package" and "Query type definition" spell one
+/// name each. A generic argument is a name of its own, so `Vec<Token>` spells
+/// two. Two covers a bare name and a name with one word beside it. A longer
+/// query is a description, and a plain word inside a description is
+/// vocabulary rather than a request for the symbol that happens to share it.
+/// Measured on the GitHub CLI store, "formatting search keywords, quoting
+/// search terms for search query" put ten rows named `search`, `query` or
+/// `keywords` above `formatKeywords`, the function it described, because every
+/// one of them took the exact-name tier.
+///
+/// A sentence ([`query_is_prose`]) is not a name for being short. "Walk me
+/// through the path" and "how is the config loaded" spell two words symbols
+/// are named after and ask for neither, which is the failure the tier's gate
+/// was written for. A sentence asks for a name only when it spells exactly one
+/// and says what kind of code it is: "where is the parse function defined"
+/// ([`NameQuery::parse`]).
+const LOCATE_NAME_QUERY_MAX_UNITS: usize = 2;
+
+/// Words a caller uses to say what kind of code they want rather than which.
+///
+/// "who calls parse", "callers of parse", "the search package" and "Query type
+/// definition" each name one symbol and describe the answer around it. These
+/// words do not count toward [`LOCATE_NAME_QUERY_MAX_UNITS`] and carry no
+/// evidence in [`descriptive_query_concepts`], so a name query written with
+/// them stays a name query. A symbol named like one of them is still named by
+/// it: the list decides what reads as a description, not what a word can name.
+fn is_code_kind_word(word: &str) -> bool {
+    matches!(
+        word,
+        "attribute"
+            | "attributes"
+            | "call"
+            | "called"
+            | "callee"
+            | "callees"
+            | "caller"
+            | "callers"
+            | "calling"
+            | "calls"
+            | "class"
+            | "classes"
+            | "const"
+            | "constant"
+            | "constants"
+            | "declaration"
+            | "declarations"
+            | "declared"
+            | "defined"
+            | "definition"
+            | "definitions"
+            | "enum"
+            | "enums"
+            | "field"
+            | "fields"
+            | "file"
+            | "files"
+            | "fn"
+            | "func"
+            | "function"
+            | "functions"
+            | "impl"
+            | "implementation"
+            | "implementations"
+            | "implemented"
+            | "impls"
+            | "interface"
+            | "interfaces"
+            | "macro"
+            | "macros"
+            | "method"
+            | "methods"
+            | "module"
+            | "modules"
+            | "package"
+            | "packages"
+            | "pkg"
+            | "properties"
+            | "property"
+            | "reference"
+            | "references"
+            | "refs"
+            | "signature"
+            | "struct"
+            | "structs"
+            | "symbol"
+            | "symbols"
+            | "test"
+            | "tests"
+            | "trait"
+            | "traits"
+            | "type"
+            | "types"
+            | "usage"
+            | "usages"
+            | "used"
+            | "uses"
+            | "variable"
+            | "variables"
+    )
+}
+
+/// Whether one query token has the shape of an identifier rather than a word.
+///
+/// [`is_symbolic_search_term`] already accepts snake_case, SCREAMING_CASE and
+/// anything with two capitals. This adds the camelCase shape it misses, one
+/// hump after a lowercase letter (`formatKeywords`, `getReply`, most Go and
+/// JavaScript function names), and a word that mixes letters with digits
+/// (`sha256`, `base64`, `utf8`), which English prose essentially never
+/// writes. A version label is the exception to that ([`is_version_word`]):
+/// prose names an API version `v1` or `v1beta1`, so "how does the scheduler
+/// bind pods in v1" asks for no module named `v1`. A capital that opens a
+/// token is not a hump, because a sentence capitalizes its first word and
+/// "Walk me through the path" asked for no symbol. Dots and `::` never reach a
+/// token, since the tokenizer splits on them; [`spell_query_names`] reads that
+/// shape.
+fn token_is_identifier_shaped(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    is_symbolic_search_term(token)
+        || bytes
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
+        || (bytes.iter().any(u8::is_ascii_digit)
+            && bytes.iter().any(u8::is_ascii_alphabetic)
+            && !is_version_word(token))
+}
+
+/// Whether a token is a version label: `v` and a number, optionally followed
+/// by a pre-release stage and its number (`v1`, `v10`, `v1beta1`, `v2alpha3`,
+/// `v1rc2`).
+fn is_version_word(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix('v') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let stage = &rest[digits..];
+    stage.is_empty()
+        || ["alpha", "beta", "rc"].iter().any(|name| {
+            stage
+                .strip_prefix(name)
+                .is_some_and(|number| number.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+}
+
+/// Qualifiers that name the enclosing instance rather than a type or package:
+/// `self.handle_request`, `this.handleClick`, `cls.create`, `super.render`.
+fn is_receiver_keyword(qualifier: &str) -> bool {
+    matches!(qualifier, "self" | "this" | "cls" | "super")
+}
+
+/// The heads of a Rust path that name the current crate or module rather than
+/// a package with a directory: `crate::`, `self::`, `super::`.
+fn is_module_path_keyword(qualifier: &str) -> bool {
+    matches!(qualifier, "crate" | "self" | "super")
+}
+
+/// The extensions that make a dotted run a file name (`locate.rs`,
+/// `query.go`, `index.d.ts`) rather than an owner and a member.
+fn is_source_file_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "bash"
+            | "c"
+            | "cc"
+            | "cfg"
+            | "cjs"
+            | "clj"
+            | "conf"
+            | "cpp"
+            | "cs"
+            | "css"
+            | "cxx"
+            | "dart"
+            | "ex"
+            | "exs"
+            | "go"
+            | "gradle"
+            | "graphql"
+            | "h"
+            | "hcl"
+            | "hh"
+            | "hpp"
+            | "hs"
+            | "html"
+            | "hxx"
+            | "ini"
+            | "java"
+            | "js"
+            | "json"
+            | "jsx"
+            | "kt"
+            | "kts"
+            | "lua"
+            | "md"
+            | "mdx"
+            | "mjs"
+            | "ml"
+            | "mts"
+            | "php"
+            | "proto"
+            | "py"
+            | "pyi"
+            | "rb"
+            | "rs"
+            | "scala"
+            | "scss"
+            | "sh"
+            | "sql"
+            | "svelte"
+            | "swift"
+            | "tf"
+            | "toml"
+            | "ts"
+            | "tsx"
+            | "txt"
+            | "vue"
+            | "xml"
+            | "yaml"
+            | "yml"
+            | "zig"
+            | "zsh"
+    )
+}
+
+/// The query with generic argument lists lifted out and member operators
+/// written as dots, and the argument lists it lifted.
+///
+/// `Vec<T>::push`, `HashMap<K, V>::insert` and `Foo::<T>::bar` name a method on
+/// a type, and the angle brackets otherwise split the path into separate words
+/// that each read as a plain name. The arguments are names too: `Vec<Token>`
+/// and `Option<Config>` ask for `Token` and `Config` as much as for the type
+/// around them, so each lifted list comes back for [`spell_query_names`] to
+/// read as words. An angle bracket opens a generic list only when it follows
+/// an identifier or `::` and closes on the same line, so a comparison written
+/// in prose (`a < b`) is left alone. `obj->method` and `Class#method` are
+/// member paths in C, C++, PHP and Ruby.
+fn normalize_query_paths(query: &str) -> (String, Vec<String>) {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::with_capacity(query.len());
+    let mut arguments = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        let previous = index.checked_sub(1).map(|at| chars[at]);
+        let follows_name =
+            previous.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+        if current == '<' && follows_name {
+            let mut depth = 0usize;
+            let mut close = None;
+            for (at, &c) in chars.iter().enumerate().skip(index) {
+                match c {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(at);
+                            break;
+                        }
+                    }
+                    '\n' => break,
+                    _ => {}
+                }
+            }
+            if let Some(close) = close {
+                arguments.push(chars[index + 1..close].iter().collect());
+                // A turbofish carries its own `::`: `Foo::<T>::bar` is `Foo::bar`.
+                let turbofish_continues =
+                    chars.get(close + 1) == Some(&':') && chars.get(close + 2) == Some(&':');
+                if out.ends_with("::") && turbofish_continues {
+                    out.truncate(out.len() - 2);
+                }
+                index = close + 1;
+                continue;
+            }
+        }
+        if current == '-' && chars.get(index + 1) == Some(&'>') {
+            out.push('.');
+            index += 2;
+            continue;
+        }
+        let names_a_member = chars
+            .get(index + 1)
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_');
+        if current == '#' && follows_name && names_a_member {
+            out.push('.');
+            index += 1;
+            continue;
+        }
+        out.push(current);
+        index += 1;
+    }
+    (out, arguments)
+}
+
+/// One name a query spells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SpelledName {
+    /// A word or identifier standing alone.
+    Word(String),
+    /// A qualified path: the segment its leaf hangs off, and the leaf.
+    Path {
+        /// The path as written, generic arguments removed.
+        text: String,
+        /// Written with `::`, which a receiver expression never is.
+        scoped: bool,
+        /// The segment the leaf hangs off: `search` in `crate::search::quote`.
+        qualifier: String,
+        /// The last segment: the name the path spells.
+        leaf: String,
+    },
+    /// A dotted run ending in a source or document extension (`locate.rs`).
+    File(String),
+}
+
+impl SpelledName {
+    /// Whether this counts toward [`LOCATE_NAME_QUERY_MAX_UNITS`]: a path or
+    /// a file name always, a word unless it spells no name
+    /// ([`word_counts_as_a_name`]).
+    fn counts_as_a_name(&self) -> bool {
+        match self {
+            Self::Word(word) => word_counts_as_a_name(word),
+            Self::Path { .. } | Self::File(_) => true,
+        }
+    }
+
+    /// Whether this is a word saying what kind of code is wanted
+    /// ([`is_code_kind_word`]).
+    fn is_code_kind_word(&self) -> bool {
+        matches!(self, Self::Word(word) if is_code_kind_word(&word.to_ascii_lowercase()))
+    }
+}
+
+/// Every name a query spells ([`SpelledName`]): the runs in order, then the
+/// words of the generic arguments the paths carried.
+///
+/// Runs split on exactly the characters [`query_qualified_paths`] splits on,
+/// after [`normalize_query_paths`], and a run without a separator yields its
+/// [`query_tokens`] as words.
+fn spell_query_names(query: &str) -> Vec<SpelledName> {
+    let (normalized, arguments) = normalize_query_paths(query);
+    let mut names = Vec::new();
+    for run in
+        normalized.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':'))
+    {
+        let run = run.trim_matches(|c| c == '.' || c == ':');
+        if run.is_empty() {
+            continue;
+        }
+        let segments: Vec<&str> = run
+            .split(['.', ':'])
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let pathlike = run.contains('.') || run.contains("::");
+        if !pathlike || segments.len() < 2 {
+            names.extend(query_tokens(run).map(|token| SpelledName::Word(token.to_string())));
+            continue;
+        }
+        let leaf = segments[segments.len() - 1];
+        let scoped = run.contains("::");
+        if !scoped && is_source_file_extension(&leaf.to_ascii_lowercase()) {
+            names.push(SpelledName::File(run.to_string()));
+            continue;
+        }
+        names.push(SpelledName::Path {
+            text: run.to_string(),
+            scoped,
+            qualifier: segments[segments.len() - 2].to_string(),
+            leaf: leaf.to_string(),
+        });
+    }
+    for argument in &arguments {
+        names.extend(query_tokens(argument).map(|token| SpelledName::Word(token.to_string())));
+    }
+    names
+}
+
+/// Whether a spelled word counts toward [`LOCATE_NAME_QUERY_MAX_UNITS`].
+fn word_counts_as_a_name(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    lower.len() > 1
+        && !is_english_stopword(&lower)
+        && !is_descriptive_filler_word(&lower)
+        && !is_code_kind_word(&lower)
+}
+
+/// What a qualifier is, which decides what the path's leaf names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualifierRole {
+    /// The enclosing instance (`self`, `this`): the leaf is one of its members.
+    Receiver,
+    /// A type the graph stores: the path names that type's own member.
+    Type,
+    /// A trait or interface the graph stores: an implementor's member answers.
+    Trait,
+    /// A package, module or namespace the graph stores, or a directory or file
+    /// named like the qualifier: a free declaration filed in it answers.
+    Package,
+    /// Nothing stored under that name, and the graph holds a member named by
+    /// the leaf: the qualifier is a value, an alias or an external type, and
+    /// the path names that member. `c.Query` asks for `Client.Query`.
+    Value,
+    /// Nothing stored under that name, and nothing named by the leaf but free
+    /// declarations filed elsewhere, which are then all the path can name.
+    /// `_.debounce` asks for `debounce`.
+    Unbound,
+}
+
+/// What the graph says one spelled path's qualifier is.
+#[derive(Clone, Debug, Default)]
+struct PathReading {
+    roles: Vec<QualifierRole>,
+    /// The files holding a module, package or namespace row named like the
+    /// qualifier. A free declaration in one of them is filed in that package
+    /// wherever the file sits, which is how a Go root package (`cobra.Command`
+    /// in `command.go`) and a C++ namespace (`cv::Mat` in `mat.hpp`) are read:
+    /// no directory is named for either.
+    package_files: FxHashSet<String>,
+    /// The directories of those files that are Go source. A Go package is its
+    /// directory, so every file in one is filed in the package.
+    package_dirs: FxHashSet<String>,
+}
+
+impl PathReading {
+    fn of(role: QualifierRole) -> Self {
+        Self {
+            roles: vec![role],
+            ..Self::default()
+        }
+    }
+
+    /// Whether a file is one of the package's own files or, for Go, sits in
+    /// one of its directories.
+    fn files(&self, file: Option<&str>) -> bool {
+        let Some(file) = file else {
+            return false;
+        };
+        self.package_files.contains(file)
+            || (file.ends_with(".go")
+                && self
+                    .package_dirs
+                    .contains(file.rsplit_once('/').map_or("", |(directory, _)| directory)))
+    }
+}
+
+/// What a query spells, read once, and what the graph says its qualifiers are.
+///
+/// The single place the exact-name tier decides whether a query ASKS for a
+/// symbol, as opposed to merely containing its name. [`locate_exact_name_tier`],
+/// the collision rules and the descriptive price all read it.
+pub struct NameQuery {
+    /// The query as the caller wrote it, for [`query_names_entity`].
+    query: String,
+    names: Vec<SpelledName>,
+    name_shaped: bool,
+    /// Whether the query reads as a sentence ([`query_is_prose`]). A sentence
+    /// that is a name query spells one name, and only that name asks for
+    /// anything: in "where is the parse function defined" a row named
+    /// `function` is still a word the sentence used.
+    prose: bool,
+    /// What the graph says each spelled path's qualifier is, keyed by the path
+    /// as spelled. Empty until [`NameQuery::resolve_qualifiers`] runs.
+    readings: FxHashMap<String, PathReading>,
+}
+
+impl NameQuery {
+    /// Read a query without consulting the graph. A qualifier is then judged by
+    /// its shape alone: a receiver keyword, a capitalized type, or a package.
+    ///
+    /// A query that is not a sentence is a name when it spells at most
+    /// [`LOCATE_NAME_QUERY_MAX_UNITS`] names. A sentence is one only when it
+    /// spells exactly one name and a word saying what kind of code that name
+    /// is. Otherwise "Walk me through the path" would ask for `Walk` and
+    /// `path`, and "how is the config file loaded" for `config`.
+    pub fn parse(query: &str) -> Self {
+        let names = spell_query_names(query);
+        let units = names.iter().filter(|name| name.counts_as_a_name()).count();
+        let prose = query_is_prose(query);
+        let name_shaped = if prose {
+            units == 1 && names.iter().any(SpelledName::is_code_kind_word)
+        } else {
+            units <= LOCATE_NAME_QUERY_MAX_UNITS
+        };
+        Self {
+            query: query.to_string(),
+            names,
+            name_shaped,
+            prose,
+            readings: FxHashMap::default(),
+        }
+    }
+
+    /// Ask the graph what each qualified path the query spells names.
+    ///
+    /// A qualifier the graph stores a type, trait, module, package or namespace
+    /// under takes that role ([`qualifier_reading_in_graph`]), however short:
+    /// `db`, `v1` and `cv` are Go packages and a C++ namespace as often as they
+    /// are anything else. One letter is a receiver or a loop variable far more
+    /// often than a declaration and is not looked up. A qualifier with nothing
+    /// stored under it is read by what the graph stores under the path's leaf
+    /// ([`unbound_qualifier_role`]).
+    pub fn resolve_qualifiers(mut self, graph: &kin_db::InMemoryGraph) -> Result<Self> {
+        let mut qualifiers: FxHashMap<String, PathReading> = FxHashMap::default();
+        for name in &self.names {
+            let SpelledName::Path {
+                text,
+                scoped,
+                qualifier,
+                leaf,
+            } = name
+            else {
+                continue;
+            };
+            let lower = qualifier.to_ascii_lowercase();
+            if self.readings.contains_key(text)
+                || (!scoped && is_receiver_keyword(&lower))
+                || (*scoped && is_module_path_keyword(&lower))
+            {
+                continue;
+            }
+            let mut reading = match qualifiers.get(qualifier) {
+                Some(reading) => reading.clone(),
+                None => {
+                    let reading = if qualifier.len() < 2 {
+                        PathReading::default()
+                    } else {
+                        qualifier_reading_in_graph(graph, qualifier)?
+                    };
+                    qualifiers.insert(qualifier.clone(), reading.clone());
+                    reading
+                }
+            };
+            if reading.roles.is_empty() {
+                reading
+                    .roles
+                    .push(unbound_qualifier_role(graph, qualifier, leaf)?);
+            }
+            self.readings.insert(text.clone(), reading);
+        }
+        Ok(self)
+    }
+
+    /// Whether the query is a name rather than a description
+    /// ([`LOCATE_NAME_QUERY_MAX_UNITS`], [`NameQuery::parse`]).
+    pub fn is_name_shaped(&self) -> bool {
+        self.name_shaped
+    }
+
+    /// Whether the query asks for this symbol, as a caller would mean it.
+    ///
+    /// A word names the entity or the tail of its qualified name, and asks for
+    /// it when the query is a name or the word is identifier-shaped; in a
+    /// sentence only the one name it spells asks. A path asks for the entity
+    /// its owner agrees with ([`qualified_path_names_entity`]), and otherwise
+    /// reads its leaf through the qualifier's role: a receiver's or a value's
+    /// member, an implementor's member for a trait, a free declaration filed in
+    /// the package, or, when the graph holds nothing else the leaf could name,
+    /// a free declaration anywhere. Member readings and that last one apply only
+    /// to a name query, where the path is the whole question. An
+    /// identifier-shaped leaf also names the free symbol of that exact name,
+    /// whatever its qualifier, unless the qualifier is a receiver. A file name
+    /// asks for what is declared in that file. Everything a qualifier spells
+    /// names nothing.
+    ///
+    /// `file` is the entity's file. Without it, package and file readings
+    /// cannot confirm anything and do not.
+    pub fn asks_for(&self, name: &str, file: Option<&str>) -> bool {
+        self.names_entity(name, file, self.name_shaped)
+    }
+
+    /// [`NameQuery::asks_for`] with plain words left out: what a description
+    /// can ask for, through identifier-shaped words, paths and file names.
+    pub fn names_symbolically(&self, name: &str, file: Option<&str>) -> bool {
+        self.names_entity(name, file, false)
+    }
+
+    /// Whether the query contains this entity's name without asking for it,
+    /// which withholds the exact-name tier. Only ever withholds on evidence: a
+    /// query with no token naming the entity at all leaves the match kind's
+    /// answer standing, which is the fused arm's empty-query fallback and
+    /// every caller whose match kind was computed against other text.
+    pub fn withholds_tier(&self, name: &str, file: Option<&str>) -> bool {
+        query_names_entity(&self.query, name) && !self.asks_for(name, file)
+    }
+
+    fn names_entity(&self, name: &str, file: Option<&str>, name_query: bool) -> bool {
+        if name.is_empty() || !query_names_entity(&self.query, name) {
+            return false;
+        }
+        let target = name.to_ascii_lowercase();
+        let tail = qualified_name_tail(&target);
+        let member = tail.len() < target.len();
+        self.names.iter().any(|spelled| match spelled {
+            SpelledName::Word(word) => {
+                let lowered = word.to_ascii_lowercase();
+                let asks = name_query && (!self.prose || word_counts_as_a_name(word));
+                (lowered == target || lowered == tail) && (asks || token_is_identifier_shaped(word))
+            }
+            SpelledName::File(text) => {
+                let lowered = text.to_ascii_lowercase();
+                lowered == target
+                    || qualified_path_names_entity(&lowered, &target)
+                    || file.is_some_and(|file| {
+                        file.rsplit('/')
+                            .next()
+                            .is_some_and(|base| base.eq_ignore_ascii_case(text))
+                    })
+            }
+            SpelledName::Path {
+                text,
+                scoped,
+                qualifier,
+                leaf,
+            } => {
+                let lowered = text.to_ascii_lowercase();
+                if lowered == target || qualified_path_names_entity(&lowered, &target) {
+                    return true;
+                }
+                let leaf_lower = leaf.to_ascii_lowercase();
+                let names_free = !member && target == leaf_lower;
+                let names_member = member && tail == leaf_lower;
+                if !names_free && !names_member {
+                    return false;
+                }
+                let lower = qualifier.to_ascii_lowercase();
+                let by_shape;
+                let reading = if !scoped && is_receiver_keyword(&lower) {
+                    by_shape = PathReading::of(QualifierRole::Receiver);
+                    &by_shape
+                } else if let Some(reading) = self.readings.get(text) {
+                    reading
+                } else if qualifier.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    by_shape = PathReading::of(QualifierRole::Type);
+                    &by_shape
+                } else {
+                    by_shape = PathReading::of(QualifierRole::Package);
+                    &by_shape
+                };
+                if reading.roles.contains(&QualifierRole::Receiver) {
+                    return names_member && name_query;
+                }
+                if names_free && token_is_identifier_shaped(leaf) {
+                    return true;
+                }
+                let module_head = *scoped && is_module_path_keyword(&lower);
+                reading.roles.iter().any(|role| match role {
+                    QualifierRole::Package => {
+                        names_free
+                            && (module_head
+                                || file_is_filed_under(file, qualifier)
+                                || reading.files(file))
+                    }
+                    QualifierRole::Trait | QualifierRole::Value => names_member && name_query,
+                    QualifierRole::Unbound => names_free && name_query,
+                    QualifierRole::Type | QualifierRole::Receiver => false,
+                })
+            }
+        })
+    }
+}
+
+/// Whether a file sits in a directory, or is a file, named like the qualifier:
+/// `pkg/search/query.go` is filed under `search`, and so is `src/search.rs`.
+/// Hyphens and underscores are one character here, as crate directories and
+/// Rust paths spell them differently: `crates/kin-model/src/entity.rs` is filed
+/// under `kin_model`.
+fn file_is_filed_under(file: Option<&str>, qualifier: &str) -> bool {
+    let Some(file) = file else {
+        return false;
+    };
+    let wanted = qualifier.to_ascii_lowercase().replace('-', "_");
+    let mut parts: Vec<&str> = file.split('/').collect();
+    let base = parts.pop().unwrap_or("");
+    let stem = base.split('.').next().unwrap_or(base);
+    parts
+        .into_iter()
+        .chain(std::iter::once(stem))
+        .any(|part| part.to_ascii_lowercase().replace('-', "_") == wanted)
+}
+
+/// What the graph stores under a qualifier's name: the roles of the types,
+/// traits, modules, packages and namespaces whose name, or whose qualified
+/// name's tail, is exactly the qualifier, and the files that declare a package
+/// by that name. The exact spelling is tried first and a case-insensitive
+/// match only when nothing is stored under it, since a caller writing
+/// `client.Query` usually means an instance of `Client`. A function or a field
+/// named like the qualifier says nothing about what the path names.
+///
+/// Looked up by suffix, which the name index answers with the stored names
+/// ending in the qualifier. Every name this can accept ends in it, and the
+/// suffix scan never falls back to every name that merely contains a short
+/// qualifier like `db` or `v1`.
+fn qualifier_reading_in_graph(
+    graph: &kin_db::InMemoryGraph,
+    qualifier: &str,
+) -> Result<PathReading> {
+    let filter = EntityFilter {
+        name_pattern: Some(format!("*{}", qualifier.to_ascii_lowercase())),
+        kinds: Some(vec![
+            EntityKind::TraitDef,
+            EntityKind::Interface,
+            EntityKind::Class,
+            EntityKind::EnumDef,
+            EntityKind::TypeAlias,
+            EntityKind::Module,
+            EntityKind::Package,
+            EntityKind::File,
+        ]),
+        ..Default::default()
+    };
+    let candidates = graph.query_entities(&filter)?;
+    let role_of = |kind: EntityKind| match kind {
+        EntityKind::TraitDef | EntityKind::Interface => Some(QualifierRole::Trait),
+        EntityKind::Class | EntityKind::EnumDef | EntityKind::TypeAlias => {
+            Some(QualifierRole::Type)
+        }
+        EntityKind::Module | EntityKind::Package | EntityKind::File => Some(QualifierRole::Package),
+        _ => None,
+    };
+    let read = |same: &dyn Fn(&str) -> bool| {
+        let mut reading = PathReading::default();
+        for entity in &candidates {
+            if !(same(&entity.name) || same(qualified_name_tail(&entity.name))) {
+                continue;
+            }
+            let Some(role) = role_of(entity.kind) else {
+                continue;
+            };
+            if !reading.roles.contains(&role) {
+                reading.roles.push(role);
+            }
+            if role != QualifierRole::Package {
+                continue;
+            }
+            if let Some(file) = entity.file_origin.as_ref().map(|file| file.0.as_str()) {
+                if file.ends_with(".go") {
+                    let directory = file.rsplit_once('/').map_or("", |(directory, _)| directory);
+                    reading.package_dirs.insert(directory.to_string());
+                }
+                reading.package_files.insert(file.to_string());
+            }
+        }
+        reading
+    };
+    let reading = read(&|name: &str| name == qualifier);
+    if !reading.roles.is_empty() {
+        return Ok(reading);
+    }
+    Ok(read(&|name: &str| name.eq_ignore_ascii_case(qualifier)))
+}
+
+/// What a path names when the graph stores nothing under its qualifier, read
+/// from what the graph stores under the path's leaf.
+///
+/// A free declaration named by the leaf and filed under the qualifier, in a
+/// directory or file named like it, makes the qualifier its package. That is
+/// a Rust crate (`kin_model::Entity`, whose crate root is stored as `crate`)
+/// or any package no module row names, and a member that shares the leaf does
+/// not take the tier from the declaration the path spells. Otherwise a member
+/// named by the leaf makes the qualifier a value, a receiver or an external
+/// type, whose member the path names ([`QualifierRole::Value`]): `c.Query`
+/// asks for `Client.Query` and not for a free `Query` filed elsewhere. With
+/// neither, a free declaration elsewhere is all the leaf can name
+/// ([`QualifierRole::Unbound`]).
+fn unbound_qualifier_role(
+    graph: &kin_db::InMemoryGraph,
+    qualifier: &str,
+    leaf: &str,
+) -> Result<QualifierRole> {
+    let wanted = leaf.to_ascii_lowercase();
+    if wanted.len() < 2 {
+        return Ok(QualifierRole::Value);
+    }
+    let filter = EntityFilter {
+        name_pattern: Some(format!("*{wanted}")),
+        ..Default::default()
+    };
+    let mut member = false;
+    for entity in graph.query_entities(&filter)? {
+        if entity.role == EntityRole::Docs {
+            continue;
+        }
+        let name = entity.name.to_ascii_lowercase();
+        let tail = qualified_name_tail(&name);
+        if tail != wanted {
+            continue;
+        }
+        if tail.len() < name.len() {
+            member = true;
+        } else if file_is_filed_under(
+            entity.file_origin.as_ref().map(|file| file.0.as_str()),
+            qualifier,
+        ) {
+            return Ok(QualifierRole::Package);
+        }
+    }
+    Ok(if member {
+        QualifierRole::Value
+    } else {
+        QualifierRole::Unbound
+    })
+}
+
+/// Whether a query is short enough to be a name rather than a description
+/// ([`LOCATE_NAME_QUERY_MAX_UNITS`]).
+pub fn query_is_name_shaped(query: &str) -> bool {
+    NameQuery::parse(query).is_name_shaped()
+}
+
 /// A prose query carries at least this many tokens.
 ///
 /// Three is the longest symbol path [`query_tokens`] routinely produces
 /// (`crate::Type::method`), so the floor sits one above it. Below the floor the
-/// tier is left exactly as it shipped, which is the conservative direction:
-/// this rule can only ever DEMOTE, and a short query a human meant as a lookup
-/// has to keep the guarantee the tier was built for.
+/// file-anchor admission, the lift budget and the prose-collision rules
+/// ([`is_prose_word_collision`]) treat the query as a lookup. The exact-name
+/// tier does not read this floor: it reads [`NameQuery`], which asks the
+/// narrower question of whether the query is short enough to be a name at all.
 const LOCATE_PROSE_MIN_TOKENS: usize = 4;
 
 /// A prose query carries at least this many stopwords.
@@ -686,10 +1508,12 @@ const LOCATE_PROSE_MIN_STOPWORDS: usize = 2;
 
 /// Whether this query reads as a SENTENCE rather than a symbol lookup.
 ///
-/// The distinction the exact-name tier never drew. `walk` typed alone is a
-/// request for the symbol `walk`; "Walk me through the path" is not, and the
-/// tier cannot tell them apart because all it ever sees is that some token
-/// equalled some name.
+/// `walk` typed alone is a request for the symbol `walk`; "Walk me through the
+/// path" is not. The file-anchor admission, the lift budget, the corroboration
+/// penalty and the entity-surface exemption read this rule. The exact-name tier
+/// used to read it too, and a keyword description with one connective
+/// ("formatting search keywords, quoting search terms for search query") passed
+/// as a lookup under it, so the tier now reads [`NameQuery`] instead.
 ///
 /// Two signals, both required, both chosen so the rule fires only on an
 /// unmistakable sentence: enough tokens to BE a sentence
@@ -722,29 +1546,21 @@ pub fn query_is_prose(query: &str) -> bool {
 ///
 /// The refinement of [`query_names_entity`] the prose rule needs: not "did some
 /// token name it" but "did a token that LOOKS LIKE A SYMBOL name it".
-/// [`is_symbolic_search_term`] reads the original-case token, so
-/// `redisReaderGetReply` and `Cross_Encoder_Model_Cached` are symbolic while
-/// `send`, `socket`, `component` and `walk` are not.
+/// [`token_is_identifier_shaped`] reads the original-case token, so
+/// `redisReaderGetReply`, `formatKeywords` and `Cross_Encoder_Model_Cached` are
+/// symbolic while `send`, `socket`, `component` and `walk` are not.
+///
+/// Paths are read whole ([`NameQuery::names_symbolically`]): a qualifier names
+/// nothing, so `InMemoryGraph::prune_orphaned_vectors` names the method and not
+/// the `InMemoryGraph` type it hangs off. Read here without the graph and
+/// without the entity's file, so a qualifier is judged by its shape alone.
 ///
 /// Strictly stronger than [`query_names_entity`]: every pair this accepts, that
 /// one accepts too. `the_symbolic_name_rule_never_claims_a_name_the_base_rule_denies`
 /// pins that, because two predicates reading one tokenizer are two things that
 /// can drift apart.
-fn query_names_entity_symbolically(query: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let target = name.to_ascii_lowercase();
-    let tail = qualified_name_tail(&target);
-    let named_by_token = query_tokens(query).any(|token| {
-        let lowered = token.to_ascii_lowercase();
-        (lowered == target || lowered == tail) && is_symbolic_search_term(token)
-    });
-    named_by_token
-        || query_qualified_paths(query).any(|path| {
-            let lowered = path.to_ascii_lowercase();
-            lowered == target || qualified_path_names_entity(&lowered, &target)
-        })
+pub fn query_names_entity_symbolically(query: &str, name: &str) -> bool {
+    NameQuery::parse(query).names_symbolically(name, None)
 }
 
 /// Whether a qualified path a query spelled out names THIS entity, rather than
@@ -812,7 +1628,7 @@ fn qualified_path_names_entity(path: &str, entity_name: &str) -> bool {
 /// the other half is that the run has to name the entity by its qualifier as
 /// well as its tail, or one dotted token in a sentence spares every entity that
 /// shares a word with it.
-fn query_qualified_paths(query: &str) -> impl Iterator<Item = &str> {
+pub fn query_qualified_paths(query: &str) -> impl Iterator<Item = &str> {
     query
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':'))
         .map(|run| run.trim_matches(|c| c == '.' || c == ':'))
@@ -831,36 +1647,71 @@ fn query_qualified_paths(query: &str) -> impl Iterator<Item = &str> {
 /// design, so a 16x score deficit still won, and the query never asked for
 /// either macro.
 ///
-/// Only ever demotes, and only when BOTH halves hold: the query is a sentence,
-/// and no symbol-shaped token in it named this entity. A prose question that
-/// does name a real symbol ("how does redisReaderGetReply handle a partial
-/// reply") keeps its name tier, and every lookup keeps it unconditionally,
-/// which is the case the tier was built for and the one that must not regress.
+/// Only ever demotes, and only when BOTH halves hold: the query is a sentence
+/// ([`query_is_prose`]), and it does not ask for this entity
+/// ([`NameQuery::asks_for`]). A prose question that does name a real symbol
+/// ("how does redisReaderGetReply handle a partial reply") keeps its name tier,
+/// and every lookup keeps it, which is the case the tier was built for and the
+/// one that must not regress.
 ///
-/// It cannot separate "the walk function" from "walk me through", and does not
-/// try. It resolves that ambiguity toward the prose reading, because prose is
-/// what the caller typed and prose is the reading that was broken.
+/// This is the prose scope the corroboration penalty and the entity-surface
+/// exemption were measured on, and they read it and nothing wider. The
+/// exact-name tier and the descriptive price read the wider description rule,
+/// [`NameQuery::withholds_tier`], which also covers a keyword description with
+/// one connective: "formatting search keywords, quoting search terms for
+/// search query" is not prose by this rule and is not a name either.
+///
+/// It separates "where is the walk function defined" from "walk me through the
+/// path" by one thing only, the word that says what kind of code is wanted: a
+/// sentence spelling one name beside such a word asks for that name
+/// ([`NameQuery::parse`]). Every other sentence resolves the ambiguity toward
+/// the prose reading, because prose is what the caller typed and prose is the
+/// reading that was broken.
 ///
 /// This is an ORDERING judgment and it changes no reported fact.
 /// [`classify_locate_match`] still calls the hit a name match, because the query
 /// still contained the name, and `match_evidence.name_match` and the cosine
-/// arm's own classifier keep agreeing with it. Public because
-/// `all_fallback` applies the same judgment at its own predicates, and one
-/// definition of "prose collision" is the point.
+/// arm's own classifier keep agreeing with it. The ranking reads it through
+/// [`row_is_prose_collision`], which adds the graph's reading of the query's
+/// qualifiers and the row's own file; this is the rule on the text alone.
 ///
 /// Split from [`name_match_is_prose_word_collision`] so the rule is testable
 /// without touching process environment: the tests pin THIS, and the wrapper
 /// adds only the kill switch.
 pub fn is_prose_word_collision(query: &str, name: &str) -> bool {
-    query_is_prose(query) && !query_names_entity_symbolically(query, name)
+    query_is_prose(query) && !NameQuery::parse(query).asks_for(name, None)
+}
+
+/// [`is_prose_word_collision`] for one ranked row, with the graph's reading of
+/// the query's qualifiers and the row's own file.
+fn row_is_prose_collision(entity: &LocateEntity, name_query: &NameQuery) -> bool {
+    entity.match_kind == Some(LocateMatchKind::Name)
+        && name_query.prose
+        && name_query.withholds_tier(&entity.name, entity.provenance.file.as_deref())
+}
+
+/// Whether a ranked row is a name match on a word a description merely used:
+/// the query is not a name ([`NameQuery::is_name_shaped`]) and does not ask for
+/// the row ([`NameQuery::withholds_tier`]). Such a row loses the exact-name
+/// tier and is priced by its evidence ([`apply_descriptive_evidence`]).
+fn row_is_descriptive_collision(entity: &LocateEntity, name_query: &NameQuery) -> bool {
+    entity.match_kind == Some(LocateMatchKind::Name)
+        && !name_query.is_name_shaped()
+        && name_query.withholds_tier(&entity.name, entity.provenance.file.as_deref())
 }
 
 /// [`is_prose_word_collision`] under the kill switch.
 ///
-/// `KIN_LOCATE_PROSE_NAME_DEMOTION=0` restores shipped ordering exactly, so one
-/// binary can run both arms of a ranking benchmark. The knob exists because a
-/// tier change moves every ranked result, and an A/B that has to compare two
-/// builds cannot tell a ranking change from a build difference.
+/// `KIN_LOCATE_PROSE_NAME_DEMOTION=0` turns the name-tier gate off: every name
+/// match takes the exact-name tier again and keeps its entity-surface
+/// exemption, so one binary can run both arms of a ranking benchmark. It does
+/// not undo the rest of the ranking changes around the gate, and no single
+/// switch does. The descriptive price (`KIN_LOCATE_DESCRIPTIVE_EVIDENCE`), the
+/// package fold (`KIN_LOCATE_COLLAPSE_PACKAGE_MODULES`) and the qualified-path
+/// search terms (`KIN_LOCATE_QUALIFIED_PATH_TERMS`) each have their own. The
+/// knob exists because a tier change moves every ranked result, and an A/B that
+/// has to compare two builds cannot tell a ranking change from a build
+/// difference.
 pub fn name_match_is_prose_word_collision(query: &str, name: &str) -> bool {
     locate_env_bool("KIN_LOCATE_PROSE_NAME_DEMOTION", true) && is_prose_word_collision(query, name)
 }
@@ -868,10 +1719,11 @@ pub fn name_match_is_prose_word_collision(query: &str, name: &str) -> bool {
 /// Whether a locate query reads as a symbol LOOKUP rather than a question.
 ///
 /// The negation of [`query_is_prose`], stated once so the file-anchor admission
-/// and the exact-name tier read the SAME rule about the same query. A lookup is
+/// and the lift budget read the SAME rule about the same query. A lookup is
 /// short or carries no English scaffolding: under four tokens, which is the
 /// longest symbol path the tokenizer routinely produces (`crate::Type::method`),
-/// or fewer than two stopwords, which a question essentially never is.
+/// or fewer than two stopwords, which a question essentially never is. The
+/// exact-name tier reads [`NameQuery`] instead.
 ///
 /// This is why the twelve control lookups the ranking lane pinned stay
 /// byte-identical with anchors on: every one of them is refused here.
@@ -933,19 +1785,42 @@ fn classify_locate_match(
 /// on queries that name nothing; a tier fixes it at every corpus scale and
 /// leaves scores meaningful within each tier.
 /// FIR-3079 gates the tier here, and ONLY here. A name hit whose name is a
-/// plain English word inside a sentence keeps `match_kind: name`, because the
-/// query did literally contain it, and simply loses the promotion, so it sorts
-/// on score beside everything else. Measured on a fully embedded hiredis store,
-/// that is what lets `redisFormatCommand` at score 300.0 outrank the Win32
-/// macro `send` at 180.0, and a row at 902.1 outrank the macro `socket` at
-/// 55.0, for questions that asked for neither macro.
+/// plain word inside a description keeps `match_kind: name`, because the
+/// query did literally contain it, and simply loses the promotion
+/// ([`NameQuery::withholds_tier`]), so it sorts on score beside everything
+/// else. Measured on a fully embedded hiredis store, that is what lets
+/// `redisFormatCommand` at score 300.0 outrank the Win32 macro `send` at 180.0,
+/// and a row at 902.1 outrank the macro `socket` at 55.0, for questions that
+/// asked for neither macro. The same gate reads a path the way a caller means
+/// it: `search::quote` asks for the `quote` filed under `search`, not for every
+/// row named `search`, and `c.Query` asks for a `Query` member such as
+/// `Client.Query`, not for a free `Query` type.
+///
+/// `KIN_LOCATE_PROSE_NAME_DEMOTION=0` restores the ungated tier, where every
+/// name hit is promoted, so one binary can run both arms of a ranking
+/// benchmark.
 ///
 /// The query is a parameter because the tier is a fact about a PAIR, the hit
 /// and the question, and it never was one about the hit alone. Callers that
 /// rank one query's results pass that query; the fused arm asks per variant.
+/// A row [`build_entity_view`] already judged carries its tier in
+/// [`LocateEntity::name_tier`], decided with the graph's reading of the
+/// query's qualifiers, and that answer is the one every later ordering reads.
+/// A row without one is judged here from the query text alone.
 fn locate_exact_name_tier(entity: &LocateEntity, query: &str) -> u8 {
+    entity
+        .name_tier
+        .unwrap_or_else(|| exact_name_tier(entity, &NameQuery::parse(query)))
+}
+
+/// [`locate_exact_name_tier`] against a query already read, with whatever the
+/// graph said about its qualifiers.
+fn exact_name_tier(entity: &LocateEntity, name_query: &NameQuery) -> u8 {
     match entity.match_kind {
-        Some(LocateMatchKind::Name) if !name_match_is_prose_word_collision(query, &entity.name) => {
+        Some(LocateMatchKind::Name)
+            if !locate_env_bool("KIN_LOCATE_PROSE_NAME_DEMOTION", true)
+                || !name_query.withholds_tier(&entity.name, entity.provenance.file.as_deref()) =>
+        {
             1
         }
         _ => 0,
@@ -1028,6 +1903,23 @@ pub struct LocateEntity {
     /// Empty (and omitted) for a single-query locate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_queries: Vec<String>,
+    /// How many more module rows of this row's package the ranking folded into
+    /// it, at least ([`collapse_package_module_rows`]: the fused arm keeps the
+    /// larger of two counts rather than risk counting a file twice). A Go
+    /// package declares itself once per file, so each file contributes a module
+    /// row with the package's name, and a word the package is named after
+    /// brought every one of them onto the page. Zero, and omitted, on every row
+    /// that folded nothing.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub collapsed_rows: usize,
+    /// The exact-name tier [`build_entity_view`] decided for this row, with the
+    /// graph's reading of the query's qualifiers. Carried so the fused arm
+    /// orders a variant's rows exactly as that variant's own ranking did, and
+    /// never serialized: it is a fact about one query, not about the entity.
+    /// `None` on a row built anywhere else, which is then judged from the
+    /// query text alone ([`locate_exact_name_tier`]).
+    #[serde(skip)]
+    pub name_tier: Option<u8>,
 }
 
 impl LocateEntity {
@@ -2226,6 +3118,39 @@ pub fn local_semantic_coverage(
     coverage_from_status(&effective.status, effective.index_attached)
 }
 
+/// What a caller can do about a text index that refuses reads.
+const TEXT_INDEX_UNAVAILABLE_REMEDIATION: &str =
+    "retry the query: the next read maps the index's image again once its files are readable; \
+     if it stays refused, restart the repository daemon, which rebuilds the text index from the \
+     graph when it opens the store";
+
+/// Record a text read a locate stage could not make, rather than drop it.
+///
+/// Four stages read the lexical index for optional evidence, and three weight
+/// terms by its document frequency, and each carried on without it on any error
+/// while recording nothing, so a query that lost its lexical evidence or its
+/// term rarity answered as if complete. Each stage names itself here; the
+/// ledger keeps one entry per component and reason, so the first refusal is
+/// the one whose detail survives.
+fn record_text_read_refused(
+    sink: &mut Vec<RetrievalDegradation>,
+    stage: &str,
+    error: &dyn std::fmt::Display,
+) {
+    record_degradation(
+        sink,
+        RetrievalDegradation {
+            component: "text_index".to_string(),
+            reason: "refused".to_string(),
+            detail: format!(
+                "the derived text index refused a read in {stage}, so that stage ran without it: \
+                 {error}"
+            ),
+            remediation: TEXT_INDEX_UNAVAILABLE_REMEDIATION.to_string(),
+        },
+    );
+}
+
 /// Push a degradation once per (component, reason); repeated hits within one
 /// query add no new information and would bloat the payload.
 pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: RetrievalDegradation) {
@@ -2301,6 +3226,27 @@ pub(crate) fn ensure_lexical_index_queryable(
                 remediation: "restart the repository daemon, which rebuilds the text index from \
                               the graph when it opens the store"
                     .to_string(),
+            },
+        );
+        return;
+    }
+    // Before the document count, because an index whose committed image is
+    // on disk but not mapped still counts that image's documents while every
+    // read of them refuses. The count check below cannot see that state, and
+    // the stages that swallow a refused read used to be the only readers that
+    // met it, so the answer carried no gap at all. The flush above has already
+    // tried to map the image back, and this asks once more.
+    if let Some(reason) = graph.text_index_unavailable() {
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "text_index".to_string(),
+                reason: "unavailable".to_string(),
+                detail: format!(
+                    "{reason}; lexical evidence and term rarity were unavailable to this query \
+                     when it started"
+                ),
+                remediation: TEXT_INDEX_UNAVAILABLE_REMEDIATION.to_string(),
             },
         );
         return;
@@ -3318,7 +4264,7 @@ fn run_with_graph_capture_budgeted(
         || text_lower.contains("multiline");
 
     // Extract priority files (explicit file paths mentioned in the text)
-    let mut priority_traces = extract_priority_file_traces(text, graph);
+    let mut priority_traces = extract_priority_file_traces(text, graph, &mut degradations);
     // Remove vendored/dependency paths from priority traces before scoring
     priority_traces.retain(|path, _| !is_vendored_path(path));
     let mut priority_files = priority_trace_to_scores(&priority_traces);
@@ -3355,7 +4301,7 @@ fn run_with_graph_capture_budgeted(
         (HashMap::new(), HashMap::new())
     } else {
         let phase_start = std::time::Instant::now();
-        let search = extract_search_signals(text, graph, test_query)?;
+        let search = extract_search_signals(text, graph, test_query, &mut degradations)?;
         let embedding = if budget.phase_remaining("entity_discovery") < 2.0 {
             tracing::info!(
                 "skipping embedding sub-phase: entity_discovery budget nearly exhausted"
@@ -3413,7 +4359,8 @@ fn run_with_graph_capture_budgeted(
     // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
     let tests = extract_test_signals(text, graph)?;
-    let private_access_tests = extract_cpp_private_access_test_seed_signals(text, graph)?;
+    let private_access_tests =
+        extract_cpp_private_access_test_seed_signals(text, graph, &mut degradations)?;
     let snippets = extract_snippet_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
@@ -3638,7 +4585,7 @@ fn run_with_graph_capture_budgeted(
     // file even when nothing else already resolved it. See
     // `top_lexical_tail_match` for why this needs its own pass rather than
     // widening the exact-name tier `priority_files` already carries.
-    fold_lexical_tail_match_into_priority_hits(&mut priority_hits, text, graph);
+    fold_lexical_tail_match_into_priority_hits(&mut priority_hits, text, graph, &mut degradations);
 
     // Phase 2b: Multihop expansion from resolved files (graph follow-up)
     let multihop = if fast_entity_dominant || budget.phase_should_skip("multihop") {
@@ -4121,10 +5068,12 @@ fn run_with_graph_capture_budgeted(
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // An explain line, not a ranking input, but it must not
+                    // print a refused read as zero hits either.
                     let text_hits = graph
                         .text_search(&identifier, 12)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
+                        .map(|v| v.len().to_string())
+                        .unwrap_or_else(|_| "refused".to_string());
                     format!("name_hits={hits} text_hits={text_hits} sample={roles:?}")
                 };
                 verdicts.push(format!(
@@ -5168,7 +6117,7 @@ fn run_with_graph_capture_budgeted(
         "KIN_LOCATE_LEXICAL_FLOOR_READMIT",
         quality.lexical_floor_readmit_default(),
     ) {
-        apply_lexical_parity_floor(&mut fused, graph, text);
+        apply_lexical_parity_floor(&mut fused, graph, text, &mut degradations);
         if explain {
             record_debug_stage(
                 &mut score_breakdown,
@@ -5992,8 +6941,7 @@ fn admit_text_matched_artifacts(
                     admittable.len(),
                     limit
                 ),
-                remediation: "raise KIN_LOCATE_ARTIFACT_ADMIT_LIMIT, or read a specific file with \
-                              kin_artifact_read"
+                remediation: "narrow the query to a semantic entity; unparsed content requires conversion coverage"
                     .to_string(),
             },
         );
@@ -6034,7 +6982,7 @@ fn record_artifact_absence(
                 "{tracked} tracked artifacts were searched and none of them carries this query's \
                  text"
             ),
-            remediation: "list them with kin_artifact_list, or read one with kin_artifact_read"
+            remediation: "select a semantic entity by name or report missing conversion coverage"
                 .to_string(),
         },
     );
@@ -6490,7 +7438,11 @@ pub fn discover_historical_test_artifact_priority_files(
 /// genuine full-name match and only ever contributes at most one file. It
 /// names no file: which one wins is decided entirely by the query and the
 /// graph it runs against.
-fn top_lexical_tail_match(text: &str, graph: &kin_db::InMemoryGraph) -> Option<(String, f32)> {
+fn top_lexical_tail_match(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+    degradations: &mut Vec<RetrievalDegradation>,
+) -> Option<(String, f32)> {
     // Half the exact-name tier's own title-term base (`base = if is_title {
     // 50.0 } else { 30.0 }` below). A tail match is weaker evidence than a
     // full-name match, so at the same term-discrimination weight it can
@@ -6520,7 +7472,13 @@ fn top_lexical_tail_match(text: &str, graph: &kin_db::InMemoryGraph) -> Option<(
         if matched.is_empty() {
             continue;
         }
-        let df = graph.text_doc_frequency(&leaf_lower);
+        let df = match graph.text_doc_frequency(&leaf_lower) {
+            Ok(df) => df,
+            Err(error) => {
+                record_text_read_refused(degradations, "tail-match weighting", &error);
+                0
+            }
+        };
         let n = graph.text_document_count();
         let weight = if df > 0 && n > 0 {
             let common = (0.02 * n as f32).max(1.0);
@@ -6584,8 +7542,9 @@ fn fold_lexical_tail_match_into_priority_hits(
     priority_hits: &mut HashMap<String, Vec<FileHit>>,
     text: &str,
     graph: &kin_db::InMemoryGraph,
+    degradations: &mut Vec<RetrievalDegradation>,
 ) {
-    if let Some((path, score)) = top_lexical_tail_match(text, graph) {
+    if let Some((path, score)) = top_lexical_tail_match(text, graph, degradations) {
         priority_hits.entry(path).or_default().push(FileHit {
             score,
             spans: vec![],
@@ -6595,12 +7554,15 @@ fn fold_lexical_tail_match_into_priority_hits(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(String, f32)> {
-    priority_trace_to_scores(&extract_priority_file_traces(text, graph))
+    // The tests this serves ask about ranking over a readable index; a
+    // refused read is asserted where it is the subject.
+    priority_trace_to_scores(&extract_priority_file_traces(text, graph, &mut Vec::new()))
 }
 
 fn extract_priority_file_traces(
     text: &str,
     graph: &kin_db::InMemoryGraph,
+    degradations: &mut Vec<RetrievalDegradation>,
 ) -> HashMap<String, PriorityFileTrace> {
     let _span =
         tracing::info_span!("locate.extract_priority_files", text_len = text.len()).entered();
@@ -6870,7 +7832,17 @@ fn extract_priority_file_traces(
                 // so hub-name words stop force-injecting their __init__/config
                 // files over the true edit sites.
                 let base = if *is_title { 50.0 } else { 30.0 };
-                let df = graph.text_doc_frequency(leaf);
+                let df = match graph.text_doc_frequency(leaf) {
+                    Ok(df) => df,
+                    Err(error) => {
+                        record_text_read_refused(
+                            degradations,
+                            "exact-name priority weighting",
+                            &error,
+                        );
+                        0
+                    }
+                };
                 let n = graph.text_document_count();
                 let score = if df > 0 && n > 0 {
                     let common_frac = locate_env_f32("KIN_LOCATE_PRIORITY_COMMON_FRAC", 0.02);
@@ -7119,7 +8091,10 @@ fn extract_priority_file_traces(
 
         let text_hits = match graph.text_search(&term_lower, tracked_text_hit_limit) {
             Ok(hits) => hits,
-            Err(_) => continue,
+            Err(error) => {
+                record_text_read_refused(degradations, "tracked-file text search", &error);
+                continue;
+            }
         };
         let mut per_term_best: HashMap<String, f32> = HashMap::new();
         for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
@@ -7365,8 +8340,18 @@ struct LexicalFileMatch {
     exact_hit: bool,
 }
 
-fn lexical_term_rarity(graph: &kin_db::InMemoryGraph, term: &str) -> f32 {
-    let df = graph.text_doc_frequency(term);
+fn lexical_term_rarity(
+    graph: &kin_db::InMemoryGraph,
+    term: &str,
+    degradations: &mut Vec<RetrievalDegradation>,
+) -> f32 {
+    let df = match graph.text_doc_frequency(term) {
+        Ok(df) => df,
+        Err(error) => {
+            record_text_read_refused(degradations, "lexical parity term rarity", &error);
+            0
+        }
+    };
     let n = graph.text_document_count();
     if df == 0 || n == 0 {
         return 1.0;
@@ -7379,6 +8364,7 @@ fn lexical_term_rarity(graph: &kin_db::InMemoryGraph, term: &str) -> f32 {
 fn lexical_parity_matches(
     graph: &kin_db::InMemoryGraph,
     terms: &[String],
+    degradations: &mut Vec<RetrievalDegradation>,
 ) -> HashMap<String, LexicalFileMatch> {
     let mut matches: HashMap<String, LexicalFileMatch> = HashMap::new();
     let quality_floor = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_QUALITY", 3.0);
@@ -7388,7 +8374,7 @@ fn lexical_parity_matches(
         .map(|term| term.to_ascii_lowercase())
         .filter(|term| term.len() >= 4 && !is_english_stopword(term))
         .map(|term| {
-            let rarity = lexical_term_rarity(graph, &term);
+            let rarity = lexical_term_rarity(graph, &term, degradations);
             (term, rarity)
         })
         .collect();
@@ -7463,8 +8449,12 @@ fn lexical_parity_matches(
 
     let text_hit_limit = locate_env_usize("KIN_LOCATE_LEXICAL_FLOOR_TEXT_HITS", 40);
     for (term, rarity) in &scored_terms {
-        let Ok(hits) = graph.text_search(term, text_hit_limit) else {
-            continue;
+        let hits = match graph.text_search(term, text_hit_limit) {
+            Ok(hits) => hits,
+            Err(error) => {
+                record_text_read_refused(degradations, "the lexical parity floor", &error);
+                continue;
+            }
         };
         let mut term_files: HashSet<String> = HashSet::new();
         for (key, _score) in hits {
@@ -7500,6 +8490,7 @@ fn apply_lexical_parity_floor(
     fused: &mut Vec<(String, f32)>,
     graph: &kin_db::InMemoryGraph,
     text: &str,
+    degradations: &mut Vec<RetrievalDegradation>,
 ) {
     let mut terms: Vec<String> = extract_loose_query_terms(text)
         .into_iter()
@@ -7514,7 +8505,7 @@ fn apply_lexical_parity_floor(
         return;
     }
 
-    let matches = lexical_parity_matches(graph, &terms);
+    let matches = lexical_parity_matches(graph, &terms, degradations);
     if matches.is_empty() {
         return;
     }
@@ -8485,6 +9476,7 @@ fn extract_search_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
     test_query: bool,
+    degradations: &mut Vec<RetrievalDegradation>,
 ) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_search_signals", text_len = text.len()).entered();
@@ -8657,8 +9649,12 @@ fn extract_search_signals(
             if term.len() < 4 {
                 continue;
             }
-            let Ok(hits) = graph.text_search(&term, body_limit) else {
-                continue;
+            let hits = match graph.text_search(&term, body_limit) {
+                Ok(hits) => hits,
+                Err(error) => {
+                    record_text_read_refused(degradations, "body-relevance seeding", &error);
+                    continue;
+                }
             };
             for (rank, (retrieval_key, _score)) in hits.into_iter().enumerate() {
                 let Some(entity) = entity_from_retrieval_key(graph, &retrieval_key)? else {
@@ -9491,13 +10487,95 @@ fn augment_terms_with_query_identifiers(
         return Ok(curated);
     }
     let limit = locate_env_usize("KIN_LOCATE_QUERY_IDENTIFIER_LIMIT", 10);
-    let mut supported = Vec::new();
+    let mut supported = qualified_path_lookup_terms(text, graph)?;
     for identifier in preserved_query_identifiers(text) {
         if term_has_graph_support(graph, &identifier, false)? {
             supported.push(identifier);
         }
     }
     Ok(merge_query_identifier_terms(supported, curated, limit))
+}
+
+/// The terms a name query spelled as a qualified path resolves through.
+///
+/// Term extraction reads a dotted or scoped path only inside backticks, so a
+/// caller who typed `Query.String` or `search::quote` bare was answered from
+/// the words alone, and both words of each are on the common-word list that
+/// curation drops once any other term survives. Measured on the GitHub CLI
+/// store: `Query.String` searched for `Query` only and never reached the
+/// method, and `search::quote` searched for `search` only, so five `search`
+/// module rows answered and `quote` was not in the ranking.
+///
+/// For a name query ([`NameQuery::is_name_shaped`]) this offers each path, read
+/// the way the exact-name tier reads it ([`spell_query_names`]: generic
+/// arguments removed, `->` and `#` as member dots), as typed when the graph
+/// stores a symbol under exactly that name, which is how Go stores a method
+/// (`Query.String`) and Rust a scoped item. Otherwise it offers the path's
+/// last segment when a symbol is stored under exactly that, which is how a
+/// language that stores a function under its bare name is reached (`quote` in
+/// Go's `search` package), and how a receiver path reaches its member
+/// (`c.Query` reaches `Client.Query`). Both are checked for an exact stored
+/// name ([`graph_stores_symbol_named`]) rather than the lexical support the
+/// other identifiers pass, because text search tokenizes `search::quote` back
+/// into the two words and would call the path supported by any file that uses
+/// both, and the name index alone accepts any stored name that merely contains
+/// the path. A descriptive query gets nothing here, so its retrieval is
+/// unchanged. `KIN_LOCATE_QUALIFIED_PATH_TERMS=0` turns this off.
+fn qualified_path_lookup_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
+    let mut terms = Vec::new();
+    let name_query = NameQuery::parse(text);
+    if !locate_env_bool("KIN_LOCATE_QUALIFIED_PATH_TERMS", true) || !name_query.is_name_shaped() {
+        return Ok(terms);
+    }
+    for spelled in &name_query.names {
+        let SpelledName::Path {
+            text: path, leaf, ..
+        } = spelled
+        else {
+            continue;
+        };
+        let segments = path.split(['.', ':']).filter(|segment| !segment.is_empty());
+        let identifier_path = segments.clone().all(|segment| {
+            segment
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        }) && (2..=3).contains(&segments.count());
+        if !identifier_path {
+            continue;
+        }
+        if graph_stores_symbol_named(graph, path)? {
+            terms.push(path.clone());
+        } else if leaf.len() > 2 && graph_stores_symbol_named(graph, leaf)? {
+            terms.push(leaf.clone());
+        }
+    }
+    Ok(terms)
+}
+
+/// Whether the graph stores a source symbol under exactly this name: the
+/// stored name, its tail, or a qualified name the path agrees with on a
+/// separator ([`qualified_path_names_entity`]). The name index answers with
+/// every stored name that contains the text, so `SubQuery.String` would
+/// otherwise vouch for `Query.String`.
+fn graph_stores_symbol_named(graph: &kin_db::InMemoryGraph, name: &str) -> Result<bool> {
+    let wanted = name.to_ascii_lowercase();
+    let filter = EntityFilter {
+        name_pattern: Some(name.to_string()),
+        ..Default::default()
+    };
+    Ok(graph.query_entities(&filter)?.iter().any(|entity| {
+        let stored = entity.name.to_ascii_lowercase();
+        let named = stored == wanted
+            || qualified_name_tail(&stored) == wanted
+            || qualified_path_names_entity(&wanted, &stored);
+        named
+            && entity.role != EntityRole::Docs
+            && entity
+                .file_origin
+                .as_ref()
+                .is_some_and(|file_origin| tracked_file_support_is_signal_bearing(&file_origin.0))
+    }))
 }
 
 /// Pure merge used by [`augment_terms_with_query_identifiers`]: prepend as many
@@ -10808,6 +11886,7 @@ fn extract_test_signals(
 fn extract_cpp_private_access_test_seed_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
+    degradations: &mut Vec<RetrievalDegradation>,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
     let _span = tracing::info_span!(
         "locate.extract_cpp_private_access_test_seed_signals",
@@ -10841,7 +11920,10 @@ fn extract_cpp_private_access_test_seed_signals(
     for term in &query_terms {
         let text_hits = match graph.text_search(term, hit_limit) {
             Ok(hits) => hits,
-            Err(_) => continue,
+            Err(error) => {
+                record_text_read_refused(degradations, "private-access test seeding", &error);
+                continue;
+            }
         };
         for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
             let Some(path) = file_path_from_retrieval_key(graph, &retrieval_key) else {
@@ -17879,6 +18961,8 @@ fn artifact_locate_entity(file: &LocateFileEntry, query: &str) -> LocateEntity {
             cosine: None,
         },
         matched_queries: Vec::new(),
+        collapsed_rows: 0,
+        name_tier: None,
     }
 }
 
@@ -17932,23 +19016,30 @@ fn entity_surface_class(name: &str, kind: &str) -> Option<&'static str> {
 /// where it is the ONLY candidate is one where nothing else is left to outrank
 /// it.
 ///
-/// Exact-name hits are exempt, which is the whole gate on "description-shaped".
-/// [`locate_exact_name_tier`] is already the single definition of "the query
-/// literally named this symbol", so a caller asking for `_dot_escape` by name
-/// gets it unpenalized and above every fused score, and the tier rather than a
-/// second predicate decides that. A description query has no token that IS an
-/// entity name, so every one of its hits lands here.
+/// Name hits are exempt, which is the whole gate on "description-shaped", so a
+/// caller asking for `_dot_escape` by name gets it unpenalized. The exemption
+/// is lost only by a prose collision ([`row_is_prose_collision`], under the
+/// same `KIN_LOCATE_PROSE_NAME_DEMOTION` switch as the tier): a name hit on an
+/// English word inside a sentence. That is the scope the exemption was measured
+/// on. A keyword description is wider than prose, and its plain-word hits lose
+/// the exact-name tier without losing this exemption, because the price they
+/// pay for it is [`apply_descriptive_evidence`] and nothing else. A description
+/// query has no token that IS an entity name, so every one of its other hits
+/// lands here.
 ///
 /// A knob outside `[0, 1)` is a no-op rather than an amplifier: this function's
 /// job is to demote, and a value above one would silently promote every private
 /// name in the store.
-fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)], query: &str) {
+fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)], name_query: &NameQuery) {
     let penalty = locate_env_f32("KIN_LOCATE_ENTITY_SURFACE_PENALTY", 0.3);
     if !(0.0..1.0).contains(&penalty) {
         return;
     }
+    let demotion = locate_env_bool("KIN_LOCATE_PROSE_NAME_DEMOTION", true);
     for (_, entity) in ranked.iter_mut() {
-        if locate_exact_name_tier(entity, query) > 0 {
+        let named = entity.match_kind == Some(LocateMatchKind::Name)
+            && !(demotion && row_is_prose_collision(entity, name_query));
+        if named {
             continue;
         }
         if entity_surface_class(&entity.name, &entity.kind).is_some() {
@@ -18059,17 +19150,17 @@ fn anchor_reference_band(ranked: &[(usize, LocateEntity)], well: f32) -> f32 {
 /// precisely because retrieval did not.
 fn apply_collision_corroboration_penalty(
     ranked: &mut [(usize, LocateEntity)],
-    query: &str,
+    name_query: &NameQuery,
     floor: f32,
     target: usize,
 ) {
     if !locate_env_bool("KIN_LOCATE_COLLISION_CORROBORATION", true) {
         return;
     }
-    let is_collision = |entity: &LocateEntity| {
-        entity.match_kind == Some(LocateMatchKind::Name)
-            && is_prose_word_collision(query, &entity.name)
-    };
+    // Prose collisions only, the scope this rule was measured on. A keyword
+    // description's plain-word hits are priced by their evidence instead
+    // ([`apply_descriptive_evidence`]).
+    let is_collision = |entity: &LocateEntity| row_is_prose_collision(entity, name_query);
     // A sibling corroborates only if the retrieval ranked it WELL, not merely
     // ranked it. Measured 2026-09-02: React's `Resolved.component` at 1052.0 has
     // two siblings from its file at ranks 109 and 110 of 136, scoring 52.4 and
@@ -18120,6 +19211,424 @@ fn apply_collision_corroboration_penalty(
         let share = (found as f32 / target as f32).min(1.0);
         entity.score *= floor + (1.0 - floor) * share;
     }
+}
+
+/// Weight of a query word found in the entity's own name, the tail of its
+/// qualified name: the strongest evidence there is that the entity is about
+/// that word.
+const EVIDENCE_NAME_WEIGHT: f32 = 1.0;
+
+/// Weight of a query word found in the owner a qualified name hangs off, in the
+/// declared signature, or in the doc summary. Each says what the entity works
+/// on or what its author says it does, which is weaker than being named for it.
+const EVIDENCE_DECLARED_WEIGHT: f32 = 0.6;
+
+/// Weight of a query word found only in the body: mentioned, which is the
+/// weakest reading of "about".
+const EVIDENCE_BODY_WEIGHT: f32 = 0.3;
+
+/// Shortest stem a prefix may match on. Five lets `config` meet
+/// `configuration` without letting `term` meet `terminal` or `form` meet
+/// `format`.
+const EVIDENCE_PREFIX_MIN: usize = 5;
+
+/// Query words that say nothing about what the code does: question words,
+/// pronouns and the connectives [`ENGLISH_STOPWORDS`] does not list.
+fn is_descriptive_filler_word(word: &str) -> bool {
+    matches!(
+        word,
+        "about"
+            | "after"
+            | "all"
+            | "also"
+            | "any"
+            | "each"
+            | "here"
+            | "how"
+            | "just"
+            | "me"
+            | "my"
+            | "no"
+            | "not"
+            | "our"
+            | "so"
+            | "some"
+            | "than"
+            | "that"
+            | "there"
+            | "these"
+            | "this"
+            | "those"
+            | "us"
+            | "very"
+            | "via"
+            | "we"
+            | "what"
+            | "who"
+            | "whom"
+            | "whose"
+            | "why"
+            | "you"
+            | "your"
+    )
+}
+
+/// A light suffix stemmer, so the inflections of one word meet.
+///
+/// Both sides pass through it, the query's words and the entity's, so what
+/// matters is that `formatting`, `formats` and `formatted` all meet `format`,
+/// `quoting` and `quoted` meet `quote`, `keywords` meets `keyword` and
+/// `queries` meets `query`, and not that the stem is a word. Verb suffixes come
+/// off until none is left, so an `-er` root meets its `-ing` form: `filtering`
+/// and `filter` both reach `filt`, `formatter` reaches `format`, `parser`
+/// reaches `pars`. Three letters or fewer pass unchanged, and a suffix only
+/// comes off when three letters and a vowel stay behind, so `string`, `thing`
+/// and `user` stay whole.
+fn evidence_stem(word: &str) -> String {
+    let mut stem = word.to_ascii_lowercase();
+    if stem.len() <= 3 {
+        return stem;
+    }
+    if stem.len() > 4 && stem.ends_with("ies") {
+        stem.truncate(stem.len() - 3);
+        stem.push('y');
+    } else if stem.len() > 4
+        && stem.ends_with("es")
+        && ["s", "x", "z", "ch", "sh"]
+            .iter()
+            .any(|end| stem[..stem.len() - 2].ends_with(end))
+    {
+        stem.truncate(stem.len() - 2);
+    } else if stem.ends_with('s') && !["ss", "us", "is"].iter().any(|end| stem.ends_with(end)) {
+        stem.truncate(stem.len() - 1);
+    }
+    while let Some(base) = ["ing", "ed", "er"]
+        .iter()
+        .find_map(|suffix| stem.strip_suffix(suffix))
+        .filter(|base| base.len() >= 3 && base.bytes().any(|byte| b"aeiouy".contains(&byte)))
+    {
+        let bytes = base.as_bytes();
+        let last = bytes[bytes.len() - 1];
+        let doubled = bytes[bytes.len() - 2] == last && !b"aeioulsz".contains(&last);
+        let keep = if doubled { base.len() - 1 } else { base.len() };
+        stem.truncate(keep);
+    }
+    if stem.len() >= 4 && stem.ends_with('e') {
+        stem.pop();
+    }
+    stem
+}
+
+/// Every stem [`evidence_stem`] makes of a piece of text, with identifier parts
+/// split out first, so `formatKeywords` contributes `format` and `keyword`.
+fn evidence_stems(text: &str) -> FxHashSet<String> {
+    let mut stems = FxHashSet::default();
+    for raw in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if raw.is_empty() {
+            continue;
+        }
+        for part in split_identifier_parts(raw) {
+            if part.len() < 2 || part.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            stems.insert(evidence_stem(&part));
+        }
+    }
+    stems
+}
+
+/// The words of a descriptive query that can be evidence, stemmed, each once,
+/// in query order. Stopwords, question words, pronouns and the words that say
+/// what kind of code is wanted ([`is_code_kind_word`]) carry none.
+fn descriptive_query_concepts(query: &str) -> Vec<String> {
+    let mut concepts: Vec<String> = Vec::new();
+    for token in query_tokens(query) {
+        for part in split_identifier_parts(token) {
+            if part.len() < 2
+                || part.bytes().all(|byte| byte.is_ascii_digit())
+                || is_english_stopword(&part)
+                || is_descriptive_filler_word(&part)
+                || is_code_kind_word(&part)
+            {
+                continue;
+            }
+            let stem = evidence_stem(&part);
+            if !concepts.contains(&stem) {
+                concepts.push(stem);
+            }
+        }
+    }
+    concepts
+}
+
+/// Whether a set of stems carries this concept: the same stem, or a shared
+/// prefix of at least [`EVIDENCE_PREFIX_MIN`] letters.
+fn evidence_covers(stems: &FxHashSet<String>, concept: &str) -> bool {
+    stems.contains(concept)
+        || (concept.len() >= EVIDENCE_PREFIX_MIN
+            && stems.iter().any(|stem| {
+                stem.len() >= EVIDENCE_PREFIX_MIN
+                    && (stem.starts_with(concept) || concept.starts_with(stem.as_str()))
+            }))
+}
+
+/// Whether an entity kind contains other declarations rather than being one.
+fn is_container_kind(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Module | EntityKind::Package | EntityKind::File
+    )
+}
+
+/// How strongly one entity carries each concept of a descriptive query: the
+/// weight of the strongest field the concept appears in, or zero.
+///
+/// The fields are the four a relevance judgment can read from graph truth:
+/// the name, the declared signature and doc summary (with the owner a qualified
+/// name hangs off), and the parse-time body preview. A container's body is
+/// every declaration inside it, so a package would carry every word any of its
+/// functions carries, and it is not read. What a container is about is its
+/// name and where it is filed: the directories and file stem of its path, at
+/// the declared weight. A `config` package whose file is
+/// `internal/config/parse.go` carries `config` and `parse` for "which package
+/// parses config files". Its signature is that same path and is not read
+/// twice.
+fn entity_concept_weights(entity: &kin_model::Entity, concepts: &[String]) -> Vec<f32> {
+    let tail = qualified_name_tail(&entity.name);
+    let owner = &entity.name[..entity.name.len() - tail.len()];
+    let mut fields: Vec<(f32, FxHashSet<String>)> = vec![
+        (EVIDENCE_NAME_WEIGHT, evidence_stems(tail)),
+        (EVIDENCE_DECLARED_WEIGHT, evidence_stems(owner)),
+    ];
+    if is_container_kind(entity.kind) {
+        if let Some(file) = entity.file_origin.as_ref() {
+            fields.push((EVIDENCE_DECLARED_WEIGHT, path_evidence_stems(&file.0)));
+        }
+    } else {
+        fields.push((EVIDENCE_DECLARED_WEIGHT, evidence_stems(&entity.signature)));
+        fields.push((
+            EVIDENCE_DECLARED_WEIGHT,
+            evidence_stems(entity.doc_summary.as_deref().unwrap_or("")),
+        ));
+        let body = entity
+            .metadata
+            .extra
+            .get(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY)
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        fields.push((EVIDENCE_BODY_WEIGHT, evidence_stems(body)));
+    }
+    concepts
+        .iter()
+        .map(|concept| {
+            fields
+                .iter()
+                .filter(|(_, stems)| evidence_covers(stems, concept))
+                .map(|(weight, _)| *weight)
+                .fold(0.0_f32, f32::max)
+        })
+        .collect()
+}
+
+/// The stems of a file's directories and of its name without the extension:
+/// where a file is filed, as evidence of what it holds.
+fn path_evidence_stems(path: &str) -> FxHashSet<String> {
+    let without_extension = match path.rsplit_once('.') {
+        Some((head, extension)) if !extension.contains('/') => head,
+        _ => path,
+    };
+    evidence_stems(without_extension)
+}
+
+/// How strongly a tracked file with no parsed entities carries each concept:
+/// its file name at the name weight (`Dockerfile` names itself), its
+/// directories at the declared weight, and the text the graph keeps for it at
+/// the body weight, so "what does the Dockerfile install" finds `install` in
+/// the file it named.
+fn artifact_concept_weights(path: &str, text: &str, concepts: &[String]) -> Vec<f32> {
+    let (directories, base) = path.rsplit_once('/').unwrap_or(("", path));
+    let fields: [(f32, FxHashSet<String>); 3] = [
+        (EVIDENCE_NAME_WEIGHT, path_evidence_stems(base)),
+        (EVIDENCE_DECLARED_WEIGHT, evidence_stems(directories)),
+        (EVIDENCE_BODY_WEIGHT, evidence_stems(text)),
+    ];
+    concepts
+        .iter()
+        .map(|concept| {
+            fields
+                .iter()
+                .filter(|(_, stems)| evidence_covers(stems, concept))
+                .map(|(weight, _)| *weight)
+                .fold(0.0_f32, f32::max)
+        })
+        .collect()
+}
+
+/// The evidence a descriptive query's ranked rows carry, weighed once per
+/// ranking.
+struct DescriptiveEvidence {
+    /// What finding each concept is worth: the inverse document frequency of
+    /// the concept over the ranked rows, so a word most rows carry (`search` in
+    /// a package named `search`) is worth little and a rare one is worth more.
+    idf: Vec<f32>,
+    /// The most evidence any ranked row carries.
+    best: f32,
+}
+
+impl DescriptiveEvidence {
+    /// Weigh the concepts over the rows that have evidence.
+    fn over(
+        rows: &[(usize, LocateEntity)],
+        weights: &FxHashMap<String, Vec<f32>>,
+        concepts: usize,
+    ) -> Self {
+        let observed: Vec<&Vec<f32>> = rows
+            .iter()
+            .filter_map(|(_, row)| weights.get(row.identity_key()))
+            .collect();
+        let rows_observed = observed.len() as f32;
+        let idf = (0..concepts)
+            .map(|index| {
+                let carrying = observed.iter().filter(|w| w[index] > 0.0).count() as f32;
+                ((rows_observed + 1.0) / (carrying + 0.5)).ln()
+            })
+            .collect();
+        let mut evidence = Self { idf, best: 0.0 };
+        evidence.best = observed
+            .iter()
+            .map(|w| evidence.carried(w))
+            .fold(0.0_f32, f32::max);
+        evidence
+    }
+
+    /// The evidence one row carries: each concept's worth times the weight of
+    /// the strongest field it appears in.
+    fn carried(&self, weights: &[f32]) -> f32 {
+        self.idf
+            .iter()
+            .zip(weights)
+            .map(|(idf, weight)| idf * weight)
+            .sum()
+    }
+}
+
+/// Price a descriptive query's plain-word name matches by the evidence they
+/// carry.
+///
+/// Out of the exact-name tier ([`row_is_descriptive_collision`]), such a row still
+/// carries the composite score of an exact name match, which is a fixed
+/// product: a module named `search` scores 450 for the one word `search`
+/// whether the query was about searching or merely mentioned it. Lexical rows
+/// earn their score from how much of the query they match, so the two are not
+/// on one scale, and on the GitHub CLI store the fixed product still put
+/// `Client.Query` (1052) and five `search` module rows (450 to 480) above
+/// `formatKeywords` (291), the function "formatting search keywords, quoting
+/// search terms for search query" described.
+///
+/// This puts them on one scale by what they carry. Each row's evidence is the
+/// query's words it carries, weighted by the strongest field each appears in
+/// (name, then owner, signature and doc summary, then body) and by how rare the
+/// word is among the ranked rows. A collision keeps its score times its share
+/// of the best row's evidence, raised to `KIN_LOCATE_DESCRIPTIVE_EVIDENCE_EXPONENT`
+/// (default 2), and never less than `KIN_LOCATE_DESCRIPTIVE_EVIDENCE_FLOOR` of
+/// it (default 0.05), so the row stays ranked. `formatKeywords` carries
+/// `format` and `keyword` in its name and `quote` in its body; `Client.Query`
+/// carries `query` alone, a word many of the ranked rows carry.
+///
+/// Only collisions move. A row the query asked for keeps the tier, and a
+/// lexical or semantic row keeps the score its own retrieval earned. A
+/// collision that carries as much as any row keeps its whole score, so a right
+/// answer whose name is an ordinary word is not demoted for it. A row with no
+/// evidence on record is left alone rather than priced as if it carried
+/// nothing: what cannot be weighed is not charged.
+fn apply_descriptive_evidence(
+    rows: &mut [(usize, LocateEntity)],
+    name_query: &NameQuery,
+    weights: &FxHashMap<String, Vec<f32>>,
+    evidence: &DescriptiveEvidence,
+) {
+    if evidence.best <= 0.0 {
+        return;
+    }
+    let exponent = locate_env_f32("KIN_LOCATE_DESCRIPTIVE_EVIDENCE_EXPONENT", 2.0);
+    let floor = locate_env_f32("KIN_LOCATE_DESCRIPTIVE_EVIDENCE_FLOOR", 0.05).min(1.0);
+    for (_, row) in rows.iter_mut() {
+        if !row_is_descriptive_collision(row, name_query) {
+            continue;
+        }
+        let Some(carried) = weights.get(row.identity_key()).map(|w| evidence.carried(w)) else {
+            continue;
+        };
+        let share = (carried / evidence.best).clamp(0.0, 1.0);
+        row.score *= share.powf(exponent).max(floor);
+    }
+}
+
+/// The package a module row stands for: its name and the directory its file
+/// sits in. `None` for every row that is not an entity-backed Go module.
+///
+/// Go is the language whose rule is one package per directory, with every file
+/// declaring it, so a module row's name and directory identify the package and
+/// nothing else. Other languages name a file's module surface by its stem or a
+/// declared namespace's last segment, and there two different modules share a
+/// name and a directory routinely: Rust's `lib.rs` and `main.rs` (both
+/// `crate`), Python's `pkg/__init__.py` and `pkg/pkg.py`, a TypeScript barrel
+/// `Button/index.ts` and `Button/Button.tsx`, C++ namespaces reopened under two
+/// parents. Folding those would hide a distinct module behind a count.
+fn package_module_key(entity: &LocateEntity) -> Option<(String, String)> {
+    if entity.kind != "module" || entity.entity_id.is_empty() {
+        return None;
+    }
+    let file = entity.provenance.file.as_deref()?;
+    if !file.ends_with(".go") {
+        return None;
+    }
+    let directory = file.rsplit_once('/').map_or("", |(directory, _)| directory);
+    Some((entity.name.to_ascii_lowercase(), directory.to_string()))
+}
+
+/// Fold the module rows one package contributes into the first of them.
+///
+/// Every source file carries a module-surface entity named for its package or
+/// its stem, and a Go package declares itself once per file, so a word the
+/// package is named after brings one row per file. Only Go rows fold
+/// ([`package_module_key`]). "formatting search keywords,
+/// quoting search terms for search query" put four `search` rows from
+/// `pkg/search` and a fifth from `pkg/cmd/search` into the first seven places
+/// of the GitHub CLI ranking. A package is one answer, so it keeps one row, at
+/// the rank of its best-placed file, and says in [`LocateEntity::collapsed_rows`]
+/// how many it folded. Another directory is another package under the same
+/// name, so `pkg/cmd/search` keeps its own row.
+///
+/// Runs on an ordered ranking. A single ranking folds rows that carry no count
+/// yet, so the count is the rows folded. The fused arm may meet two kept rows
+/// of one package, each already carrying its variant's count, and adding them
+/// would count a file twice, so the count is the larger of the counts carried
+/// and the rows folded here: a lower bound, never an overcount.
+/// `KIN_LOCATE_COLLAPSE_PACKAGE_MODULES=0` keeps every row.
+fn collapse_package_module_rows(entities: &mut Vec<LocateEntity>) {
+    if !locate_env_bool("KIN_LOCATE_COLLAPSE_PACKAGE_MODULES", true) {
+        return;
+    }
+    // Per package: the index of the kept row, the rows in the group, and the
+    // largest count any member already carried.
+    let mut groups: FxHashMap<(String, String), (usize, usize, usize)> = FxHashMap::default();
+    let mut kept: Vec<LocateEntity> = Vec::with_capacity(entities.len());
+    for entity in entities.drain(..) {
+        if let Some(key) = package_module_key(&entity) {
+            if let Some(group) = groups.get_mut(&key) {
+                group.1 += 1;
+                group.2 = group.2.max(entity.collapsed_rows);
+                continue;
+            }
+            groups.insert(key, (kept.len(), 1, entity.collapsed_rows));
+        }
+        kept.push(entity);
+    }
+    for (index, members, carried) in groups.into_values() {
+        kept[index].collapsed_rows = carried.max(members - 1);
+    }
+    *entities = kept;
 }
 
 /// The global entity ordering: definitions first, then the exact-name tier
@@ -18185,6 +19694,21 @@ pub fn build_entity_view(
     // and fall through to the file-order tie-break unchanged.
     let mut name_owner_mass: FxHashMap<String, usize> = FxHashMap::default();
     let owner_mass_limit = locate_env_usize("KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT", 16);
+    // What the query spells and what the graph stores under its qualifiers,
+    // read once for every judgment below: the tier, the prose collisions and
+    // the descriptive price ([`NameQuery`]).
+    let name_query = NameQuery::parse(query).resolve_qualifiers(graph)?;
+    // What each row carries of a descriptive query, read from the entity while
+    // it is in hand ([`apply_descriptive_evidence`]). A name query reads
+    // nothing here and ranks exactly as before.
+    let evidence_concepts = if locate_env_bool("KIN_LOCATE_DESCRIPTIVE_EVIDENCE", true)
+        && !name_query.is_name_shaped()
+    {
+        descriptive_query_concepts(query)
+    } else {
+        Vec::new()
+    };
+    let mut evidence_weights: FxHashMap<String, Vec<f32>> = FxHashMap::default();
     // File-anchor admission (FIR-3079). The entity surface is a projection of
     // the FILE ranking through the symbols a query token happened to name, so a
     // file can rank first for a question and contribute nothing: measured on
@@ -18239,8 +19763,10 @@ pub fn build_entity_view(
     // own top row is the only scale-free way to ask it.
     let anchor_band_share = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", 0.25);
     // Built once on the first ranked file that resolves to no entity, because
-    // it walks every tracked artifact and most rankings never need it.
-    let mut tracked_artifacts: Option<HashSet<String>> = None;
+    // it walks every tracked artifact and most rankings never need it. Keyed
+    // by path, holding the text the graph keeps for each file, which is the
+    // evidence an artifact row carries ([`artifact_concept_weights`]).
+    let mut tracked_artifacts: Option<HashMap<String, String>> = None;
     for (file_rank, file) in result.files.iter().enumerate() {
         // File ordering preserves the full path ranking. Carry only the role
         // demotions that raw symbol scores otherwise lose at entity projection;
@@ -18270,14 +19796,20 @@ pub fn build_entity_view(
             let tracked = tracked_artifacts.get_or_insert_with(|| {
                 tracked_non_entity_files(graph)
                     .into_iter()
-                    .map(|tracked| tracked.path)
+                    .map(|tracked| (tracked.path, tracked.descriptor))
                     .collect()
             });
-            if !tracked.contains(&file.path) {
+            let Some(descriptor) = tracked.get(&file.path) else {
                 continue;
-            }
+            };
             if !seen.insert(file.path.clone()) {
                 continue;
+            }
+            if !evidence_concepts.is_empty() {
+                evidence_weights.insert(
+                    file.path.clone(),
+                    artifact_concept_weights(&file.path, descriptor, &evidence_concepts),
+                );
             }
             ranked.push((file_rank, artifact_locate_entity(file, query)));
             continue;
@@ -18319,6 +19851,12 @@ pub fn build_entity_view(
                     kin_ranking::entity_ranking::owner_graph_mass(graph, &entity.id, &entity.name)?,
                 );
             }
+            if !evidence_concepts.is_empty() {
+                evidence_weights.insert(
+                    entity_id.clone(),
+                    entity_concept_weights(entity, &evidence_concepts),
+                );
+            }
             ranked.push((
                 file_rank,
                 LocateEntity {
@@ -18339,6 +19877,8 @@ pub fn build_entity_view(
                         cosine: sym.cosine,
                     },
                     matched_queries: Vec::new(),
+                    collapsed_rows: 0,
+                    name_tier: None,
                 },
             ));
         }
@@ -18369,7 +19909,7 @@ pub fn build_entity_view(
 
     // Surface penalty before the ordering, because it moves the composite score
     // the ordering then reads ([`apply_entity_surface_penalty`]).
-    apply_entity_surface_penalty(&mut ranked, query);
+    apply_entity_surface_penalty(&mut ranked, &name_query);
 
     // The floor is a CAP on the collision demotion, and it is pinned from both
     // sides by measurement. It has to be under 0.810 or React's
@@ -18402,7 +19942,23 @@ pub fn build_entity_view(
     // is now demoted against the anchors alone, which corroborate nothing, so
     // it takes the full floor. Both are the conservative direction for a row
     // whose whole claim is that it is a second opinion.
-    apply_collision_corroboration_penalty(&mut ranked, query, collision_floor, collision_target);
+    apply_collision_corroboration_penalty(
+        &mut ranked,
+        &name_query,
+        collision_floor,
+        collision_target,
+    );
+
+    // Also BEFORE the anchors, for the same reason: this moves collision
+    // scores, and the anchor reference is a share of the scores that ship.
+    // After the corroboration rule, so that rule still weighs siblings against
+    // the collision's own retrieval score, which is what its share was
+    // measured as.
+    let descriptive_evidence = (!evidence_concepts.is_empty())
+        .then(|| DescriptiveEvidence::over(&ranked, &evidence_weights, evidence_concepts.len()));
+    if let Some(evidence) = &descriptive_evidence {
+        apply_descriptive_evidence(&mut ranked, &name_query, &evidence_weights, evidence);
+    }
 
     // The anchors, beneath the band of rows retrieval scored well. The
     // reference adapts to the store's scale instead of imposing one, and the
@@ -18484,6 +20040,12 @@ pub fn build_entity_view(
             // reports `name`, and one it does not reports the weaker claim,
             // exactly as a projected symbol does.
             let match_kind = classify_locate_match(query, &entity.name, FILE_ANCHOR_ORIGIN, None);
+            if !evidence_concepts.is_empty() {
+                evidence_weights.insert(
+                    entity_id.clone(),
+                    entity_concept_weights(&entity, &evidence_concepts),
+                );
+            }
             admitted.push((
                 file_rank,
                 LocateEntity {
@@ -18509,22 +20071,34 @@ pub fn build_entity_view(
                         cosine: None,
                     },
                     matched_queries: Vec::new(),
+                    collapsed_rows: 0,
+                    name_tier: None,
                 },
             ));
         }
-        apply_entity_surface_penalty(&mut admitted, query);
+        apply_entity_surface_penalty(&mut admitted, &name_query);
         // An anchor the query happens to name is a name hit like any other and
         // can be a prose-word collision like any other, so it faces the same
         // demotion the retrieval rows already took above.
         apply_collision_corroboration_penalty(
             &mut admitted,
-            query,
+            &name_query,
             collision_floor,
             collision_target,
         );
+        // And the same evidence price, against the rows retrieval found.
+        if let Some(evidence) = &descriptive_evidence {
+            apply_descriptive_evidence(&mut admitted, &name_query, &evidence_weights, evidence);
+        }
         ranked.extend(admitted);
     }
 
+    // Every row's tier is decided here, with the graph's reading of the
+    // query's qualifiers, and carried on the row so the fused arm orders this
+    // variant's rows exactly as this ranking does.
+    for (_, entity) in ranked.iter_mut() {
+        entity.name_tier = Some(exact_name_tier(entity, &name_query));
+    }
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
             .get(entity.identity_key())
@@ -18534,6 +20108,7 @@ pub fn build_entity_view(
     order_locate_entities(&mut ranked, query, owner_mass_of);
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
+    collapse_package_module_rows(&mut result.entities);
 
     // Make the tie-break arguable from the response: under --explain (the only
     // mode that populates `origin`), every name hit whose exact score is shared
@@ -18865,16 +20440,24 @@ pub fn fuse_locate_results(
     // keeps the promotion when at least one variant that surfaced it named it
     // outside a sentence, or named it with a symbol-shaped token. Asking the
     // joined text instead would let one prose variant demote a hit an explicit
-    // symbol variant asked for by name.
+    // symbol variant asked for by name. Each variant is asked about its OWN
+    // record of the hit, which carries the tier that variant's ranking decided
+    // with the graph ([`LocateEntity::name_tier`]).
     let fused_tier: FxHashMap<String, u8> = fused_entities
         .iter()
         .map(|(entity, lists, _)| {
+            let identity = entity.identity_key();
             let tier = lists
                 .iter()
-                .map(|&list| locate_exact_name_tier(entity, &variants[list]))
+                .filter_map(|&list| {
+                    entity_lists[list]
+                        .iter()
+                        .find(|record| record.identity_key() == identity)
+                        .map(|record| locate_exact_name_tier(record, &variants[list]))
+                })
                 .max()
                 .unwrap_or(0);
-            (entity.identity_key().to_string(), tier)
+            (identity.to_string(), tier)
         })
         .collect();
     let tier_of = |entity: &LocateEntity| -> u8 {
@@ -18890,13 +20473,17 @@ pub fn fuse_locate_results(
             .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
             .then_with(|| a.identity_key().cmp(b.identity_key()))
     });
-    let entities: Vec<LocateEntity> = fused_entities
+    let mut entities: Vec<LocateEntity> = fused_entities
         .into_iter()
         .map(|(mut entity, lists, _)| {
             entity.matched_queries = lists.iter().map(|&i| variants[i].clone()).collect();
+            entity.name_tier = fused_tier.get(entity.identity_key()).copied();
             entity
         })
         .collect();
+    // Two variants can keep different files of one package, each already
+    // folding the rest, so the fused ranking folds again.
+    collapse_package_module_rows(&mut entities);
 
     let mut fused_files = rrf_fuse(&file_lists, |f| f.path.clone(), rrf_k);
     fused_files.sort_by(|(a, _, sa), (b, _, sb)| {
@@ -19688,6 +21275,8 @@ mod tests {
                 cosine: Some(0.8),
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         }
     }
 
@@ -19700,7 +21289,7 @@ mod tests {
             .enumerate()
             .map(|(rank, (name, kind, score))| (rank, surface_hit(name, kind, *score, query)))
             .collect();
-        apply_entity_surface_penalty(&mut ranked, query);
+        apply_entity_surface_penalty(&mut ranked, &NameQuery::parse(query));
         order_locate_entities(&mut ranked, query, |_| 0);
         ranked.into_iter().map(|(_, entity)| entity).collect()
     }
@@ -20163,6 +21752,264 @@ mod tests {
         assert!(
             !reported.remediation.is_empty(),
             "a gap report with no remediation tells a caller nothing to do: {reported:?}"
+        );
+    }
+
+    /// A graph whose text index is in the state a failed commit read-back
+    /// leaves it: the committed image is on disk and every read of it refuses.
+    ///
+    /// Built the way a store gets there. A segment the next commit carries
+    /// forward is removed, and a root change with no document delta makes that
+    /// commit carry it, so the image it publishes names a missing file. The
+    /// removed file comes back with the graph so a test can restore it.
+    fn unmapped_text_index_graph(
+        entities: &[Entity],
+    ) -> (
+        tempfile::TempDir,
+        kin_db::InMemoryGraph,
+        std::path::PathBuf,
+        Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let text_dir = dir.path().join("text-index");
+        let graph = kin_db::InMemoryGraph::with_text_index(text_dir.clone());
+        for entity in entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph.flush_text_index().unwrap();
+        let segment = std::fs::read_dir(&text_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.contains(".kinseg-") && !name.ends_with(".kinseg-manifest")
+            })
+            .expect("the committed text index is segmented");
+        let bytes = std::fs::read(&segment).unwrap();
+        std::fs::remove_file(&segment).unwrap();
+        assert!(
+            graph.persist_text_index_with_root_hash([0x5a; 32]).is_err(),
+            "the carrying commit must fail its read-back"
+        );
+        assert!(
+            graph.text_index_unavailable().is_some(),
+            "the fixture must leave the text index unmapped, or nothing below is about that state"
+        );
+        (dir, graph, segment, bytes)
+    }
+
+    fn refused_text_read(sink: &[RetrievalDegradation]) -> Option<&RetrievalDegradation> {
+        sink.iter()
+            .find(|event| event.component == "text_index" && event.reason == "refused")
+    }
+
+    /// The query-entry check reports an unmapped text index as a gap.
+    ///
+    /// The index still counts the published image's documents, so the
+    /// empty-index check could not see the state, and the stages that met the
+    /// refusal dropped it: the answer carried no text evidence and no gap.
+    #[test]
+    #[serial_test::serial]
+    fn an_unmapped_text_index_is_reported_at_query_entry() {
+        let (_dir, graph, segment, bytes) =
+            unmapped_text_index_graph(&[test_entity("parse_config", "src/config.py", 1, 5)]);
+
+        let mut sink = Vec::new();
+        ensure_lexical_index_queryable(&graph, &mut sink);
+        let reported = sink
+            .iter()
+            .find(|event| event.component == "text_index")
+            .unwrap_or_else(|| panic!("an unmapped index answered with no gap: {sink:?}"));
+        assert_eq!(reported.reason, "unavailable", "{reported:?}");
+        assert!(
+            reported.detail.contains("could not be mapped back"),
+            "the report must say what is wrong: {reported:?}"
+        );
+        assert!(!reported.remediation.is_empty(), "{reported:?}");
+
+        // The control: with the file back, the same check maps the image
+        // again and has nothing to report.
+        std::fs::write(&segment, &bytes).unwrap();
+        let mut sink = Vec::new();
+        ensure_lexical_index_queryable(&graph, &mut sink);
+        assert!(
+            sink.iter().all(|event| event.component != "text_index"),
+            "a readable index was reported as a gap: {sink:?}"
+        );
+        assert_eq!(graph.text_search("parse_config", 5).unwrap().len(), 1);
+    }
+
+    /// Each stage that reads the lexical index for optional evidence records a
+    /// refused read in the ledger instead of dropping it with a bare
+    /// `continue`.
+    #[test]
+    #[serial_test::serial]
+    fn every_stage_that_skips_a_refused_text_read_records_it() {
+        let (_dir, graph, _segment, _bytes) =
+            unmapped_text_index_graph(&[test_entity("parse_config", "src/config.py", 1, 5)]);
+
+        // A term no entity is named, so the exact-name weighting reads nothing
+        // and the tracked-file search is the stage that meets the refusal.
+        let mut sink = Vec::new();
+        extract_priority_file_traces("tokenizer", &graph, &mut sink);
+        let refused = refused_text_read(&sink)
+            .unwrap_or_else(|| panic!("tracked-file text search dropped it: {sink:?}"));
+        assert!(
+            refused.detail.contains("tracked-file text search")
+                && refused.detail.contains("search is refused"),
+            "{refused:?}"
+        );
+
+        // The floor weighs each term by its document frequency before it
+        // searches for it, and on an unmapped index both reads refuse. The
+        // ledger keeps the first refusal per component and reason, so the one
+        // the floor leaves is its term rarity read's.
+        let mut sink = Vec::new();
+        let _ = lexical_parity_matches(&graph, &["tokenizer".to_string()], &mut sink);
+        let refused = refused_text_read(&sink)
+            .unwrap_or_else(|| panic!("the lexical parity floor dropped it: {sink:?}"));
+        assert!(
+            refused.detail.contains("lexical parity term rarity"),
+            "{refused:?}"
+        );
+
+        let mut sink = Vec::new();
+        {
+            let _body = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_BODY_SEED_FILE", "1");
+            // A symbolic term the graph names reads no text before the body
+            // seed, so this reaches that stage rather than refusing earlier.
+            extract_search_signals("parse_config", &graph, false, &mut sink)
+                .expect("no stage before the body seed reads text for this query");
+        }
+        let refused = refused_text_read(&sink)
+            .unwrap_or_else(|| panic!("body-relevance seeding dropped it: {sink:?}"));
+        assert!(
+            refused.detail.contains("body-relevance seeding"),
+            "{refused:?}"
+        );
+
+        let mut sink = Vec::new();
+        extract_cpp_private_access_test_seed_signals(
+            "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
+            &graph,
+            &mut sink,
+        )
+        .expect("this stage skips a refused read");
+        let refused = refused_text_read(&sink)
+            .unwrap_or_else(|| panic!("private-access test seeding dropped it: {sink:?}"));
+        assert!(
+            refused.detail.contains("private-access test seeding"),
+            "{refused:?}"
+        );
+    }
+
+    /// The three stages that weight a term by its document frequency record a
+    /// refused frequency read instead of weighting the term as rare in silence.
+    ///
+    /// A frequency read used to answer 0 while the index could not answer,
+    /// which each of these reads as "unknown, full weight". The entry check
+    /// catches an index that is already unmapped when a query starts; these
+    /// records are what catch one that stops answering partway through.
+    #[test]
+    #[serial_test::serial]
+    fn every_stage_that_weights_by_document_frequency_records_a_refusal() {
+        let (_dir, graph, _segment, _bytes) =
+            unmapped_text_index_graph(&[test_entity("parse_config", "src/config.py", 1, 5)]);
+
+        let mut sink = Vec::new();
+        assert_eq!(
+            lexical_term_rarity(&graph, "parse_config", &mut sink),
+            1.0,
+            "an unknown frequency keeps its full weight, as before"
+        );
+        let refused = refused_text_read(&sink)
+            .unwrap_or_else(|| panic!("the parity rarity dropped it: {sink:?}"));
+        assert!(
+            refused.detail.contains("lexical parity term rarity")
+                && refused
+                    .detail
+                    .contains("a document frequency read is refused"),
+            "{refused:?}"
+        );
+
+        let mut sink = Vec::new();
+        let _ = top_lexical_tail_match("parse_config", &graph, &mut sink);
+        let refused = refused_text_read(&sink)
+            .unwrap_or_else(|| panic!("the tail-match weighting dropped it: {sink:?}"));
+        assert!(
+            refused.detail.contains("tail-match weighting"),
+            "{refused:?}"
+        );
+
+        let mut sink = Vec::new();
+        let _ = extract_priority_file_traces("parse_config", &graph, &mut sink);
+        let refused = refused_text_read(&sink)
+            .unwrap_or_else(|| panic!("the exact-name weighting dropped it: {sink:?}"));
+        assert!(
+            refused.detail.contains("exact-name priority weighting"),
+            "{refused:?}"
+        );
+    }
+
+    /// A locate over an unmapped text index refuses or answers with the gap in
+    /// its ledger, and never answers as if it were complete.
+    ///
+    /// Which of the two depends on the stages a query reaches. A stage that
+    /// needs its text read to rank propagates the refusal and fails the query.
+    /// A query that reaches none of them answers, and carries the gap the entry
+    /// check recorded, which is what the reply's completeness and verdict are
+    /// built from. Before this, that second answer carried no gap at all.
+    #[test]
+    #[serial_test::serial]
+    fn a_locate_over_an_unmapped_text_index_refuses_or_reports_the_gap() {
+        let (_dir, graph, _segment, _bytes) =
+            unmapped_text_index_graph(&[test_entity("parse_config", "src/config.py", 1, 5)]);
+
+        // Every word is under the four characters any text stage searches for,
+        // so no stage reads the index and the query answers.
+        let answered = agent_locate(&graph, "how is it");
+        let reported = text_index_degradation(&answered).unwrap_or_else(|| {
+            panic!(
+                "a locate over an unmapped index answered with no gap; ledger: {:?}",
+                answered
+                    .degradations
+                    .iter()
+                    .map(|event| (event.component.as_str(), event.reason.as_str()))
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(reported.reason, "unavailable", "{reported:?}");
+
+        // The source-text stage searches the index for this name and cannot
+        // rank without it, so the query refuses, and the refusal says why.
+        let refused = match run_with_graph_capture_budgeted(
+            &graph,
+            None,
+            "parse_config",
+            false,
+            10,
+            true,
+            Vec::new(),
+            None,
+            SnippetOptions::enabled(None),
+            None,
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            LocateScope::SOURCE_ONLY,
+            LocateBudget::unbounded(),
+        ) {
+            Err(error) => error,
+            Ok(answered) => panic!(
+                "a stage that needs its text read answered instead of refusing; ledger: {:?}",
+                answered
+                    .degradations
+                    .iter()
+                    .map(|event| (event.component.as_str(), event.reason.as_str()))
+                    .collect::<Vec<_>>()
+            ),
+        };
+        assert!(
+            format!("{refused:#}").contains("is refused until it maps again"),
+            "the refusal names the unmapped index: {refused:#}"
         );
     }
 
@@ -20662,6 +22509,8 @@ mod tests {
                 cosine: Some(0.5),
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         }
     }
 
@@ -21014,6 +22863,8 @@ mod tests {
                 cosine: None,
             },
             matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            name_tier: None,
         }
     }
 
@@ -22036,6 +23887,1774 @@ mod tests {
         assert_eq!(
             with_symbol_variant.entities[0].name, "send",
             "a variant that named the symbol outright keeps its tier"
+        );
+    }
+
+    /// The fused arm orders a hit by the tier each variant's own ranking gave
+    /// it, and that tier was decided with the graph.
+    ///
+    /// The first variant is a sentence that ranked `Client.Query` well and
+    /// withheld the tier from it. The second is `c.Query`, whose ranking asked
+    /// the graph what `c` is, found no type or package by that name and a
+    /// member named `Query`, and gave that member the tier. Both rank `Other`
+    /// above it, so the fused hit sorts first only on the tier the second
+    /// variant's own record carries. The record fusion keeps for the hit is the
+    /// first variant's, and read from the variant texts alone `c` could be a
+    /// package, so either shortcut loses the tier.
+    #[test]
+    #[serial_test::serial]
+    fn the_fused_tier_is_the_tier_each_variant_gave_its_own_record() {
+        let _demotion = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_PROSE_NAME_DEMOTION", "1");
+        let row = |name: &str, kind: LocateMatchKind, tier: Option<u8>| {
+            let mut entity = mk_locate_entity(name, 10.0, true);
+            entity.match_kind = Some(kind);
+            entity.name_tier = tier;
+            entity
+        };
+        let prose = "how does the client run a query against the api";
+        let path = "c.Query";
+        for variant in [prose, path] {
+            assert_eq!(
+                locate_exact_name_tier(&row("Client.Query", LocateMatchKind::Name, None), variant),
+                0,
+                "control: the text of {variant:?} alone does not give Client.Query the tier"
+            );
+        }
+        let ranking = |tier: u8| {
+            fusion_result(vec![
+                row("Other", LocateMatchKind::TextFallback, Some(0)),
+                row("Client.Query", LocateMatchKind::Name, Some(tier)),
+            ])
+        };
+        let fused = fuse_locate_results(
+            vec![prose.to_string(), path.to_string()],
+            vec![ranking(0), ranking(1)],
+            60.0,
+        );
+        let order: Vec<&str> = fused.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["Client.Query", "Other"],
+            "the tier the path variant gave its own record lifts the hit over RRF"
+        );
+        assert_eq!(fused.entities[0].name_tier, Some(1));
+
+        // Control: with no variant granting it, RRF decides.
+        let neither = fuse_locate_results(
+            vec![prose.to_string(), path.to_string()],
+            vec![ranking(0), ranking(0)],
+            60.0,
+        );
+        assert_eq!(neither.entities[0].name, "Other");
+    }
+
+    /// The description the matched-pair agent typed against the GitHub CLI
+    /// store, verbatim.
+    const SEARCH_KEYWORDS_QUESTION: &str =
+        "formatting search keywords, quoting search terms for search query";
+
+    /// A minimal Go tree with the GitHub CLI's search shape: a package named
+    /// `search` split over four files, a command package also named `search`,
+    /// an API client whose `Query` method shares the query's last word, and a
+    /// struct field named `Search`. Written for this fixture, not copied.
+    const SEARCH_PACKAGE_FIXTURE: &[(&str, &str)] = &[
+        (
+            "pkg/search/query.go",
+            include_str!("../../tests/fixtures/locate_search_package/pkg/search/query.go"),
+        ),
+        (
+            "pkg/search/searcher.go",
+            include_str!("../../tests/fixtures/locate_search_package/pkg/search/searcher.go"),
+        ),
+        (
+            "pkg/search/result.go",
+            include_str!("../../tests/fixtures/locate_search_package/pkg/search/result.go"),
+        ),
+        (
+            "pkg/search/searcher_mock.go",
+            include_str!("../../tests/fixtures/locate_search_package/pkg/search/searcher_mock.go"),
+        ),
+        (
+            "pkg/cmd/search/search.go",
+            include_str!("../../tests/fixtures/locate_search_package/pkg/cmd/search/search.go"),
+        ),
+        (
+            "api/client.go",
+            include_str!("../../tests/fixtures/locate_search_package/api/client.go"),
+        ),
+        (
+            "pkg/cmd/pr/shared/params.go",
+            include_str!("../../tests/fixtures/locate_search_package/pkg/cmd/pr/shared/params.go"),
+        ),
+    ];
+
+    /// The fixture above, parsed by the real Go adapter through the same
+    /// indexing pipeline the daemon runs on admit, with the text index flushed.
+    fn search_package_graph() -> kin_db::InMemoryGraph {
+        go_source_graph(SEARCH_PACKAGE_FIXTURE)
+    }
+
+    /// Go sources parsed by the real Go adapter through the indexing pipeline
+    /// the daemon runs on admit, with the text index flushed.
+    fn go_source_graph(sources: &[(&str, &str)]) -> kin_db::InMemoryGraph {
+        let graph = kin_db::InMemoryGraph::new();
+        let pipeline = kin_index::pipeline::IndexPipeline::new();
+        for (path, source) in sources {
+            let bytes = source.as_bytes();
+            let indexed = pipeline
+                .index_any_content(&FilePathId::new(*path), bytes, kin_blobs::digest(bytes))
+                .unwrap();
+            let kin_index::pipeline::IndexedAny::EntitySource(file) = indexed else {
+                panic!("{path} must parse as Go source");
+            };
+            for entity in &file.entities {
+                graph.upsert_entity(entity).unwrap();
+            }
+            for relation in &file.relations {
+                // In-file edges only; an edge to an endpoint the fixture does
+                // not hold is refused, and the ranking needs none of them.
+                let _ = graph.upsert_relation(relation);
+            }
+        }
+        graph.flush_text_index().unwrap();
+        graph
+    }
+
+    fn ranked_names(result: &LocateResult) -> Vec<(String, String, f32)> {
+        result
+            .entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.name.clone(),
+                    entity.provenance.file.clone().unwrap_or_default(),
+                    entity.score,
+                )
+            })
+            .collect()
+    }
+
+    /// The matched-pair failure, end to end on a store the real parser built.
+    ///
+    /// Against the GitHub CLI the agent asked "formatting search keywords,
+    /// quoting search terms for search query" and got twelve rows. Ten held the
+    /// exact-name tier because their names are ordinary words the question
+    /// used: `Client.Query`, five `search` module rows (one per file of two
+    /// packages), `Query`, `Query.Keywords`, `FilterOptions.Search` and
+    /// `searcher.search`. `formatKeywords`, the function the words describe,
+    /// came eleventh. This fixture reproduces that shape on the shipped rule:
+    /// `formatKeywords` ranks ninth, under eight of those name hits.
+    ///
+    /// The description names no identifier, so none of those rows is a request
+    /// for its symbol. They rank on score, a plain-word name match is priced by
+    /// the query evidence it carries, and one package keeps one module row.
+    #[test]
+    #[serial_test::serial]
+    fn a_description_surfaces_the_function_it_describes_above_names_it_shares_words_with() {
+        let graph = search_package_graph();
+        let result = agent_locate(&graph, SEARCH_KEYWORDS_QUESTION);
+        let shape = ranked_names(&result);
+
+        // Controls: the fixture holds the rows the store held, and the query
+        // still contains their names. Without these the assertion below could
+        // pass on a fixture where nothing ever collided.
+        for name in ["Client.Query", "Query", "Query.Keywords", "search"] {
+            let row = result
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("control: {name} must be ranked, got {shape:?}"));
+            assert_eq!(
+                row.match_kind,
+                Some(LocateMatchKind::Name),
+                "control: the question contains {name}, and match_kind reports facts"
+            );
+        }
+
+        let position = result
+            .entities
+            .iter()
+            .position(|entity| entity.name == "formatKeywords")
+            .unwrap_or_else(|| panic!("formatKeywords must be ranked, got {shape:?}"));
+        assert!(
+            position < 3,
+            "the function the description describes must reach the top three, \
+             landed at {} of {shape:?}",
+            position + 1
+        );
+
+        // One package, one module row. Every file of `pkg/search` declares the
+        // package, so each ranks a module row of its own until they fold;
+        // `pkg/cmd/search` is another package under the same name and keeps
+        // its own row.
+        let package_rows = |result: &LocateResult| -> Vec<LocateEntity> {
+            result
+                .entities
+                .iter()
+                .filter(|entity| {
+                    entity.kind == "module"
+                        && entity.name == "search"
+                        && entity
+                            .provenance
+                            .file
+                            .as_deref()
+                            .is_some_and(|file| file.starts_with("pkg/search/"))
+                })
+                .cloned()
+                .collect()
+        };
+        let unfolded = {
+            let _keep_every_row =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLAPSE_PACKAGE_MODULES", "0");
+            package_rows(&agent_locate(&graph, SEARCH_KEYWORDS_QUESTION)).len()
+        };
+        assert!(
+            unfolded >= 2,
+            "control: several files of pkg/search rank a module row of their own, got {unfolded}"
+        );
+        let folded = package_rows(&result);
+        assert_eq!(
+            folded.len(),
+            1,
+            "pkg/search keeps one module row: {shape:?}"
+        );
+        assert_eq!(
+            folded[0].collapsed_rows,
+            unfolded - 1,
+            "and the row says how many it folded"
+        );
+        assert!(
+            result
+                .entities
+                .iter()
+                .filter(|entity| entity.kind == "module" && entity.name == "search")
+                .count()
+                <= 2,
+            "two packages are named search, so at most two module rows: {shape:?}"
+        );
+    }
+
+    /// The other half, on the same store: a name query still resolves exactly
+    /// first. An identifier, a dotted method, a scoped path and a single word
+    /// each name one symbol, and that symbol is rank one as a name hit.
+    ///
+    /// `Query.String` and `search::quote` did not resolve on the rule this
+    /// replaced. Retrieval read neither path, so `Query.String` searched for
+    /// `Query` and `search::quote` for `search`, and the tier then promoted
+    /// every row the qualifier named. `c.Query` and `s.search` name a member
+    /// through a receiver, and the rule before this one ranked the free
+    /// `Query` struct and the `search` modules beside the members they name.
+    #[test]
+    #[serial_test::serial]
+    fn name_queries_resolve_exactly_first_on_the_same_store() {
+        let graph = search_package_graph();
+        for (query, expected) in [
+            ("formatKeywords", "formatKeywords"),
+            ("Query.String", "Query.String"),
+            ("search::quote", "quote"),
+            ("quote", "quote"),
+            ("Qualifiers.Map", "Qualifiers.Map"),
+            // A receiver path names a member, so the method outranks the
+            // struct of the same name and the modules named for the package.
+            ("c.Query", "Client.Query"),
+            ("s.search", "searcher.search"),
+            // A file name asks for what that file declares.
+            ("query.go", "Query"),
+        ] {
+            let result = agent_locate(&graph, query);
+            let first = result
+                .entities
+                .first()
+                .unwrap_or_else(|| panic!("{query} returned no entity"));
+            assert_eq!(
+                first.name,
+                expected,
+                "{query} must resolve {expected} first, got {:?}",
+                ranked_names(&result)
+            );
+            assert_eq!(
+                first.match_kind,
+                Some(LocateMatchKind::Name),
+                "{query} named {expected}"
+            );
+        }
+
+        // A single word is a name query: the package it names is rank one, and
+        // its four files still fold into one row.
+        let result = agent_locate(&graph, "search");
+        assert_eq!(
+            result.entities[0].name,
+            "search",
+            "{:?}",
+            ranked_names(&result)
+        );
+        assert_eq!(result.entities[0].match_kind, Some(LocateMatchKind::Name));
+        let search_modules = result
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == "module" && entity.name == "search")
+            .count();
+        assert_eq!(
+            search_modules,
+            2,
+            "two packages, two rows: {:?}",
+            ranked_names(&result)
+        );
+    }
+
+    /// A package-qualified free name resolves to the declaration its package
+    /// files, on sources the real Go adapter parsed: a package named in two
+    /// letters, and a root package whose files no directory is named for. A
+    /// method sharing the leaf, and a type of the same name in another
+    /// package, rank below it.
+    #[test]
+    #[serial_test::serial]
+    fn a_package_qualified_name_resolves_to_the_declaration_its_package_files() {
+        let graph = go_source_graph(&[
+            (
+                "internal/db/query.go",
+                "package db\n\n// Query runs one statement against the store.\n\
+                 func Query(statement string) error {\n\treturn nil\n}\n",
+            ),
+            (
+                "api/client.go",
+                "package api\n\n// Client talks to the API.\ntype Client struct{}\n\n\
+                 // Query sends one GraphQL query.\n\
+                 func (c *Client) Query(name string) error {\n\treturn nil\n}\n",
+            ),
+            (
+                "command.go",
+                "package cobra\n\n// Command is one command of a program.\n\
+                 type Command struct {\n\tUse string\n}\n",
+            ),
+            (
+                "pkg/cli/command.go",
+                "package cli\n\n// Command is a different command type.\n\
+                 type Command struct {\n\tName string\n}\n",
+            ),
+        ]);
+        for (query, name, file) in [
+            ("db.Query", "Query", "internal/db/query.go"),
+            ("cobra.Command", "Command", "command.go"),
+        ] {
+            let result = agent_locate(&graph, query);
+            let first = result
+                .entities
+                .first()
+                .unwrap_or_else(|| panic!("{query} returned no entity"));
+            assert_eq!(
+                (first.name.as_str(), first.provenance.file.as_deref()),
+                (name, Some(file)),
+                "{query} must resolve the {name} in {file} first, got {:?}",
+                ranked_names(&result)
+            );
+            assert_eq!(first.match_kind, Some(LocateMatchKind::Name));
+        }
+    }
+
+    /// A name query spelled as a path searches for the name the path resolves
+    /// to in the name index: the path itself when a symbol is stored under it,
+    /// its last segment when that is how the language stores the symbol.
+    ///
+    /// Checked against the name index on purpose. Lexical support calls
+    /// `search::quote` supported by any file that uses both words, and on the
+    /// GitHub CLI store that sent the whole path to retrieval, where it matched
+    /// no name and `quote` never reached the ranking.
+    ///
+    /// `KIN_LOCATE_QUALIFIED_PATH_TERMS=0` turns the terms off, so one binary
+    /// can run both arms of a benchmark.
+    #[test]
+    #[serial_test::serial]
+    fn a_qualified_name_query_searches_for_the_symbol_the_path_names() {
+        let graph = search_package_graph();
+        {
+            let _off = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_QUALIFIED_PATH_TERMS", "0");
+            for query in ["search::quote", "Query.String", "c.Query"] {
+                assert!(
+                    qualified_path_lookup_terms(query, &graph)
+                        .unwrap()
+                        .is_empty(),
+                    "{query}: the switch turns the path terms off"
+                );
+            }
+        }
+        let _on = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_QUALIFIED_PATH_TERMS", "1");
+        assert!(
+            term_has_graph_support(&graph, "search::quote", false).unwrap(),
+            "control: lexical support accepts the path on its words alone"
+        );
+        assert_eq!(
+            qualified_path_lookup_terms("search::quote", &graph).unwrap(),
+            vec!["quote"],
+            "no symbol is stored as search::quote, so the leaf is the term"
+        );
+        assert_eq!(
+            qualified_path_lookup_terms("Query.String", &graph).unwrap(),
+            vec!["Query.String"],
+            "Go stores the method under the path"
+        );
+        assert_eq!(
+            qualified_path_lookup_terms("Query.String()", &graph).unwrap(),
+            vec!["Query.String"]
+        );
+        assert!(
+            qualified_path_lookup_terms(
+                "how does Query.String format keywords for the search API",
+                &graph
+            )
+            .unwrap()
+            .is_empty(),
+            "a description keeps the retrieval it had"
+        );
+        assert!(qualified_path_lookup_terms("formatKeywords", &graph)
+            .unwrap()
+            .is_empty());
+        // A receiver path reaches its member through the leaf.
+        assert_eq!(
+            qualified_path_lookup_terms("c.Query", &graph).unwrap(),
+            vec!["Query"]
+        );
+
+        // The name index answers with every stored name that contains the
+        // text, so a store holding only `SubQuery.String` would vouch for
+        // `Query.String`. The exact check does not.
+        let contained = kin_db::InMemoryGraph::new();
+        let mut method = test_entity("SubQuery.String", "pkg/sub/query.go", 1, 5);
+        method.kind = EntityKind::Method;
+        contained.upsert_entity(&method).unwrap();
+        assert!(
+            term_has_name_support(&contained, "Query.String").unwrap(),
+            "control: the name index accepts a name that merely contains the path"
+        );
+        assert!(!graph_stores_symbol_named(&contained, "Query.String").unwrap());
+        assert!(graph_stores_symbol_named(&contained, "SubQuery.String").unwrap());
+    }
+
+    /// The tier's gate on the exact strings it has to decide.
+    #[test]
+    fn the_name_tier_reads_the_query_shape_and_the_naming_token() {
+        // How many names a query spells: a qualified path or a file name is
+        // one, and connectives, question words and the words that say what
+        // kind of code is wanted are none.
+        for query in [
+            "formatKeywords",
+            "Query.String",
+            "search::quote",
+            "crate::Type::method",
+            "Query.String()",
+            "http.parse_request.to.string",
+            "Vec<T>::push",
+            "HashMap<K, V>::insert",
+            "locate.rs",
+            "search query",
+            "send",
+            "who calls parse",
+            "callers of parse",
+            "the search package",
+            "Query type definition",
+            "find the Run method",
+            "Vec<Token>",
+            "Option<Config>",
+            // A sentence spelling one name beside a word for its kind.
+            "where is the parse function defined",
+            "where is formatKeywords called",
+        ] {
+            assert!(query_is_name_shaped(query), "{query:?} is a name query");
+        }
+        for query in [
+            SEARCH_KEYWORDS_QUESTION,
+            "format search keywords",
+            "compute sha256 digest",
+            "when I send a command, how does it reach the socket",
+            // A short sentence is not a name for being short.
+            "Walk me through the path",
+            "how is the config loaded",
+            "where are errors handled",
+            "when I send a command",
+            // One word for a kind of code does not make two names one.
+            "how is the config file loaded",
+            // Nor does it make a sentence with no name a name query.
+            "where is the function defined",
+            "Result<Config, Error>",
+        ] {
+            assert!(!query_is_name_shaped(query), "{query:?} is a description");
+        }
+
+        // Generic arguments are lifted out of the path they break, and member
+        // operators are written as dots.
+        for (query, normalized, arguments) in [
+            ("Vec<T>::push", "Vec::push", vec!["T"]),
+            ("HashMap<K, V>::insert", "HashMap::insert", vec!["K, V"]),
+            ("Foo::<T>::bar", "Foo::bar", vec!["T"]),
+            ("Vec<Vec<u8>>::len", "Vec::len", vec!["Vec<u8>"]),
+            ("Vec<Token>", "Vec", vec!["Token"]),
+            ("$this->handle", "$this.handle", vec![]),
+            ("Parser#parse", "Parser.parse", vec![]),
+            ("is a < b here", "is a < b here", vec![]),
+        ] {
+            assert_eq!(
+                normalize_query_paths(query),
+                (
+                    normalized.to_string(),
+                    arguments.into_iter().map(String::from).collect::<Vec<_>>()
+                ),
+                "{query:?}"
+            );
+        }
+        // And read as words of their own.
+        assert_eq!(
+            spell_query_names("Vec<Token>"),
+            vec![
+                SpelledName::Word("Vec".to_string()),
+                SpelledName::Word("Token".to_string())
+            ]
+        );
+
+        // The camelCase hump and a word mixing letters with digits are
+        // identifier shape; an opening capital is not.
+        for token in [
+            "formatKeywords",
+            "getReply",
+            "QueryWithContext",
+            "HTTP",
+            "parse_request",
+            "sha256",
+            "base64",
+        ] {
+            assert!(
+                token_is_identifier_shaped(token),
+                "{token} is an identifier"
+            );
+        }
+        // A version label mixes letters with digits and is still a word.
+        for token in [
+            "Query", "search", "Walk", "keywords", "I", "256", "v1", "V2", "v10", "v1beta1",
+            "v2alpha3", "v1rc2",
+        ] {
+            assert!(!token_is_identifier_shaped(token), "{token} is a word");
+        }
+
+        // Without the graph a qualifier is judged by its shape, so this reads
+        // the paths the way the pure predicates do.
+        let granted = |query: &str, name: &str, file: Option<&str>| {
+            !NameQuery::parse(query).withholds_tier(name, file)
+        };
+        // The matched-pair description names none of the rows that held the
+        // tier on it.
+        for name in [
+            "Client.Query",
+            "search",
+            "Query",
+            "Query.Keywords",
+            "FilterOptions.Search",
+            "searcher.search",
+        ] {
+            assert!(
+                query_names_entity(SEARCH_KEYWORDS_QUESTION, name),
+                "control: the description contains {name}"
+            );
+            assert!(
+                !granted(SEARCH_KEYWORDS_QUESTION, name, None),
+                "{name} is a word the description used, not a symbol it asked for"
+            );
+        }
+        // A description that spells an identifier still asks for it.
+        assert!(granted(
+            "how does formatKeywords quote a keyword that carries a qualifier",
+            "formatKeywords",
+            None
+        ));
+        // Name queries, including the paths a caller writes one name with.
+        assert!(granted("formatKeywords", "formatKeywords", None));
+        assert!(granted("search", "search", None));
+        assert!(granted("search", "searcher.search", None));
+        assert!(granted(
+            "search::quote",
+            "quote",
+            Some("pkg/search/query.go")
+        ));
+        assert!(granted("Query.String", "Query.String", None));
+        assert!(granted("requests.Session.get", "Session.get", None));
+        assert!(granted(
+            "self.handle_request",
+            "Server.handle_request",
+            None
+        ));
+        assert!(granted(
+            "locate.rs",
+            "locate",
+            Some("src/commands/locate.rs")
+        ));
+        // A qualifier says where the name lives; it is not the name.
+        assert!(!granted(
+            "search::quote",
+            "search",
+            Some("pkg/search/query.go")
+        ));
+        assert!(!granted("Query.String", "Query", None));
+        assert!(!granted(
+            "InMemoryGraph::prune_orphaned_vectors",
+            "InMemoryGraph",
+            None
+        ));
+        // A path names the one its qualifier files it under, and no other.
+        assert!(!granted(
+            "search::quote",
+            "quote",
+            Some("pkg/other/quote.go")
+        ));
+        // A path's leaf does not name another owner's member.
+        assert!(!granted("Query.String", "Qualifiers.String", None));
+        // A receiver's member is not a free symbol of the same name.
+        assert!(!granted("self.handle_request", "handle_request", None));
+        // The fused arm's empty fallback keeps the match kind's answer.
+        assert!(granted("", "anything", None));
+    }
+
+    /// The rule before the exact-name tier read descriptions, restated from its
+    /// source: every name hit took the tier unless the query was prose
+    /// ([`query_is_prose`]) and no symbol-shaped token or qualified path named
+    /// it.
+    fn prose_rule_tier(query: &str, name: &str) -> u8 {
+        if !query_names_entity(query, name) {
+            return 0;
+        }
+        let target = name.to_ascii_lowercase();
+        let tail = qualified_name_tail(&target);
+        let symbolic = query_tokens(query).any(|token| {
+            let lowered = token.to_ascii_lowercase();
+            (lowered == target || lowered == tail) && is_symbolic_search_term(token)
+        }) || query_qualified_paths(query).any(|path| {
+            let lowered = path.to_ascii_lowercase();
+            lowered == target || qualified_path_names_entity(&lowered, &target)
+        });
+        u8::from(!query_is_prose(query) || symbolic)
+    }
+
+    /// The rule main runs, restated from its source. A query spelling more than
+    /// two tokens, a qualified path counting once, was a description whose
+    /// plain words asked for nothing. In a shorter query a qualifier named
+    /// nothing and a path's last segment named only an entity stored under that
+    /// bare name. In any query a symbol-shaped token (the camelCase hump
+    /// included) or a whole qualified path named its entity.
+    fn token_rule_tier(query: &str, name: &str) -> u8 {
+        if !query_names_entity(query, name) {
+            return 0;
+        }
+        let target = name.to_ascii_lowercase();
+        // Every token in its place: 0 outside a path, 1 a qualifier, 2 a leaf.
+        let mut places: Vec<(&str, u8)> = Vec::new();
+        for run in
+            query.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':'))
+        {
+            let path = run.trim_matches(|c| c == '.' || c == ':');
+            let qualified = path.contains('.') || path.contains("::");
+            let tokens: Vec<&str> = query_tokens(run).collect();
+            let last = tokens.len().saturating_sub(1);
+            for (index, token) in tokens.into_iter().enumerate() {
+                let place = if !qualified {
+                    0
+                } else if index == last {
+                    2
+                } else {
+                    1
+                };
+                places.push((token, place));
+            }
+        }
+        let names = |token: &str, place: u8| {
+            let lowered = token.to_ascii_lowercase();
+            match place {
+                1 => false,
+                2 => lowered == target,
+                _ => lowered == target || lowered == qualified_name_tail(&target),
+            }
+        };
+        let identifier = |token: &str| {
+            is_symbolic_search_term(token)
+                || token
+                    .as_bytes()
+                    .windows(2)
+                    .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
+        };
+        let symbolic = places
+            .iter()
+            .any(|&(token, place)| identifier(token) && names(token, place))
+            || query_qualified_paths(query).any(|path| {
+                let lowered = path.to_ascii_lowercase();
+                lowered == target || qualified_path_names_entity(&lowered, &target)
+            });
+        let units = query_tokens(query).count().saturating_sub(
+            query_qualified_paths(query)
+                .map(|path| query_tokens(path).count().saturating_sub(1))
+                .sum(),
+        );
+        u8::from(
+            symbolic || (units <= 2 && places.iter().any(|&(token, place)| names(token, place))),
+        )
+    }
+
+    /// Every name the table below asks about, with its kind and file, stored so
+    /// the gate can ask the graph what each qualifier names.
+    fn name_tier_table_graph() -> kin_db::InMemoryGraph {
+        let graph = kin_db::InMemoryGraph::new();
+        for (name, path, kind) in [
+            ("search", "pkg/search/query.go", EntityKind::Module),
+            ("Query", "pkg/search/query.go", EntityKind::Class),
+            ("Query.String", "pkg/search/query.go", EntityKind::Method),
+            ("Qualifiers", "pkg/search/query.go", EntityKind::Class),
+            (
+                "Qualifiers.String",
+                "pkg/search/query.go",
+                EntityKind::Method,
+            ),
+            ("quote", "pkg/search/query.go", EntityKind::Function),
+            ("quote", "pkg/other/quote.go", EntityKind::Function),
+            (
+                "formatKeywords",
+                "pkg/search/query.go",
+                EntityKind::Function,
+            ),
+            ("Client", "api/client.go", EntityKind::Class),
+            ("Client.Query", "api/client.go", EntityKind::Method),
+            ("parse", "src/parse.rs", EntityKind::Function),
+            ("sha256", "src/digest.rs", EntityKind::Function),
+            ("Cmd.Run", "cmd/run.go", EntityKind::Method),
+            ("Server.handle_request", "server.py", EntityKind::Method),
+            ("handle_request", "handlers.py", EntityKind::Function),
+            ("Button.handleClick", "src/Button.tsx", EntityKind::Method),
+            ("Stack::push", "src/stack.rs", EntityKind::Method),
+            ("Cache::insert", "src/cache.rs", EntityKind::Method),
+            ("Foo::bar", "src/foo.rs", EntityKind::Method),
+            ("Counter::next", "src/counter.rs", EntityKind::Method),
+            (
+                "locate",
+                "crates/kin-cli/src/commands/locate.rs",
+                EntityKind::Module,
+            ),
+            ("send", "sockcompat.h", EntityKind::Macro),
+            ("redisReaderGetReply", "read.c", EntityKind::Function),
+            // Words a short sentence uses that symbols are named after.
+            ("Walk", "path/filepath/path.go", EntityKind::Function),
+            ("path", "path/path.go", EntityKind::Module),
+            ("config", "internal/config/load.go", EntityKind::Module),
+            ("Config", "internal/config/load.go", EntityKind::Class),
+            ("errors", "errors/errors.go", EntityKind::Module),
+            // A Go root package: every file at the root declares `cobra`.
+            ("cobra", "command.go", EntityKind::Module),
+            ("Command", "command.go", EntityKind::Class),
+            // A Rust crate, whose root is stored as `crate`, and a member
+            // elsewhere named like the item the crate path names.
+            ("crate", "crates/kin-model/src/lib.rs", EntityKind::Module),
+            (
+                "Entity",
+                "crates/kin-model/src/entity.rs",
+                EntityKind::Class,
+            ),
+            (
+                "Record::Entity",
+                "crates/kin-db/src/record.rs",
+                EntityKind::EnumVariant,
+            ),
+            // A C++ namespace, stored as a module row in the file that opens
+            // it, with its members stored bare.
+            ("utils", "src/string_helpers.cpp", EntityKind::Module),
+            ("helper", "src/string_helpers.cpp", EntityKind::Function),
+            (
+                "cv",
+                "modules/core/include/opencv2/core/mat.hpp",
+                EntityKind::Module,
+            ),
+            (
+                "Mat",
+                "modules/core/include/opencv2/core/mat.hpp",
+                EntityKind::Class,
+            ),
+            // Go packages named in two letters.
+            ("db", "internal/db/query.go", EntityKind::Module),
+            ("Query", "internal/db/query.go", EntityKind::Function),
+            (
+                "v1",
+                "staging/src/k8s.io/api/core/v1/types.go",
+                EntityKind::Module,
+            ),
+            (
+                "Pod",
+                "staging/src/k8s.io/api/core/v1/types.go",
+                EntityKind::Class,
+            ),
+            ("Token", "src/token.rs", EntityKind::Class),
+            ("debounce", "debounce.js", EntityKind::Function),
+        ] {
+            let mut entity = test_entity(name, path, 1, 10);
+            entity.kind = kind;
+            graph.upsert_entity(&entity).unwrap();
+        }
+        graph
+    }
+
+    /// Name queries row by row against the two rules before this one, with the
+    /// descriptive cases beside them.
+    ///
+    /// `prose` is the rule before the tier read descriptions
+    /// ([`prose_rule_tier`]) and `main` is the rule main runs
+    /// ([`token_rule_tier`]); every row asserts both, so each column is that
+    /// rule's real answer and not a claim about it. `now` is this gate with the
+    /// graph's reading of each qualifier. Where `now` departs from `main`, `why`
+    /// says which rule decided it, and a row that departs from nothing says
+    /// nothing. The rows after the first thirty-two are the shapes a review of
+    /// this gate found moved from main: short sentences, package-qualified free
+    /// names, version words and generic arguments. Each holds main's tier.
+    #[test]
+    #[serial_test::serial]
+    fn name_queries_keep_the_tier_main_gives_them_except_where_a_path_says_otherwise() {
+        const WORDS_OF_KIND: &str =
+            "connectives, question words and words for a kind of code spell no name";
+        const FILE_NAME: &str = "a file name asks for what is declared in that file";
+        let _demotion = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_PROSE_NAME_DEMOTION", "1");
+        let graph = name_tier_table_graph();
+        let rows: &[(&str, &str, &str, u8, u8, u8, &str)] = &[
+            ("parse", "parse", "src/parse.rs", 1, 1, 1, ""),
+            (
+                "who calls parse",
+                "parse",
+                "src/parse.rs",
+                1,
+                0,
+                1,
+                WORDS_OF_KIND,
+            ),
+            (
+                "callers of parse",
+                "parse",
+                "src/parse.rs",
+                1,
+                0,
+                1,
+                WORDS_OF_KIND,
+            ),
+            (
+                "the search package",
+                "search",
+                "pkg/search/query.go",
+                1,
+                0,
+                1,
+                WORDS_OF_KIND,
+            ),
+            (
+                "Query type definition",
+                "Query",
+                "pkg/search/query.go",
+                1,
+                0,
+                1,
+                WORDS_OF_KIND,
+            ),
+            (
+                "compute sha256 digest",
+                "sha256",
+                "src/digest.rs",
+                1,
+                0,
+                1,
+                "a word mixing letters with digits is identifier shape",
+            ),
+            (
+                "find the Run method",
+                "Cmd.Run",
+                "cmd/run.go",
+                1,
+                0,
+                1,
+                WORDS_OF_KIND,
+            ),
+            (
+                "formatKeywords",
+                "formatKeywords",
+                "pkg/search/query.go",
+                1,
+                1,
+                1,
+                "",
+            ),
+            (
+                "where is formatKeywords called",
+                "formatKeywords",
+                "pkg/search/query.go",
+                0,
+                1,
+                1,
+                "",
+            ),
+            (
+                "Query.String",
+                "Query.String",
+                "pkg/search/query.go",
+                1,
+                1,
+                1,
+                "",
+            ),
+            ("Query.String", "Query", "pkg/search/query.go", 1, 0, 0, ""),
+            (
+                "Query.String",
+                "Qualifiers.String",
+                "pkg/search/query.go",
+                1,
+                0,
+                0,
+                "",
+            ),
+            ("search::quote", "quote", "pkg/search/query.go", 1, 1, 1, ""),
+            (
+                "search::quote",
+                "quote",
+                "pkg/other/quote.go",
+                1,
+                1,
+                0,
+                "search is a stored package and this quote is not filed in it",
+            ),
+            ("search::quote", "search", "pkg/search/query.go", 1, 0, 0, ""),
+            (
+                "c.Query",
+                "Client.Query",
+                "api/client.go",
+                1,
+                0,
+                1,
+                "c is no stored type or package and a member is named Query, so the path names it",
+            ),
+            (
+                "c.Query",
+                "Query",
+                "pkg/search/query.go",
+                1,
+                1,
+                0,
+                "c is no stored type or package and a member is named Query, so the path names it",
+            ),
+            (
+                "self.handle_request",
+                "Server.handle_request",
+                "server.py",
+                1,
+                0,
+                1,
+                "self names the enclosing instance, so the path names its member",
+            ),
+            (
+                "self.handle_request",
+                "handle_request",
+                "handlers.py",
+                1,
+                1,
+                0,
+                "self names the enclosing instance, so the path names its member",
+            ),
+            (
+                "this.handleClick",
+                "Button.handleClick",
+                "src/Button.tsx",
+                1,
+                0,
+                1,
+                "this names the enclosing instance, so the path names its member",
+            ),
+            (
+                "Vec<T>::push",
+                "Stack::push",
+                "src/stack.rs",
+                1,
+                0,
+                1,
+                "generic arguments belong to the path, and Vec is no stored type, so it names a member",
+            ),
+            (
+                "HashMap<K, V>::insert",
+                "Cache::insert",
+                "src/cache.rs",
+                1,
+                0,
+                1,
+                "generic arguments belong to the path, and HashMap is no stored type, so it names a member",
+            ),
+            (
+                "Foo::<T>::bar",
+                "Foo::bar",
+                "src/foo.rs",
+                1,
+                0,
+                1,
+                "a turbofish belongs to the path, which names Foo::bar",
+            ),
+            (
+                "Iterator::next",
+                "Counter::next",
+                "src/counter.rs",
+                1,
+                0,
+                1,
+                "Iterator is no stored type or package, so the path names an implementor's member",
+            ),
+            (
+                "locate.rs",
+                "locate",
+                "crates/kin-cli/src/commands/locate.rs",
+                1,
+                0,
+                1,
+                FILE_NAME,
+            ),
+            (
+                "query.go",
+                "Query",
+                "pkg/search/query.go",
+                1,
+                0,
+                1,
+                FILE_NAME,
+            ),
+            ("query.go", "Client.Query", "api/client.go", 1, 0, 0, ""),
+            (
+                SEARCH_KEYWORDS_QUESTION,
+                "search",
+                "pkg/search/query.go",
+                1,
+                0,
+                0,
+                "",
+            ),
+            (
+                SEARCH_KEYWORDS_QUESTION,
+                "Client.Query",
+                "api/client.go",
+                1,
+                0,
+                0,
+                "",
+            ),
+            (
+                "when I send a command, how does it reach the socket",
+                "send",
+                "sockcompat.h",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "how does redisReaderGetReply handle a partial reply",
+                "redisReaderGetReply",
+                "read.c",
+                1,
+                1,
+                1,
+                "",
+            ),
+            (
+                "how does search::quote escape a keyword",
+                "quote",
+                "pkg/search/query.go",
+                0,
+                0,
+                1,
+                "a path in a description names what its package files",
+            ),
+            // A short sentence is a description, however few names it spells.
+            (
+                "Walk me through the path",
+                "Walk",
+                "path/filepath/path.go",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "Walk me through the path",
+                "path",
+                "path/path.go",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "how is the config loaded",
+                "config",
+                "internal/config/load.go",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "how is the config loaded",
+                "Config",
+                "internal/config/load.go",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "where are errors handled",
+                "errors",
+                "errors/errors.go",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "when I send a command",
+                "send",
+                "sockcompat.h",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "how is the config file loaded",
+                "config",
+                "internal/config/load.go",
+                0,
+                0,
+                0,
+                "",
+            ),
+            (
+                "where is the parse function defined",
+                "parse",
+                "src/parse.rs",
+                0,
+                0,
+                1,
+                "a sentence spelling one name beside a word for its kind asks for that name",
+            ),
+            // A package-qualified free name keeps the tier, and a member named
+            // by the leaf does not take it from the name the path spells.
+            ("cobra.Command", "Command", "command.go", 1, 1, 1, ""),
+            (
+                "kin_model::Entity",
+                "Entity",
+                "crates/kin-model/src/entity.rs",
+                1,
+                1,
+                1,
+                "",
+            ),
+            (
+                "kin_model::Entity",
+                "Record::Entity",
+                "crates/kin-db/src/record.rs",
+                1,
+                0,
+                0,
+                "",
+            ),
+            (
+                "utils::helper",
+                "helper",
+                "src/string_helpers.cpp",
+                1,
+                1,
+                1,
+                "",
+            ),
+            ("db.Query", "Query", "internal/db/query.go", 1, 1, 1, ""),
+            ("db.Query", "Client.Query", "api/client.go", 1, 0, 0, ""),
+            (
+                "db.Query",
+                "Query",
+                "pkg/search/query.go",
+                1,
+                1,
+                0,
+                "db is a stored package and this Query is not filed in it",
+            ),
+            (
+                "v1.Pod",
+                "Pod",
+                "staging/src/k8s.io/api/core/v1/types.go",
+                1,
+                1,
+                1,
+                "",
+            ),
+            (
+                "cv::Mat",
+                "Mat",
+                "modules/core/include/opencv2/core/mat.hpp",
+                1,
+                1,
+                1,
+                "",
+            ),
+            ("_.debounce", "debounce", "debounce.js", 1, 1, 1, ""),
+            // Generic arguments are names too.
+            ("Vec<Token>", "Token", "src/token.rs", 1, 1, 1, ""),
+            (
+                "Option<Config>",
+                "Config",
+                "internal/config/load.go",
+                1,
+                1,
+                1,
+                "",
+            ),
+            // A version word is not an identifier.
+            (
+                "how does the scheduler bind pods in v1",
+                "v1",
+                "staging/src/k8s.io/api/core/v1/types.go",
+                0,
+                0,
+                0,
+                "",
+            ),
+        ];
+        let mut disagreements = Vec::new();
+        for &(query, name, file, prose, main, now, why) in rows {
+            let mut row = mk_locate_entity(name, 1.0, true);
+            row.provenance.file = Some(file.to_string());
+            row.match_kind = Some(classify_locate_match(query, name, "", None));
+            assert_eq!(
+                row.match_kind,
+                Some(LocateMatchKind::Name),
+                "control: {query:?} contains {name}, or this row proves nothing"
+            );
+            assert_eq!(
+                prose_rule_tier(query, name),
+                prose,
+                "the prose rule on {query:?} for {name}"
+            );
+            assert_eq!(
+                token_rule_tier(query, name),
+                main,
+                "main's rule on {query:?} for {name}"
+            );
+            assert_eq!(
+                main != now,
+                !why.is_empty(),
+                "{query:?} for {name}: every departure from main says why, and only a departure"
+            );
+            let name_query = NameQuery::parse(query).resolve_qualifiers(&graph).unwrap();
+            let tier = exact_name_tier(&row, &name_query);
+            if tier != now {
+                disagreements.push(format!(
+                    "{query:?} for {name} in {file}: tier {tier}, want {now} (main {main})"
+                ));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "{} of {} rows disagree:\n{}",
+            disagreements.len(),
+            rows.len(),
+            disagreements.join("\n")
+        );
+    }
+
+    /// The pricing moves only plain-word name matches in a description, and a
+    /// collision that carries as much of the query as any row keeps its score.
+    #[test]
+    fn descriptive_evidence_prices_collisions_and_nothing_else() {
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_DESCRIPTIVE_EVIDENCE", "1")
+            .with("KIN_LOCATE_DESCRIPTIVE_EVIDENCE_EXPONENT", "2")
+            .with("KIN_LOCATE_DESCRIPTIVE_EVIDENCE_FLOOR", "0.05");
+        let concepts = descriptive_query_concepts(SEARCH_KEYWORDS_QUESTION);
+        assert_eq!(
+            concepts,
+            vec!["format", "search", "keyword", "quot", "term", "query"],
+            "stopwords carry nothing and inflections meet"
+        );
+
+        let row = |name: &str, score: f32, kind: LocateMatchKind| {
+            let mut entity = mk_locate_entity(name, score, true);
+            entity.entity_id = name.to_string();
+            entity.match_kind = Some(kind);
+            (0usize, entity)
+        };
+        let mut rows = vec![
+            row("Client.Query", 1052.0, LocateMatchKind::Name),
+            row("formatKeywords", 291.21, LocateMatchKind::TextFallback),
+            row(
+                "Client.QueryWithContext",
+                252.0,
+                LocateMatchKind::TextFallback,
+            ),
+        ];
+        // Per concept (format, search, keyword, quot, term, query): the name
+        // carries `format` and `keyword`, the body `quote`; `Client.Query`
+        // carries `query` in its name; `QueryWithContext` carries `query` too.
+        let mut weights: FxHashMap<String, Vec<f32>> = FxHashMap::default();
+        weights.insert(
+            "Client.Query".into(),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, EVIDENCE_NAME_WEIGHT],
+        );
+        weights.insert(
+            "formatKeywords".into(),
+            vec![
+                EVIDENCE_NAME_WEIGHT,
+                0.0,
+                EVIDENCE_NAME_WEIGHT,
+                EVIDENCE_BODY_WEIGHT,
+                0.0,
+                0.0,
+            ],
+        );
+        weights.insert(
+            "Client.QueryWithContext".into(),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, EVIDENCE_NAME_WEIGHT],
+        );
+        let evidence = DescriptiveEvidence::over(&rows, &weights, concepts.len());
+        rows.push(row("search", 480.0, LocateMatchKind::Name));
+        apply_descriptive_evidence(
+            &mut rows,
+            &NameQuery::parse(SEARCH_KEYWORDS_QUESTION),
+            &weights,
+            &evidence,
+        );
+        let score = |name: &str| {
+            rows.iter()
+                .find(|(_, entity)| entity.name == name)
+                .map(|(_, entity)| entity.score)
+                .unwrap()
+        };
+        assert!(
+            score("Client.Query") < score("formatKeywords"),
+            "a collision on one common word falls below the row carrying three: {} vs {}",
+            score("Client.Query"),
+            score("formatKeywords")
+        );
+        assert_eq!(
+            score("formatKeywords"),
+            291.21,
+            "a lexical row keeps its score"
+        );
+        assert_eq!(
+            score("Client.QueryWithContext"),
+            252.0,
+            "only collisions are priced, whatever they share with a collision"
+        );
+        assert_eq!(
+            score("search"),
+            480.0,
+            "a collision with no evidence on record is left alone, not charged as carrying nothing"
+        );
+
+        // A collision carrying as much as any row keeps its whole score.
+        let mut alone = vec![row("apply", 900.0, LocateMatchKind::Name)];
+        let mut alone_weights: FxHashMap<String, Vec<f32>> = FxHashMap::default();
+        alone_weights.insert("apply".into(), vec![EVIDENCE_NAME_WEIGHT]);
+        let question = "how does the editor apply an edit";
+        let evidence = DescriptiveEvidence::over(&alone, &alone_weights, 1);
+        apply_descriptive_evidence(
+            &mut alone,
+            &NameQuery::parse(question),
+            &alone_weights,
+            &evidence,
+        );
+        assert_eq!(alone[0].1.score, 900.0);
+
+        // A lookup is never priced: the tier governs it.
+        let mut lookup = vec![
+            row("search", 450.0, LocateMatchKind::Name),
+            row("formatKeywords", 291.21, LocateMatchKind::TextFallback),
+        ];
+        let evidence = DescriptiveEvidence::over(&lookup, &weights, concepts.len());
+        apply_descriptive_evidence(
+            &mut lookup,
+            &NameQuery::parse("search"),
+            &weights,
+            &evidence,
+        );
+        assert_eq!(lookup[0].1.score, 450.0);
+    }
+
+    /// The light stemmer meets the inflections the matched-pair question used
+    /// and leaves short and irregular words whole.
+    #[test]
+    fn the_evidence_stemmer_meets_inflections() {
+        for (word, stem) in [
+            ("formatting", "format"),
+            ("formatted", "format"),
+            ("formats", "format"),
+            ("format", "format"),
+            ("quoting", "quot"),
+            ("quoted", "quot"),
+            ("quote", "quot"),
+            ("keywords", "keyword"),
+            ("queries", "query"),
+            ("searches", "search"),
+            ("terms", "term"),
+            ("string", "string"),
+            ("user", "user"),
+            ("class", "class"),
+            ("status", "status"),
+            // An `-er` root meets its `-ing` form.
+            ("filtering", "filt"),
+            ("filter", "filt"),
+            ("ordering", "ord"),
+            ("order", "ord"),
+            ("formatter", "format"),
+            ("parser", "pars"),
+            ("parse", "pars"),
+        ] {
+            assert_eq!(evidence_stem(word), stem, "{word}");
+        }
+        let stems = evidence_stems("func formatKeywords(ks []string) []string { quote(k) }");
+        assert!(evidence_covers(&stems, "keyword"));
+        assert!(evidence_covers(&stems, "quot"));
+        assert!(
+            !evidence_covers(&evidence_stems("terminal"), "term"),
+            "a four-letter stem does not match a longer word by prefix"
+        );
+        assert!(evidence_covers(&evidence_stems("configuration"), "config"));
+    }
+
+    /// A container is read by its name and where it is filed, never by its
+    /// body, which is every declaration in it.
+    #[test]
+    fn a_module_row_carries_its_name_and_where_it_is_filed() {
+        let concepts = descriptive_query_concepts(SEARCH_KEYWORDS_QUESTION);
+        let mut module = test_entity("search", "pkg/search/query.go", 1, 80);
+        module.kind = EntityKind::Module;
+        module.signature = "package pkg/search/query.go".to_string();
+        module.metadata.extra.insert(
+            kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.to_string(),
+            serde_json::Value::String(
+                "func formatKeywords(ks []string) []string { quote(k) } query".to_string(),
+            ),
+        );
+        let weights = entity_concept_weights(&module, &concepts);
+        let carried: Vec<&str> = concepts
+            .iter()
+            .zip(&weights)
+            .filter(|(_, weight)| **weight > 0.0)
+            .map(|(concept, _)| concept.as_str())
+            .collect();
+        assert_eq!(
+            carried,
+            vec!["search", "query"],
+            "the package name and its file's stem, and nothing it contains"
+        );
+
+        // A package answer to a description of what it does: its file names
+        // the behavior. "package" and "files" say what kind of answer is
+        // wanted and carry nothing.
+        let described = descriptive_query_concepts("which package parses config files");
+        assert_eq!(described, vec!["pars", "config"]);
+        let mut config = test_entity("config", "internal/config/parse.go", 1, 40);
+        config.kind = EntityKind::Module;
+        assert_eq!(
+            entity_concept_weights(&config, &described),
+            vec![EVIDENCE_DECLARED_WEIGHT, EVIDENCE_NAME_WEIGHT]
+        );
+
+        let mut function = module.clone();
+        function.kind = EntityKind::Function;
+        function.name = "formatKeywords".to_string();
+        let weights = entity_concept_weights(&function, &concepts);
+        assert!(weights[concepts.iter().position(|c| c == "quot").unwrap()] > 0.0);
+    }
+
+    /// One package keeps one module row, at its best-placed file's rank.
+    #[test]
+    #[serial_test::serial]
+    fn package_module_rows_fold_into_their_first() {
+        let module = |file: &str| {
+            let mut entity = mk_locate_entity("search", 450.0, true);
+            entity.entity_id = file.to_string();
+            entity.kind = "module".to_string();
+            entity.provenance.file = Some(file.to_string());
+            entity
+        };
+        let function = |name: &str| {
+            let mut entity = mk_locate_entity(name, 300.0, true);
+            entity.entity_id = name.to_string();
+            entity.provenance.file = Some("pkg/search/query.go".to_string());
+            entity
+        };
+        let rows = vec![
+            module("pkg/search/query.go"),
+            function("formatKeywords"),
+            module("pkg/search/searcher.go"),
+            module("pkg/cmd/search/search.go"),
+            module("pkg/search/result.go"),
+        ];
+
+        let _on = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLAPSE_PACKAGE_MODULES", "1");
+        let mut folded = rows.clone();
+        collapse_package_module_rows(&mut folded);
+        let shape: Vec<(&str, usize)> = folded
+            .iter()
+            .map(|entity| (entity.identity_key(), entity.collapsed_rows))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("pkg/search/query.go", 2),
+                ("formatKeywords", 0),
+                ("pkg/cmd/search/search.go", 0),
+            ]
+        );
+
+        // The fused arm meets two kept rows of one package, each already
+        // folding the rest. Adding the counts would count files twice.
+        let mut first = module("pkg/search/query.go");
+        first.collapsed_rows = 3;
+        let mut second = module("pkg/search/searcher.go");
+        second.collapsed_rows = 3;
+        let mut fused = vec![first, second];
+        collapse_package_module_rows(&mut fused);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].collapsed_rows, 3);
+
+        // Only Go's rule is one package per directory. Elsewhere two module
+        // rows sharing a name and a directory are two modules, and neither
+        // hides behind the other.
+        let named = |name: &str, file: &str| {
+            let mut entity = module(file);
+            entity.name = name.to_string();
+            entity
+        };
+        let mut distinct = vec![
+            named("crate", "src/lib.rs"),
+            named("crate", "src/main.rs"),
+            named("pkg", "pkg/__init__.py"),
+            named("pkg", "pkg/pkg.py"),
+            named("Button", "src/Button/index.ts"),
+            named("Button", "src/Button/Button.tsx"),
+        ];
+        collapse_package_module_rows(&mut distinct);
+        assert_eq!(distinct.len(), 6, "nothing folds outside Go");
+        assert!(distinct.iter().all(|entity| entity.collapsed_rows == 0));
+        drop(_on);
+
+        // The kill switch keeps every row.
+        let _off = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLAPSE_PACKAGE_MODULES", "0");
+        let mut kept = rows.clone();
+        collapse_package_module_rows(&mut kept);
+        assert_eq!(kept.len(), rows.len());
+    }
+
+    /// The prose rules keep the scope they were measured on.
+    ///
+    /// The corroboration penalty, and the loss of the entity-surface exemption,
+    /// fire on a sentence's plain-word name hits and on nothing wider. A keyword
+    /// description's plain-word hits lose the exact-name tier and pay the
+    /// descriptive price, and only that: with the price switched off they keep
+    /// their whole score.
+    #[test]
+    #[serial_test::serial]
+    fn prose_rules_fire_on_sentences_and_not_on_keyword_descriptions() {
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_DESCRIPTIVE_EVIDENCE", "0")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1")
+            .with("KIN_LOCATE_COLLISION_LONE_FLOOR", "0.75")
+            .with("KIN_LOCATE_FILE_ANCHORS", "0")
+            .with("KIN_LOCATE_PROSE_NAME_DEMOTION", "1")
+            .with("KIN_LOCATE_ENTITY_SURFACE_PENALTY", "0.3");
+        let graph = kin_db::InMemoryGraph::new();
+        let lone = test_entity("search", "pkg/lone/lone.go", 10, 20);
+        graph.upsert_entity(&lone).unwrap();
+        let mut suite = test_entity("keywords", "pkg/kw/kw.go", 10, 20);
+        suite.kind = EntityKind::Test;
+        graph.upsert_entity(&suite).unwrap();
+        let other = test_entity("formatKeywords", "pkg/format/format.go", 10, 20);
+        graph.upsert_entity(&other).unwrap();
+        let symbol = |name: &str, kind: &str, score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some([10, 20]),
+            score,
+            kind: kind.to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let build = |query: &str| {
+            let mut result = LocateResult {
+                files: vec![
+                    corroboration_file(
+                        "pkg/lone/lone.go",
+                        0.3,
+                        vec![symbol("search", "function", 450.0)],
+                    ),
+                    corroboration_file(
+                        "pkg/kw/kw.go",
+                        0.2,
+                        vec![symbol("keywords", "test", 300.0)],
+                    ),
+                    corroboration_file(
+                        "pkg/format/format.go",
+                        0.1,
+                        vec![symbol("formatKeywords", "function", 291.0)],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                query,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .map(|entity| (entity.name.clone(), entity.score))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+
+        let keyword_query = "formatting search keywords quoting search terms";
+        assert!(
+            !query_is_prose(keyword_query) && !query_is_name_shaped(keyword_query),
+            "control: a keyword description, not a sentence and not a name"
+        );
+        let keywords = build(keyword_query);
+        assert_eq!(
+            keywords["search"], 450.0,
+            "no corroboration penalty outside prose: {keywords:?}"
+        );
+        assert_eq!(
+            keywords["keywords"], 300.0,
+            "the entity-surface exemption holds outside prose: {keywords:?}"
+        );
+
+        let sentence = "where do we format the search keywords and quote the terms";
+        assert!(query_is_prose(sentence), "control: a sentence");
+        let prose = build(sentence);
+        assert!(
+            (prose["search"] - 337.5).abs() < 0.01,
+            "a sentence's lone collision takes the corroboration floor: {prose:?}"
+        );
+        assert!(
+            (prose["keywords"] - 300.0 * 0.3 * 0.75).abs() < 0.01,
+            "and a sentence's test-support collision loses its exemption: {prose:?}"
+        );
+    }
+
+    /// A tracked file with no parsed entities is weighed by its own name, its
+    /// directories and its text, so a description that names it does not
+    /// price it as if it carried nothing. Before, an artifact row had no
+    /// evidence on record and a description naming it kept five percent of
+    /// its score.
+    #[test]
+    #[serial_test::serial]
+    fn an_artifact_a_description_names_keeps_its_answer() {
+        let graph = kin_db::InMemoryGraph::new();
+        admit_test_source(
+            &graph,
+            "Dockerfile",
+            "FROM debian:12\nRUN apt-get update && apt-get install -y git curl build-essential\n",
+        );
+        admit_test_source(
+            &graph,
+            "docs/notes.md",
+            "Notes on the build image and the release process.\n",
+        );
+        graph.flush_text_index().unwrap();
+        let question = "which system packages does the Dockerfile install for the build image";
+        assert!(
+            !query_is_name_shaped(question),
+            "control: a description, so the price applies"
+        );
+        let dockerfile = |evidence: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_DESCRIPTIVE_EVIDENCE", evidence);
+            let result = agent_locate(&graph, question);
+            result
+                .entities
+                .iter()
+                .find(|entity| entity.artifact_path.as_deref() == Some("Dockerfile"))
+                .map(|entity| (entity.score, entity.match_kind))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the Dockerfile must be ranked, got {:?}",
+                        ranked_names(&result)
+                    )
+                })
+        };
+        let (unpriced, kind) = dockerfile("0");
+        assert_eq!(
+            kind,
+            Some(LocateMatchKind::Name),
+            "control: the description names the file, so it is a collision the price reads"
+        );
+        let (priced, _) = dockerfile("1");
+        assert_eq!(
+            priced, unpriced,
+            "the file carries more of the question than any other row, so it keeps its whole score"
+        );
+    }
+
+    /// An artifact a description merely names is priced like any other plain
+    /// word collision, by what it carries: its own name, its directories and
+    /// its text.
+    ///
+    /// The question names two files and asks what one of them installs. The
+    /// `Dockerfile` carries its name, `install` and `build`; the `Makefile`
+    /// carries its name and `build`, so it keeps less than its whole score and
+    /// the `Dockerfile` keeps all of its. With no evidence on record for an
+    /// artifact, both would keep their scores whatever they carried, and the
+    /// test above could not tell.
+    #[test]
+    #[serial_test::serial]
+    fn an_artifact_a_description_merely_names_is_priced_by_what_it_carries() {
+        let graph = kin_db::InMemoryGraph::new();
+        admit_test_source(
+            &graph,
+            "Dockerfile",
+            "FROM debian:12\nRUN apt-get update && apt-get install -y git curl build-essential\n",
+        );
+        admit_test_source(&graph, "Makefile", "all:\n\tdocker build -t app .\n");
+        graph.flush_text_index().unwrap();
+        let question =
+            "does the Makefile or the Dockerfile install the system packages for the build image";
+        assert!(
+            !query_is_name_shaped(question),
+            "control: a description, so the price applies"
+        );
+        let scores = |evidence: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_DESCRIPTIVE_EVIDENCE", evidence);
+            let result = agent_locate(&graph, question);
+            let row = |path: &str| {
+                result
+                    .entities
+                    .iter()
+                    .find(|entity| entity.artifact_path.as_deref() == Some(path))
+                    .map(|entity| (entity.score, entity.match_kind))
+                    .unwrap_or_else(|| {
+                        panic!("{path} must be ranked, got {:?}", ranked_names(&result))
+                    })
+            };
+            (row("Dockerfile"), row("Makefile"))
+        };
+        let ((docker_unpriced, docker_kind), (make_unpriced, make_kind)) = scores("0");
+        for kind in [docker_kind, make_kind] {
+            assert_eq!(
+                kind,
+                Some(LocateMatchKind::Name),
+                "control: the question names both files, so both are collisions the price reads"
+            );
+        }
+        let ((docker_priced, _), (make_priced, _)) = scores("1");
+        assert_eq!(
+            docker_priced, docker_unpriced,
+            "the file carrying the most of the question keeps its whole score"
+        );
+        assert!(
+            make_priced < make_unpriced,
+            "the file the question merely names keeps only its share: {make_priced} of {make_unpriced}"
         );
     }
 
@@ -23306,14 +26925,22 @@ mod tests {
         }
 
         let question = "where HTTP redirects are resolved and followed after a response";
-        let build = |band: &str| {
+        let build_with = |band: &str, evidence: &str| {
             // The flag is pinned beside the band for the reason the fixture
             // above spells out: this arm reads the anchor knobs from the
             // process environment, and a neighbour holding
             // `KIN_LOCATE_FILE_ANCHORS=0` would empty the anchor set under it.
+            //
+            // The evidence price is pinned too, because this fixture's
+            // arithmetic is the band rule's alone: it needs `Response` to ship
+            // at the 349.06 the corroboration rule leaves it. The evidence
+            // price moves that same row, since "response" is the only word of
+            // the question it carries, and the default-profile run below pins
+            // what that does to the answer.
             let _guard =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", band)
-                    .with("KIN_LOCATE_FILE_ANCHORS", "1");
+                    .with("KIN_LOCATE_FILE_ANCHORS", "1")
+                    .with("KIN_LOCATE_DESCRIPTIVE_EVIDENCE", evidence);
             let mut result = LocateResult {
                 files: vec![
                     file(
@@ -23345,6 +26972,7 @@ mod tests {
             .unwrap();
             result
         };
+        let build = |band: &str| build_with(band, "0");
 
         let rank_of = |result: &LocateResult, name: &str| {
             result
@@ -23400,6 +27028,34 @@ mod tests {
                 .iter()
                 .any(|entity| entity.provenance.origin == FILE_ANCHOR_ORIGIN),
             "the anchors still rank, they just rank beneath the evidence"
+        );
+
+        // The default profile. `Response` carries one word of the question and
+        // the answer carries two (`resolve`, `redirects`), so the collision is
+        // priced under the answer, which then sits behind `TooManyRedirects`
+        // alone. Still no anchor above it, and the anchors still rank.
+        let priced = build_with("0.25", "1");
+        let shape = priced
+            .entities
+            .iter()
+            .map(|e| (&e.name, e.score, &e.provenance.origin))
+            .collect::<Vec<_>>();
+        let priced_rank = rank_of(&priced, "SessionRedirectMixin.resolve_redirects");
+        assert_eq!(
+            priced_rank, 2,
+            "a collision on one word no longer outranks the answer: {shape:?}"
+        );
+        assert_eq!(priced.entities[0].name, "TooManyRedirects", "{shape:?}");
+        assert!(
+            rank_of(&priced, "Response") > priced_rank,
+            "the collision ranks beneath the answer: {shape:?}"
+        );
+        assert!(
+            priced
+                .entities
+                .iter()
+                .any(|entity| entity.provenance.origin == FILE_ANCHOR_ORIGIN),
+            "the anchors still rank: {shape:?}"
         );
     }
 
@@ -24762,7 +28418,12 @@ mod tests {
             ("crates/b.rs".to_string(), 0.5_f32),
         ];
         let before = fused.clone();
-        apply_lexical_parity_floor(&mut fused, &graph, "resolve repository identifier manifest");
+        apply_lexical_parity_floor(
+            &mut fused,
+            &graph,
+            "resolve repository identifier manifest",
+            &mut Vec::new(),
+        );
         assert_eq!(
             fused, before,
             "empty graph yields no lexical matches, so the floor must not change fusion"
@@ -24852,7 +28513,7 @@ mod tests {
             let _budget =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "1024");
             let mut fused = base();
-            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION, &mut Vec::new());
             assert_eq!(
                 order(&fused).last().map(String::as_str),
                 Some("type_operations"),
@@ -24871,7 +28532,7 @@ mod tests {
         {
             let _budget = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_LEXICAL_FLOOR_BUDGET");
             let mut fused = base();
-            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION, &mut Vec::new());
             let o = order(&fused);
             assert_eq!(
                 &o[..2],
@@ -24902,7 +28563,7 @@ mod tests {
             let _budget =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "2");
             let mut fused = base();
-            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION, &mut Vec::new());
             let o = order(&fused);
             assert_eq!(
                 &o[..4],
@@ -24919,7 +28580,7 @@ mod tests {
             let _budget =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "3");
             let mut fused = base();
-            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION, &mut Vec::new());
             let scores: HashMap<&str, f32> = fused.iter().map(|(p, s)| (p.as_str(), *s)).collect();
             assert!(
                 scores["src/junk_00_editor.rs"] > 0.7,
@@ -24938,7 +28599,7 @@ mod tests {
             let _budget =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "2");
             let mut fused = base();
-            apply_lexical_parity_floor(&mut fused, &graph, "editor");
+            apply_lexical_parity_floor(&mut fused, &graph, "editor", &mut Vec::new());
             assert_eq!(
                 order(&fused).last().map(String::as_str),
                 Some("type_operations"),
@@ -24955,10 +28616,10 @@ mod tests {
             let _zero =
                 kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "0");
             let mut zeroed = base();
-            apply_lexical_parity_floor(&mut zeroed, &graph, QUESTION);
+            apply_lexical_parity_floor(&mut zeroed, &graph, QUESTION, &mut Vec::new());
             let _unset = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_LEXICAL_FLOOR_BUDGET");
             let mut defaulted = base();
-            apply_lexical_parity_floor(&mut defaulted, &graph, QUESTION);
+            apply_lexical_parity_floor(&mut defaulted, &graph, QUESTION, &mut Vec::new());
             assert_eq!(order(&zeroed), order(&defaulted), "0 reads as unset");
         }
     }
@@ -30714,7 +34375,8 @@ mod tests {
         graph.upsert_entity(&test_fn).unwrap();
         graph.flush_text_index().unwrap();
 
-        let seeds = extract_search_signals("save_with_relations", &graph, false).unwrap();
+        let seeds =
+            extract_search_signals("save_with_relations", &graph, false, &mut Vec::new()).unwrap();
         let discovery = seeds
             .get(&test_fn.id)
             .expect("the exactly-named test entity must be seeded");
@@ -31410,6 +35072,7 @@ mod tests {
         let priorities = extract_priority_file_traces(
             "Regression in astropy.nddata.NDDataRef mask handling",
             &graph,
+            &mut Vec::new(),
         );
 
         assert!(priorities.values().all(|trace| {
@@ -31572,6 +35235,7 @@ mod tests {
         let hits = extract_cpp_private_access_test_seed_signals(
             "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
             &graph,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -31654,6 +35318,7 @@ mod tests {
         let seeds = extract_cpp_private_access_test_seed_signals(
             "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
             &graph,
+            &mut Vec::new(),
         )
         .unwrap();
         let hits = extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, true, None)
@@ -31741,6 +35406,7 @@ mod tests {
             "Implement `_experimental_snapshot/2`\n\nEnable writes with `JQ_ENABLE_SNAPSHOT=1`.",
             &graph,
             false,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -32212,7 +35878,7 @@ mod tests {
         let owner = test_entity("Owner.member", "src/owner.rs", 1, 10);
         graph.upsert_entity(&owner).unwrap();
 
-        let hit = top_lexical_tail_match("What does member do here", &graph);
+        let hit = top_lexical_tail_match("What does member do here", &graph, &mut Vec::new());
 
         assert_eq!(
             hit,
@@ -32229,7 +35895,7 @@ mod tests {
         let bare = test_entity("member", "src/bare.rs", 1, 10);
         graph.upsert_entity(&bare).unwrap();
 
-        let hit = top_lexical_tail_match("What does member do here", &graph);
+        let hit = top_lexical_tail_match("What does member do here", &graph, &mut Vec::new());
 
         assert_eq!(
             hit, None,
@@ -32248,7 +35914,7 @@ mod tests {
         let a = test_entity("OwnerA.member", "src/a.rs", 1, 10);
         graph.upsert_entity(&a).unwrap();
 
-        let hit = top_lexical_tail_match("What does member do here", &graph);
+        let hit = top_lexical_tail_match("What does member do here", &graph, &mut Vec::new());
 
         assert_eq!(
             hit,
@@ -32264,7 +35930,10 @@ mod tests {
         let unrelated = test_entity("Something.else", "src/other.rs", 1, 10);
         graph.upsert_entity(&unrelated).unwrap();
 
-        assert_eq!(top_lexical_tail_match("hello world", &graph), None);
+        assert_eq!(
+            top_lexical_tail_match("hello world", &graph, &mut Vec::new()),
+            None
+        );
     }
 
     #[test]
@@ -32274,7 +35943,12 @@ mod tests {
         graph.upsert_entity(&unrelated).unwrap();
 
         let mut priority_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
-        fold_lexical_tail_match_into_priority_hits(&mut priority_hits, "hello world", &graph);
+        fold_lexical_tail_match_into_priority_hits(
+            &mut priority_hits,
+            "hello world",
+            &graph,
+            &mut Vec::new(),
+        );
 
         assert!(
             priority_hits.is_empty(),
@@ -32294,6 +35968,7 @@ mod tests {
             &mut priority_hits,
             "What does member do here",
             &graph,
+            &mut Vec::new(),
         );
 
         let hits = priority_hits
@@ -32321,6 +35996,7 @@ mod tests {
             &mut priority_hits,
             "What does member do here",
             &graph,
+            &mut Vec::new(),
         );
 
         let hits = &priority_hits["src/owner.rs"];
@@ -32416,6 +36092,7 @@ mod tests {
         let traces = extract_priority_file_traces(
             "Remove #define private public from tests\n\nThis PR adds JSON_PRIVATE_UNLESS_TESTED for JSON_TESTS_PRIVATE.",
             &graph,
+            &mut Vec::new(),
         );
         let stale_reasons = traces
             .get("src/lib.cpp")

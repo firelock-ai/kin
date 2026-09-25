@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 use kin_blobs::BlobStore;
 use kin_index::{FileEvent, IndexPipeline};
 use kin_model::preset::{BrokenAstBehavior, ReconcilePolicy, ValidationLevel};
+use kin_model::EntityStore;
 use kin_model::{
     ConflictId, ConflictKind, ConflictObject, Entity, EntityDelta, EntityId, EntityKind,
     FilePathId, GraphNodeId, GraphStore, IntentScope, IntentSummary, ParseState, Relation,
@@ -33,6 +34,67 @@ fn is_parser_derived(relation: &Relation) -> bool {
         relation.origin,
         kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred
     )
+}
+
+/// A persisted layout may omit import enrichment (legacy canonical backfill),
+/// but cannot claim a foreign entity or stale source range. The projection cache
+/// always receives the freshly checked parser layout, never this held value.
+fn validate_restored_layout(
+    held: &kin_model::FileLayout,
+    fresh: &kin_model::FileLayout,
+    body_len: usize,
+) -> Result<()> {
+    let invalid = || {
+        ReconcileError::InvalidTransaction(format!(
+            "canonical projection layout differs from verified source for {}",
+            fresh.file_id
+        ))
+    };
+    if held.file_id != fresh.file_id {
+        return Err(invalid());
+    }
+    let regions = |layout: &kin_model::FileLayout| {
+        let mut refs = Vec::new();
+        for region in &layout.regions {
+            let range = match region {
+                kin_model::SourceRegion::EntityRef {
+                    entity_id,
+                    byte_range,
+                } => {
+                    refs.push((*entity_id, byte_range.start, byte_range.end));
+                    byte_range
+                }
+                kin_model::SourceRegion::Trivia { byte_range } => byte_range,
+            };
+            if range.start > range.end || range.end > body_len {
+                return Err(invalid());
+            }
+        }
+        refs.sort();
+        Ok(refs)
+    };
+    if regions(held)? != regions(fresh)? {
+        return Err(invalid());
+    }
+    // Empty imports at 0..0 are the documented older backfill representation.
+    // Nonempty import claims must be exactly the parser's current source map.
+    if (!held.imports.items.is_empty() || held.imports.byte_range != (0..0))
+        && serde_json::to_value(&held.imports).map_err(|_| invalid())?
+            != serde_json::to_value(&fresh.imports).map_err(|_| invalid())?
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Both inputs describe this pass's fresh source, so match occurrences rather
+/// than summing the two resolvers' counts or reviving old graph evidence.
+fn incorporate_dispatch_evidence(
+    parsed_relation: &mut Relation,
+    informed: &Relation,
+) -> Result<()> {
+    kin_index::occurrence::incorporate_fresh_dispatch(parsed_relation, informed)
+        .map_err(ReconcileError::InvalidTransaction)
 }
 
 /// The existing relation a freshly derived parser edge keeps the identity of.
@@ -83,6 +145,35 @@ fn relations_held_at<'a, G: GraphStore>(
     Ok(cache
         .get(&node)
         .expect("the entry was just inserted when it was absent"))
+}
+
+/// A checked dependent can rederive its own intra-file edge while another file
+/// is being edited. Its held parser identity is not in that edited file's
+/// relation buckets. Read its actual source adjacency rather than minting the
+/// linker's alternate id beside the pipeline's existing fact. Enrichment and
+/// manual identities remain independent evidence, even at identical endpoints.
+fn dependent_parser_identity_to_keep<G: GraphStore>(
+    graph: &G,
+    cache: &mut HashMap<GraphNodeId, HashMap<RelationId, Relation>>,
+    candidate: &Relation,
+) -> Result<Option<Relation>> {
+    if !matches!(
+        (candidate.src, candidate.dst),
+        (GraphNodeId::Entity(_), GraphNodeId::Entity(_))
+    ) || !is_parser_derived(candidate)
+    {
+        return Ok(None);
+    }
+    Ok(relations_held_at(graph, cache, candidate.src)?
+        .values()
+        .filter(|held| {
+            held.src == candidate.src
+                && held.dst == candidate.dst
+                && held.kind == candidate.kind
+                && is_parser_derived(held)
+        })
+        .min_by_key(|held| held.id)
+        .cloned())
 }
 
 /// The relation the graph already holds under this identity, if any.
@@ -247,7 +338,9 @@ pub enum ReconcileOutcome {
         collision_warnings: Vec<IntentSummary>,
     },
     /// Only independently verified existing declarations were refreshed. The
-    /// file remains incomplete and every other entity and relation is retained.
+    /// file remains incomplete and every other entity and call relation is retained.
+    /// This can contain no entity changes when only a stale coverage certificate
+    /// is withdrawn; unlike BrokenAst, callers must apply that exact delta.
     PartiallyUpdated {
         file_id: FilePathId,
         modified: Vec<EntityId>,
@@ -303,6 +396,162 @@ impl ReconcileResult {
     }
 }
 
+fn batch_invalid(reason: &str) -> ReconcileError {
+    ReconcileError::InvalidTransaction(format!("prepared source batch: {reason}"))
+}
+
+fn batch_semantics(snapshot: &kin_db::GraphSnapshot) -> kin_model::graph::ResolvedGraphState {
+    kin_model::graph::ResolvedGraphState {
+        entities: snapshot.entities.clone(),
+        relations: snapshot.relations.clone(),
+        tree: snapshot.resolved_tree.clone(),
+        external_references: snapshot.external_references.clone(),
+        ..Default::default()
+    }
+}
+
+fn batch_semantics_match(
+    expected: &kin_model::graph::ResolvedGraphState,
+    actual: &kin_db::GraphSnapshot,
+) -> bool {
+    expected.entities == actual.entities
+        && expected.relations == actual.relations
+        && expected.external_references == actual.external_references
+        && expected.tree == actual.resolved_tree
+}
+
+fn batch_source_files(
+    before: &kin_model::graph::ResolvedGraphState,
+    after: &kin_db::GraphSnapshot,
+) -> HashSet<FilePathId> {
+    let mut files = HashSet::new();
+    let mut add = |node: GraphNodeId| {
+        if let Some(id) = node.as_entity() {
+            for entity in before
+                .entities
+                .get(&id)
+                .into_iter()
+                .chain(after.entities.get(&id))
+            {
+                if let Some(file) = &entity.file_origin {
+                    files.insert(file.clone());
+                }
+            }
+        } else if let GraphNodeId::Artifact(id) = node {
+            for tree in [&before.tree, &after.resolved_tree] {
+                if let Some(path) = tree.get(&id).and_then(|entry| entry.path.as_utf8()) {
+                    files.insert(FilePathId::new(path));
+                }
+            }
+        }
+    };
+    for (id, entity) in &before.entities {
+        if after.entities.get(id) != Some(entity) {
+            add(GraphNodeId::Entity(*id));
+        }
+    }
+    for (id, entity) in &after.entities {
+        if before.entities.get(id) != Some(entity) {
+            add(GraphNodeId::Entity(*id));
+        }
+    }
+    for (id, relation) in &before.relations {
+        if after.relations.get(id) != Some(relation) {
+            add(relation.src);
+        }
+    }
+    for (id, relation) in &after.relations {
+        if before.relations.get(id) != Some(relation) {
+            add(relation.src);
+        }
+    }
+    files
+}
+
+/// An admitted source whose graph declarations this build does not derive from
+/// the exact bytes the tree names for it.
+///
+/// A daemon that stopped between admitting new bytes and deriving them leaves
+/// one, and so does a store an older Kin build wrote whose parser minted a
+/// different declaration set for the same bytes. Re-deriving the file from its
+/// bytes clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleCanonicalSource {
+    pub file: FilePathId,
+    /// Which check the graph's declarations failed.
+    pub reason: &'static str,
+}
+
+/// Exact source projection prepared beside a coherent semantic batch.
+#[derive(Debug, Clone)]
+pub struct PreparedBatchSource {
+    pub file_id: FilePathId,
+    pub artifact_id: kin_model::ArtifactId,
+    pub blob_hash: kin_model::Hash256,
+    pub layout: kin_model::FileLayout,
+    pub content: Vec<u8>,
+}
+
+/// An unpublished candidate. It is not permission to replace the live graph.
+pub struct PreparedAdmittedSourceBatch {
+    before: kin_model::graph::ResolvedGraphState,
+    snapshot: kin_db::GraphSnapshot,
+    requested: Vec<FilePathId>,
+    sources: Vec<PreparedBatchSource>,
+    withdrawn_unrecorded: usize,
+    external_unreproduced: usize,
+}
+
+impl PreparedAdmittedSourceBatch {
+    pub fn snapshot(&self) -> &kin_db::GraphSnapshot {
+        &self.snapshot
+    }
+
+    /// Withdrawn cross-file bindings a startup re-derivation dropped without a
+    /// withdrawal record, because the store it loaded could not certify their
+    /// caller. Always zero outside [`Reconciler::prepare_admitted_source_rederivation`].
+    pub fn withdrawn_bindings_unrecorded(&self) -> usize {
+        self.withdrawn_unrecorded
+    }
+
+    /// Stored external-import edges a startup re-derivation retired because
+    /// this build's parser, re-reading the exact bytes each was recorded
+    /// against, derives a different declaration or occurrence count from them.
+    /// Each is counted once, and only when the prepared graph no longer holds
+    /// its identity. Always zero outside
+    /// [`Reconciler::prepare_admitted_source_rederivation`].
+    pub fn external_edges_retired_unreproduced(&self) -> usize {
+        self.external_unreproduced
+    }
+
+    pub fn sources(&self) -> &[PreparedBatchSource] {
+        &self.sources
+    }
+
+    pub fn into_snapshot(self) -> kin_db::GraphSnapshot {
+        self.snapshot
+    }
+}
+
+/// Parent-owned, preflighted cache state. Consume only on the same reconciler,
+/// after applying the exact preflighted semantic delta, while retaining the
+/// caller's graph/reconciler serialization guards across the whole sequence.
+/// Construction is private; installing it performs no reads or fallible work.
+pub struct PreparedBatchAdoption {
+    cross_file: LiveCrossFileLinker,
+    retired_paths: Vec<FilePathId>,
+    sources: Vec<PreparedBatchSource>,
+    entities: Vec<Entity>,
+    removed: Vec<EntityId>,
+    collision_warnings: Vec<IntentSummary>,
+}
+
+impl PreparedBatchAdoption {
+    pub fn collision_warnings(&self) -> &[IntentSummary] {
+        &self.collision_warnings
+    }
+}
+
 /// The reconciliation engine. Derives exact transactions from filesystem
 /// input and projects committed transactions back to filesystem views.
 ///
@@ -325,6 +574,17 @@ pub struct Reconciler {
     /// Cross-file relation resolution for the live path. Seeded from graph
     /// truth once, then kept current as files arrive.
     cross_file: LiveCrossFileLinker,
+    /// Set only on the private reconciler of a daemon's startup re-derivation.
+    /// A stored external-import edge this derivation does not reproduce is
+    /// retired as superseded instead of refusing the derivation when its one
+    /// failed check is the recount: this build's parser, re-reading the exact
+    /// bytes the edge was recorded against, derives a different declaration or
+    /// occurrence count from them. Its factory shape, its admitted target, and
+    /// those bytes' presence, digest and complete parse are still required.
+    retire_unprovable_superseded: bool,
+    /// The edges retired that way, so the start can count and disclose them.
+    /// Always empty unless `retire_unprovable_superseded` is set.
+    retired_unreproduced: HashSet<RelationId>,
 }
 
 impl Reconciler {
@@ -347,6 +607,8 @@ impl Reconciler {
             policy,
             tree_cache: HashMap::new(),
             cross_file: LiveCrossFileLinker::new(),
+            retire_unprovable_superseded: false,
+            retired_unreproduced: HashSet::new(),
         }
     }
 
@@ -383,6 +645,110 @@ impl Reconciler {
     /// defines, never by repository size.
     pub fn seed_cross_file_linker_from_graph<G: GraphStore>(&mut self, graph: &G) {
         self.cross_file.seed_from_graph(graph);
+    }
+
+    /// Reconstruct live dependency nominations from current canonical source.
+    /// This runs after canonical semantic debt is paid at daemon startup.
+    pub fn restore_cross_file_dependencies<G: GraphStore>(
+        &mut self,
+        graph: &G,
+        blobs: &BlobStore,
+    ) -> Result<()> {
+        if !self.cross_file.is_seeded() {
+            self.cross_file.seed_from_graph_checked(graph)?;
+        }
+        self.cross_file.restore_dependencies(graph, blobs, None)
+    }
+
+    /// Restore checked canonical source state before serving edits after reopen.
+    ///
+    /// The caller excludes graph mutations for this entire census. Complete
+    /// sources reuse the one checked parse also restoring dependency knowledge;
+    /// persisted layouts are never authority. Partial sources retain LKG but
+    /// have no newly certified editable projection. This retains O(source bytes)
+    /// additional cache memory and makes no startup performance guarantee.
+    pub fn restore_canonical_source_state<G: GraphStore>(
+        &mut self,
+        graph: &G,
+        blobs: &BlobStore,
+    ) -> Result<()> {
+        self.restore_canonical_source_state_inner(graph, blobs, None)
+    }
+
+    /// The same checked restore, except that a source whose graph declarations
+    /// this build does not derive from its exact bytes is named rather than
+    /// refused.
+    ///
+    /// An empty answer means the census found every complete source coherent
+    /// and installed it, exactly as [`Self::restore_canonical_source_state`]
+    /// does. A non-empty answer names every stale source and installs nothing,
+    /// so the caller can re-derive all of them in one pass and then restore
+    /// strictly. Stopping at the first one would hand the caller a repair set
+    /// the next source outside it can still refuse. Every other failure (a
+    /// missing body, a digest mismatch, a layout that disagrees with its
+    /// source) is still an error, because re-deriving cannot repair it.
+    pub fn restore_canonical_source_state_or_name_stale<G: GraphStore>(
+        &mut self,
+        graph: &G,
+        blobs: &BlobStore,
+    ) -> Result<Vec<StaleCanonicalSource>> {
+        let mut stale = Vec::new();
+        self.restore_canonical_source_state_inner(graph, blobs, Some(&mut stale))?;
+        Ok(stale)
+    }
+
+    fn restore_canonical_source_state_inner<G: GraphStore>(
+        &mut self,
+        graph: &G,
+        blobs: &BlobStore,
+        mut stale: Option<&mut Vec<StaleCanonicalSource>>,
+    ) -> Result<()> {
+        let tree = graph
+            .resolved_tree_snapshot()
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?
+            .ok_or_else(|| {
+                ReconcileError::InvalidTransaction(
+                    "canonical source restore requires exact current tree inventory".into(),
+                )
+            })?;
+        let paths: Vec<_> = tree
+            .artifacts_by_path()
+            .filter(|artifact| matches!(artifact.entry, kin_model::TreeEntry::Blob { .. }))
+            .filter_map(|artifact| artifact.path.as_utf8())
+            .filter(|path| {
+                matches!(
+                    kin_index::FileClassifier::classify(Path::new(path)),
+                    kin_index::FileClassification::EntitySource
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        let mut staged = self.cross_file.checked_fork()?;
+        let sources =
+            staged.restore_canonical_sources(graph, blobs, paths, stale.as_deref_mut())?;
+        if stale.is_some_and(|stale| !stale.is_empty()) {
+            return Ok(());
+        }
+        for source in &sources {
+            if let Some(held) = graph
+                .get_file_layout(&source.indexed.file_id)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?
+            {
+                validate_restored_layout(&held, &source.indexed.file_layout, source.content.len())?;
+            }
+        }
+        // No fallible work follows. Installing a whole checked projection census
+        // removes obsolete old paths while preserving the separate LKG store.
+        let mut projection = ProjectionState::new();
+        for source in sources {
+            for entity in &source.indexed.entities {
+                self.lkg.record(entity);
+            }
+            projection.register_file(source.indexed.file_layout, source.content);
+        }
+        self.projection = projection;
+        self.cross_file = staged;
+        Ok(())
     }
 
     /// Access the cross-file linker (for inspection/testing).
@@ -450,7 +816,7 @@ impl Reconciler {
                 file = %event_path.display(),
                 "excluded path reached reconcile; purging any existing graph state"
             );
-            return self.reconcile_file_removal(path, graph);
+            return self.reconcile_file_removal(path, blob_store, graph);
         }
 
         match event {
@@ -470,7 +836,7 @@ impl Reconciler {
                     );
                     return self.reconcile_file_edit(path, blob_store, graph);
                 }
-                self.reconcile_file_removal(path, graph)
+                self.reconcile_file_removal(path, blob_store, graph)
             }
         }
     }
@@ -544,7 +910,7 @@ impl Reconciler {
             (FileEvent::Changed(path), Some(hint)) => {
                 let comparable_path = self.comparable_event_path(path);
                 if !self.should_track_path(&comparable_path) {
-                    return self.reconcile_file_removal(&comparable_path, graph);
+                    return self.reconcile_file_removal(&comparable_path, blob_store, graph);
                 }
                 self.reconcile_file_edit_incremental(&comparable_path, blob_store, graph, hint)
             }
@@ -722,6 +1088,583 @@ impl Reconciler {
         result
     }
 
+    /// Reconcile a complete batch of graph-owned source bodies in a private
+    /// candidate. Its tree may already name the new blobs while declarations
+    /// still carry the original identities needed for matching and retirement.
+    /// No intermediate candidate or relaxed source reader escapes this method.
+    pub fn reconcile_admitted_source_batch(
+        snapshot: kin_db::GraphSnapshot,
+        files: &[FilePathId],
+        blobs: &BlobStore,
+        predecessors: &[kin_model::graph::ResolvedGraphState],
+    ) -> Result<kin_db::GraphSnapshot> {
+        Self::prepare_admitted_source_batch(snapshot, files, blobs, predecessors)
+            .map(PreparedAdmittedSourceBatch::into_snapshot)
+    }
+
+    /// Prepare exact source layouts and bytes without changing live caches.
+    /// The snapshot wrapper above retains its authored-merge behavior. Live
+    /// callers must preflight the result and publish a delta, never this graph.
+    pub fn prepare_admitted_source_batch(
+        snapshot: kin_db::GraphSnapshot,
+        files: &[FilePathId],
+        blobs: &BlobStore,
+        predecessors: &[kin_model::graph::ResolvedGraphState],
+    ) -> Result<PreparedAdmittedSourceBatch> {
+        Self::prepare_admitted_source_batch_with(
+            snapshot,
+            files,
+            blobs,
+            predecessors,
+            crate::batch_debt::UncertifiedCallers::Refuse,
+        )
+    }
+
+    /// The same preparation for a daemon's startup re-derivation, whose only
+    /// observation from before this start is the store as it loaded it.
+    ///
+    /// That store is the predecessor. A withdrawn binding whose caller it
+    /// certifies keeps its withdrawal record exactly as a live edit's would.
+    /// One whose caller it cannot certify, because the caller's own
+    /// declarations were not derived from its current bytes, is dropped and
+    /// counted in [`PreparedAdmittedSourceBatch::withdrawn_bindings_unrecorded`]
+    /// for the caller to disclose: the parse that bound it did not survive the
+    /// restart, so nothing is left to ground a record in.
+    ///
+    /// A stored external-import edge the fresh derivation does not reproduce is
+    /// retired when the only check it fails is the recount of the bytes it was
+    /// recorded against under this build's parser, and counted in
+    /// [`PreparedAdmittedSourceBatch::external_edges_retired_unreproduced`].
+    /// Every other failure of its proof still refuses the preparation.
+    pub fn prepare_admitted_source_rederivation(
+        snapshot: kin_db::GraphSnapshot,
+        files: &[FilePathId],
+        blobs: &BlobStore,
+    ) -> Result<PreparedAdmittedSourceBatch> {
+        let loaded = kin_model::graph::ResolvedGraphState {
+            entities: snapshot.entities.clone(),
+            relations: snapshot.relations.clone(),
+            tree: snapshot.resolved_tree.clone(),
+            external_references: snapshot.external_references.clone(),
+            ..Default::default()
+        };
+        Self::prepare_admitted_source_batch_with(
+            snapshot,
+            files,
+            blobs,
+            std::slice::from_ref(&loaded),
+            crate::batch_debt::UncertifiedCallers::Drop,
+        )
+    }
+
+    fn prepare_admitted_source_batch_with(
+        snapshot: kin_db::GraphSnapshot,
+        files: &[FilePathId],
+        blobs: &BlobStore,
+        predecessors: &[kin_model::graph::ResolvedGraphState],
+        uncertified: crate::batch_debt::UncertifiedCallers,
+    ) -> Result<PreparedAdmittedSourceBatch> {
+        let before = batch_semantics(&snapshot);
+        // Retain semantic anchors, not another copy of repository history,
+        // facets, acceleration indexes or authority metadata.
+        let anchors = kin_model::graph::ResolvedGraphState {
+            entities: snapshot.entities.clone(),
+            relations: snapshot.relations.clone(),
+            ..Default::default()
+        };
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        let mut files = files.to_vec();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        if files.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ReconcileError::InvalidTransaction(
+                "duplicate source in admitted batch".into(),
+            ));
+        }
+        let mut prepared = Vec::new();
+        let mut non_source = Vec::new();
+        let mut artifacts = HashMap::new();
+        for file in &files {
+            let path = kin_model::RepoPath::from_utf8(file.0.clone())
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+            let artifact = graph.artifact_id_at_path(&path).ok_or_else(|| {
+                ReconcileError::InvalidTransaction("batch source has no admitted artifact".into())
+            })?;
+            let Some(kin_model::TreeEntry::Blob { hash, .. }) = graph
+                .get_tree_entry(file)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?
+            else {
+                return Err(ReconcileError::InvalidTransaction(
+                    "batch source has no admitted blob".into(),
+                ));
+            };
+            let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+            let body = blobs.read(&digest)?;
+            match IndexPipeline::new().index_any_content(file, &body, digest)? {
+                kin_index::IndexedAny::EntitySource(indexed) => {
+                    if !matches!(indexed.parse_state, ParseState::Valid) {
+                        return Err(ReconcileError::InvalidTransaction(format!(
+                            "batch source {file} has syntax errors"
+                        )));
+                    }
+                    artifacts.insert(artifact, file.0.clone());
+                    prepared.push((artifact, indexed));
+                }
+                _ => non_source.push((artifact, file.clone())),
+            }
+        }
+        // Retire non-code meanings inside the same private candidate, after
+        // retaining the original anchors used to account for lost bindings.
+        for (artifact, file) in non_source {
+            let entities = graph
+                .query_entities(&kin_model::EntityFilter {
+                    file_path: Some(file),
+                    ..Default::default()
+                })
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+            let mut relations = HashMap::new();
+            for node in entities
+                .iter()
+                .map(|entity| GraphNodeId::Entity(entity.id))
+                .chain(std::iter::once(GraphNodeId::Artifact(artifact)))
+            {
+                for relation in graph
+                    .get_all_relations_for_node(&node)
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                {
+                    if node.as_entity().is_some()
+                        || (relation.src == node && is_parser_derived(&relation))
+                    {
+                        relations.insert(relation.id, relation);
+                    }
+                }
+            }
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    entity_deltas: entities
+                        .into_iter()
+                        .map(|old| EntityDelta::Removed { old })
+                        .collect(),
+                    relation_deltas: relations
+                        .into_values()
+                        .map(|old| RelationDelta::Removed { old })
+                        .collect(),
+                    ..Default::default()
+                })
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        }
+        let mut reconciler = Self::new(PathBuf::new());
+        reconciler.retire_unprovable_superseded =
+            uncertified == crate::batch_debt::UncertifiedCallers::Drop;
+        reconciler.cross_file.withhold_batch(artifacts);
+        reconciler.cross_file.seed_from_graph_checked(&graph)?;
+        for (artifact, indexed) in &prepared {
+            let result = reconciler.reconcile_indexed_content(indexed, blobs, &graph)?;
+            graph
+                .apply_transaction_delta(&result.delta)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+            reconciler.cross_file.finish_batch_file(*artifact);
+        }
+        // Every declaration now has its stable identity and exact current
+        // source. Reconcile each authored caller against that complete universe
+        // once more, including cycles and names absent from the waiting index.
+        // A legitimately unresolved import may remain pending; no old authored
+        // declaration remains withheld or supplies resolution authority.
+        for (_, indexed) in &prepared {
+            let result = reconciler.reconcile_indexed_content(indexed, blobs, &graph)?;
+            graph
+                .apply_transaction_delta(&result.delta)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        }
+        let withdrawn_unrecorded = crate::batch_debt::retain_removed_bindings(
+            &anchors,
+            &graph,
+            predecessors,
+            blobs,
+            uncertified,
+        )?;
+        crate::rust_project::finalize(&graph, blobs)?;
+        // Use the ordinary strict reader at the exit, after constructing a
+        // coherent candidate. The source/declaration check itself is unchanged.
+        for (_, indexed) in &prepared {
+            let file = &indexed.file_id;
+            if crate::admitted_source::load(&graph, blobs, file)?.is_none() {
+                return Err(ReconcileError::InvalidTransaction(format!(
+                    "batch source {file} is not complete"
+                )));
+            }
+        }
+        let snapshot = graph.to_snapshot();
+        let external_unreproduced = reconciler
+            .retired_unreproduced
+            .iter()
+            .filter(|id| !snapshot.relations.contains_key(id))
+            .count();
+        let mut affected = batch_source_files(&before, &snapshot);
+        affected.extend(files.iter().cloned());
+        let mut affected: Vec<_> = affected.into_iter().collect();
+        affected.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut sources = Vec::new();
+        for file in affected {
+            let path = kin_model::RepoPath::from_utf8(file.0.clone())
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+            let Some(artifact) = graph.artifact_id_at_path(&path) else {
+                continue;
+            };
+            let Some(kin_model::TreeEntry::Blob { hash, .. }) = graph
+                .get_tree_entry(&file)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?
+            else {
+                continue;
+            };
+            let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+            let content = blobs.read(&digest)?;
+            // Non-source authored inputs keep their old retirement behavior.
+            let kin_index::IndexedAny::EntitySource(mut indexed) =
+                IndexPipeline::new().index_any_content(&file, &content, digest)?
+            else {
+                continue;
+            };
+            if !matches!(indexed.parse_state, ParseState::Valid) {
+                continue;
+            }
+            let admitted = crate::admitted_source::load(&graph, blobs, &file)?
+                .ok_or_else(|| batch_invalid("complete source lost its admitted parse"))?;
+            let remap: HashMap<_, _> = indexed
+                .entities
+                .iter()
+                .zip(&admitted.entities)
+                .map(|(raw, exact)| (raw.id, exact.id))
+                .collect();
+            for region in &mut indexed.file_layout.regions {
+                if let SourceRegion::EntityRef { entity_id, .. } = region {
+                    *entity_id = *remap
+                        .get(entity_id)
+                        .ok_or_else(|| batch_invalid("layout contains an unbound declaration"))?;
+                }
+            }
+            sources.push(PreparedBatchSource {
+                file_id: file,
+                artifact_id: artifact,
+                blob_hash: hash,
+                layout: indexed.file_layout,
+                content,
+            });
+        }
+        Ok(PreparedAdmittedSourceBatch {
+            before,
+            snapshot,
+            requested: files,
+            sources,
+            withdrawn_unrecorded,
+            external_unreproduced,
+        })
+    }
+
+    /// Check the exact source/result and the live traffic checker before any
+    /// semantic/layout/cache publication. `graph` must remain serialized until
+    /// the caller applies `delta` and consumes the returned adoption on `self`.
+    pub fn preflight_admitted_source_batch(
+        &self,
+        prepared: &PreparedAdmittedSourceBatch,
+        graph: &kin_db::InMemoryGraph,
+        delta: &TransactionDelta,
+        blobs: &BlobStore,
+    ) -> Result<PreparedBatchAdoption> {
+        if self.traffic_checker.is_none() {
+            return Err(batch_invalid(
+                "live adoption requires an explicit traffic checker",
+            ));
+        }
+        let current = graph.to_snapshot();
+        if !batch_semantics_match(&prepared.before, &current) {
+            return Err(batch_invalid("live graph changed after batch preparation"));
+        }
+        if !delta.tree_deltas.is_empty() || delta.admission_policy_delta.is_some() {
+            return Err(batch_invalid("live batch accepts semantic deltas only"));
+        }
+        let candidate = kin_db::InMemoryGraph::from_snapshot(current)
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        candidate
+            .apply_transaction_delta(delta)
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        if !batch_semantics_match(
+            &batch_semantics(&prepared.snapshot),
+            &candidate.to_snapshot(),
+        ) {
+            return Err(batch_invalid(
+                "proposed delta differs from the prepared result",
+            ));
+        }
+        if prepared
+            .requested
+            .iter()
+            .any(|file| !prepared.sources.iter().any(|s| &s.file_id == file))
+        {
+            return Err(batch_invalid(
+                "live batch requires every selected source to be complete",
+            ));
+        }
+        let mut indexed_sources = Vec::new();
+        for source in &prepared.sources {
+            let indexed = crate::admitted_source::load(&candidate, blobs, &source.file_id)?
+                .ok_or_else(|| batch_invalid("prepared source is no longer a complete parse"))?;
+            let artifact = candidate.artifact_id_at_path(
+                &kin_model::RepoPath::from_utf8(source.file_id.0.clone())
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?,
+            );
+            if artifact != Some(source.artifact_id)
+                || kin_model::Hash256::from_bytes(indexed.blob_hash.0) != source.blob_hash
+                || kin_blobs::digest(&source.content) != indexed.blob_hash
+                || source.layout.file_id != source.file_id
+            {
+                return Err(batch_invalid(
+                    "prepared projection differs from admitted source",
+                ));
+            }
+            // The public view is read-only, but recheck every layout reference
+            // against the exact final entity and current source range.
+            for region in &source.layout.regions {
+                let range = match region {
+                    SourceRegion::EntityRef {
+                        entity_id,
+                        byte_range,
+                    } => {
+                        let entity = indexed
+                            .entities
+                            .iter()
+                            .find(|e| e.id == *entity_id)
+                            .ok_or_else(|| {
+                                batch_invalid("projection references an absent entity")
+                            })?;
+                        let span = entity.span.as_ref().ok_or_else(|| {
+                            batch_invalid("projection references a spanless entity")
+                        })?;
+                        if span.file != source.file_id
+                            || span.start_byte != byte_range.start
+                            || span.end_byte != byte_range.end
+                        {
+                            return Err(batch_invalid(
+                                "projection range differs from final entity",
+                            ));
+                        }
+                        byte_range
+                    }
+                    SourceRegion::Trivia { byte_range } => byte_range,
+                };
+                if range.start > range.end || range.end > source.content.len() {
+                    return Err(batch_invalid("projection range is outside admitted bytes"));
+                }
+            }
+            indexed_sources.push(indexed);
+        }
+        let (cross_file, retired_paths) =
+            self.cross_file
+                .fork_for_admitted_batch(&candidate, blobs, &indexed_sources)?;
+        let mut scopes = Vec::new();
+        let mut scoped_entities: HashSet<_> = indexed_sources
+            .iter()
+            .flat_map(|source| source.entities.iter().map(|entity| entity.id))
+            .collect();
+        let mut scoped_files = HashSet::new();
+        for source in &prepared.sources {
+            scoped_files.insert(source.file_id.clone());
+        }
+        scoped_files.extend(retired_paths.iter().cloned());
+        let mut include_node = |node: GraphNodeId| {
+            if let Some(id) = node.as_entity() {
+                scoped_entities.insert(id);
+                for entity in prepared
+                    .before
+                    .entities
+                    .get(&id)
+                    .into_iter()
+                    .chain(prepared.snapshot.entities.get(&id))
+                {
+                    if let Some(file) = &entity.file_origin {
+                        scoped_files.insert(file.clone());
+                    }
+                }
+            } else if let GraphNodeId::Artifact(id) = node {
+                for tree in [&prepared.before.tree, &prepared.snapshot.resolved_tree] {
+                    if let Some(entry) = tree.get(&id) {
+                        if let Some(path) = entry.path.as_utf8() {
+                            scoped_files.insert(FilePathId::new(path));
+                        }
+                    }
+                }
+            }
+        };
+        for change in &delta.entity_deltas {
+            include_node(GraphNodeId::Entity(change.target_id()));
+        }
+        for change in &delta.relation_deltas {
+            let rows: Vec<_> = match change {
+                RelationDelta::Added { new } => vec![new],
+                RelationDelta::Modified { old, new } => vec![old, new],
+                RelationDelta::Removed { old } => vec![old],
+            };
+            for row in rows {
+                include_node(row.src);
+                include_node(row.dst);
+            }
+        }
+        scopes.extend(scoped_entities.into_iter().map(IntentScope::Entity));
+        scopes.extend(scoped_files.into_iter().map(IntentScope::Artifact));
+        let collision_warnings = self.check_scopes(&scopes)?;
+        let entities = indexed_sources
+            .iter()
+            .flat_map(|source| source.entities.clone())
+            .collect();
+        let removed = prepared
+            .before
+            .entities
+            .keys()
+            .filter(|id| !prepared.snapshot.entities.contains_key(id))
+            .copied()
+            .collect();
+        Ok(PreparedBatchAdoption {
+            cross_file,
+            retired_paths,
+            sources: prepared.sources.clone(),
+            entities,
+            removed,
+            collision_warnings,
+        })
+    }
+
+    /// Preflight a complete observed transition whose tree retirement/moves
+    /// were staged before the coherent source batch. The caller retains the
+    /// same live/reconciler guards from capture through adoption. This adds no
+    /// source authority: both the whole transition and the batch must produce
+    /// the exact same prepared semantic/tree result independently.
+    pub fn preflight_admitted_source_batch_from_observation(
+        &self,
+        prepared: &PreparedAdmittedSourceBatch,
+        staged: &kin_db::InMemoryGraph,
+        batch_delta: &TransactionDelta,
+        observed: &kin_db::GraphSnapshot,
+        whole_delta: &TransactionDelta,
+        blobs: &BlobStore,
+    ) -> Result<PreparedBatchAdoption> {
+        if whole_delta.admission_policy_delta.is_some() {
+            return Err(batch_invalid(
+                "source adoption cannot supply admission policy authority",
+            ));
+        }
+        let whole = kin_db::InMemoryGraph::from_snapshot(observed.clone())
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        whole
+            .apply_transaction_delta(whole_delta)
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        if !batch_semantics_match(&batch_semantics(&prepared.snapshot), &whole.to_snapshot()) {
+            return Err(batch_invalid(
+                "whole observed transition differs from prepared result",
+            ));
+        }
+        let mut adoption =
+            self.preflight_admitted_source_batch(prepared, staged, batch_delta, blobs)?;
+        let mut scopes = Vec::new();
+        let mut entities = HashSet::new();
+        let mut files = HashSet::new();
+        let mut include = |node: GraphNodeId| {
+            if let Some(id) = node.as_entity() {
+                entities.insert(id);
+                for entity in observed
+                    .entities
+                    .get(&id)
+                    .into_iter()
+                    .chain(prepared.snapshot.entities.get(&id))
+                {
+                    if let Some(file) = &entity.file_origin {
+                        files.insert(file.clone());
+                    }
+                }
+            } else if let GraphNodeId::Artifact(id) = node {
+                for tree in [&observed.resolved_tree, &prepared.snapshot.resolved_tree] {
+                    if let Some(path) = tree.get(&id).and_then(|entry| entry.path.as_utf8()) {
+                        files.insert(FilePathId::new(path));
+                    }
+                }
+            }
+        };
+        for delta in &whole_delta.entity_deltas {
+            include(GraphNodeId::Entity(delta.target_id()));
+        }
+        for delta in &whole_delta.relation_deltas {
+            match delta {
+                RelationDelta::Added { new } => {
+                    include(new.src);
+                    include(new.dst);
+                }
+                RelationDelta::Removed { old } => {
+                    include(old.src);
+                    include(old.dst);
+                }
+                RelationDelta::Modified { old, new } => {
+                    include(old.src);
+                    include(old.dst);
+                    include(new.src);
+                    include(new.dst);
+                }
+            }
+        }
+        for delta in &whole_delta.tree_deltas {
+            include(GraphNodeId::Artifact(delta.artifact_id()));
+        }
+        scopes.extend(entities.into_iter().map(IntentScope::Entity));
+        scopes.extend(files.into_iter().map(IntentScope::Artifact));
+        adoption
+            .collision_warnings
+            .extend(self.check_scopes(&scopes)?);
+        adoption
+            .collision_warnings
+            .sort_by_key(|warning| warning.intent_id.0);
+        adoption
+            .collision_warnings
+            .dedup_by_key(|warning| warning.intent_id);
+        adoption.removed = observed
+            .entities
+            .keys()
+            .filter(|id| !prepared.snapshot.entities.contains_key(id))
+            .copied()
+            .collect();
+        let mut final_entities: HashMap<_, _> =
+            adoption.entities.into_iter().map(|e| (e.id, e)).collect();
+        for delta in &whole_delta.entity_deltas {
+            match delta {
+                EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => {
+                    final_entities.insert(new.id, new.clone());
+                }
+                EntityDelta::Removed { .. } => {}
+            }
+        }
+        adoption.entities = final_entities.into_values().collect();
+        Ok(adoption)
+    }
+
+    /// Infallibly install already checked cache state after the exact semantic
+    /// delta succeeds. Caller must hold the same guards used for preflight.
+    pub fn adopt_admitted_source_batch(&mut self, adoption: PreparedBatchAdoption) {
+        // Cleanup precedes all replacements: a new artifact may now own an old
+        // path, or two artifacts may have exchanged their locations.
+        for path in adoption.retired_paths {
+            self.tree_cache.remove(&path);
+            self.projection.remove_file(&path);
+        }
+        for id in adoption.removed {
+            self.lkg.remove(&id);
+        }
+        for entity in &adoption.entities {
+            self.lkg.record(entity);
+        }
+        for source in adoption.sources {
+            self.tree_cache.remove(&source.file_id);
+            self.projection.register_file(source.layout, source.content);
+        }
+        self.cross_file = adoption.cross_file;
+    }
+
     /// Reconcile parsed canonical bytes with the same partial/LKG policy as an
     /// observed edit, without reading a host path or inferring file removal.
     /// The caller must bind the indexed blob to its current repository tree.
@@ -780,6 +1723,7 @@ impl Reconciler {
         blob_store: &BlobStore,
         graph: &G,
     ) -> Result<ReconcileResult> {
+        let coverage_artifact = crate::coverage::admitted_artifact(graph, indexed)?;
         // Get existing entities for this file from the graph
         let existing = self.get_file_entities(graph, file_id)?;
 
@@ -893,10 +1837,30 @@ impl Reconciler {
                     // An actual addition can occupy a moved declaration's old
                     // parser key. Give only the new declaration a fresh id;
                     // the carried declaration keeps its persisted ancestry.
-                    if existing.iter().any(|old| old.id == added_entity.id)
+                    if graph
+                        .get_entity(&added_entity.id)
+                        .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                        .is_some()
                         || claimed.contains(&added_entity.id)
                     {
-                        added_entity.id = EntityId::new();
+                        let mut fresh = None;
+                        for _ in 0..8 {
+                            let candidate = EntityId::new();
+                            if !claimed.contains(&candidate)
+                                && graph
+                                    .get_entity(&candidate)
+                                    .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                                    .is_none()
+                            {
+                                fresh = Some(candidate);
+                                break;
+                            }
+                        }
+                        added_entity.id = fresh.ok_or_else(|| {
+                            ReconcileError::InvalidTransaction(
+                                "cannot allocate an unoccupied newcomer entity identity".into(),
+                            )
+                        })?;
                     }
                     claimed.insert(added_entity.id);
                     added_entity
@@ -985,22 +1949,6 @@ impl Reconciler {
                 Some(stable)
             })
             .collect();
-        // A graph that gained files through a path that does not run reconcile
-        // (`kin init` over an existing git history) leaves the universe behind.
-        // A file the graph already has entities for that the linker never heard
-        // of is the tell, and it re-indexes once.
-        if !existing.is_empty() {
-            self.cross_file.refresh_if_behind(graph, &file_id.0);
-        }
-        let cross_file = self.cross_file.resolve_after_edit(
-            graph,
-            &file_id.0,
-            &stable_entities,
-            &indexed.extracted_relations,
-            &indexed.imports,
-            kin_model::ParseCompleteness::from_parse_state(&indexed.parse_state),
-        );
-
         // Collect existing relations for all entities in this file.
         type RelationKey = (GraphNodeId, GraphNodeId, RelationKind);
         let mut existing_relations: HashMap<RelationKey, Vec<Relation>> = HashMap::new();
@@ -1021,6 +1969,105 @@ impl Reconciler {
             relations.sort_by_key(|relation| relation.id);
         }
 
+        if !self.cross_file.is_seeded()
+            && ((coverage_artifact.is_some() && !indexed.imports.is_empty())
+                || crate::external::has_import_pinned_reference(indexed)
+                || existing_relations
+                    .values()
+                    .flatten()
+                    .any(crate::external::claims_external_import))
+        {
+            self.cross_file.seed_from_graph_checked(graph)?;
+        }
+        // A graph that gained files through a path that does not run reconcile
+        // (`kin init` over an existing git history) leaves the universe behind.
+        // A file the graph already has entities for that the linker never heard
+        // of is the tell, and it re-indexes once.
+        if !existing.is_empty() {
+            self.cross_file.refresh_if_behind(graph, &file_id.0);
+        }
+        let cross_file = self.cross_file.resolve_after_edit_checked(
+            graph,
+            blob_store,
+            &file_id.0,
+            &stable_entities,
+            &indexed.extracted_relations,
+            &indexed.imports,
+            kin_model::ParseCompleteness::from_parse_state(&indexed.parse_state),
+        )?;
+        if let Some(error) = &cross_file.failure {
+            return Err(ReconcileError::Graph(format!(
+                "cross-file resolution unavailable: {error}"
+            )));
+        }
+
+        let external = crate::external::prepare(
+            graph,
+            indexed,
+            &stable_entities,
+            &existing,
+            &cross_file.external,
+            &existing_relations
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>(),
+            blob_store,
+            cross_file.ran,
+            self.retire_unprovable_superseded,
+        )?;
+        self.retired_unreproduced
+            .extend(external.unreproduced.iter().copied());
+        let external_target_ids: HashSet<_> = cross_file
+            .external
+            .iter()
+            .chain(&cross_file.dependent_external)
+            .filter_map(|relation| relation.dst.as_entity())
+            .collect();
+        let mut external_targets_added = HashSet::new();
+        for target in external.targets {
+            external_targets_added.insert(target.id);
+            delta.entity_deltas.push(EntityDelta::Added { new: target });
+        }
+        for source in &cross_file.dependent_sources {
+            let ids: HashSet<_> = source.entities.iter().map(|entity| entity.id).collect();
+            let produced: Vec<_> = cross_file
+                .dependent_external
+                .iter()
+                .filter(|relation| relation.src.as_entity().is_some_and(|id| ids.contains(&id)))
+                .cloned()
+                .collect();
+            // Fresh dependent observations may authorize new external edges.
+            // Existing external retirement still requires retire_rebound's
+            // exact local replacement proof below.
+            let checked = crate::external::prepare(
+                graph,
+                source,
+                &source.entities,
+                &source.entities,
+                &produced,
+                &[],
+                blob_store,
+                true,
+                false,
+            )?;
+            for target in checked.targets {
+                if external_targets_added.insert(target.id) {
+                    delta.entity_deltas.push(EntityDelta::Added { new: target });
+                }
+            }
+        }
+
+        let rebound_external_removals = crate::external::retire_rebound(
+            graph,
+            &stable_entities,
+            &removed_entity_ids,
+            &cross_file.resolved,
+            blob_store,
+            self.retire_unprovable_superseded,
+            |source| self.cross_file.relink_complete_source(graph, source),
+        )?;
+
         // Build set of newly parsed relations keyed by (src, dst, kind).
         let mut new_relation_keys: HashSet<RelationKey> = HashSet::new();
         let mut matched_relation_ids = HashSet::new();
@@ -1029,10 +2076,53 @@ impl Reconciler {
         // transition otherwise, so the invariant is enforced here, once, at the
         // producer.
         let mut spoken_for: HashSet<RelationId> = HashSet::new();
+        for relation in rebound_external_removals {
+            if spoken_for.insert(relation.id) {
+                delta
+                    .relation_deltas
+                    .push(RelationDelta::Removed { old: relation });
+            }
+        }
         // Memoized per-node reads of what the graph holds, shared by the
         // identity check below and the removal collection further down.
         let mut held_relations: HashMap<GraphNodeId, HashMap<RelationId, Relation>> =
             HashMap::new();
+        // The live linker sees override facts the intra-file resolver cannot.
+        // Fold its qualification into the fresh occurrences before choosing
+        // a retained graph identity or staging any delta. Neither resolver
+        // may erase a fresh site only the other resolver represented.
+        let dispatch_calls: HashMap<_, _> = cross_file
+            .resolved
+            .iter()
+            .chain(&cross_file.same_file)
+            .filter(|relation| kin_index::is_self_dispatch_candidate(relation))
+            .map(|relation| ((relation.src, relation.dst, relation.kind), relation))
+            .collect();
+        let linked_contains: HashSet<_> = cross_file
+            .resolved
+            .iter()
+            .chain(&cross_file.same_file)
+            .filter(|relation| relation.kind == RelationKind::Contains)
+            .map(|relation| (relation.src, relation.dst, relation.kind))
+            .collect();
+        let go_methods: HashSet<_> = stable_entities
+            .iter()
+            .filter(|entity| {
+                entity.language == kin_model::LanguageId::Go && entity.kind == EntityKind::Method
+            })
+            .map(|entity| GraphNodeId::Entity(entity.id))
+            .collect();
+        let go_types: HashSet<_> = stable_entities
+            .iter()
+            .filter(|entity| {
+                entity.language == kin_model::LanguageId::Go
+                    && matches!(
+                        entity.kind,
+                        EntityKind::Class | EntityKind::TypeAlias | EntityKind::Interface
+                    )
+            })
+            .map(|entity| GraphNodeId::Entity(entity.id))
+            .collect();
         for relation in &indexed.relations {
             // Remap src/dst to stable IDs if they were matched to existing entities.
             let stable_src = relation
@@ -1049,6 +2139,16 @@ impl Reconciler {
                 .unwrap_or(relation.dst);
 
             let key = (stable_src, stable_dst, relation.kind);
+            // A per-file owner cannot overrule the package-level uniqueness
+            // check. Another file may declare a competing receiver type.
+            if cross_file.ran
+                && relation.kind == RelationKind::Contains
+                && go_types.contains(&stable_src)
+                && go_methods.contains(&stable_dst)
+                && !linked_contains.contains(&key)
+            {
+                continue;
+            }
             if !new_relation_keys.insert(key) {
                 return Err(ReconcileError::InvalidTransaction(format!(
                     "parser emitted duplicate {:?} relation from {} to {}",
@@ -1056,13 +2156,28 @@ impl Reconciler {
                 )));
             }
             let mut stable_relation = relation.clone();
-            stable_relation.src = stable_src;
-            stable_relation.dst = stable_dst;
+            let stable_id = stable_relation.id;
+            kin_index::occurrence::rebind_identity(
+                &mut stable_relation,
+                stable_id,
+                stable_src,
+                stable_dst,
+            )
+            .map_err(ReconcileError::InvalidTransaction)?;
+            if let Some(informed) = dispatch_calls.get(&key) {
+                incorporate_dispatch_evidence(&mut stable_relation, informed)?;
+            }
 
             if let Some(old) = parser_identity_to_keep(existing_relations.get(&key)) {
                 matched_relation_ids.insert(old.id);
                 spoken_for.insert(old.id);
-                stable_relation.id = old.id;
+                kin_index::occurrence::rebind_identity(
+                    &mut stable_relation,
+                    old.id,
+                    stable_src,
+                    stable_dst,
+                )
+                .map_err(ReconcileError::InvalidTransaction)?;
                 stable_relation.created_in = old.created_in;
                 if stable_relation != *old {
                     delta.relation_deltas.push(RelationDelta::Modified {
@@ -1077,11 +2192,18 @@ impl Reconciler {
                 if stable_src != relation.src || stable_dst != relation.dst {
                     if let (Some(src), Some(dst)) = (stable_src.as_entity(), stable_dst.as_entity())
                     {
-                        stable_relation.id = RelationId::from_content(
+                        let remapped_id = RelationId::from_content(
                             &src.to_string(),
                             &dst.to_string(),
                             &format!("{:?}", stable_relation.kind),
                         );
+                        kin_index::occurrence::rebind_identity(
+                            &mut stable_relation,
+                            remapped_id,
+                            stable_src,
+                            stable_dst,
+                        )
+                        .map_err(ReconcileError::InvalidTransaction)?;
                     }
                 }
                 push_relation_addition(
@@ -1139,19 +2261,59 @@ impl Reconciler {
             if removed_entity_ids.contains(&id) {
                 return false;
             }
-            stable_entity_ids.values().any(|stable| *stable == id)
+            external_target_ids.contains(&id)
+                || stable_entity_ids.values().any(|stable| *stable == id)
                 || matches!(graph.get_entity(&id), Ok(Some(_)))
         };
         for relation in cross_file
             .resolved
             .iter()
             .chain(cross_file.same_file.iter())
+            .chain(cross_file.external.iter())
+            .chain(cross_file.dependent_external.iter())
         {
             let endpoints_admitted =
                 [relation.src, relation.dst]
                     .into_iter()
                     .all(|node| match node {
                         GraphNodeId::Entity(id) => admits_entity(id),
+                        GraphNodeId::Artifact(id) if relation.kind == RelationKind::DerivedFrom => {
+                            let entity = relation.src.as_entity().and_then(|source| {
+                                stable_entities
+                                    .iter()
+                                    .find(|e| e.id == source)
+                                    .cloned()
+                                    .or_else(|| graph.get_entity(&source).ok().flatten())
+                            });
+                            entity.is_some_and(|entity| {
+                                kin_model::entity_derivation(&entity)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|derivation| {
+                                        let admitted = kin_model::RepoPath::from_utf8(
+                                            derivation.generator.file.0.clone(),
+                                        )
+                                        .ok()
+                                        .and_then(|path| graph.artifact_id_at_path(&path));
+                                        let hash = graph
+                                            .get_tree_entry(&derivation.generator.file)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|entry| match entry {
+                                                kin_model::TreeEntry::Blob { hash, .. } => {
+                                                    Some(hash.to_string())
+                                                }
+                                                _ => None,
+                                            });
+                                        admitted == Some(id)
+                                            && hash.is_some_and(|hash| {
+                                                kin_model::derivation::generator_relation_matches(
+                                                    &entity, relation, id, &hash,
+                                                )
+                                            })
+                                    })
+                            })
+                        }
                         _ => false,
                     });
             if !endpoints_admitted {
@@ -1168,16 +2330,21 @@ impl Reconciler {
                 continue;
             }
             let mut linked = relation.clone();
-            if let Some(old) = parser_identity_to_keep(existing_relations.get(&key)) {
+            let old = match parser_identity_to_keep(existing_relations.get(&key)) {
+                Some(old) => Some(old.clone()),
+                None => dependent_parser_identity_to_keep(graph, &mut held_relations, relation)?,
+            };
+            if let Some(old) = old {
                 matched_relation_ids.insert(old.id);
                 spoken_for.insert(old.id);
-                linked.id = old.id;
+                let (src, dst) = (linked.src, linked.dst);
+                kin_index::occurrence::rebind_identity(&mut linked, old.id, src, dst)
+                    .map_err(ReconcileError::InvalidTransaction)?;
                 linked.created_in = old.created_in;
-                if linked != *old {
-                    delta.relation_deltas.push(RelationDelta::Modified {
-                        old: old.clone(),
-                        new: linked,
-                    });
+                if linked != old {
+                    delta
+                        .relation_deltas
+                        .push(RelationDelta::Modified { old, new: linked });
                 }
             } else {
                 push_relation_addition(
@@ -1248,6 +2415,7 @@ impl Reconciler {
                     && file_entity_node_ids.contains(src)
                     && new_relation_keys.contains(&(*src, *dst, *kind));
                 let cross_file_source_authoritative = parser_derived
+                    && !crate::external::claims_external_import(relation)
                     && !both_in_file
                     && cross_file.ran
                     && file_entity_node_ids.contains(src)
@@ -1271,6 +2439,7 @@ impl Reconciler {
                             })
                     });
                 if touches_removed_entity
+                    || external.retired.contains(&relation.id)
                     || parser_authoritative
                     || duplicate_parser_relation
                     || cross_file_source_authoritative
@@ -1286,6 +2455,62 @@ impl Reconciler {
                         dst = %dst,
                         "stale relation removed"
                     );
+                }
+            }
+        }
+
+        // A Go receiver's Contains edge is declared by the method file, even
+        // when the source type lives elsewhere. Fresh dependent parses can
+        // therefore withdraw an old owner after a competing type appears or
+        // the receiver changes. The ordinary source-file retire loop above
+        // cannot see that authority. Do not touch manual/LSP ownership or a
+        // partial parse, and propagate relation/owner read failures.
+        if cross_file.ran && matches!(indexed.parse_state, ParseState::Valid) {
+            let methods = stable_entities
+                .iter()
+                .chain(
+                    cross_file
+                        .dependent_sources
+                        .iter()
+                        .flat_map(|source| &source.entities),
+                )
+                .filter(|entity| {
+                    entity.language == kin_model::LanguageId::Go
+                        && entity.kind == EntityKind::Method
+                });
+            for method in methods {
+                let held = graph
+                    .get_all_relations_for_entity(&method.id)
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+                for relation in held {
+                    if relation.kind != RelationKind::Contains
+                        || relation.dst.as_entity() != Some(method.id)
+                        || !is_parser_derived(&relation)
+                        || new_relation_keys.contains(&(relation.src, relation.dst, relation.kind))
+                        || retired_relation_ids.contains(&relation.id)
+                    {
+                        continue;
+                    }
+                    let Some(owner) = relation.src.as_entity() else {
+                        continue;
+                    };
+                    let owner = graph
+                        .get_entity(&owner)
+                        .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+                    if !owner.is_some_and(|owner| {
+                        owner.language == kin_model::LanguageId::Go
+                            && matches!(
+                                owner.kind,
+                                EntityKind::Class | EntityKind::TypeAlias | EntityKind::Interface
+                            )
+                    }) {
+                        continue;
+                    }
+                    retired_relation_ids.insert(relation.id);
+                    spoken_for.insert(relation.id);
+                    delta
+                        .relation_deltas
+                        .push(RelationDelta::Removed { old: relation });
                 }
             }
         }
@@ -1382,6 +2607,7 @@ impl Reconciler {
         // which is what this loop used to rebuild for itself out of
         // `delta.relation_deltas`. One set, so the artifact half and the entity
         // half cannot disagree about what has been claimed.
+        let mut held_artifact_imports = Vec::new();
         if cross_file.ran {
             let produced_by_id: HashMap<RelationId, &Relation> = cross_file
                 .artifact_imports
@@ -1403,6 +2629,7 @@ impl Reconciler {
                     if !stored_ids.insert(relation.id) {
                         continue;
                     }
+                    held_artifact_imports.push(relation.clone());
                     match produced_by_id.get(&relation.id) {
                         Some(current) if **current == relation => {}
                         Some(current) => {
@@ -1470,6 +2697,113 @@ impl Reconciler {
                 )?;
             }
         }
+
+        if let Some(artifact) = coverage_artifact {
+            let current = matches!(indexed.parse_state, ParseState::Valid)
+                .then(|| self.cross_file.coverage_for(indexed, artifact));
+            delta.relation_deltas.extend(crate::coverage::reconcile(
+                graph, file_id, artifact, current,
+            )?);
+        }
+
+        for source in &cross_file.dependent_sources {
+            let artifact = crate::coverage::admitted_artifact(graph, source)?.ok_or_else(|| {
+                ReconcileError::InvalidTransaction("dependent source lost admitted artifact".into())
+            })?;
+            delta.relation_deltas.extend(crate::coverage::reconcile(
+                graph,
+                &source.file_id,
+                artifact,
+                Some(self.cross_file.coverage_for(source, artifact)),
+            )?);
+        }
+
+        // Only relations actually accepted by the staging loops can discharge
+        // debt. Raw linker candidates may have failed endpoint admission.
+        let mut produced_by_id: HashMap<_, _> = existing_relations
+            .values()
+            .flatten()
+            .filter(|relation| matched_relation_ids.contains(&relation.id))
+            .chain(
+                held_relations
+                    .values()
+                    .flat_map(|held| held.values())
+                    .filter(|relation| spoken_for.contains(&relation.id)),
+            )
+            .chain(held_artifact_imports.iter())
+            .map(|relation| (relation.id, relation.clone()))
+            .collect();
+        for change in &delta.relation_deltas {
+            match change {
+                RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
+                    produced_by_id.insert(new.id, new.clone());
+                }
+                RelationDelta::Removed { old } => {
+                    produced_by_id.remove(&old.id);
+                }
+            }
+        }
+        let produced: Vec<_> = produced_by_id
+            .into_values()
+            .filter(|relation| {
+                // Entity proof still requires admitted surviving endpoints.
+                // Artifact import proof comes only from this exact held/staged
+                // overlay; settlement checks both artifact identities against
+                // current admitted source and target paths before using it.
+                [relation.src, relation.dst]
+                    .into_iter()
+                    .all(|node| node.as_entity().is_some_and(admits_entity))
+                    || (matches!(
+                        relation.kind,
+                        RelationKind::Imports | RelationKind::Includes
+                    ) && matches!(relation.src, GraphNodeId::Artifact(_))
+                        && matches!(relation.dst, GraphNodeId::Artifact(_)))
+            })
+            .collect();
+        let replacement_entities: HashMap<_, _> = delta
+            .entity_deltas
+            .iter()
+            .filter_map(|change| match change {
+                EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => {
+                    Some((new.id, new.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for source in std::iter::once(indexed).chain(cross_file.dependent_sources.iter()) {
+            let current_entities = if source.file_id == indexed.file_id {
+                &stable_entities
+            } else {
+                &source.entities
+            };
+            let changes = crate::binding_debt::settle(
+                graph,
+                blob_store,
+                source,
+                current_entities,
+                &produced,
+                |id| {
+                    if removed_entity_ids.contains(&id) {
+                        return Ok(None);
+                    }
+                    if let Some(entity) = replacement_entities.get(&id) {
+                        return Ok(Some(entity.clone()));
+                    }
+                    graph
+                        .get_entity(&id)
+                        .map_err(|error| ReconcileError::Graph(error.to_string()))
+                },
+            )?;
+            delta.relation_deltas.extend(changes);
+        }
+
+        crate::named_imports::refresh(
+            graph,
+            &cross_file.dependent_sources,
+            &cross_file.named_import_observations,
+            &produced,
+            &mut delta,
+        )?;
 
         let added_count = added.len();
         let modified_count = modified.len();
@@ -1644,7 +2978,17 @@ impl Reconciler {
                 new,
             });
         }
-        if modified.is_empty() {
+        // Incomplete bytes cannot retain an earlier full-file certificate.
+        // Do not fabricate import counts from a partial parse or touch LKG calls.
+        if let Some(artifact) = crate::coverage::admitted_artifact(graph, indexed)? {
+            delta.relation_deltas.extend(crate::coverage::reconcile(
+                graph,
+                &indexed.file_id,
+                artifact,
+                None,
+            )?);
+        }
+        if modified.is_empty() && delta.relation_deltas.is_empty() {
             return ReconcileResult::unchanged(ReconcileOutcome::BrokenAst {
                 file_id: indexed.file_id.clone(),
                 error_ranges: error_ranges.to_vec(),
@@ -1682,6 +3026,7 @@ impl Reconciler {
     fn reconcile_file_removal<G: GraphStore>(
         &mut self,
         path: &Path,
+        blob_store: &BlobStore,
         graph: &G,
     ) -> Result<ReconcileResult> {
         let file_id = self.file_path_id(path);
@@ -1698,10 +3043,55 @@ impl Reconciler {
         let mut removed = Vec::new();
         let mut relations = HashMap::new();
 
-        // Drop the file from the cross-file universe and the waiting index
-        // before deriving the removal, so a later file defining one of its
-        // names does not try to re-bind a file that no longer exists.
-        self.cross_file.forget_file(&file_id.0);
+        if !self.cross_file.is_seeded() {
+            self.cross_file.seed_from_graph_checked(graph)?;
+        }
+        self.cross_file
+            .restore_dependencies(graph, blob_store, Some(&file_id.0))?;
+        let departing = existing.iter().map(|entity| entity.id).collect();
+        let mut incident = Vec::new();
+        for entity in &existing {
+            incident.extend(
+                graph
+                    .get_all_relations_for_entity(&entity.id)
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?,
+            );
+        }
+        let withdrawals = crate::coverage::plan_local_binding_obligations(
+            &departing,
+            &incident,
+            |id| {
+                graph
+                    .get_entity(&id)
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))
+            },
+            |file| {
+                let path = kin_model::RepoPath::from_utf8(file.0.clone())
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+                let Some(artifact) = graph.artifact_id_at_path(&path) else {
+                    return Ok(None);
+                };
+                Ok(graph
+                    .get_tree_entry(file)
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                    .and_then(|entry| match entry {
+                        kin_model::TreeEntry::Blob { hash, .. } => Some((artifact, hash)),
+                        _ => None,
+                    }))
+            },
+            |artifact| {
+                graph
+                    .traverse(&GraphNodeId::Artifact(artifact), &[], 1)
+                    .map(|subgraph| subgraph.relations)
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))
+            },
+            |id| crate::binding_debt::exact(graph, id),
+        )?;
+        // Retire the file from the cached universe and rebind complete Go
+        // receiver sources whose owner may now be unique again.
+        let receiver_owners = self
+            .cross_file
+            .forget_file_and_relink_go_receivers(graph, blob_store, &file_id.0, &existing)?;
 
         for entity in &existing {
             for relation in graph
@@ -1710,10 +3100,52 @@ impl Reconciler {
             {
                 relations.insert(relation.id, relation);
             }
+            if kin_model::is_derived_member(entity) {
+                for relation in graph
+                    .traverse(
+                        &GraphNodeId::Entity(entity.id),
+                        &[RelationKind::DerivedFrom],
+                        1,
+                    )
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                    .relations
+                {
+                    if relation.src == GraphNodeId::Entity(entity.id)
+                        || relation.dst == GraphNodeId::Entity(entity.id)
+                    {
+                        relations.insert(relation.id, relation);
+                    }
+                }
+            }
             self.lkg.remove(&entity.id);
             removed.push(entity.id);
         }
-        let delta = TransactionDelta {
+        if let Ok(path) = kin_model::RepoPath::from_utf8(file_id.0.clone()) {
+            if let Some(artifact) = graph.artifact_id_at_path(&path) {
+                for change in crate::coverage::reconcile(graph, &file_id, artifact, None)? {
+                    if let RelationDelta::Removed { old } = change {
+                        relations.insert(old.id, old);
+                    }
+                }
+                let reserved = kin_index::binding_debt::local_binding_debt_id(artifact);
+                for relation in crate::binding_debt::held(graph, artifact)? {
+                    if (relation.src == GraphNodeId::Artifact(artifact) || relation.id == reserved)
+                        && kin_index::binding_debt::decode_local_binding_debt(
+                            &file_id, artifact, &relation,
+                        )
+                        .map_err(|error| {
+                            ReconcileError::InvalidTransaction(format!(
+                                "local binding obligation: {error}"
+                            ))
+                        })?
+                        .is_some()
+                    {
+                        relations.insert(relation.id, relation);
+                    }
+                }
+            }
+        }
+        let mut delta = TransactionDelta {
             entity_deltas: existing
                 .into_iter()
                 .map(|old| EntityDelta::Removed { old })
@@ -1721,9 +3153,35 @@ impl Reconciler {
             relation_deltas: relations
                 .into_values()
                 .map(|old| RelationDelta::Removed { old })
+                .chain(withdrawals)
                 .collect(),
             ..TransactionDelta::default()
         };
+        let mut held_relations = HashMap::new();
+        let mut spoken_for = HashSet::new();
+        for mut owner in receiver_owners {
+            if relation_already_held(graph, &mut held_relations, &owner)?
+                .is_some_and(|held| !is_parser_derived(&held))
+            {
+                continue;
+            }
+            // A removal can nominate an unchanged same-file declaration too.
+            // Keep its admitted parser identity and history just as the edit
+            // path does, rather than add the linker's alternate ID beside it.
+            if let Some(held) =
+                dependent_parser_identity_to_keep(graph, &mut held_relations, &owner)?
+            {
+                owner.id = held.id;
+                owner.created_in = held.created_in;
+            }
+            push_relation_addition(
+                graph,
+                &mut held_relations,
+                &mut delta,
+                &mut spoken_for,
+                owner,
+            )?;
+        }
         let removed_count = removed.len();
         let warning_count = collision_warnings.len();
         let result = ReconcileResult::validated(
@@ -1763,6 +3221,17 @@ impl Reconciler {
     ) -> Result<(Vec<FilePathId>, Vec<IntentSummary>)> {
         kin_model::validate_transaction_delta(delta)
             .map_err(|error| ReconcileError::InvalidTransaction(error.to_string()))?;
+
+        for entity_delta in &delta.entity_deltas {
+            if let EntityDelta::Modified { old, .. } = entity_delta {
+                kin_model::require_independent_source(old).map_err(|reason| {
+                    ReconcileError::BodyExtractionFailed {
+                        entity_id: old.id,
+                        reason,
+                    }
+                })?;
+            }
+        }
 
         let modified_entities: HashMap<EntityId, &Entity> = delta
             .entity_deltas
@@ -1806,6 +3275,12 @@ impl Reconciler {
         // and corrupt body extraction.
         let mut mutations: HashMap<EntityId, Vec<u8>> = HashMap::new();
         for (id, entity) in modified_entities {
+            kin_model::require_independent_source(&entity).map_err(|reason| {
+                ReconcileError::BodyExtractionFailed {
+                    entity_id: id,
+                    reason,
+                }
+            })?;
             // Prefer an explicitly supplied entity body. This turns a graph
             // mutation into a real file edit. Fall back to exact span extraction
             // only for metadata-only modifications.
@@ -2821,6 +4296,64 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+    }
+
+    #[test]
+    fn dispatch_fold_preserves_fresh_direct_sites_shapes_counts_and_relation_identity() {
+        use kin_model::{CallArgShape, RelationEvidence, RelationOrigin, SourceSpan};
+        let record = |line, positional| RelationEvidence {
+            source_span: Some(SourceSpan {
+                file: FilePathId::new("base.py"),
+                start_byte: line as usize * 10,
+                end_byte: line as usize * 10 + 8,
+                start_line: line,
+                end_line: line,
+                start_col: 0,
+                end_col: 8,
+            }),
+            parser_rule: Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
+            call_shape: Some(CallArgShape::new(positional, vec![], false, false)),
+            ..RelationEvidence::default()
+        };
+        let mut parsed = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(EntityId::new()),
+            dst: GraphNodeId::Entity(EntityId::new()),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![record(4, 1), record(5, 2)],
+        };
+        let id = parsed.id;
+        let direct = parsed.evidence[1].clone();
+        let mut informed = parsed.clone();
+        informed.id = RelationId::new();
+        informed.confidence = 0.86;
+        informed.origin = RelationOrigin::Inferred;
+        informed.evidence.truncate(1);
+        informed.evidence[0].token =
+            Some(kin_index::SELF_DISPATCH_OVERRIDE_EVIDENCE_V1.to_string());
+        let mut additional = record(6, 3);
+        additional.token = Some(kin_index::SELF_DISPATCH_OVERRIDE_EVIDENCE_V1.to_string());
+        informed.evidence.push(additional);
+        incorporate_dispatch_evidence(&mut parsed, &informed).unwrap();
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.confidence, 0.86);
+        assert_eq!(parsed.evidence.len(), 3);
+        assert_eq!(parsed.evidence[0], informed.evidence[0]);
+        assert_eq!(
+            parsed.evidence[1], direct,
+            "direct site only the parser resolved remains intact"
+        );
+        assert_eq!(parsed.evidence[2], informed.evidence[1]);
+        let once = parsed.clone();
+        incorporate_dispatch_evidence(&mut parsed, &informed).unwrap();
+        assert_eq!(
+            parsed, once,
+            "seeing the same fresh sites twice must not double their counts"
+        );
     }
 
     fn partial_fixture(

@@ -17,8 +17,23 @@ use super::graph_health::{inspect_graph, inspect_graph_with_entities};
 pub enum GraphCommandRequest {
     Status,
     Validate,
-    Inspect { name: String },
-    Source { entity: String },
+    Inspect {
+        name: String,
+    },
+    Source {
+        entity: String,
+    },
+    /// One file's persisted conversion coverage, for `kin doctor
+    /// --conversion-source`.
+    ///
+    /// An operator diagnostic at the legacy conversion boundary rather than a
+    /// graph query an agent asks: it reports whether and how completely
+    /// conversion read one file, and counts what it produced by kind. It serves
+    /// no entity row. Only that doctor flag builds it; no `kin graph`
+    /// subcommand, MCP tool or routed command does.
+    ConversionSource {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +73,161 @@ pub struct GraphCommandResponse {
     /// store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_section: Option<kin_core::graph_section::GraphSectionState>,
+    /// One file's conversion coverage, for the conversion-source request.
+    ///
+    /// Structural rather than prose for the reason the fields above are: the
+    /// acceptance suite and an operator's script read the facts, not a terminal
+    /// rendering. Optional because every other request reports none, and an
+    /// older daemon sends none at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion_source: Option<ConversionSourceReport>,
+}
+
+/// One file's persisted conversion coverage, as `kin doctor
+/// --conversion-source` reports it.
+///
+/// What conversion read of one file and how much it produced, from the file's
+/// persisted layout and repository authority, through the same reading the
+/// retired file enumeration published
+/// ([`kin_mcp::handlers::file_entities::read_file_coverage`]). Counts, never
+/// rows: it carries no entity name, id, signature, span or body, and no cursor,
+/// because it describes the conversion rather than cataloguing the file. For
+/// the same reason it has no `truncated` field. Nothing here is paged, so there
+/// is nothing to have been cut, and `total` is the whole count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversionSourceReport {
+    /// The path as the graph stores it.
+    pub path: String,
+    pub file_coverage: ConversionSourceCoverage,
+    /// How many entities of each kind conversion produced for the file, keyed
+    /// by the kind word every other Kin surface uses (`function`, `class`).
+    /// A kind it produced none of is absent.
+    pub counts_by_kind: BTreeMap<String, u64>,
+    /// How many entities the graph holds for the file. Sums `counts_by_kind`.
+    pub total: u64,
+}
+
+/// The file-level facts of one conversion source, in the wire words the
+/// retired enumeration's `file_coverage` object used, so a reader of either
+/// reads the same vocabulary.
+///
+/// The extractor's dynamic-members note is published as a flag only. The note
+/// is text the extractor wrote on the file's module entity and it can quote
+/// the source, which this report never carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversionSourceCoverage {
+    /// Whether the repository tree admits the path.
+    pub tracked_in_graph: bool,
+    /// `entity_source`, `shallow_syntax`, `structured_artifact`,
+    /// `opaque_artifact`, or `none`.
+    pub tier: String,
+    /// Whether the file holds nothing because no adapter claims its type.
+    pub content_opaque: bool,
+    /// The cause when `content_opaque`, naming the extension nothing claims.
+    pub opaque_reason: Option<String>,
+    /// `full`, `partial`, `failed`, `absent`, or `unrecorded`.
+    pub parsed: String,
+    /// The adapter's reason for a partial or failed parse.
+    pub parse_detail: Option<String>,
+    /// The layout's own entity-region count, when the file has a layout.
+    pub layout_entity_regions: Option<u64>,
+    /// Whether the graph holds language-server-derived edges for the file's
+    /// entities: `present`, `absent`, or `unknown`.
+    pub enriched: String,
+    /// Whether the file's spans were derived from the bytes the tree holds.
+    pub span_provenance: String,
+    pub stale_spans: u64,
+    /// What the working copy holds at the path, relative to graph truth.
+    pub host_bytes: String,
+    pub dynamic_members_disclosed: bool,
+    /// Whether the file's entity set may be read as whole.
+    pub certifies_enumeration: bool,
+}
+
+impl ConversionSourceReport {
+    fn from_coverage(coverage: &kin_mcp::handlers::file_entities::FileCoverage) -> Self {
+        Self {
+            path: coverage.path.clone(),
+            file_coverage: ConversionSourceCoverage {
+                tracked_in_graph: coverage.tracked_in_graph,
+                tier: coverage.tier.to_string(),
+                content_opaque: coverage.content_opaque(),
+                opaque_reason: coverage.opaque_reason.clone(),
+                parsed: coverage.parsed.wire().to_string(),
+                parse_detail: coverage.parse_detail.clone(),
+                layout_entity_regions: coverage.layout_entity_regions.map(|count| count as u64),
+                enriched: coverage.enriched.to_string(),
+                span_provenance: coverage.span_provenance.wire().to_string(),
+                stale_spans: coverage.span_provenance.stale_entities() as u64,
+                host_bytes: coverage.host_bytes.wire().to_string(),
+                dynamic_members_disclosed: coverage.dynamic_members.is_some(),
+                certifies_enumeration: coverage.certifies_enumeration(),
+            },
+            counts_by_kind: coverage
+                .counts_by_kind
+                .iter()
+                .map(|(kind, count)| (entity_kind_word(*kind), *count as u64))
+                .collect(),
+            total: coverage.total as u64,
+        }
+    }
+
+    /// The short terminal rendering `kin doctor --conversion-source` prints
+    /// without `--json`.
+    fn summary_lines(&self) -> Vec<String> {
+        let coverage = &self.file_coverage;
+        let yes_no = |value: bool| if value { "yes" } else { "no" };
+        let mut lines = vec![
+            format!("Conversion source: {}", self.path),
+            format!(
+                "  tracked in graph: {}, tier: {}",
+                yes_no(coverage.tracked_in_graph),
+                coverage.tier
+            ),
+            format!(
+                "  parsed: {}, certifies enumeration: {}",
+                coverage.parsed,
+                yes_no(coverage.certifies_enumeration)
+            ),
+        ];
+        if let Some(detail) = &coverage.parse_detail {
+            lines.push(format!("  parse detail: {detail}"));
+        }
+        if let Some(reason) = &coverage.opaque_reason {
+            lines.push(format!("  content opaque: {reason}"));
+        }
+        let kinds = if self.counts_by_kind.is_empty() {
+            "none".to_string()
+        } else {
+            self.counts_by_kind
+                .iter()
+                .map(|(kind, count)| format!("{kind}: {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!("  entities: {} ({kinds})", self.total));
+        lines.push(format!(
+            "  span provenance: {} ({} stale), host bytes: {}, language-server edges: {}",
+            coverage.span_provenance, coverage.stale_spans, coverage.host_bytes, coverage.enriched
+        ));
+        if coverage.dynamic_members_disclosed {
+            lines.push(
+                "  dynamic members disclosed: the extractor recorded members it could not \
+                 enumerate statically"
+                    .to_string(),
+            );
+        }
+        lines
+    }
+}
+
+/// An entity kind in the word its serialized form uses, which is the word
+/// every Kin surface that names a kind publishes.
+fn entity_kind_word(kind: EntityKind) -> String {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(word)) => word,
+        _ => format!("{kind:?}"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +256,11 @@ pub struct GraphSourceRecord {
     /// distinguishes is a verified pair from one the graph recorded no digest for,
     /// so a caller about to restate this body as an edit can tell which it has.
     pub span_coherence: String,
+    /// Why a current read issued no `source_base`, when it could not: the span is
+    /// unverified, so no guarded change can cite this body
+    /// (`kin_mcp::source_base::SOURCE_BASE_UNAVAILABLE_UNVERIFIED`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_base_unavailable: Option<String>,
 }
 
 /// The three distinguishable results of resolving an entity's source for
@@ -108,6 +283,15 @@ pub enum EntitySourceOutcome {
     /// origin or no source span). Distinct from [`EntitySourceOutcome::NotFound`]
     /// — the ID is valid, there is simply nothing to return.
     NoSource(String),
+    /// The query is a name that names no one entity: twins, several owners'
+    /// members, or a partial name. No body was read. Every candidate is
+    /// carried, in the order every surface lists them, for the caller to choose
+    /// by id.
+    NameCandidates {
+        query: String,
+        reason: kin_ranking::entity_ranking::CandidateReason,
+        candidates: Vec<Entity>,
+    },
 }
 
 /// `kin graph status` — quick health check of the semantic graph.
@@ -167,17 +351,30 @@ fn append_hydration_semantics_line(
     lines: &mut Vec<String>,
     standing: &kin_core::hydration_semantics::HydrationStanding,
 ) {
+    if let Some(line) = hydration_semantics_line(standing) {
+        lines.push(line);
+    }
+}
+
+/// The one line every CLI surface prints for a hydration-semantics gap, or
+/// `None` when the store agrees with this build.
+///
+/// Shared by `kin graph status` and `kin status`, so the two print the same
+/// sentence and the same remedy for the same store.
+pub(crate) fn hydration_semantics_line(
+    standing: &kin_core::hydration_semantics::HydrationStanding,
+) -> Option<String> {
     if !standing.is_gap() {
-        return;
+        return None;
     }
     let remedy = standing
         .remedy()
         .map(|remedy| format!(" Remedy: {remedy}."))
         .unwrap_or_default();
-    lines.push(format!(
+    Some(format!(
         "⚠ hydration semantics: {}.{remedy}",
         standing.sentence()
-    ));
+    ))
 }
 
 /// `kin graph validate` — structural integrity checks.
@@ -260,6 +457,42 @@ pub async fn source(entity: String, json: bool) -> Result<()> {
 /// `kin graph body <entity>` — alias for `kin graph source <entity>`.
 pub async fn body(entity: String, json: bool) -> Result<()> {
     source(entity, json).await
+}
+
+/// `kin doctor --conversion-source <path>`: one file's persisted conversion
+/// coverage and its entity counts by kind.
+///
+/// A diagnostic at the legacy conversion boundary, for an operator or an
+/// acceptance suite asking whether conversion read a file and what it produced.
+/// It is not an agent surface and lists no entity: an agent works by entity
+/// through `kin locate` and the rest. Here rather than in the doctor's own
+/// module because it is a daemon graph request and shares the client, the wait
+/// reporting and the build-match check with the graph commands above.
+///
+/// A path the graph does not track is refused with a nonzero exit in both
+/// modes. An empty report there would say the file holds nothing, about a file
+/// the graph has never seen.
+pub async fn doctor_conversion_source(path: String, json: bool) -> Result<()> {
+    let layout = crate::commands::require_repository_layout()?;
+    let response =
+        run_daemon_graph(&layout, &GraphCommandRequest::ConversionSource { path }).await?;
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
+    let report = response.conversion_source.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the daemon answered the conversion-source request without a report; restart it so \
+             it matches this build"
+        )
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 async fn run_daemon_graph(
@@ -361,6 +594,9 @@ fn graph_wait_label(request: &GraphCommandRequest) -> &'static str {
         GraphCommandRequest::Validate => "validating the graph for this repository",
         GraphCommandRequest::Inspect { .. } => "looking this entity up in the graph",
         GraphCommandRequest::Source { .. } => "reading this entity's source from the graph",
+        GraphCommandRequest::ConversionSource { .. } => {
+            "reading this file's conversion coverage from the graph"
+        }
     }
 }
 
@@ -399,6 +635,9 @@ pub fn execute_graph_command(
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
     census: &kin_core::relation_census::CensusContext,
 ) -> Result<GraphCommandResponse> {
+    // No working copy is offered, which is the standing a caller with none
+    // has: a conversion-source reading here reports `host_bytes:
+    // not_applicable` rather than a comparison nobody made.
     execute_graph_command_for_store(
         authority,
         graph,
@@ -407,16 +646,24 @@ pub fn execute_graph_command(
         embedding_runtime,
         census,
         None,
+        kin_mcp::WorkingCopySurface::NotApplicable,
     )
 }
 
-/// The same command, told which store on disk it is reporting about.
+/// The same command, told which store on disk it is reporting about and which
+/// working copy that store's graph is supposed to be level with.
 ///
-/// Separate from [`execute_graph_command`] rather than an extra parameter on it
-/// because the store is knowable only to a caller that holds the layout, which
-/// today is the daemon and nobody else. Every other caller, including this
-/// module's own tests, asks the same question about a graph it already has in
-/// hand and has no `.kin` directory to name.
+/// Separate from [`execute_graph_command`] rather than extra parameters on it
+/// because the store and its working copy are knowable only to a caller that
+/// holds the layout, which today is the daemon and nobody else. Every other
+/// caller, including this module's own tests, asks the same question about a
+/// graph it already has in hand and has no `.kin` directory to name.
+///
+/// `host` is the standing the daemon hands its MCP handlers for the same
+/// repository, so the conversion-source reading qualifies a file by the same
+/// working-copy comparison the retired enumeration did. Only that request
+/// reads it.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_graph_command_for_store(
     authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
@@ -425,6 +672,7 @@ pub fn execute_graph_command_for_store(
     embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
     census: &kin_core::relation_census::CensusContext,
     kin_root: Option<&std::path::Path>,
+    host: kin_mcp::WorkingCopySurface<'_>,
 ) -> Result<GraphCommandResponse> {
     match request {
         GraphCommandRequest::Status => build_graph_status_response_for_store(
@@ -442,7 +690,55 @@ pub fn execute_graph_command_for_store(
         GraphCommandRequest::Source { entity } => {
             build_graph_source_response(authority, graph, entity)
         }
+        GraphCommandRequest::ConversionSource { path } => {
+            build_conversion_source_response(graph, path, host)
+        }
     }
+}
+
+/// Answer the conversion-source request from the shared coverage reading.
+///
+/// No authority argument, because the reading needs none beyond the graph: the
+/// layout facet, the tier facets, the repository tree and the entity index all
+/// live in it. The working copy is read only through `host`, at the one path
+/// named, and only to qualify certification, never to produce a fact.
+///
+/// A refusal of the path (one the graph has never seen, or one no Kin path rule
+/// admits) is carried in `error` with the reading's own words, the way an
+/// inspect of an unknown name is. A store that could not be read is a failure
+/// of the request instead.
+fn build_conversion_source_response(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+    host: kin_mcp::WorkingCopySurface<'_>,
+) -> Result<GraphCommandResponse> {
+    let coverage = match kin_mcp::handlers::file_entities::read_file_coverage(graph, host, path) {
+        Ok(coverage) => coverage,
+        Err(kin_mcp::McpError::Context(refusal) | kin_mcp::McpError::InvalidParams(refusal)) => {
+            return Ok(GraphCommandResponse {
+                lines: Vec::new(),
+                error: Some(refusal),
+                source: None,
+                reference_edge_coverage: None,
+                relation_census: None,
+                graph_section: None,
+                conversion_source: None,
+            });
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("read the file's conversion coverage"))
+        }
+    };
+    let report = ConversionSourceReport::from_coverage(&coverage);
+    Ok(GraphCommandResponse {
+        lines: report.summary_lines(),
+        error: None,
+        source: None,
+        reference_edge_coverage: None,
+        relation_census: None,
+        graph_section: None,
+        conversion_source: Some(report),
+    })
 }
 
 /// Whether coverage counters describe an attached vector index.
@@ -1138,6 +1434,13 @@ fn build_graph_status_response_for_store(
     for reason in reconcile.degraded_reasons() {
         warnings.push(format!("reconcile loop degraded: {reason}"));
     }
+    // Warnings for the same reason, and not degraded ones: the loop is healthy
+    // and is taking these paths, but until it has, the graph this command
+    // describes is not the working copy, and an all-clear under it would say it
+    // was.
+    for reason in reconcile.working_copy_behind_reasons() {
+        warnings.push(format!("graph behind the working copy: {reason}"));
+    }
     // Warnings rather than criticals, for the reason stated directly above:
     // criticals set the response error and would turn `kin graph status`
     // nonzero for every caller scripting it. A lost relation kind is a real
@@ -1216,6 +1519,7 @@ fn build_graph_status_response_for_store(
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
         relation_census: Some(census_comparison),
         graph_section: Some(graph_section),
+        conversion_source: None,
     })
 }
 
@@ -1504,6 +1808,7 @@ fn build_graph_validate_response_with_census(
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
         relation_census: Some(census_comparison),
         graph_section: None,
+        conversion_source: None,
     })
 }
 
@@ -1569,6 +1874,7 @@ fn build_graph_inspect_response(
             reference_edge_coverage: None,
             relation_census: None,
             graph_section: None,
+            conversion_source: None,
         });
     }
 
@@ -1626,6 +1932,7 @@ fn build_graph_inspect_response(
         reference_edge_coverage: None,
         relation_census: None,
         graph_section: None,
+        conversion_source: None,
     })
 }
 
@@ -1755,9 +2062,16 @@ fn build_entity_source_outcome_for_view(
     entity_query: &str,
     mint_current_source_base: bool,
 ) -> Result<EntitySourceOutcome> {
-    let entity = match resolve_source_entity(graph, entity_query)? {
-        Some(e) => e,
-        None => {
+    let entity = match resolve_source_query(graph, entity_query)? {
+        SourceQuery::One(e) => e,
+        SourceQuery::Candidates(reason, candidates) => {
+            return Ok(EntitySourceOutcome::NameCandidates {
+                query: entity_query.trim().to_string(),
+                reason,
+                candidates,
+            });
+        }
+        SourceQuery::Missing => {
             return Ok(EntitySourceOutcome::NotFound(
                 entity_source_not_found_message(entity_query),
             ));
@@ -1778,6 +2092,11 @@ fn entity_source_outcome(
     entity: &Entity,
     mint_current_source_base: bool,
 ) -> Result<EntitySourceOutcome> {
+    if let Err(reason) = kin_model::require_independent_source(entity) {
+        return Ok(EntitySourceOutcome::NoSource(entity_no_source_message(
+            entity, &reason,
+        )));
+    }
     // A structurally sourceless entity (no file origin or no span) is a valid ID
     // with nothing to return, reported as `NoSource` rather than as the genuine
     // extraction error below, which signals corrupt spans or unavailable blobs.
@@ -1808,59 +2127,81 @@ pub fn build_graph_source_response(
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<GraphCommandResponse> {
-    // `kin graph source` resolves through the resolver every read command
-    // shares, so it answers about the entity `kin refs` and `kin impact` answer
-    // about. The daemon's MCP source tool keeps `build_entity_source_outcome`.
+    // `kin graph source` reads a body, so it answers by the strict rule every
+    // source path shares, the one `get_entity_source` applies over MCP: one
+    // exact name, or one owner's member when nothing is named exactly. Twins,
+    // several owners' members and partial names list their candidates and read
+    // nothing. The shared resolver still reads the id and any
+    // `Name#kind@path:line` pins, and a pinned name answers only when the pins
+    // leave one entity it names exactly or as a member.
     let resolution = crate::entity_identity::resolve_entity(
         graph,
         entity_query,
         &crate::entity_identity::IdentityQualifiers::default(),
     )?;
-    let refusal = if resolution.pin_excluded_all() {
-        Some(crate::entity_identity::pin_miss_lines(
+    let pinned = !resolution.reference.qualifiers.is_empty() || resolution.reference.line.is_some();
+    let name = resolution.reference.name.clone();
+    let chosen: std::result::Result<Option<Entity>, Vec<String>> = if resolution.pin_excluded_all()
+    {
+        Err(crate::entity_identity::pin_miss_lines(
             graph,
             &resolution,
             crate::entity_identity::PinSpelling::FileKind,
         ))
-    } else if resolution.needs_a_pin() {
-        Some(crate::entity_identity::pin_request_lines(
-            graph,
-            &resolution,
-        ))
+    } else if resolution.addressed_by_id() || pinned {
+        let named_exactly = resolution.addressed_by_id()
+            || matches!(
+                resolution.name_match,
+                crate::entity_identity::NameMatch::Exact
+                    | crate::entity_identity::NameMatch::Member
+            );
+        match resolution.candidates.as_slice() {
+            [] => Ok(None),
+            [one] if named_exactly => Ok(Some(one.clone())),
+            many => Err(crate::entity_identity::name_candidate_lines(
+                &name,
+                crate::entity_identity::candidate_reason(resolution.name_match),
+                many,
+            )),
+        }
     } else {
-        None
+        match resolve_source_query(graph, &name)? {
+            SourceQuery::One(entity) => Ok(Some(entity)),
+            SourceQuery::Candidates(reason, candidates) => Err(
+                crate::entity_identity::name_candidate_lines(&name, reason, &candidates),
+            ),
+            SourceQuery::Missing => Ok(None),
+        }
     };
-    if let Some(lines) = refusal {
-        return Ok(GraphCommandResponse {
-            error: Some(lines.join("\n")),
-            lines,
-            source: None,
-            reference_edge_coverage: None,
-            relation_census: None,
-            graph_section: None,
-        });
-    }
-    let outcome = match resolution.chosen() {
+    let chosen = match chosen {
+        Ok(chosen) => chosen,
+        Err(lines) => {
+            return Ok(GraphCommandResponse {
+                error: Some(lines.join("\n")),
+                lines,
+                source: None,
+                reference_edge_coverage: None,
+                relation_census: None,
+                graph_section: None,
+                conversion_source: None,
+            });
+        }
+    };
+    let outcome = match chosen.as_ref() {
         Some(entity) => entity_source_outcome(repository_authority, graph, entity, false)?,
         None => EntitySourceOutcome::NotFound(entity_source_not_found_message(entity_query)),
     };
-    let choice = crate::entity_identity::choice_note(
-        graph,
-        &resolution,
-        crate::entity_identity::PinSpelling::FileKind,
-    );
     match outcome {
         EntitySourceOutcome::Found(record) => {
             let mut lines = vec![
                 format!(
                     "Entity source for '{}' -> {} ({})",
-                    resolution.reference.name, record.name, record.kind
+                    name, record.name, record.kind
                 ),
                 format!("ID: {}", record.id),
                 format!("File: {}", record.file_path),
                 format!("Lines: {}-{}", record.start_line, record.end_line),
             ];
-            lines.extend(choice);
             if !record.signature.is_empty() {
                 lines.push(format!("Signature: {}", record.signature));
             }
@@ -1874,6 +2215,7 @@ pub fn build_graph_source_response(
                 reference_edge_coverage: None,
                 relation_census: None,
                 graph_section: None,
+                conversion_source: None,
             })
         }
         EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
@@ -1883,11 +2225,30 @@ pub fn build_graph_source_response(
             reference_edge_coverage: None,
             relation_census: None,
             graph_section: None,
+            conversion_source: None,
         }),
         // A valid entity with no retrievable source is an error for the text/`?`
         // command paths (the CLI `kin graph source` and `trace_data_flow`, which
         // drops the step). The MCP path keeps the two apart via the typed outcome.
         EntitySourceOutcome::NoSource(message) => Err(anyhow::anyhow!(message)),
+        // Not reached from the resolution above, which refuses a name that names
+        // no one entity before any outcome is built; answered the same way anyway.
+        EntitySourceOutcome::NameCandidates {
+            query,
+            reason,
+            candidates,
+        } => {
+            let lines = crate::entity_identity::name_candidate_lines(&query, reason, &candidates);
+            Ok(GraphCommandResponse {
+                error: Some(lines.join("\n")),
+                lines,
+                source: None,
+                reference_edge_coverage: None,
+                relation_census: None,
+                graph_section: None,
+                conversion_source: None,
+            })
+        }
     }
 }
 
@@ -1923,21 +2284,67 @@ fn entity_no_source_message(entity: &Entity, reason: &str) -> String {
     )
 }
 
-fn resolve_source_entity(
+/// What a source query names: one entity, candidates, or nothing.
+pub enum SourceQuery {
+    One(Entity),
+    Candidates(kin_ranking::entity_ranking::CandidateReason, Vec<Entity>),
+    Missing,
+}
+
+/// Resolve a source query by id, then by the strict rule every source path
+/// shares ([`kin_ranking::entity_ranking::resolve_name_strictly`]): one exact
+/// name, or one owner's member when nothing is named exactly. Anything else is
+/// returned as candidates and never ranked to one: a guessed body is a guessed
+/// edit base. `get_entity_source(entity_id: "get")` used to answer with the body
+/// of whatever ranked first among every name containing `get`, which on
+/// pallets/flask was the tutorial's `get_db`, and `get_d` did the same.
+pub fn resolve_source_query(
+    graph: &kin_db::InMemoryGraph,
+    entity_query: &str,
+) -> Result<SourceQuery> {
+    let trimmed = entity_query.trim();
+    if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
+        return Ok(match graph.get_entity(&EntityId(uuid))? {
+            Some(entity) => SourceQuery::One(entity),
+            None => SourceQuery::Missing,
+        });
+    }
+    match kin_ranking::entity_ranking::resolve_name_strictly(graph, trimmed)? {
+        kin_ranking::entity_ranking::StrictNameResolution::One(entity) => {
+            Ok(SourceQuery::One(entity))
+        }
+        kin_ranking::entity_ranking::StrictNameResolution::Candidates(reason, candidates) => {
+            Ok(SourceQuery::Candidates(reason, candidates))
+        }
+        kin_ranking::entity_ranking::StrictNameResolution::Missing => {
+            // A spelling the name index cannot match literally, such as a
+            // generic owner written out, is retried the way `kin trace` retries
+            // it. What that reaches is listed, never chosen.
+            let mut matches = kin_core::query_trace_matches(graph, trimmed)?;
+            matches.retain(|entity| !kin_index::is_external_reference_target(entity));
+            if matches.is_empty() {
+                return Ok(SourceQuery::Missing);
+            }
+            kin_ranking::entity_ranking::sort_name_candidates(&mut matches);
+            Ok(SourceQuery::Candidates(
+                kin_ranking::entity_ranking::CandidateReason::PartialName,
+                matches,
+            ))
+        }
+    }
+}
+
+/// [`resolve_source_query`] for a caller that needs one entity or none: a
+/// name that names no one entity resolves to `None` here, and the caller's own
+/// outcome path reports the candidates.
+pub fn resolve_source_entity(
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<Option<Entity>> {
-    let trimmed = entity_query.trim();
-    if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
-        return Ok(graph.get_entity(&EntityId(uuid))?);
-    }
-
-    if let Some(entity) = kin_ranking::entity_ranking::select_best_entity(graph, trimmed)? {
-        return Ok(Some(entity));
-    }
-
-    let matches = kin_core::query_trace_matches(graph, trimmed)?;
-    Ok(matches.into_iter().next())
+    Ok(match resolve_source_query(graph, entity_query)? {
+        SourceQuery::One(entity) => Some(entity),
+        SourceQuery::Candidates(..) | SourceQuery::Missing => None,
+    })
 }
 
 fn graph_source_record(
@@ -1949,6 +2356,10 @@ fn graph_source_record(
     let authority = repository_authority.open()?;
     let workspace = authority.workspace()?;
     let mut record = graph_source_record_from(&authority, &workspace, entity)?;
+    if mint_current_source_base && record.span_coherence != "digest_verified" {
+        record.source_base_unavailable =
+            Some(kin_mcp::source_base::SOURCE_BASE_UNAVAILABLE_UNVERIFIED.to_string());
+    }
     if mint_current_source_base && record.span_coherence == "digest_verified" {
         let path = kin_model::RepoPath::from_utf8(record.file_path.clone())?;
         let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
@@ -1994,6 +2405,7 @@ pub(crate) fn graph_source_record_bounded_from(
     entity: &Entity,
     max_bytes: usize,
 ) -> Result<Option<GraphSourceRecord>> {
+    kin_model::require_independent_source(entity).map_err(anyhow::Error::msg)?;
     let file_origin = entity
         .file_origin
         .as_ref()
@@ -2033,6 +2445,7 @@ pub(crate) fn graph_source_record_bounded_from(
         );
     }
 
+    kin_parser::validate_module_source_span(entity, &bytes)?;
     let body = std::str::from_utf8(&bytes[span.start_byte..span.end_byte]).with_context(|| {
         format!(
             "entity '{}' source span {}..{} in '{}' is not valid UTF-8",
@@ -2058,6 +2471,7 @@ pub(crate) fn graph_source_record_bounded_from(
         signature: entity.signature.clone(),
         body,
         span_coherence: span_coherence.label().to_string(),
+        source_base_unavailable: None,
     }))
 }
 
@@ -3076,6 +3490,101 @@ mod tests {
         assert!(
             response.error.is_none(),
             "an ordinary working copy must not turn this command nonzero"
+        );
+    }
+
+    /// Tracked files the working copy changed while no daemon watched, and that
+    /// the daemon's catch-up has not taken yet, withhold the all-clear.
+    ///
+    /// Unlike untracked content one test up, these are not new files beside
+    /// the graph: the graph still answers about them from their old bytes, so
+    /// a report that called the graph healthy would describe a working copy
+    /// the host no longer holds. The loop is not degraded and the exit code
+    /// does not move; the control is the same graph with nothing owed.
+    #[test]
+    fn graph_status_withholds_the_all_clear_while_tracked_changes_are_owed() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+        graph
+            .upsert_entity(&test_entity("caller_of_run_task"))
+            .unwrap();
+
+        let owed = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                changed_path_count: 2,
+                changed_paths_sample: vec!["src/doomed.rs".to_string(), "src/lib.rs".to_string()],
+                ..Default::default()
+            },
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            !owed
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "a graph still holding old bytes is not an all-clear: {:?}",
+            owed.lines
+        );
+        let warning = owed
+            .lines
+            .iter()
+            .find(|line| line.contains("graph behind the working copy"))
+            .unwrap_or_else(|| panic!("the owed files must be named: {:?}", owed.lines));
+        assert!(
+            warning.contains("src/doomed.rs") && warning.contains("src/lib.rs"),
+            "{warning}"
+        );
+        assert!(
+            !owed
+                .lines
+                .iter()
+                .any(|line| line.contains("reconcile loop degraded")),
+            "a catch-up in flight is not a degraded loop: {:?}",
+            owed.lines
+        );
+        assert!(owed.error.is_none(), "the exit code does not move");
+
+        let unchecked = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                changed_paths_unchecked: Some("the check could not run".to_string()),
+                ..Default::default()
+            },
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            unchecked
+                .lines
+                .iter()
+                .any(|line| line.contains("graph behind the working copy")
+                    && line.contains("the check could not run")),
+            "a check that did not run is said, not read as nothing owed: {:?}",
+            unchecked.lines
+        );
+
+        let level = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &crate::commands::resources::ReconcileHealth::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            !level
+                .lines
+                .iter()
+                .any(|line| line.contains("graph behind the working copy")),
+            "the control: nothing owed, nothing said: {:?}",
+            level.lines
         );
     }
 
@@ -4941,6 +5450,48 @@ mod tests {
     }
 
     #[test]
+    fn derived_member_legacy_source_and_rename_refuse_generator_body() {
+        let text = "for (const name of names) { app[name] = function() {}; }";
+        let fixture = graph_source_fixture(Some(text.as_bytes()));
+        let mut entity = source_entity("app.get", fixture.file_id.clone(), 0, text.len());
+        entity.language = LanguageId::JavaScript;
+        entity.kind = EntityKind::Method;
+        entity.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        commit_source_entity(&fixture, &entity);
+        match build_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &entity.id.to_string(),
+        )
+        .unwrap()
+        {
+            EntitySourceOutcome::NoSource(message) => assert!(message.contains("independent")),
+            other => panic!("a generator must not be returned as the member body: {other:?}"),
+        }
+        let authority = fixture.authority().open().unwrap();
+        let workspace = authority.workspace().unwrap();
+        let error = graph_source_record_bounded_from(&authority, &workspace, &entity, usize::MAX)
+            .unwrap_err();
+        assert!(error.to_string().contains("independent"));
+        let request = crate::commands::rename::RenameRequest {
+            symbol: entity.name.clone(),
+            new_name: "renamed".into(),
+            file: None,
+            line: None,
+            column: None,
+            json: false,
+            operation_id: kin_model::OperationId::new(),
+            actor: kin_model::AuthorId("derived-source-test".into()),
+        };
+        let error = crate::commands::rename::plan_rename(&fixture.graph, &request, |_, _| {
+            panic!("rename must refuse a derived declaration before loading source")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("independent"), "{error}");
+    }
+
+    #[test]
     fn bounded_graph_source_validates_before_refusing_allocation() {
         let text = "fn target() {\r\n    execute();\r\n}";
         let fixture = graph_source_fixture(Some(text.as_bytes()));
@@ -4997,6 +5548,22 @@ mod tests {
         assert_eq!(source.file_path, "src/lib.rs");
         assert_eq!(source.start_byte, start);
         assert_eq!(source.end_byte, end);
+        assert!(source.source_base.is_none());
+        assert!(source.source_base_unavailable.is_none());
+        let EntitySourceOutcome::Found(source) = build_current_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &id.to_string(),
+        )
+        .unwrap() else {
+            panic!("the current-source route must find the same entity");
+        };
+        assert_eq!(source.body, body);
+        assert!(source.source_base.is_none());
+        assert_eq!(
+            source.source_base_unavailable.as_deref(),
+            Some(kin_mcp::source_base::SOURCE_BASE_UNAVAILABLE_UNVERIFIED)
+        );
     }
 
     /// This arm enforces the span/bytes coherence rule too.
@@ -5061,6 +5628,19 @@ mod tests {
         let record = response.source.unwrap();
         assert_eq!(record.body, "fn target() {}");
         assert_eq!(record.span_coherence, "digest_verified");
+        assert!(record.source_base.is_none());
+        assert!(record.source_base_unavailable.is_none());
+        let EntitySourceOutcome::Found(record) = build_current_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &id.to_string(),
+        )
+        .unwrap() else {
+            panic!("the current-source route must find the same entity");
+        };
+        assert_eq!(record.body, "fn target() {}");
+        assert!(record.source_base.is_some());
+        assert!(record.source_base_unavailable.is_none());
     }
 
     #[test]
@@ -5225,6 +5805,69 @@ mod tests {
             other => panic!("unexpected taxonomy: {other:?}"),
         };
         assert_ne!(nf, ns);
+    }
+
+    /// `kin graph source` reads a body, so it answers by the strict rule every
+    /// source path shares: several owners' members, exact twins and a partial
+    /// name each list their candidates and read nothing, and a lone member
+    /// reads its own body.
+    #[test]
+    fn graph_source_reads_a_body_only_for_a_name_that_names_one_entity() {
+        const SOURCE: &[u8] = b"def route(self):\n    return 1\n";
+        let fixture = graph_source_fixture(Some(SOURCE));
+        let member = |name: &str| {
+            let mut entity = source_entity(name, fixture.file_id.clone(), 0, SOURCE.len() - 1);
+            entity.kind = EntityKind::Method;
+            entity
+        };
+        let route = member("Scaffold.route");
+        let scaffold_get = member("Scaffold.get");
+        let globals_get = member("Globals.get");
+        let cousin = source_entity("get_db", fixture.file_id.clone(), 0, SOURCE.len() - 1);
+        let twin_one = source_entity("resolve", fixture.file_id.clone(), 0, SOURCE.len() - 1);
+        let twin_two = source_entity("resolve", FilePathId::new("src/other.rs"), 0, 4);
+        for entity in [
+            &route,
+            &scaffold_get,
+            &globals_get,
+            &cousin,
+            &twin_one,
+            &twin_two,
+        ] {
+            commit_source_entity(&fixture, entity);
+        }
+        let source = |query: &str| {
+            build_graph_source_response(&fixture.authority(), &fixture.graph, query).unwrap()
+        };
+
+        let shared = source("get");
+        assert!(shared.source.is_none());
+        let text = shared.error.expect("a shared member name reads nothing");
+        assert!(
+            text.contains("Scaffold.get")
+                && text.contains("Globals.get")
+                && !text.contains("get_db"),
+            "{text}"
+        );
+
+        let twins = source("resolve");
+        assert!(twins.source.is_none());
+        assert!(twins
+            .error
+            .expect("twins read nothing")
+            .contains("2 entities are named 'resolve' exactly"));
+
+        let partial = source("get_d");
+        assert!(partial.source.is_none(), "a partial name reads no body");
+        let text = partial.error.expect("a partial name lists its candidates");
+        assert!(
+            text.contains("get_db") && text.contains(&cousin.id.to_string()),
+            "{text}"
+        );
+
+        let lone = source("route");
+        let record = lone.source.expect("a lone member reads its own body");
+        assert_eq!(record.id, route.id.to_string());
     }
 
     #[test]
@@ -5528,6 +6171,283 @@ mod tests {
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({"lines": ["older daemon response"]})
+        );
+    }
+
+    /// A converted store holding one conversion source per shape the acceptance
+    /// suite reads: a file an adapter read completely, a docstring-only module,
+    /// and a file whose type no adapter claims, admitted with no facet the way
+    /// conversion leaves one. Returns the entities so a test can look for them
+    /// in what the report must not carry.
+    fn conversion_source_graph() -> (kin_db::InMemoryGraph, Vec<Entity>) {
+        let graph = kin_db::InMemoryGraph::new();
+        for path in ["pkg/parsed.py", "pkg/empty.py", "docs/notes.md"] {
+            admit_artifact(&graph, ArtifactId::new(), path);
+        }
+        let mut entities = Vec::new();
+        for (name, file, kind) in [
+            ("alpha_probe", "pkg/parsed.py", EntityKind::Function),
+            ("beta_probe", "pkg/parsed.py", EntityKind::Function),
+            ("GammaProbe", "pkg/parsed.py", EntityKind::Class),
+            ("parsed_module_probe", "pkg/parsed.py", EntityKind::Module),
+            ("empty_module_probe", "pkg/empty.py", EntityKind::Module),
+        ] {
+            let mut entity = test_entity_in_file(name, file);
+            entity.kind = kind;
+            graph.upsert_entity(&entity).unwrap();
+            entities.push(entity);
+        }
+        for (path, regions) in [("pkg/parsed.py", 4), ("pkg/empty.py", 1)] {
+            graph
+                .upsert_file_layout(&kin_model::layout::FileLayout {
+                    file_id: FilePathId::new(path),
+                    parse_completeness: kin_model::layout::ParseCompleteness::Full,
+                    imports: kin_model::layout::ImportSection {
+                        byte_range: 0..0,
+                        items: Vec::new(),
+                    },
+                    regions: (0..regions)
+                        .map(|index| kin_model::layout::SourceRegion::EntityRef {
+                            entity_id: EntityId::new(),
+                            byte_range: index..index + 1,
+                        })
+                        .collect(),
+                })
+                .unwrap();
+        }
+        (graph, entities)
+    }
+
+    /// The request as the daemon runs it, through the one dispatch every graph
+    /// command takes.
+    fn conversion_source_over(
+        binding: &kin_core::LocalRepositoryAuthorityBinding,
+        graph: &kin_db::InMemoryGraph,
+        path: &str,
+        host: kin_mcp::WorkingCopySurface<'_>,
+    ) -> GraphCommandResponse {
+        execute_graph_command_for_store(
+            &pinned(binding),
+            graph,
+            &GraphCommandRequest::ConversionSource {
+                path: path.to_string(),
+            },
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            host,
+        )
+        .expect("the request answers")
+    }
+
+    /// The conversion-source request answers each shape on its own terms and
+    /// refuses a path the graph has never seen.
+    ///
+    /// The three answers are the facts the acceptance suite's checks 15, 17 and
+    /// 21 read: a complete parse certifies with its counts by kind, a
+    /// docstring-only module certifies with a module and nothing else, and a
+    /// file no adapter claims stays uncertified and names its extension as the
+    /// reason. The refusal is the control that keeps an empty report from ever
+    /// standing in for a file nobody converted.
+    #[test]
+    fn a_conversion_source_reports_each_shape_and_refuses_an_unknown_path() {
+        let (_temp, binding, _) = graph_validation_fixture();
+        let (graph, _) = conversion_source_graph();
+        let report = |path: &str| {
+            conversion_source_over(
+                &binding,
+                &graph,
+                path,
+                kin_mcp::WorkingCopySurface::NotApplicable,
+            )
+            .conversion_source
+            .unwrap_or_else(|| panic!("{path} carries a report"))
+        };
+
+        let parsed = report("pkg/parsed.py");
+        assert_eq!(parsed.path, "pkg/parsed.py");
+        assert_eq!(parsed.file_coverage.parsed, "full");
+        assert_eq!(parsed.file_coverage.tier, "entity_source");
+        assert!(parsed.file_coverage.tracked_in_graph);
+        assert!(parsed.file_coverage.certifies_enumeration);
+        assert!(!parsed.file_coverage.content_opaque);
+        assert_eq!(parsed.file_coverage.opaque_reason, None);
+        assert_eq!(parsed.file_coverage.layout_entity_regions, Some(4));
+        assert_eq!(parsed.file_coverage.host_bytes, "not_applicable");
+        assert_eq!(
+            parsed.counts_by_kind,
+            BTreeMap::from([
+                ("class".to_string(), 1),
+                ("function".to_string(), 2),
+                ("module".to_string(), 1),
+            ])
+        );
+        assert_eq!(parsed.total, 4);
+
+        let empty = report("pkg/empty.py");
+        assert_eq!(empty.file_coverage.parsed, "full");
+        assert!(empty.file_coverage.certifies_enumeration);
+        assert!(!empty.file_coverage.content_opaque);
+        assert_eq!(
+            empty.counts_by_kind,
+            BTreeMap::from([("module".to_string(), 1)])
+        );
+        assert_eq!(empty.total, 1);
+
+        let opaque = report("docs/notes.md");
+        assert_eq!(opaque.file_coverage.tier, "none");
+        assert_eq!(opaque.file_coverage.parsed, "absent");
+        assert!(opaque.file_coverage.tracked_in_graph);
+        assert!(!opaque.file_coverage.certifies_enumeration);
+        assert!(opaque.file_coverage.content_opaque);
+        assert_eq!(
+            opaque.file_coverage.opaque_reason.as_deref(),
+            Some("no_adapter_for_extension:md")
+        );
+        assert!(opaque.counts_by_kind.is_empty());
+        assert_eq!(opaque.total, 0);
+
+        let unknown = conversion_source_over(
+            &binding,
+            &graph,
+            "pkg/missing.py",
+            kin_mcp::WorkingCopySurface::NotApplicable,
+        );
+        let refusal = unknown.error.expect("an unknown path is refused");
+        assert!(
+            refusal.starts_with("graph gap: ") && refusal.contains("pkg/missing.py"),
+            "the refusal names the gap and the path: {refusal}"
+        );
+        assert!(unknown.conversion_source.is_none());
+        assert!(
+            conversion_source_over(
+                &binding,
+                &graph,
+                "../outside.py",
+                kin_mcp::WorkingCopySurface::NotApplicable,
+            )
+            .error
+            .is_some(),
+            "a path no Kin path rule admits is refused too"
+        );
+    }
+
+    /// The working copy qualifies the reading by the standing the daemon hands
+    /// it, the same one its MCP handlers get: a working copy nothing compared
+    /// says so and refuses certification, and never borrows a fact from disk.
+    #[test]
+    fn a_conversion_source_reads_the_working_copy_standing_it_is_handed() {
+        let (_temp, binding, _) = graph_validation_fixture();
+        let (graph, _) = conversion_source_graph();
+        let unchecked = conversion_source_over(
+            &binding,
+            &graph,
+            "pkg/parsed.py",
+            kin_mcp::WorkingCopySurface::Unchecked,
+        )
+        .conversion_source
+        .expect("a report");
+        assert_eq!(unchecked.file_coverage.host_bytes, "unchecked");
+        assert!(!unchecked.file_coverage.certifies_enumeration);
+        assert_eq!(unchecked.total, 4, "the counts are graph truth either way");
+    }
+
+    /// The report is counts and coverage, never a catalog: no entity's name,
+    /// id, signature, span or body, no row, no cursor and no `truncated`,
+    /// whether read as the report or as the whole daemon response with its
+    /// terminal lines.
+    #[test]
+    fn a_conversion_source_report_carries_no_entity_row() {
+        fn collect_keys(value: &serde_json::Value, keys: &mut std::collections::BTreeSet<String>) {
+            if let Some(object) = value.as_object() {
+                for (key, nested) in object {
+                    keys.insert(key.clone());
+                    collect_keys(nested, keys);
+                }
+            }
+        }
+
+        let (_temp, binding, _) = graph_validation_fixture();
+        let (graph, entities) = conversion_source_graph();
+        for path in ["pkg/parsed.py", "pkg/empty.py", "docs/notes.md"] {
+            let response = conversion_source_over(
+                &binding,
+                &graph,
+                path,
+                kin_mcp::WorkingCopySurface::NotApplicable,
+            );
+            let report =
+                serde_json::to_value(response.conversion_source.as_ref().unwrap()).unwrap();
+            let mut keys = std::collections::BTreeSet::new();
+            collect_keys(&report, &mut keys);
+            for forbidden in [
+                "entities",
+                "id",
+                "name",
+                "signature",
+                "span",
+                "start_line",
+                "end_line",
+                "start_byte",
+                "end_byte",
+                "body",
+                "text_preview",
+                "cursor",
+                "next_cursor",
+                "truncated",
+            ] {
+                assert!(
+                    !keys.contains(forbidden),
+                    "{path}: the report carries `{forbidden}`: {report}"
+                );
+            }
+            let wire = serde_json::to_string(&response).unwrap();
+            for entity in &entities {
+                for leaked in [
+                    entity.name.clone(),
+                    entity.id.0.to_string(),
+                    entity.signature.clone(),
+                ] {
+                    assert!(
+                        !wire.contains(&leaked),
+                        "{path}: the response carries {leaked:?}: {wire}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An older daemon's response carries no report, and one with a report
+    /// round-trips unchanged, so the CLI can tell a daemon that predates the
+    /// request from one that answered it.
+    #[test]
+    fn a_conversion_source_report_round_trips_and_is_optional() {
+        let older: GraphCommandResponse =
+            serde_json::from_value(serde_json::json!({"lines": []})).unwrap();
+        assert!(older.conversion_source.is_none());
+
+        let (_temp, binding, _) = graph_validation_fixture();
+        let (graph, _) = conversion_source_graph();
+        let response = conversion_source_over(
+            &binding,
+            &graph,
+            "docs/notes.md",
+            kin_mcp::WorkingCopySurface::NotApplicable,
+        );
+        let wire = serde_json::to_value(&response).unwrap();
+        let back: GraphCommandResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back.conversion_source, response.conversion_source);
+        assert_eq!(
+            wire["conversion_source"]["file_coverage"]["opaque_reason"],
+            serde_json::json!("no_adapter_for_extension:md")
+        );
+        assert_eq!(
+            serde_json::to_value(GraphCommandRequest::ConversionSource {
+                path: "docs/notes.md".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({"command": "conversion_source", "path": "docs/notes.md"})
         );
     }
 }

@@ -82,21 +82,21 @@ pub async fn start(
         }
     }
 
-    let mut config = build_mcp_start_config();
     let resolved_profile = resolve_tool_profile(
         tool_profile.as_deref(),
         std::env::var("KIN_MCP_TOOL_PROFILE").ok().as_deref(),
     );
     eprintln!("{}", resolved_profile.startup_notice());
-    if let Some(names) = resolved_profile.profile.allowed_tool_names() {
-        config.allowed_tools = Some(
-            names
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect::<HashSet<_>>(),
-        );
-    }
-    config.agent_belt = resolved_profile.profile.is_agent_belt();
+    let mut config = served_config(resolved_profile.profile);
+    // Paths the server compares, the client's folder against the repository
+    // that answers, go through the same symlink resolution the binder uses.
+    config.canonicalize = canonical_path;
+    // Until the client names a workspace root, the folder it works in is the
+    // one this server was launched in.
+    config.client_root = std::env::current_dir().ok().map(|dir| canonical_path(&dir));
+    // Every command an answer names is spelled so it runs for this reader: a
+    // registry install runs Kin through `npx` and puts no `kin` on PATH.
+    kin_mcp::first_contact::set_spelling(command_spelling());
 
     let startup = kin_mcp::StartupDaemonBinding::new();
 
@@ -136,16 +136,23 @@ pub async fn start(
     crate::daemon_client::install_spawn_registrar();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let init_served = config.serves_init();
     let bind_task = tokio::spawn(run_startup_binding(
         global,
         repo_override,
         cwd,
         std::sync::Arc::clone(&startup),
+        init_served,
     ));
 
-    let served = kin_mcp::run_stdio_daemon(config, repo_binder, Some(startup))
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server error: {}", e));
+    // `kin_session_exec` runs toolchain commands in session workspaces through
+    // this launcher, the way `kin_init` sets folders up through it.
+    kin_mcp::session_exec::install_executor(crate::commands::agent_exec::executor());
+
+    let served =
+        kin_mcp::run_stdio_daemon(config, repo_binder, Some(startup), Some(repo_initializer()))
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP server error: {}", e));
 
     // The client closed stdin, so this server is done. A daemon spawn already
     // in flight is detached and survives on its own by design, so the next
@@ -163,6 +170,7 @@ async fn run_startup_binding(
     repo_override: Option<PathBuf>,
     cwd: PathBuf,
     startup: std::sync::Arc<kin_mcp::StartupDaemonBinding>,
+    init_served: bool,
 ) {
     // Name the repository being bound before the slow work starts, so the
     // still-starting report can say how far that daemon's startup has come.
@@ -195,10 +203,20 @@ async fn run_startup_binding(
         Ok(daemon_url) => {
             eprintln!("{}", session_authority_notice());
             eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
+            let launch_dir = canonical_path(&cwd);
             let root = discovered
                 .as_ref()
                 .map(|layout| canonical_path(layout.working_dir()))
-                .unwrap_or(cwd);
+                .unwrap_or_else(|| launch_dir.clone());
+            // Which repository answers, said once at startup, and said loudly
+            // when it is not the folder this server was launched in: a folder
+            // nested in another Kin repository is answered from that one.
+            eprintln!("Kin MCP: serving the Kin repository at {}", root.display());
+            if let Some(warning) =
+                kin_mcp::first_contact::repository_identity(&root, Some(&launch_dir)).warning
+            {
+                eprintln!("Kin MCP: {warning}");
+            }
             startup.resolve_bound(
                 kin_mcp::BoundRepo { root, daemon_url },
                 repo_override.is_some(),
@@ -207,10 +225,20 @@ async fn run_startup_binding(
         }
         Err(reason) => {
             if !global {
+                let init = kin_mcp::first_contact::kin_command(
+                    "init .",
+                    kin_mcp::first_contact::Spelling::here(),
+                );
+                // `kin_init` is a write, served only on a profile that writes.
+                let set_up = if init_served {
+                    format!("ask your agent to call kin_init, or run {init} in it")
+                } else {
+                    format!("run {init} in it")
+                };
                 eprintln!(
                     "Kin MCP: no repository bound at startup ({reason}). If the MCP client \
                      advertises workspace roots, Kin binds to the open repository after \
-                     initialization; otherwise run `kin init .`, relaunch inside a Kin \
+                     initialization. To set a folder up, {set_up}; or relaunch inside a Kin \
                      repository, or pass --repo <path> (or set KIN_MCP_REPO=<path>)."
                 );
             } else {
@@ -272,10 +300,20 @@ pub(crate) enum McpToolProfile {
     ///
     /// The smallest surface this binary serves and the first designed from
     /// measurement rather than from what a code-graph agent ought to want. It
-    /// serves five tools; the other sixty-two are found through
-    /// `kin_tool_search`, which returns a tool's full registered schema, so this
-    /// is a smaller list rather than a smaller product.
+    /// serves a small set plus discovery and invocation. `kin_tool_search`
+    /// returns full schemas; `kin_tool_call` invokes hidden read-only operations
+    /// through their normal checks. Mutations still require a direct tool.
     AgentSearch,
+    /// One routed tool, `kin`, for a client that loads every tool it is handed
+    /// and re-sends them all with every request: Codex CLI, Cursor, Gemini CLI,
+    /// Windsurf, Antigravity and LM Studio. Its commands reach the belt's tools
+    /// with that belt's defaults and envelope, writes included, so an eager
+    /// client pays for one small tool definition per request instead of
+    /// twenty-one, and `describe` and `call` reach every other tool.
+    AgentRouted,
+    /// `agent-routed` without a write path: the same one tool and commands,
+    /// minus `session` and `mutate`, reaching only read-only tools.
+    AgentRoutedQuery,
     /// The retrieval belt the benchmark arm drives.
     Benchmark,
     /// Read-only graph-native ContextBench belt: no write-side session or
@@ -291,6 +329,8 @@ const TOOL_PROFILE_TOKENS: &[(&str, McpToolProfile)] = &[
     ("agent-default", McpToolProfile::AgentDefault),
     ("agent-query", McpToolProfile::AgentQuery),
     ("agent-search", McpToolProfile::AgentSearch),
+    ("agent-routed", McpToolProfile::AgentRouted),
+    ("agent-routed-query", McpToolProfile::AgentRoutedQuery),
     ("full", McpToolProfile::Full),
     ("benchmark", McpToolProfile::Benchmark),
     ("context-bench", McpToolProfile::ContextBench),
@@ -303,6 +343,7 @@ impl McpToolProfile {
             Self::AgentDefault => Some(kin_mcp::agent_default_tool_names()),
             Self::AgentQuery => Some(kin_mcp::agent_query_tool_names()),
             Self::AgentSearch => Some(kin_mcp::agent_search_tool_names()),
+            Self::AgentRouted | Self::AgentRoutedQuery => Some(kin_mcp::agent_routed_tool_names()),
             Self::Benchmark => Some(kin_mcp::benchmark_tool_names()),
             Self::ContextBench => Some(kin_mcp::context_bench_tool_names()),
             Self::Full => None,
@@ -313,17 +354,59 @@ impl McpToolProfile {
     /// trimmed input schemas, and the compact `semantic_locate` shape.
     ///
     /// `agent-default`, `agent-query`, which is that belt with its write half
-    /// removed, and `agent-search`, which is the measured always-on slice of it:
-    /// all three serve the same short forms. `full` is the whole documented
-    /// surface by definition. `benchmark` and `context-bench` keep the long
-    /// forms and the shared payload because their bytes are an input to a
-    /// citable result, and a benchmark number must not move because a
+    /// removed, `agent-search`, which is the measured always-on slice of it, and
+    /// the two routed profiles, which reach the belt through one tool: all of
+    /// them serve the same short forms and defaults. `full` is the whole
+    /// documented surface by definition. `benchmark` and `context-bench` keep
+    /// the long forms and the shared payload because their bytes are an input
+    /// to a citable result, and a benchmark number must not move because a
     /// description was rewritten or a payload was narrowed.
     pub(crate) fn is_agent_belt(self) -> bool {
         matches!(
             self,
-            Self::AgentDefault | Self::AgentQuery | Self::AgentSearch
+            Self::AgentDefault
+                | Self::AgentQuery
+                | Self::AgentSearch
+                | Self::AgentRouted
+                | Self::AgentRoutedQuery
         )
+    }
+
+    /// The routed surface this profile serves, or `None` for a named one.
+    pub(crate) fn routed_surface(self) -> Option<kin_mcp::routed::RoutedSurface> {
+        match self {
+            Self::AgentRouted => Some(kin_mcp::routed::RoutedSurface::WITH_WRITES),
+            Self::AgentRoutedQuery => Some(kin_mcp::routed::RoutedSurface::READ_ONLY),
+            _ => None,
+        }
+    }
+
+    /// Whether this profile serves entity bodies with each line marked by its
+    /// offset in the entity. Only the profiles with no Kin write path do, and a
+    /// client that asks for exact bodies when it connects is served them anyway.
+    pub(crate) fn numbers_entity_lines(self) -> bool {
+        matches!(
+            self,
+            Self::AgentQuery | Self::AgentSearch | Self::AgentRoutedQuery
+        )
+    }
+
+    /// Whether this profile's bytes are an input to a citable result.
+    pub(crate) fn is_citable(self) -> bool {
+        matches!(self, Self::Benchmark | Self::ContextBench)
+    }
+
+    /// Whether a client on this profile can write through Kin.
+    #[cfg(test)]
+    pub(crate) fn writes(self) -> bool {
+        match self.routed_surface() {
+            Some(surface) => surface.writes,
+            None => kin_mcp::tools::serves_a_write_tool(
+                self.allowed_tool_names()
+                    .map(kin_mcp::tool_name_set)
+                    .as_ref(),
+            ),
+        }
     }
 
     pub(crate) fn token(self) -> &'static str {
@@ -390,9 +473,11 @@ impl ResolvedToolProfile {
                  belt without the session and transaction tools ({} tools), which a \
                  query-only client re-sends in every prompt and never calls, \
                  KIN_MCP_TOOL_PROFILE=agent-search for the measured always-on set ({} tools) \
-                 plus kin_tool_search for discovery (withheld tools remain disabled), or \
-                 KIN_MCP_TOOL_PROFILE=full for the complete {} tool surface; accepted \
-                 profiles: {}.",
+                 plus kin_tool_search and kin_tool_call for discovered operations, \
+                 KIN_MCP_TOOL_PROFILE=agent-routed for one routed tool, for a client that \
+                 sends every tool with every request, agent-routed-query for that tool without \
+                 a write path, or KIN_MCP_TOOL_PROFILE=full for the complete {} tool surface; \
+                 accepted profiles: {}.",
                 McpToolProfile::AgentQuery.tool_count(),
                 McpToolProfile::AgentSearch.tool_count(),
                 McpToolProfile::Full.tool_count(),
@@ -407,6 +492,24 @@ impl ResolvedToolProfile {
             ),
         }
     }
+}
+
+/// Every profile token `kin mcp start` serves.
+pub(crate) fn tool_profile_tokens() -> impl Iterator<Item = &'static str> {
+    TOOL_PROFILE_TOKENS.iter().map(|(token, _)| *token)
+}
+
+/// Whether `value` names a profile `kin mcp start` serves, as its token.
+pub(crate) fn is_tool_profile_token(value: &str) -> bool {
+    TOOL_PROFILE_TOKENS.iter().any(|(token, _)| *token == value)
+}
+
+/// The profile a token names, or `None` for a value that is not one.
+pub(crate) fn tool_profile_for_token(value: &str) -> Option<McpToolProfile> {
+    TOOL_PROFILE_TOKENS
+        .iter()
+        .find(|(token, _)| *token == value)
+        .map(|(_, profile)| *profile)
 }
 
 fn accepted_tool_profiles() -> String {
@@ -747,8 +850,27 @@ fn current_daemon_url() -> Option<String> {
 /// compare equal when they name the same repository (`/tmp` vs `/private/tmp`
 /// on macOS, for one). Falls back to the path as given when it cannot be
 /// canonicalized.
-fn canonical_path(path: &Path) -> PathBuf {
+pub(crate) fn canonical_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// How this server's answers spell a `kin` command: `kin` when one is on the
+/// PATH this server runs with, the `npx` form of this release when none is.
+pub(crate) fn command_spelling() -> kin_mcp::first_contact::Spelling {
+    if which::which("kin").is_ok() {
+        kin_mcp::first_contact::Spelling::Kin
+    } else {
+        kin_mcp::first_contact::Spelling::Npx
+    }
+}
+
+/// What `kin_init` runs: the checks an agent-driven setup needs, then `kin
+/// init` itself. See [`crate::commands::init::initialize_for_mcp`].
+fn repo_initializer() -> kin_mcp::RepoInitializer {
+    std::sync::Arc::new(|dir: PathBuf| {
+        Box::pin(crate::commands::init::initialize_for_mcp(dir))
+            as Pin<Box<dyn Future<Output = kin_mcp::InitOutcome> + Send>>
+    })
 }
 
 fn session_authority_notice() -> &'static str {
@@ -761,6 +883,29 @@ fn build_mcp_start_config() -> kin_mcp::McpServerConfig {
         snapshot_path: None,
         ..Default::default()
     }
+}
+
+/// The config `kin mcp start` serves `profile` under before a client
+/// connects: the profile's tools, whether it is the agent belt, its routed
+/// surface, whether it numbers entity lines, and whether it is citable.
+///
+/// `kin call` answers under the same config, so a shell's call is served
+/// exactly as that profile's MCP client is.
+pub(crate) fn served_config(profile: McpToolProfile) -> kin_mcp::McpServerConfig {
+    let mut config = build_mcp_start_config();
+    if let Some(names) = profile.allowed_tool_names() {
+        config.allowed_tools = Some(
+            names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<HashSet<_>>(),
+        );
+    }
+    config.agent_belt = profile.is_agent_belt();
+    config.routed = profile.routed_surface();
+    config.number_entity_lines = profile.numbers_entity_lines();
+    config.citable = profile.is_citable();
+    config
 }
 
 /// Resolve an explicit repository override for MCP startup: an explicit
@@ -1019,6 +1164,8 @@ mod tests {
             ("agent-default", McpToolProfile::AgentDefault),
             ("agent-query", McpToolProfile::AgentQuery),
             ("agent-search", McpToolProfile::AgentSearch),
+            ("agent-routed", McpToolProfile::AgentRouted),
+            ("agent-routed-query", McpToolProfile::AgentRoutedQuery),
             ("benchmark", McpToolProfile::Benchmark),
             ("context-bench", McpToolProfile::ContextBench),
             ("full", McpToolProfile::Full),
@@ -1115,6 +1262,259 @@ mod tests {
                 kin_mcp::agent_search_tool_names().len()
             )),
             "notice must state what the search surface costs: {notice}"
+        );
+        assert!(
+            notice.contains("KIN_MCP_TOOL_PROFILE=agent-routed"),
+            "notice must name the routed surface: {notice}"
+        );
+    }
+
+    /// The config `kin mcp start` builds for a resolved profile.
+    fn config_for(profile: McpToolProfile) -> kin_mcp::McpServerConfig {
+        let mut config = build_mcp_start_config();
+        config.allowed_tools = profile.allowed_tool_names().map(kin_mcp::tool_name_set);
+        config.agent_belt = profile.is_agent_belt();
+        config.routed = profile.routed_surface();
+        config.number_entity_lines = profile.numbers_entity_lines();
+        config.citable = profile.is_citable();
+        config
+    }
+
+    /// Both routed profiles serve the one routed tool, on the agent belt, so
+    /// their commands get the belt's defaults and the procedure worded for
+    /// them; `agent-routed` carries the writes and `agent-routed-query` does
+    /// not.
+    #[test]
+    fn the_routed_profiles_serve_one_routed_tool_on_the_belt() {
+        for (token, writes) in [("agent-routed", true), ("agent-routed-query", false)] {
+            let resolved = resolve_tool_profile(Some(token), None);
+            let profile = resolved.profile;
+            assert_eq!(profile.token(), token);
+            assert_eq!(
+                profile.allowed_tool_names(),
+                Some(&[kin_mcp::routed::TOOL_NAME][..])
+            );
+            assert!(profile.is_agent_belt());
+            assert_eq!(profile.tool_count(), 1);
+            assert_eq!(
+                profile.routed_surface().map(|surface| surface.writes),
+                Some(writes)
+            );
+            assert_eq!(profile.writes(), writes);
+            let served = kin_mcp::server::served_tools_for(&config_for(profile));
+            assert_eq!(served.tools.len(), 1);
+            assert_eq!(served.tools[0].name, kin_mcp::routed::TOOL_NAME);
+            assert_eq!(served.tools[0].annotations.read_only_hint, !writes);
+            assert!(resolved.startup_notice().contains(&format!("'{token}'")));
+        }
+    }
+
+    /// Numbering is a presentation for a client with no Kin write path: every
+    /// profile that numbers serves no write, every profile that writes is
+    /// served exact bodies, and only the citable profiles are citable.
+    #[test]
+    fn only_a_profile_without_a_write_path_numbers_entity_bodies() {
+        for (_, profile) in TOOL_PROFILE_TOKENS {
+            let profile = *profile;
+            if profile.numbers_entity_lines() {
+                assert!(
+                    !profile.writes(),
+                    "{} numbers bodies and writes",
+                    profile.token()
+                );
+            }
+            if profile.writes() {
+                assert!(!profile.numbers_entity_lines(), "{}", profile.token());
+            }
+            let config = config_for(profile);
+            assert_eq!(
+                config.routed.is_some_and(|surface| surface.numbered),
+                profile.routed_surface().is_some() && profile.numbers_entity_lines(),
+                "{}: the routed surface and the connection disagree on numbering",
+                profile.token()
+            );
+        }
+        let numbered: Vec<&str> = TOOL_PROFILE_TOKENS
+            .iter()
+            .filter(|(_, profile)| profile.numbers_entity_lines())
+            .map(|(token, _)| *token)
+            .collect();
+        assert_eq!(
+            numbered,
+            vec!["agent-query", "agent-search", "agent-routed-query"]
+        );
+        let citable: Vec<&str> = TOOL_PROFILE_TOKENS
+            .iter()
+            .filter(|(_, profile)| profile.is_citable())
+            .map(|(token, _)| *token)
+            .collect();
+        assert_eq!(citable, vec!["benchmark", "context-bench"]);
+    }
+
+    /// The npm wrapper words its launch notice from its own copy of three facts
+    /// this module owns: every profile `kin mcp start` accepts, the one it serves
+    /// when none is named or the name is not a profile, and the profiles whose
+    /// connection serves `kin_init`. A copy that drifted would have the notice
+    /// send a user's agent to a tool the server does not list, or keep quiet
+    /// about one it does, so the copies are read out of the wrapper's source and
+    /// held to the registry here.
+    #[test]
+    fn the_npm_wrapper_agrees_on_which_profiles_serve_kin_init() {
+        let wrapper = include_str!("../../../../packages/kin-mcp/src/index.js");
+        let accepted: std::collections::BTreeSet<&str> = TOOL_PROFILE_TOKENS
+            .iter()
+            .map(|(token, _)| *token)
+            .collect();
+        let serving_init: std::collections::BTreeSet<&str> = TOOL_PROFILE_TOKENS
+            .iter()
+            .filter(|(_, profile)| config_for(*profile).serves_init())
+            .map(|(token, _)| *token)
+            .collect();
+        // The rule is not vacuous: a profile that writes serves it and a
+        // read-only one does not.
+        assert!(serving_init.contains("agent-default"), "{serving_init:?}");
+        assert!(
+            !serving_init.contains("agent-routed-query"),
+            "{serving_init:?}"
+        );
+
+        assert_eq!(
+            wrapper_string_set(wrapper, "TOOL_PROFILES"),
+            accepted,
+            "packages/kin-mcp/src/index.js TOOL_PROFILES must list every profile `kin mcp \
+             start` accepts"
+        );
+        assert_eq!(
+            wrapper_string_set(wrapper, "PROFILES_SERVING_INIT"),
+            serving_init,
+            "packages/kin-mcp/src/index.js PROFILES_SERVING_INIT must list exactly the profiles \
+             whose connection serves kin_init"
+        );
+        assert_eq!(
+            wrapper_string_const(wrapper, "DEFAULT_TOOL_PROFILE"),
+            resolve_tool_profile(None, None).profile.token(),
+            "packages/kin-mcp/src/index.js DEFAULT_TOOL_PROFILE must be the profile `kin mcp \
+             start` serves when none is named"
+        );
+    }
+
+    /// The single-quoted strings inside `const <name> = new Set([ ... ]);` in the
+    /// wrapper's source.
+    fn wrapper_string_set<'a>(source: &'a str, name: &str) -> std::collections::BTreeSet<&'a str> {
+        let opening = format!("const {name} = new Set([");
+        let start = source
+            .find(&opening)
+            .unwrap_or_else(|| panic!("the wrapper declares no `{opening}`"))
+            + opening.len();
+        let body = &source[start..];
+        let end = body
+            .find("]);")
+            .unwrap_or_else(|| panic!("the wrapper's {name} is never closed"));
+        let values: std::collections::BTreeSet<&str> =
+            body[..end].split('\'').skip(1).step_by(2).collect();
+        assert!(!values.is_empty(), "the wrapper's {name} names nothing");
+        values
+    }
+
+    /// The single-quoted string in `const <name> = '...';` in the wrapper's
+    /// source.
+    fn wrapper_string_const<'a>(source: &'a str, name: &str) -> &'a str {
+        let opening = format!("const {name} = '");
+        let start = source
+            .find(&opening)
+            .unwrap_or_else(|| panic!("the wrapper declares no `{opening}`"))
+            + opening.len();
+        let rest = &source[start..];
+        &rest[..rest
+            .find('\'')
+            .unwrap_or_else(|| panic!("the wrapper's {name} is never closed"))]
+    }
+
+    /// A first launch of the npm wrapper answers `initialize` before `kin mcp
+    /// start` exists, from the wrapper's own copy of the instructions each
+    /// profile is served, and a client keeps the instructions it was first
+    /// given for the whole session. So the copy is read out of the wrapper and
+    /// held, profile by profile, to what this server answers `initialize` with
+    /// on the config `kin mcp start` builds for that profile. The wrapper used
+    /// to carry one string, the one only `benchmark` and `context-bench` are
+    /// served, and hand it to every first launch.
+    #[tokio::test]
+    async fn a_first_launch_is_handed_the_instructions_its_profile_is_served() {
+        let copy: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../packages/kin-mcp/src/server-instructions.json"
+        ))
+        .expect("the wrapper's instructions file is JSON");
+        let texts = copy["instructions"]
+            .as_object()
+            .expect("the wrapper's instructions file carries its texts by name");
+        let profiles = copy["profiles"]
+            .as_object()
+            .expect("the wrapper's instructions file names a text for each profile");
+        let accepted: std::collections::BTreeSet<&str> = TOOL_PROFILE_TOKENS
+            .iter()
+            .map(|(token, _)| *token)
+            .collect();
+        assert_eq!(
+            profiles
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            accepted,
+            "packages/kin-mcp/src/server-instructions.json must name the instructions of every \
+             profile `kin mcp start` accepts, and of no other"
+        );
+
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "first-launch-pin", "version": "1" }
+            }
+        })
+        .to_string();
+        let mut handed_out = std::collections::BTreeSet::new();
+        for (token, profile) in TOOL_PROFILE_TOKENS {
+            let answer = kin_mcp::process_daemon_message(&initialize, &config_for(*profile))
+                .await
+                .expect("initialize is answered");
+            let served = answer
+                .result
+                .as_ref()
+                .and_then(|result| result.get("instructions"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("{token}: `kin mcp start` answered with no instructions")
+                });
+            let name = profiles[*token]
+                .as_str()
+                .unwrap_or_else(|| panic!("{token}: the wrapper names no text for it"));
+            let copied = texts
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("{token}: the wrapper names {name} and carries no such text")
+                });
+            assert_eq!(
+                copied, served,
+                "{token}: a first launch hands out the wrapper's {name}, and `kin mcp start` \
+                 answers this profile with other instructions; update \
+                 packages/kin-mcp/src/server-instructions.json"
+            );
+            handed_out.insert(name);
+        }
+        // The pin is not vacuous: profiles are served different texts, and the
+        // wrapper carries none that no profile is served.
+        assert!(handed_out.len() > 1, "{handed_out:?}");
+        assert_eq!(
+            texts
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            handed_out,
+            "the wrapper carries a text no profile is served"
         );
     }
 

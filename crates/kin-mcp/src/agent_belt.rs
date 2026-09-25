@@ -26,9 +26,18 @@
 //! has to stay advertised; [`schema_keep_lists`] names that exception and the
 //! checks that own it.
 //!
-//! Every short form answers two questions in one or two sentences: when to call
-//! this, and what comes back. Where two tools are easy to confuse, the one a
-//! caller reaches for by mistake names the other.
+//! Halved again on 2026-09-22. An eager client re-sends the whole served list on
+//! every request, and in the corrected rerun pilot the `agent-query` list was
+//! about 3,500 tokens a request, nearly all of it parameter prose. Every served
+//! description on `agent-default` and `agent-query`, tool and parameter, nested
+//! transaction contract included, is now at most half its bytes at 97c719c8d,
+//! and no served parameter was dropped: 3,235 bytes of tool description became
+//! 1,512 and 11,333 of schema description became 4,388 on `agent-default`.
+//! `every_served_description_is_at_most_half_its_2026_09_22_base` holds each
+//! one against the measured base.
+//!
+//! Every short form says in a few words what the tool answers. Where two tools
+//! are easy to confuse, the one a caller reaches for by mistake names the other.
 //!
 //! Trimming a schema hides a property; it does not remove it. No tool in this
 //! profile sets `additionalProperties: false`, and the handlers read arguments
@@ -41,10 +50,11 @@
 //! `kin-mcp` went red on `every_agent_default_tool_has_a_short_description`,
 //! that is this module asking for two entries, not a defect:
 //!
-//! 1. [`short_descriptions`]: one or two sentences saying when to call the tool
-//!    and what comes back, under [`AGENT_DEFAULT_DESCRIPTION_BUDGET`]
-//!    characters. Where another tool is easy to confuse with yours, name it, and
-//!    add the pointer back in its entry.
+//! 1. [`short_descriptions`]: one short sentence saying what the tool answers,
+//!    under [`AGENT_DEFAULT_DESCRIPTION_BUDGET`] characters. Where another tool
+//!    is easy to confuse with yours, name it, and add the pointer back in its
+//!    entry. Short property descriptions go in [`tool_property_descriptions`],
+//!    under [`AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET`].
 //! 2. [`schema_keep_lists`]: the input properties that change WHICH entities
 //!    come back. Leave out the ones that only reshape the response, since the
 //!    profile picks those itself.
@@ -59,23 +69,24 @@ use crate::types::ToolsListResult;
 
 /// The most characters one `agent-default` description may carry.
 ///
-/// 180 is one sentence of technical prose, down from the 265 that bought two.
-/// It is a budget rather than a target: several tools here are shorter, and none
-/// should need more, because a description longer than this is documentation,
-/// and documentation belongs in the `full` profile where a reader has the room
-/// for it. Two sentences were affordable when the belt was measured in tens of
-/// thousands of tokens; against a 64k local window they are not, and the second
-/// sentence was where the prose crept back.
+/// 90 is half the 180 that held until 2026-09-22, which was itself down from
+/// the 265 that bought two sentences. It is a budget rather than a target:
+/// several tools here are shorter, and none should need more, because a
+/// description longer than this is documentation, and documentation belongs in
+/// the `full` profile where a reader has the room for it. An eager client
+/// re-sends every description on every request, so a sentence here is paid for
+/// once per turn rather than once per session.
 /// `no_agent_default_description_exceeds_its_budget` below fails on any tool
 /// that exceeds it.
-pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 180;
+pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 90;
 
 /// The whole profile's description budget.
 ///
-/// 4,500 characters against the 47,739 the long forms cost. Held as a total as
-/// well as a per-tool cap because twenty tools each sitting just under the
-/// per-tool budget would be a profile that had learned nothing.
-pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 4_500;
+/// Half of the 3,235 characters the served descriptions cost at 97c719c8d, and
+/// a small fraction of the 47,739 the long forms cost. Held as a total as well
+/// as a per-tool cap because twenty tools each sitting just under the per-tool
+/// budget would be a profile that had learned nothing.
+pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 1_617;
 
 /// The honest name for the declaration filter, accepted on a call and never
 /// served.
@@ -144,18 +155,10 @@ pub fn canonicalize_tool_name(name: &mut String) {
 /// Ask, on this belt's agents' behalf, for the answer shape and the size a
 /// small model can afford.
 ///
-/// The compact response is opt-in on the wire, and deliberately so: the fused
-/// `semantic_locate` payload IS the `LocateResult` schema `kin locate --json`
-/// and `POST /locate` serialize, asserted by
-/// `mcp_semantic_locate_fused_payload_round_trips_into_locate_schema` and two
-/// sibling tests, so a consumer needs one parser across all three. Narrowing
-/// that by default would break the contract for every caller to help one of
-/// them.
-///
-/// This is where the one that needs helping asks. The belt exists to fit a small
-/// model's context, its agents read ids and coordinates rather than the shared
-/// schema, and on a 730-entity store the shapes are 38,819 bytes against 3,472
-/// at twelve results.
+/// Compact responses keep entity identities and signatures within the initial
+/// tool budget. Full responses retain entity detail and explanations; neither
+/// MCP shape exposes the operator's file catalog. The shared result type can
+/// still decode a full MCP answer with its absent legacy roll-up defaulted empty.
 ///
 /// Only when the caller named no `surface` of its own. An agent that asks for
 /// `full` gets full, which is what makes this a default rather than an override,
@@ -173,6 +176,19 @@ pub fn canonicalize_tool_name(name: &mut String) {
 /// so a caller reading `tools/list` sees the number the belt actually sends and
 /// can raise it with the same `max_chars` it always could.
 pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_json::Value>) {
+    if name == "find_references" {
+        let explain = arguments
+            .get("explain")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || arguments
+                .get("compact")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false);
+        arguments
+            .entry(crate::budget::ANSWER_ONLY_PARAM.to_string())
+            .or_insert_with(|| serde_json::Value::Bool(!explain));
+    }
     if name == "semantic_locate" {
         arguments
             .entry("surface".to_string())
@@ -196,10 +212,9 @@ pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_jso
             .or_insert_with(|| serde_json::json!(AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET));
     }
 
-    // A page the client's own per-result budget does not cut. Only when the
-    // caller named no limit of its own, so an agent that asks for more pages
-    // gets them.
-    if name == "semantic_locate" {
+    // Default only a fresh ranking. A cursor already carries its page width;
+    // injecting a limit here would override it and silently widen the next page.
+    if name == "semantic_locate" && !arguments.contains_key("cursor") {
         arguments
             .entry("limit".to_string())
             .or_insert_with(|| serde_json::json!(AGENT_DEFAULT_LOCATE_PAGE));
@@ -230,102 +245,106 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "find_references",
-            "Find who depends on one entity: callers, importers and references, one row each with id, name, kind and file. One hop only; use trace_data_flow for a chain.",
+            "Callers, importers and references of one entity. Chains? trace_data_flow.",
         ),
         (
             "get_context_pack",
-            "Assemble a token-bounded context bundle from one entity, several entities or a question: focal bodies plus signatures and routes, instead of several get_entity_source reads.",
+            "Bodies, signatures and routes around entities or a question, in one bundle.",
         ),
-        (
-            "get_entity_source",
-            "Return one entity's exact graph-owned body by id, when a snippet is not enough.",
-        ),
+        ("get_entity_source", "One entity's exact source, by id."),
         (
             "graph_neighborhood",
-            "Get what one entity depends on and what depends on it, to a depth you choose. Callers only? Use find_references. An ordered path? Use trace_data_flow.",
+            "What one entity depends on and what depends on it. Paths: trace_data_flow.",
         ),
         (
             "impact_analysis",
-            "Walk the graph from a change to every entity it could affect, targeted one way at a time by entity_ids, files, base and head, or change_ids.",
-        ),
-        (
-            "kin_artifact_list",
-            "List the repository's tracked files at one semantic change, code and non-code alike, whether or not the parsers made entities for them.",
-        ),
-        (
-            "kin_artifact_read",
-            "Read one tracked file's exact content by artifact_id or repo-relative path: text when valid UTF-8, else base64.",
+            "Every entity a change could affect, from entity_ids or change_ids.",
         ),
         (
             "kin_graph_status",
-            "Counts for the graph this call is answered from, and how many entities are embedded, pending or unindexed. `sampling=last_settled_selected_graph` is the last settled reading.",
+            "Graph and embedding counts. last_settled_selected_graph marks a last settled reading.",
         ),
         // The one fact an agent cannot discover for itself: that the list it was
         // handed is partial on purpose, and how to reach the rest. Every other
         // short form here describes a capability; this one describes the surface.
         (
+            crate::tool_invocation::TOOL_NAME,
+            "Run a discovered read-only tool with its name and input object. Mutations require a direct tool; normal authorization applies.",
+        ),
+        (
             crate::handlers::tool_search::TOOL_NAME,
             "This profile does not serve every tool in the registry. Find tools by describing \
              the job. Each match includes its full \
-             schema and invocation.profile_enabled. Discovery does not enable withheld tools; \
-             use a connection whose profile serves them. Enabled tools still require normal \
-             authorization. Omit `need` to list every tool.",
+             schema and invocation routes. Discovery does not change the tool list; use \
+             kin_tool_call for matches marked callable_via_dispatcher, or a connection serving \
+             the tool directly. Normal authorization applies. Omit `need` to list every tool.",
         ),
         (
             "kin_provenance_query",
-            "Answer who changed an entity and whether it was approved: change count, latest change, approvals, a page of changes and recent audit events.",
+            "Who changed an entity, when, and whether it was approved.",
+        ),
+        (
+            crate::repository_init::TOOL_NAME,
+            "Set a folder up as a Kin repository when it is not one.",
+        ),
+        // A toolchain run, not plumbing and not a question about code: it
+        // names what it does in the words a build, test or run request uses,
+        // and none a locate or reference question arrives in.
+        (
+            crate::session_exec::TOOL_NAME,
+            "Build, test or run this project with its toolchain. Session needs can_execute.",
         ),
         (
             "kin_session_end",
-            "Session plumbing for writes. Close an open session and release what it holds, once your writing is done.",
+            "Session plumbing for writes. Close an open session.",
         ),
         (
             "kin_session_heartbeat",
-            "Session plumbing for writes. Renew an open session during long work so it does not lapse at its idle TTL.",
+            "Session plumbing for writes. Keep a session alive.",
         ),
         (
             "kin_mutate",
-            "Validate and commit a batch of graph mutations in one atomic call, naming the entity or file each operation changes and the new body it gets.",
+            "Commit targeted entity changes atomically, in one call.",
         ),
         (
             "kin_session_start",
-            "Session plumbing for writes. Open a session and get a session_id, before your first transaction, so the work is attributed.",
+            "Session plumbing for writes. Open one; get a session_id.",
         ),
         (
             "kin_transaction_abort",
-            "Transaction plumbing for writes. Discard everything staged on an open transaction and close it. Refused once kin_transaction_commit has fenced it.",
+            "Transaction plumbing for writes. Discard what is staged and close it.",
         ),
         (
             "kin_transaction_begin",
-            "Transaction plumbing for writes. Open a transaction and get a transaction_id. Nothing staged on it lands until kin_transaction_commit.",
+            "Transaction plumbing for writes. Open one; get a transaction_id.",
         ),
         (
             "kin_transaction_commit",
-            "Transaction plumbing for writes. Publish everything staged on one transaction atomically, all of it or none. Re-sending a fenced commit is safe.",
+            "Transaction plumbing for writes. Publish everything staged, atomically.",
         ),
         (
             "kin_transaction_stage",
-            "Transaction plumbing for writes. Stage a create, update, delete or rename onto an open transaction. An update replaces the whole body, so send the complete new text.",
+            "Transaction plumbing for writes. Stage an update, create, delete or rename.",
         ),
         (
-            "list_file_entities",
-            "List every entity the graph holds for one file by repo-relative path, and say whether that list is complete, before concluding a file holds nothing.",
+            crate::handlers::lexical::TOOL_NAME,
+            "Exact literals, punctuation included, in stored graph fields. Lexical evidence only.",
         ),
         (
             "semantic_locate",
-            "Find code by a plain-language question, ranked from the graph: id, name, kind, file, line, signature, score. Know the exact name? Use semantic_search.",
+            "Find code by describing what it does. Know the exact name? semantic_search.",
         ),
         (
             DECLARATION_FILTER_CANONICAL,
-            "Filter declarations by exact name, kind or language; it matches names, not meaning. Asking what code does rather than what it is called? Use semantic_locate.",
+            "Declarations by name, kind or language. By meaning? semantic_locate.",
         ),
         (
             "trace_data_flow",
-            "Walk the call chain out from ONE entity and get the whole ordered path back; it walks call and import edges. Naming TWO things? Use trace_path.",
+            "The ordered call chain out from one entity. Two endpoints? trace_path.",
         ),
         (
             "trace_path",
-            "Find how one entity reaches another as ordered hops; read `found` and `gap` before concluding A never reaches B. One endpoint only? Use trace_data_flow.",
+            "How one entity reaches another, as hops. One endpoint? trace_data_flow.",
         ),
     ])
 }
@@ -380,7 +399,13 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
         // path a caller uses when it has a name and no id.
         (
             "find_references",
-            &["entity_id", "query", "relation_kinds", "max_chars"] as &[&str],
+            &[
+                "entity_id",
+                "query",
+                "relation_kinds",
+                "max_chars",
+                "answer_only",
+            ] as &[&str],
         ),
         (
             "trace_data_flow",
@@ -433,6 +458,8 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "depth",
                 "token_budget",
                 "max_chars",
+                "focal_body",
+                "neighbor_bodies",
             ] as &[&str],
         ),
         ("kin_provenance_query", &["entity_id", "limit"] as &[&str]),
@@ -443,6 +470,23 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
         (
             crate::handlers::tool_search::TOOL_NAME,
             &["need", "limit"] as &[&str],
+        ),
+        (
+            crate::tool_invocation::TOOL_NAME,
+            &["tool", "arguments"] as &[&str],
+        ),
+        // Every one, written out for the same reason as the tool-search entry:
+        // each changes what runs, what it may see or what comes back.
+        (
+            crate::session_exec::TOOL_NAME,
+            &[
+                "session_id",
+                "argv",
+                "env",
+                "timeout_secs",
+                "max_output_bytes",
+                "summary",
+            ] as &[&str],
         ),
     ])
 }
@@ -569,21 +613,13 @@ pub fn agent_default_response_max_chars(tool: &str) -> u64 {
 /// number exists to buy.
 pub const AGENT_DEFAULT_LOCATE_PAGE: u64 = 12;
 
-/// The context pack's own token budget on `agent-default`.
+/// The whole rendered context reply's estimated token budget on the agent belt.
 ///
-/// `get_context_pack` bounds itself in TOKENS as well as characters, and its
-/// registered default of 16,000 is larger than the whole answer this belt now
-/// asks for. 2,500 sits under the roughly 2,800 tokens
-/// [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`] buys, leaving the envelope its room.
-///
-/// This did not move when the pack's response ceiling did. The two are separate
-/// levers and the change to the ceiling was a decision about one of them: this
-/// number bounds what the BUILDER assembles, and the ceiling bounds what the
-/// response may ship. Raising the ceiling stops a built pack from being cut on
-/// the way out; raising this would build a larger one, which is a different
-/// question with its own measurement and is not what
-/// [`AGENT_CHAIN_RESPONSE_MAX_CHARS`] decided.
-pub const AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET: u64 = 2_500;
+/// Code, repository observations and qualification metadata all count. A real
+/// short focal with its dependency neighborhood needs over 3,300 tokens, so
+/// 4,000 keeps that answer intact with room for a longer body. The byte ceiling
+/// applies independently, and explicit token budgets override this default.
+pub const AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET: u64 = 4_000;
 
 /// The belt tools whose registered schema advertises a response budget.
 ///
@@ -591,7 +627,7 @@ pub const AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET: u64 = 2_500;
 /// building the registry there to rediscover eight names would cost more than
 /// it saves. `the_budget_tool_list_matches_the_registry` fails if the registry
 /// and this list ever disagree, so it cannot go stale quietly.
-const BUDGET_TOOLS: [&str; 8] = [
+const BUDGET_TOOLS: [&str; 9] = [
     "semantic_locate",
     DECLARATION_FILTER_CANONICAL,
     "find_references",
@@ -600,6 +636,7 @@ const BUDGET_TOOLS: [&str; 8] = [
     "graph_neighborhood",
     "impact_analysis",
     "get_context_pack",
+    crate::handlers::lexical::TOOL_NAME,
 ];
 
 /// Whole input schemas this belt serves in place of the registered ones.
@@ -610,10 +647,9 @@ const BUDGET_TOOLS: [&str; 8] = [
 /// trimmed profile should not advertise.
 ///
 /// `kin_mutate` is the only entry and the reason the mechanism exists. Its
-/// registered `operations` item is a seven-branch `oneOf` that spells out every
-/// verb synonym and every path rule, 8,406 bytes of input schema on a tool whose
-/// whole served definition is 8,699. The form below carries the same five fields
-/// under one object and the canonical verb for each operation.
+/// registered `operations` item spells out every guarded and unguarded branch,
+/// verb synonym and path rule. The form below carries the common fields and
+/// the compact anchored-edit contract under one object, with canonical verbs.
 ///
 /// It advertises less than the server accepts, which is the same bargain every
 /// trim in this module makes: no tool here sets `additionalProperties: false` at
@@ -633,39 +669,62 @@ fn belt_schema_overrides() -> BTreeMap<&'static str, serde_json::Value> {
             "properties": {
                 "operations": {
                     "type": "array",
-                    "description": "Changes applied together or not at all.",
+                    "description": "Applied atomically.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "verb": {
                                 "type": "string",
-                                "enum": ["update", "create", "replace", "rename", "delete"],
-                                "description": "update an entity body; create, replace, rename or delete a tracked file."
+                                "enum": ["patch", "update", "create", "remove"],
+                                "description": "Patch, update, create or remove."
                             },
                             "target": {
                                 "type": "string",
                                 "minLength": 1,
-                                "description": "Entity UUID or exact entity name for update; repository-relative path for the file verbs."
+                                "description": "UUID, or the declared or package name."
                             },
                             "body": {
                                 "type": "string",
-                                "description": "Complete new UTF-8 text, never a fragment or a diff. Required by update, create and replace."
+                                "description": "Complete new entity source for update."
                             },
-                            "destination": {
-                                "type": "string",
-                                "description": "Repository-relative path the file moves to. Required by rename."
+                            "payload": {
+                                "type": "object",
+                                "description": "Required. body only with EntitySourceBase. In an empty repository, create with EntityCreate addressed to a unit.",
+                                "properties": {
+                                    "EntitySourceBase": { "type": "object", "description": "Unchanged source_base from a current get_entity_source read; verb update with the complete body." },
+                                    "EntityCreate": crate::entity_lifecycle::compact_schema(true),
+                                    "UnitImports": crate::entity_lifecycle::compact_unit_imports_schema(),
+                                    "EntityRemove": crate::entity_lifecycle::compact_schema(false),
+                                    "EntitySourcePatch": {
+                                        "type": "object",
+                                        "properties": {
+                                            "source_base": { "type": "object", "description": "Unchanged source_base from a current get_entity_source read." },
+                                            "edits": {
+                                                "type": "array", "minItems": 1,
+                                                "description": "Each old_text must occur exactly once. Anchors must not overlap; all address the original entity body.",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": { "old_text": { "type": "string", "minLength": 1 }, "new_text": { "type": "string" } },
+                                                    "required": ["old_text", "new_text"], "additionalProperties": false
+                                                }
+                                            }
+                                        },
+                                        "required": ["source_base", "edits"], "additionalProperties": false
+                                    }
+                                },
+                                "oneOf": [{"required":["EntitySourcePatch"]},{"required":["EntitySourceBase"]},{"required":["EntityCreate"]},{"required":["UnitImports"]},{"required":["EntityRemove"]}], "additionalProperties": false
                             },
                             "description": {
                                 "type": "string",
-                                "description": "One sentence saying what this operation changes."
+                                "description": "What this op changes."
                             }
                         },
-                        "required": ["verb", "target", "description"]
+                        "required": ["verb", "target", "payload", "description"]
                     }
                 },
                 "summary": {
                     "type": "string",
-                    "description": "One sentence a human reads in history. Omitted, the change records only its id."
+                    "description": "One sentence for the history."
                 }
             },
             "required": ["operations"]
@@ -679,6 +738,10 @@ fn belt_schema_overrides() -> BTreeMap<&'static str, serde_json::Value> {
 /// the served schema stops being the contract the acceptance suite grades it as.
 fn belt_schema_defaults() -> BTreeMap<(&'static str, &'static str), serde_json::Value> {
     let mut defaults: BTreeMap<(&'static str, &'static str), serde_json::Value> = BTreeMap::new();
+    defaults.insert(
+        ("find_references", "answer_only"),
+        serde_json::Value::Bool(true),
+    );
     for tool in BUDGET_TOOLS {
         defaults.insert(
             (tool, "max_chars"),
@@ -749,30 +812,31 @@ fn apply_belt_schema_defaults(tool: &str, schema: &mut serde_json::Value) {
 /// characters, and one of them, `max_chars`, carried the same 649 characters on
 /// seven different tools.
 ///
-/// 90 is one plain clause. A property description exists to tell a model what
-/// to pass, and the shape, bounds and default are already machine-readable
-/// beside it in `type`, `enum`, `minimum`, `maximum` and `default`, so prose
-/// that restates them is paid for twice.
+/// 45 is half the 90 that held until 2026-09-22, and one short clause. A
+/// property description exists to tell a model what to pass, and the shape,
+/// bounds and default are already machine-readable beside it in `type`, `enum`,
+/// `minimum`, `maximum` and `default`, so prose that restates them is paid for
+/// twice, and on an eager client it is paid for again on every request.
 /// `no_agent_default_property_description_exceeds_its_budget` fails on any
-/// property over it.
-pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 90;
+/// top-level property over it.
+pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 45;
 
-/// The tools whose schemas this module does not rewrite at all.
+/// The tools whose nested operation contract this module shortens in place.
 ///
-/// The nested transaction contracts stay whole: a staged mutation's shape is the
-/// thing a caller gets wrong, and it is the one place on this belt where the
-/// schema IS the documentation. Both of these are harness-owned
-/// (`kin-agent/src/belt.rs`), so `kin agent run` never puts either on a model's
-/// belt and their bytes are paid only by a client wired straight to the MCP
-/// server.
+/// The nested transaction contracts keep their whole SHAPE: all seven branches,
+/// every verb and every property, because a staged mutation's shape is the
+/// thing a caller gets wrong and it is the one place on this belt where the
+/// schema IS the documentation. Only the prose inside the branches is cut, by
+/// [`transaction_operation_descriptions`], keyed on each branch's `title` so a
+/// branch that moves in the registry keeps its short form. Both of these are
+/// harness-owned (`kin-agent/src/belt.rs`), so `kin agent run` never puts either
+/// on a model's belt and their bytes are paid only by a client wired straight to
+/// the MCP server.
 ///
-/// `kin_mutate` used to sit here with them and no longer does. It is the one
-/// mutation tool a model IS handed, so its bytes are on the belt of every agent
-/// run: 8,699 of the belt's 22,014 bytes, 40 percent of the schema an agent
-/// reads before it has asked anything, almost all of it the seven-branch `oneOf`
-/// under `operations`. [`belt_schema_overrides`] serves it a single-object form
-/// of the same contract instead.
-const PROSE_EXEMPT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction_commit"];
+/// `kin_mutate` is not here. It is the one mutation tool a model IS handed, so
+/// its bytes are on the belt of every agent run, and [`belt_schema_overrides`]
+/// serves it a single-object form of the same contract instead.
+const NESTED_CONTRACT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction_commit"];
 
 /// Short property descriptions that read the same on every tool carrying them.
 ///
@@ -782,22 +846,18 @@ const PROSE_EXEMPT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction
 /// genuinely differs.
 fn shared_property_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
-        (
-            "max_chars",
-            "Character ceiling; what was cut is named in `elisions`.",
-        ),
-        (
-            "max_response_chars",
-            "Character ceiling; the same parameter as `max_chars`.",
-        ),
-        (
-            "cursor",
-            "Opaque token from a prior result's `next_cursor`. Pass it back unedited.",
-        ),
-        (
-            "session_id",
-            "Owning session UUID. In enforce mode it must match the authenticated caller.",
-        ),
+        // A target, not a maximum: every list the shared ladder cuts keeps one
+        // entry, and a reply that still does not fit ships over the budget and
+        // says so under `response_over_budget`. The same 24 bytes as the
+        // "Max response characters." it replaced. `get_context_pack` refuses a
+        // pack that cannot fit instead, so it carries a hard-cap clause below.
+        ("max_chars", "Soft cap on reply bytes."),
+        ("max_response_chars", "Same as `max_chars`."),
+        ("cursor", "`next_cursor` from the prior page."),
+        ("session_id", "Owning session UUID."),
+        ("entity_id", "UUID"),
+        ("transaction_id", "UUID"),
+        ("source_change_id", "Change id; default is head."),
     ])
 }
 
@@ -810,81 +870,188 @@ fn shared_property_descriptions() -> BTreeMap<&'static str, &'static str> {
 fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'static str> {
     BTreeMap::from([
         (
+            ("semantic_locate", "query"),
+            "What the code does, in plain words.",
+        ),
+        (("semantic_locate", "limit"), "Rows per page."),
+        (
+            ("semantic_locate", "granularity"),
+            "Rank entities or files.",
+        ),
+        (
             ("semantic_locate", "include_tests"),
-            "Rank test-role entities alongside source. Off unless your query is about tests.",
+            "Rank test entities too.",
         ),
-        (
-            ("semantic_locate", "limit"),
-            "Max ranked rows per page: entities, or files at file granularity. Default 20.",
-        ),
-        (
-            ("list_file_entities", "path"),
-            "Repo-relative file path, no leading slash and no \"..\". Optional when `cursor` names it.",
-        ),
-        (
-            ("list_file_entities", "page_size"),
-            "Entities per page (default 200, 1..1000). `total_in_file` is the whole-file count.",
-        ),
+        (("semantic_search", "query"), "Name pattern."),
         (
             ("semantic_search", "kind"),
-            "Declaration kind, or `command` for a CLI command's own run function and constructor.",
+            "Kind; `command` finds CLI entry points.",
         ),
+        (("semantic_search", "language"), "Language filter."),
+        (("semantic_search", "limit"), "Max rows."),
         (
-            ("trace_data_flow", "target"),
-            "A symbol to reach, by exact name or UUID. Its branch survives the per-step cap first.",
+            ("find_references", "answer_only"),
+            "False adds coverage and candidates.",
         ),
-        (
-            ("trace_data_flow", "include_body"),
-            "Inline each step's source. False gives the chain's shape at a fraction of the size.",
-        ),
-        (
-            ("trace_data_flow", "direction"),
-            "Which way to walk: `calls` for callees, `callers` for callers, `both` merges.",
-        ),
-        (
-            ("trace_data_flow", "limit_per_step"),
-            "Edges kept per hop. Raise it for a node `clipped_steps` reports as cut.",
-        ),
-        (
-            ("get_context_pack", "entities"),
-            "Several focal entity names or UUIDs when the question is about how they connect.",
-        ),
-        (
-            ("get_context_pack", "question"),
-            "A plain-language question resolved to one or more focal entities before packing.",
-        ),
-        (
-            ("trace_path", "direction"),
-            "`forward`: from reaches to. `reverse`: the other way. `either` (default) tries both.",
-        ),
-        (
-            ("trace_path", "max_depth"),
-            "Hops between the two ends (default 6, ceiling 12). Containment hops are not counted.",
-        ),
-        (
-            ("trace_path", "limit"),
-            "Routes returned, shortest first (default 3, ceiling 25). See `routes_total`.",
-        ),
-        (
-            ("trace_path", "from_file"),
-            "Pin `from` to the entity of that name in this file. Same as the name@file spelling.",
-        ),
-        (
-            ("kin_mutate", "summary"),
-            "One sentence a human reads in history. Omitted, the change records only its id.",
-        ),
+        (("find_references", "entity_id"), "UUID, or give query."),
+        // A member name several owners share is answered for each owner, in its
+        // own section under `candidates_by_owner`, rather than ranked to one.
+        // The same 37 bytes as the text it replaced, so the agent-query listing
+        // stays at its measured ceiling.
         (
             ("find_references", "query"),
-            "Symbol name. `Owner.member` is exact; a bare name shared by declarations is ranked.",
+            "Name; a section per owner sharing it.",
         ),
         (
             ("find_references", "relation_kinds"),
-            "Filter to calls, imports or references. Defaults to all three.",
+            "calls, imports or references.",
+        ),
+        (("get_context_pack", "depth"), "Hops to walk."),
+        // A hard cap, not the shared soft one: this pack answers under its token
+        // budget as well and refuses one that cannot fit both rather than ship
+        // it over. The same 24 bytes as the clause it replaced.
+        (
+            ("get_context_pack", "max_chars"),
+            "Hard cap on reply bytes.",
         ),
         (
-            ("graph_neighborhood", "direction"),
-            "`out` for what the focal depends on, `in` for what depends on it, `both` merges.",
+            ("get_context_pack", "entities"),
+            "Several entities, by name or UUID.",
         ),
+        (
+            ("get_context_pack", "question"),
+            "A question to resolve into entities.",
+        ),
+        (("get_context_pack", "token_budget"), "Token budget."),
+        (
+            ("get_context_pack", "focal_body"),
+            "False: neighbourhood only, no focal body.",
+        ),
+        (
+            ("get_context_pack", "neighbor_bodies"),
+            "True: neighbours' bodies too, not signatures.",
+        ),
+        (("graph_neighborhood", "depth"), "Hops."),
+        (
+            ("graph_neighborhood", "direction"),
+            "`out` deps, `in` dependents, or `both`.",
+        ),
+        (("graph_neighborhood", "limit"), "Max entities."),
+        (("impact_analysis", "base"), "Base change."),
+        (("impact_analysis", "head"), "Head change."),
+        (("impact_analysis", "change_ids"), "Change ids to combine."),
+        (("impact_analysis", "entity_ids"), "Entity UUIDs."),
+        (("impact_analysis", "files"), "Deprecated; use entity_ids."),
+        (("kin_provenance_query", "limit"), "Page size."),
+        (
+            (crate::repository_init::TOOL_NAME, "path"),
+            "Default: the workspace folder.",
+        ),
+        (
+            (crate::session_exec::TOOL_NAME, "session_id"),
+            "Session that declared can_execute.",
+        ),
+        (
+            (crate::session_exec::TOOL_NAME, "argv"),
+            "Command words; no shell runs them.",
+        ),
+        (
+            (crate::session_exec::TOOL_NAME, "env"),
+            "App variables; loader and build keys refused.",
+        ),
+        (
+            (crate::session_exec::TOOL_NAME, "timeout_secs"),
+            "Seconds before the command is stopped.",
+        ),
+        (
+            (crate::session_exec::TOOL_NAME, "max_output_bytes"),
+            "Bytes kept per stream; the middle is cut.",
+        ),
+        (
+            (crate::session_exec::TOOL_NAME, "summary"),
+            "History message for manifests it keeps.",
+        ),
+        (("kin_session_start", "capabilities"), "Abilities"),
+        (("kin_session_start", "client_name"), "Client name."),
+        (("kin_session_start", "cwd"), "Agent's cwd."),
+        (("kin_session_start", "pid"), "Agent process id."),
+        (
+            ("kin_session_start", "session_id"),
+            "Optional UUID to register under.",
+        ),
+        (("kin_session_start", "transport"), "mcp|cli|wrapper|ui"),
+        (("kin_session_start", "vendor"), "e.g. claude-code, codex."),
+        (("kin_session_end", "session_id"), "UUID"),
+        (("kin_session_heartbeat", "session_id"), "UUID"),
+        (("kin_transaction_begin", "scope"), "Label, never a path."),
+        (("kin_transaction_begin", "session_id"), "Owning session."),
+        (
+            ("kin_transaction_commit", "message"),
+            "One sentence on what this change does.",
+        ),
+        (
+            ("kin_transaction_commit", "operations"),
+            "Operations to stage in this commit.",
+        ),
+        (("kin_transaction_stage", "operations"), "What to stage."),
+        (("kin_mutate", "summary"), "One sentence for the history."),
+        (
+            (crate::handlers::lexical::TOOL_NAME, "cursor"),
+            "Next page; restart if contents changed.",
+        ),
+        (
+            (crate::handlers::lexical::TOOL_NAME, "kind"),
+            "Entity kind; test means test role.",
+        ),
+        (
+            (crate::handlers::lexical::TOOL_NAME, "limit"),
+            "Hits per page.",
+        ),
+        (
+            (crate::handlers::lexical::TOOL_NAME, "literal"),
+            "Bare literal; ASCII case-insensitive.",
+        ),
+        (
+            ("trace_data_flow", "compact"),
+            "Alias for include_body: false.",
+        ),
+        (("trace_data_flow", "depth"), "Hops from the focal (max 8)."),
+        (
+            ("trace_data_flow", "direction"),
+            "`calls`, `callers` or `both`.",
+        ),
+        (("trace_data_flow", "focal"), "Start entity: UUID or name."),
+        (
+            ("trace_data_flow", "include_body"),
+            "Inline sources; false gives the shape.",
+        ),
+        (("trace_data_flow", "limit_per_step"), "Edges kept per hop."),
+        // Not "Max": below the size of its smallest retained walk this tool
+        // ships that walk over the budget and discloses `response_over_budget`.
+        (("trace_data_flow", "max_chars"), "Soft cap on reply bytes."),
+        (
+            ("trace_data_flow", "target"),
+            "A symbol to reach; its branch is kept.",
+        ),
+        (
+            ("trace_path", "direction"),
+            "`forward`, `reverse` or `either`.",
+        ),
+        (
+            ("trace_path", "from"),
+            "Start: UUID, exact name, or name@file.",
+        ),
+        (
+            ("trace_path", "from_file"),
+            "Deprecated; pin with name@file.",
+        ),
+        (("trace_path", "limit"), "Routes returned, shortest first."),
+        (
+            ("trace_path", "max_depth"),
+            "Hops between the ends (max 12).",
+        ),
+        (("trace_path", "to"), "End entity."),
+        (("trace_path", "to_file"), "Deprecated; pin with name@file."),
         (
             (crate::handlers::tool_search::TOOL_NAME, "need"),
             "The job in plain language. Omit it to list every registered tool.",
@@ -896,17 +1063,76 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
     ])
 }
 
-/// Replace one tool's top-level property descriptions with their short forms.
+/// Short descriptions for the properties inside one transaction operation, by
+/// the branch's `title` and the property's name.
 ///
-/// Top-level only. A nested schema below a property belongs to whatever
-/// contract that property describes, and on this belt the only deep ones are
-/// the transaction mutations that [`PROSE_EXEMPT_TOOLS`] keeps whole anyway.
-fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
-    if PROSE_EXEMPT_TOOLS.contains(&tool) {
+/// Every property in every branch of [`crate::tools`]'s operation schema that
+/// carries prose has an entry, and the rule each long form states survives in a
+/// clause: which paths must already be tracked and which must not, that a body
+/// is a whole text rather than a fragment, and what an unchanged body earns.
+/// `description`, the per-operation explanation every branch takes, reads the
+/// same everywhere and is keyed on the empty title.
+fn transaction_operation_descriptions() -> BTreeMap<(&'static str, &'static str), &'static str> {
+    BTreeMap::from([
+        (("", "description"), "What this changes."),
+        (
+            ("Guarded entity source body edit", "verb"),
+            "Edit an entity.",
+        ),
+        (
+            ("Guarded entity source body edit", "target"),
+            "source_base UUID.",
+        ),
+        (
+            ("Guarded entity source body edit", "body"),
+            "Complete new entity text, indentation kept, never truncated.",
+        ),
+        (
+            ("Structured entity or relation mutation", "verb"),
+            "Mutation verb.",
+        ),
+        (
+            ("Structured entity or relation mutation", "target"),
+            "Entity UUID; empty for a Relation payload.",
+        ),
+        (
+            ("Structured entity or relation mutation", "payload"),
+            "{\"Relation\": {from, to, kind}}; create with EntityCreate.",
+        ),
+    ])
+}
+
+/// Replace `property`'s description with `short` when that is actually shorter.
+///
+/// Only when it is shorter. A "short form" table keyed by property name meets
+/// the same name on tools whose registered description is already one clause,
+/// and replacing those made three tools BIGGER when this table grew:
+/// `kin_transaction_begin` by 41 bytes, `kin_session_end` and
+/// `kin_session_heartbeat` by 64 each. A trim that can lengthen its subject is
+/// not a trim, and the arithmetic hid it because the total still fell.
+fn shorten_description(property: &mut serde_json::Value, short: &str) {
+    let Some(property) = property.as_object_mut() else {
         return;
+    };
+    let Some(existing) = property.get("description").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if short.len() < existing.len() {
+        property.insert(
+            "description".to_string(),
+            serde_json::Value::String(short.to_string()),
+        );
     }
+}
+
+/// Replace one tool's top-level property descriptions with their short forms,
+/// and the prose inside a nested operation contract where the tool has one.
+fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
     let shared = shared_property_descriptions();
     let per_tool = tool_property_descriptions();
+    if NESTED_CONTRACT_TOOLS.contains(&tool) {
+        shorten_operation_branches(schema);
+    }
     let Some(properties) = schema
         .get_mut("properties")
         .and_then(|value| value.as_object_mut())
@@ -917,24 +1143,41 @@ fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
         let short = per_tool
             .get(&(tool, name.as_str()))
             .or_else(|| shared.get(name.as_str()));
-        let (Some(short), Some(property)) = (short, property.as_object_mut()) else {
+        if let Some(short) = short {
+            shorten_description(property, short);
+        }
+    }
+}
+
+/// Shorten the prose in every branch of `operations.items.oneOf`, keeping each
+/// branch, verb and property exactly as registered.
+fn shorten_operation_branches(schema: &mut serde_json::Value) {
+    let table = transaction_operation_descriptions();
+    let Some(branches) = schema
+        .pointer_mut("/properties/operations/items/oneOf")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    for branch in branches {
+        let title = branch
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(properties) = branch
+            .get_mut("properties")
+            .and_then(|value| value.as_object_mut())
+        else {
             continue;
         };
-        // Only when it is actually shorter. A "short form" table keyed by
-        // property name meets the same name on tools whose registered
-        // description is already one clause, and replacing those made three
-        // tools BIGGER when this table grew: `kin_transaction_begin` by 41
-        // bytes, `kin_session_end` and `kin_session_heartbeat` by 64 each. A
-        // trim that can lengthen its subject is not a trim, and the arithmetic
-        // hid it because the total still fell.
-        let Some(existing) = property.get("description").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if short.len() < existing.len() {
-            property.insert(
-                "description".to_string(),
-                serde_json::Value::String((*short).to_string()),
-            );
+        for (name, property) in properties.iter_mut() {
+            let short = table
+                .get(&(title.as_str(), name.as_str()))
+                .or_else(|| table.get(&("", name.as_str())));
+            if let Some(short) = short {
+                shorten_description(property, short);
+            }
         }
     }
 }
@@ -1038,6 +1281,64 @@ mod tests {
              crates/kin-mcp/src/agent_belt.rs, at most {AGENT_DEFAULT_DESCRIPTION_BUDGET} \
              characters per description."
         );
+    }
+
+    #[test]
+    fn reference_answer_default_is_advertised_and_explicit_detail_is_respected() {
+        for profile in [
+            crate::tools::agent_default_tool_names(),
+            crate::tools::agent_query_tool_names(),
+        ] {
+            let served =
+                crate::tools::served_tools_list(Some(&crate::tools::name_set(profile)), true);
+            let tool = served
+                .tools
+                .iter()
+                .find(|tool| tool.name == "find_references")
+                .unwrap();
+            assert_eq!(
+                tool.input_schema["properties"]["answer_only"]["default"],
+                true
+            );
+        }
+        let full = crate::tools::served_tools_list(None, false);
+        let tool = full
+            .tools
+            .iter()
+            .find(|tool| tool.name == "find_references")
+            .unwrap();
+        assert_eq!(
+            tool.input_schema["properties"]["answer_only"]["default"],
+            false
+        );
+        for (mut args, expected) in [
+            (HashMap::new(), true),
+            (
+                HashMap::from([("answer_only".to_string(), serde_json::json!(false))]),
+                false,
+            ),
+            (
+                HashMap::from([("explain".to_string(), serde_json::json!(true))]),
+                false,
+            ),
+            (
+                HashMap::from([("compact".to_string(), serde_json::json!(false))]),
+                false,
+            ),
+            (
+                HashMap::from([
+                    ("answer_only".to_string(), serde_json::json!(true)),
+                    ("explain".to_string(), serde_json::json!(true)),
+                ]),
+                true,
+            ),
+        ] {
+            apply_belt_defaults("find_references", &mut args);
+            assert_eq!(
+                crate::budget::ResponseBudget::from_arguments(&args).answer_only,
+                expected
+            );
+        }
     }
 
     /// And nothing in the table that no belt profile serves, which would be a
@@ -1262,9 +1563,11 @@ mod tests {
     /// property are already machine-readable beside its description, so prose
     /// that restates them is paid for on every `tools/list` a small model reads.
     ///
-    /// Top-level properties only, and the two tools in [`PROSE_EXEMPT_TOOLS`]
-    /// are skipped, because the earlier compaction kept their nested mutation
-    /// contracts whole and this test is not the place to reopen that.
+    /// Top-level properties on every served tool, the two in
+    /// [`NESTED_CONTRACT_TOOLS`] included since 2026-09-22. Their nested branch
+    /// prose is held by
+    /// `every_served_description_is_at_most_half_its_2026_09_22_base` instead,
+    /// because a rule stated inside a branch needs more than one clause.
     ///
     /// Nothing in the acceptance suite reads a property description, checked
     /// rather than assumed: `magic_repro.py` `check_6` tests for the presence of
@@ -1277,7 +1580,6 @@ mod tests {
         let over: Vec<(String, String, usize)> = served_agent_default()
             .tools
             .into_iter()
-            .filter(|tool| !PROSE_EXEMPT_TOOLS.contains(&tool.name.as_str()))
             .flat_map(|tool| {
                 let properties = tool
                     .input_schema
@@ -1303,6 +1605,319 @@ mod tests {
             "over the {AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET}-character property budget: \
              {over:?}; give each one a single clause in shared_property_descriptions or \
              tool_property_descriptions"
+        );
+    }
+
+    /// Every description `agent-default` served at 97c719c8d, measured on
+    /// 2026-09-22 from the listing a client receives: the tool, a JSON pointer
+    /// into its input schema to the node carrying the description (empty for the
+    /// tool's own description), and the bytes it carried. `agent-query` serves a
+    /// subset of these, byte for byte the same, so this is its base as well.
+    const BASE_2026_09_22: &[(&str, &str, usize)] = &[
+        ("find_references", "", 148),
+        ("find_references", "/properties/answer_only", 88),
+        ("find_references", "/properties/entity_id", 49),
+        ("find_references", "/properties/max_chars", 55),
+        ("find_references", "/properties/query", 83),
+        ("find_references", "/properties/relation_kinds", 62),
+        ("get_context_pack", "", 173),
+        ("get_context_pack", "/properties/depth", 26),
+        ("get_context_pack", "/properties/entities", 80),
+        ("get_context_pack", "/properties/entity_id", 17),
+        ("get_context_pack", "/properties/max_chars", 55),
+        ("get_context_pack", "/properties/question", 80),
+        ("get_context_pack", "/properties/token_budget", 36),
+        ("get_entity_source", "", 79),
+        ("get_entity_source", "/properties/entity_id", 11),
+        ("graph_neighborhood", "", 150),
+        ("graph_neighborhood", "/properties/depth", 15),
+        ("graph_neighborhood", "/properties/direction", 80),
+        ("graph_neighborhood", "/properties/entity_id", 11),
+        ("graph_neighborhood", "/properties/limit", 35),
+        ("graph_neighborhood", "/properties/max_chars", 55),
+        ("impact_analysis", "", 140),
+        ("impact_analysis", "/properties/base", 29),
+        ("impact_analysis", "/properties/change_ids", 45),
+        ("impact_analysis", "/properties/entity_ids", 34),
+        ("impact_analysis", "/properties/files", 85),
+        ("impact_analysis", "/properties/head", 29),
+        ("impact_analysis", "/properties/max_chars", 55),
+        ("kin_artifact_list", "", 135),
+        ("kin_artifact_list", "/properties/source_change_id", 62),
+        ("kin_graph_status", "", 174),
+        ("kin_mutate", "", 141),
+        ("kin_mutate", "/properties/operations", 39),
+        (
+            "kin_mutate",
+            "/properties/operations/items/properties/body",
+            92,
+        ),
+        (
+            "kin_mutate",
+            "/properties/operations/items/properties/description",
+            48,
+        ),
+        (
+            "kin_mutate",
+            "/properties/operations/items/properties/target",
+            89,
+        ),
+        (
+            "kin_mutate",
+            "/properties/operations/items/properties/verb",
+            72,
+        ),
+        ("kin_mutate", "/properties/summary", 79),
+        ("kin_provenance_query", "", 140),
+        ("kin_provenance_query", "/properties/entity_id", 35),
+        ("kin_provenance_query", "/properties/limit", 33),
+        ("kin_session_end", "", 104),
+        ("kin_session_end", "/properties/session_id", 12),
+        ("kin_session_heartbeat", "", 105),
+        ("kin_session_heartbeat", "/properties/session_id", 12),
+        ("kin_session_start", "", 123),
+        ("kin_session_start", "/properties/capabilities", 18),
+        ("kin_session_start", "/properties/client_name", 26),
+        ("kin_session_start", "/properties/cwd", 30),
+        ("kin_session_start", "/properties/pid", 37),
+        ("kin_session_start", "/properties/session_id", 76),
+        ("kin_session_start", "/properties/transport", 41),
+        ("kin_session_start", "/properties/vendor", 56),
+        ("kin_transaction_abort", "", 146),
+        ("kin_transaction_abort", "/properties/session_id", 76),
+        ("kin_transaction_abort", "/properties/transaction_id", 16),
+        ("kin_transaction_begin", "", 134),
+        ("kin_transaction_begin", "/properties/scope", 42),
+        ("kin_transaction_begin", "/properties/session_id", 35),
+        ("kin_transaction_commit", "", 144),
+        ("kin_transaction_commit", "/properties/message", 232),
+        ("kin_transaction_commit", "/properties/operations", 77),
+        // The unguarded body edit that was branch 0 is retired. Its body, verb and
+        // description prose now ride the guarded body edit, branch 1, so those rows
+        // follow it there; its name-or-UUID target has no successor, and neither
+        // does the structured branch's body.
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/1/properties/body",
+            125,
+        ),
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/1/properties/description",
+            42,
+        ),
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/1/properties/verb",
+            33,
+        ),
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/1/properties/target",
+            37,
+        ),
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/2/properties/description",
+            42,
+        ),
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/2/properties/payload",
+            132,
+        ),
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/2/properties/target",
+            88,
+        ),
+        (
+            "kin_transaction_commit",
+            "/properties/operations/items/oneOf/2/properties/verb",
+            33,
+        ),
+        ("kin_transaction_commit", "/properties/session_id", 126),
+        ("kin_transaction_commit", "/properties/transaction_id", 16),
+        ("kin_transaction_stage", "", 165),
+        ("kin_transaction_stage", "/properties/operations", 37),
+        // The unguarded body edit that was branch 0 is retired. Its body, verb and
+        // description prose now ride the guarded body edit, branch 1, so those rows
+        // follow it there; its name-or-UUID target has no successor, and neither
+        // does the structured branch's body.
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/1/properties/body",
+            125,
+        ),
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/1/properties/description",
+            42,
+        ),
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/1/properties/verb",
+            33,
+        ),
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/1/properties/target",
+            37,
+        ),
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/2/properties/description",
+            42,
+        ),
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/2/properties/payload",
+            132,
+        ),
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/2/properties/target",
+            88,
+        ),
+        (
+            "kin_transaction_stage",
+            "/properties/operations/items/oneOf/2/properties/verb",
+            33,
+        ),
+        ("kin_transaction_stage", "/properties/session_id", 126),
+        ("kin_transaction_stage", "/properties/transaction_id", 16),
+        ("lexical_lookup", "", 173),
+        ("lexical_lookup", "/properties/cursor", 87),
+        ("lexical_lookup", "/properties/kind", 82),
+        ("lexical_lookup", "/properties/limit", 47),
+        ("lexical_lookup", "/properties/literal", 82),
+        ("lexical_lookup", "/properties/max_chars", 55),
+        ("list_file_entities", "", 148),
+        ("list_file_entities", "/properties/cursor", 72),
+        ("list_file_entities", "/properties/page_size", 82),
+        ("list_file_entities", "/properties/path", 87),
+        ("semantic_locate", "", 150),
+        ("semantic_locate", "/properties/cursor", 72),
+        ("semantic_locate", "/properties/granularity", 62),
+        ("semantic_locate", "/properties/include_tests", 79),
+        ("semantic_locate", "/properties/limit", 77),
+        ("semantic_locate", "/properties/max_chars", 55),
+        ("semantic_locate", "/properties/query", 85),
+        ("semantic_search", "", 157),
+        ("semantic_search", "/properties/kind", 84),
+        ("semantic_search", "/properties/language", 40),
+        ("semantic_search", "/properties/limit", 21),
+        ("semantic_search", "/properties/max_chars", 55),
+        ("semantic_search", "/properties/query", 26),
+        ("trace_data_flow", "", 143),
+        ("trace_data_flow", "/properties/compact", 77),
+        ("trace_data_flow", "/properties/depth", 63),
+        ("trace_data_flow", "/properties/direction", 77),
+        ("trace_data_flow", "/properties/focal", 60),
+        ("trace_data_flow", "/properties/include_body", 83),
+        ("trace_data_flow", "/properties/limit_per_step", 71),
+        ("trace_data_flow", "/properties/max_chars", 55),
+        ("trace_data_flow", "/properties/max_response_chars", 53),
+        ("trace_data_flow", "/properties/target", 85),
+        ("trace_path", "", 152),
+        ("trace_path", "/properties/direction", 84),
+        ("trace_path", "/properties/from", 88),
+        ("trace_path", "/properties/from_file", 83),
+        ("trace_path", "/properties/limit", 76),
+        ("trace_path", "/properties/max_chars", 55),
+        ("trace_path", "/properties/max_depth", 84),
+        ("trace_path", "/properties/to", 30),
+        ("trace_path", "/properties/to_file", 83),
+    ];
+
+    /// Every description in one served tool: its own, keyed on the empty
+    /// pointer, and every `description` string anywhere in its input schema,
+    /// keyed on the JSON pointer to the node that carries it.
+    fn served_descriptions(tool: &crate::types::ToolDefinition) -> BTreeMap<String, usize> {
+        fn walk(pointer: &str, value: &serde_json::Value, out: &mut BTreeMap<String, usize>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        match child.as_str() {
+                            Some(text) if key == "description" => {
+                                out.insert(pointer.to_string(), text.len());
+                            }
+                            _ => walk(&format!("{pointer}/{key}"), child, out),
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        walk(&format!("{pointer}/{index}"), child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = BTreeMap::from([(String::new(), tool.description.len())]);
+        walk("", &tool.input_schema, &mut out);
+        out
+    }
+
+    /// Every description `agent-default` and `agent-query` serve is at most half
+    /// its bytes at 97c719c8d, and every parameter that carried one is still
+    /// served.
+    ///
+    /// The whole served list rides every request an eager client sends, and in
+    /// the corrected rerun pilot the `agent-query` list alone was about 3,500
+    /// tokens a request against about 1,100 for the raw arm's four tools, nearly
+    /// all of it parameter prose. Read per description rather than as a total,
+    /// because a total halves while one long clause survives untouched, and the
+    /// pointer has to resolve, so a parameter trimmed off the served schema
+    /// fails here as a dropped parameter rather than passing as a short one.
+    #[test]
+    fn every_served_description_is_at_most_half_its_2026_09_22_base() {
+        let mut problems: Vec<String> = Vec::new();
+        let mut graded = 0usize;
+        for names in [
+            crate::tools::agent_default_tool_names(),
+            crate::tools::agent_query_tool_names(),
+        ] {
+            let served =
+                crate::tools::served_tools_list(Some(&crate::tools::name_set(names)), true);
+            let by_name: BTreeMap<&str, BTreeMap<String, usize>> = served
+                .tools
+                .iter()
+                .map(|tool| (tool.name.as_str(), served_descriptions(tool)))
+                .collect();
+            for (tool, pointer, base) in BASE_2026_09_22 {
+                if !names.contains(tool) {
+                    continue;
+                }
+                graded += 1;
+                let Some(descriptions) = by_name.get(tool) else {
+                    problems.push(format!("{tool} is no longer served"));
+                    continue;
+                };
+                match descriptions.get(*pointer) {
+                    None => problems.push(format!(
+                        "{tool}{pointer} carried a {base}-byte description and is no longer \
+                         served with one, so a parameter was dropped or its prose deleted"
+                    )),
+                    Some(now) if now * 2 > *base => problems.push(format!(
+                        "{tool}{pointer} is {now} bytes, over half its {base}-byte base"
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+        assert_eq!(
+            graded,
+            BASE_2026_09_22
+                .iter()
+                .filter(|(tool, _, _)| !matches!(*tool, "kin_artifact_list" | "list_file_entities"))
+                .count()
+                + BASE_2026_09_22
+                    .iter()
+                    .filter(|(tool, _, _)| crate::tools::agent_query_tool_names().contains(tool))
+                    .count(),
+            "the sweep did not grade every base description on both profiles"
         );
     }
 
@@ -1472,6 +2087,25 @@ mod tests {
             registered_limit.is_some_and(|value| value > AGENT_DEFAULT_LOCATE_PAGE),
             "the full profile's locate page was shrunk too: {registered_limit:?}"
         );
+    }
+
+    #[test]
+    fn locate_cursor_keeps_its_width_unless_the_caller_overrides_it() {
+        let mut inherited = HashMap::from([("cursor".into(), serde_json::json!("held"))]);
+        apply_belt_defaults("semantic_locate", &mut inherited);
+        assert!(!inherited.contains_key("limit"));
+        assert!(!inherited.contains_key("page_size"));
+        for key in ["limit", "page_size"] {
+            let mut explicit = HashMap::from([
+                ("cursor".into(), serde_json::json!("held")),
+                (key.into(), serde_json::json!(3)),
+            ]);
+            apply_belt_defaults("semantic_locate", &mut explicit);
+            assert_eq!(explicit[key], serde_json::json!(3));
+            if key == "page_size" {
+                assert!(!explicit.contains_key("limit"));
+            }
+        }
     }
 
     /// The belt must never outrank a caller who named a budget itself.
@@ -1806,7 +2440,16 @@ mod tests {
                     .as_object()
                     .map(|properties| properties.keys().map(String::as_str).collect())
                     .unwrap_or_default();
-                for (required, from_branch) in required_property_names(&tool.input_schema) {
+                // The "at least one of" rules the server enforces in place of a
+                // top-level `anyOf` are read as branch names, because that is
+                // what they were and the same defect lives in them.
+                let alternatives = crate::input_contract::alternatives(&tool.name)
+                    .iter()
+                    .flat_map(|set| set.iter().map(|name| (*name, true)));
+                for (required, from_branch) in required_property_names(&tool.input_schema)
+                    .into_iter()
+                    .chain(alternatives)
+                {
                     names_read += 1;
                     if from_branch {
                         branch_names_read += 1;
@@ -1831,7 +2474,8 @@ mod tests {
         assert!(
             branch_names_read >= 3,
             "the sweep read {names_read} required names across three profiles and only \
-             {branch_names_read} of them from an anyOf/oneOf/allOf branch, which is the only \
+             {branch_names_read} of them from an anyOf/oneOf/allOf branch or a server-side \
+             alternative, which is the only \
              place this defect can live"
         );
     }
@@ -2010,7 +2654,12 @@ mod tests {
     /// `kin_mutate` is the eighth write tool and is deliberately not lifecycle.
     /// It is the write ACTION rather than the plumbing around one, an agent
     /// asking how to change something should find it, and it names entity
-    /// changes on purpose.
+    /// changes on purpose. `kin_init` is the ninth and is not lifecycle either:
+    /// it sets a folder up, and the answer that says a folder has no repository
+    /// is what sends an agent to it. `kin_session_exec` is the tenth: an agent
+    /// asking to build, test or run the project should find it, and
+    /// `a_code_question_never_ranks_a_lifecycle_tool_over_the_tool_that_answers_it`
+    /// holds it to the same vocabulary rule the plumbing keeps.
     #[test]
     fn the_lifecycle_set_is_the_write_half_of_the_belt() {
         let query: BTreeSet<&str> = crate::tools::agent_query_tool_names()
@@ -2020,7 +2669,12 @@ mod tests {
         let write_half: BTreeSet<&str> = crate::tools::agent_default_tool_names()
             .iter()
             .copied()
-            .filter(|name| !query.contains(name) && *name != "kin_mutate")
+            .filter(|name| {
+                !query.contains(name)
+                    && *name != "kin_mutate"
+                    && *name != crate::repository_init::TOOL_NAME
+                    && *name != crate::session_exec::TOOL_NAME
+            })
             .collect();
         assert_eq!(
             write_half,
@@ -2200,9 +2854,17 @@ mod tests {
             ),
         ];
 
+        // The toolchain run is held to the same rule as the plumbing: it
+        // answers no question about code, so it must not outrank a tool that
+        // does.
+        let noise_tools: Vec<&str> = LIFECYCLE_TOOLS
+            .into_iter()
+            .chain([crate::session_exec::TOOL_NAME])
+            .collect();
         for (question, answering) in code_questions {
-            let noise = LIFECYCLE_TOOLS
-                .into_iter()
+            let noise = noise_tools
+                .iter()
+                .copied()
                 .map(|tool| (tool, score(question, tool)))
                 .max_by_key(|(_, points)| *points)
                 .expect("the lifecycle set is not empty");
@@ -2226,13 +2888,15 @@ mod tests {
 
         // The control. A write question has to reach the plumbing, or the guard
         // above would pass on seven blank strings.
-        let write_questions: [(&str, &str); 3] = [
+        let write_questions: [(&str, &str); 5] = [
             ("commit the staged transaction", "kin_transaction_commit"),
             ("open a session before writing", "kin_session_start"),
             (
                 "stage an update onto the open transaction",
                 "kin_transaction_stage",
             ),
+            ("build and test the project", crate::session_exec::TOOL_NAME),
+            ("run the toolchain", crate::session_exec::TOOL_NAME),
         ];
         let query_tools: Vec<&str> = crate::tools::agent_query_tool_names().to_vec();
         for (question, answering) in write_questions {
@@ -2269,17 +2933,15 @@ mod tests {
         // bytes SAY.
         let instructions = crate::server::SERVER_INSTRUCTIONS;
 
-        // The tools it must name. A model that never reads a schema learns the
-        // surface from these names, so the query half has to be in here.
+        // The tools it must name: the five the operating procedure sends a
+        // model to, in the order it sends it. A model that never reads a
+        // schema learns the surface from these names.
         let named = [
             "semantic_locate",
             "semantic_search",
-            "get_context_pack",
             "find_references",
-            "trace_data_flow",
-            "trace_path",
-            "impact_analysis",
-            "list_file_entities",
+            "get_context_pack",
+            "get_entity_source",
         ];
         let default: BTreeSet<&str> = crate::tools::agent_default_tool_names()
             .iter()
@@ -2316,15 +2978,177 @@ mod tests {
         // The one instruction that only matters in a client that hides the
         // schemas, and the one every measured run needed and did not get.
         assert!(
-            instructions.contains("search for \"kin\" first, before your first file read"),
+            instructions.contains("search for \"kin\" first, to discover the semantic tools"),
             "the instructions must tell a model whose client lists tools by search to search \
-             for this server before it reads a file: {instructions:?}"
+             for this server to discover semantic tools: {instructions:?}"
         );
         // And the envelope sentence a reader has to act on survives the cut.
         assert!(
             instructions.contains("_kin.verdict") && instructions.contains("inconclusive"),
             "the verdict contract keeps its one sentence: {instructions:?}"
         );
+    }
+
+    /// Every instruction string but the citable one is the founder-approved
+    /// operating procedure: five numbered steps in order, the named profiles'
+    /// wording naming the registered tools, the routed wording naming the
+    /// routed commands, and no em dash in any of them.
+    #[test]
+    fn the_instructions_carry_the_five_step_procedure() {
+        let steps = |instructions: &str| -> Vec<String> {
+            instructions
+                .lines()
+                .filter(|line| line.len() > 3 && line.as_bytes()[1] == b'.')
+                .map(str::to_string)
+                .collect()
+        };
+        let named = crate::server::SERVER_INSTRUCTIONS;
+        let search = crate::server::SEARCH_SERVER_INSTRUCTIONS;
+        let routed = crate::server::ROUTED_SERVER_INSTRUCTIONS;
+        let routed_query = crate::server::ROUTED_QUERY_SERVER_INSTRUCTIONS;
+        assert_eq!(
+            steps(named),
+            vec![
+                "1. Find things with semantic_locate or semantic_search first. Do not grep or list \
+                 files to explore.",
+                "2. Use find_references and get_context_pack when relationships or surrounding context are needed.",
+                "3. Read code with get_entity_source by entity id.",
+                "4. Use available verification tools only for builds and tests.",
+                "5. Read _kin.verdict first; inconclusive means the counts are a lower bound.",
+            ]
+        );
+        let routed_steps = vec![
+            "1. Find things with kin locate or kin search first. Do not grep or list files to \
+             explore.",
+            "2. Use kin refs and kin context when relationships or surrounding context are needed.",
+            "3. Read code with kin source by entity id.",
+            "4. Use available verification tools only for builds and tests.",
+            "5. Read _kin.verdict first; inconclusive means the counts are a lower bound.",
+        ];
+        assert_eq!(steps(routed), routed_steps);
+        assert_eq!(steps(routed_query), routed_steps);
+        assert_eq!(steps(search).len(), 5, "{search}");
+        for instructions in [named, search, routed, routed_query] {
+            assert!(!instructions.contains('\u{2014}'), "{instructions}");
+            assert!(
+                instructions.contains("search for \"kin\" first, to discover the semantic tools"),
+                "{instructions}"
+            );
+        }
+        // The historical profile keeps its original procedure, but retired file
+        // catalog guidance is removed from newly built servers.
+        assert!(steps(crate::server::LEGACY_SERVER_INSTRUCTIONS).is_empty());
+        assert_eq!(crate::server::LEGACY_SERVER_INSTRUCTIONS.len(), 1117);
+
+        // Every command a routed wording names is one its routed tool takes,
+        // and the sentence about the rest is true of that surface.
+        for (instructions, surface) in [
+            (routed, crate::routed::RoutedSurface::WITH_WRITES),
+            (routed_query, crate::routed::RoutedSurface::READ_ONLY),
+        ] {
+            let commands = crate::routed::command_names(surface);
+            for command in [
+                "locate", "search", "refs", "context", "source", "describe", "call",
+            ] {
+                assert!(
+                    instructions.contains(&format!("kin {command}")),
+                    "{command}: {instructions}"
+                );
+                assert!(
+                    commands.contains(&command),
+                    "the routed tool takes no {command}"
+                );
+            }
+        }
+        assert!(routed.contains("every other Kin tool"));
+        assert!(routed_query.contains("every other read-only Kin tool"));
+
+        // The tool-search wording names only what that profile serves, and the
+        // one tool it reaches through kin_tool_call is read-only.
+        let served: BTreeSet<&str> = crate::tools::agent_search_tool_names()
+            .iter()
+            .copied()
+            .collect();
+        for tool in [
+            "semantic_locate",
+            "get_context_pack",
+            "trace_data_flow",
+            "kin_tool_search",
+            "kin_tool_call",
+        ] {
+            assert!(search.contains(tool), "{tool}: {search}");
+            assert!(served.contains(tool), "agent-search does not serve {tool}");
+        }
+        for withheld in ["semantic_search", "find_references"] {
+            assert!(!search.contains(withheld), "{withheld}: {search}");
+        }
+        let registry = crate::tools::tool_definitions();
+        assert!(registry
+            .tools
+            .iter()
+            .any(|tool| tool.name == "get_entity_source" && tool.annotations.read_only_hint));
+    }
+
+    /// Each profile is served the wording written for what it serves.
+    #[test]
+    fn each_profile_is_served_its_own_instructions() {
+        use crate::server::{instructions_for, McpServerConfig};
+        let named = |names: Option<&[&str]>| McpServerConfig {
+            allowed_tools: names.map(crate::tools::name_set),
+            agent_belt: true,
+            ..McpServerConfig::default()
+        };
+        let routed = |surface: crate::routed::RoutedSurface| McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_routed_tool_names(),
+            )),
+            agent_belt: true,
+            routed: Some(surface),
+            ..McpServerConfig::default()
+        };
+        let citable = |names: &[&str]| McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(names)),
+            citable: true,
+            ..McpServerConfig::default()
+        };
+        for (config, expected) in [
+            (named(None), crate::server::SERVER_INSTRUCTIONS),
+            (
+                named(Some(crate::tools::agent_default_tool_names())),
+                crate::server::SERVER_INSTRUCTIONS,
+            ),
+            (
+                named(Some(crate::tools::agent_query_tool_names())),
+                crate::server::SERVER_INSTRUCTIONS,
+            ),
+            (
+                named(Some(crate::tools::agent_search_tool_names())),
+                crate::server::SEARCH_SERVER_INSTRUCTIONS,
+            ),
+            (
+                routed(crate::routed::RoutedSurface::WITH_WRITES),
+                crate::server::ROUTED_SERVER_INSTRUCTIONS,
+            ),
+            (
+                routed(crate::routed::RoutedSurface::READ_ONLY),
+                crate::server::ROUTED_QUERY_SERVER_INSTRUCTIONS,
+            ),
+            (
+                citable(crate::tools::benchmark_tool_names()),
+                crate::server::LEGACY_SERVER_INSTRUCTIONS,
+            ),
+            (
+                citable(crate::tools::context_bench_tool_names()),
+                crate::server::LEGACY_SERVER_INSTRUCTIONS,
+            ),
+        ] {
+            assert_eq!(
+                instructions_for(&config),
+                expected,
+                "{:?}",
+                config.allowed_tools
+            );
+        }
     }
 
     /// The belt asks for compact on behalf of its agents, and only when the
@@ -2517,5 +3341,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A whole-body update on the belt carries its `EntitySourceBase`. The served
+    /// `kin_mutate` requires a payload on every operation and admits `EntitySourceBase`
+    /// beside the anchored and lifecycle payloads, and the operation that shape describes
+    /// is one the handler admits. The handler refuses `EntitySourceBase` with any verb but
+    /// update or modify, or without a full body, and refuses the update without its base.
+    #[test]
+    fn the_belt_admits_a_guarded_whole_body_update() {
+        let overrides = belt_schema_overrides();
+        let item = &overrides["kin_mutate"]["properties"]["operations"]["items"];
+        let payload = &item["properties"]["payload"];
+        let declared = payload["properties"]
+            .as_object()
+            .expect("the payload declares its properties");
+        assert_eq!(declared["EntitySourceBase"]["type"], "object");
+        let branches: Vec<&str> = payload["oneOf"]
+            .as_array()
+            .expect("the payload is one of its branches")
+            .iter()
+            .filter_map(|branch| branch["required"][0].as_str())
+            .collect();
+        assert_eq!(
+            branches,
+            [
+                "EntitySourcePatch",
+                "EntitySourceBase",
+                "EntityCreate",
+                "UnitImports",
+                "EntityRemove"
+            ]
+        );
+        assert!(item["properties"]["verb"]["enum"]
+            .as_array()
+            .expect("the verb is an enum")
+            .iter()
+            .any(|verb| verb == "update"));
+        let said = payload["description"].as_str().unwrap_or_default();
+        assert!(
+            !said.contains("no outer body") && said.contains("EntitySourceBase"),
+            "the payload description must not forbid the body a guarded update carries: {said}"
+        );
+
+        let base = crate::source_base::EntitySourceBase {
+            schema: crate::source_base::SourceBaseSchema::V1,
+            context: crate::source_base::SourceBaseContext {
+                repository_id: "belt-test".into(),
+                workspace_id: uuid::Uuid::new_v4().to_string(),
+                workspace_generation: 1,
+                workspace_head_hash: "a".repeat(64),
+                workspace_tree_hash: "b".repeat(64),
+            },
+            entity_id: kin_model::EntityId::new(),
+            artifact_id: kin_model::ArtifactId::new(),
+            source_blob_hash: "c".repeat(64),
+            start_byte: 0,
+            end_byte: 12,
+            body_hash: "d".repeat(64),
+        };
+        let target = base.entity_id.to_string();
+        let operation = |verb: &str, body: Option<&str>| {
+            let mut operation = serde_json::json!({
+                "verb": verb,
+                "target": target,
+                "payload": { "EntitySourceBase": base },
+                "description": "rewrite value",
+            });
+            if let Some(body) = body {
+                operation["body"] = serde_json::json!(body);
+            }
+            operation
+        };
+        let admitted = |operation: serde_json::Value| -> Result<(), String> {
+            let operations =
+                crate::session::parse_staged_operations(&serde_json::json!([operation]))?;
+            crate::session::validate_semantic_operations(&operations)
+        };
+
+        // The served shape describes the update: every payload key is declared, exactly
+        // one branch is satisfied, and every required operation field is present.
+        let update = operation("update", Some("pub fn value() -> u8 {\n    2\n}"));
+        let sent = update["payload"]
+            .as_object()
+            .expect("the payload is an object");
+        assert!(sent.keys().all(|key| declared.contains_key(key)));
+        let satisfied = payload["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|branch| {
+                branch["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|key| sent.contains_key(key.as_str().unwrap()))
+            })
+            .count();
+        assert_eq!(satisfied, 1);
+        for field in item["required"].as_array().unwrap() {
+            assert!(update.get(field.as_str().unwrap()).is_some(), "{field}");
+        }
+        assert!(
+            item["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "payload"),
+            "every belt operation names the version it changes"
+        );
+        admitted(update).expect("update, body and EntitySourceBase are admitted");
+
+        // The handler's own refusals stand.
+        for verb in ["patch", "create", "remove"] {
+            assert!(
+                admitted(operation(verb, Some("pub fn value() -> u8 {\n    2\n}"))).is_err(),
+                "EntitySourceBase with verb {verb} must stay refused"
+            );
+        }
+        assert!(
+            admitted(operation("update", None)).is_err(),
+            "an update with no body"
+        );
+        assert!(
+            admitted(operation("update", Some("  "))).is_err(),
+            "an update with a blank body"
+        );
+
+        // The same update without its base is refused, and says what fixes it.
+        let unguarded = serde_json::json!({
+            "verb": "update",
+            "target": target,
+            "body": "pub fn value() -> u8 {\n    2\n}",
+            "description": "rewrite value",
+        });
+        let refusal = admitted(unguarded).expect_err("an unguarded update is refused");
+        assert!(
+            refusal.starts_with("source_base_required:") && refusal.contains("EntitySourceBase"),
+            "{refusal}"
+        );
     }
 }

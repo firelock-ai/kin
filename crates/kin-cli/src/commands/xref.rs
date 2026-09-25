@@ -85,8 +85,29 @@ pub async fn build_xref_response(
     // `buffer_grow`'s two entities came first (FIR-3071). `select_best_match`
     // ranks by name quality and breaks its ties on facts read off the entity
     // record, so the answer is a property of the candidates.
-    let target = match kin_core::select_best_match(&request.entity, &matches, |entity, hint| {
-        kin_core::normalize_symbol_hint(&entity.name).contains(hint)
+    // The member rule every surface shares: with no entity named it exactly, a
+    // bare name that owners carry as their member name means those members, and
+    // several of them name none.
+    let members = match kin_ranking::entity_ranking::reach_by_name(graph, &request.entity)? {
+        kin_ranking::entity_ranking::NameReach::Members(members) => members,
+        _ => Vec::new(),
+    };
+    if members.len() > 1 {
+        let lines = crate::entity_identity::name_candidate_lines(
+            &request.entity,
+            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            &members,
+        );
+        return Ok(XrefResponse {
+            error: Some(lines.join("\n")),
+            lines,
+            spine: None,
+        });
+    }
+    let target = match members.first().or_else(|| {
+        kin_core::select_best_match(&request.entity, &matches, |entity, hint| {
+            kin_core::normalize_symbol_hint(&entity.name).contains(hint)
+        })
     }) {
         Some(target) => target,
         None => {

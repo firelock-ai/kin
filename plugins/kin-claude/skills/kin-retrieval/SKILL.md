@@ -10,8 +10,11 @@ questions from that graph. Where grep matches strings and a file read spends con
 lines you did not need, these tools return the declaration, its neighborhood, and the
 graph state that produced the answer.
 
-Reach for the graph first. Fall back to grep only for things the graph does not model:
-prose in comments, generated files, and text inside languages Kin does not parse.
+Answer semantic questions from the graph. If the graph does not model the relevant
+content, report the coverage gap and the supported conversion or enrichment step
+needed to address it. Do not substitute grep, raw filesystem search, whole-file reads,
+or artifact bodies for a missing semantic answer. Import, reconcile, and materialization
+are separate operations, not retrieval fallbacks.
 
 ## Pick the tool by what you know
 
@@ -23,7 +26,7 @@ vector similarity, so treat it as the fast exact-ish lookup.
 
 You only know the behavior. Use `semantic_locate`. It ranks code against a
 natural-language query using the vector index, which is the retrieval that powers
-`kin locate`. Set `granularity` to `entity` for declarations or `file` for files. It needs
+`kin locate`. Results are semantic entities; file granularity is unavailable. It needs
 the running daemon and an embedded graph, and it reports its coverage in the response.
 
 You have an entity and need to understand it. Use `get_context_pack`. It bundles the
@@ -42,10 +45,10 @@ chain from a focal entity and returns it as an ordered list of steps.
 You need history. Use `kin_provenance_query` for who changed an entity, how many times,
 what the latest change was, and which approvals are recorded.
 
-You need to know what the repository contains. Use `kin_artifact_list` and
-`kin_artifact_read`. These cover every tracked object, including lockfiles, configuration,
-binary assets, and files in languages Kin does not parse, addressed by artifact id rather
-than by path.
+A query has no matching semantic entity. Read the coverage evidence and report missing
+conversion coverage. Whole artifacts and importer-created file-module nodes are not source
+read substitutes. Choose an entity body or bounded context, then reuse it instead of
+reading the same source again through several tools.
 
 ## Read the envelope before you trust the answer
 
@@ -54,13 +57,12 @@ Every response carries a `_kin` envelope. It names the runtime that answered
 generation and reconciliation state, embedding coverage, and any degraded flags. There is
 no configuration under which a semantic answer is quietly backfilled from raw file search.
 
-An empty result is not automatically an absence. Empty retrieval responses carry a
-`negative` object whose `safe_to_conclude_absent` field says whether the absence can be
-trusted. Semantic tools report `semantic_authoritative` only under complete embedding
-coverage with no degraded signals, and `coverage_partial` or `coverage_unknown` otherwise.
-Structural tools report `structural_authoritative` only when the graph is initialized and
-loaded. Any other verdict means ask again once the graph is ready, not that the thing does
-not exist.
+An empty result is not automatically an absence. Before concluding that something is
+absent, require both `negative.safe_to_conclude_absent` and
+`_kin.verdict.safe_to_conclude_absent` to be true, with a certified authoritative verdict
+and no contradictory `_kin.self_check`. A reason label or a loaded graph alone is not
+proof of absence. Report the stated limitation when the evidence is incomplete.
+A name-resolution miss also does not prove that a resolved entity has no references.
 
 If `semantic_locate` reports thin coverage, embeddings are still building. Run `kin embed`
 in the repository, or use `semantic_search` and the structural tools in the meantime, which

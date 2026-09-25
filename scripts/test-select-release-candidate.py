@@ -63,8 +63,7 @@ def job_block(source: str, job: str) -> str:
 
     Both workflows carry more than one `artifact:` matrix, so a whole-file
     search reads rows from a job the assertion is not about: rc-build.yml's
-    capability matrix carries a windows row the build matrix deliberately does
-    not. Slicing by job is what keeps a contract test honest about its subject.
+    capability matrix repeats the build artifacts. Slicing by job is what keeps a contract test honest about its subject.
     """
 
     match = re.search(rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [a-z][a-z0-9_-]*:\n|\Z)", source)
@@ -1174,10 +1173,12 @@ class ContractTests(unittest.TestCase):
 
         source = RC_BUILD_PATH.read_text(encoding="utf-8")
         build = job_block(source, "build")
+        # Candidate-only native install probes add archives without expanding
+        # the existing automatic preflight's three required platform legs.
         self.assertEqual(
-            sorted(matrix_artifacts(build)),
-            sorted(selector.RC_BUILD_ARTIFACTS),
-            "rc-build.yml's build matrix and the selector's usable set have drifted",
+            set(matrix_artifacts(build)),
+            set(selector.RC_BUILD_ARTIFACTS) | {"kin-macos-x86_64", "kin-windows-x86_64"},
+            "RC archive inventory must include every preflight and native install artifact",
         )
         # The row value is only the artifact name if the upload step names it
         # unadorned. A prefix added here would make every row a different

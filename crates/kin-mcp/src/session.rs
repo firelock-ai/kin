@@ -25,6 +25,14 @@ pub struct AssistantSession {
 pub enum McpMutationPayload {
     /// Exact caller-read expectation. Only the daemon can enforce and publish it.
     EntitySourceBase(crate::source_base::EntitySourceBase),
+    /// Exact anchored replacements, bound to the caller-read source version.
+    EntitySourcePatch(crate::source_base::EntitySourcePatch),
+    /// Create one declaration relative to a current independent source entity.
+    EntityCreate(crate::entity_lifecycle::EntityCreate),
+    /// Remove one exact declaration while preserving its source unit.
+    EntityRemove(crate::entity_lifecycle::EntityRemove),
+    /// Add or remove imports on one source unit addressed by language identity.
+    UnitImports(crate::source_unit::UnitImports),
     Entity(kin_model::Entity),
     Relation {
         from: kin_model::ids::EntityId,
@@ -59,14 +67,12 @@ pub struct McpMutationOperation {
 
 /// A payload-less operation that expresses "this entity's new source is
 /// `body`": verb update/modify, `target` naming the entity (name or id), and a
-/// non-empty `body`. This is the minimal write surface for agents, which know
-/// names and source text but not Kin's entity structs.
+/// non-empty `body`.
 ///
-/// Only the daemon commit path can honor it: the daemon resolves the target
-/// fail-closed against repository authority, plans the exact span edit, and
-/// projects the new source into the entity's working-directory file. The
-/// in-process commit path has no projection and refuses the shape rather than
-/// committing a same-entity no-op that would discard the body.
+/// It names no version of the entity it replaces, so it is refused on every
+/// semantic route with [`source_base_required`]: a replacement must carry the
+/// `EntitySourceBase` of the source it was written against. The predicate
+/// stays because conversion and the refusal both have to recognise the shape.
 pub fn is_target_body_update(op: &McpMutationOperation) -> bool {
     op.payload.is_none()
         && matches!(op.verb.trim().to_lowercase().as_str(), "update" | "modify")
@@ -215,7 +221,15 @@ pub fn is_renamed_source_file(op: &McpMutationOperation) -> bool {
 /// the daemon can honor without a payload, while this names every shape whose
 /// substance is the body, including an entity payload sent alongside one.
 pub fn carries_source_body(op: &McpMutationOperation) -> bool {
-    op.body
+    matches!(
+        op.payload,
+        Some(
+            McpMutationPayload::EntitySourcePatch(_)
+                | McpMutationPayload::EntityCreate(_)
+                | McpMutationPayload::UnitImports(_)
+        )
+    ) || op
+        .body
         .as_deref()
         .is_some_and(|body| !body.trim().is_empty())
 }
@@ -453,7 +467,8 @@ pub enum IntentRegistrationAttempt {
 
 /// Effective coordination enforcement mode shared by transaction preflight
 /// and proof/build attestation. Warn remains the default; only explicit
-/// `enforce` may reject a write.
+/// `enforce` may reject a coordination conflict. Session liveness is required
+/// independently before new transaction work in every mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinationEnforcementMode {
@@ -516,6 +531,101 @@ impl Default for CoordinationSurfaceCoverage {
     }
 }
 
+/// A door through which a session writes, named for the capability it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDoor {
+    /// `kin_transaction_begin`, which opens a write transaction.
+    Begin,
+    /// `kin_transaction_stage`, which stages writes onto one.
+    Stage,
+    /// `kin_transaction_commit`, which publishes one.
+    Commit,
+    /// `kin_mutate`, which begins, stages and publishes in one call.
+    Mutate,
+    /// `kin commit`, which publishes the working copy.
+    CliCommit,
+    /// `kin reconcile`, which admits a session workspace into the primary one.
+    CliReconcile,
+    /// `kin push`, which publishes local history to a remote.
+    CliPush,
+    /// `kin pull`, which admits a remote's history into this replica.
+    CliPull,
+    /// `kin_session_exec`, whose toolchain run hands its manifests and
+    /// lockfiles back and records them as a change.
+    SessionExec,
+}
+
+impl WriteDoor {
+    /// The name a caller used to reach this door.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Begin => "kin_transaction_begin",
+            Self::Stage => "kin_transaction_stage",
+            Self::Commit => "kin_transaction_commit",
+            Self::Mutate => "kin_mutate",
+            Self::CliCommit => "kin commit",
+            Self::CliReconcile => "kin reconcile",
+            Self::CliPush => "kin push",
+            Self::CliPull => "kin pull",
+            Self::SessionExec => "kin_session_exec",
+        }
+    }
+
+    /// Whether this door publishes, so a session needs `can_commit` as well
+    /// as `can_write` to pass it.
+    fn publishes(self) -> bool {
+        matches!(
+            self,
+            Self::Commit | Self::Mutate | Self::CliCommit | Self::CliPush | Self::SessionExec
+        )
+    }
+
+    /// Whether a caller reaches this door from a shell, where the session was
+    /// named by `KIN_SESSION_ID` rather than by an MCP tool call.
+    fn reached_from_a_shell(self) -> bool {
+        matches!(
+            self,
+            Self::CliCommit | Self::CliReconcile | Self::CliPush | Self::CliPull
+        )
+    }
+}
+
+/// The refusal a read-only session gets at `door`, or `None` when its
+/// capabilities cover the door.
+///
+/// Every door needs `can_write`, and the doors that publish need `can_commit`
+/// too. The sentence names the door, the session and the missing bits, and
+/// says what to do about it where the caller is: an MCP client starts another
+/// session, because capabilities are fixed when a session starts, and a shell
+/// stops naming the session.
+pub fn read_only_session_refusal(door: WriteDoor, session: &AgentSession) -> Option<String> {
+    let mut missing = Vec::new();
+    if !session.capabilities.can_write {
+        missing.push("can_write=false");
+    }
+    if door.publishes() && !session.capabilities.can_commit {
+        missing.push("can_commit=false");
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    let remedy = if door.reached_from_a_shell() {
+        "The CLI names its session with KIN_SESSION_ID, so unset KIN_SESSION_ID and run this \
+         again from your own shell."
+    } else {
+        "To write, start a session with kin_session_start that declares can_write and \
+         can_commit, or declares no capabilities to take what this store permits. A bit its \
+         capability_policy reports as store is one this store refuses to every session."
+    };
+    Some(format!(
+        "read_only_session: {} writes, and session {} may not: it started with {}, and a \
+         session's capabilities are fixed when it starts. {remedy}",
+        door.name(),
+        session.session_id,
+        missing.join(" and ")
+    ))
+}
+
 /// Result of checking a transaction immediately before graph application.
 #[derive(Debug, Clone, Serialize)]
 pub struct CoordinationWritePreflight {
@@ -533,7 +643,7 @@ pub struct CoordinationWritePreflight {
 /// The mutation verbs the transaction commit path understands, listed for
 /// actionable error messages.
 const KNOWN_MUTATION_VERBS: &str =
-    "create/add/upsert/insert, update/modify, replace/overwrite, delete/remove, or rename/move";
+    "create/add/upsert/insert, update/modify, patch, replace/overwrite, delete/remove, or rename/move";
 
 fn is_known_mutation_verb(verb: &str) -> bool {
     matches!(
@@ -544,6 +654,7 @@ fn is_known_mutation_verb(verb: &str) -> bool {
             | "insert"
             | "update"
             | "modify"
+            | "patch"
             | "replace"
             | "overwrite"
             | "delete"
@@ -616,15 +727,10 @@ pub fn validate_staged_operations(
                 continue;
             }
             return Err(format!(
-                "operation #{idx} ('{}'): missing payload; provide an entity, relation, or blob \
-                 payload, express an edit to an existing entity as verb 'update' with `target` \
-                 (entity name or id) and `body` (the entity's full new source text), admit a \
-                 source file the graph has never seen as verb 'create' with `target` (its \
-                 repository-relative path) and `body` (the file's complete text), rewrite a \
-                 tracked file as verb 'replace' with `target` (its repository-relative path) and \
-                 `body` (the file's complete new text), retire a tracked file as verb 'delete' \
-                 with `target` (its repository-relative path) and no body, or relocate one as \
-                 verb 'rename' with `target` and `destination` (both repository-relative paths)",
+                "operation #{idx} ('{}'): missing payload; provide a guarded EntitySourcePatch, \
+                 an EntitySourceBase from get_entity_source with the entity's UUID and \
+                 replacement body, an EntityCreate or UnitImports addressed to a unit, or an \
+                 Entity or Relation payload (an Entity payload never creates source)",
                 op.verb
             ));
         };
@@ -644,6 +750,73 @@ pub fn validate_staged_operations(
         }
     }
     Ok(())
+}
+
+/// A whole-entity replacement that names no version of the entity it replaces:
+/// a payload-less update or modify with a body, or an explicit `Entity`
+/// payload with a body.
+///
+/// Both write the entity's whole span from `body` and neither carries the
+/// source the caller read, so a change made to the entity after that read
+/// would be overwritten without a word. The guarded forms carry it: an
+/// `EntitySourceBase` payload beside the body, or an `EntitySourcePatch`.
+pub fn is_unguarded_replacement(op: &McpMutationOperation) -> bool {
+    let bodied = op
+        .body
+        .as_deref()
+        .is_some_and(|body| !body.trim().is_empty());
+    bodied
+        && (is_target_body_update(op) || matches!(op.payload, Some(McpMutationPayload::Entity(_))))
+}
+
+/// The refusal an unguarded whole-entity replacement gets, naming the fix.
+///
+/// Retryable by construction: nothing was begun or applied, and one fresh
+/// `get_entity_source` read supplies everything the resend needs.
+pub fn source_base_required(idx: usize, op: &McpMutationOperation) -> String {
+    let target = op.target.trim();
+    format!(
+        "source_base_required: operation #{idx} ('{verb}') replaces entity {target} whole, and a \
+         whole-entity replacement must carry the source_base of the version you read. Call \
+         get_entity_source for {target}, then resend with payload.EntitySourceBase set to the \
+         source_base it returned, unchanged, and target set to its entity_id; or send an \
+         anchored EntitySourcePatch. One fresh read and a resend is the fix. If \
+         get_entity_source answers source_base_unavailable instead of a source_base, that \
+         entity's span is unverified and Kin cannot guard a replacement: stop and report the \
+         gap. An older repository may need `kin upgrade`; reread afterward and proceed only \
+         if Kin issues a source_base.",
+        verb = op.verb,
+    )
+}
+
+/// Admit work on entities and relationships at the semantic agent boundary.
+/// Conversion can still decode legacy source-tree operations, but accepting
+/// their wire shape must never grant an agent whole-file write authority, and
+/// a whole-entity replacement is admitted only with the source it replaces.
+pub fn validate_semantic_operations(operations: &[McpMutationOperation]) -> Result<(), String> {
+    for (idx, operation) in operations.iter().enumerate() {
+        if is_unguarded_replacement(operation) {
+            return Err(source_base_required(idx, operation));
+        }
+        let verb = operation.verb.trim().to_ascii_lowercase();
+        if matches!(verb.as_str(), "replace" | "overwrite" | "rename" | "move")
+            || operation.destination.is_some()
+            || (operation.payload.is_none()
+                && matches!(
+                    verb.as_str(),
+                    "create" | "add" | "insert" | "upsert" | "delete" | "remove"
+                ))
+        {
+            return Err(format!(
+                "semantic_operation_required: operation #{idx} ('{}') is a file-level operation. \
+                 Kin agent mutations target entities and relationships. Use a guarded entity \
+                 patch, an entity source update, or an explicit Entity/Relation payload; \
+                 source-tree conversion is a separate boundary. No new operation was admitted.",
+                operation.verb
+            ));
+        }
+    }
+    validate_staged_operations(operations)
 }
 
 /// Validate one repository-relative path a path-shaped operation names.
@@ -723,6 +896,62 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
         return Some("missing payload".to_string());
     };
     match payload {
+        McpMutationPayload::EntityCreate(create) => {
+            if let Err(error) = create.form() {
+                return Some(error);
+            }
+            if verb != "create"
+                || create.expected_target().as_deref() != Some(op.target.as_str())
+                || op.body.is_some()
+                || op.destination.is_some()
+            {
+                Some(
+                    "EntityCreate requires verb create, no outer body or destination, and as \
+                      target the declared name (unit form) or the source_base anchor UUID \
+                      (anchored form)"
+                        .into(),
+                )
+            } else {
+                create.validate().err()
+            }
+        }
+        McpMutationPayload::UnitImports(imports) => {
+            if !matches!(verb.as_str(), "update" | "modify")
+                || op.target != imports.unit.package_name()
+                || op.body.is_some()
+                || op.destination.is_some()
+            {
+                Some(
+                    "UnitImports requires verb update, the unit's package name as target, and \
+                      no body or destination"
+                        .into(),
+                )
+            } else {
+                imports.validate().err()
+            }
+        }
+        McpMutationPayload::EntityRemove(remove) => {
+            if verb != "remove"
+                || op.target != remove.source_base.entity_id.to_string()
+                || op.body.is_some()
+                || op.destination.is_some()
+            {
+                Some("EntityRemove requires verb remove, its exact source_base entity UUID as target, and no body or destination".into())
+            } else {
+                remove.validate().err()
+            }
+        }
+        McpMutationPayload::EntitySourcePatch(patch) => {
+            if verb != "patch"
+                || op.target != patch.source_base.entity_id.to_string()
+                || op.body.is_some()
+                || op.destination.is_some()
+            {
+                Some("EntitySourcePatch requires verb patch, its exact source_base entity UUID as target, and no body or destination".into())
+            } else {
+                patch.validate().err()
+            }
+        }
         McpMutationPayload::EntitySourceBase(base) => {
             if !matches!(verb.as_str(), "update" | "modify")
                 || op.target != base.entity_id.to_string()
@@ -742,19 +971,19 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
         // here rather than at commit, where the payload branch has no arm for
         // these verbs and would drop the operation without a word.
         McpMutationPayload::Entity(_) => {
+            if verb == "patch" {
+                return Some("verb patch requires an EntitySourcePatch payload".into());
+            }
             if matches!(verb.as_str(), "rename" | "move") {
                 Some(format!(
-                    "verb '{}' is not committable for entity payloads; a rename moves a file, so \
-                     stage it with no payload, `target` set to the file's current \
-                     repository-relative path, and `destination` set to its new one",
+                    "verb '{}' is not committable for entity payloads; use an entity update \
+                     or targeted relationship mutation",
                     op.verb
                 ))
             } else if matches!(verb.as_str(), "replace" | "overwrite") {
                 Some(format!(
-                    "verb '{}' is not committable for entity payloads; a replacement rewrites a \
-                     whole file, so stage it with no payload, `target` set to the file's \
-                     repository-relative path, and `body` set to its complete new text. To \
-                     change one entity in place, use verb 'update'",
+                    "verb '{}' is not committable for entity payloads; use a guarded entity \
+                     patch or verb 'update' for that entity's source",
                     op.verb
                 ))
             } else {
@@ -789,49 +1018,40 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
 /// shape learns one missing field per attempt from a raw decode error, so it
 /// discovers the contract by looping on retries; naming the full schema once
 /// ends the loop on the first refusal.
-pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one of:\n  \
-     - a guarded entity source edit: {\"verb\": \"update\", \"target\": \"<entity uuid>\", \
-     \"payload\": {\"EntitySourceBase\": <source_base from get_entity_source>}, \
-     \"body\": \"<full new source text>\", \"description\": \"<why>\"}\n  \
-     - an entity source edit: {\"verb\": \"update\", \"target\": \"<entity uuid or exact name>\", \
-     \"body\": \"<the entity's full new source text>\", \"description\": \"<why>\"}\n  \
-     - an entity payload edit: {\"verb\": \"update\", \"target\": \"<entity uuid>\", \
-     \"payload\": {\"Entity\": {<the entity object>}}, \"body\": \"<full new source text>\", \
-     \"description\": \"<why>\"}\n  \
-     - a relation edit: {\"verb\": \"create\"|\"delete\", \"target\": \"\", \
-     \"payload\": {\"Relation\": {\"from\": \"<uuid>\", \"to\": \"<uuid>\", \"kind\": \"<relation kind>\"}}, \
-     \"description\": \"<why>\"}\n  \
-     - a new source file: {\"verb\": \"create\", \"target\": \"<repository-relative path>\", \
-     \"body\": \"<the file's complete source text>\", \"description\": \"<why>\"}\n  \
-     - a rewritten source file: {\"verb\": \"replace\", \"target\": \"<repository-relative path \
-     the graph already tracks>\", \"body\": \"<the file's complete new source text>\", \
-     \"description\": \"<why>\"}\n  \
-     - a retired source file: {\"verb\": \"delete\", \"target\": \"<repository-relative path>\", \
-     \"description\": \"<why>\"}\n  \
-     - a renamed source file: {\"verb\": \"rename\", \"target\": \"<current path>\", \
-     \"destination\": \"<new path>\", \"description\": \"<why>\"}\n\
-     Prefer the first shape for changing code that exists: it needs only a target and the new \
-     source text.\n\
-     Every field of an operation, and nothing else is accepted:\n  \
-     - `verb` (string, REQUIRED): one of create/add/upsert/insert, update/modify, \
-     replace/overwrite, delete/remove, or rename/move. Compared case-insensitively after \
-     trimming.\n  \
-     - `target` (string, REQUIRED): the entity this operation acts on, as either its uuid or \
-     its exact name. A repository-relative path instead for the four file-level shapes \
-     (create, replace, delete, rename). Empty string for relation payloads, which identify \
-     themselves by their endpoints and kind.\n  \
-     - `description` (string, REQUIRED): why this operation is being made.\n  \
-     - `destination` (string, optional): where a rename puts the file, as a \
-     repository-relative path. Required by rename/move and accepted by nothing else.\n  \
-     - `body` (string, optional): the entity's complete new source text, never a fragment or a \
-     diff. New source text is carried by this field and no other; a key like `content`, \
-     `source`, or `new_body` is refused rather than accepted with the source dropped.\n  \
-     - `payload` (object, optional): omit it for a source edit and for every file-level shape. \
-     Otherwise exactly one of \
-     {\"Entity\": {<entity object>}}, {\"Relation\": {\"from\": \"<uuid>\", \"to\": \"<uuid>\", \
-     \"kind\": \"<relation kind>\"}}, or {\"Blob\": [<bytes>]}. Relation payloads accept only \
-     create/add/upsert/insert or delete/remove, and blob payloads are not committable through \
-     transactions yet";
+pub const ACCEPTED_OPERATION_SHAPES: &str = r#"each element of `operations` is one of these entity or relationship operations:
+  - declaration creation addressed to a unit (the form for an empty repository and for every
+    Go declaration kind): verb create, the declared name as target, payload
+    {"EntityCreate": {"repository_base": <repository_base from session, status or the last mutate>,
+    "unit": {"language": "go", "package": "." | <module-relative import path>, "name": <package name>,
+    "role": "source" | "test"}, "name": <Name or Receiver.Method>, "kind": "function" | "method" |
+    "struct" | "interface" | "type" | "const" | "var", "body": <exact declaration>,
+    "imports": [<import path>, ...]}}; no outer body or destination;
+  - import management on a unit: verb update, the unit's package name as target, payload
+    {"UnitImports": {"repository_base": <repository_base>, "unit": <unit>, "add": [<import path>],
+    "remove": [<import path>]}}; no body or destination;
+  - anchored function creation: verb create, anchor UUID target, payload
+    {"EntityCreate": {"source_base": <anchor source_base>, "name": <identifier>,
+    "kind": "function", "body": <exact function declaration>, "placement": "sibling_after" | "new_source_unit"}}; no outer body or destination;
+  - anchored function removal: verb remove, entity UUID target, payload
+    {"EntityRemove": {"source_base": <unchanged source_base>}}; no body or destination;
+  - an anchored entity patch: verb patch, exact entity UUID target, payload
+    {"EntitySourcePatch": {"source_base": <unchanged source_base from get_entity_source>,
+    "edits": [{"old_text": <unique exact anchor>, "new_text": <replacement>}]}}; no body;
+  - a guarded entity source edit: verb update/modify, exact entity UUID target,
+    payload {"EntitySourceBase": <source_base from get_entity_source>}, body containing
+    that entity's complete new source text. Every whole-entity replacement takes this
+    form: an update with no payload, or an Entity payload with a body, is refused as
+    source_base_required;
+  - a structured entity or relation mutation: verb create/add/upsert/insert or
+    delete/remove, an empty target, and payload {"Relation": {"from": <entity UUID>,
+    "to": <entity UUID>, "kind": <kind>}}. A structured Entity payload is Kin's own internal
+    record, never a way to create source: create declarations with EntityCreate.
+Every operation requires string fields `verb`, `target`, and `description`.
+The semantic optional fields are `payload` and `body`; unknown keys are refused.
+`destination` is recognized only for legacy conversion decoding and is refused on agent routes.
+Prefer a guarded entity patch for a targeted source change. Whole-file create, replace,
+delete and rename operations are not semantic agent operations. Conversion and
+materialization are separate boundaries."#;
 
 /// Every field an operation is allowed to carry.
 ///
@@ -886,15 +1106,65 @@ pub fn parse_staged_operations(
         if !unknown.is_empty() {
             return Err(format!(
                 "invalid operations: element #{idx} carries unknown field(s) {}; an operation is \
-                 described only by {}. New source text goes in `body`, and nowhere else, or it is \
-                 not committed; {ACCEPTED_OPERATION_SHAPES}",
+                 described only by {}. Full replacement text goes in `body`; anchored edits go in \
+                 payload.EntitySourcePatch.edits; {ACCEPTED_OPERATION_SHAPES}",
                 unknown.join(", "),
                 OPERATION_FIELDS.join(", ")
             ));
         }
+        // An explicit null is still a supplied field. Do not let serde turn
+        // forbidden full-body/path fields into an apparently valid patch.
+        if fields.get("payload").is_some_and(|payload| {
+            [
+                "EntitySourcePatch",
+                "EntityCreate",
+                "EntityRemove",
+                "UnitImports",
+            ]
+            .iter()
+            .any(|kind| payload.get(kind).is_some())
+        }) && (fields.contains_key("body") || fields.contains_key("destination"))
+        {
+            return Err(format!(
+                "invalid operations: element #{idx}: EntitySourcePatch/EntityCreate/EntityRemove/UnitImports forbids body and destination, including null"
+            ));
+        }
     }
-    serde_json::from_value(operations.clone())
-        .map_err(|error| format!("invalid operations array: {error}; {ACCEPTED_OPERATION_SHAPES}"))
+    serde_json::from_value(operations.clone()).map_err(|error| {
+        match elements.iter().position(is_raw_entity_creation) {
+            Some(idx) => raw_entity_creation_refusal(idx),
+            None => format!("invalid operations array: {error}; {ACCEPTED_OPERATION_SHAPES}"),
+        }
+    })
+}
+
+/// A create-verb operation carrying Kin's internal `Entity` record.
+///
+/// That record needs internal Kin identity (id, fingerprint, spans) that no
+/// caller can know for source that does not exist yet, so a caller improvising
+/// it is walked through one internal field per refusal. Naming the supported
+/// creation form on the first refusal ends that loop.
+fn is_raw_entity_creation(element: &serde_json::Value) -> bool {
+    element["payload"].get("Entity").is_some()
+        && element["verb"].as_str().is_some_and(|verb| {
+            matches!(
+                verb.trim().to_ascii_lowercase().as_str(),
+                "create" | "add" | "insert" | "upsert"
+            )
+        })
+}
+
+fn raw_entity_creation_refusal(idx: usize) -> String {
+    format!(
+        "entity_create_required: operation #{idx} tries to create source with a structured \
+         Entity payload, which is Kin's internal record and not a creation form. Create a \
+         declaration with payload.EntityCreate addressed to a unit: verb create, the declared \
+         name as target, and {{\"EntityCreate\": {{\"repository_base\": <repository_base from \
+         session, status or the last mutate>, \"unit\": {{\"language\": \"go\", \"package\": \
+         \".\", \"name\": \"main\", \"role\": \"source\"}}, \"name\": \"main\", \"kind\": \
+         \"function\", \"body\": \"func main() {{}}\", \"imports\": [\"fmt\"]}}}}. Nothing was \
+         staged. {ACCEPTED_OPERATION_SHAPES}"
+    )
 }
 
 /// Whether two staged operation sets describe exactly the same work.
@@ -1497,6 +1767,38 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Snapshot live intent scopes for graph-based context proximity. Keeping
+    /// the registration gate makes owner/intent selection one registry read.
+    /// Missing owners and expired intents cannot become advisory active traffic.
+    pub fn context_traffic_snapshot(&self) -> Vec<kin_context::ScopedTrafficIntent> {
+        let _gate = self.lock_coordination_apply();
+        let intents = self.intents.lock().expect("intents lock poisoned");
+        let sessions = self
+            .agent_sessions
+            .lock()
+            .expect("agent_sessions lock poisoned");
+        let now = Timestamp::now();
+        let mut snapshot: Vec<_> = intents
+            .values()
+            .filter_map(|intent| {
+                if intent
+                    .expires_at
+                    .as_ref()
+                    .is_some_and(|expiry| expiry < &now)
+                {
+                    return None;
+                }
+                let owner = sessions.get(&intent.session_id)?;
+                Some(kin_context::ScopedTrafficIntent {
+                    intent: intent.clone(),
+                    vendor: owner.vendor.clone(),
+                })
+            })
+            .collect();
+        snapshot.sort_by_key(|entry| entry.intent.intent_id.to_string());
+        snapshot
+    }
+
     /// Get active traffic summaries near a given entity (for include_traffic flag).
     pub fn get_traffic_near_entity(&self, entity_id: &EntityId) -> Vec<IntentSummary> {
         let target = IntentScope::Entity(*entity_id);
@@ -1546,23 +1848,38 @@ impl SessionRegistry {
             .contains_key(session_id)
     }
 
+    /// Refuse `door` when the rich agent session `session_id` is read-only.
+    ///
+    /// The capabilities a session reports at `kin_session_start` used to be
+    /// checked only when coordination was enforced, and it is not on a default
+    /// install, so a session that declared itself read-only could still begin,
+    /// stage and commit. This check does not depend on the coordination mode.
+    ///
+    /// A legacy assistant session carries no capabilities, so it has nothing to
+    /// declare and nothing is refused here. An id that names no session is
+    /// [`Self::require_live_session`]'s refusal to make.
+    pub fn require_write_capability(
+        &self,
+        session_id: &str,
+        door: WriteDoor,
+    ) -> std::result::Result<(), String> {
+        let session = uuid::Uuid::parse_str(session_id)
+            .ok()
+            .map(SessionId)
+            .and_then(|id| self.get_agent_session(&id));
+        match session.and_then(|session| read_only_session_refusal(door, &session)) {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
+    }
+
     pub fn begin_transaction(
         &self,
         session_id: &str,
         scope: &str,
     ) -> std::result::Result<McpTransaction, String> {
-        if !self.has_session(session_id) {
-            // A well-formed id that names nothing is an ended or idle-reaped
-            // session, not a typo. Saying only "not found" sends an agent
-            // hunting for a bad argument; naming expiry sends it to the one
-            // call that recovers.
-            return Err(format!(
-                "Session not found: {session_id}. It was ended or expired after its idle \
-                 timeout. Call kin_session_start for a new session id and begin the \
-                 transaction on that one; kin_session_heartbeat keeps a session alive \
-                 through a long read phase."
-            ));
-        }
+        self.require_live_session(session_id)?;
+        self.require_write_capability(session_id, WriteDoor::Begin)?;
         let mut map = self
             .transactions
             .lock()
@@ -1604,6 +1921,26 @@ impl SessionRegistry {
         Ok(transaction)
     }
 
+    /// Session validity is a prerequisite for new work, independently of the
+    /// advisory/enforced collision policy. Callers recovering an already
+    /// published receipt check authority before requiring a live owner.
+    pub fn require_live_session(&self, session_id: &str) -> std::result::Result<(), String> {
+        if !self.has_session(session_id) {
+            // A well-formed id that names nothing is an ended or idle-reaped
+            // session, not a typo. Saying only "not found" sends an agent
+            // hunting for a bad argument; naming expiry sends it to the one
+            // call that recovers.
+            return Err(format!(
+                "Session not found: {session_id}. It was ended or expired after its idle \
+                 timeout or the daemon restarted. For retained daemon-backed work, call \
+                 kin_session_start with the original session_id to re-register it, then retry \
+                 the same transaction. Otherwise start a new session and transaction. \
+                 kin_session_heartbeat keeps a session alive through a long read phase."
+            ));
+        }
+        Ok(())
+    }
+
     pub fn stage_transaction(
         &self,
         transaction_id: &str,
@@ -1614,6 +1951,8 @@ impl SessionRegistry {
             .lock()
             .expect("transactions lock poisoned");
         if let Some(tx) = map.get_mut(transaction_id) {
+            self.require_live_session(&tx.session_id)?;
+            self.require_write_capability(&tx.session_id, WriteDoor::Stage)?;
             if tx.state != "active" {
                 return Err(format!(
                     "Cannot stage operations on transaction {} in state: {}",
@@ -1662,6 +2001,7 @@ impl SessionRegistry {
             .lock()
             .expect("transactions lock poisoned");
         if let Some(tx) = map.get_mut(transaction_id) {
+            self.require_live_session(&tx.session_id)?;
             if tx.state != "active" {
                 return Err(format!(
                     "Cannot validate transaction {} in state: {}",
@@ -2675,6 +3015,89 @@ mod tests {
         );
     }
 
+    fn assert_revoked_transaction_is_unchanged(registry: &SessionRegistry, tx: &McpTransaction) {
+        let before = serde_json::to_value(registry.get_transaction(&tx.transaction_id)).unwrap();
+        for error in [
+            registry
+                .stage_transaction(&tx.transaction_id, vec![tiny_operation(1)])
+                .unwrap_err(),
+            registry
+                .validate_transaction(&tx.transaction_id)
+                .unwrap_err(),
+        ] {
+            assert!(error.contains("Session not found"), "{error}");
+            assert!(error.contains("kin_session_start"), "{error}");
+        }
+        assert_eq!(
+            serde_json::to_value(registry.get_transaction(&tx.transaction_id)).unwrap(),
+            before,
+            "revocation must not change the payload, state, fence or activity timestamp"
+        );
+    }
+
+    #[test]
+    fn revoked_simple_owner_cannot_stage_or_validate_but_can_discard_its_work() {
+        let registry = SessionRegistry::new();
+        registry.register("revoked-owner", "test");
+        let tx = staged_edit(&registry, "revoked-owner");
+        registry.remove("revoked-owner").unwrap();
+        assert_revoked_transaction_is_unchanged(&registry, &tx);
+        assert_eq!(
+            registry
+                .abort_transaction(&tx.transaction_id)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+    }
+
+    #[test]
+    fn revoked_rich_owner_cannot_stage_or_validate_and_fresh_owner_can() {
+        let registry = SessionRegistry::new();
+        let writable = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            ..SessionCapabilities::default()
+        };
+        let owner = registry.start_agent_session(
+            "test",
+            "revoked owner",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/unused"),
+            writable.clone(),
+        );
+        let tx = staged_edit(&registry, &owner.session_id.to_string());
+        registry.end_agent_session(&owner.session_id).unwrap();
+        assert_revoked_transaction_is_unchanged(&registry, &tx);
+        let fresh = registry.start_agent_session(
+            "test",
+            "fresh owner",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/unused"),
+            writable,
+        );
+        let new_tx = staged_edit(&registry, &fresh.session_id.to_string());
+        assert_eq!(
+            registry
+                .validate_transaction(&new_tx.transaction_id)
+                .unwrap()
+                .state,
+            "validated"
+        );
+    }
+
+    #[test]
+    fn restored_transaction_does_not_restore_its_revoked_owner() {
+        let previous = SessionRegistry::new();
+        previous.register("old-process-owner", "test");
+        let tx = staged_edit(&previous, "old-process-owner");
+        let restored = SessionRegistry::new();
+        restored.replace_transactions(vec![tx.clone()]);
+        assert_revoked_transaction_is_unchanged(&restored, &tx);
+    }
+
     #[test]
     fn abort_discards_the_staged_mutations_it_says_it_discards() {
         let registry = SessionRegistry::new();
@@ -2930,6 +3353,36 @@ mod tests {
         assert!(validate_staged_operations(&ops).is_ok());
     }
 
+    /// The baseline greenfield run: an agent in an empty repository reached for
+    /// the structured Entity payload to create a function, and each refusal
+    /// named one more internal Kin field (`language` spelling, `id`,
+    /// `fingerprint`). The first refusal now names the creation form instead.
+    #[test]
+    fn raw_entity_creation_is_redirected_to_entity_create_on_the_first_refusal() {
+        for verb in ["create", "add", "insert", "upsert"] {
+            let error = parse_staged_operations(&serde_json::json!([{
+                "verb": verb,
+                "target": "main",
+                "payload": {"Entity": {"name": "main", "kind": "function", "language": "go"}},
+                "description": "first function"
+            }]))
+            .unwrap_err();
+            assert!(
+                error.starts_with("entity_create_required:"),
+                "{verb}: {error}"
+            );
+            assert!(error.contains("\"EntityCreate\""), "{error}");
+            assert!(error.contains("repository_base"), "{error}");
+            assert!(!error.contains("missing field"), "{error}");
+        }
+        // A malformed relation keeps the ordinary decode refusal.
+        let error = parse_staged_operations(&serde_json::json!([{
+            "verb": "create", "target": "", "payload": {"Relation": {}}, "description": "edge"
+        }]))
+        .unwrap_err();
+        assert!(error.starts_with("invalid operations array"), "{error}");
+    }
+
     #[test]
     fn validate_staged_operations_rejects_missing_payload() {
         // The commit path silently skips payload-less ops; stage time must not.
@@ -2939,11 +3392,14 @@ mod tests {
         // (target "function", body None), so it must still be rejected.
         let err = validate_staged_operations(&[op("create", None)]).unwrap_err();
         assert!(err.contains("missing payload"), "{err}");
+        assert!(err.contains("guarded EntitySourcePatch"), "{err}");
         assert!(
-            err.contains("express an edit to an existing entity"),
+            err.contains("EntitySourceBase from get_entity_source"),
             "{err}"
         );
-        assert!(err.contains("admit a source file"), "{err}");
+        assert!(!err.contains("UUID/exact name"), "{err}");
+        assert!(err.contains("Entity or Relation payload"), "{err}");
+        assert!(!err.contains("admit a source file"), "{err}");
     }
 
     #[test]
@@ -3110,6 +3566,91 @@ mod target_body_update_tests {
         assert!(is_target_body_update(&op));
         assert!(uncommittable_reason(&op).is_none());
         assert!(validate_staged_operations(std::slice::from_ref(&op)).is_ok());
+    }
+
+    /// A whole-entity replacement that names no version of what it replaces is
+    /// refused where agent work is admitted, and the guarded form is not.
+    ///
+    /// The runtime-independent check still accepts both unguarded shapes, which
+    /// is what lets conversion keep decoding them. The refusal belongs to
+    /// `validate_semantic_operations`, the check every agent route runs, and it
+    /// names the operation it refused, so a batch says which one to fix.
+    #[test]
+    fn an_unguarded_replacement_is_refused_only_at_the_semantic_boundary() {
+        let body = "fn resolve_binary() {}";
+        let payload_less = target_op("update", "resolve_binary", Some(body));
+        let mut modified = payload_less.clone();
+        modified.verb = "modify".to_string();
+        let mut entity_plus_body = payload_less.clone();
+        entity_plus_body.payload = Some(McpMutationPayload::Entity(super::tests::entity_named(
+            "resolve_binary",
+        )));
+        for op in [&payload_less, &modified, &entity_plus_body] {
+            assert!(is_unguarded_replacement(op), "{op:?}");
+            validate_staged_operations(std::slice::from_ref(op))
+                .expect("the runtime-independent check still admits the shape");
+            let refusal = validate_semantic_operations(std::slice::from_ref(op))
+                .expect_err("an unguarded replacement must be refused");
+            assert!(
+                refusal.starts_with(&format!(
+                    "source_base_required: operation #0 ('{}')",
+                    op.verb
+                )),
+                "{refusal}"
+            );
+            assert!(
+                refusal.contains("EntitySourceBase") && refusal.contains("get_entity_source"),
+                "the refusal must name the fix: {refusal}"
+            );
+        }
+
+        // An entity payload without a body changes metadata and replaces
+        // nothing, and a blank body is no source.
+        let mut metadata_only = entity_plus_body.clone();
+        metadata_only.body = None;
+        let mut blank = entity_plus_body.clone();
+        blank.body = Some("  \n".to_string());
+        assert!(!is_unguarded_replacement(&metadata_only));
+        assert!(!is_unguarded_replacement(&blank));
+        validate_semantic_operations(std::slice::from_ref(&metadata_only))
+            .expect("an entity payload alone is admitted");
+
+        // In a batch, the refusal names the replacement's own index.
+        let refusal = validate_semantic_operations(&[metadata_only, payload_less])
+            .expect_err("the batch holds an unguarded replacement");
+        assert!(
+            refusal.starts_with("source_base_required: operation #1 "),
+            "{refusal}"
+        );
+
+        // The control: the same body carrying its source base is admitted.
+        let base = crate::source_base::EntitySourceBase {
+            schema: crate::source_base::SourceBaseSchema::V1,
+            context: crate::source_base::SourceBaseContext {
+                repository_id: "session-test".into(),
+                workspace_id: uuid::Uuid::new_v4().to_string(),
+                workspace_generation: 1,
+                workspace_head_hash: "a".repeat(64),
+                workspace_tree_hash: "b".repeat(64),
+            },
+            entity_id: EntityId::new(),
+            artifact_id: kin_model::ArtifactId::new(),
+            source_blob_hash: "c".repeat(64),
+            start_byte: 0,
+            end_byte: 12,
+            body_hash: "d".repeat(64),
+        };
+        let guarded = McpMutationOperation {
+            verb: "update".to_string(),
+            target: base.entity_id.to_string(),
+            payload: Some(McpMutationPayload::EntitySourceBase(base)),
+            body: Some(body.to_string()),
+            destination: None,
+            description: "test".to_string(),
+        };
+        assert!(!is_unguarded_replacement(&guarded));
+        validate_semantic_operations(std::slice::from_ref(&guarded))
+            .expect("a guarded replacement is admitted");
     }
 
     /// Build a file-level operation: a verb, a path, and optionally a
@@ -3389,7 +3930,11 @@ mod target_body_update_tests {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/tmp"),
-            SessionCapabilities::default(),
+            SessionCapabilities {
+                can_write: true,
+                can_commit: true,
+                ..SessionCapabilities::default()
+            },
         );
         let ok = registry.begin_transaction(&session.session_id.to_string(), "scope");
         assert!(ok.is_ok(), "known agent session must be accepted: {ok:?}");

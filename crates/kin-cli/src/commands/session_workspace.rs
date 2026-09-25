@@ -167,17 +167,18 @@ pub fn create_session_workspace_from_authority(
     strategy: Option<MaterializeStrategy>,
     scope: Option<&str>,
 ) -> Result<MaterializedWorkspace> {
-    layout
-        .check_version()
-        .context("repository layout is not repository-v6 compatible")?;
-    if scope.is_some() {
-        bail!(
-            "scoped exact-session materialization is fail-closed until its selected artifact set \
-             is authenticated outside the editable session; request a full session"
-        );
-    }
-    let session_name = validate_session_directory(layout, session_dir)?;
-    require_exact_copy_strategy(strategy)?;
+    create_session_workspace_at_roots(layout, binding, session_dir, strategy, scope, None)
+}
+
+fn create_session_workspace_at_roots(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    session_dir: &Path,
+    strategy: Option<MaterializeStrategy>,
+    scope: Option<&str>,
+    expected_roots: Option<&RootBundle>,
+) -> Result<MaterializedWorkspace> {
+    let session_name = validate_session_request_parts(layout, session_dir, strategy, scope)?;
 
     // Projection lock first: a session writer that began before exact eject
     // must stay bound to that repository epoch and may not wake onto a
@@ -186,6 +187,9 @@ pub fn create_session_workspace_from_authority(
         .context("freeze the existing repository projection before creating a session")?;
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let (source_workspace, authority_roots) = authority.workspace_with_roots()?;
+    if expected_roots.is_some_and(|expected| expected != &authority_roots) {
+        bail!("session authority changed after its live semantic capture");
+    }
     let selected_tree = select_materialized_tree(&source_workspace.tree, scope)?;
     let selected_artifacts = selected_tree
         .into_artifacts()
@@ -287,6 +291,17 @@ pub fn materialize_session_workspace(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     request: &SessionWorkspaceRequest,
 ) -> Result<SessionWorkspaceResponse> {
+    materialize_session_workspace_at_roots(layout, binding, request, None)
+}
+
+/// Bind a daemon's captured observation to the exact authority used for its
+/// new session base. No request field can supply or override this binding.
+pub fn materialize_session_workspace_at_roots(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    request: &SessionWorkspaceRequest,
+    expected_roots: Option<&RootBundle>,
+) -> Result<SessionWorkspaceResponse> {
     let strategy = request
         .strategy
         .as_deref()
@@ -294,12 +309,13 @@ pub fn materialize_session_workspace(
         .transpose()
         .map_err(anyhow::Error::msg)?;
     let root = PathBuf::from(&request.session_dir);
-    let workspace = create_session_workspace_from_authority(
+    let workspace = create_session_workspace_at_roots(
         layout,
         binding,
         &root,
         strategy,
         request.scope.as_deref(),
+        expected_roots,
     )?;
     Ok(SessionWorkspaceResponse {
         root: workspace.root().display().to_string(),
@@ -309,6 +325,47 @@ pub fn materialize_session_workspace(
         }
         .to_string(),
     })
+}
+
+/// Validate request-only constraints before a daemon captures live semantics.
+/// The actual projection retains and revalidates its namespace independently.
+pub fn validate_session_workspace_request(
+    layout: &kin_core::KinLayout,
+    request: &SessionWorkspaceRequest,
+) -> Result<()> {
+    let strategy = request
+        .strategy
+        .as_deref()
+        .map(str::parse::<MaterializeStrategy>)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    validate_session_request_parts(
+        layout,
+        Path::new(&request.session_dir),
+        strategy,
+        request.scope.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn validate_session_request_parts<'a>(
+    layout: &kin_core::KinLayout,
+    session_dir: &'a Path,
+    strategy: Option<MaterializeStrategy>,
+    scope: Option<&str>,
+) -> Result<&'a str> {
+    layout
+        .check_version()
+        .context("repository layout is not repository-v6 compatible")?;
+    if scope.is_some() {
+        bail!(
+            "scoped exact-session materialization is fail-closed until its selected artifact set \
+             is authenticated outside the editable session; request a full session"
+        );
+    }
+    let session_name = validate_session_directory(layout, session_dir)?;
+    require_exact_copy_strategy(strategy)?;
+    Ok(session_name)
 }
 
 fn require_exact_copy_strategy(strategy: Option<MaterializeStrategy>) -> Result<()> {

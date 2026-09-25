@@ -627,3 +627,62 @@ async fn reference_rows_carry_call_site_lines_on_both_ingest_arms() {
         }
     }
 }
+
+/// One caller can have independently proven and guessed occurrences of the
+/// same target. Both public reference surfaces must partition the sites while
+/// retaining a single counted caller, in either source order and ingest arm.
+#[tokio::test]
+async fn mixed_parser_sites_are_partitioned_in_cli_and_mcp() {
+    for (source, proven, held) in [
+        ("from adapters import HTTPAdapter\n\ndef relay(known: HTTPAdapter, unknown, request):\n    known.send(request)\n    unknown.send(request)\n", 4, 5),
+        ("from adapters import HTTPAdapter\n\ndef relay(known: HTTPAdapter, unknown, request):\n    unknown.send(request)\n    known.send(request)\n", 5, 4),
+    ] {
+        let fixture = Fixture {
+            language: "Python",
+            defs_path: "adapters.py",
+            defs_source: "class HTTPAdapter:\n    def send(self, request):\n        return request\n",
+            target_name: "HTTPAdapter.send",
+            caller_path: "caller.py",
+            caller_source: source,
+            caller_name: "relay",
+            rows_field: "references",
+            call_text: ".send(request)",
+        };
+        let foreign = Fixture {
+            defs_path: "foreign.py",
+            defs_source: "class ForeignAdapter:\n    def send(self, request):\n        return None\n",
+            ..fixture
+        };
+        let mut files = index_files(&fixture);
+        files.push(index_files(&foreign).remove(0));
+        let target = files[0].entities.iter().find(|entity| entity.name == "HTTPAdapter.send")
+            .expect("real parser target").clone();
+        for (arm, link) in [
+            ("batch", link_batch as fn(&[IndexedFixtureFile]) -> Vec<Relation>),
+            ("incremental", link_incremental),
+        ] {
+            let graph = graph_with(&files, &link(&files));
+            let body = find_references(&graph, &target).await;
+            let confirmed: Vec<_> = body["references"].as_array().expect("references")
+                .iter().filter(|row| row["name"] == "relay").collect();
+            let candidates: Vec<_> = body["candidates"].as_array().expect("candidates")
+                .iter().filter(|row| row["name"] == "relay").collect();
+            assert_eq!(confirmed.len(), 1, "{arm}: one counted caller: {body:#}");
+            assert_eq!(candidates.len(), 1, "{arm}: one held caller: {body:#}");
+            assert_eq!(confirmed[0]["reference_lines"], serde_json::json!([proven]), "{arm}: {body:#}");
+            assert_eq!(candidates[0]["reference_lines"], serde_json::json!([held]), "{arm}: {body:#}");
+            let temporary = tempfile::tempdir().unwrap();
+            let layout = kin_core::KinLayout::new(temporary.path().join(".kin"));
+            let cli = build_refs_response(&layout, &graph, &RefsRequest {
+                entity: target.id.to_string(), kind: "calls".to_string(),
+            }, &kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                "initialized": true, "graph_loaded": true,
+                "graph_entity_count": 6, "graph_generation": 1,
+            }))).expect("kin refs");
+            let text = cli.lines.join("\n");
+            assert!(text.contains(&format!("sites {proven}")), "{arm}: {text}");
+            assert!(text.contains(&format!("sites {held}")), "{arm}: {text}");
+            assert!(!text.contains("sites 4,5"), "{arm}: mixed sites must not be promoted: {text}");
+        }
+    }
+}

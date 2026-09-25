@@ -2133,10 +2133,13 @@ jobs:
 
   # Update the MCP Registry entry for `ai.kinlab/kin`. The registry is the
   # substrate the other MCP catalogs read, and it validates the npm package the
-  # entry points at against live npm, so this runs only after @kinlab/kin-mcp
-  # is public at this exact version. Prerelease tags are skipped: the registry
-  # treats the newest published version as the current one, and a candidate
-  # must not become what a catalog offers.
+  # entry points at against live npm, so this runs only after @kinlab/kin is
+  # public at this exact version. The entry installs the canonical package and
+  # runs `kin mcp start` through it, rather than the compatibility wrapper its
+  # own README calls superseded, so a registry install has the same `kin` a
+  # terminal install does. Prerelease tags are skipped: the registry treats the
+  # newest published version as the current one, and a candidate must not
+  # become what a catalog offers.
   #
   # Authority is the DNS door: an Ed25519 key proves control of kinlab.ai
   # through a TXT record. The registry also accepts
@@ -2151,11 +2154,11 @@ jobs:
   # green job that published nothing is the failure mode this posture buys.
   publish_mcp_registry:
     name: Publish to the MCP Registry
-    needs: publish_npm_compatibility
+    needs: publish_npm_canonical
     if: >-
       ${{
         always() &&
-        needs.publish_npm_compatibility.result == 'success' &&
+        needs.publish_npm_canonical.result == 'success' &&
         startsWith(github.ref, 'refs/tags/v') &&
         !contains(github.ref_name, '-')
       }}
@@ -2183,9 +2186,9 @@ jobs:
           # The registry refuses the publish unless package.json's mcpName is
           # exactly server.json's name, and it reports that as a package
           # validation failure rather than as the mismatch it is.
-          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+          jq -e --slurpfile pkg packages/kin/package.json \
             '.name == $pkg[0].mcpName' server.json > /dev/null
-          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+          jq -e --slurpfile pkg packages/kin/package.json \
             '.packages[0].identifier == $pkg[0].name' server.json > /dev/null
 
       - name: Wait for npm to serve the published version
@@ -2193,13 +2196,13 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           for attempt in $(seq 1 12); do
-            if [ "$(npm view "@kinlab/kin-mcp@${version}" version 2>/dev/null)" = "$version" ]; then
-              echo "npm serves @kinlab/kin-mcp@${version}"
+            if [ "$(npm view "@kinlab/kin@${version}" version 2>/dev/null)" = "$version" ]; then
+              echo "npm serves @kinlab/kin@${version}"
               exit 0
             fi
             [ "$attempt" -eq 12 ] || sleep 10
           done
-          echo "::error::npm does not serve @kinlab/kin-mcp@${version} yet; the registry validates against live npm, so nothing was published"
+          echo "::error::npm does not serve @kinlab/kin@${version} yet; the registry validates against live npm, so nothing was published"
           exit 1
 
       - name: Install mcp-publisher

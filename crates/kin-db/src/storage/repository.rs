@@ -9,6 +9,8 @@
 //! one full snapshot with backend CAS, and only after durable acknowledgement
 //! publishes one new `Arc` to readers.
 
+mod session_publication;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -46,11 +48,12 @@ use crate::storage::authority::{
 #[cfg(test)]
 use crate::storage::backend::load_recovered_repository_authority;
 use crate::storage::backend::{
-    load_recovered_repository_authority_streaming, validate_source_blob_size,
-    verify_source_blob_digest, AuthorityPayloadStats, DurableAuthorityIdentity, Generation,
-    LocalAuthorityFreezeLock, LocalFileBackend, PreparedWorkspaceGraphArtifact, RecoveredSnapshot,
-    SnapshotCursor, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
-    StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
+    load_recovered_repository_authority_streaming, try_reopen_repository_authority_streaming,
+    validate_source_blob_size, verify_source_blob_digest, AuthorityPayloadStats,
+    DurableAuthorityIdentity, Generation, LocalAuthorityFreezeLock, LocalFileBackend,
+    PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotCursor, SnapshotSaveOutcome,
+    SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch,
+    MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::canonical_hash::canonical_hash_into;
 use crate::storage::change_map::ChangeMap;
@@ -61,7 +64,9 @@ use crate::storage::format::{
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 use crate::types::ResolvedGraphState;
 
-/// Persisted repository-envelope schema this binary WRITES.
+/// Persisted repository-envelope schema new authority WRITES.
+/// Schema5 requires binding-history-aware writers; legacy3/4 retains Unknown
+/// until an explicit, root-preserving full-snapshot capability transition.
 ///
 /// Moved 3 to 4 when commit receipts stopped repeating their operation records
 /// (FIR-3064). The snapshot version ladder is what refuses an older BINARY at
@@ -69,7 +74,7 @@ use crate::types::ResolvedGraphState;
 /// envelope declares, and what makes [`HISTORY_VALIDATION_VERSION`] refuse
 /// every durable validation proof minted against the shape that came before,
 /// so an already-written store revalidates in full on its first open here.
-pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 4;
+pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 5;
 
 /// The oldest persisted envelope schema this binary READS.
 ///
@@ -120,7 +125,8 @@ pub const MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 /// minting this revision, records from the earlier binary are honored by the
 /// later one, so the two must land in the order that keeps each value
 /// unambiguous, or the revision must move to separate them.
-const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 3;
+// Existing root .kinignore transitions now admit a checked same-observation unignore.
+const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 4;
 
 /// Version of the complete open-time validation a durable history-validation
 /// record stands for.
@@ -573,10 +579,13 @@ pub struct ChangeAdmissionPolicy {
 }
 
 /// One coherent workspace authority binding and its exact compiled admission
-/// behavior.
+/// behavior, selected either for the dirty workspace or its next Native
+/// commit by the method returning it.
 ///
 /// `binding.admission_policy` is the shared-plus-local policy stamp carried by
-/// the same authority lease that selected `case` and `matcher`. Rule bodies
+/// the same authority lease that selected `case` and `matcher`. A Native
+/// preview's matcher uses the committed parent selected by `binding.base_target`,
+/// rather than the dirty workspace stamp. Rule bodies
 /// are loaded only from repository-owned immutable CAS and verified against
 /// the pinned shared policy and frozen local overlay before this value is
 /// returned.
@@ -718,7 +727,7 @@ impl PersistedCommitReceipt {
 ///
 /// Every vector with set semantics is kept in canonical sorted order.
 /// `operation_log` alone is append-ordered.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedRepositoryAuthority {
     pub schema_version: u32,
@@ -744,6 +753,55 @@ pub struct PersistedRepositoryAuthority {
     /// no re-import.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_transactions: Vec<MergeTransactionRecord>,
+    /// Exact-state derived proof. Missing means unknown, including schema5.
+    #[serde(default)]
+    pub binding_history: Vec<super::binding_history::BindingHistoryWitness>,
+    /// Owed derivation work, bound to the exact trees beside it.
+    ///
+    /// Receiver-local derived bookkeeping like `binding_history`: it folds into
+    /// no root and no transaction carries it. Last, and written only when
+    /// non-empty, so a store that owes nothing keeps its exact bytes. A
+    /// non-empty ledger moves the snapshot and frame versions, which is what
+    /// makes an older binary refuse it at the header rather than drop it.
+    #[serde(default)]
+    pub owed_derivations: super::derivation_ledger::OwedDerivationLedger,
+}
+
+impl Serialize for PersistedRepositoryAuthority {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Positional: a trailing collection is written only when it, or one
+        // after it, is, so every earlier position stays filled.
+        let has_ledger = !self.owed_derivations.is_empty();
+        let has_binding = !self.binding_history.is_empty() || has_ledger;
+        let has_merge = !self.merge_transactions.is_empty() || has_binding;
+        let mut out = serializer.serialize_struct(
+            "PersistedRepositoryAuthority",
+            12 + usize::from(has_merge) + usize::from(has_binding) + usize::from(has_ledger),
+        )?;
+        out.serialize_field("schema_version", &self.schema_version)?;
+        out.serialize_field("repository_id", &self.repository_id)?;
+        out.serialize_field("roots", &self.roots)?;
+        out.serialize_field("external_objects", &self.external_objects)?;
+        out.serialize_field("git_external_authority", &self.git_external_authority)?;
+        out.serialize_field("aliases", &self.aliases)?;
+        out.serialize_field("ref_state", &self.ref_state)?;
+        out.serialize_field("operation_log", &self.operation_log)?;
+        out.serialize_field("workspaces", &self.workspaces)?;
+        out.serialize_field("admission_policies", &self.admission_policies)?;
+        out.serialize_field("local_overlays", &self.local_overlays)?;
+        out.serialize_field("receipts", &self.receipts)?;
+        if has_merge {
+            out.serialize_field("merge_transactions", &self.merge_transactions)?;
+        }
+        if has_binding {
+            out.serialize_field("binding_history", &self.binding_history)?;
+        }
+        if has_ledger {
+            out.serialize_field("owed_derivations", &self.owed_derivations)?;
+        }
+        out.end()
+    }
 }
 
 impl PersistedRepositoryAuthority {
@@ -765,6 +823,8 @@ impl PersistedRepositoryAuthority {
             local_overlays: Vec::new(),
             receipts: Vec::new(),
             merge_transactions: Vec::new(),
+            binding_history: Vec::new(),
+            owed_derivations: Default::default(),
         };
         authority.roots = compute_roots(snapshot, &authority, 0)?;
         Ok(authority)
@@ -838,6 +898,7 @@ impl PersistedRepositoryAuthority {
             )));
         }
         self.roots.validate()?;
+        super::binding_history::validate_metadata(self)?;
         self.ref_state.validate()?;
 
         require_sorted_unique(
@@ -982,6 +1043,10 @@ impl PersistedRepositoryAuthority {
                 "repository without operations must remain at generation zero".to_string(),
             ));
         }
+        // After the log is proven, because a payment names the operation that
+        // made it, and after every workspace is, because a record names a body
+        // its workspace tree must hold.
+        super::derivation_ledger::validate_metadata(self)?;
 
         let operation_log_ms = timer.lap_ms();
         let derived_policies = derive_admission_policies(&snapshot.changes)?;
@@ -1075,6 +1140,9 @@ fn require_sorted_unique<T, K: Ord>(
 #[derive(Debug)]
 pub struct RepositoryAuthorityState {
     snapshot: GraphSnapshot,
+    /// True only for the manager's actually unpersisted empty construction.
+    /// Never decoded, inferred from a version stamp, or carried by a successor.
+    pub(super) binding_history_genesis: bool,
     /// Derived acceleration over immutable, externally authenticated Git
     /// history. This is never serialized or accepted from a transaction.
     authenticated_gitlinks: Arc<BTreeSet<(ArtifactId, GitObjectId)>>,
@@ -1096,6 +1164,7 @@ impl Clone for RepositoryAuthorityState {
     fn clone(&self) -> Self {
         Self {
             snapshot: self.snapshot.clone(),
+            binding_history_genesis: self.binding_history_genesis,
             authenticated_gitlinks: Arc::clone(&self.authenticated_gitlinks),
             prepared: self.prepared.clone(),
             durable: std::sync::OnceLock::new(),
@@ -1127,6 +1196,7 @@ impl RepositoryAuthorityState {
     ) -> Self {
         Self {
             snapshot,
+            binding_history_genesis: false,
             authenticated_gitlinks: Arc::new(authenticated_gitlinks),
             prepared: None,
             durable: std::sync::OnceLock::new(),
@@ -1157,6 +1227,7 @@ impl RepositoryAuthorityState {
         }
         Self {
             snapshot,
+            binding_history_genesis: false,
             authenticated_gitlinks,
             // A commit rewrote the authority bytes, so the digest the open
             // bound its prepared state to no longer describes this
@@ -1181,6 +1252,7 @@ impl RepositoryAuthorityState {
         );
         Self {
             snapshot,
+            binding_history_genesis: current.binding_history_genesis,
             authenticated_gitlinks: Arc::clone(&current.authenticated_gitlinks),
             prepared: None,
             durable: std::sync::OnceLock::new(),
@@ -1280,7 +1352,12 @@ impl RepositoryAuthorityState {
             .as_ref()
             .filter(|_| prepared_workspace_state_pays_for_itself(workspace));
         if let Some(prepared) = prepared {
-            if let Some(snapshot) = prepared.serve(self.generation(), workspace) {
+            if let Some(mut snapshot) = prepared.serve(self.generation(), workspace) {
+                super::binding_history::bind_selected_graph(
+                    self.metadata(),
+                    *workspace_id,
+                    &mut snapshot,
+                )?;
                 return Ok(Some(snapshot));
             }
         }
@@ -1763,7 +1840,12 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         // an earlier one was either reconciled as committed or dropped, and a
         // frame retained for it must not outlive that decision.
         state.pending_frame = None;
-        let frame = if self.frame_is_candidate(&state) {
+        // A successor that raises the envelope schema, which only a
+        // re-derivation commit does, changes the representation a frame is
+        // encoded against, so it is persisted whole rather than offered to the
+        // frame encoder, which refuses it.
+        let same_schema = current.metadata().schema_version == next.metadata().schema_version;
+        let frame = if same_schema && self.frame_is_candidate(&state) {
             match self.encode_frame(current, next) {
                 Ok(frame) => Some(frame),
                 Err(error) => {
@@ -2082,6 +2164,14 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
         &self,
         next: &RepositoryAuthorityState,
     ) -> RetainedPersistOutcome<LocalAuthorityFreezeLock> {
+        self.persist_and_freeze_inner(next, None)
+    }
+
+    fn persist_and_freeze_inner(
+        &self,
+        next: &RepositoryAuthorityState,
+        session_digest: Option<&str>,
+    ) -> RetainedPersistOutcome<LocalAuthorityFreezeLock> {
         let mut timer = PublicationPhaseTimer::start();
         // `next` passed the successor's own storage-admission gate under the
         // single writer permit and is immutable from that gate to this write.
@@ -2092,12 +2182,22 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
         let serialize_ms = timer.lap_ms();
         let snapshot_bytes = bytes.len();
         let mut state = self.state.lock();
-        let outcome = match self.backend.save_snapshot_and_freeze(
-            self.repository_id.as_str(),
-            &bytes,
-            state.cursor,
-            Some(HISTORY_VALIDATION_VERSION),
-        ) {
+        let persisted = match session_digest {
+            Some(digest) => self.backend.save_prepared_session_snapshot_and_freeze(
+                self.repository_id.as_str(),
+                &bytes,
+                state.cursor,
+                HISTORY_VALIDATION_VERSION,
+                digest,
+            ),
+            None => self.backend.save_snapshot_and_freeze(
+                self.repository_id.as_str(),
+                &bytes,
+                state.cursor,
+                Some(HISTORY_VALIDATION_VERSION),
+            ),
+        };
+        let outcome = match persisted {
             Ok((committed_cursor, retained)) if committed_cursor != state.cursor => {
                 state.cursor = committed_cursor;
                 // The lock that committed these bytes named them by the digest
@@ -2307,6 +2407,14 @@ pub struct LocalRepositoryAuthorityFreeze {
 }
 
 impl LocalRepositoryAuthorityFreeze {
+    /// Refuse ordinary projection recovery while the exact frozen local record
+    /// acknowledges an unfinished prepared publication. This does not reopen
+    /// storage or acquire another lock; roots alone miss acknowledgement-only
+    /// record changes.
+    pub fn ensure_no_active_session_publication(&self) -> Result<(), KinDbError> {
+        self._lock.ensure_no_active_session_publication()
+    }
+
     /// Open and fully validate existing authority without changing storage.
     ///
     /// The existing exclusive namespace lock is retained through validation
@@ -2318,6 +2426,25 @@ impl LocalRepositoryAuthorityFreeze {
         backend: &LocalFileBackend,
     ) -> Result<Self, KinDbError> {
         let locked = backend.freeze_existing_authority_read_only(repository_id.as_str())?;
+        Self::from_locked_authority(&repository_id, backend, locked)
+    }
+
+    /// [`Self::open_existing_read_only`], waiting at most `wait` for a
+    /// repository lock another process holds rather than until it is free.
+    ///
+    /// A lock still held when `wait` runs out refuses, having read nothing
+    /// and changed nothing. Once the lock is taken it is held through the
+    /// whole validation, exactly as the unbounded open holds it.
+    pub fn open_existing_read_only_within(
+        repository_id: RepositoryId,
+        backend: &LocalFileBackend,
+        wait: std::time::Duration,
+    ) -> Result<Self, KinDbError> {
+        let locked = backend
+            .freeze_existing_authority_read_only_within(repository_id.as_str(), wait)?
+            .ok_or_else(|| {
+                crate::storage::backend::no_existing_authority_to_freeze(repository_id.as_str())
+            })?;
         Self::from_locked_authority(&repository_id, backend, locked)
     }
 
@@ -2711,6 +2838,12 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
         else {
             return Ok(None);
         };
+        // The checksum and the frame chain say these are the acknowledged
+        // bytes, not that the owed derivation ledger inside them describes the
+        // trees beside it. The ledger's own checks read nothing but this
+        // envelope, so they run here too, and no reader of this cheap path is
+        // handed a ledger the full open would refuse.
+        super::derivation_ledger::validate_metadata(&metadata)?;
         let frames_at = started.elapsed();
 
         // The backend cursor fences physical writes. The roots generation is
@@ -2798,6 +2931,90 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
     }
 }
 
+impl RepositoryAuthorityMetadata<LocalFileBackend> {
+    /// [`Self::open`] for a local store, writing nothing.
+    ///
+    /// `open` loads through the backend's recovery load, and on a local store
+    /// that load is a recovery step as well as a read: while it holds the
+    /// repository lock it finalizes retired quarantined frames, deletes
+    /// superseded snapshot files and confirms a candidate an interrupted write
+    /// left staged. This reads the same snapshot and acknowledged frame chain
+    /// through the backend's read-only capture instead. Both are still checked
+    /// against the digests the authority record names, under the lock, but
+    /// nothing is cleaned up, confirmed or created, and a staged candidate
+    /// refuses. The lock is released as soon as the bytes are held, before the
+    /// envelope is decoded, and it is waited for at most `wait` when another
+    /// process holds it, then refused.
+    ///
+    /// `None` means what it means for `open`: the namespace holds no
+    /// authority, or the snapshot or its journal is one this cheap read
+    /// cannot answer. A caller that wants the answer anyway validates the
+    /// store in full without writing, through
+    /// [`LocalRepositoryAuthorityFreeze::open_existing_read_only_within`].
+    pub fn open_local_read_only(
+        repository_id: RepositoryId,
+        backend: Arc<LocalFileBackend>,
+        wait: std::time::Duration,
+    ) -> Result<Option<Self>, KinDbError> {
+        let started = std::time::Instant::now();
+        let Some(locked) =
+            backend.freeze_existing_authority_read_only_within(repository_id.as_str(), wait)?
+        else {
+            return Ok(None);
+        };
+        let (authority, journal) = locked.into_captured();
+        let read_at = started.elapsed();
+        let envelope = crate::storage::format::AuthorityEnvelopeSnapshot::from_bytes(
+            &authority.snapshot_bytes,
+        )?;
+        let base_generation = authority.snapshot_generation;
+        let head_generation = authority.head_generation;
+        drop(authority);
+        let crate::storage::format::AuthorityEnvelopeSnapshot {
+            version: _,
+            repository_authority,
+            materialized_graph,
+        } = envelope;
+        let Some(metadata) = repository_authority else {
+            return Ok(None);
+        };
+        if metadata.repository_id != repository_id {
+            return Err(storage(format!(
+                "snapshot authority belongs to {}, not {}",
+                metadata.repository_id, repository_id
+            )));
+        }
+        let Some(metadata) = advance_envelope_over_journal(
+            &repository_id,
+            metadata,
+            &journal,
+            base_generation,
+            head_generation,
+        )?
+        else {
+            return Ok(None);
+        };
+        super::derivation_ledger::validate_metadata(&metadata)?;
+        let logical_generation = metadata.roots.generation;
+        tracing::debug!(
+            repository = %repository_id,
+            logical_generation,
+            backend_base_generation = base_generation,
+            backend_head_generation = head_generation,
+            read_ms = read_at.as_millis(),
+            total_ms = started.elapsed().as_millis(),
+            "repository authority envelope read, read-only"
+        );
+        Ok(Some(Self {
+            repository_id,
+            backend,
+            metadata,
+            generation: logical_generation,
+            materialized_graph,
+        }))
+    }
+}
+
 impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Open existing authority or prepare an unpersisted generation-zero repo.
     ///
@@ -2863,7 +3080,8 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 .clone()
                 .filter(|identity| identity.head_generation() == recovered.recovered.generation)
         });
-        let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
+        let binding_history_genesis = recovered.is_none();
+        let (mut snapshot, backend_cursor) = if let Some(recovered) = recovered {
             let recovered = recovered.recovered;
             // Recovery already refused an incremental graph delta over an
             // authority base and applied every acknowledged authority frame.
@@ -2904,8 +3122,63 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 repository_id.clone(),
                 &snapshot,
             )?);
+            snapshot.version = snapshot.wire_version();
             (snapshot, SnapshotCursor::INITIAL)
         };
+
+        // A retained handle inside `snapshot.changes`'s on-disk base can only
+        // be recovered by reopening this history fresh: a superseding
+        // snapshot is a whole new file, so a record's byte range in it bears
+        // no relation to that record's range in whatever file the failing
+        // handle was opened from, and only a fresh index over fresh bytes can
+        // be trusted to name the fresh range correctly. Wire that recovery in
+        // now, while this open still uniquely owns the change map it just
+        // built: `install_stale_handle_recovery` mutates the encoded base in
+        // place and does nothing once this map has been shared, so it must
+        // run here and not after `RepositoryAuthorityState` wraps `snapshot`
+        // in the `Arc` every reader clones from.
+        let physical_generation = backend_cursor.backend_generation();
+        let logical_generation = snapshot
+            .repository_authority
+            .as_ref()
+            .map(|authority| authority.roots.generation)
+            .unwrap_or(physical_generation);
+        let reopen_backend = Arc::clone(&backend);
+        let reopen_repository_id = repository_id.clone();
+        let reopen: crate::storage::change_map::HistoryReopen = Arc::new(move || {
+            let recovered = try_reopen_repository_authority_streaming(
+                reopen_backend.as_ref(),
+                reopen_repository_id.as_str(),
+                HISTORY_VALIDATION_VERSION,
+            )?
+            .ok_or_else(|| {
+                storage(format!(
+                    "repository {reopen_repository_id} has no persisted authority to reopen \
+                     its history from"
+                ))
+            })?
+            .recovered;
+            let physical_generation = recovered.generation;
+            let logical_generation = recovered
+                .snapshot
+                .repository_authority
+                .as_ref()
+                .map(|authority| authority.roots.generation)
+                .unwrap_or(physical_generation);
+            Ok(crate::storage::change_map::ReopenedHistory {
+                changes: recovered.snapshot.changes,
+                physical_generation,
+                logical_generation,
+            })
+        });
+        // `false` means this open's change map has no on-disk base to protect
+        // (generation zero, constructed in memory above), which is normal and
+        // leaves nothing for a stale handle to happen to.
+        let _ = snapshot.changes.install_stale_handle_recovery(
+            reopen,
+            physical_generation,
+            logical_generation,
+        );
 
         // Recovery either performed storage admission itself or proved that
         // these exact, journal-free bytes already passed this validator
@@ -2979,6 +3252,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         } else {
             RepositoryAuthorityState::from_validated_snapshot(snapshot)?
         };
+        initial.binding_history_genesis = binding_history_genesis;
         // Prepared state binds to the digest of the durable authority this open
         // actually loaded, so a repository with no persisted authority yet has
         // nothing to bind to and gets no cache at all.
@@ -3212,6 +3486,71 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         }))
     }
 
+    /// Resolve the judging policy for the next ordinary Native commit from
+    /// this workspace. Unlike `workspace_admission_snapshot`, an uncommitted
+    /// workspace rule change is not itself the committed judging generation.
+    ///
+    /// The returned binding pins the exact roots/base used to select the first
+    /// parent. All matcher bodies come from exact immutable CAS and the same
+    /// frozen local overlay as publication. This is a scan boundary only;
+    /// Native publication still independently verifies every candidate.
+    pub fn workspace_native_admission_snapshot(
+        &self,
+        repository_id: &RepositoryId,
+        workspace_id: &WorkspaceId,
+        expected_roots: &RootBundle,
+    ) -> Result<Option<WorkspaceAdmissionSnapshot>, KinDbError> {
+        self.require_repository(repository_id)?;
+        let lease = self.read_authority();
+        if lease.roots() != expected_roots {
+            return Err(ModelError::InvalidOperation(
+                "Native admission preview authority roots changed".into(),
+            )
+            .into());
+        }
+        let Some(workspace) = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.workspace_id == workspace_id)
+        else {
+            return Ok(None);
+        };
+        let head_target = match &workspace.head {
+            WorkspaceHead::Symbolic { target } => lease
+                .metadata()
+                .ref_state
+                .refs
+                .iter()
+                .find(|entry| entry.name == *target)
+                .map(|entry| &entry.target),
+            WorkspaceHead::Detached { target } => Some(target),
+        };
+        if head_target != workspace.base_target.as_ref() {
+            return Err(ModelError::InvalidOperation(
+                "Native admission preview workspace base differs from its current HEAD".into(),
+            )
+            .into());
+        }
+        let parent = head_target
+            .map(|target| target_change_id(lease.metadata(), target))
+            .transpose()?;
+        let judging = native_judging_shared_policy(
+            lease.metadata(),
+            parent.as_ref(),
+            Some(workspace),
+            &workspace.shared_admission_policy,
+        );
+        let overlay = local_overlay_for_workspace(lease.metadata(), workspace)?;
+        let matcher =
+            resolve_admission_matcher(self.backend.as_ref(), repository_id, judging, overlay)?;
+        Ok(Some(WorkspaceAdmissionSnapshot {
+            binding: workspace.snapshot_binding(lease.roots().clone())?,
+            case: overlay.case,
+            matcher,
+        }))
+    }
+
     /// Build one daemon/VFS wire snapshot from one coherent authority lease.
     ///
     /// Blob and symlink sizes come from the immutable source CAS. Gitlinks
@@ -3282,6 +3621,30 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     ) -> Result<Option<GraphSnapshot>, KinDbError> {
         self.require_repository(repository_id)?;
         self.read_authority().workspace_graph_snapshot(workspace_id)
+    }
+
+    /// Explicitly require binding-history-aware writers from this point on.
+    /// This is a fenced full-snapshot representation rewrite, never an open
+    /// side effect. It preserves every root and leaves legacy history Unknown.
+    pub fn require_binding_history_capability(&self) -> Result<bool, KinDbError> {
+        self.publication.rewrite_equivalent(|current| {
+            if current.metadata().schema_version
+                >= super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA
+            {
+                return Ok(AuthorityRewriteDecision::Unchanged { output: false });
+            }
+            let mut snapshot = current.snapshot.clone();
+            let metadata = snapshot
+                .repository_authority
+                .as_mut()
+                .expect("admitted authority");
+            metadata.schema_version = super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA;
+            metadata.binding_history.clear();
+            snapshot.version = snapshot.wire_version();
+            snapshot.validate_storage_admission()?;
+            let next = RepositoryAuthorityState::from_validated_equivalent(current, snapshot);
+            Ok(AuthorityRewriteDecision::Rewrite { next, output: true })
+        })
     }
 
     /// Persist the complete resolved graph at one workspace's committed base.
@@ -3385,6 +3748,24 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         transaction: RepositoryTransaction,
         changes: ChangeMap,
     ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_git_bootstrap_with_verifier(transaction, changes, None)
+    }
+
+    pub fn commit_git_bootstrap_with_binding_history(
+        &self,
+        transaction: RepositoryTransaction,
+        changes: ChangeMap,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_git_bootstrap_with_verifier(transaction, changes, Some(verifier))
+    }
+
+    fn commit_git_bootstrap_with_verifier(
+        &self,
+        transaction: RepositoryTransaction,
+        changes: ChangeMap,
+        verifier: Option<&dyn super::binding_history::BindingHistoryVerifier>,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
         if transaction.expected_generation != 0 || !transaction.changes.is_empty() {
             return Err(ModelError::InvalidOperation(
                 "streamed Git bootstrap requires generation zero and no owned changes".into(),
@@ -3409,7 +3790,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             }))
         })?;
         self.publication.commit(|current| {
-            prepare_repository_commit_decision_with_history(
+            let decision = prepare_repository_commit_decision_with_history(
                 current,
                 &transaction,
                 transaction_hash,
@@ -3417,7 +3798,18 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 self.backend.as_ref(),
                 NativeAdmissionSource::LocalWorkspace,
                 Some(&changes),
-            )
+                None,
+            )?;
+            match verifier {
+                Some(verifier) => self.qualify_binding_history_decision(
+                    current,
+                    &transaction,
+                    decision,
+                    verifier,
+                    None,
+                ),
+                None => Ok(decision),
+            }
         })
     }
 
@@ -3425,6 +3817,29 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     pub fn commit_repository_transaction(
         &self,
         transaction: RepositoryTransaction,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_repository_transaction_updating(transaction, None)
+    }
+
+    /// Commit one complete repository transaction and apply `owed` to the
+    /// successor's owed derivation ledger inside the same compare-and-swap,
+    /// so the update is durable exactly when the transaction is and a refused
+    /// commit applies nothing.
+    ///
+    /// `owed` is trusted compiled input, never transaction data, and it is
+    /// checked against the exact successor the transaction produces.
+    pub fn commit_repository_transaction_owing(
+        &self,
+        transaction: RepositoryTransaction,
+        owed: &super::derivation_ledger::OwedDerivationUpdate,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_repository_transaction_updating(transaction, Some(owed))
+    }
+
+    fn commit_repository_transaction_updating(
+        &self,
+        transaction: RepositoryTransaction,
+        owed: Option<&super::derivation_ledger::OwedDerivationUpdate>,
     ) -> Result<RepositoryCommitReceipt, KinDbError> {
         // `transaction_hash` opens with `self.validate()` as part of its
         // contract, so validating here first proved nothing and walked every
@@ -3439,14 +3854,286 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         let backend = Arc::clone(&self.backend);
 
         self.publication.commit(|current| {
-            prepare_repository_commit_decision(
+            let decision = prepare_repository_commit_decision(
                 current,
                 &transaction,
                 transaction_hash,
                 &repository_id,
                 backend.as_ref(),
-            )
+            )?;
+            apply_owed_derivation_update(current, &transaction, decision, owed)
         })
+    }
+
+    /// Checked local publication. The verifier is trusted compiled code, not
+    /// transaction data. Ordinary and transferred commits cannot call it by
+    /// adding a request field and always invalidate the predecessor proof.
+    pub fn commit_repository_transaction_with_binding_history(
+        &self,
+        transaction: RepositoryTransaction,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_repository_transaction_with_binding_history_updating(
+            transaction,
+            verifier,
+            None,
+        )
+    }
+
+    /// [`Self::commit_repository_transaction_with_binding_history`] that also
+    /// applies `owed` inside the same compare-and-swap, as
+    /// [`Self::commit_repository_transaction_owing`] does.
+    pub fn commit_repository_transaction_with_binding_history_owing(
+        &self,
+        transaction: RepositoryTransaction,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+        owed: &super::derivation_ledger::OwedDerivationUpdate,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_repository_transaction_with_binding_history_updating(
+            transaction,
+            verifier,
+            Some(owed),
+        )
+    }
+
+    fn commit_repository_transaction_with_binding_history_updating(
+        &self,
+        transaction: RepositoryTransaction,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+        owed: Option<&super::derivation_ledger::OwedDerivationUpdate>,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        let transaction_hash = transaction.transaction_hash()?;
+        self.publication.commit(|current| {
+            let decision = prepare_repository_commit_decision(
+                current,
+                &transaction,
+                transaction_hash,
+                &self.repository_id,
+                self.backend.as_ref(),
+            )?;
+            let decision = self.qualify_binding_history_decision(
+                current,
+                &transaction,
+                decision,
+                verifier,
+                None,
+            )?;
+            apply_owed_derivation_update(current, &transaction, decision, owed)
+        })
+    }
+
+    /// Publish one captured live predecessor and its tree/semantic successor
+    /// under the same authority CAS. The capture is not a wire certificate.
+    pub fn commit_repository_transaction_with_observed_binding_history(
+        &self,
+        transaction: RepositoryTransaction,
+        workspace: WorkspaceId,
+        observed: &GraphSnapshot,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_repository_transaction_with_observed_binding_history_updating(
+            transaction,
+            workspace,
+            observed,
+            verifier,
+            None,
+        )
+    }
+
+    /// [`Self::commit_repository_transaction_with_observed_binding_history`]
+    /// that also applies `owed` inside the same compare-and-swap, as
+    /// [`Self::commit_repository_transaction_owing`] does.
+    pub fn commit_repository_transaction_with_observed_binding_history_owing(
+        &self,
+        transaction: RepositoryTransaction,
+        workspace: WorkspaceId,
+        observed: &GraphSnapshot,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+        owed: &super::derivation_ledger::OwedDerivationUpdate,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_repository_transaction_with_observed_binding_history_updating(
+            transaction,
+            workspace,
+            observed,
+            verifier,
+            Some(owed),
+        )
+    }
+
+    fn commit_repository_transaction_with_observed_binding_history_updating(
+        &self,
+        transaction: RepositoryTransaction,
+        workspace: WorkspaceId,
+        observed: &GraphSnapshot,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+        owed: Option<&super::derivation_ledger::OwedDerivationUpdate>,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        let transaction_hash = transaction.transaction_hash()?;
+        self.publication.commit(|current| {
+            let decision = prepare_repository_commit_decision(
+                current,
+                &transaction,
+                transaction_hash,
+                &self.repository_id,
+                self.backend.as_ref(),
+            )?;
+            let decision = self.qualify_binding_history_decision(
+                current,
+                &transaction,
+                decision,
+                verifier,
+                Some((workspace, observed)),
+            )?;
+            apply_owed_derivation_update(current, &transaction, decision, owed)
+        })
+    }
+
+    /// Commit a transaction that re-derives the selected workspace graph from
+    /// exact bytes, letting `verifier` start a new binding-history lineage at
+    /// it.
+    ///
+    /// The one path to [`super::binding_history::BindingHistoryEligibility::Rederivation`].
+    /// It exists for `kin upgrade`, whose transaction replaces the state every
+    /// head serves with a complete derivation of that head's tree, and
+    /// `scripts/check_runtime_boundaries.sh` refuses any other caller: no
+    /// HTTP, MCP, hosted or other CLI path reaches it, and no request field
+    /// can ask for it. A transaction handed to it that is not such a
+    /// re-derivation gains nothing either, because the qualification is
+    /// decided by `verifier`, a [`super::binding_history::RederivationVerifier`]
+    /// that re-derives the committed successor graph itself and qualifies a
+    /// workspace only on an exact match. A transition verifier cannot be passed
+    /// here. A workspace the verifier does not qualify is left unproven,
+    /// exactly as an ordinary commit would leave it.
+    ///
+    /// The same compare-and-swap pays `payment`'s workspace when the verifier
+    /// qualified it and the transaction moves it: every derivation that
+    /// workspace owed is dropped, and the payment is recorded against the exact
+    /// predecessor this commit is taken from. A record a later publication
+    /// makes carries a later generation and stays owed, and a publication that
+    /// lands first makes this compare-and-swap refuse. No other workspace's
+    /// records are touched, and a workspace the verifier leaves unproven keeps
+    /// every record it owed.
+    pub fn commit_rederived_repository_transaction(
+        &self,
+        transaction: RepositoryTransaction,
+        verifier: &dyn super::binding_history::RederivationVerifier,
+        payment: super::derivation_ledger::RederivationPayment,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        let transaction_hash = transaction.transaction_hash()?;
+        self.publication.commit(|current| {
+            let decision = prepare_repository_commit_decision(
+                current,
+                &transaction,
+                transaction_hash,
+                &self.repository_id,
+                self.backend.as_ref(),
+            )?;
+            // A store written before binding history existed is raised to the
+            // representation that carries it in the same commit, rather than
+            // by a separate rewrite ahead of it, so a run stopped before this
+            // commit leaves the store byte for byte as it was. The raise is
+            // the one `require_binding_history_capability` performs: it moves
+            // no root, and everything before this commit stays unknown.
+            let decision = match decision {
+                AuthorityCommitDecision::Publish { mut next, output } => {
+                    let metadata = next
+                        .snapshot
+                        .repository_authority
+                        .as_mut()
+                        .expect("validated authority");
+                    if metadata.schema_version
+                        < super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA
+                    {
+                        metadata.schema_version =
+                            super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA;
+                        metadata.binding_history.clear();
+                        next.snapshot.version = next.snapshot.wire_version();
+                    }
+                    AuthorityCommitDecision::Publish { next, output }
+                }
+                other => other,
+            };
+            let decision = self.qualify_binding_history_decision_with(
+                current,
+                &transaction,
+                decision,
+                &super::binding_history::RederivationTransitionVerifier(verifier),
+                None,
+                true,
+            )?;
+            // Paid only where the verifier proved the re-derivation it pays
+            // for: the witness it installed names this operation.
+            let proved = match &decision {
+                AuthorityCommitDecision::Publish { next, .. } => {
+                    super::binding_history::rederived_by(
+                        next.metadata(),
+                        payment.workspace_id,
+                        transaction.operation_id,
+                    )
+                }
+                _ => false,
+            };
+            let owed = proved
+                .then(|| super::derivation_ledger::OwedDerivationUpdate::pay_rederived(payment));
+            apply_owed_derivation_update(current, &transaction, decision, owed.as_ref())
+        })
+    }
+
+    fn qualify_binding_history_decision(
+        &self,
+        current: &RepositoryAuthorityState,
+        transaction: &RepositoryTransaction,
+        decision: AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+        observed: Option<(WorkspaceId, &GraphSnapshot)>,
+    ) -> Result<
+        AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>,
+        KinDbError,
+    > {
+        self.qualify_binding_history_decision_with(
+            current,
+            transaction,
+            decision,
+            verifier,
+            observed,
+            false,
+        )
+    }
+
+    fn qualify_binding_history_decision_with(
+        &self,
+        current: &RepositoryAuthorityState,
+        transaction: &RepositoryTransaction,
+        decision: AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+        observed: Option<(WorkspaceId, &GraphSnapshot)>,
+        rederivation: bool,
+    ) -> Result<
+        AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>,
+        KinDbError,
+    > {
+        let AuthorityCommitDecision::Publish { mut next, output } = decision else {
+            return Ok(decision);
+        };
+        let load_body = |digest| self.load_source_blob(digest);
+        let witnesses = super::binding_history::checked_witnesses(
+            super::binding_history::BindingHistoryTransition {
+                predecessor: current,
+                successor: &next,
+                transaction,
+                observed,
+                load_body: &load_body,
+                rederivation,
+            },
+            verifier,
+        )?;
+        next.snapshot
+            .repository_authority
+            .as_mut()
+            .expect("validated authority")
+            .binding_history = witnesses;
+        super::binding_history::validate_metadata(next.metadata())?;
+        Ok(AuthorityCommitDecision::Publish { next, output })
     }
 
     /// Commit one complete local repository transaction and return a freeze
@@ -3507,6 +4194,22 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         &self,
         transaction: RepositoryTransaction,
     ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze), KinDbError> {
+        self.commit_with_optional_binding_history_and_freeze(transaction, None)
+    }
+
+    pub fn commit_repository_transaction_with_binding_history_and_freeze(
+        &self,
+        transaction: RepositoryTransaction,
+        verifier: &dyn super::binding_history::BindingHistoryVerifier,
+    ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze), KinDbError> {
+        self.commit_with_optional_binding_history_and_freeze(transaction, Some(verifier))
+    }
+
+    fn commit_with_optional_binding_history_and_freeze(
+        &self,
+        transaction: RepositoryTransaction,
+        verifier: Option<&dyn super::binding_history::BindingHistoryVerifier>,
+    ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze), KinDbError> {
         // `transaction_hash` opens with `self.validate()` as part of its
         // contract, so validating here first proved nothing and walked every
         // change and every delta a second time. A bootstrap commit carries the
@@ -3521,13 +4224,23 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
 
         self.publication.commit_and_retain(
             |current| {
-                prepare_repository_commit_decision(
+                let decision = prepare_repository_commit_decision(
                     current,
                     &transaction,
                     transaction_hash,
                     &repository_id,
                     backend.as_ref(),
-                )
+                )?;
+                match verifier {
+                    Some(verifier) => self.qualify_binding_history_decision(
+                        current,
+                        &transaction,
+                        decision,
+                        verifier,
+                        None,
+                    ),
+                    None => Ok(decision),
+                }
             },
             |_, current| self.freeze_exact_state(current),
             |persistence, _, next| match persistence.persist_and_freeze(next) {
@@ -3716,6 +4429,44 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     }
 }
 
+/// Apply one commit's trusted owed-derivation update to the successor it
+/// decided on, inside the same compare-and-swap.
+///
+/// A replay decision is left alone: its transaction already committed, with
+/// whatever update rode it then. The ledger is checked whole afterwards, and
+/// the snapshot version follows it, because whether the ledger is empty is one
+/// of the facts the version encodes.
+fn apply_owed_derivation_update(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    decision: AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>,
+    owed: Option<&super::derivation_ledger::OwedDerivationUpdate>,
+) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
+{
+    let Some(owed) = owed else {
+        return Ok(decision);
+    };
+    let AuthorityCommitDecision::Publish { mut next, output } = decision else {
+        return Ok(decision);
+    };
+    let metadata = next
+        .snapshot
+        .repository_authority
+        .as_mut()
+        .expect("validated authority");
+    // The logical generation of the predecessor this compare-and-swap is taken
+    // against, never a storage backend's cursor.
+    super::derivation_ledger::apply_update(
+        metadata,
+        transaction,
+        owed,
+        current.roots().generation,
+    )?;
+    super::derivation_ledger::validate_metadata(metadata)?;
+    next.snapshot.version = next.snapshot.wire_version();
+    Ok(AuthorityCommitDecision::Publish { next, output })
+}
+
 fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
     current: &RepositoryAuthorityState,
     transaction: &RepositoryTransaction,
@@ -3751,6 +4502,7 @@ fn prepare_repository_commit_decision_from<B: StorageBackend + ?Sized>(
         backend,
         source,
         None,
+        None,
     )
 }
 
@@ -3762,6 +4514,7 @@ fn prepare_repository_commit_decision_with_history<B: StorageBackend + ?Sized>(
     backend: &B,
     source: NativeAdmissionSource,
     external_history: Option<&ChangeMap>,
+    prepared_commit_time: Option<Timestamp>,
 ) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
 {
     let metadata = current.metadata();
@@ -3820,8 +4573,16 @@ fn prepare_repository_commit_decision_with_history<B: StorageBackend + ?Sized>(
             backend,
             source,
             Some(changes),
+            prepared_commit_time,
         )?,
-        None => prepare_successor(current, transaction, transaction_hash, backend, source)?,
+        None => prepare_successor(
+            current,
+            transaction,
+            transaction_hash,
+            backend,
+            source,
+            prepared_commit_time,
+        )?,
     };
     Ok(AuthorityCommitDecision::Publish {
         next,
@@ -3884,6 +4645,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     transaction_hash: Hash256,
     backend: &B,
     source: NativeAdmissionSource,
+    prepared_commit_time: Option<Timestamp>,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
     prepare_successor_with_history(
         current,
@@ -3892,6 +4654,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         backend,
         source,
         None,
+        prepared_commit_time,
     )
 }
 
@@ -3902,6 +4665,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     backend: &B,
     source: NativeAdmissionSource,
     external_history: Option<&ChangeMap>,
+    prepared_commit_time: Option<Timestamp>,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
     // Every lap below runs inside its own span as well as reporting its
     // milliseconds, and the two must not drift apart: a profiler reads spans and
@@ -3922,6 +4686,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         .repository_authority
         .take()
         .expect("repository authority state always carries metadata");
+    metadata.binding_history.clear();
     let clone_ms = timer.lap_ms();
     drop(lap);
 
@@ -4050,6 +4815,11 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     let replay_decode_ms = replay.build_ms();
 
     let lap = tracing::info_span!("kindb.prepare.roots").entered();
+    // Every workspace transition above is final here, so an owed record whose
+    // exact body the successor no longer names is overtaken by the transaction
+    // that moved it, taken from its exact predecessor. The ledger folds into no
+    // root, so this precedes the fold only because both read final state.
+    super::derivation_ledger::retain_named(&mut metadata);
     let next_generation = current
         .generation()
         .checked_add(1)
@@ -4060,7 +4830,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         repository_id: transaction.repository_id.clone(),
         transaction_hash,
         actor: transaction.actor.clone(),
-        committed_at: Timestamp::now(),
+        committed_at: prepared_commit_time.unwrap_or_else(Timestamp::now),
         git_authority_delta: transaction.git_authority_delta.clone(),
         ref_mutations: transaction.ref_mutations.clone(),
         default_ref_mutation: transaction.default_ref_mutation.clone(),
@@ -5615,7 +6385,10 @@ fn verify_transaction_admission<B: StorageBackend + ?Sized>(
 ///
 /// Fail-loud is intact under the judging generation: content the rules already
 /// in force exclude still fails the whole transaction, and every later proposal
-/// is judged by the rule that just landed.
+/// is judged by the rule that just landed. The one bounded exception is an
+/// existing root `.kinignore` unignore: `checked_root_unignore` independently
+/// proves the successor source and retains every unrelated standing exclusion.
+/// New sources, `.gitignore`, and nested sources keep the forward-only rule.
 fn judging_shared_policy<'a>(
     previous_workspace: Option<&'a WorkspaceState>,
     published: &'a SharedAdmissionPolicy,
@@ -5623,6 +6396,107 @@ fn judging_shared_policy<'a>(
     previous_workspace
         .map(|previous| &previous.shared_admission_policy)
         .unwrap_or(published)
+}
+
+/// The exact committed-parent rule shared by Native judging and its scanner
+/// preview. Missing parent policy retains the existing workspace fallback;
+/// this does not infer transferable proof from dirty workspace history.
+fn native_judging_shared_policy<'a>(
+    metadata: &'a PersistedRepositoryAuthority,
+    parent: Option<&SemanticChangeId>,
+    previous_workspace: Option<&'a WorkspaceState>,
+    published: &'a SharedAdmissionPolicy,
+) -> &'a SharedAdmissionPolicy {
+    parent
+        .and_then(|parent| {
+            metadata
+                .admission_policies
+                .iter()
+                .find(|resolved| resolved.change_id == *parent)
+        })
+        .and_then(|resolved| resolved.policy.as_ref())
+        .unwrap_or_else(|| judging_shared_policy(previous_workspace, published))
+}
+
+/// An independently CAS-checked same-observation relaxation of an existing
+/// root `.kinignore`. This is never supplied by the scanner or serialized.
+struct CheckedRootUnignore {
+    without_root: ResolvedAdmissionMatcher,
+    proposed_root: ResolvedAdmissionMatcher,
+}
+
+impl CheckedRootUnignore {
+    fn allows(&self, path: &RepoPath, tracked: bool) -> bool {
+        !self.without_root.decide(path, false, tracked).is_ignored()
+            && !self.proposed_root.decide(path, false, tracked).is_ignored()
+    }
+}
+
+fn checked_root_unignore<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    standing: &SharedAdmissionPolicy,
+    successor: &SharedAdmissionPolicy,
+    candidate: &ResolvedTree,
+    matcher: &ResolvedAdmissionMatcher,
+) -> Result<Option<CheckedRootUnignore>, KinDbError> {
+    let root = RepoPath::from_utf8(".kinignore").expect("fixed root rule path");
+    let Some(old) = standing.sources.iter().find(|source| source.path == root) else {
+        return Ok(None);
+    };
+    let proposed = successor.sources.iter().find(|source| source.path == root);
+    if proposed == Some(old) {
+        return Ok(None);
+    }
+    if old.kind != kin_model::AdmissionRuleSourceKind::KinIgnore || old.base_directory.is_some() {
+        return Err(storage(
+            "standing root .kinignore source is malformed".to_string(),
+        ));
+    }
+    // Native policy derivation is verified by history preparation; a dirty
+    // workspace policy otherwise carries only checked shape/stamp/body closure.
+    // Independently prove this exception's exact root source/tree correspondence:
+    // an omitted source or non-regular replacement is not a checked deletion.
+    let body = match (proposed, candidate.artifact_at_path(&root)) {
+        (None, None) => None,
+        // A non-rule replacement keeps ordinary predecessor judgment. It does
+        // not qualify for this exception, but do not revoke prior allowances.
+        (None, Some(artifact)) if !matches!(artifact.entry, TreeEntry::Blob { .. }) => {
+            return Ok(None);
+        }
+        (Some(source), Some(artifact))
+            if source.kind == kin_model::AdmissionRuleSourceKind::KinIgnore
+                && source.base_directory.is_none()
+                && matches!(artifact.entry, TreeEntry::Blob { hash, .. } if hash == source.body_hash) =>
+        {
+            Some(load_exact_body(
+                backend,
+                repository_id,
+                source.body_hash,
+                source.body_len,
+                "proposed root .kinignore source",
+            )?)
+        }
+        _ => {
+            return Err(storage(
+                "proposed root .kinignore source does not match its exact successor tree"
+                    .to_string(),
+            ));
+        }
+    };
+    let replace = |bytes| {
+        matcher
+            .with_replaced_shared_source(&root, bytes)
+            .map_err(|error| {
+                storage(format!(
+                    "compile checked root .kinignore transition: {error}"
+                ))
+            })
+    };
+    Ok(Some(CheckedRootUnignore {
+        without_root: replace(None)?,
+        proposed_root: replace(body.as_deref())?,
+    }))
 }
 
 fn verify_workspace_admission<B: StorageBackend + ?Sized>(
@@ -5652,11 +6526,15 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
         .iter()
         .find(|candidate| candidate.workspace_id == workspace.workspace_id);
     let overlay = local_overlay_for_workspace(metadata, workspace)?;
-    let matcher = resolve_admission_matcher(
+    let judging = judging_shared_policy(previous_workspace, &workspace.shared_admission_policy);
+    let matcher = resolve_admission_matcher(backend, &transaction.repository_id, judging, overlay)?;
+    let root_unignore = checked_root_unignore(
         backend,
         &transaction.repository_id,
-        judging_shared_policy(previous_workspace, &workspace.shared_admission_policy),
-        overlay,
+        judging,
+        &workspace.shared_admission_policy,
+        &workspace.tree,
+        &matcher,
     )?;
 
     let mut tracked = BTreeSet::<ArtifactId>::new();
@@ -5721,6 +6599,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
             artifact,
             ArtifactAdmissionContext {
                 policy: &workspace.shared_admission_policy,
+                root_unignore: root_unignore.as_ref(),
                 tracked: tracked.contains(&artifact.artifact_id),
                 gitlink_is_admitted,
                 label: "workspace",
@@ -5974,19 +6853,22 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
         // the one that was in force. See `judging_shared_policy`: a change that
         // carries a new rule file is derived from the same tree the rule would
         // judge, so judging it by its own generation is the FIR-2348 livelock.
-        let judging = change
-            .parents
-            .first()
-            .and_then(|parent| {
-                metadata
-                    .admission_policies
-                    .iter()
-                    .find(|resolved| resolved.change_id == *parent)
-            })
-            .and_then(|resolved| resolved.policy.as_ref())
-            .unwrap_or_else(|| judging_shared_policy(previous_workspace, policy));
+        let judging = native_judging_shared_policy(
+            metadata,
+            change.parents.first(),
+            previous_workspace,
+            policy,
+        );
         let matcher =
             resolve_admission_matcher(backend, &transaction.repository_id, judging, overlay)?;
+        let root_unignore = checked_root_unignore(
+            backend,
+            &transaction.repository_id,
+            judging,
+            policy,
+            candidate,
+            &matcher,
+        )?;
         // An artifact the pre-transaction workspace already carried is already
         // repository authority, exactly as `verify_workspace_admission` treats
         // it. The parent comparison above cannot see that on its own: a change
@@ -6016,6 +6898,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 artifact,
                 ArtifactAdmissionContext {
                     policy,
+                    root_unignore: root_unignore.as_ref(),
                     tracked: workspace_tracked.contains(&artifact.artifact_id),
                     gitlink_is_admitted,
                     label: &format!("native change {}", change.id),
@@ -6171,6 +7054,7 @@ fn push_resolved_rule(
 }
 
 struct ArtifactAdmissionContext<'a> {
+    root_unignore: Option<&'a CheckedRootUnignore>,
     policy: &'a SharedAdmissionPolicy,
     tracked: bool,
     gitlink_is_admitted: bool,
@@ -6293,7 +7177,11 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
     context: ArtifactAdmissionContext<'_>,
 ) -> Result<(), KinDbError> {
     let decision = matcher.decide(&artifact.path, false, context.tracked);
-    if decision.is_ignored() {
+    if decision.is_ignored()
+        && !context
+            .root_unignore
+            .is_some_and(|checked| checked.allows(&artifact.path, context.tracked))
+    {
         return Err(ModelError::InvalidOperation(admission_refusal(
             context.label,
             &artifact.path,
@@ -6760,7 +7648,9 @@ fn materialize_workspace_graph_snapshot(
         workspace.base_target.as_ref(),
         WorkspaceBaseHistory::Carried(admitted),
     )?;
-    materialize_workspace_graph_snapshot_from_base(base, workspace, admitted)
+    let mut selected = materialize_workspace_graph_snapshot_from_base(base, workspace, admitted)?;
+    super::binding_history::bind_selected_graph(metadata, workspace.workspace_id, &mut selected)?;
+    Ok(selected)
 }
 
 /// Materialize a workspace over a base graph the caller already resolved.
@@ -7296,7 +8186,8 @@ fn resolve_workspace_base_graph_snapshot_capturing(
     // them; adjacency is rebuilt below from the resolved relations, so the
     // persisted authority adjacency is never copied at all.
     let mut base = GraphSnapshot {
-        version: authority_snapshot.version,
+        // Materialized graph has no authority envelope or materialized section.
+        version: GraphSnapshot::MIN_SUPPORTED_VERSION,
         entities,
         relations,
         outgoing: HashMap::new(),
@@ -7340,6 +8231,7 @@ fn resolve_workspace_base_graph_snapshot_capturing(
         downstream_warnings: authority_snapshot.downstream_warnings.clone(),
         entity_revisions,
         repository_authority: None,
+        verified_binding_history: None,
         external_references,
         // A workspace base is not a published authority snapshot: it carries no
         // envelope, so there is no change it can claim to be the resolution at
@@ -9090,6 +9982,9 @@ fn storage(message: String) -> KinDbError {
 
 #[cfg(test)]
 mod tests {
+    include!("binding_history_tests.rs");
+    include!("derivation_ledger_tests.rs");
+    include!("repository/session_publication_tests.rs");
     use super::*;
     use crate::storage::backend::{HistoryValidationProof, VerifiedSourceBlob};
     use kin_model::{
@@ -14392,8 +15287,19 @@ mod tests {
 
         /// One ambient pass: admit these host paths into the workspace tree.
         fn pass(&mut self, operation: u128, paths: &[(&str, &[u8])]) -> Result<(), KinDbError> {
-            let current = self.workspace();
             let deltas = self.deltas(paths);
+            let transaction = self.pass_transaction(operation, deltas);
+            self.manager
+                .commit_repository_transaction(transaction)
+                .map(|_| ())
+        }
+
+        fn pass_transaction(
+            &self,
+            operation: u128,
+            deltas: Vec<TreeDelta>,
+        ) -> RepositoryTransaction {
+            let current = self.workspace();
             let next_tree = current.tree.apply(&deltas).unwrap();
             let (policy, _) = self.derive(Some(&current.shared_admission_policy), &next_tree);
             let mutation = WorkspaceMutation {
@@ -14422,9 +15328,7 @@ mod tests {
             };
             let mut transaction = transaction_shell(&self.manager, operation);
             transaction.workspace_mutation = Some(mutation);
-            self.manager
-                .commit_repository_transaction(transaction)
-                .map(|_| ())
+            transaction
         }
 
         /// Publish the workspace tree as one Native change, admitting `paths` in
@@ -14539,6 +15443,392 @@ mod tests {
             self.manager
                 .commit_repository_transaction(transaction)
                 .map(|_| ())
+        }
+    }
+
+    mod root_unignore_controls {
+        use super::*;
+
+        fn prepared(remove: bool, target: &str) -> (AmbientWorkspace, RepositoryTransaction) {
+            let mut repo = AmbientWorkspace::start(0xa900);
+            repo.pass(
+                0xa901,
+                &[
+                    (".kinignore", b"restore.py\n.env\n.git\nprivate.py\n"),
+                    (".gitignore", b"private.py\n"),
+                ],
+            )
+            .unwrap();
+            let mut deltas = repo.deltas(&[(target, b"ordinary contents\n")]);
+            if remove {
+                let root = repo
+                    .tree()
+                    .artifact_at_path(&RepoPath::from_utf8(".kinignore").unwrap())
+                    .unwrap()
+                    .clone();
+                deltas.push(TreeDelta::Removed {
+                    artifact_id: root.artifact_id,
+                    old: root.located_entry(),
+                });
+            } else {
+                deltas.extend(repo.deltas(&[(".kinignore", b"# no longer excludes restore.py\n")]));
+            }
+            let transaction = repo.pass_transaction(0xa902, deltas);
+            (repo, transaction)
+        }
+
+        #[test]
+        fn root_unignore_clear_and_delete_admit_in_one_checked_transaction() {
+            for remove in [false, true] {
+                let (repo, transaction) = prepared(remove, "restore.py");
+                repo.manager
+                    .commit_repository_transaction(transaction)
+                    .unwrap();
+                assert!(repo.holds("restore.py"));
+                assert_eq!(repo.holds(".kinignore"), !remove);
+                let before = repo.manager.read_authority().roots().clone();
+                let reopened = initial_manager(Arc::clone(&repo.manager.backend));
+                assert_eq!(reopened.read_authority().roots(), &before);
+            }
+        }
+
+        #[test]
+        fn root_unignore_does_not_admit_unchanged_shared_intrinsic_or_sensitive_exclusions() {
+            for target in ["private.py", ".git/config", ".env"] {
+                let (repo, transaction) = prepared(false, target);
+                let before = repo.manager.read_authority().roots().clone();
+                let error = repo
+                    .manager
+                    .commit_repository_transaction(transaction)
+                    .unwrap_err();
+                assert!(error.to_string().contains(target), "{target}: {error}");
+                assert_eq!(repo.manager.read_authority().roots(), &before);
+                assert!(!repo.holds(target));
+            }
+        }
+
+        #[test]
+        fn root_unignore_cannot_override_an_unchanged_shared_deny_with_a_new_negation() {
+            let (mut repo, _) = prepared(false, "private.py");
+            let before = repo.manager.read_authority().roots().clone();
+            let error = repo
+                .pass(
+                    0xa903,
+                    &[
+                        (".kinignore", b"!private.py\n"),
+                        ("private.py", b"ordinary\n"),
+                    ],
+                )
+                .unwrap_err();
+            assert_policy_exclusion(&error, "private.py");
+            assert_eq!(repo.manager.read_authority().roots(), &before);
+        }
+
+        #[test]
+        fn root_unignore_retains_the_frozen_local_overlay() {
+            for kind in [
+                LocalAdmissionRuleSourceKind::GitGlobalExclude,
+                LocalAdmissionRuleSourceKind::GitInfoExclude,
+                LocalAdmissionRuleSourceKind::KinLocal,
+            ] {
+                let (mut repo, _) = prepared(false, "restore.py");
+                let lease = repo.manager.read_authority();
+                let old = local_overlay_for_workspace(lease.metadata(), &repo.workspace())
+                    .unwrap()
+                    .clone();
+                drop(lease);
+                let body = b"restore.py\n";
+                let hash = digest(body);
+                repo.manager.save_source_blob(hash, body).unwrap();
+                let overlay = FrozenLocalOverlay::new(
+                    old.workspace_id,
+                    old.generation + 1,
+                    old.case,
+                    vec![LocalAdmissionRuleSource {
+                        kind,
+                        body_hash: hash,
+                        body_len: body.len() as u64,
+                        precedence: 0,
+                    }],
+                )
+                .unwrap();
+                let mut install = repo.pass_transaction(0xa905, Vec::new());
+                install
+                    .workspace_mutation
+                    .as_mut()
+                    .unwrap()
+                    .new_admission_policy
+                    .local = overlay.stamp();
+                install.local_overlay_delta = Some(FrozenLocalOverlayDelta::update(old, overlay));
+                repo.manager.commit_repository_transaction(install).unwrap();
+                let before = repo.manager.read_authority().roots().clone();
+                let error = repo
+                    .pass(
+                        0xa906,
+                        &[
+                            (".kinignore", b"!restore.py\n"),
+                            ("restore.py", b"ordinary\n"),
+                        ],
+                    )
+                    .unwrap_err();
+                assert_policy_exclusion(&error, "restore.py");
+                assert_eq!(repo.manager.read_authority().roots(), &before);
+            }
+        }
+
+        #[test]
+        fn root_unignore_requires_exact_successor_policy_and_cas() {
+            for fault in ["forged-policy", "missing-body", "wrong-body"] {
+                let (repo, mut transaction) = prepared(false, "restore.py");
+                let before = repo.manager.read_authority().roots().clone();
+                let mutation = transaction.workspace_mutation.as_mut().unwrap();
+                if fault == "forged-policy" {
+                    // The source remains in the tree. A permissive policy and
+                    // internally matching stamp cannot substitute for it.
+                    let forged = SharedAdmissionPolicy::empty(
+                        mutation.new_shared_admission_policy.generation,
+                    );
+                    mutation.new_admission_policy.shared = forged.stamp();
+                    mutation.new_shared_admission_policy = forged;
+                } else {
+                    let hash = mutation
+                        .new_shared_admission_policy
+                        .sources
+                        .iter()
+                        .find(|source| source.path.as_bytes() == b".kinignore")
+                        .unwrap()
+                        .body_hash;
+                    if fault == "missing-body" {
+                        repo.manager.backend.blobs.lock().remove(hash.as_bytes());
+                    } else {
+                        repo.manager
+                            .backend
+                            .blobs
+                            .lock()
+                            .insert(*hash.as_bytes(), b"forged\n".to_vec());
+                    }
+                }
+                let error = repo
+                    .manager
+                    .commit_repository_transaction(transaction)
+                    .unwrap_err();
+                eprintln!("{fault}: {error}");
+                assert_eq!(repo.manager.read_authority().roots(), &before);
+                assert!(!repo.holds("restore.py"));
+            }
+        }
+
+        #[test]
+        fn root_unignore_non_regular_replacement_keeps_prior_judgment() {
+            for include_target in [false, true] {
+                let (mut repo, _) = prepared(false, "restore.py");
+                let old = repo
+                    .tree()
+                    .artifact_at_path(&RepoPath::from_utf8(".kinignore").unwrap())
+                    .unwrap()
+                    .clone();
+                let body = b"other-ignore";
+                let target_blob = digest(body);
+                repo.manager.save_source_blob(target_blob, body).unwrap();
+                let mut deltas = vec![TreeDelta::Updated {
+                    artifact_id: old.artifact_id,
+                    old: old.located_entry(),
+                    new: LocatedEntry::new(old.path, TreeEntry::Symlink { target_blob }),
+                }];
+                if include_target {
+                    deltas.extend(repo.deltas(&[("restore.py", b"ordinary\n")]));
+                }
+                let transaction = repo.pass_transaction(0xa907, deltas);
+                let before = repo.manager.read_authority().roots().clone();
+                let result = repo.manager.commit_repository_transaction(transaction);
+                if include_target {
+                    assert_policy_exclusion(&result.unwrap_err(), "restore.py");
+                    assert_eq!(repo.manager.read_authority().roots(), &before);
+                } else {
+                    result.expect("non-rule replacement cannot revoke predecessor allowance");
+                }
+            }
+        }
+
+        #[test]
+        fn root_unignore_native_commit_and_transfer_rederive_the_same_exact_rule() {
+            let mut repo = AmbientWorkspace::start(0xaa00);
+            repo.pass(0xaa01, &[(".kinignore", b"restore.py\n")])
+                .unwrap();
+            repo.commit(0xaa02, "standing root rule", &[]).unwrap();
+            repo.commit(
+                0xaa03,
+                "same-pass unignore",
+                &[(".kinignore", b""), ("restore.py", b"ordinary\n")],
+            )
+            .unwrap();
+            let lease = repo.manager.read_authority();
+            let head = target_change_id(
+                lease.metadata(),
+                repo.workspace().base_target.as_ref().unwrap(),
+            )
+            .unwrap();
+            let mut changes = Vec::new();
+            let mut cursor = Some(head);
+            while let Some(id) = cursor {
+                let change = lease.snapshot().changes.read_change(&id).unwrap().unwrap();
+                cursor = change.parents.first().copied();
+                changes.push(change);
+            }
+            changes.reverse();
+            drop(lease);
+            let receiver = initial_manager(Arc::new(MemoryBackend::default()));
+            for (hash, body) in repo.manager.backend.blobs.lock().iter() {
+                receiver
+                    .save_source_blob(Hash256::from_bytes(*hash), body)
+                    .unwrap();
+            }
+            let mut transaction = transaction_shell(&receiver, 0xaa04);
+            transaction.changes = changes;
+            transaction.ref_mutations.push(RefMutation {
+                name: RefName::branch(b"main").unwrap(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(RefTarget::change(head)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            });
+            receiver
+                .commit_transferred_repository_transaction(
+                    transaction,
+                    Some(AdmissionCase::Sensitive),
+                )
+                .unwrap();
+            let received = receiver.read_authority();
+            let replay = SharedReplayGraph::new(received.snapshot());
+            assert_eq!(replay.resolve_tree(head).unwrap(), repo.tree());
+            let before = received.roots().clone();
+            drop(received);
+            let reopened = initial_manager(Arc::clone(&receiver.backend));
+            assert_eq!(reopened.read_authority().roots(), &before);
+        }
+
+        #[test]
+        fn root_unignore_native_preview_keeps_committed_parent_and_refuses_stale_roots() {
+            let mut repo = AmbientWorkspace::start(0xac00);
+            repo.pass(
+                0xac01,
+                &[
+                    (".gitignore", b"private.py\n"),
+                    (".kinignore", b"restore.py\n"),
+                ],
+            )
+            .unwrap();
+            repo.commit(0xac02, "standing policy", &[]).unwrap();
+            let old_roots = repo.manager.read_authority().roots().clone();
+            repo.pass(
+                0xac03,
+                &[
+                    (".kinignore", b"!private.py\n"),
+                    ("restore.py", b"ordinary\n"),
+                ],
+            )
+            .unwrap();
+            let workspace = repo.workspace();
+            let roots = repo.manager.read_authority().roots().clone();
+            let private = RepoPath::from_utf8("private.py").unwrap();
+            let workspace_preview = repo
+                .manager
+                .workspace_admission_snapshot(&repository_id(), &workspace.workspace_id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                workspace_preview
+                    .matcher
+                    .decide(&private, false, false)
+                    .admitted
+            );
+            let native_preview = repo
+                .manager
+                .workspace_native_admission_snapshot(
+                    &repository_id(),
+                    &workspace.workspace_id,
+                    &roots,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(native_preview.binding, workspace_preview.binding);
+            assert!(native_preview
+                .matcher
+                .decide(&private, false, false)
+                .is_ignored());
+            assert!(repo
+                .manager
+                .workspace_native_admission_snapshot(
+                    &repository_id(),
+                    &workspace.workspace_id,
+                    &old_roots,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("authority roots changed"));
+            let mut wrong_roots = roots.clone();
+            wrong_roots.generation += 1;
+            assert!(repo
+                .manager
+                .workspace_native_admission_snapshot(
+                    &repository_id(),
+                    &workspace.workspace_id,
+                    &wrong_roots,
+                )
+                .is_err());
+            assert_eq!(repo.manager.read_authority().roots(), &roots);
+            let error = repo
+                .commit(
+                    0xac04,
+                    "cannot introduce private under old parent",
+                    &[("private.py", b"ordinary\n")],
+                )
+                .unwrap_err();
+            assert_policy_exclusion(&error, "private.py");
+            assert_eq!(repo.manager.read_authority().roots(), &roots);
+            repo.commit(0xac05, "publish rule and restored source only", &[])
+                .unwrap();
+            let next_roots = repo.manager.read_authority().roots().clone();
+            let next = repo
+                .manager
+                .workspace_native_admission_snapshot(
+                    &repository_id(),
+                    &workspace.workspace_id,
+                    &next_roots,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(next.matcher.decide(&private, false, false).admitted);
+            repo.commit(
+                0xac06,
+                "now the parent admits private",
+                &[("private.py", b"ordinary\n")],
+            )
+            .unwrap();
+            assert!(repo.holds("private.py"));
+        }
+
+        #[test]
+        fn root_unignore_keeps_forward_only_new_exclusions_and_unchanged_denials() {
+            let mut repo = AmbientWorkspace::start(0xab00);
+            repo.pass(0xab01, &[(".kinignore", b"restore.py\n")])
+                .unwrap();
+            let error = repo
+                .pass(0xab02, &[("restore.py", b"ordinary\n")])
+                .unwrap_err();
+            assert_policy_exclusion(&error, "restore.py");
+            repo.pass(
+                0xab03,
+                &[
+                    (".kinignore", b"restore.py\nnew.py\n"),
+                    ("new.py", b"ordinary\n"),
+                ],
+            )
+            .unwrap();
+            assert!(repo.holds("new.py"));
+            let error = repo
+                .pass(0xab04, &[("restore.py", b"ordinary\n")])
+                .unwrap_err();
+            assert_policy_exclusion(&error, "restore.py");
         }
     }
 
@@ -15561,6 +16851,7 @@ mod tests {
             PersistedRepositoryAuthority::empty(repository_id(), &snapshot)
                 .expect("a generation-zero authority folds over these contents"),
         );
+        snapshot.version = snapshot.wire_version();
         let bytes = snapshot.to_bytes().expect("the seeded snapshot serializes");
         backend
             .save_snapshot(repository_id().as_str(), &bytes, 0)
@@ -16398,6 +17689,175 @@ mod tests {
         assert_eq!(before, freeze_storage_bytes(directory.path()));
     }
 
+    /// The read-only envelope read answers what the recovery-load read answers
+    /// and leaves storage exactly as it found it, where the recovery load
+    /// cleans up. A superseded snapshot beside the current one and an installed
+    /// record's retained marker are what an interrupted promotion or cleanup
+    /// leaves; the recovery load behind every open finalizes both.
+    #[test]
+    fn local_read_only_envelope_read_answers_and_leaves_storage_alone() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3093, 0x64))
+            .unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+        let expected = manager.read_authority();
+        let snapshots = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("snapshots");
+        let current = snapshots.join(
+            read_authority_json(directory.path())["snapshot_file"]
+                .as_str()
+                .expect("the record names its snapshot"),
+        );
+        let generation: Generation = current
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse().ok())
+            .expect("a snapshot is named by its generation");
+        assert!(generation > 0);
+        let superseded = snapshots.join(format!("{:020}.kndb", generation - 1));
+        std::fs::copy(&current, &superseded).unwrap();
+        let _marker = retain_installed_authority_marker(&directory);
+        let before = freeze_storage_bytes(directory.path());
+
+        let read = RepositoryAuthorityMetadata::open_local_read_only(
+            repository_id(),
+            Arc::clone(&backend),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap()
+        .expect("the read-only envelope read answers a framed store");
+        assert_eq!(read.metadata(), expected.metadata());
+        assert_eq!(read.generation(), expected.roots().generation);
+        assert_eq!(
+            before,
+            freeze_storage_bytes(directory.path()),
+            "the read-only envelope read changed storage"
+        );
+        assert!(!backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+
+        let cleaned = RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
+            .unwrap()
+            .expect("the recovery-load read answers the same store");
+        assert_eq!(cleaned.metadata(), read.metadata());
+        assert!(
+            !superseded.exists(),
+            "the recovery load no longer cleans up, so this test no longer shows the difference"
+        );
+    }
+
+    /// Both read-only reads wait a bounded time for a repository lock another
+    /// holder has, and never wait on: held throughout, each refuses once its
+    /// bound runs out, having read and changed nothing; released within the
+    /// bound, the envelope read answers.
+    #[test]
+    fn local_read_only_reads_wait_a_bounded_time_for_a_held_lock() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        let expected = manager.read_authority().metadata().clone();
+        let before = freeze_storage_bytes(directory.path());
+        let wait = std::time::Duration::from_millis(300);
+
+        let held = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let refused = RepositoryAuthorityMetadata::open_local_read_only(
+            repository_id(),
+            Arc::clone(&backend),
+            wait,
+        )
+        .err()
+        .expect("a held lock refuses the envelope read");
+        assert!(started.elapsed() >= wait, "it refused before its bound");
+        assert!(
+            refused
+                .to_string()
+                .contains("another process held the repository authority lock"),
+            "{refused}"
+        );
+        let started = std::time::Instant::now();
+        let refused = LocalRepositoryAuthorityFreeze::open_existing_read_only_within(
+            repository_id(),
+            backend.as_ref(),
+            wait,
+        )
+        .expect_err("a held lock refuses the full validation");
+        assert!(started.elapsed() >= wait, "it refused before its bound");
+        assert!(
+            refused
+                .to_string()
+                .contains("another process held the repository authority lock"),
+            "{refused}"
+        );
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+
+        let reader = {
+            let backend = Arc::clone(&backend);
+            std::thread::spawn(move || {
+                RepositoryAuthorityMetadata::open_local_read_only(
+                    repository_id(),
+                    backend,
+                    std::time::Duration::from_secs(10),
+                )
+                .map(|read| read.map(|read| read.metadata().clone()))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(held);
+        let read = reader
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("the envelope read answers once the lock is released");
+        assert_eq!(read, expected);
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    /// A namespace holding no authority is declined by the read-only envelope
+    /// read and refused by the read-only full validation, and neither writes.
+    #[test]
+    fn local_read_only_reads_of_a_namespace_without_authority_write_nothing() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        let namespace = directory.path().join(repository_id().as_str());
+        std::fs::remove_file(namespace.join("authority.json")).unwrap();
+        if let Ok(entries) = std::fs::read_dir(namespace.join("deltas")) {
+            for entry in entries {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+        }
+        let before = freeze_storage_bytes(directory.path());
+        assert!(RepositoryAuthorityMetadata::open_local_read_only(
+            repository_id(),
+            Arc::clone(&backend),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap()
+        .is_none());
+        let refused = LocalRepositoryAuthorityFreeze::open_existing_read_only_within(
+            repository_id(),
+            backend.as_ref(),
+            std::time::Duration::from_secs(5),
+        )
+        .expect_err("there is no authority to validate");
+        assert!(
+            refused
+                .to_string()
+                .contains("has no existing local snapshot authority to freeze"),
+            "{refused}"
+        );
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
     fn freeze_storage_bytes(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
         fn visit(
             root: &std::path::Path,
@@ -17071,8 +18531,8 @@ mod tests {
         // HISTORY_VALIDATION_COVERAGE_REVISION and update this expectation
         // together; if nothing about coverage moved, leave both alone.
         assert_eq!(
-            HISTORY_VALIDATION_VERSION, 1_403,
-            "envelope schema 4 and coverage revision 3 compose to 1403"
+            HISTORY_VALIDATION_VERSION, 1_504,
+            "envelope schema 5 and coverage revision 4 compose to 1504"
         );
         // That literal is the whole test. The rest of this comment exists so
         // nobody reads the test as stronger than it is, or pads it with
@@ -18478,7 +19938,12 @@ mod tests {
             repository_authority,
             external_references,
             materialized_graph,
+            verified_binding_history,
         } = served;
+        assert_eq!(
+            *verified_binding_history, fresh.verified_binding_history,
+            "binding history capability"
+        );
         assert_eq!(*version, fresh.version);
         // `ResolvedGraphState` carries no `PartialEq`, so the two sections are
         // compared through the exact MessagePack form they persist in.
@@ -21441,8 +22906,8 @@ mod tests {
         let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
         assert_eq!(
             bytes[4..8],
-            crate::storage::AuthorityFrame::CURRENT_VERSION.to_le_bytes(),
-            "a frame that carries collaboration is written at version 3"
+            crate::storage::AuthorityFrame::BINDING_HISTORY_VERSION.to_le_bytes(),
+            "a schema5 frame carries collaboration at version 4"
         );
         let frame = crate::storage::AuthorityFrame::from_bytes(&bytes).unwrap();
         for name in kin_model::COLLABORATION_COLLECTIONS {
@@ -21459,7 +22924,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("declares version 2 but its contents are written at version 3"),
+            error.contains("declares version 2 but its contents are written at version 4"),
             "{error}"
         );
         assert_collaboration_reopens(&directory, &manager, "create");
@@ -21571,12 +23036,38 @@ mod tests {
     /// A frame that carries no collaboration is the version 2 frame 0.7.112
     /// writes for the same successor, byte for byte, and a version 2 frame
     /// decodes here with an empty patch. The first keeps a store this binary
-    /// writes readable by 0.7.112 until its first collaboration frame; the
-    /// second keeps every store 0.7.112 wrote readable here.
+    /// writes into an existing schema4 store readable by 0.7.112 until its
+    /// first collaboration frame; the second keeps legacy stores readable.
+    /// New schema5 stores intentionally require frame4 and newer writers.
     #[test]
     fn a_frame_without_collaboration_is_the_version_2_frame_byte_for_byte() {
         let directory = TempDir::new().unwrap();
-        let (_backend, manager) = framed_local_repository(&directory);
+        // Age a real admitted snapshot explicitly, then exercise ordinary
+        // current publication into that legacy store without upgrading it.
+        let seed_backend = Arc::new(MemoryBackend::default());
+        let seed = initial_manager(Arc::clone(&seed_backend));
+        seed.commit_repository_transaction(arbitrary_repository_transaction(&seed))
+            .unwrap();
+        let mut snapshot = seed.read_authority().snapshot().clone();
+        snapshot
+            .repository_authority
+            .as_mut()
+            .unwrap()
+            .schema_version = 4;
+        snapshot.version = snapshot.wire_version();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        for (digest, body) in seed_backend.blobs.lock().iter() {
+            backend
+                .save_source_blob(repository_id().as_str(), *digest, body)
+                .unwrap();
+        }
+        backend
+            .save_snapshot(repository_id().as_str(), &snapshot.to_bytes().unwrap(), 0)
+            .unwrap();
+        let manager = RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
         let current = manager.read_authority().snapshot().clone();
         manager
             .commit_repository_transaction(overlay_publication(&manager, 0xfc_2026_0201, 0x61))
@@ -22369,6 +23860,75 @@ mod tests {
                 history_replays: after.history_replays - before.history_replays,
                 body_sweeps: after.body_sweeps - before.body_sweeps,
             }
+        }
+    }
+
+    #[test]
+    fn history_recovery_under_a_freeze_is_bounded() {
+        const CHILD_ROOT: &str = "KIN_DB_FROZEN_RECOVERY_CHILD";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let directory = tempfile::tempdir_in(&root).unwrap();
+            let backend = committed_local_repository(&directory);
+            let manager = reopen(&directory);
+            let authority = manager.read_authority();
+            let changes = &authority.snapshot().changes;
+            assert!(changes.has_admitted_encoded_base());
+            let id = changes.change_ids().unwrap()[0];
+            let expected = changes.read_change(&id).unwrap().unwrap();
+            let frozen = manager.freeze_current_authority(authority.roots()).unwrap();
+            assert!(backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap());
+            assert!(changes.shares_storage(&frozen.authority().snapshot().changes));
+            changes.fail_retained_reads_for_test();
+            std::fs::write(
+                std::path::Path::new(&root).join("reading-frozen-history"),
+                b"ready",
+            )
+            .unwrap();
+            let error = frozen
+                .authority()
+                .snapshot()
+                .changes
+                .read_change(&id)
+                .expect_err("a busy recovery lock must refuse without blocking the holder");
+            assert!(error.to_string().contains("busy"), "{error}");
+            drop(frozen);
+            assert_eq!(changes.read_change(&id).unwrap(), Some(expected));
+            assert!(!backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap());
+            return;
+        }
+
+        // A regressed lock acquisition is killed and reaped with its fixture
+        // contained in the parent's TempDir; no blocked thread or lock survives.
+        let directory = TempDir::new().unwrap();
+        let name = format!(
+            "{}::history_recovery_under_a_freeze_is_bounded",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD_ROOT, directory.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "recovery child failed: {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                assert!(
+                    directory.path().join("reading-frozen-history").exists(),
+                    "child did not reach the frozen read"
+                );
+                panic!("retained history recovery blocked under a held freeze; child reaped");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -26472,6 +28032,7 @@ mod fir3527_refusal_wording {
             &artifact(path),
             ArtifactAdmissionContext {
                 policy: &policy,
+                root_unignore: None,
                 tracked,
                 gitlink_is_admitted: false,
                 label: "workspace",

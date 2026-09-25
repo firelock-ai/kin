@@ -7,6 +7,8 @@ pub mod engine;
 pub mod error;
 pub mod retrieval;
 pub mod search;
+#[cfg(any(test, feature = "test-support"))]
+pub mod session_publication_test_support;
 pub mod storage;
 pub mod store;
 pub mod types;
@@ -21,7 +23,9 @@ pub use embed::{
 pub use engine::VectorSalvageStats;
 pub use engine::{
     EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
-    ProducedSemanticSearchBatch, ResolvedRetrievalItem,
+    ProducedSemanticSearchBatch, ResolvedRetrievalItem, SourceDerivationFacts,
+    SourceDerivationLimit, SourceDerivationLimits, SourceDerivationUnavailable,
+    SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact, SourceReservedRelation,
 };
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
@@ -69,6 +73,10 @@ pub use storage::{
     AuthorityEnvelopeSnapshot, ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze,
     MaterializedGraphSectionOutcome, PersistedRepositoryAuthority, RepositoryAuthorityManager,
     RepositoryAuthorityMetadata, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
+};
+pub use storage::{
+    DerivationPayment, OwedDerivation, OwedDerivationCause, OwedDerivationLedger,
+    OwedDerivationUpdate, RederivationPayment,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use storage::{VectorSidecarDisposition, VectorSidecarLoadOutcome};

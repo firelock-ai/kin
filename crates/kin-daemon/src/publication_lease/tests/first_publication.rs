@@ -256,6 +256,121 @@ fn first_publication_refuses_identity_mode_and_uninitialized_authority() {
     assert!(destination.load_snapshot(other.as_str()).unwrap().is_none());
 }
 
+/// A publication of `body` at `path` in the source's workspace, the shape a
+/// daemon's standalone tree admission publishes before any parse of it.
+fn owed_publication(
+    source: &RepositoryAuthorityManager<dyn StorageBackend>,
+    path: &str,
+    body: &[u8],
+) -> (
+    kin_model::RepositoryTransaction,
+    kin_model::WorkspaceId,
+    kin_model::RepoPath,
+    Hash256,
+) {
+    let body_hash = hash(body);
+    source.save_source_blob(body_hash, body).unwrap();
+    let lease = source.read_authority();
+    let workspace = lease.metadata().workspaces[0].clone();
+    let path = kin_model::RepoPath::from_utf8(path).unwrap();
+    let tree_deltas = vec![kin_model::TreeDelta::Added {
+        artifact_id: kin_model::ArtifactId::new(),
+        new: kin_model::LocatedEntry::new(
+            path.clone(),
+            kin_model::TreeEntry::blob(body_hash, false),
+        ),
+    }];
+    let tree = workspace.tree.apply(&tree_deltas).unwrap();
+    let transaction = kin_model::RepositoryTransaction {
+        schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: kin_model::OperationId::new(),
+        repository_id: lease.metadata().repository_id.clone(),
+        expected_generation: lease.roots().generation,
+        expected_roots: lease.roots().clone(),
+        actor: kin_model::AuthorId::new("owed-publication-fixture"),
+        reason: "publish source bytes before their parse".to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes: Vec::new(),
+        aliases: Vec::new(),
+        ref_mutations: Vec::new(),
+        default_ref_mutation: None,
+        workspace_mutation: Some(kin_model::WorkspaceMutation {
+            workspace_id: workspace.workspace_id,
+            expected: kin_model::WorkspaceExpectation::MustEqual {
+                generation: workspace.generation,
+                head: workspace.head.clone(),
+                base_target: workspace.base_target.clone(),
+                base_tree_hash: workspace.base_tree_hash,
+                tree_hash: workspace.tree_hash,
+                semantic_overlay_hash: workspace.semantic_overlay_hash,
+                admission_policy: workspace.admission_policy,
+            },
+            new_generation: workspace.generation + 1,
+            new_head: workspace.head.clone(),
+            new_base_target: workspace.base_target.clone(),
+            new_base_tree_hash: workspace.base_tree_hash,
+            tree_deltas,
+            new_tree_hash: kin_model::compute_resolved_tree_hash(&tree).unwrap(),
+            semantic_delta: kin_model::WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+            new_admission_policy: workspace.admission_policy,
+        }),
+        local_overlay_delta: None,
+        merge_transaction_delta: None,
+        sealed_observation: None,
+        collaboration_delta: None,
+    };
+    (transaction, workspace.workspace_id, path, body_hash)
+}
+
+/// A replica that owes the derivation of bytes no commit recorded is not
+/// published: the hosted copy would serve their previous spans with nothing to
+/// say so, and hosted storage never holds the ledger that says so locally.
+/// Once a commit pays that work, the same source publishes.
+#[test]
+fn first_publication_refuses_a_source_that_owes_derivation_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = RepositoryId::new("owed-derivation").unwrap();
+    let source = source(&temp.path().join("source"), &id, false);
+    let (owing, workspace, path, body_hash) =
+        owed_publication(&source, "owed.rs", b"pub fn owed() -> u32 { 1 }\n");
+    source
+        .commit_repository_transaction_owing(
+            owing,
+            &kin_db::OwedDerivationUpdate::owe(workspace, vec![(path, body_hash)], Vec::new()),
+        )
+        .unwrap();
+    let destination: Arc<dyn StorageBackend> = local_backend(&temp.path().join("destination"));
+    let refused = publish_first_repository(
+        source.clone(),
+        &id,
+        FirstPublicationMode::Native,
+        destination.clone(),
+    )
+    .expect_err("a source that owes derivation work must not publish");
+    assert!(
+        refused
+            .to_string()
+            .contains("owes the derivation of 1 path"),
+        "{refused}"
+    );
+    assert!(destination.load_snapshot(id.as_str()).unwrap().is_none());
+
+    let (paying, workspace, _, _) =
+        owed_publication(&source, "paid.rs", b"pub fn paid() -> u32 { 2 }\n");
+    source
+        .commit_repository_transaction_owing(paying, &kin_db::OwedDerivationUpdate::pay(workspace))
+        .unwrap();
+    assert!(source
+        .read_authority()
+        .metadata()
+        .owed_derivations
+        .is_empty());
+    publish_first_repository(source, &id, FirstPublicationMode::Native, destination)
+        .expect("a source whose owed work was paid publishes");
+}
+
 #[test]
 fn first_publication_refuses_identical_retry_and_independent_existing_authority() {
     let temp = tempfile::tempdir().unwrap();

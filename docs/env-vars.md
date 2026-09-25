@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (537 total, 360 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (553 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -36,10 +36,13 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_MANAGED_BIN` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin launcher instead of provisioning |
 | `KIN_MCP_AUTO_INIT` | bool | false | operational | allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup |
 | `KIN_MCP_CACHE_DIR` | path | *(unset)* | operational | cache directory override for the npm MCP wrapper's managed Kin binary |
+| `KIN_MCP_DAEMON_PATIENCE_SECS` | seconds>=0 | 300 | operational | total wait for one forwarded MCP call once the daemon has shown it is alive but still starting |
+| `KIN_MCP_DAEMON_TIMEOUT_SECS` | seconds>=0 | 60 | operational | how long one forwarded MCP call waits before asking whether the daemon is alive |
 | `KIN_MCP_KIN_BINARY` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin-mcp wrapper |
 | `KIN_MCP_RELEASE_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the @kinlab/kin-mcp wrapper |
 | `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
-| `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), full (every tool), benchmark, context-bench |
+| `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), agent-routed (one kin tool whose commands reach the agent belt, writes included, and every other tool through describe and call, for clients that send every tool with every request), agent-routed-query (that tool without a write path), full (every tool), benchmark, context-bench |
+| `KIN_MCP_TOOL_PROFILE_PINNED` | bool | false | operational | written by `kin setup` beside KIN_MCP_TOOL_PROFILE in a client's MCP entry when the profile was chosen, with `--tool-profile` or by hand: later `kin setup` and `kin update` runs keep it rather than moving it to the client's default |
 | `KIN_NO_PROVISION` | bool | false | operational | forbid network provisioning by the @kinlab/kin launcher |
 | `KIN_NO_SETUP` | bool | false | operational | skip the installer's post-install setup wizard when set truthy |
 | `KIN_REGISTRY_REPAIR` | bool | false | operational | allow the POSIX installer to repair safe registry ownership modes |
@@ -54,7 +57,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_AGENT_CONTEXT_ACCOUNTING` | enum | heuristic | correctness | agent request accounting: heuristic estimates the prepared request; llama_cpp uses the selected server's rendered prompt and tokenizer |
 | `KIN_AGENT_OUTPUT_RESERVE_TOKENS` | usize | *(unset)* | correctness | override the agent's output token reserve; must be positive and below the context window, and unset uses the configured context's answer reserve |
 | `KIN_AGENT_OUTPUT_TOKEN_PARAMETER` | enum | *(unset)* | correctness | override the completion request's output-limit field; unset selects max_completion_tokens for api.openai.com and max_tokens for compatible endpoints |
-| `KIN_AGENT_PURE_KIN` | bool | true | operational | keep `kin agent run` on Kin tools only, the default: the belt carries no edit_file or write_file, and the one write tool is kin_mutate, which names the entity it changes; false adds the two file tools back |
+| `KIN_AGENT_PURE_KIN` | bool | true | operational | retired switch: `kin agent run` always runs on Kin tools only, and its one write tool is kin_mutate, which names the entity it changes; a false value refuses to start, because the local edit_file and write_file tools are retired |
 | `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN` | bool | false | operational | allow the CLI to bootstrap an admin-scoped daemon |
 | `KIN_ALLOW_MASS_DELETION` | bool | false | correctness | permit reconcile to apply mass deletions (data-destructive) |
 | `KIN_ALLOW_OFFLINE_RESTORE` | bool | false | operational | allow restoring a backup without remote verification |
@@ -65,6 +68,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
 | `KIN_LANGUAGE_SERVER_ASSET_BASE` | url | GitHub Releases | operational | base URL the language-server release binaries are fetched from; set by acceptance checks to drive the standalone install against a fixture |
 | `KIN_LANGUAGE_SERVER_ASSET_SHA256` | string | *(unset)* | operational | sha256 an overridden language-server asset is verified against; IGNORED unless KIN_LANGUAGE_SERVER_ASSET_BASE is also set, so it can never relax the pinned release check |
+| `KIN_LANGUAGE_TOOL_SEARCH` | bool | true | operational | look for language servers and the programs they run on beyond the PATH a process inherited: in the directories `kin setup` and `kin doctor --fix` recorded from the shell they ran in, then in the usual per-user install places (rustup's and Go's bin directories, npm's global prefix, nvm, volta, fnm, pyenv, asdf, mise, ~/.local/bin, Homebrew). Each goes behind the inherited entries and ahead of Kin's own tool directories, so a server the operator installed wins. Set falsy to search only the inherited PATH and Kin's own tool directories. Read at process start, so a daemon keeps the value it started with |
 | `KIN_MEMORY_PRESSURE` | enum | *(unset)* | operational | force the memory-pressure level heavy work is judged against, in place of measuring the machine: 'critical' refuses the enrichment sweep, the embedding batch and ambient admission with a named reason, 'elevated' shrinks the embedding batch, 'unknown' proceeds exactly as an unreadable host does, and unset measures the cgroup or the host. Read by the daemon at process start, so it takes effect on the command that starts one |
 | `KIN_MEMORY_PRESSURE_CRITICAL_FRACTION` | float>=0 | 0.90 | operational | fraction of the memory ceiling at or above which heavy work refuses to start; must be within 0..=1, anything else keeps 0.90, and a value below the elevated fraction is raised to it |
 | `KIN_MEMORY_PRESSURE_ELEVATED_FRACTION` | float>=0 | 0.75 | operational | fraction of the memory ceiling at or above which heavy work shrinks; must be within 0..=1, and anything else keeps 0.75 |
@@ -129,16 +133,22 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_EXACT_SOURCE_EXPORT_WAIT_MS` | usize | 3000 | operational | how long one exact-source archive export waits in milliseconds for the daemon's single in-memory export slot before it is refused with a Retry-After. The wait is spent inside the caller's own read bound, so raising it past what one export costs turns a queued clone into a caller timeout instead of an answer. Zero means do not wait, which restores the outright refusal this queue replaced; it is a real value here rather than the unbounded-means-zero convention the millisecond bound knobs use |
 | `KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS` | seconds>=0 | 3 | operational | readiness wait for an already-running daemon |
 | `KIN_DAEMON_HOSTED_HYDRATION_TIMEOUT_SECS` | seconds>=0 | 300 | operational | budget for one cold hosted-repository hydration before its admission slot is reclaimed |
+| `KIN_DAEMON_HOSTED_VIEW_PREWARM` | bool | true | operational | warm hosted repository views in the background at startup and after each publication; set falsy to turn it off |
+| `KIN_DAEMON_HOSTED_VIEW_PREWARM_MIN_AVAILABLE_MB` | usize | 4096 | operational | available memory, in MiB, below which a hosted view pre-warm is deferred |
 | `KIN_DAEMON_HTTP_TIMEOUT_SECS` | seconds>=0 | 300 | operational | per-request HTTP timeout for the CLI's daemon client; 0 or invalid falls back to 300, and long-running requests (large-repo review) need a higher value |
 | `KIN_DAEMON_IDLE_FLUSH_SECS` | seconds>=0 | 2 | operational | idle debounce before a full-graph persistence flush |
 | `KIN_DAEMON_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | auto-shutdown after this idle period; 0 disables idle shutdown |
 | `KIN_DAEMON_LOCATE_ONLY` | bool | false | correctness | daemon serves locate-only from a snapshot, changing what it answers |
+| `KIN_DAEMON_LSP_FILE_BUDGET_SECS` | seconds>=0 | 120 | operational | wall-clock budget for one file's language-server definitions pass; an overrun is counted and the file gets no definitions from that pass |
 | `KIN_DAEMON_MEMORY_BUDGET_BYTES` | usize | *(unset)* | operational | the most one repository daemon and the processes it starts may hold before heavy work backs off, in bytes. Unset derives it as half this machine's total memory, held between 1 GiB and a cap that follows the machine: 8 GiB below 32 GiB of RAM, then 16, 24 and 32 GiB at the 32, 64 and 96 GiB tiers the inference resource plan grades a host on, because a repository daemon holding more than that is pathological for the size of machine it is running on. An operator value wins outright and is not clamped; zero or an unparseable value is ignored, since a budget of zero would refuse every background pass forever |
+| `KIN_DAEMON_PASS_RETRY_BUDGET_SECS` | seconds>=0 | 1800 | operational | cumulative retry delay a failing background pass may spend before it is parked with an announced reason; 0 disables parking |
+| `KIN_DAEMON_PASS_STALL_SECS` | seconds>=0 | 600 | operational | how long a background pass may run without recording durable progress before the daemon stops it; 0 disables stopping |
 | `KIN_DAEMON_PERIODIC_FLUSH_SECS` | seconds>=0 | 30 | operational | maximum interval before dirty graph state is flushed |
 | `KIN_DAEMON_READY_TIMEOUT_SECS` | seconds>=0 | 300 | operational | how long to wait for a starting daemon to become ready |
 | `KIN_DAEMON_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for all daemon requests; set falsy to opt out |
 | `KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS` | seconds>=0 | 8 | operational | bound on tokio runtime teardown waiting for blocking tasks |
 | `KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | timeout for a daemon-side scope graph build |
+| `KIN_DAEMON_SHUTDOWN_FLUSH_SECS` | seconds>=0 | 300 | operational | how long shutdown waits for the final persistence flush before giving up on it |
 | `KIN_DAEMON_SHUTDOWN_GRACE_SECS` | seconds>=0 | 25 | operational | grace before the shutdown watchdog force-exits; 0 escalates immediately |
 | `KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | how long to wait for the daemon startup lock |
 | `KIN_DAEMON_STOP_TIMEOUT_SECS` | seconds>=0 | 30 | operational | ceiling in seconds kin daemon stop waits for a signaled daemon to exit |
@@ -264,7 +274,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
-| `KIN_INIT_MEMORY_CEILING_BYTES` | usize | *(unset)* | operational | the memory ceiling `kin init` judges a conversion's forecast peak against, in bytes, in place of the container cap or host memory it would otherwise measure. Two audiences share one lever: a machine whose real ceiling Kin reads wrongly can state it, and an operator who has judged the forecast wrong for their repository can get past the refusal without editing anything. An operator value wins outright and is not clamped; zero or an unparseable value is refused rather than ignored, because silently converting under a ceiling nobody set is how a conversion gets killed with no warning. It moves only the up-front refusal and changes nothing about what a conversion holds |
+| `KIN_INIT_DISK_FREE_BYTES` | usize | *(unset)* | operational | the free disk space `kin init` judges a conversion against, in bytes, in place of what the filesystem holding the repository's parent reports. A conversion holds every reachable file version twice, uncompressed, while it copies its capture into the store, so it refuses before any work when free space is under that, and says so in one line when free space is under the store size measured repositories reached. Set it for a filesystem that compresses or deduplicates, where the uncompressed figures overstate what it will use. An operator value wins outright, and zero or an unparseable value is refused rather than ignored. It moves only the up-front check and changes nothing about what a conversion writes |
+| `KIN_INIT_MEMORY_CEILING_BYTES` | usize | *(unset)* | operational | the memory ceiling `kin init` judges a conversion's forecast peak against, in bytes, in place of the container cap or host memory it would otherwise measure. Two audiences share one lever: a machine whose real ceiling Kin reads wrongly can state it, and an operator who has judged the forecast wrong for their repository can get past the refusal without editing anything. An operator value wins outright and is not clamped; zero or an unparseable value is refused rather than ignored, because silently converting under a ceiling nobody set is how a conversion gets killed with no warning. It moves both memory refusals: the forecast taken before capture is judged against it, and the projection taken after planning against it less the memory already in use. It changes nothing about what a conversion holds |
 
 ## Storage
 
@@ -351,6 +362,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_COCHANGE_SEED_FILES` | usize | 8 | correctness | locate tuning knob: cochange seed files |
 | `KIN_LOCATE_COCHANGE_SEED_FLOOR` | float>=0 | 1.0 | correctness | locate tuning knob: cochange seed floor |
 | `KIN_LOCATE_COCHANGE_SEED_RANK_LIMIT` | usize | 5 | correctness | locate tuning knob: cochange seed rank limit |
+| `KIN_LOCATE_COLLAPSE_PACKAGE_MODULES` | bool | true | correctness | locate tuning knob: collapse package modules |
 | `KIN_LOCATE_COLLISION_CORROBORATION` | bool | true | correctness | locate tuning knob: collision corroboration |
 | `KIN_LOCATE_COLLISION_CORROBORATION_TARGET` | usize | 2 | correctness | locate tuning knob: collision corroboration target |
 | `KIN_LOCATE_COLLISION_LONE_FLOOR` | float>=0 | 0.75 | correctness | locate tuning knob: collision lone floor |
@@ -386,6 +398,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_DERIVED_PROJECTION_RETAIN_MAX` | usize | 0 | correctness | locate tuning knob: derived projection retain max |
 | `KIN_LOCATE_DERIVED_PROJECTION_RETAIN_SEED_FLOOR_PCT` | float>=0 | 0.4 | correctness | locate tuning knob: derived projection retain seed floor pct |
 | `KIN_LOCATE_DERIVED_PROJECTION_RETAIN_SEED_TOPK` | usize | 3 | correctness | locate tuning knob: derived projection retain seed topk |
+| `KIN_LOCATE_DESCRIPTIVE_EVIDENCE` | bool | true | correctness | locate tuning knob: descriptive evidence |
+| `KIN_LOCATE_DESCRIPTIVE_EVIDENCE_EXPONENT` | float>=0 | 2.0 | correctness | locate tuning knob: descriptive evidence exponent |
+| `KIN_LOCATE_DESCRIPTIVE_EVIDENCE_FLOOR` | float>=0 | 0.05 | correctness | locate tuning knob: descriptive evidence floor |
 | `KIN_LOCATE_DIRECT_BLEND` | float>=0 | 0.90 | correctness | locate tuning knob: direct blend |
 | `KIN_LOCATE_DIRECT_DOMINANCE_MIN` | float>=0 | 1000.0 | correctness | locate tuning knob: direct dominance min |
 | `KIN_LOCATE_DIRECT_DOMINANCE_RATIO_MIN` | float>=0 | 5.0 | correctness | locate tuning knob: direct dominance ratio min |
@@ -520,6 +535,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_PROFILE` | enum | *(unset)* | correctness | locate capability profile; unset auto-detects from cores/RAM |
 | `KIN_LOCATE_PROSE_NAME_DEMOTION` | bool | true | correctness | locate tuning knob: prose name demotion |
 | `KIN_LOCATE_PUBLIC_API_IMPL_PENALTY` | float>=0 | 0.3 | correctness | locate tuning knob: public api impl penalty |
+| `KIN_LOCATE_QUALIFIED_PATH_TERMS` | bool | true | correctness | locate tuning knob: qualified path terms |
 | `KIN_LOCATE_QUERY_IDENTIFIER_LIMIT` | usize | 10 | correctness | locate tuning knob: query identifier limit |
 | `KIN_LOCATE_QUERY_PRIORITY_RETAIN_LIMIT` | usize | 3 | correctness | locate tuning knob: query priority retain limit |
 | `KIN_LOCATE_QUERY_TEST_ARTIFACT_LIMIT` | usize | 3 | correctness | locate tuning knob: query test artifact limit |

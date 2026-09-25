@@ -203,8 +203,14 @@ impl Drop for SupervisorLock {
 }
 
 fn acquire_supervisor_lifecycle_guard(dir: &Path) -> std::io::Result<std::fs::File> {
+    acquire_supervisor_lifecycle_guard_until(dir, Instant::now() + SUPERVISOR_LIFECYCLE_BUDGET)
+}
+
+fn acquire_supervisor_lifecycle_guard_until(
+    dir: &Path,
+    deadline: Instant,
+) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(dir)?;
-    let deadline = Instant::now() + SUPERVISOR_LIFECYCLE_BUDGET;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -285,10 +291,40 @@ fn acquire_supervisor_lock(dir: &Path) -> std::io::Result<SupervisorLock> {
 
 fn write_supervisor_endpoint_files(
     dir: &Path,
-    _supervisor_lock: &SupervisorLock,
+    supervisor_lock: &SupervisorLock,
     port: u16,
 ) -> std::io::Result<()> {
-    let _lifecycle = acquire_supervisor_lifecycle_guard(dir)?;
+    write_supervisor_endpoint_files_until(
+        dir,
+        supervisor_lock,
+        port,
+        Instant::now() + SUPERVISOR_LIFECYCLE_BUDGET,
+    )
+}
+
+fn write_supervisor_endpoint_files_until(
+    dir: &Path,
+    supervisor_lock: &SupervisorLock,
+    port: u16,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let lifecycle = acquire_supervisor_lifecycle_guard_until(dir, deadline)?;
+    write_supervisor_endpoint_files_under_authority(
+        dir,
+        supervisor_lock,
+        &lifecycle,
+        port,
+        deadline,
+    )
+}
+
+fn write_supervisor_endpoint_files_under_authority(
+    dir: &Path,
+    _supervisor_lock: &SupervisorLock,
+    _lifecycle: &std::fs::File,
+    port: u16,
+    deadline: Instant,
+) -> std::io::Result<()> {
     let pid_tmp = dir.join(format!("{SUPERVISOR_PID_FILE}.tmp"));
     let port_tmp = dir.join(format!("{SUPERVISOR_PORT_FILE}.tmp"));
     let owner_tmp = dir.join(format!("{SUPERVISOR_OWNER_FILE}.tmp"));
@@ -296,12 +332,14 @@ fn write_supervisor_endpoint_files(
     let port_path = dir.join(SUPERVISOR_PORT_FILE);
     let owner_path = dir.join(SUPERVISOR_OWNER_FILE);
     let result = (|| {
-        let owner = kin_cli::daemon_client::EndpointOwnerRecord::current().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "cannot publish supervisor endpoint without process-incarnation identity",
-            )
-        })?;
+        // Do not restart the executable-observation budget after lock wait.
+        let owner = kin_cli::daemon_client::EndpointOwnerRecord::current_with_deadline(deadline)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "cannot publish supervisor endpoint without process-incarnation identity",
+                )
+            })?;
         std::fs::write(&pid_tmp, std::process::id().to_string())?;
         std::fs::write(&port_tmp, port.to_string())?;
         std::fs::write(
@@ -2427,8 +2465,12 @@ fn daemon_log_len(repo_root: &str) -> u64 {
 #[cfg(unix)]
 async fn probe_daemon_health(client: &reqwest::Client, port: u16) -> DaemonHealth {
     let url = format!("http://127.0.0.1:{port}/health");
+    // Marked as a watchdog probe so the worker does not count it as a client.
+    // Unmarked, this read reset every worker's idle clock every sweep, and a
+    // worker could never idle out while any supervisor ran.
     let response = match client
         .get(&url)
+        .header(crate::api::WATCHDOG_PROBE_HEADER, "supervisor")
         .timeout(REAPER_HEALTH_PROBE_TIMEOUT)
         .send()
         .await
@@ -2720,6 +2762,100 @@ mod tests {
             dir.path().join("supervisor.start.lock").is_dir(),
             "the compatibility sentinel must remain a directory for the supervisor lifetime"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn supervisor_publication_records_the_publishers_executable() {
+        // Linux hashes the large debug test binary. This tests publication of
+        // image evidence, not whether hashing fits the production stop budget;
+        // the exhausted-budget test below separately pins cooperative fallback.
+        let image_budget = Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let authority = acquire_supervisor_lock(dir.path()).unwrap();
+        #[cfg(target_os = "linux")]
+        write_supervisor_endpoint_files_until(
+            dir.path(),
+            &authority,
+            50595,
+            Instant::now() + image_budget,
+        )
+        .unwrap();
+        #[cfg(target_os = "macos")]
+        write_supervisor_endpoint_files(dir.path(), &authority, 50595).unwrap();
+        let raw = std::fs::read(dir.path().join(SUPERVISOR_OWNER_FILE)).unwrap();
+        let published: kin_cli::daemon_client::EndpointOwnerRecord =
+            serde_json::from_slice(&raw).unwrap();
+        let observed = kin_cli::daemon_client::EndpointOwnerRecord::current_with_deadline(
+            Instant::now() + image_budget,
+        )
+        .expect("observe this publisher");
+        assert_eq!(published.identity(), observed.identity());
+        let published = serde_json::to_value(published).unwrap();
+        let observed = serde_json::to_value(observed).unwrap();
+        assert!(
+            observed.get("executable").is_some(),
+            "the real test executable must yield usable image evidence"
+        );
+        assert_eq!(published.get("executable"), observed.get("executable"));
+        assert_eq!(
+            recorded_supervisor_pid(dir.path()),
+            Some(std::process::id())
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exhausted_supervisor_budget_preserves_incarnation_and_owner_first_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let authority = acquire_supervisor_lock(root).unwrap();
+        let lifecycle = acquire_supervisor_lifecycle_guard(root).unwrap();
+        write_supervisor_endpoint_files_under_authority(
+            root,
+            &authority,
+            &lifecycle,
+            50595,
+            Instant::now(),
+        )
+        .expect("an exhausted image budget still allows cooperative publication");
+        let raw = std::fs::read(root.join(SUPERVISOR_OWNER_FILE)).unwrap();
+        let owner: kin_cli::daemon_client::EndpointOwnerRecord =
+            serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            owner,
+            kin_cli::daemon_client::EndpointOwnerRecord::for_identity(
+                kin_cli::daemon_client::current_process_identity().unwrap()
+            )
+        );
+        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(json.get("executable").is_none());
+        assert_eq!(recorded_supervisor_pid(root), Some(std::process::id()));
+
+        std::fs::remove_file(root.join(SUPERVISOR_OWNER_FILE)).unwrap();
+        std::fs::create_dir(root.join(SUPERVISOR_OWNER_FILE)).unwrap();
+        std::fs::write(root.join(SUPERVISOR_OWNER_FILE).join("occupant"), b"x").unwrap();
+        std::fs::write(root.join(SUPERVISOR_PID_FILE), b"123456789").unwrap();
+        write_supervisor_endpoint_files_under_authority(
+            root,
+            &authority,
+            &lifecycle,
+            50596,
+            Instant::now(),
+        )
+        .expect_err("owner installation must precede PID replacement");
+        assert_eq!(
+            std::fs::read(root.join(SUPERVISOR_PID_FILE)).unwrap(),
+            b"123456789"
+        );
+        assert_eq!(
+            std::fs::read(root.join(SUPERVISOR_PORT_FILE)).unwrap(),
+            b"50595"
+        );
+        assert!(root.join(SUPERVISOR_OWNER_FILE).join("occupant").exists());
+        assert!(!root.join("supervisor.owner.tmp").exists());
+        assert!(!root.join("supervisor.pid.tmp").exists());
+        assert!(!root.join("supervisor.port.tmp").exists());
     }
 
     fn repo_payload(instance_id: &str, port: u16) -> RepoDaemonRegistration {
@@ -4588,5 +4724,35 @@ mod tests {
 
         let repos = state.repo_daemons.read().await;
         assert_eq!(repos.get("demo").unwrap().kin_home, "/homes/moved/.kin");
+    }
+
+    /// The reaper's probe is the read that kept every worker alive: sent every
+    /// 15 seconds, it reset each worker's idle clock, so no worker idled out
+    /// while a supervisor ran and no supervisor idled out while it had a
+    /// worker. Answered by a real worker router, it must still classify the
+    /// worker and must leave that worker's idle clock where it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reaper_probe_does_not_keep_a_worker_awake() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let worker = Arc::new(DaemonState::open(layout).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = crate::api::router(Arc::clone(&worker));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let aged = worker.idle_duration();
+        let health = probe_daemon_health(&reqwest::Client::new(), port).await;
+        assert!(
+            matches!(health, DaemonHealth::Healthy(_)),
+            "the probe must still read the worker: {health:?}"
+        );
+        assert!(
+            worker.idle_duration() >= aged,
+            "the reaper's probe reset the worker's idle clock"
+        );
+        server.abort();
     }
 }

@@ -1094,6 +1094,24 @@ jobs:
       - name: Test magic-repro case 16's surface reading
         run: python3 scripts/acceptance/test_magic_repro_case16.py
 
+      # Checks 15, 17 and 21 read conversion coverage through `kin doctor
+      # --conversion-source`, and a losing run must keep its root and the
+      # responses its checks read. Both rules are pure, so they are graded here,
+      # where a pull request can see them.
+      - name: Test magic-repro's conversion-source reading and run-root retention
+        run: python3 scripts/acceptance/test_magic_repro_conversion_report.py
+
+      # trace-spine, mcp-spawn, graph-viz and response-budget stop the daemons
+      # they own, report that stop as a result row, and keep a losing run's
+      # root. Each suite's own main() is driven there with synthetic results
+      # and a stub kin, so the rule is graded here, where a pull request can
+      # see it.
+      - name: Test daemon cleanup and run-root retention in four acceptance suites
+        run: python3 scripts/acceptance/test_run_root_retention.py
+
+      - name: Test acceptance reference diagnostic contracts
+        run: python3 scripts/acceptance/test_reference_diagnostic_contract.py
+
       # Here rather than in `check`, for the reason the step above records: a
       # script step in `check` is a gate `bin/kin-precheck` enumerates and must
       # classify by name, and one wired there without the matching umbrella
@@ -2368,6 +2386,14 @@ jobs:
       - name: Install language servers for the enrichment proof
         if: runner.os == 'Linux'
         run: bash scripts/ci-install-language-servers.sh
+
+      # Go's proof needs both gopls and the Go toolchain it loads packages
+      # through. Provision the pinned Linux pair on every shard: nextest may
+      # assign the proof to either one. Unlike the optional servers above,
+      # failure to provision this pair fails the job, and the proof refuses
+      # to skip if either promised binary is subsequently missing.
+      - name: Provision Go and gopls for the Go enrichment proof
+        run: bash scripts/ci-install-go-language-server.sh
 
       # `--partition count:N/M` splits the suite by test, deterministically,
       # so the two shards together run exactly the set one unpartitioned run

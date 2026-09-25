@@ -777,6 +777,7 @@ mod tests {
         let mut snapshot = manager.read_authority().snapshot().clone();
         drop(manager);
         let metadata = snapshot.repository_authority.as_mut().unwrap();
+        assert!(!metadata.binding_history.is_empty());
         let operations: BTreeMap<_, _> = metadata
             .operation_log
             .iter()
@@ -794,6 +795,45 @@ mod tests {
         snapshot.materialized_graph = None;
         snapshot.version = snapshot.wire_version();
         assert_eq!(snapshot.version, 13);
+        assert!(
+            snapshot
+                .to_bytes()
+                .unwrap_err()
+                .to_string()
+                .contains("binding history witness: requires authority schema 5"),
+            "changing the schema label must not launder a current binding-history witness"
+        );
+        // Legacy schema 3 predates binding-history evidence. Construct its
+        // actual shape, rather than merely relabelling a current snapshot.
+        snapshot
+            .repository_authority
+            .as_mut()
+            .unwrap()
+            .binding_history
+            .clear();
+        snapshot.verified_binding_history = None;
+        assert!(
+            serde_json::to_value(snapshot.repository_authority.as_ref().unwrap())
+                .unwrap()
+                .get("binding_history")
+                .is_none()
+        );
+        for schema in [
+            kin_db::storage::repository::MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION - 1,
+            kin_db::storage::repository::REPOSITORY_AUTHORITY_SCHEMA_VERSION + 1,
+        ] {
+            let mut unsupported = snapshot.clone();
+            unsupported
+                .repository_authority
+                .as_mut()
+                .unwrap()
+                .schema_version = schema;
+            unsupported.version = unsupported.wire_version();
+            assert!(
+                unsupported.to_bytes().is_err(),
+                "unsupported schema {schema}"
+            );
+        }
         let aged = scratch.path().join("aged");
         let metadata_files = inventory(&source)
             .unwrap()

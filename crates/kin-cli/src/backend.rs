@@ -282,7 +282,7 @@ async fn open_snapshot_daemon_first_with_mode(
         ));
     }
 
-    let graph = graph_from_bootstrap_snapshot(layout, snapshot, true)?;
+    let graph = graph_from_bootstrap_snapshot(layout, snapshot)?;
     let snap =
         kin_db::SnapshotManager::from_bootstrap_graph_read_only(kindb_snapshot_path(layout), graph);
     load_vector_index_if_exists(&snap, layout);
@@ -296,6 +296,12 @@ async fn open_snapshot_daemon_first_with_mode(
 /// index. The unchecked loader is intentionally unavailable outside KinDB
 /// tests because accepting a stale sidecar would return silently-wrong
 /// neighbors.
+///
+/// Read-only, because both callers open a store this process does not own:
+/// the daemon's, over a bootstrap, and a local one under the admin escape
+/// hatch. The owner's load archives an index that contradicts its metadata;
+/// this one refuses it and leaves the pair in place, so a read that catches the
+/// daemon replacing its pair never renames the daemon's files.
 #[cfg(feature = "vector")]
 fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
     let _span = tracing::info_span!(
@@ -305,7 +311,7 @@ fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core
     .entered();
     let snapshot_path = kindb_snapshot_path(layout);
     let graph = snap.graph();
-    match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+    match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid_read_only(
         graph.as_ref(),
         &snapshot_path,
         None,
@@ -335,32 +341,28 @@ fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core
 #[cfg(not(feature = "vector"))]
 fn load_vector_index_if_exists(_snap: &kin_db::SnapshotManager, _layout: &kin_core::KinLayout) {}
 
-/// Fetch the graph from the daemon's `/graph/bootstrap` endpoint.
-/// Returns `None` if the daemon is unreachable or returns an error.
+/// Build the CLI's read-only graph from a daemon bootstrap snapshot, over the
+/// daemon's own text index opened read-only.
+///
+/// That index belongs to the live daemon, and this process only reads it. The
+/// open never archives, renames or writes, so a segment the daemon is in the
+/// middle of reclaiming, or one that is genuinely missing, costs this process
+/// an in-memory rebuild and costs the daemon nothing.
+///
+/// It used to peek the index's stored root hash first, through a WRITING open
+/// that took no lock, to hand to a constructor that ignores that argument. The
+/// peek could rename the daemon's manifest aside, and when it found no index it
+/// computed the snapshot's Merkle root instead, which was discarded too. Both
+/// are gone: currency is decided by the retrieval authority hash, computed
+/// from the snapshot inside the open.
 fn graph_from_bootstrap_snapshot(
     layout: &kin_core::KinLayout,
     snapshot: kin_db::GraphSnapshot,
-    read_only: bool,
 ) -> std::result::Result<kin_db::InMemoryGraph, kin_db::KinDbError> {
-    // Prefer the on-disk text index's stored root hash so the hash check
-    // passes without an expensive Merkle recomputation.  Falls back to
-    // computing the hash from the snapshot when no text index exists.
-    let ti_dir = layout.text_index_dir();
-    let graph_root_hash = kin_db::TextIndex::peek_root_hash(&ti_dir)
-        .unwrap_or_else(|| kin_db::compute_graph_root_hash(&snapshot));
-    if read_only {
-        kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash_read_only(
-            snapshot,
-            ti_dir,
-            graph_root_hash,
-        )
-    } else {
-        kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
-            snapshot,
-            ti_dir,
-            graph_root_hash,
-        )
-    }
+    kin_db::InMemoryGraph::from_snapshot_with_text_index_read_only(
+        snapshot,
+        layout.text_index_dir(),
+    )
 }
 
 /// Attach the daemon's bearer token to a request built against a bare
@@ -1230,6 +1232,69 @@ mod tests {
         assert!(
             monolithic.exists() || segmented_manifest.exists(),
             "persistent text index should leave either monolithic or segmented sidecar storage"
+        );
+    }
+
+    /// The CLI's read-only open reads the daemon's live text index and must
+    /// never move a file in it.
+    ///
+    /// With a segment missing, which is also what a read racing the daemon's
+    /// reclaim of an old generation meets, the open still succeeds, answers from
+    /// an index rebuilt in memory, and leaves the manifest and every other file
+    /// where they were. The root-hash peek this open used to make first was a
+    /// writing open, and on these bytes it archived the daemon's manifest.
+    #[test]
+    fn bootstrap_open_over_a_text_index_missing_a_segment_moves_nothing() {
+        fn files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(dir.path()).unwrap().layout;
+        let text_dir = layout.text_index_dir();
+        let daemon_side = kin_db::InMemoryGraph::with_text_index(text_dir.clone());
+        let entities: Vec<Entity> = (0..8)
+            .map(|n| test_entity(&format!("bootstrap_peek_{n}")))
+            .collect();
+        for entity in &entities {
+            daemon_side.upsert_entity(entity).unwrap();
+        }
+        daemon_side.flush_text_index().unwrap();
+        let snapshot = daemon_side.to_snapshot();
+        drop(daemon_side);
+
+        let segment = files(&text_dir)
+            .into_keys()
+            .find(|name| name.contains(".kinseg-") && !name.ends_with(".kinseg-manifest"))
+            .expect("the daemon's index is segmented");
+        std::fs::remove_file(text_dir.join(&segment)).unwrap();
+        let before = files(&text_dir);
+        assert!(before.keys().any(|name| name.ends_with(".kinseg-manifest")));
+
+        let graph = super::graph_from_bootstrap_snapshot(&layout, snapshot)
+            .expect("an unreadable text index costs the read-only open a rebuild, not an error");
+        let after = files(&text_dir);
+        assert!(
+            after == before,
+            "the read-only open changed the daemon's text index: before {:?}, after {:?}",
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+        let hits = graph.text_search("bootstrap_peek_3", 10).unwrap();
+        assert!(
+            hits.iter()
+                .any(|(key, _)| *key == RetrievalKey::Entity(entities[3].id)),
+            "the in-memory rebuild answers from graph truth: {hits:?}"
         );
     }
 

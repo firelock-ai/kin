@@ -11,6 +11,7 @@ pub mod common;
 pub mod bench;
 pub mod entities;
 pub mod file_entities;
+pub mod lexical;
 pub mod path;
 pub mod provenance;
 pub(crate) mod repository_authority;
@@ -19,6 +20,9 @@ pub mod sessions;
 pub mod tool_search;
 pub mod verification;
 pub mod work;
+
+#[cfg(test)]
+mod confirmed_sites_tests;
 
 pub use repository_authority::{
     ActiveRepositoryAuthority, LocalRepositoryAuthorityBinding, RequestRepositoryAuthority,
@@ -123,8 +127,11 @@ async fn dispatch_tool_call<G: GraphStore>(
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
     repository_authority: Option<&RequestRepositoryAuthority>,
-    host: WorkingCopySurface<'_>,
+    _host: WorkingCopySurface<'_>,
 ) -> Result<ToolCallResult> {
+    if let Some(message) = crate::tools::retired_file_operation(tool_name) {
+        return Err(crate::error::McpError::InvalidParams(message.into()));
+    }
     match tool_name {
         "kin_draft_apply"
         | "kin_draft_capabilities"
@@ -132,13 +139,6 @@ async fn dispatch_tool_call<G: GraphStore>(
         | "kin_draft_save"
         | "kin_draft_read"
         | "kin_draft_list" => crate::entity_drafts::forward(tool_name, arguments).await,
-        // Exact repository membership and bytes
-        "kin_artifact_list" => {
-            artifacts::handle_artifact_list(arguments, store, repository_authority)
-        }
-        "kin_artifact_read" => {
-            artifacts::handle_artifact_read(arguments, store, repository_authority)
-        }
         // The registry itself. Answered from the tool definitions compiled into
         // this binary rather than from the store, because what it returns has to
         // be what THIS server would serve; see `handlers::tool_search`.
@@ -171,7 +171,9 @@ async fn dispatch_tool_call<G: GraphStore>(
         "dead_code" => entities::handle_dead_code(arguments, store),
         "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
-        "list_file_entities" => file_entities::handle_list_file_entities(arguments, store, host),
+        lexical::TOOL_NAME => {
+            lexical::handle_lexical_lookup(arguments, store, repository_authority)
+        }
         // Review
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
         "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
@@ -281,6 +283,28 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn retired_file_operations_refuse_direct_handler_dispatch() {
+        for name in [
+            "kin_artifact_read",
+            "kin_artifact_list",
+            "list_file_entities",
+        ] {
+            let error = handle_tool_call(
+                name,
+                &HashMap::new(),
+                &InMemoryGraph::default(),
+                &SessionRegistry::new(),
+                SessionAuthorityMode::OfflineFallback,
+                None,
+                WorkingCopySurface::NotApplicable,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("unavailable"), "{name}: {error}");
+        }
+    }
 
     #[derive(Default)]
     pub(super) struct EmptyStore {
@@ -2056,6 +2080,358 @@ mod tests {
         let kinds = filter.kinds.unwrap();
         assert!(kinds.contains(&EntityKind::Function));
         assert!(kinds.contains(&EntityKind::Method));
+    }
+
+    #[test]
+    fn semantic_search_rejects_invalid_kinds_instead_of_reporting_a_graph_miss() {
+        let store = EmptyStore::default();
+        for kind in [
+            serde_json::json!("file"),
+            serde_json::json!("FUNCTIONS"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::json!(null),
+        ] {
+            let args = HashMap::from([
+                ("query".into(), serde_json::json!("query_test")),
+                ("kind".into(), kind.clone()),
+            ]);
+            let error = entities::handle_semantic_search(&args, &store).unwrap_err();
+            let McpError::InvalidParams(message) = error else {
+                panic!("invalid kind {kind} was not an invalid-parameters error: {error}");
+            };
+            assert!(message.contains(SEMANTIC_SEARCH_KIND_GUIDANCE), "{message}");
+            assert!(message.contains("semantic entity"), "{message}");
+            assert!(!message.contains("kin_artifact_read"), "{message}");
+        }
+    }
+
+    #[test]
+    fn semantic_search_kind_validation_preserves_aliases_default_and_test_role() {
+        let mut args = HashMap::from([("query".into(), serde_json::json!("save"))]);
+        let (_, limit, filter) = build_semantic_search_request(&args).unwrap();
+        assert_eq!(limit, 20);
+        assert!(filter.kinds.is_none());
+        assert!(filter.roles.is_none());
+        for (name, expected) in [
+            ("function", vec![EntityKind::Function, EntityKind::Method]),
+            ("fn", vec![EntityKind::Function, EntityKind::Method]),
+            ("command", vec![EntityKind::Function, EntityKind::Method]),
+            ("cmd", vec![EntityKind::Function, EntityKind::Method]),
+            ("subcommand", vec![EntityKind::Function, EntityKind::Method]),
+            ("class", vec![EntityKind::Class]),
+            ("interface", vec![EntityKind::Interface]),
+            ("trait", vec![EntityKind::TraitDef]),
+            ("traitdef", vec![EntityKind::TraitDef]),
+            ("type_alias", vec![EntityKind::TypeAlias]),
+            ("module", vec![EntityKind::Module]),
+            ("package", vec![EntityKind::Package]),
+            ("schema", vec![EntityKind::Schema]),
+            ("api_endpoint", vec![EntityKind::ApiEndpoint]),
+            ("event_contract", vec![EntityKind::EventContract]),
+            ("method", vec![EntityKind::Method]),
+            ("enum", vec![EntityKind::EnumDef]),
+            ("enumdef", vec![EntityKind::EnumDef]),
+            ("constant", vec![EntityKind::Constant]),
+        ] {
+            for spelling in [name.to_string(), name.to_uppercase()] {
+                args.insert("kind".into(), serde_json::json!(spelling));
+                let (_, _, filter) = build_semantic_search_request(&args).unwrap();
+                assert_eq!(filter.kinds, Some(expected.clone()), "{spelling}");
+                assert!(filter.roles.is_none(), "{spelling}");
+            }
+        }
+        for spelling in ["test", "TEST"] {
+            args.insert("kind".into(), serde_json::json!(spelling));
+            let (_, _, filter) = build_semantic_search_request(&args).unwrap();
+            assert!(filter.kinds.is_none());
+            assert_eq!(filter.roles, Some(vec![kin_model::EntityRole::Test]));
+        }
+        let registry = crate::tools::tool_definitions();
+        let tool = registry
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_search")
+            .unwrap();
+        let schema = &tool.input_schema["properties"]["kind"];
+        assert!(schema["description"]
+            .as_str()
+            .unwrap()
+            .contains(SEMANTIC_SEARCH_KIND_GUIDANCE));
+        assert!(
+            schema.get("enum").is_none(),
+            "case-insensitive aliases stay valid"
+        );
+    }
+
+    #[test]
+    fn imported_file_modules_refuse_source_and_context_but_real_modules_remain_semantic() {
+        let adapters = kin_parser::AdapterRegistry::new();
+        let samples = [
+            (
+                LanguageId::Rust,
+                "src/lib.rs",
+                "pub mod nested { pub fn bounded() {} }\npub fn value() {}\n",
+            ),
+            (
+                LanguageId::Go,
+                "query.go",
+                "package search\nfunc Value() int { return 1 }\n",
+            ),
+            (
+                LanguageId::JavaScript,
+                "query.js",
+                "export function value() { return 1; }\n",
+            ),
+            (
+                LanguageId::TypeScript,
+                "query.ts",
+                "export namespace CoreNavigationCommands { export class BaseMoveToCommand {} }\nmodule LegacyNames { export class Renamed {} }\nexport function top() { return 1; }\n",
+            ),
+            (
+                LanguageId::Python,
+                "query.py",
+                "def value():\n    return 1\n",
+            ),
+            (
+                LanguageId::Java,
+                "Query.java",
+                "package search; class Query { int value() { return 1; } }",
+            ),
+            (
+                LanguageId::Kotlin,
+                "query.kt",
+                "package search\nfun value(): Int = 1\n",
+            ),
+            (
+                LanguageId::Swift,
+                "query.swift",
+                "func value() -> Int { return 1 }\n",
+            ),
+            (
+                LanguageId::Php,
+                "query.php",
+                "<?php namespace Search; function value() { return 1; }",
+            ),
+        ];
+        for (language, path, source) in samples {
+            let file = FilePathId::new(path);
+            let adapter = adapters.get_by_language(language).unwrap();
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let parsed = adapter.extract(&tree, source.as_bytes(), &file).unwrap();
+            let entities: Vec<_> = parsed
+                .entities
+                .into_iter()
+                .map(|e| e.into_entity_with_source(language, &file, Some(source.as_bytes())))
+                .collect();
+            let wrappers: Vec<_> = entities
+                .iter()
+                .filter(|e| kin_model::is_file_module_surface(e))
+                .collect();
+            assert!(
+                !wrappers.is_empty(),
+                "{language:?} must exercise a real importer wrapper"
+            );
+            for entity in &entities {
+                if kin_model::is_file_module_surface(entity) {
+                    assert!(kin_model::require_independent_source(entity)
+                        .unwrap_err()
+                        .contains("whole file"));
+                    let mut store = EmptyStore::default();
+                    store.entities_by_id.insert(entity.id, entity.clone());
+                    assert!(
+                        serde_json::to_value(entity)
+                            .unwrap()
+                            .pointer("/metadata/embedding_body_preview")
+                            .is_some(),
+                        "exercise actual serialized preview field"
+                    );
+                    let metadata = entity_response_json(&store, entity, None).unwrap();
+                    for key in [
+                        "embedding_body_preview",
+                        "file_import_context",
+                        "file_surface_context",
+                    ] {
+                        assert!(
+                            metadata.pointer(&format!("/metadata/{key}")).is_none(),
+                            "{metadata}"
+                        );
+                    }
+                    assert!(entity.metadata.extra.contains_key("embedding_body_preview"));
+                    let held = HeldSourceAuthority::new(&store, None);
+                    assert!(read_entity_source_exact(&held, entity, usize::MAX)
+                        .unwrap()
+                        .is_none());
+                    assert!(read_entity_source_excerpt_detailed_held(
+                        &held,
+                        entity,
+                        200,
+                        60000,
+                        EntitySourceScope::WorkspaceHead
+                    )
+                    .unwrap()
+                    .is_none());
+                    let focal = focal_context_json(&store, entity, None).unwrap();
+                    assert!(
+                        focal.get("body").is_none_or(serde_json::Value::is_null),
+                        "{focal}"
+                    );
+                    assert!(focal["body_unavailable"]
+                        .as_str()
+                        .unwrap()
+                        .contains("whole file"));
+                    let args = HashMap::from([("entity_id".into(), serde_json::json!(entity.id))]);
+                    assert!(entities::handle_get_entity_source(&args, &store, None)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("whole file"));
+                } else if entity.kind == EntityKind::Module {
+                    assert!(
+                        kin_model::require_independent_source(entity).is_ok(),
+                        "real module {}",
+                        entity.signature
+                    );
+                }
+            }
+            if language == LanguageId::Rust {
+                assert!(
+                    entities
+                        .iter()
+                        .any(|e| e.kind == EntityKind::Module
+                            && !kin_model::is_file_module_surface(e)),
+                    "{language:?} real bounded module control: {entities:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn module_source_reads_refuse_persisted_widened_span_and_keep_bounded_declaration() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "// unrelated prefix\npub mod defaults { pub fn inside() {} }\npub fn outside() { sibling_only(); }\n";
+        let fixture = make_source_backed_entity(content);
+        let file = FilePathId::new("src/defaults.rs");
+        let adapters = kin_parser::AdapterRegistry::new();
+        let adapter = adapters.get_by_language(LanguageId::Rust).unwrap();
+        let parsed = adapter
+            .extract(
+                &adapter.parse(content.as_bytes()).unwrap(),
+                content.as_bytes(),
+                &file,
+            )
+            .unwrap();
+        let module = parsed
+            .entities
+            .into_iter()
+            .find(|e| e.kind == EntityKind::Module)
+            .unwrap()
+            .into_entity_with_source(LanguageId::Rust, &file, Some(content.as_bytes()));
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(module.id, module.clone());
+        store.file_hashes.insert(file, fixture.hash);
+        install_empty_store_exact_tree(&mut store, fixture._dir.path());
+        let authority = test_repository_authority(fixture._dir.path());
+        let held = HeldSourceAuthority::new(&store, Some(&authority));
+        let source = read_entity_source_exact(&held, &module, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.body, "pub mod defaults { pub fn inside() {} }");
+        let mut legacy = module.clone();
+        let span = legacy.span.as_mut().unwrap();
+        span.start_byte = 0;
+        span.start_line = 0;
+        span.end_byte = content.len();
+        span.end_line = 3;
+        span.end_col = 0;
+        let before = serde_json::to_value(&legacy).unwrap();
+        assert!(read_entity_source_exact(&held, &legacy, usize::MAX)
+            .unwrap_err()
+            .to_string()
+            .contains("reparse/reconcile"));
+        assert!(read_entity_source_excerpt_detailed_held(
+            &held,
+            &legacy,
+            100,
+            10000,
+            EntitySourceScope::WorkspaceHead
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("declaration span"));
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), before);
+        // Historical reads must validate the revision selected by that history,
+        // not the live node's changed signature or invalid coordinates.
+        legacy.signature = "pub mod later_signature".into();
+        let change = *store.changes_by_id.keys().next().unwrap();
+        let historical = read_entity_source_excerpt_detailed_held(
+            &held,
+            &legacy,
+            100,
+            10000,
+            EntitySourceScope::At(change),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(historical.body, source.body);
+    }
+
+    #[tokio::test]
+    async fn semantic_collection_metadata_never_exposes_stored_source_previews() {
+        let callee = impact_probe_entity("preview_callee", None);
+        let mut caller = impact_probe_entity("preview_caller", Some(41));
+        for key in [
+            "embedding_body_preview",
+            "file_import_context",
+            "file_surface_context",
+        ] {
+            caller.metadata.extra.insert(
+                key.into(),
+                serde_json::json!(format!("private_source_{key}")),
+            );
+        }
+        caller
+            .metadata
+            .extra
+            .insert("retained_fact".into(), serde_json::json!("retained"));
+        let mut store = EmptyStore::default();
+        store.insert_test_entity(callee.clone());
+        store.insert_test_entity(caller.clone());
+        store.insert_test_calls_relation(&caller, &callee);
+        store.dead_entities.push(caller.clone());
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([
+            ("entity_ids".into(), serde_json::json!([callee.id])),
+            ("include_traffic".into(), serde_json::json!(false)),
+            ("format".into(), serde_json::json!("json")),
+        ]);
+        let impact = tool_result_json(
+            review::handle_impact_analysis(&args, &store, &sessions)
+                .await
+                .unwrap(),
+        );
+        assert!(!impact["affected_callers"].as_array().unwrap().is_empty());
+        let review =
+            tool_result_json(review::handle_semantic_review(&args, &store, &sessions).unwrap());
+        let dead = tool_result_json(entities::handle_dead_code(&HashMap::new(), &store).unwrap());
+        for response in [&impact, &review, &dead] {
+            let text = response.to_string();
+            assert!(text.contains("preview_caller"), "{text}");
+            assert!(text.contains("retained_fact"), "{text}");
+            assert!(!text.contains("private_source_"), "{text}");
+        }
+        let domain =
+            serde_json::json!({"metadata":{"embedding_body_preview":"ordinary domain metadata"}});
+        assert_eq!(semantic_metadata_json(&domain).unwrap(), domain);
+        assert!(store
+            .get_entity(&caller.id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .extra
+            .contains_key("embedding_body_preview"));
     }
 
     struct GraphBackedSource {
@@ -4045,7 +4421,23 @@ mod tests {
             direct["body"].as_str().is_some(),
             "the recovered caller has readable source: {direct}"
         );
-        let value = context_pack_json(&fixture, &sender, false);
+        // Neighbour bodies are asked for, so a recovered row that was never
+        // priced is a promised body the response has to account for.
+        let value = tool_result_json(
+            entities::handle_get_context_pack(
+                &HashMap::from([
+                    (
+                        "entity_id".to_string(),
+                        serde_json::json!(sender.id.to_string()),
+                    ),
+                    ("neighbor_bodies".to_string(), serde_json::json!(true)),
+                ]),
+                &fixture.store,
+                &SessionRegistry::new(),
+                Some(&fixture.authority),
+            )
+            .unwrap(),
+        );
         let row = value["dependents"]
             .as_array()
             .unwrap()
@@ -4183,7 +4575,7 @@ mod tests {
     }
 
     #[test]
-    fn context_requested_4000_keeps_the_effective_8000_tier_and_exact_final_cost() {
+    fn context_honors_the_compact_profile_budget_and_exact_final_cost() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -4198,24 +4590,151 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
         let sessions = crate::session::SessionRegistry::empty_for_test();
-        let args = HashMap::from([
+        for multi in [false, true] {
+            // The actual profile default, explicit overrides between old tiers,
+            // and the unchanged full-profile and zero defaults all reach the
+            // same builder and final response accounting.
+            for (agent_profile, requested, expected) in [
+                (true, None, 4000),
+                (true, Some(2500), 2500),
+                (true, Some(12000), 12000),
+                (true, Some(20000), 20000),
+                (true, Some(40000), 40000),
+                (false, None, 16000),
+                (false, Some(0), 8000),
+                (false, Some(32000), 32000),
+            ] {
+                let mut args = HashMap::new();
+                if multi {
+                    args.insert(
+                        "question_focals".into(),
+                        serde_json::json!([{"entity_id": entity.id.to_string(), "route": "id"}]),
+                    );
+                } else {
+                    args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
+                }
+                if let Some(requested) = requested {
+                    args.insert("token_budget".into(), serde_json::json!(requested));
+                }
+                if agent_profile {
+                    crate::agent_belt::apply_belt_defaults("get_context_pack", &mut args);
+                }
+                let raw =
+                    entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                        .unwrap();
+                let result = crate::envelope::finalize(
+                    raw,
+                    crate::envelope::Envelope::daemon(),
+                    "get_context_pack",
+                );
+                assert_ne!(
+                    result.is_error,
+                    Some(true),
+                    "multi={multi}, budget={expected}"
+                );
+                let crate::types::ContentBlock::Text { text } = &result.content[0];
+                let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(value["token_budget"], expected);
+                assert_eq!(value["tokens_used"], kin_context::estimate_tokens(text));
+                assert!(kin_context::estimate_tokens(text) <= expected);
+                let row = if multi {
+                    &value["entities"][0]
+                } else {
+                    &value["focal_entity"]
+                };
+                assert_eq!(row["body"], "fn exact() {\r\n    execute();\r\n}");
+                assert_eq!(row["body_complete"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_context_preserves_focal_source_among_recovered_callers() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let body = format!(
+            "function validate() {{\n{}\n}}",
+            "    validate_range(value, min, max);\n".repeat(30)
+        );
+        let source = make_source_backed_entity(&body);
+        let entity = &source.entity;
+        let mut store = EmptyStore::default();
+        store.insert_test_entity(entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        let blobs = kin_blobs::BlobStore::new(source._dir.path().join(".kin/objects")).unwrap();
+        for index in 0..40 {
+            let mut caller =
+                impact_probe_entity(&format!("validate_range_caller_{index}"), Some(0));
+            let caller_body = format!("{} {{\n    validate();\n}}", caller.signature);
+            let span = caller.span.as_mut().unwrap();
+            span.end_byte = caller_body.len();
+            let hash = blobs.write(caller_body.as_bytes()).unwrap();
+            store
+                .file_hashes
+                .insert(caller.file_origin.clone().unwrap(), hash);
+            store.insert_test_entity(caller.clone());
+            store.insert_test_calls_relation(&caller, entity);
+        }
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let mut args = HashMap::from([
             ("entity_id".into(), serde_json::json!(entity.id.to_string())),
-            ("token_budget".into(), serde_json::json!(4000)),
+            ("token_budget".into(), serde_json::json!(2500)),
         ]);
+        crate::agent_belt::apply_belt_defaults("get_context_pack", &mut args);
         let raw =
             entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
-        let result =
-            crate::envelope::finalize(raw, crate::envelope::Envelope::daemon(), "get_context_pack");
-        assert_ne!(result.is_error, Some(true));
+        let result = crate::envelope::finalize_bounded(
+            raw,
+            crate::envelope::Envelope::daemon(),
+            "get_context_pack",
+            &crate::budget::ResponseBudget::from_arguments(&args),
+        );
+        assert_ne!(result.is_error, Some(true), "{result:?}");
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         let value: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(value["token_budget"], 8000);
+        assert_eq!(value["token_budget"], 2500);
         assert_eq!(value["tokens_used"], kin_context::estimate_tokens(text));
-        assert!(kin_context::estimate_tokens(text) <= 8000);
+        assert!(kin_context::estimate_tokens(text) <= 2500);
+        assert_eq!(value["focal_entity"]["body"], body);
+        assert_eq!(value["focal_entity"]["body_complete"], true);
+        let kept = value["dependents"].as_array().unwrap().len();
+        let withheld = value["dependents_withheld"].as_u64().unwrap() as usize;
+        assert!(kept < 40, "{text}");
+        assert_eq!(kept + withheld, 40, "{text}");
+        assert_eq!(value["dependency_selection"]["certified_dependents"], 40);
+        assert_eq!(value["dependency_selection"]["dependents_returned"], kept);
+        assert!(value["elisions"]["dependents"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("token_budget"));
+        assert!(value.get("edge_coverage").is_some());
+        assert!(value.get("negative").is_some());
+        assert_eq!(value["negative"]["result_count"], kept);
+        assert_eq!(value["negative"]["safe_to_conclude_absent"], false);
+        assert_eq!(value["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+        assert_eq!(value["negative"]["interpretation"], "qualified_answer");
+        assert!(value["negative"]["subject"]
+            .as_str()
+            .unwrap()
+            .contains("were found but withheld"));
         assert_eq!(
-            value["focal_entity"]["body"],
-            "fn exact() {\r\n    execute();\r\n}"
+            value["_kin"]["verdict"]["inputs"]["response_budget"],
+            "inconclusive"
         );
+        assert!(value["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .unwrap()
+            .starts_with("response_bounded"));
+        assert!(value["_kin"]["completeness"]["limits"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("response_bounded")));
     }
 
     #[test]
@@ -4303,6 +4822,7 @@ mod tests {
         let args = HashMap::from([
             ("entity_id".into(), serde_json::json!(entity.id.to_string())),
             ("compact".into(), serde_json::json!(false)),
+            ("neighbor_bodies".into(), serde_json::json!(true)),
         ]);
         let value = tool_result_json(
             entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
@@ -4316,6 +4836,143 @@ mod tests {
         assert_eq!(dep["body"].as_str(), Some(content.as_str()));
         assert_eq!(dep["projection"], "FullBody");
         assert_eq!(dep["body_complete"], true);
+    }
+
+    /// A focal with one dependency, both backed by exact graph-owned source.
+    fn context_focal_with_a_dependency(
+        content: &str,
+    ) -> (
+        GraphBackedSource,
+        EntityId,
+        EmptyStore,
+        RequestRepositoryAuthority,
+    ) {
+        let source = make_source_backed_entity(content);
+        let entity = source.entity.clone();
+        let mut dependency = entity.clone();
+        dependency.id = EntityId::new();
+        dependency.name = "dependency".into();
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .entities_by_id
+            .insert(dependency.id, dependency.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        store.insert_test_calls_relation(&entity, &dependency);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        (source, dependency.id, store, authority)
+    }
+
+    #[test]
+    fn context_neighbours_are_signatures_unless_their_bodies_are_asked_for() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "return café;\r\n".repeat(46);
+        let (source, dependency, store, authority) = context_focal_with_a_dependency(&content);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let args = HashMap::from([(
+            "entity_id".into(),
+            serde_json::json!(source.entity.id.to_string()),
+        )]);
+        let value = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+
+        // The focal is still the exact span, byte for byte.
+        assert_eq!(
+            value["focal_entity"]["body"].as_str(),
+            Some(content.as_str())
+        );
+        assert_eq!(value["focal_entity"]["projection"], "FullBody");
+        assert_eq!(value["focal_entity"]["body_complete"], true);
+
+        // The neighbour is the signature the schema promises, and an unasked-for
+        // body is not reported as a gap.
+        let dep = value["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == dependency.to_string())
+            .expect("dependency retained");
+        assert_eq!(dep["projection"], "SignatureOnly", "{dep}");
+        assert!(dep.get("body").is_none(), "{dep}");
+        assert!(dep.get("body_unavailable").is_none(), "{dep}");
+        assert!(dep.get("body_complete").is_none(), "{dep}");
+    }
+
+    #[test]
+    fn context_focal_body_false_serves_the_neighbourhood_alone() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "return café;\r\n".repeat(46);
+        let (source, dependency, store, authority) = context_focal_with_a_dependency(&content);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let args = HashMap::from([
+            (
+                "entity_id".into(),
+                serde_json::json!(source.entity.id.to_string()),
+            ),
+            ("focal_body".into(), serde_json::json!(false)),
+        ]);
+        let value = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+
+        let focal = &value["focal_entity"];
+        assert_eq!(focal["id"], source.entity.id.to_string());
+        assert_eq!(focal["signature"], source.entity.signature);
+        assert_eq!(focal["projection"], "SignatureOnly", "{focal}");
+        assert_eq!(focal["body_omitted"], "focal_body:false", "{focal}");
+        for key in ["body", "body_complete", "body_unavailable", "body_elided"] {
+            assert!(focal.get(key).is_none(), "{key} on {focal}");
+        }
+        assert!(
+            value["dependencies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == dependency.to_string()),
+            "the neighbourhood is still served: {value}"
+        );
+    }
+
+    #[test]
+    fn context_body_controls_are_refused_on_multi_focal_packs() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "return café;\r\n".repeat(4);
+        let (source, _dependency, store, authority) = context_focal_with_a_dependency(&content);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        for (control, value) in [
+            ("focal_body", serde_json::json!(false)),
+            ("neighbor_bodies", serde_json::json!(true)),
+        ] {
+            let args = HashMap::from([
+                (
+                    "question_focals".into(),
+                    serde_json::json!([{"entity_id": source.entity.id.to_string(), "route": "id"}]),
+                ),
+                (control.to_string(), value),
+            ]);
+            let result =
+                entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                    .unwrap();
+            assert_eq!(result.is_error, Some(true), "{control}: {result:?}");
+            let text = format!("{result:?}");
+            assert!(
+                text.contains("applies to a single `entity_id` context pack"),
+                "{control}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -5478,6 +6135,100 @@ mod tests {
         assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "validated");
     }
 
+    #[tokio::test]
+    async fn revoked_offline_owner_cannot_publish_but_live_owner_can() {
+        use crate::session::{
+            CoordinationEnforcementMode, McpMutationOperation, McpMutationPayload,
+        };
+        for mode in [
+            CoordinationEnforcementMode::Off,
+            CoordinationEnforcementMode::Warn,
+            CoordinationEnforcementMode::Enforce,
+        ] {
+            let store = InMemoryGraph::default();
+            let registry = SessionRegistry::new();
+            registry.set_coordination_mode(mode);
+            let start = || {
+                registry.start_agent_session(
+                    "codex",
+                    "offline-owner",
+                    SessionTransport::Mcp,
+                    None,
+                    PathBuf::from("/tmp"),
+                    SessionCapabilities {
+                        can_write: true,
+                        can_commit: true,
+                        ..Default::default()
+                    },
+                )
+            };
+            let owner = start();
+            let entity = placement_free_entity("retained");
+            store.upsert_entity(&entity).unwrap();
+            let operation = McpMutationOperation {
+                verb: "delete".into(),
+                target: entity.id.to_string(),
+                payload: Some(McpMutationPayload::Entity(entity.clone())),
+                body: None,
+                description: "offline control".into(),
+                destination: None,
+            };
+            let tx = registry
+                .begin_transaction(&owner.session_id.to_string(), "repository")
+                .unwrap();
+            registry
+                .stage_transaction(&tx.transaction_id, vec![operation.clone()])
+                .unwrap();
+            let before =
+                serde_json::to_value(registry.get_transaction(&tx.transaction_id)).unwrap();
+            registry.end_agent_session(&owner.session_id).unwrap();
+            let args = HashMap::from([(
+                "transaction_id".into(),
+                serde_json::json!(tx.transaction_id),
+            )]);
+            let refused = sessions::handle_transaction_commit(
+                &args,
+                &store,
+                &registry,
+                SessionAuthorityMode::OfflineFallback,
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused.is_error, Some(true), "{refused:?}");
+            let crate::types::ContentBlock::Text { text } = &refused.content[0];
+            assert!(text.contains("Session not found"), "{text}");
+            assert_eq!(
+                serde_json::to_value(registry.get_transaction(&tx.transaction_id)).unwrap(),
+                before
+            );
+            assert_eq!(
+                store.get_entity(&entity.id).unwrap().unwrap().name,
+                entity.name
+            );
+            let fresh = start();
+            let next = registry
+                .begin_transaction(&fresh.session_id.to_string(), "repository")
+                .unwrap();
+            registry
+                .stage_transaction(&next.transaction_id, vec![operation])
+                .unwrap();
+            let args = HashMap::from([(
+                "transaction_id".into(),
+                serde_json::json!(next.transaction_id),
+            )]);
+            let committed = sessions::handle_transaction_commit(
+                &args,
+                &store,
+                &registry,
+                SessionAuthorityMode::OfflineFallback,
+            )
+            .await
+            .unwrap();
+            assert_ne!(committed.is_error, Some(true), "{committed:?}");
+            assert!(store.get_entity(&entity.id).unwrap().is_none());
+        }
+    }
+
     /// A graph-resident entity with no repository placement, so an in-process
     /// commit is not gated by kin-db's staged-tree consistency check and the
     /// assertions stay about commit-shape handling.
@@ -5549,14 +6300,19 @@ mod tests {
         }
     }
 
+    /// A payload-less `update` carrying a target and a body replaces the
+    /// entity's whole span and names no version of the entity it replaces, so
+    /// a change made after the caller's read would be overwritten without a
+    /// word. It is refused as `source_base_required` before anything is
+    /// staged, and a transaction that already holds one, staged by a route
+    /// that ran no semantic check, meets the same refusal at commit.
+    ///
+    /// The control is the guarded form of the same edit. It stages clean, and
+    /// the in-process commit then refuses it for its own reason: this path has
+    /// no projection to write a body with. Without the control, the refusals
+    /// above would pass just as well against a stage that refused every body.
     #[tokio::test]
-    async fn offline_commit_refuses_payload_less_source_update() {
-        // A payload-less `update` carrying a target and a body is a real source
-        // edit, but planning the exact span edit and projecting the new source
-        // into the working file lives in the daemon. The in-process path has no
-        // projection, so it must refuse the shape instead of applying a
-        // same-entity no-op delta and reporting "committed", which would
-        // report an agent's edit as durable while discarding the body.
+    async fn a_payload_less_source_update_is_refused_as_source_base_required_offline() {
         use crate::session::{McpMutationOperation, McpMutationPayload};
 
         let store = InMemoryGraph::default();
@@ -5569,7 +6325,6 @@ mod tests {
         let session_authority = SessionAuthorityMode::OfflineFallback;
         let tx_id = begin_offline_transaction(&sessions, "offline-payload-less-refusal").await;
 
-        // Staging still accepts the shape: the daemon commit path can honor it.
         let op = McpMutationOperation {
             verb: "update".into(),
             target: "value".into(),
@@ -5580,25 +6335,36 @@ mod tests {
         };
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
-        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
-        let stage_res =
+        stage_args.insert("operations".into(), serde_json::json!(vec![op.clone()]));
+        let err =
             sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
                 .await
-                .unwrap();
-        assert_ne!(
-            stage_res.is_error,
-            Some(true),
-            "staging must keep accepting the daemon-committable shape: {}",
-            tool_result_text(&stage_res)
+                .expect_err("an unguarded replacement must be refused at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        let refusal = err.to_string();
+        assert!(
+            refusal.contains("source_base_required:")
+                && refusal.contains("EntitySourceBase")
+                && refusal.contains("get_entity_source"),
+            "the refusal must name the missing base and the read that supplies it, got: {refusal}"
+        );
+        assert!(
+            sessions
+                .get_transaction(&tx_id)
+                .unwrap()
+                .staged_operations
+                .is_empty(),
+            "a refused stage stages nothing"
         );
 
+        // A transaction that already holds the shape is refused at commit too.
+        sessions.stage_transaction(&tx_id, vec![op]).unwrap();
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         let commit_res =
             sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
                 .await
                 .unwrap();
-
         assert_eq!(
             commit_res.is_error,
             Some(true),
@@ -5606,8 +6372,8 @@ mod tests {
         );
         let commit_text = tool_result_text(&commit_res);
         assert!(
-            commit_text.contains("require the daemon commit path"),
-            "message must name the daemon requirement, got: {commit_text}"
+            commit_text.starts_with("source_base_required:"),
+            "the commit must refuse for the missing base, got: {commit_text}"
         );
 
         // Nothing was applied and the transaction is still usable.
@@ -5617,6 +6383,46 @@ mod tests {
             before, after,
             "graph truth must be untouched by the refusal"
         );
+
+        // The control: the same edit carrying its source base stages, then
+        // meets the in-process source-body refusal rather than this one.
+        let tx_id = begin_offline_transaction(&sessions, "offline-guarded-control").await;
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        stage_args.insert(
+            "operations".into(),
+            body_update_operations(entity.id, "pub fn value() -> u8 { 2 }"),
+        );
+        let stage_res =
+            sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
+        assert_ne!(
+            stage_res.is_error,
+            Some(true),
+            "the guarded form must stage: {}",
+            tool_result_text(&stage_res)
+        );
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        let commit_res =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
+        assert_eq!(commit_res.is_error, Some(true));
+        let commit_text = tool_result_text(&commit_res);
+        assert!(
+            commit_text.contains("source_body_requires_daemon_commit")
+                && commit_text.contains("require the daemon commit path"),
+            "the guarded form must reach the in-process source-body refusal, got: {commit_text}"
+        );
+        assert!(
+            !commit_text.contains("source_base_required"),
+            "{commit_text}"
+        );
+        assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "active");
+        let after = serde_json::to_value(store.get_entity(&entity.id).unwrap().unwrap()).unwrap();
+        assert_eq!(before, after);
     }
 
     #[tokio::test]
@@ -5689,8 +6495,12 @@ mod tests {
     /// the agent actually wrote is gone with no signal that it was. A partial
     /// commit reported as a whole one is undetectable to the caller, which is
     /// why the whole operation is refused instead.
+    ///
+    /// The body replaces the entity whole and the payload names no version of
+    /// it, so the operation is refused as `source_base_required`: at stage
+    /// time, and at commit for a transaction that already holds it.
     #[tokio::test]
-    async fn offline_commit_refuses_an_entity_payload_carrying_a_source_body() {
+    async fn an_entity_payload_carrying_a_source_body_is_refused_as_source_base_required() {
         use crate::session::{McpMutationOperation, McpMutationPayload};
 
         let store = InMemoryGraph::default();
@@ -5715,18 +6525,28 @@ mod tests {
         };
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
-        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
-        let stage_res =
+        stage_args.insert("operations".into(), serde_json::json!(vec![op.clone()]));
+        let err =
             sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
                 .await
-                .unwrap();
-        assert_ne!(
-            stage_res.is_error,
-            Some(true),
-            "staging must keep accepting the daemon-committable shape: {}",
-            tool_result_text(&stage_res)
+                .expect_err("an entity payload with a body must be refused at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        assert!(
+            err.to_string().contains("source_base_required:"),
+            "the refusal must name the missing base, got: {err}"
+        );
+        assert!(
+            sessions
+                .get_transaction(&tx_id)
+                .unwrap()
+                .staged_operations
+                .is_empty(),
+            "a refused stage stages nothing"
         );
 
+        // A transaction that already holds the shape is refused at commit, and
+        // the payload half that could have applied on its own does not.
+        sessions.stage_transaction(&tx_id, vec![op]).unwrap();
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         let commit_res =
@@ -5741,12 +6561,9 @@ mod tests {
         );
         let commit_text = tool_result_text(&commit_res);
         assert!(
-            commit_text.contains("require the daemon commit path"),
-            "message must name the daemon requirement, got: {commit_text}"
-        );
-        assert!(
-            commit_text.contains("source_body_requires_daemon_commit"),
-            "refusal must carry its machine-readable code, got: {commit_text}"
+            commit_text.starts_with("source_base_required:")
+                && commit_text.contains("EntitySourceBase"),
+            "refusal must name the missing base and the fix, got: {commit_text}"
         );
 
         assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "active");
@@ -5763,10 +6580,11 @@ mod tests {
     /// it is the form an agent reaches for first. It must reach the same
     /// verdict as stage-then-commit rather than becoming the one route that
     /// reports success for a dropped body.
+    ///
+    /// The operation is the guarded form, which passes the semantic check, so
+    /// the refusal it meets is the in-process source-body one under test.
     #[tokio::test]
     async fn offline_commit_refuses_inline_operations_carrying_a_source_body() {
-        use crate::session::{McpMutationOperation, McpMutationPayload};
-
         let store = InMemoryGraph::default();
         let entity = placement_free_entity("value");
         store.upsert_entity(&entity).unwrap();
@@ -5777,16 +6595,7 @@ mod tests {
         let session_authority = SessionAuthorityMode::OfflineFallback;
         let tx_id = begin_offline_transaction(&sessions, "offline-inline-body").await;
 
-        let mut updated = entity.clone();
-        updated.doc_summary = Some("returns the configured value".into());
-        let op = McpMutationOperation {
-            verb: "update".into(),
-            target: entity.id.to_string(),
-            payload: Some(McpMutationPayload::Entity(updated)),
-            body: Some("pub fn value() -> u8 { 2 }".into()),
-            description: "inline entity payload plus source body".into(),
-            destination: None,
-        };
+        let op = guarded_update(entity.id, "pub fn value() -> u8 { 2 }");
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         commit_args.insert("operations".into(), serde_json::json!(vec![op]));
@@ -5805,14 +6614,76 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    #[tokio::test]
+    async fn inline_commit_truncation_refusal_preserves_staged_work() {
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("value");
+        store.upsert_entity(&entity).unwrap();
+        let before_entity = serde_json::to_value(&entity).unwrap();
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        let tx_id = begin_offline_transaction(&sessions, "inline-truncation").await;
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("already staged metadata".into());
+        let pending = crate::session::parse_staged_operations(&serde_json::json!([{
+            "verb": "update", "target": entity.id.to_string(),
+            "payload": {"Entity": updated}, "description": "retain this work"
+        }]))
+        .unwrap();
+        sessions.stage_transaction(&tx_id, pending).unwrap();
+        let before = sessions.get_transaction(&tx_id).unwrap();
+        // Both carry their source base, so the refusal is the truncation
+        // guard's own and not the missing base's.
+        let clipped = "pub fn value() -> u8 { 3 }\n// … [truncated] \n\t";
+        let args = HashMap::from([
+            ("transaction_id".into(), serde_json::json!(tx_id)),
+            (
+                "operations".into(),
+                serde_json::json!([
+                    guarded_update(entity.id, "pub fn value() -> u8 { 2 }"),
+                    guarded_update(entity.id, clipped)
+                ]),
+            ),
+        ]);
+        let result = sessions::handle_transaction_commit(
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        let text = tool_result_text(&result);
+        let after = sessions.get_transaction(&tx_id).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text.contains("operation #1")
+                && text.contains("[truncated]")
+                && text.contains("get_entity_source"),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::to_value(&after.staged_operations).unwrap(),
+            serde_json::to_value(&before.staged_operations).unwrap()
+        );
+        assert_eq!(after.state, before.state);
+        assert_eq!(
+            serde_json::to_value(store.get_entity(&entity.id).unwrap().unwrap()).unwrap(),
+            before_entity
+        );
+    }
+
     /// A refusal is parseable, not just readable.
     ///
     /// An agent that has to regex prose to decide whether to retry, restage, or
     /// escalate will get it wrong. The refusal carries a stable schema, code,
     /// and operation list so the decision is a field lookup.
+    ///
+    /// The operation is a guarded body update, which passes the semantic check
+    /// and reaches the commit refusal whose rendering is under test.
     #[tokio::test]
     async fn commit_refusal_is_machine_readable() {
-        use crate::session::{CommitRefusal, McpMutationOperation, McpMutationPayload};
+        use crate::session::CommitRefusal;
 
         let store = InMemoryGraph::default();
         let entity = placement_free_entity("value");
@@ -5823,14 +6694,7 @@ mod tests {
         let session_authority = SessionAuthorityMode::OfflineFallback;
         let tx_id = begin_offline_transaction(&sessions, "offline-typed-refusal").await;
 
-        let op = McpMutationOperation {
-            verb: "update".into(),
-            target: "value".into(),
-            payload: None::<McpMutationPayload>,
-            body: Some("pub fn value() -> u8 { 2 }".into()),
-            description: "payload-less body update".into(),
-            destination: None,
-        };
+        let op = guarded_update(entity.id, "pub fn value() -> u8 { 2 }");
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         commit_args.insert("operations".into(), serde_json::json!(vec![op]));
@@ -5907,30 +6771,52 @@ mod tests {
     /// dividing line is simply whether the operation carries source text: if it
     /// does, the commit refuses, and if it does not, the commit applies
     /// everything the operation carried. Nothing lands in between.
+    ///
+    /// A body with no source base is refused as `source_base_required` before
+    /// the commit is attempted, and comes back as invalid params because the
+    /// operations arrived inline. A guarded body passes that check and is
+    /// refused by the commit itself. Each shape names the refusal it expects,
+    /// so one refusal cannot stand in for another.
     #[tokio::test]
     async fn no_commit_shape_reports_success_while_dropping_content() {
         use crate::session::{McpMutationOperation, McpMutationPayload};
 
+        #[derive(Clone, Copy)]
+        enum Payload {
+            Absent,
+            Entity,
+            SourceBase,
+        }
         struct Shape {
             label: &'static str,
             body: Option<&'static str>,
-            with_payload: bool,
+            payload: Payload,
+            refusal: Option<&'static str>,
         }
         let shapes = [
             Shape {
                 label: "payload-less source edit",
                 body: Some("pub fn value() -> u8 { 2 }"),
-                with_payload: false,
+                payload: Payload::Absent,
+                refusal: Some("source_base_required:"),
             },
             Shape {
                 label: "entity payload plus source edit",
                 body: Some("pub fn value() -> u8 { 2 }"),
-                with_payload: true,
+                payload: Payload::Entity,
+                refusal: Some("source_base_required:"),
+            },
+            Shape {
+                label: "guarded source edit",
+                body: Some("pub fn value() -> u8 { 2 }"),
+                payload: Payload::SourceBase,
+                refusal: Some("source_body_requires_daemon_commit"),
             },
             Shape {
                 label: "entity payload alone",
                 body: None,
-                with_payload: true,
+                payload: Payload::Entity,
+                refusal: None,
             },
         ];
 
@@ -5949,9 +6835,13 @@ mod tests {
             let op = McpMutationOperation {
                 verb: "update".into(),
                 target: entity.id.to_string(),
-                payload: shape
-                    .with_payload
-                    .then_some(McpMutationPayload::Entity(updated)),
+                payload: match shape.payload {
+                    Payload::Absent => None,
+                    Payload::Entity => Some(McpMutationPayload::Entity(updated)),
+                    Payload::SourceBase => Some(McpMutationPayload::EntitySourceBase(
+                        test_source_base(entity.id),
+                    )),
+                },
                 body: shape.body.map(str::to_string),
                 description: shape.label.into(),
                 destination: None,
@@ -5959,27 +6849,35 @@ mod tests {
             let mut commit_args = HashMap::new();
             commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
             commit_args.insert("operations".into(), serde_json::json!(vec![op]));
-            let commit_res = sessions::handle_transaction_commit(
+            // A refusal is either a tool error or, for inline operations the
+            // semantic check refuses, invalid params. Both are refusals.
+            let (refused, text) = match sessions::handle_transaction_commit(
                 &commit_args,
                 &store,
                 &sessions,
                 session_authority,
             )
             .await
-            .unwrap();
+            {
+                Ok(result) => (result.is_error == Some(true), tool_result_text(&result)),
+                Err(error) => (true, error.to_string()),
+            };
 
-            let text = tool_result_text(&commit_res);
             let applied = store
                 .get_entity(&entity.id)
                 .unwrap()
                 .unwrap()
                 .doc_summary
                 .is_some();
-            if shape.body.is_some() {
-                assert_eq!(
-                    commit_res.is_error,
-                    Some(true),
+            if let Some(expected) = shape.refusal {
+                assert!(
+                    refused,
                     "{}: a body this path cannot write must refuse: {text}",
+                    shape.label
+                );
+                assert!(
+                    text.contains(expected),
+                    "{}: expected the {expected} refusal, got: {text}",
                     shape.label
                 );
                 assert!(
@@ -5988,9 +6886,8 @@ mod tests {
                     shape.label
                 );
             } else {
-                assert_ne!(
-                    commit_res.is_error,
-                    Some(true),
+                assert!(
+                    !refused,
                     "{}: a body-free operation must still commit: {text}",
                     shape.label
                 );
@@ -6017,10 +6914,12 @@ mod tests {
     /// writes into a path that refuses every body-carrying operation.
     ///
     /// Pinned here so that change fails a test instead of failing a user.
+    ///
+    /// The staged operation is a guarded body update, the shape that would
+    /// meet the in-process refusal if this path were reached. An unguarded one
+    /// would meet `source_base_required` first and hide that refusal.
     #[tokio::test]
     async fn daemon_required_mode_never_reaches_the_in_process_refusal() {
-        use crate::session::{McpMutationOperation, McpMutationPayload};
-
         let store = InMemoryGraph::default();
         let entity = placement_free_entity("value");
         store.upsert_entity(&entity).unwrap();
@@ -6033,14 +6932,7 @@ mod tests {
         sessions
             .stage_transaction(
                 &tx_id,
-                vec![McpMutationOperation {
-                    verb: "update".into(),
-                    target: entity.id.to_string(),
-                    payload: None::<McpMutationPayload>,
-                    body: Some("pub fn value() -> u8 { 2 }".into()),
-                    description: "body update".into(),
-                    destination: None,
-                }],
+                vec![guarded_update(entity.id, "pub fn value() -> u8 { 2 }")],
             )
             .unwrap();
 
@@ -6130,6 +7022,208 @@ mod tests {
         );
         let text = tool_result_text(&res);
         assert!(text.contains("committed") || text.contains("applied") || text.contains("receipt"));
+    }
+
+    /// A session's declared capabilities hold at every in-process write door,
+    /// whatever the coordination mode. They used to be checked only when
+    /// coordination was enforced, which it is not by default, so a session
+    /// that declared itself read-only could begin, stage and commit.
+    #[tokio::test]
+    async fn a_read_only_session_is_refused_at_every_offline_write_door() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let entity = placement_free_entity("ReadOnlyTarget");
+        store.upsert_entity(&entity).unwrap();
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("written by a session that may not write".into());
+        let operations = serde_json::json!([{
+            "verb": "update",
+            "target": entity.id.to_string(),
+            "description": "update entity docs",
+            "payload": { "Entity": updated },
+        }]);
+        fn args(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect()
+        }
+        fn refused(result: &crate::types::ToolCallResult, door: &str, missing: &str) {
+            let text = tool_result_text(result);
+            assert_eq!(result.is_error, Some(true), "{door} must refuse: {text}");
+            assert!(text.starts_with("read_only_session: "), "{text}");
+            assert!(text.contains(&format!("{door} writes")), "{text}");
+            assert!(text.contains(missing), "{text}");
+            assert!(text.contains("kin_session_start"), "{text}");
+        }
+        let offline = SessionAuthorityMode::OfflineFallback;
+        let start = |label: &str, capabilities: SessionCapabilities| {
+            sessions
+                .start_agent_session(
+                    "codex",
+                    label,
+                    SessionTransport::Mcp,
+                    None,
+                    PathBuf::from("/tmp"),
+                    capabilities,
+                )
+                .session_id
+                .to_string()
+        };
+
+        // Read-only, the way a session that declares nothing used to start.
+        let reader = start("reader", SessionCapabilities::default());
+        let begin = sessions::handle_transaction_begin(
+            &args(&[
+                ("session_id", serde_json::json!(reader)),
+                ("scope", serde_json::json!("repository")),
+            ]),
+            &sessions,
+            offline,
+        )
+        .await
+        .unwrap();
+        refused(&begin, "kin_transaction_begin", "can_write=false");
+        let mutate = sessions::handle_mutate(
+            &args(&[
+                ("session_id", serde_json::json!(reader)),
+                ("operations", operations.clone()),
+            ]),
+            &store,
+            &sessions,
+            offline,
+        )
+        .await
+        .unwrap();
+        refused(
+            &mutate,
+            "kin_mutate",
+            "can_write=false and can_commit=false",
+        );
+
+        // A transaction the session holds from before it started read-only,
+        // which is what a restart and a re-registration under the same id
+        // leave behind.
+        sessions.replace_transactions(vec![crate::session::McpTransaction {
+            transaction_id: "retained".into(),
+            session_id: reader.clone(),
+            scope: "repository".into(),
+            state: "active".into(),
+            staged_operations: Vec::new(),
+            commit_payload_hash: None,
+            last_activity_at: kin_model::timestamp::Timestamp::now(),
+        }]);
+        let stage = sessions::handle_transaction_stage(
+            &args(&[
+                ("transaction_id", serde_json::json!("retained")),
+                ("operations", operations.clone()),
+            ]),
+            &store,
+            &sessions,
+            offline,
+        )
+        .await
+        .unwrap();
+        refused(&stage, "kin_transaction_stage", "can_write=false");
+        for inline in [false, true] {
+            let mut commit_args = args(&[("transaction_id", serde_json::json!("retained"))]);
+            if inline {
+                commit_args.insert("operations".into(), operations.clone());
+            }
+            let commit =
+                sessions::handle_transaction_commit(&commit_args, &store, &sessions, offline)
+                    .await
+                    .unwrap();
+            refused(&commit, "kin_transaction_commit", "can_write=false");
+        }
+        let retained = sessions.get_transaction("retained").unwrap();
+        assert_eq!(retained.state, "active");
+        assert!(
+            retained.staged_operations.is_empty(),
+            "a refused door stages nothing"
+        );
+
+        // A session that may write but not commit stages, and is refused only
+        // where the transaction would publish.
+        let stager = start(
+            "stager",
+            SessionCapabilities {
+                can_write: true,
+                ..SessionCapabilities::default()
+            },
+        );
+        let begin = sessions::handle_transaction_begin(
+            &args(&[
+                ("session_id", serde_json::json!(stager)),
+                ("scope", serde_json::json!("repository")),
+            ]),
+            &sessions,
+            offline,
+        )
+        .await
+        .unwrap();
+        assert_ne!(begin.is_error, Some(true), "{}", tool_result_text(&begin));
+        let transaction: serde_json::Value =
+            serde_json::from_str(&tool_result_text(&begin)).unwrap();
+        let transaction_id = transaction["transaction_id"].clone();
+        let stage = sessions::handle_transaction_stage(
+            &args(&[
+                ("transaction_id", transaction_id.clone()),
+                ("operations", operations.clone()),
+            ]),
+            &store,
+            &sessions,
+            offline,
+        )
+        .await
+        .unwrap();
+        assert_ne!(stage.is_error, Some(true), "{}", tool_result_text(&stage));
+        let commit = sessions::handle_transaction_commit(
+            &args(&[("transaction_id", transaction_id)]),
+            &store,
+            &sessions,
+            offline,
+        )
+        .await
+        .unwrap();
+        refused(&commit, "kin_transaction_commit", "can_commit=false");
+        assert!(!tool_result_text(&commit).contains("can_write=false"));
+        assert_eq!(
+            store.get_entity(&entity.id).unwrap().unwrap().doc_summary,
+            None,
+            "nothing a refused door carried reached the graph"
+        );
+
+        // The control: a session that may write and commit passes the same door.
+        let writer = start(
+            "writer",
+            SessionCapabilities {
+                can_write: true,
+                can_commit: true,
+                ..SessionCapabilities::default()
+            },
+        );
+        let mutate = sessions::handle_mutate(
+            &args(&[
+                ("session_id", serde_json::json!(writer)),
+                ("operations", operations),
+            ]),
+            &store,
+            &sessions,
+            offline,
+        )
+        .await
+        .unwrap();
+        assert_ne!(mutate.is_error, Some(true), "{}", tool_result_text(&mutate));
+        assert_eq!(
+            store
+                .get_entity(&entity.id)
+                .unwrap()
+                .unwrap()
+                .doc_summary
+                .as_deref(),
+            Some("written by a session that may not write")
+        );
     }
 
     #[tokio::test]
@@ -6240,17 +7334,140 @@ mod tests {
         assert_eq!(calls[0].1, args);
     }
 
-    /// A payload-less entity update carrying the body and nothing else.
+    /// The keyed half of the `allOf` `kin_mutate`'s schema used to carry: a
+    /// call with a `request_id` names its session, or it is refused before
+    /// anything is forwarded, whether the session is absent or null. The
+    /// scope and field allowlist of a keyed call are the daemon's durable
+    /// route's to refuse, and are held there.
+    #[tokio::test]
+    async fn a_keyed_mutate_without_a_session_is_refused_before_anything_is_forwarded() {
+        for session in [None, Some(serde_json::Value::Null)] {
+            let mut args = HashMap::from([
+                ("request_id".to_string(), serde_json::json!("key-1")),
+                ("operations".to_string(), serde_json::json!([])),
+            ]);
+            if let Some(session) = session {
+                args.insert("session_id".to_string(), session);
+            }
+            let forwarded = std::sync::atomic::AtomicUsize::new(0);
+            let refused = sessions::mutate_through(&args, |_, _| {
+                forwarded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(Some(crate::ToolCallResult::text("{}"))) }
+            })
+            .await
+            .unwrap();
+            assert_eq!(refused.is_error, Some(true), "{args:?}");
+            assert!(tool_result_text(&refused).contains("session_id"));
+            assert_eq!(forwarded.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    /// Through the stdio server an unkeyed kin_mutate reaches the daemon as a
+    /// forwarded begin and commit. A read-only refusal from either names
+    /// kin_mutate, the tool the caller sent, and keeps the rest of the
+    /// daemon's sentence.
+    #[tokio::test]
+    async fn a_forwarded_read_only_refusal_names_kin_mutate() {
+        let session = "11111111-1111-4111-8111-111111111111";
+        let args = HashMap::from([
+            ("session_id".to_string(), serde_json::json!(session)),
+            (
+                "operations".to_string(),
+                body_update_operations(EntityId::new(), "def written():\n    return 1\n"),
+            ),
+        ]);
+        fn refusal(door: &str) -> String {
+            format!(
+                "read_only_session: {door} writes, and session 11111111 may not: it started \
+                 with can_write=false and can_commit=false"
+            )
+        }
+        let expected = "read_only_session: kin_mutate writes, and session 11111111 may not: it \
+                        started with can_write=false and can_commit=false";
+
+        let refused_at_begin = sessions::mutate_through(&args, |name, _| {
+            let answer = crate::ToolCallResult::error(refusal(name));
+            async move { Ok(Some(answer)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(refused_at_begin.is_error, Some(true));
+        assert_eq!(tool_result_text(&refused_at_begin), expected);
+
+        let calls = std::sync::Mutex::new(Vec::new());
+        let refused_at_commit = sessions::mutate_through(&args, |name, _| {
+            calls.lock().unwrap().push(name);
+            let answer = match name {
+                "kin_transaction_begin" => {
+                    crate::ToolCallResult::text(r#"{"transaction_id":"tx-read-only"}"#)
+                }
+                "kin_transaction_commit" => crate::ToolCallResult::error(refusal(name)),
+                _ => crate::ToolCallResult::text("{}"),
+            };
+            async move { Ok(Some(answer)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(refused_at_commit.is_error, Some(true));
+        assert_eq!(tool_result_text(&refused_at_commit), expected);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "kin_transaction_begin",
+                "kin_transaction_commit",
+                "kin_transaction_abort"
+            ],
+            "a refused commit still aborts the transaction it began"
+        );
+    }
+
+    /// A well-formed source base for `entity`, in the shape `get_entity_source`
+    /// serves.
     ///
-    /// The shape the belt actually sends: an agent knows the entity and the new
-    /// source, not Kin's entity struct.
-    fn body_update_operations(target: &str, body: &str) -> serde_json::Value {
-        serde_json::json!([{
-            "verb": "update",
-            "target": target,
-            "body": body,
-            "description": "replace the entity body",
-        }])
+    /// Nothing on an offline or scripted route compares a base with repository
+    /// bytes, so these tests need only what `EntitySourceBase::validate`
+    /// checks: 64-hex hashes, a UUID workspace id and a nonempty byte span.
+    fn test_source_base(entity: EntityId) -> crate::source_base::EntitySourceBase {
+        crate::source_base::EntitySourceBase {
+            schema: crate::source_base::SourceBaseSchema::V1,
+            context: crate::source_base::SourceBaseContext {
+                repository_id: "handler-test".into(),
+                workspace_id: uuid::Uuid::new_v4().to_string(),
+                workspace_generation: 1,
+                workspace_head_hash: "a".repeat(64),
+                workspace_tree_hash: "b".repeat(64),
+            },
+            entity_id: entity,
+            artifact_id: kin_model::ArtifactId::new(),
+            source_blob_hash: "c".repeat(64),
+            start_byte: 0,
+            end_byte: 12,
+            body_hash: "d".repeat(64),
+        }
+    }
+
+    /// A guarded whole-entity update: the new body beside the source base of
+    /// the version it replaces, with that base's entity id as the target.
+    fn guarded_update(entity: EntityId, body: &str) -> crate::session::McpMutationOperation {
+        crate::session::McpMutationOperation {
+            verb: "update".into(),
+            target: entity.to_string(),
+            payload: Some(crate::session::McpMutationPayload::EntitySourceBase(
+                test_source_base(entity),
+            )),
+            body: Some(body.into()),
+            description: "replace the entity body".into(),
+            destination: None,
+        }
+    }
+
+    /// A guarded entity update carrying the body and the base it replaces.
+    ///
+    /// The shape the belt sends: the entity's UUID as target, its complete new
+    /// source, and the unchanged `source_base` a `get_entity_source` read
+    /// returned. A body without its base is refused as `source_base_required`.
+    fn body_update_operations(entity: EntityId, body: &str) -> serde_json::Value {
+        serde_json::json!([guarded_update(entity, body)])
     }
 
     /// A malformed operations array comes back as a tool error, never as a
@@ -6361,7 +7578,7 @@ mod tests {
         let clipped = "pub fn clipped() -> u8 {\n    let a = 1;\n... [truncated]";
         let args = HashMap::from([(
             "operations".to_string(),
-            body_update_operations(&entity.id.to_string(), clipped),
+            body_update_operations(entity.id, clipped),
         )]);
         let res = sessions::handle_mutate(
             &args,
@@ -6407,7 +7624,7 @@ mod tests {
             ),
             (
                 "operations".to_string(),
-                body_update_operations(&entity.id.to_string(), clipped),
+                body_update_operations(entity.id, clipped),
             ),
         ]);
         let res = sessions::handle_transaction_stage(
@@ -6439,14 +7656,11 @@ mod tests {
     async fn a_daemon_mode_mutate_without_a_session_is_refused_by_name() {
         let store = InMemoryGraph::default();
         let sessions = SessionRegistry::new();
+        // Guarded, so the operations pass the semantic check that runs before
+        // the session is resolved and the refusal under test is the session's.
         let args = HashMap::from([(
             "operations".to_string(),
-            serde_json::json!([{
-                "verb": "update",
-                "target": "Widget",
-                "body": "pub fn widget() {}",
-                "description": "edit",
-            }]),
+            body_update_operations(EntityId::new(), "pub fn widget() {}"),
         )]);
 
         let res = sessions::handle_mutate(
@@ -6517,6 +7731,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repository_base_conflict_aborts_the_one_shot_and_hands_back_the_base() {
+        fn current() -> crate::source_unit::RepositoryBase {
+            crate::source_unit::RepositoryBase {
+                schema: crate::source_unit::RepositoryBaseSchema::V1,
+                context: crate::source_base::SourceBaseContext {
+                    repository_id: "one-shot".into(),
+                    workspace_id: "22222222-2222-4222-8222-222222222222".into(),
+                    workspace_generation: 9,
+                    workspace_head_hash: "a".repeat(64),
+                    workspace_tree_hash: "b".repeat(64),
+                },
+            }
+        }
+        let calls: Recorded = Default::default();
+        let result = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                calls.clone(),
+                || {
+                    Ok(Some(ToolCallResult::error(
+                        crate::source_unit::repository_base_conflict(
+                            "tx-1",
+                            "tree changed",
+                            Some(&current()),
+                            &[],
+                        ),
+                    )))
+                },
+                || Ok(Some(ToolCallResult::text(r#"{"state":"aborted"}"#))),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let refusal: serde_json::Value = serde_json::from_str(&tool_result_text(&result)).unwrap();
+        assert_eq!(refusal["code"], "repository_base_conflict");
+        assert_eq!(refusal["transaction_aborted"], true);
+        assert!(refusal["next_step"]
+            .as_str()
+            .unwrap()
+            .starts_with("Resend the same operations with current_repository_base"));
+        assert!(refusal["remedy"].as_str().unwrap().contains("next_step"));
+        assert_eq!(refusal["staged_operations_retained"], false);
+        assert_eq!(
+            serde_json::from_value::<crate::source_unit::RepositoryBase>(
+                refusal["current_repository_base"].clone()
+            )
+            .unwrap(),
+            current()
+        );
+        assert_eq!(
+            forwarded(&calls),
+            [
+                "kin_transaction_begin",
+                "kin_transaction_commit",
+                "kin_transaction_abort"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_source_base_conflict_retains_the_one_shot_transaction() {
         let calls: Recorded = Default::default();
         let result = sessions::mutate_through(
@@ -6551,7 +7826,7 @@ mod tests {
             ),
             (
                 "operations".to_string(),
-                body_update_operations("Widget", "pub fn widget() {}"),
+                body_update_operations(EntityId::new(), "pub fn widget() {}"),
             ),
         ])
     }
@@ -6563,6 +7838,113 @@ mod tests {
             .iter()
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// A whole-entity replacement without its source base is refused by
+    /// `kin_mutate`'s own check, before the daemon hears of it.
+    ///
+    /// Both unguarded shapes are covered: a payload-less update with a body,
+    /// and an `Entity` payload with a body. The refusal names the fix, so a
+    /// caller can resend from the refusal alone, and nothing was begun, so
+    /// there is nothing to abort. The control is the same edit carrying its
+    /// base: it passes the same check and reaches the forward with the base
+    /// intact, so the refusal is about the missing base and not the body.
+    #[tokio::test]
+    async fn kin_mutate_refuses_an_unguarded_replacement_before_any_forward() {
+        let entity = placement_free_entity("Widget");
+        let body = "pub fn widget() {}";
+        let unguarded = [
+            (
+                "payload-less update",
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "body": body,
+                    "description": "replace the entity body",
+                }]),
+            ),
+            (
+                "entity payload plus body",
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "payload": { "Entity": entity },
+                    "body": body,
+                    "description": "replace the entity body",
+                }]),
+            ),
+        ];
+        for (label, operations) in unguarded {
+            let args = HashMap::from([
+                ("session_id".to_string(), serde_json::json!(SESSIONED)),
+                ("operations".to_string(), operations),
+            ]);
+            let checked = sessions::checked_mutate_operations(&args)
+                .expect_err("an unguarded replacement must not pass kin_mutate's check");
+            let checked = tool_result_text(&checked);
+            assert!(
+                checked.starts_with("source_base_required: operation #0 ('update')"),
+                "{label}: {checked}"
+            );
+            assert!(
+                checked.contains("EntitySourceBase") && checked.contains("get_entity_source"),
+                "{label}: the refusal must name the fix: {checked}"
+            );
+
+            let calls: Recorded = Default::default();
+            let result = sessions::mutate_through(
+                &args,
+                scripted_forward(
+                    calls.clone(),
+                    || Err("an unguarded replacement must never be committed".into()),
+                    || Err("nothing began, so nothing may be aborted".into()),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_error, Some(true), "{label}");
+            assert_eq!(
+                tool_result_text(&result),
+                checked,
+                "{label}: kin_mutate answers with the check's own refusal"
+            );
+            assert!(
+                forwarded(&calls).is_empty(),
+                "{label}: nothing may reach the daemon: {:?}",
+                forwarded(&calls)
+            );
+        }
+
+        // The control: the same edit with its source base is forwarded, and
+        // the commit carries the base the caller sent.
+        let args = HashMap::from([
+            ("session_id".to_string(), serde_json::json!(SESSIONED)),
+            (
+                "operations".to_string(),
+                body_update_operations(entity.id, body),
+            ),
+        ]);
+        assert!(sessions::checked_mutate_operations(&args).is_ok());
+        let calls: Recorded = Default::default();
+        let result = sessions::mutate_through(
+            &args,
+            scripted_forward(
+                calls.clone(),
+                || Ok(Some(ToolCallResult::text(r#"{"status":"committed"}"#))),
+                || Err("a landed commit is never aborted".into()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", tool_result_text(&result));
+        assert_eq!(
+            forwarded(&calls),
+            ["kin_transaction_begin", "kin_transaction_commit"]
+        );
+        assert_eq!(
+            calls.lock().unwrap()[1].1["operations"][0]["payload"]["EntitySourceBase"]["entity_id"],
+            entity.id.to_string()
+        );
     }
 
     /// A commit the daemon refuses is aborted, and the abort names the transaction.
@@ -6660,6 +8042,161 @@ mod tests {
         );
     }
 
+    /// The first line of a refusal, parsed as the not-started marker when it is one.
+    fn not_started_marker(result: &ToolCallResult) -> Option<serde_json::Value> {
+        let text = tool_result_text(result);
+        let first = text.lines().next()?;
+        serde_json::from_str(first.strip_prefix("kin_mutate_not_started: ")?).ok()
+    }
+
+    const SESSIONED: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// A begin refused because this call's session is gone started nothing, and says so
+    /// on a first line a caller can read. The daemon's own sentence follows unchanged.
+    #[tokio::test]
+    async fn a_begin_refused_for_a_gone_session_is_marked_not_started() {
+        let gone = format!(
+            "Session not found: {SESSIONED}. It was ended or expired after its idle timeout or \
+             the daemon restarted."
+        );
+        let calls = std::sync::Mutex::new(Vec::new());
+        let refusal = gone.clone();
+        let result = sessions::mutate_through(&sessioned_mutate(), |name, _| {
+            calls.lock().unwrap().push(name);
+            let answer = ToolCallResult::error(refusal.clone());
+            async move { Ok(Some(answer)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            not_started_marker(&result),
+            Some(serde_json::json!({
+                "stage": "begin",
+                "refusal": "session_not_found",
+                "session_id": SESSIONED,
+            }))
+        );
+        assert!(tool_result_text(&result).ends_with(&gone));
+        assert_eq!(*calls.lock().unwrap(), ["kin_transaction_begin"]);
+
+        // The control: a gone session this call did not send is not this call's.
+        let other = "Session not found: 22222222-2222-4222-8222-222222222222. It was ended.";
+        let result = sessions::mutate_through(&sessioned_mutate(), |_, _| {
+            let answer = ToolCallResult::error(other);
+            async move { Ok(Some(answer)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(not_started_marker(&result), None);
+        assert!(!tool_result_text(&result).contains("kin_mutate_not_started"));
+    }
+
+    /// A client reads the refusal after the server has put it in the envelope, which wraps
+    /// text that is not JSON as `{"_kin": ..., "message": <text>}`. The marker has to
+    /// survive that as the first line of `message`, because that is where kin-agent looks
+    /// once a real server, not a scripted one, answers.
+    #[tokio::test]
+    async fn the_not_started_marker_is_the_first_line_of_the_enveloped_message() {
+        let gone = format!("Session not found: {SESSIONED}. It was ended.");
+        let result = sessions::mutate_through(&sessioned_mutate(), |_, _| {
+            let answer = ToolCallResult::error(gone.clone());
+            async move { Ok(Some(answer)) }
+        })
+        .await
+        .unwrap();
+        let annotated = crate::envelope::annotate(result, &crate::envelope::Envelope::daemon());
+        assert_eq!(annotated.is_error, Some(true));
+        let payload: serde_json::Value =
+            serde_json::from_str(&tool_result_text(&annotated)).expect("an enveloped payload");
+        assert!(payload.get("_kin").is_some(), "{payload}");
+        let message = payload["message"]
+            .as_str()
+            .expect("the refusal rides in message");
+        let first = message.lines().next().unwrap_or_default();
+        let marker: serde_json::Value = serde_json::from_str(
+            first
+                .strip_prefix("kin_mutate_not_started: ")
+                .expect("the marker is the first line of message"),
+        )
+        .unwrap();
+        assert_eq!(
+            marker,
+            serde_json::json!({
+                "stage": "begin",
+                "refusal": "session_not_found",
+                "session_id": SESSIONED,
+            })
+        );
+    }
+
+    /// A commit that never answered may have published. The abort after it runs against
+    /// a restarted daemon and answers "Session not found", and the note that says so is
+    /// appended to the commit's refusal. That text carries the words and never the
+    /// marker, because the change may have landed.
+    #[tokio::test]
+    async fn a_gone_session_found_only_by_the_abort_is_never_marked_not_started() {
+        let calls: Recorded = Default::default();
+        let result = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                calls.clone(),
+                || Err("connection reset by peer".to_string()),
+                || {
+                    Ok(Some(ToolCallResult::error(
+                        "Session not found: 11111111-1111-4111-8111-111111111111. It was ended \
+                         or expired after its idle timeout or the daemon restarted.",
+                    )))
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let text = tool_result_text(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text.contains("Session not found") && text.contains("still open"),
+            "the abort's answer is in the note: {text}"
+        );
+        assert_eq!(not_started_marker(&result), None, "{text}");
+        assert!(!text.contains("kin_mutate_not_started"), "{text}");
+        assert_eq!(
+            forwarded(&calls),
+            [
+                "kin_transaction_begin",
+                "kin_transaction_commit",
+                "kin_transaction_abort"
+            ]
+        );
+    }
+
+    /// A commit refused for a gone session is not marked either. The commit checks the
+    /// session before it applies anything, but only the begin marks a refusal, which
+    /// keeps the one retryable case the one that provably started nothing.
+    #[tokio::test]
+    async fn a_commit_refused_for_a_gone_session_is_never_marked_not_started() {
+        let calls: Recorded = Default::default();
+        let result = sessions::mutate_through(
+            &sessioned_mutate(),
+            scripted_forward(
+                calls.clone(),
+                || {
+                    Ok(Some(ToolCallResult::error(
+                        "Session not found: 11111111-1111-4111-8111-111111111111. It was ended \
+                         or expired after its idle timeout or the daemon restarted.",
+                    )))
+                },
+                || Ok(Some(ToolCallResult::text(r#"{"state":"aborted"}"#))),
+            ),
+        )
+        .await
+        .unwrap();
+        let text = tool_result_text(&result);
+        assert!(text.contains("Session not found"), "{text}");
+        assert_eq!(not_started_marker(&result), None, "{text}");
+        assert!(!text.contains("kin_mutate_not_started"), "{text}");
+    }
+
     /// An abort that is refused, or cannot reach the daemon, names what it left open.
     #[tokio::test]
     async fn an_abort_that_fails_names_the_transaction_it_left_open() {
@@ -6749,7 +8286,7 @@ mod tests {
         let mentions = "pub fn clip(out: &mut String) {\n    out.push_str(\"... [truncated]\");\n}";
         let args = HashMap::from([(
             "operations".to_string(),
-            body_update_operations(&entity.id.to_string(), mentions),
+            body_update_operations(entity.id, mentions),
         )]);
         let res = sessions::handle_mutate(
             &args,
@@ -6786,7 +8323,7 @@ mod tests {
         let session_authority = SessionAuthorityMode::OfflineFallback;
 
         let op: McpMutationOperation = McpMutationOperation {
-            verb: "create".into(),
+            verb: "update".into(),
             target: "function".into(),
             payload: None::<McpMutationPayload>,
             body: None,
@@ -6808,258 +8345,111 @@ mod tests {
         );
     }
 
-    /// FIR-2417 follow-up: a `create` naming a path the graph already tracks
-    /// is refused at stage time, not just at commit. Before this check existed
-    /// staging such an operation reported `staged_count: 1` and the caller only
-    /// learned the path collided once it committed, after staging whatever else
-    /// it had queued alongside it.
+    /// File operations refuse before staging in every semantic write door.
     #[tokio::test]
-    async fn handle_transaction_stage_rejects_a_create_for_an_already_tracked_path() {
-        use crate::session::McpMutationOperation;
-
+    async fn semantic_stage_and_mutate_refuse_every_file_operation_before_admission() {
         let store = InMemoryGraph::default();
-        let path = kin_model::RepoPath::from_utf8("src/tracked.py".to_string()).unwrap();
-        store
-            .apply_transaction_delta(&kin_model::TransactionDelta {
-                tree_deltas: vec![kin_model::TreeDelta::Added {
-                    artifact_id: kin_model::ArtifactId::new(),
-                    new: kin_model::LocatedEntry::new(
-                        path,
-                        kin_model::TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
-                    ),
-                }],
-                ..kin_model::TransactionDelta::default()
-            })
+        let registry = SessionRegistry::new();
+        registry.register("semantic-test", "test");
+        let tx = registry
+            .begin_transaction("semantic-test", "entity:test")
             .unwrap();
-        let sessions = SessionRegistry::new();
-        let session_authority = SessionAuthorityMode::OfflineFallback;
-
-        let op = McpMutationOperation {
-            verb: "create".into(),
-            target: "src/tracked.py".into(),
-            payload: None,
-            body: Some("value = 1\n".into()),
-            description: "admit new source src/tracked.py".into(),
-            destination: None,
-        };
-        let mut stage_args = HashMap::new();
-        stage_args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
-        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
-
-        let err =
-            sessions::handle_transaction_stage(&stage_args, &store, &sessions, session_authority)
-                .await
-                .expect_err("create over an already-tracked path must be rejected at stage time");
-        assert!(matches!(err, McpError::InvalidParams(_)));
-        assert!(
-            err.to_string().contains("already tracked"),
-            "actionable stage-time message expected, got: {err}"
-        );
-    }
-
-    /// A retirement or a rename naming a path the graph does NOT track is
-    /// refused at stage time, and so is a rename onto a path it does.
-    ///
-    /// The mirror image of the create check, and it matters for the same
-    /// reason in the opposite direction: a retirement that answered "already
-    /// gone, nothing to do" would tell a caller its file left the graph while
-    /// the real one kept ranking, which is the FIR-2419 symptom arriving by a
-    /// second route.
-    #[tokio::test]
-    async fn handle_transaction_stage_rejects_file_level_operations_on_the_wrong_paths() {
-        use crate::session::McpMutationOperation;
-
-        let store = InMemoryGraph::default();
-        for path in ["src/tracked.py", "src/occupied.py"] {
-            let path = kin_model::RepoPath::from_utf8(path.to_string()).unwrap();
-            store
-                .apply_transaction_delta(&kin_model::TransactionDelta {
-                    tree_deltas: vec![kin_model::TreeDelta::Added {
-                        artifact_id: kin_model::ArtifactId::new(),
-                        new: kin_model::LocatedEntry::new(
-                            path,
-                            kin_model::TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
-                        ),
-                    }],
-                    ..kin_model::TransactionDelta::default()
-                })
-                .unwrap();
-        }
-        let sessions = SessionRegistry::new();
-        let session_authority = SessionAuthorityMode::OfflineFallback;
-
-        let file_op = |verb: &str, target: &str, destination: Option<&str>| {
-            let op = McpMutationOperation {
-                verb: verb.into(),
-                target: target.into(),
-                payload: None,
-                body: None,
-                destination: destination.map(str::to_string),
-                description: format!("{verb} {target}"),
-            };
-            let mut args = HashMap::new();
-            args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
-            args.insert("operations".into(), serde_json::json!(vec![op]));
-            args
-        };
-
-        let err = sessions::handle_transaction_stage(
-            &file_op("delete", "src/never_tracked.py", None),
-            &store,
-            &sessions,
-            session_authority,
-        )
-        .await
-        .expect_err("a retirement of an untracked path must be rejected at stage time");
-        assert!(matches!(err, McpError::InvalidParams(_)));
-        assert!(
-            err.to_string()
-                .contains("is not tracked by repository authority"),
-            "actionable stage-time message expected, got: {err}"
-        );
-
-        let err = sessions::handle_transaction_stage(
-            &file_op("rename", "src/tracked.py", Some("src/occupied.py")),
-            &store,
-            &sessions,
-            session_authority,
-        )
-        .await
-        .expect_err("a rename onto a tracked path must be rejected at stage time");
-        assert!(
-            err.to_string()
-                .contains("is already tracked by repository authority"),
-            "actionable stage-time message expected, got: {err}"
-        );
-
-        // The control: the same two shapes on the right paths get past these
-        // checks and fail only on the bogus transaction id, which is what
-        // proves the refusals above came from the path checks rather than from
-        // staging refusing everything.
-        for args in [
-            file_op("delete", "src/tracked.py", None),
-            file_op("rename", "src/tracked.py", Some("src/moved.py")),
+        for verb in [
+            "create",
+            "add",
+            "insert",
+            "replace",
+            "overwrite",
+            "delete",
+            "remove",
+            "rename",
+            "move",
         ] {
-            let result =
-                sessions::handle_transaction_stage(&args, &store, &sessions, session_authority)
-                    .await
-                    .expect("a well-formed file-level operation must reach transaction lookup");
-            let text = tool_result_text(&result);
+            let mut operation = serde_json::json!({
+                "verb": verb, "target": "src/example.rs", "description": "file operation"
+            });
+            if matches!(verb, "create" | "add" | "insert" | "replace" | "overwrite") {
+                operation["body"] = serde_json::json!("pub fn unrelated() {}\n");
+            }
+            if matches!(verb, "rename" | "move") {
+                operation["destination"] = serde_json::json!("src/other.rs");
+            }
+            let args = HashMap::from([
+                (
+                    "transaction_id".into(),
+                    serde_json::json!(tx.transaction_id),
+                ),
+                ("session_id".into(), serde_json::json!("semantic-test")),
+                ("operations".into(), serde_json::json!([operation])),
+            ]);
+            let error = sessions::handle_transaction_stage(
+                &args,
+                &store,
+                &registry,
+                SessionAuthorityMode::OfflineFallback,
+            )
+            .await
+            .unwrap_err();
             assert!(
-                text.contains("Transaction not found"),
-                "expected the bogus transaction id to be what refuses, got: {text}"
+                error.to_string().contains("semantic_operation_required"),
+                "{verb}: {error}"
             );
+            let error = sessions::checked_mutate_operations(&args).unwrap_err();
+            assert!(
+                tool_result_text(&error).contains("semantic_operation_required"),
+                "{verb}"
+            );
+            let error = sessions::handle_transaction_commit(
+                &args,
+                &store,
+                &registry,
+                SessionAuthorityMode::OfflineFallback,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("semantic_operation_required"),
+                "{verb}: {error}"
+            );
+            assert!(registry
+                .get_transaction(&tx.transaction_id)
+                .unwrap()
+                .staged_operations
+                .is_empty());
         }
-    }
-
-    /// A whole-file rewrite is admitted for a tracked path, and refused both
-    /// when the path is untracked and when the body is the text authority
-    /// already holds.
-    ///
-    /// This is the shape an agent holding a path and a file's new contents
-    /// stages, which is every local `edit_file` and `write_file` harness. Both
-    /// refusals are checked here rather than only at commit because a caller
-    /// that learns at commit has already staged whatever it built on top, and
-    /// because each one names the verb that does what it asked: `create` for a
-    /// path the graph has never seen, and nothing at all for a body that
-    /// changes nothing.
-    ///
-    /// The identical-body answer comes from the artifact's own content hash,
-    /// so it is a graph-authority read rather than a look at the working copy.
-    #[tokio::test]
-    async fn handle_transaction_stage_admits_a_rewrite_and_refuses_the_two_ways_it_can_be_empty() {
-        use crate::session::McpMutationOperation;
-
-        const TRACKED: &str = "def value():\n    return 1\n";
-        const REWRITTEN: &str = "def value():\n    return 2\n\n\ndef added():\n    return 3\n";
-
-        let store = InMemoryGraph::default();
-        let tracked_path = kin_model::RepoPath::from_utf8("src/tracked.py".to_string()).unwrap();
-        store
-            .apply_transaction_delta(&kin_model::TransactionDelta {
-                tree_deltas: vec![kin_model::TreeDelta::Added {
-                    artifact_id: kin_model::ArtifactId::new(),
-                    new: kin_model::LocatedEntry::new(
-                        tracked_path,
-                        kin_model::TreeEntry::blob(kin_blobs::digest(TRACKED.as_bytes()), false),
-                    ),
-                }],
-                ..kin_model::TransactionDelta::default()
-            })
-            .unwrap();
-        let sessions = SessionRegistry::new();
-        let session_authority = SessionAuthorityMode::OfflineFallback;
-
-        let rewrite = |target: &str, body: &str| {
-            let op = McpMutationOperation {
-                verb: "replace".into(),
-                target: target.into(),
-                payload: None,
-                body: Some(body.into()),
-                destination: None,
-                description: format!("rewrite {target}"),
-            };
-            let mut args = HashMap::new();
-            args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
-            args.insert("operations".into(), serde_json::json!(vec![op]));
-            args
-        };
-
-        let err = sessions::handle_transaction_stage(
-            &rewrite("src/never_tracked.py", REWRITTEN),
-            &store,
-            &sessions,
-            session_authority,
-        )
-        .await
-        .expect_err("a rewrite of an untracked path must be rejected at stage time");
-        assert!(matches!(err, McpError::InvalidParams(_)));
-        let message = err.to_string();
-        assert!(
-            message.contains("\"src/never_tracked.py\" is not tracked by repository authority"),
-            "the refusal must name the path it rejected, got: {message}"
-        );
-        assert!(
-            message.contains("verb 'create'"),
-            "the refusal must name the verb that admits a new path, got: {message}"
-        );
-
-        let err = sessions::handle_transaction_stage(
-            &rewrite("src/tracked.py", TRACKED),
-            &store,
-            &sessions,
-            session_authority,
-        )
-        .await
-        .expect_err("a rewrite carrying the tracked contents must be rejected at stage time");
-        assert!(matches!(err, McpError::InvalidParams(_)));
-        let message = err.to_string();
-        assert!(
-            message.contains("byte-identical to the contents repository authority already tracks"),
-            "the refusal must say the operation changes nothing, got: {message}"
-        );
-
-        // The control: the same shape, on the tracked path, carrying text that
-        // differs, gets past both checks and fails only on the bogus
-        // transaction id. Without it the two refusals above would also be
-        // satisfied by a stage call that refused every rewrite.
+        // Positive control: guarded entity source edits still stage, so this
+        // contract does not obtain safety by refusing every mutation.
+        let args = HashMap::from([
+            (
+                "transaction_id".into(),
+                serde_json::json!(tx.transaction_id),
+            ),
+            (
+                "operations".into(),
+                body_update_operations(EntityId::new(), "fn value() -> u8 { 2 }"),
+            ),
+        ]);
         let result = sessions::handle_transaction_stage(
-            &rewrite("src/tracked.py", REWRITTEN),
+            &args,
             &store,
-            &sessions,
-            session_authority,
+            &registry,
+            SessionAuthorityMode::OfflineFallback,
         )
         .await
-        .expect("a rewrite of a tracked path with new text must reach transaction lookup");
-        let text = tool_result_text(&result);
-        assert!(
-            text.contains("Transaction not found"),
-            "expected the bogus transaction id to be what refuses, got: {text}"
+        .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            registry
+                .get_transaction(&tx.transaction_id)
+                .unwrap()
+                .staged_operations
+                .len(),
+            1
         );
     }
 
     use std::sync::{Mutex, OnceLock};
-    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    pub(super) static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn exact_artifact_tools_preserve_every_repository_leaf_without_entities() {
@@ -7709,6 +9099,171 @@ mod tests {
         assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
     }
 
+    #[test]
+    fn derived_member_source_is_a_separate_graph_bound_generator_not_an_editable_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let blobs = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+        let source =
+            "export const app = {}; for (const key of ['café','post']) { app[key] = () => 1; }";
+        let hash = blobs.write(source.as_bytes()).unwrap();
+        let file = FilePathId::new("members.js");
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(&file, source.as_bytes(), hash)
+            .unwrap()
+            .indexed_file;
+        let candidate = indexed
+            .entities
+            .iter()
+            .find(|e| e.name == "app.café")
+            .unwrap()
+            .clone();
+        let mut store = EmptyStore::default();
+        for entity in &indexed.entities {
+            store.insert_test_entity(entity.clone());
+        }
+        store.file_hashes.insert(file.clone(), hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+        let artifact = {
+            let held = HeldSourceAuthority::new(&store, Some(&authority));
+            held.workspace_sample()
+                .unwrap()
+                .tree
+                .artifact_at_path(&kin_model::RepoPath::from_utf8("members.js").unwrap())
+                .unwrap()
+                .artifact_id
+        };
+        let files = [kin_index::FileParseData {
+            file_path: file.0.clone(),
+            entities: indexed.entities,
+            relations: indexed.extracted_relations,
+            imports: indexed.imports,
+        }];
+        let relations =
+            kin_index::link_cross_file(&files, &HashMap::from([(file.0.clone(), artifact)]))
+                .unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: artifact,
+                    new: kin_model::LocatedEntry::new(
+                        kin_model::RepoPath::from_utf8("members.js").unwrap(),
+                        kin_model::TreeEntry::blob(Hash256::from_bytes(hash.0), false),
+                    ),
+                }],
+                entity_deltas: files[0]
+                    .entities
+                    .iter()
+                    .cloned()
+                    .map(|new| kin_model::EntityDelta::Added { new })
+                    .collect(),
+                relation_deltas: relations
+                    .into_iter()
+                    .map(|new| kin_model::RelationDelta::Added { new })
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let args = HashMap::from([(
+            "entity_id".into(),
+            serde_json::json!(candidate.id.to_string()),
+        )]);
+        let value = tool_result_json(
+            entities::handle_get_entity_source(&args, &graph, Some(&authority)).unwrap(),
+        );
+        assert!(value["body"].is_null());
+        assert!(value["source_base"].is_null());
+        assert_eq!(value["independently_editable"], false);
+        assert_eq!(value["generator_source"]["source"], "graph", "{value}");
+        let derivation = kin_model::entity_derivation(&candidate).unwrap().unwrap();
+        assert_eq!(
+            value["generator_source"]["body"].as_str(),
+            source.get(derivation.generator.start_byte..derivation.generator.end_byte)
+        );
+        let held = HeldSourceAuthority::new(&graph, Some(&authority));
+        assert!(common::read_entity_source_exact(&held, &candidate, 10000)
+            .unwrap()
+            .is_none());
+        let context = common::focal_context_json_held(&held, &candidate).unwrap();
+        assert!(context["body"].is_null());
+        assert_eq!(context["projection"], "SignatureOnly");
+        assert_eq!(context["derivation"]["source_blob_hash"], hash.to_string());
+        assert!(context["generator_read"].is_object());
+        // Wrong artifact identity cannot borrow the path's real bytes.
+        let generator_edge = graph
+            .traverse(
+                &kin_model::GraphNodeId::Entity(candidate.id),
+                &[RelationKind::DerivedFrom],
+                1,
+            )
+            .unwrap()
+            .relations
+            .into_iter()
+            .find(|r| r.src == kin_model::GraphNodeId::Entity(candidate.id))
+            .unwrap();
+        let mut projected = vec![generator_edge.clone()];
+        kin_index::relation_read::project_relations_for_read(&graph, &mut projected).unwrap();
+        assert!(kin_index::RelationResolution::of(&projected[0]).is_proven());
+        assert_eq!(
+            serde_json::to_value(&projected[0]).unwrap(),
+            serde_json::to_value(&generator_edge).unwrap()
+        );
+        let mut forged = generator_edge.clone();
+        for evidence in &mut forged.evidence {
+            evidence.token = Some("0".repeat(64));
+        }
+        let mut projected_forgery = vec![forged];
+        kin_index::relation_read::project_relations_for_read(&graph, &mut projected_forgery)
+            .unwrap();
+        assert!(!kin_index::RelationResolution::of(&projected_forgery[0]).is_proven());
+        graph.remove_relation(&generator_edge.id).unwrap();
+        let wrong = tool_result_json(
+            entities::handle_get_entity_source(&args, &graph, Some(&authority)).unwrap(),
+        );
+        assert!(wrong["generator_source"].is_null());
+        assert!(wrong["generator_source_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("provenance"));
+        graph.upsert_relation(&generator_edge).unwrap();
+        // A moved tree cannot reuse the old generator's plausible in-bounds span.
+        admit_test_workspace_tree(
+            dir.path(),
+            &kin_model::RepoPath::from_utf8("members.js").unwrap(),
+            source.replace("=> 1", "=> 2").as_bytes(),
+        );
+        let stale = tool_result_json(
+            entities::handle_get_entity_source(&args, &graph, Some(&authority)).unwrap(),
+        );
+        assert!(stale["generator_source"].is_null());
+        assert!(stale["generator_source_unavailable"].is_string());
+        // Old PR155 synthetic spans are refused even when they are in bounds.
+        let mut legacy = candidate.clone();
+        legacy
+            .metadata
+            .extra
+            .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+        legacy.span = Some(derivation.generator);
+        legacy.doc_summary = Some(
+            "Derived from a loop over `keys`; no literal `app.café` assignment appears in source."
+                .into(),
+        );
+        assert!(common::read_entity_source_exact(
+            &HeldSourceAuthority::new(&graph, Some(&authority)),
+            &legacy,
+            10000
+        )
+        .unwrap()
+        .is_none());
+    }
+
     /// Which source digest the live entity records, relative to a workspace tree
     /// that has moved past its base.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7980,6 +9535,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lexical_lookup_exact_lines_require_the_matching_entity_source_digest() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = "export function alpha(){crowdneedle();\nreturn 1;}\n";
+        let after = "export function alpha(){\ncrowdneedle();return 2;}\n";
+        assert_eq!(before.len(), after.len());
+        for stamp in [SpanStamp::Current, SpanStamp::Stale, SpanStamp::Absent] {
+            let dir = tempdir().unwrap();
+            let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+            let (mut entity, mut store, authority, _) =
+                divergent_tree_fixture(dir.path(), before, after, stamp);
+            entity.metadata.extra.insert(
+                "embedding_body_preview".into(),
+                serde_json::json!("crowdneedle()"),
+            );
+            store.entities_by_id.insert(entity.id, entity);
+            let args = HashMap::from([("literal".into(), serde_json::json!("crowdneedle"))]);
+            let payload = tool_result_json(
+                lexical::handle_lexical_lookup(&args, &store, Some(&authority)).unwrap(),
+            );
+            assert_eq!(payload["total_matching"], serde_json::json!(1));
+            let hit = &payload["hits"][0];
+            match stamp {
+                SpanStamp::Current => {
+                    assert_eq!(hit["line"], serde_json::json!(2));
+                    assert_eq!(hit["line_confidence"], serde_json::json!("exact"));
+                }
+                SpanStamp::Stale | SpanStamp::Absent => {
+                    assert_eq!(hit["line"], serde_json::Value::Null);
+                    assert_eq!(
+                        hit["line_confidence"],
+                        serde_json::json!("entity_span_only")
+                    );
+                }
+            }
+        }
+    }
+
     /// The digest check must not reject a read it cannot verify.
     ///
     /// Entities legitimately arrive without recorded source provenance, and a
@@ -8021,6 +9617,19 @@ mod tests {
             source.span_coherence,
             common::SpanCoherence::Unverified,
             "an unverifiable pair must be reported as unverified, not as coherent"
+        );
+        let reply = tool_result_json(
+            entities::handle_get_entity_source(
+                &HashMap::from([("entity_id".into(), serde_json::json!(entity.id))]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert!(reply["source_base"].is_null());
+        assert_eq!(
+            reply["source_base_unavailable"],
+            crate::source_base::SOURCE_BASE_UNAVAILABLE_UNVERIFIED
         );
     }
 

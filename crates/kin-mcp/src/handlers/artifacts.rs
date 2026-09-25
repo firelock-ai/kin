@@ -26,31 +26,13 @@ Docker Compose files, Dockerfiles, lockfiles, configuration, binary assets, unsu
 languages, symlinks, executable files, and gitlinks. Each row names its path once: \
 `path_label` is the exact path whenever `path_label_lossy` is false, and only a path whose \
 bytes are not valid UTF-8 also carries the byte-exact `path` as a lowercase `bytes_hex` \
-object. Identity comes from `artifact_id`, never from a path, and it is what \
-`kin_artifact_read` takes to read a listed row. Content-addressed ids are lowercase hex strings: each \
+object. Identity comes from `artifact_id`, never from a path. Content-addressed ids are lowercase hex strings: each \
 entry's blob `hash`, a symlink's `target_blob`, and the response's `source_change_id`, so a \
-value this returns can be passed straight back into `kin_artifact_read`'s \
-`source_change_id` or compared against what `kin log` prints. A gitlink is the one \
+value can be compared against what `kin log` prints. A gitlink is the one \
 exception: its `target` keeps the algorithm-tagged object, because a repository may be sha1 \
 or sha256 and that discriminator is not recoverable from a bare string, and `target_hex` \
 carries the printable form beside it. Omit `source_change_id` to read the exact current \
 workspace tree.";
-
-pub const ARTIFACT_READ_DESC: &str = "\
-Read one exact graph-owned repository artifact by stable `artifact_id` or by `path`: the \
-repository-relative string `kin_artifact_list` prints as `path_label` (a leading `/` is \
-tolerated), or the byte-exact `{\"bytes_hex\": ...}` object for a path whose bytes are not \
-valid UTF-8. A blob or symlink body comes back as `text_utf8` when its bytes are valid \
-UTF-8, which is lossless for them, and as base64 in `content_base64` when they are not; \
-pass `include_bytes: true` for the base64 of a UTF-8 body too. Gitlinks return their \
-external object identity, as the \
-algorithm-tagged `git_object_id` plus a printable `git_object_id_hex`, and have no \
-repository-owned body. Content-addressed hashes are lowercase hex strings, including the \
-returned `source_change_id`, which is exactly the form this tool's own `source_change_id` \
-parameter takes, so a read can be repeated at the change a \
-previous call reported. The read is bound to the resolved tree entry at \
-`source_change_id` (or the exact current workspace) and fails loudly when the tree, identity, \
-or content-addressed blob is missing. It never reads the working directory.";
 
 /// One tree entry with its content-addressed ids rendered as hex.
 ///

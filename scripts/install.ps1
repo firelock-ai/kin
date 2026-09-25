@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# Kin installer for Windows — installs the repository-free native CLI surface.
+# Kin installer for Windows: installs the native Kin CLI, kin and kin-daemon.
 #
 # Usage:
 #   irm https://get.kinlab.dev/install.ps1 | iex
@@ -49,7 +49,7 @@ function Test-KinTruthy([string]$Value) {
     return @("1", "true", "yes", "on") -contains $Value.Trim().ToLowerInvariant()
 }
 
-$NativeWindowsSupportNotice = "Native Windows x86_64 support is early. Repository admission works: kin init imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience. If kin init reports that tracked bytes differ from the committed tree, Git for Windows checked the repository out with core.autocrlf=true from its system config; run 'git config --global core.autocrlf false' and clone again."
+$NativeWindowsSupportNotice = "Native Windows x86_64 support is early. Repository admission works: kin init imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience. If kin init reports that tracked bytes differ from the committed tree, Git for Windows checked the repository out with core.autocrlf=true from its system config; run 'git config --global core.autocrlf false' and clone again."
 
 function Resolve-KinWindowsArchiveArchitecture {
     param(
@@ -241,13 +241,14 @@ $Target = "windows-$Arch"
 Write-Host ""
 Write-Host "  Kin Installer" -ForegroundColor Cyan -NoNewline
 Write-Host " (Windows)" -ForegroundColor DarkGray
-Write-Host "  Repository-free CLI diagnostics"
+Write-Host "  Native Windows CLI"
 Write-Host ""
 
 Write-Info "Platform: windows ($Arch)"
 
-# The notice is intentionally complete rather than a vague "smaller subset":
-# without repository admission there is no supported native graph workflow.
+# The notice is intentionally complete rather than a vague "smaller subset", so a
+# reader learns what runs natively and what still needs WSL2 before anything is
+# downloaded.
 Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow
 Write-Host "    Details: https://github.com/firelock-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor DarkGray
 Write-Host ""
@@ -359,9 +360,9 @@ New-Item -ItemType Directory -Path $KinLib -Force | Out-Null
 
 Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Force
 
-# kin-daemon remains a mandatory release component even though repository-backed
-# daemon workflows are unavailable on native Windows today. Assert the archive
-# shape before moving anything so every install stays exact and upgrade-safe.
+# kin-daemon is a mandatory release component: daemon-backed queries answer on
+# native Windows too. Assert the archive shape before moving anything so every
+# install stays exact and upgrade-safe.
 if (-not (Test-Path (Join-Path $TmpDir "kin-daemon.exe"))) {
     Write-Err "kin-daemon.exe missing from the downloaded archive. Refusing a daemon-less install."
     exit 1
@@ -437,11 +438,11 @@ if (Test-Path $KinExe) {
 
 if (Test-KinTruthy $env:KIN_NO_SETUP) {
     Write-Host ""
-    Write-Info "Skipping repository-free setup diagnostics (KIN_NO_SETUP=1)."
+    Write-Info "Skipping the setup notice (KIN_NO_SETUP=1)."
 } else {
     Write-Host ""
-    Write-Info "Not running repository setup: MCP and review workflows are not yet covered on native Windows."
-    Write-Info "Run 'kin init' in a Git repository to publish graph authority; use WSL2 for MCP, review, and projection workflows."
+    Write-Info "Not running repository setup: WSL2 remains the recommended path on Windows."
+    Write-Info "Run 'kin init' in a Git repository to publish graph authority; use WSL2 for review and projection workflows."
 }
 
 # ── Cleanup ─────────────────────────────────────────────────────────────
@@ -454,6 +455,6 @@ if (Test-KinTruthy $env:KIN_NO_SETUP) {
 }
 
 Write-Host ""
-Write-Ok "Done! Restart your terminal to use repository-free CLI diagnostics."
-Write-Host "  Use WSL2 for Kin repository workflows: https://github.com/firelock-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor Yellow
+Write-Ok "Done! Open a new terminal, then run 'kin init' in a Git repository."
+Write-Host "  Use WSL2 for review and projection workflows: https://github.com/firelock-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor Yellow
 Write-Host ""

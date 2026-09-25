@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use kin_mcp::verdict::{CLAUSE_CODES, UNLISTED_CLAUSE_CODE};
+use crate::verdict::{CLAUSE_CODES, UNLISTED_CLAUSE_CODE};
 
 /// Labels the scan finds that are not verdict clauses, each with where it lives
 /// and what it is instead. Every entry must still be found by the scan, so a
@@ -28,6 +28,10 @@ const NOT_CLAUSES: &[(&str, &str)] = &[
         "handlers/sessions.rs: a keyed mutation transport outcome error, not a retrieval verdict",
     ),
     (
+        "entity_create_required",
+        "session.rs: refusal of a raw Entity payload used to create source, not a retrieval verdict",
+    ),
+    (
         "invalid_request_id",
         "handlers/sessions.rs: a mutation request-identity validation error",
     ),
@@ -36,13 +40,33 @@ const NOT_CLAUSES: &[(&str, &str)] = &[
         "kin-core layout.rs: the prefix of a CLI refusal message",
     ),
     (
+        "kin_mutate_not_started",
+        "handlers/sessions.rs: a mutation begin refusal marker for session recovery, not a retrieval verdict",
+    ),
+    (
         "parse_hole",
         "kin-core reference_coverage.rs: a census label no MCP verdict carries",
     ),
     ("phase", "startup_binding.rs: a startup progress label"),
     (
+        "read_only_session",
+        "session.rs: a write refusal for a session that declared itself read-only",
+    ),
+    (
         "scope",
         "handlers/review.rs: a replacement parameter example in path-anchor deprecations",
+    ),
+    (
+        "semantic_operation_required",
+        "session.rs: refusal of file-shaped agent mutations, not a retrieval verdict",
+    ),
+    (
+        "source_base_required",
+        "session.rs: refusal of an unguarded entity replacement, not a retrieval verdict",
+    ),
+    (
+        "source_base_unavailable",
+        "source_base.rs: a source read's unavailable edit-base status, not a retrieval verdict",
     ),
     (
         "spine_unavailable",
@@ -80,6 +104,14 @@ const SOURCED_ELSEWHERE: &[(&str, &str)] = &[
     (
         "cross_repo_unavailable",
         "negative.rs cross_repo_unavailable_qualifier, the label for a spine answer naming no code",
+    ),
+    (
+        "spine_candidate_representation_gap",
+        "kin-spine SPINE_CANDIDATE_REPRESENTATION_GAP, the code a daemon's spine refusal opens its reason with, carried as the label",
+    ),
+    (
+        "spine_initialization_deferred",
+        "handlers/entities.rs SPINE_INITIALIZATION_DEFERRED, a spine's code carried as the label",
     ),
     (
         "spine_root_stale",
@@ -121,6 +153,64 @@ fn production_source(text: &str) -> String {
         .join("\n")
 }
 
+/// Whether an attribute is a `cfg` naming the bare `test` predicate.
+///
+/// A bare token, so `#[cfg(all(test, unix))]` counts and
+/// `#[cfg(feature = "testing")]` does not.
+fn cfg_names_test(line: &str) -> bool {
+    let Some(predicate) = line.strip_prefix("#[cfg(") else {
+        return false;
+    };
+    predicate
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| token == "test")
+}
+
+/// The file an `#[path = "..."]` attribute names.
+fn path_attribute(line: &str) -> Option<&str> {
+    line.strip_prefix("#[path = \"")?.split('"').next()
+}
+
+/// The files a crate includes only under `#[cfg(test)]`, as the walk names
+/// them.
+///
+/// A whole-file test module is declared `#[cfg(test)] #[path = "..."] mod ...;`,
+/// so its own text carries no `#[cfg(test)]` for [`production_source`] to cut
+/// at, and every fixture byte string in it reads as a producer writing a label.
+/// The declaration is what makes the file test source, so the declaration is
+/// what this reads. A `#[path]` module that is not test-gated stays in the
+/// scan, and so does every ordinary module: this closes the one hole in the
+/// cut rather than widening what a producer may write.
+fn test_only_modules(files: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut excluded = BTreeSet::new();
+    for file in files {
+        let (Some(directory), Ok(text)) = (file.parent(), std::fs::read_to_string(file)) else {
+            continue;
+        };
+        let mut test_gated = false;
+        for line in text.lines() {
+            let line = line.trim();
+            // A doc comment or a blank line sits inside the attribute stack it
+            // documents, so neither opens nor closes one.
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if let Some(name) = path_attribute(line) {
+                if test_gated {
+                    excluded.insert(directory.join(name));
+                }
+                continue;
+            }
+            if cfg_names_test(line) {
+                test_gated = true;
+            } else if !line.starts_with("#[") {
+                test_gated = false;
+            }
+        }
+    }
+    excluded
+}
+
 /// Every label a string literal opens with (`"label: ...`), and every value of
 /// a `*_LIMITING_FACTOR` constant.
 fn labels_in(source: &str) -> BTreeSet<String> {
@@ -160,8 +250,12 @@ fn scanned_labels() -> BTreeSet<String> {
         "the scan read {} files, so it read almost nothing",
         files.len()
     );
+    let test_only = test_only_modules(&files);
     let mut labels = BTreeSet::new();
     for file in files {
+        if test_only.contains(&file) {
+            continue;
+        }
         let text = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
         labels.extend(labels_in(&production_source(&text)));

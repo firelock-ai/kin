@@ -111,6 +111,11 @@ pub struct AdmitReport {
     /// the two answers this field exists to keep apart.
     #[serde(default)]
     pub tree_moved: Option<bool>,
+    /// Whether full repository authority roots changed during the coordinated
+    /// pass. Separate from the live query tree; publication can precede a live
+    /// graph refusal. None means unavailable or an older daemon did not report it.
+    #[serde(default)]
+    pub repository_authority_moved: Option<bool>,
     /// Wall-clock time of the admission that ran BEFORE this pass, RFC 3339.
     ///
     /// Read on the daemon before this pass records its own success, because the
@@ -164,6 +169,12 @@ pub fn census_moved(report: &AdmitReport) -> bool {
 /// `false`, so this can only ever be more true than `census_moved`, never less.
 pub fn graph_moved(report: &AdmitReport) -> bool {
     census_moved(report) || report.tree_moved == Some(true)
+}
+
+/// Any observed publication or live mutation; unknown measurements stay unknown
+/// in the report and cannot establish a mutation by themselves.
+pub fn admission_moved(report: &AdmitReport) -> bool {
+    graph_moved(report) || report.repository_authority_moved == Some(true)
 }
 
 /// The one wording that means this pass did not admit the working copy.
@@ -245,22 +256,23 @@ pub fn summary_lines(report: &AdmitReport) -> Vec<String> {
             .unwrap_or("no cause recorded");
         lines.push(format!("{ADMIT_FAILURE_PREFIX}{cause}"));
         if graph_moved(report) {
-            // Authority crossed before the failure. Calling that unchanged is
-            // the one wording an operator cannot recover from, because it
-            // describes a settled store while the real one is half admitted:
-            // the tree published and the semantic enrichment for it did not.
             lines.push(format!(
-                "Graph authority moved before the failure: {} tracked artifacts \
+                "Live graph moved before the failure: {} tracked artifacts \
                  ({tracked_delta:+}), {} entities ({entity_delta:+}). Enrichment for that \
                  transition is incomplete; re-run `kin admit` once the cause above is resolved.",
                 report.tracked_after, report.entities_after
             ));
         } else {
             lines.push(format!(
-                "Graph authority is unchanged: {} tracked artifacts, {} entities.",
-                report.tracked_before, report.entities_before
+                "Current live graph: {} tracked artifacts, {} entities.",
+                report.tracked_after, report.entities_after
             ));
         }
+        lines.push(match report.repository_authority_moved {
+            Some(true) => "Repository authority changed during this admission; the failed pass must be retried after its cause is resolved.".to_string(),
+            Some(false) => "Repository authority roots did not change during this admission.".to_string(),
+            None => "Repository authority movement was not measured.".to_string(),
+        });
         return lines;
     }
 
@@ -547,6 +559,7 @@ mod tests {
             embeddings_total: 14187,
             reconcile: ReconcileHealth::default(),
             tree_moved: Some(true),
+            repository_authority_moved: None,
             prior_admission_at: None,
             admitted,
             failure: (!admitted)
@@ -806,7 +819,14 @@ mod tests {
             first.starts_with("Complete exact-tree admission failed: host entry changed"),
             "{text}"
         );
-        assert!(text.contains("Graph authority is unchanged"), "{text}");
+        assert!(
+            text.contains("Current live graph: 31 tracked artifacts, 0 entities"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Repository authority movement was not measured"),
+            "{text}"
+        );
         assert!(!text.contains("4210"), "{text}");
     }
 
@@ -834,7 +854,7 @@ mod tests {
         );
         assert!(!text.contains("unchanged"), "{text}");
         assert!(
-            text.contains("Graph authority moved before the failure"),
+            text.contains("Live graph moved before the failure"),
             "{text}"
         );
         assert!(text.contains("4210 tracked artifacts (+4179)"), "{text}");
@@ -842,6 +862,39 @@ mod tests {
             text.contains("Enrichment for that transition is incomplete"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn repository_publication_is_reported_when_the_live_graph_stands_still() {
+        let mut failed = content_only_pass(Some(false));
+        failed.admitted = false;
+        failed.failure = Some("live semantic plan refused".into());
+        failed.repository_authority_moved = Some(true);
+        assert!(!graph_moved(&failed));
+        assert!(admission_moved(&failed));
+        let text = summary_lines(&failed).join("\n");
+        assert!(
+            text.contains("Repository authority changed during this admission"),
+            "{text}"
+        );
+        assert!(!text.contains("unchanged"), "{text}");
+        failed.repository_authority_moved = Some(false);
+        assert!(!admission_moved(&failed));
+        assert!(summary_lines(&failed)
+            .join("\n")
+            .contains("roots did not change"));
+    }
+
+    #[test]
+    fn older_reports_leave_repository_publication_unknown() {
+        let mut encoded = serde_json::to_value(content_only_pass(Some(false))).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("repository_authority_moved");
+        let decoded: AdmitReport = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.repository_authority_moved, None);
+        assert!(!admission_moved(&decoded));
     }
 
     /// Nothing coming back establishes nothing about the pass, so no run of

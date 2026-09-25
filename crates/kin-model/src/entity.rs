@@ -17,7 +17,8 @@ pub struct Entity {
     pub fingerprint: SemanticFingerprint,
     /// None for graph-created entities before placement.
     pub file_origin: Option<FilePathId>,
-    /// None until projection assigns a file location.
+    /// None when no independent source declaration exists, including derived
+    /// member candidates whose generator evidence lives in metadata.
     pub span: Option<SourceSpan>,
     pub signature: String,
     pub visibility: Visibility,
@@ -31,6 +32,8 @@ pub struct Entity {
 }
 
 /// Classification of a semantic entity.
+///
+/// Append new variants: the compact ReadIndex persists these discriminants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
@@ -53,6 +56,10 @@ pub enum EntityKind {
     Constant,
     StaticVar,
     Macro,
+    /// A named field declared on a struct, class, or record, addressable by
+    /// its owner-qualified name (`Owner.Field`) the way a `Method` is
+    /// addressable by `Owner.Method`.
+    Field,
 }
 
 /// Content-based fingerprint of an entity, used to detect what changed

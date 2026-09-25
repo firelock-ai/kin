@@ -36,6 +36,13 @@ use crate::vector::VectorIndex;
 use super::index::IndexSet;
 use super::traverse;
 
+mod source_derivation;
+pub use source_derivation::{
+    SourceDerivationFacts, SourceDerivationLimit, SourceDerivationLimits,
+    SourceDerivationUnavailable, SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact,
+    SourceReservedRelation,
+};
+
 #[cfg(all(feature = "embeddings", feature = "vector"))]
 fn default_embedding_batch_size() -> usize {
     std::env::var("KIN_EMBED_BATCH_SIZE")
@@ -1284,6 +1291,7 @@ impl ResolvedRetrievalItem {
 /// Core entity/relation graph data.
 #[derive(Clone)]
 struct EntityData {
+    verified_binding_history: Option<crate::storage::binding_history::VerifiedBindingHistory>,
     entities: HashMap<EntityId, Entity>,
     entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
     external_references: HashMap<ExternalReferenceId, ExternalReference>,
@@ -2442,18 +2450,31 @@ fn run_embedding_coverage_before_count_hook(_graph: &InMemoryGraph) {}
 impl InMemoryGraph {
     /// Create a new empty in-memory graph (RAM-only text index).
     pub fn new() -> Self {
-        Self::build(None)
+        Self::build(None, false)
     }
 
     /// Create a new empty in-memory graph with a persistent text index at
     /// the given directory path. The directory is created if it does not exist.
     pub fn with_text_index(text_index_path: PathBuf) -> Self {
-        Self::build(Some(text_index_path))
+        Self::build(Some(text_index_path), false)
     }
 
-    fn build(text_index_path: Option<PathBuf>) -> Self {
+    /// The same, with the persistent text index opened read-only.
+    ///
+    /// For a read-only open of a store, which may be another process's live
+    /// store: the index is read and never archived, renamed or written, even
+    /// when a file it names is missing.
+    pub(crate) fn with_text_index_read_only(text_index_path: PathBuf) -> Self {
+        Self::build(Some(text_index_path), true)
+    }
+
+    fn build(text_index_path: Option<PathBuf>, read_only: bool) -> Self {
         let text_index = match text_index_path.as_ref() {
-            Some(p) => match TextIndex::open(Some(p)) {
+            Some(p) => match if read_only {
+                TextIndex::open_read_only(Some(p))
+            } else {
+                TextIndex::open(Some(p))
+            } {
                 Ok(index) => Some(index),
                 Err(err) => {
                     tracing::warn!(
@@ -2467,6 +2488,7 @@ impl InMemoryGraph {
         };
         Self {
             entities: RwLock::new(EntityData {
+                verified_binding_history: None,
                 entities: HashMap::new(),
                 entity_revisions: HashMap::new(),
                 external_references: HashMap::new(),
@@ -2789,8 +2811,12 @@ impl InMemoryGraph {
         read_only: bool,
         skip_text_index: bool,
     ) -> Result<Self, KinDbError> {
+        if let Some(proof) = &snapshot.verified_binding_history {
+            proof.validate_selected(&snapshot)?;
+        }
         let retrieval_authority_hash = compute_retrieval_authority_hash(&snapshot);
         let GraphSnapshot {
+            verified_binding_history,
             version: _,
             entities,
             relations,
@@ -2917,7 +2943,12 @@ impl InMemoryGraph {
                 .as_ref()
                 .map(|index| {
                     entities.keys().all(|entity_id| {
-                        index.contains_retrievable(&RetrievalKey::Entity(*entity_id))
+                        // A refusal is not coverage, so an index that cannot
+                        // answer is rebuilt below like one that is missing a key.
+                        matches!(
+                            index.contains_retrievable(&RetrievalKey::Entity(*entity_id)),
+                            Ok(true)
+                        )
                     })
                 })
                 .unwrap_or(false)
@@ -2984,6 +3015,7 @@ impl InMemoryGraph {
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
         let entity_data = EntityData {
+            verified_binding_history,
             entities: entities.into_iter().collect(),
             entity_revisions,
             external_references: external_references.into_iter().collect(),
@@ -3206,6 +3238,7 @@ impl InMemoryGraph {
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
         let entity_data = EntityData {
+            verified_binding_history: None,
             entities,
             entity_revisions: if entity_revisions.is_empty() && !changes.is_empty() {
                 let _span = tracing::info_span!(
@@ -4253,6 +4286,52 @@ impl InMemoryGraph {
             && left.resolved_tree == right.resolved_tree
     }
 
+    /// Coherent current semantic observation only. No history, facets, work,
+    /// sessions, or vector/text indexes are copied at an admission boundary.
+    pub fn semantic_observation(&self) -> GraphSnapshot {
+        let ent = self.entities.read();
+        Self::semantic_observation_from_entities(&ent)
+    }
+
+    fn semantic_observation_from_entities(ent: &EntityData) -> GraphSnapshot {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = ent
+            .entities
+            .iter()
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        snapshot.relations = ent
+            .relations
+            .iter()
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        snapshot.external_references = ent
+            .external_references
+            .iter()
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        snapshot.resolved_tree = ent.resolved_tree.clone();
+        snapshot.verified_binding_history = ent.verified_binding_history.clone();
+        snapshot
+    }
+
+    /// A trusted producer qualifies one observed mutation batch. Holding the
+    /// truth lock binds the qualification to the exact selected successor;
+    /// the ordinary mutation guard revokes it on every later mutation.
+    pub fn qualify_binding_history_derivation(
+        &self,
+        before: &GraphSnapshot,
+        verifier: &dyn crate::storage::binding_history::BindingHistoryVerifier,
+        load_body: &dyn Fn(kin_model::Hash256) -> Result<Option<Vec<u8>>, KinDbError>,
+    ) -> Result<bool, KinDbError> {
+        let mut ent = self.entities_write();
+        let after = Self::semantic_observation_from_entities(&ent);
+        ent.verified_binding_history = crate::storage::binding_history::qualify_graph_derivation(
+            before, &after, verifier, load_body,
+        )?;
+        Ok(ent.verified_binding_history.is_some())
+    }
+
     pub fn to_snapshot(&self) -> GraphSnapshot {
         // Clone each sub-store under its own read lock, then drop the lock
         // immediately. Lock ordering: entities → changes → work → reviews
@@ -4304,6 +4383,7 @@ impl InMemoryGraph {
         ses: SessionData,
     ) -> GraphSnapshot {
         GraphSnapshot {
+            verified_binding_history: ent.verified_binding_history,
             // This export always sets `materialized_graph: None` below, and a
             // body with no section serializes as v13, so declaring
             // CURRENT_VERSION here would build a snapshot `to_bytes` refuses.
@@ -4444,10 +4524,23 @@ impl InMemoryGraph {
     /// what makes [`InMemoryGraph::truth_epoch`] a complete record of truth
     /// movement. See [`TruthWriteGuard`].
     fn entities_write(&self) -> TruthWriteGuard<'_> {
+        let mut guard = self.entities.write();
+        guard.verified_binding_history = None;
         TruthWriteGuard {
-            guard: Some(self.entities.write()),
+            guard: Some(guard),
             epoch: &self.truth_epoch,
         }
+    }
+
+    /// Completed writes to graph truth, including source trees, history
+    /// registration and binding-history proof revocation or restoration.
+    ///
+    /// This is a supplementary cache invalidator, not a writer fence: the
+    /// counter advances after the entity write lock is released. A caller
+    /// reusing a detached graph must independently exclude active writers and
+    /// revalidate its authority before serving the read.
+    pub fn truth_epoch(&self) -> u64 {
+        self.truth_epoch.load(Ordering::Acquire)
     }
 
     /// Number of entities in the graph.
@@ -4455,9 +4548,54 @@ impl InMemoryGraph {
         self.entities.read().entities.len()
     }
 
+    /// Revoke the selected authority capability even when a publication only
+    /// changed nonsemantic authority. Its prior whole-authority binding no
+    /// longer describes the published generation.
+    pub fn invalidate_binding_history(&self) {
+        drop(self.entities_write());
+    }
+
+    /// Rebind a proof already admitted from immutable repository authority
+    /// after installing its exact semantic graph. This cannot mint a proof:
+    /// the source capability is private, runtime-only and invalidated by all
+    /// semantic writes. No per-query graph walk is needed afterwards.
+    pub fn restore_binding_history_from(&self, authority: &Self) -> bool {
+        if std::ptr::eq(self, authority) {
+            return self.entities.read().verified_binding_history.is_some();
+        }
+        // A stable address order avoids inverse-call deadlocks. Authority is
+        // ordinarily immutable, but the public method need not assume that.
+        let install = |mut target: TruthWriteGuard<'_>, source: &EntityData| {
+            if target.entities != source.entities
+                || target.relations != source.relations
+                || target.external_references != source.external_references
+                || target.resolved_tree != source.resolved_tree
+            {
+                return false;
+            }
+            target.verified_binding_history = source.verified_binding_history.clone();
+            target.verified_binding_history.is_some()
+        };
+        if std::ptr::from_ref(self) < std::ptr::from_ref(authority) {
+            let target = self.entities_write();
+            let source = authority.entities.read();
+            install(target, &source)
+        } else {
+            let source = authority.entities.read();
+            let target = self.entities_write();
+            install(target, &source)
+        }
+    }
+
     /// Number of relations in the graph.
     pub fn relation_count(&self) -> usize {
         self.entities.read().relations.len()
+    }
+
+    /// Read an exact relation identity, including a payload whose endpoints
+    /// differ from the nodes a caller expects that identity to describe.
+    pub fn get_relation_by_id(&self, id: &RelationId) -> Option<Relation> {
+        self.entities.read().relations.get(id).cloned()
     }
 
     /// Number of relations whose source or destination is not an admitted node.
@@ -4572,18 +4710,20 @@ impl InMemoryGraph {
         let sessions = self.sessions.read();
         let total_entities = ent.entities.len();
         let total_relations = ent.relations.len();
-        let text_indexed_entity_count = self
-            .text_index
-            .as_ref()
-            .map(|index| {
-                ent.entities
-                    .keys()
-                    .filter(|entity_id| {
-                        index.contains_retrievable(&RetrievalKey::Entity(**entity_id))
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
+        // `None` when the text index cannot answer, which is unavailable and
+        // not zero. A committed image that is on disk but not mapped used to
+        // answer every membership probe `false` and publish 0 percent coverage
+        // for a store whose documents were all still there.
+        let text_indexed_entity_count = match self.text_index.as_ref() {
+            None => Some(0),
+            Some(index) => ent.entities.keys().try_fold(0usize, |indexed, entity_id| {
+                match index.contains_retrievable(&RetrievalKey::Entity(*entity_id)) {
+                    Ok(true) => Some(indexed + 1),
+                    Ok(false) => Some(indexed),
+                    Err(_) => None,
+                }
+            }),
+        };
         #[cfg(feature = "vector")]
         let indexed_embedding_count = self
             .vector_index
@@ -4653,10 +4793,8 @@ impl InMemoryGraph {
             opaque_artifact_count: ent.opaque_artifacts.len(),
             working_tree_entry_count: ent.resolved_tree.len(),
             text_indexed_entity_count,
-            text_index_coverage_percent: coverage_percent(
-                text_indexed_entity_count,
-                total_entities,
-            ),
+            text_index_coverage_percent: text_indexed_entity_count
+                .map(|indexed| coverage_percent(indexed, total_entities)),
             indexed_embedding_count,
             pending_embedding_count,
             queued_embedding_count: embedding_status.queued,
@@ -4692,6 +4830,14 @@ impl InMemoryGraph {
                     return Err(error);
                 }
             }
+        } else if let Some(ref ti) = self.text_index {
+            // Nothing to commit, but a committed image a failed read-back left
+            // unmapped may be readable again, and only a commit used to retry
+            // it. A clean index was then refused until the next graph write.
+            // A remap that still fails changes nothing and is not this flush's
+            // error: the readers refuse, and the callers that need to say so
+            // ask `text_index_unavailable`.
+            ti.remap_if_unmapped();
         }
         Ok(())
     }
@@ -4753,26 +4899,58 @@ impl InMemoryGraph {
     /// Document frequency of `term` in the text index (its rarest token's
     /// posting count), for IDF-style term-discrimination weighting by callers.
     /// Returns 0 when there is no text index or the term is unindexed.
-    pub fn text_doc_frequency(&self, term: &str) -> usize {
+    ///
+    /// Refuses while the index cannot answer: when it is quarantined pending a
+    /// rebuild, and when its committed image is on disk but not mapped. It used
+    /// to answer 0 there, which a caller reads as "unknown, full weight", so an
+    /// index that stopped answering partway through a query weighted every
+    /// term as rare with nothing recorded. The refusal is the same one
+    /// [`Self::text_search`] gives, so a caller can report it the same way.
+    pub fn text_doc_frequency(&self, term: &str) -> Result<usize, KinDbError> {
         if self.text_full_rebuild_required.load(Ordering::Acquire) {
-            return 0;
+            return Err(KinDbError::StorageError(
+                "derived text index is quarantined pending a full graph-authority rebuild"
+                    .to_string(),
+            ));
         }
         match self.text_index {
             Some(ref ti) => ti.doc_frequency(term),
-            None => 0,
+            None => Ok(0),
         }
     }
 
     /// Number of documents currently visible to text search (the N for IDF).
-    /// Returns 0 when there is no text index.
+    /// Returns 0 when there is no text index, and while the index cannot
+    /// answer, because then no document is visible to search.
     pub fn text_document_count(&self) -> usize {
         if self.text_full_rebuild_required.load(Ordering::Acquire) {
             return 0;
         }
         match self.text_index {
-            Some(ref ti) => ti.live_document_count(),
-            None => 0,
+            Some(ref ti) if ti.remap_if_unmapped() => ti.live_document_count(),
+            Some(_) | None => 0,
         }
+    }
+
+    /// Why the text index cannot answer right now, or `None` when it can.
+    ///
+    /// `Some` while a committed image that a failed commit read-back left
+    /// unmapped still cannot be mapped again. It tries first, so a file that
+    /// has come back ends the gap on this call rather than at the next write.
+    /// Every read of the index refuses in that state; this is how a caller that
+    /// also reads counts and frequencies, which cannot refuse, learns it has to
+    /// report the gap. A graph with no text index at all is not reported here:
+    /// its document count of 0 already says so.
+    pub fn text_index_unavailable(&self) -> Option<String> {
+        let ti = self.text_index.as_ref()?;
+        if ti.remap_if_unmapped() {
+            return None;
+        }
+        Some(
+            "the text index's committed image is on disk but could not be mapped back after \
+             its last commit, so none of its documents can be read until it maps again"
+                .to_string(),
+        )
     }
 
     /// Which entity a revision id names, whether or not that entity is still
@@ -4886,11 +5064,72 @@ impl InMemoryGraph {
     fn get_embedder(&self) -> Result<Arc<CodeEmbedder>, KinDbError> {
         let mut guard = self.embedder.lock();
         if let Some(ref e) = *guard {
+            self.validate_loaded_embedding_identity(e)?;
             return Ok(Arc::clone(e));
         }
         let embedder = Arc::new(CodeEmbedder::new()?);
+        self.validate_loaded_embedding_identity(&embedder)?;
         *guard = Some(Arc::clone(&embedder));
         Ok(embedder)
+    }
+
+    /// Local content identities must agree before old document vectors can
+    /// receive either a new query or an incremental batch from a loaded model.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn validate_loaded_embedding_identity(
+        &self,
+        embedder: &CodeEmbedder,
+    ) -> Result<(), KinDbError> {
+        let Some(runtime) = embedder.runtime_identity() else {
+            return Ok(());
+        };
+        let index = self.vector_index.lock();
+        let Some(index) = index.as_ref().filter(|index| !index.is_empty()) else {
+            return Ok(());
+        };
+        if let Some(stored) = index.descriptor().model_id {
+            if (crate::embed::is_local_content_identity(&stored)
+                || crate::embed::is_local_content_identity(&runtime.model_id))
+                && stored != runtime.model_id
+            {
+                return Err(KinDbError::IndexError(format!(
+                    "loaded embedding model {} does not match vector index {stored}; rebuild the index for the selected model",
+                    runtime.model_id
+                )));
+            }
+        } else if crate::embed::is_local_content_identity(&runtime.model_id) {
+            return Err(KinDbError::IndexError(
+                "vector index has no model content identity; rebuild it before using the selected local model".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Snapshotting an owner that already loaded its model uses that captured
+    /// identity, never a fresh interpretation of mutable environment or paths.
+    #[cfg(feature = "embeddings")]
+    pub(crate) fn loaded_embedding_runtime(&self) -> Option<crate::embed::EmbeddingRuntimeConfig> {
+        self.embedder
+            .lock()
+            .as_ref()
+            .and_then(|embedder| embedder.runtime_identity().cloned())
+    }
+
+    /// Build the code embedder now, without embedding anything.
+    ///
+    /// The first build on a machine fetches the model from Hugging Face, and
+    /// every later one reads it from the local cache. A caller about to take a
+    /// lock for an embedding batch calls this first, so the fetch never runs
+    /// under that lock: the batch then finds the embedder already built.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn prepare_embedder(&self) -> Result<(), KinDbError> {
+        self.get_embedder().map(|_| ())
+    }
+
+    /// A build without embeddings has no embedder to prepare.
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn prepare_embedder(&self) -> Result<(), KinDbError> {
+        Ok(())
     }
 
     /// Get or lazily initialize the HNSW vector index, self-healing a
@@ -4914,11 +5153,29 @@ impl InMemoryGraph {
 
         let mut did_reset = false;
         if let Some(ref vi) = *guard {
-            if vi.dimensions() == embedder.dimensions() {
+            let model_matches = embedder.runtime_identity().is_none_or(|runtime| {
+                vi.descriptor().model_id.as_deref().is_none_or(|stored| {
+                    !(crate::embed::is_local_content_identity(stored)
+                        || crate::embed::is_local_content_identity(&runtime.model_id))
+                        || stored == runtime.model_id
+                })
+            });
+            if vi.dimensions() == embedder.dimensions() && model_matches {
+                if vi.is_empty() {
+                    if let Some(runtime) = embedder.runtime_identity() {
+                        if crate::embed::is_local_content_identity(&runtime.model_id) {
+                            vi.set_descriptor(crate::vector::IndexDescriptor {
+                                model_id: Some(runtime.model_id.clone()),
+                                graph_root: None,
+                            });
+                        }
+                    }
+                }
                 return Ok(Arc::clone(vi));
             }
             tracing::warn!(
-                "LOUD WARNING: Vector index dimensions ({}) do not match embedder dimensions ({})! Resetting and re-queueing missing.",
+                model_matches,
+                "Vector index dimensions ({}) or local model identity do not match the embedder ({})! Resetting and re-queueing missing.",
                 vi.dimensions(),
                 embedder.dimensions()
             );
@@ -4930,6 +5187,14 @@ impl InMemoryGraph {
         }
 
         let vi = Arc::new(VectorIndex::new(embedder.dimensions())?);
+        if let Some(runtime) = embedder.runtime_identity() {
+            if crate::embed::is_local_content_identity(&runtime.model_id) {
+                vi.set_descriptor(crate::vector::IndexDescriptor {
+                    model_id: Some(runtime.model_id.clone()),
+                    graph_root: None,
+                });
+            }
+        }
         *guard = Some(Arc::clone(&vi));
         drop(guard);
 
@@ -8121,6 +8386,16 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
 }
 
 impl EntityStore for InMemoryGraph {
+    fn binding_history_observation(&self) -> kin_model::BindingHistoryObservation {
+        self.entities
+            .read()
+            .verified_binding_history
+            .as_ref()
+            .map_or(kin_model::BindingHistoryObservation::Unproven, |proof| {
+                proof.observation()
+            })
+    }
+
     type Error = KinDbError;
 
     fn artifact_id_at_path(&self, path: &RepoPath) -> Option<ArtifactId> {
@@ -8134,6 +8409,16 @@ impl EntityStore for InMemoryGraph {
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, KinDbError> {
         let _span = tracing::info_span!("kindb.get_entity").entered();
         Ok(self.entities.read().entities.get(id).cloned())
+    }
+
+    fn lookup_relation_by_id(
+        &self,
+        id: &RelationId,
+    ) -> Result<kin_model::RelationLookup, KinDbError> {
+        Ok(match self.get_relation_by_id(id) {
+            Some(relation) => kin_model::RelationLookup::Present(relation),
+            None => kin_model::RelationLookup::Absent,
+        })
     }
 
     fn get_relations(
@@ -8375,6 +8660,19 @@ impl EntityStore for InMemoryGraph {
         Ok(results)
     }
 
+    fn text_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(kin_model::RetrievalKey, f32)>, KinDbError> {
+        // Fully qualified so this reaches the inherent method below rather than
+        // recursing into this trait method: an inherent method and a trait
+        // method of the same name both named `text_search` on the same type is
+        // legal and Rust prefers the inherent one on a plain `self.text_search`
+        // call, but spelling it out removes any doubt for a reader.
+        InMemoryGraph::text_search(self, query, limit)
+    }
+
     fn list_all_entities(&self) -> Result<Vec<Entity>, KinDbError> {
         Ok(self
             .entities
@@ -8431,16 +8729,39 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
+        // An identical edge is not a write. Taking the truth lock first would
+        // drop the binding witness and then discover there was nothing to
+        // change, which is how a re-offered language-server edge made a
+        // committed tree answer `local_binding_unproven` without moving a count.
+        //
+        // Not a write is still not a pass. The endpoint gate is what makes this
+        // edge writable at all, and an endpoint unadmitted since the edge was
+        // stored makes the re-offer the same refusal a first offer would get.
+        // Returning `Ok` on the identity alone would report the held edge as
+        // accepted over a graph that may no longer carry either end of it, so
+        // the gate runs on both early returns. It reads, so the read guard is
+        // enough and the witness survives.
+        {
+            let ent = self.entities.read();
+            if ent
+                .relations
+                .get(&relation.id)
+                .is_some_and(|held| held == relation)
+            {
+                self.require_admitted_relation_endpoints(&ent, relation)?;
+                return Ok(());
+            }
+        }
         let mut ent = self.entities_write();
-        self.require_admitted_relation_endpoints(&ent, relation)?;
-        // A re-offer of the edge the graph already holds changes nothing, so it
-        // must cost nothing. Without this it still rewrites both index entries,
-        // records a remove and an upsert delta, reseeds the merkle, and through
-        // `invalidate_entities_for_embedding` below retires both endpoints'
-        // vectors for an edge that did not move.
-        if ent.relations.get(&relation.id) == Some(relation) {
+        if ent
+            .relations
+            .get(&relation.id)
+            .is_some_and(|held| held == relation)
+        {
+            self.require_admitted_relation_endpoints(&ent, relation)?;
             return Ok(());
         }
+        self.require_admitted_relation_endpoints(&ent, relation)?;
         let mut affected = HashSet::new();
         let mut merkle_seeds = Vec::new();
 
@@ -8807,6 +9128,10 @@ impl EntityStore for InMemoryGraph {
             .resolved_tree
             .artifact_at_path(&path)
             .map(|artifact| artifact.entry))
+    }
+
+    fn resolved_tree_snapshot(&self) -> Result<Option<ResolvedTree>, KinDbError> {
+        Ok(Some(self.entities.read().resolved_tree.clone()))
     }
 
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
@@ -9602,6 +9927,49 @@ impl ChangeStore for InMemoryGraph {
         // Sort by timestamp ascending
         history.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         Ok(history)
+    }
+
+    fn get_entity_history_page(
+        &self,
+        id: &EntityId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<kin_model::change::EntityHistoryPage, KinDbError> {
+        let changes = self.changes.read();
+        let mut identities = Vec::new();
+        changes.changes.visit_changes(|change| {
+            if change.entity_deltas.iter().any(|delta| {
+                delta.old_state().is_some_and(|entity| entity.id == *id)
+                    || delta.new_state().is_some_and(|entity| entity.id == *id)
+            }) {
+                identities.push((change.timestamp.clone(), change.id));
+            }
+            Ok(())
+        })?;
+        identities.sort();
+        let mut entries = Vec::new();
+        // Discovery still inspects cold records once to find the focal history.
+        // The second pass reads only page identities: warm bodies are borrowed,
+        // and indexed cold/spooled bodies decode one selected record at a time.
+        // Legacy unindexed encoded maps retain their whole-map read fallback.
+        for (_, change_id) in identities.iter().skip(offset).take(limit) {
+            let projected = changes
+                .changes
+                .project_change(change_id, |change| {
+                    kin_model::change::EntityHistoryEntry::for_entity(change, id)
+                })?
+                .ok_or_else(|| {
+                    KinDbError::StorageError(format!("history record {change_id} missing"))
+                })?;
+            if let Some(entry) = projected {
+                entries.push(entry);
+            }
+        }
+        Ok(kin_model::change::EntityHistoryPage {
+            change_count: identities.len(),
+            latest_change_id: identities.last().map(|(_, id)| *id),
+            entries,
+        })
     }
 
     fn find_merge_bases(
@@ -12682,7 +13050,14 @@ mod tests {
                 .contains("quarantined"),
             "a quarantined derived index must never answer from stale documents"
         );
-        assert_eq!(graph.text_doc_frequency("faulted"), 0);
+        assert!(
+            graph
+                .text_doc_frequency("faulted")
+                .unwrap_err()
+                .to_string()
+                .contains("quarantined"),
+            "a quarantined index refuses a frequency read rather than answering 0"
+        );
         assert_eq!(graph.text_document_count(), 0);
         graph.fail_next_text_rebuild.store(true, Ordering::Release);
         assert!(
@@ -12706,6 +13081,154 @@ mod tests {
                 "an exact artifact without enrichment has no vector document to rebuild"
             );
         }
+    }
+
+    /// Leave `graph`'s text index unmapped the way a store gets there: a segment
+    /// the next commit carries forward is gone, so that commit publishes an
+    /// image naming a file that is not there and its read-back fails.
+    ///
+    /// Returns the removed file and its bytes, so a test can put it back.
+    fn unmap_text_index(graph: &InMemoryGraph, text_dir: &std::path::Path) -> (PathBuf, Vec<u8>) {
+        let segment = std::fs::read_dir(text_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.contains(".kinseg-") && !name.ends_with(".kinseg-manifest")
+            })
+            .expect("the committed text index is segmented");
+        let bytes = std::fs::read(&segment).unwrap();
+        std::fs::remove_file(&segment).unwrap();
+        // A root change with no document delta is a commit that carries every
+        // segment forward, including the missing one.
+        let error = graph
+            .persist_text_index_with_root_hash([0x5a; 32])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("could not map it back"),
+            "the fixture's commit must fail its read-back: {error}"
+        );
+        (segment, bytes)
+    }
+
+    /// Every text reader here refuses or reports the gap while the committed
+    /// image is unmapped, and a read maps the image back once its file returns,
+    /// with nothing written to the graph.
+    ///
+    /// Search already refused. Membership answered `false` for every key, so
+    /// stats published 0 percent coverage; document frequency answered 0; the
+    /// document count answered the published count, so nothing downstream
+    /// could tell the index had stopped answering; and only a graph write
+    /// retried the mapping.
+    #[test]
+    fn an_unmapped_text_index_is_unavailable_to_every_reader_until_a_read_maps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let text_dir = dir.path().join("text-index");
+        let graph = InMemoryGraph::with_text_index(text_dir.clone());
+        let entities: Vec<Entity> = (0..6)
+            .map(|n| test_entity(&format!("unmapped_reader_{n}"), "src/unmapped.rs"))
+            .collect();
+        for entity in &entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph.flush_text_index().unwrap();
+        assert_eq!(
+            graph.graph_stats().text_indexed_entity_count,
+            Some(entities.len()),
+            "the control: a readable index reports its coverage"
+        );
+        assert!(graph.text_index_unavailable().is_none());
+
+        let (segment, bytes) = unmap_text_index(&graph, &text_dir);
+
+        let reason = graph
+            .text_index_unavailable()
+            .expect("an unmapped index reports the gap");
+        assert!(reason.contains("could not be mapped back"), "{reason}");
+        assert!(
+            graph
+                .text_search("unmapped_reader_1", 10)
+                .unwrap_err()
+                .to_string()
+                .contains("search is refused"),
+            "search refuses"
+        );
+        assert!(
+            graph
+                .text_doc_frequency("unmapped")
+                .unwrap_err()
+                .to_string()
+                .contains("a document frequency read is refused"),
+            "a frequency read refuses rather than answering 0"
+        );
+        assert_eq!(
+            graph.text_document_count(),
+            0,
+            "no document is visible to search"
+        );
+        let stats = graph.graph_stats();
+        assert_eq!(
+            stats.text_indexed_entity_count, None,
+            "unavailable, not zero"
+        );
+        assert_eq!(stats.text_index_coverage_percent, None);
+        graph
+            .flush_text_index()
+            .expect("a clean flush with the file still missing changes nothing");
+        assert!(graph.text_index_unavailable().is_some());
+
+        std::fs::write(&segment, &bytes).unwrap();
+        let hits = graph
+            .text_search("unmapped_reader_1", 10)
+            .expect("a read maps the image again once its file is back");
+        assert!(
+            hits.iter()
+                .any(|(key, _)| *key == RetrievalKey::Entity(entities[1].id)),
+            "{hits:?}"
+        );
+        assert!(graph.text_index_unavailable().is_none());
+        assert_eq!(
+            graph.text_doc_frequency("unmapped").unwrap(),
+            entities.len()
+        );
+        assert_eq!(graph.text_document_count(), entities.len());
+        let stats = graph.graph_stats();
+        assert_eq!(stats.text_indexed_entity_count, Some(entities.len()));
+        assert!((stats.text_index_coverage_percent.unwrap() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// The query-entry flush is itself a read path that maps the image back.
+    ///
+    /// A clean index used to make `flush_text_index` a no-op, so a store whose
+    /// file had returned stayed refused until the next graph write.
+    #[test]
+    fn a_clean_flush_maps_an_unmapped_text_index_back_once_its_file_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let text_dir = dir.path().join("text-index");
+        let graph = InMemoryGraph::with_text_index(text_dir.clone());
+        let entity = test_entity("flush_remaps", "src/flush.rs");
+        graph.upsert_entity(&entity).unwrap();
+        graph.flush_text_index().unwrap();
+        let (segment, bytes) = unmap_text_index(&graph, &text_dir);
+        assert!(
+            !graph.text_dirty.load(Ordering::Acquire),
+            "nothing is staged"
+        );
+
+        std::fs::write(&segment, &bytes).unwrap();
+        graph.flush_text_index().unwrap();
+        // Take the file away again. A read cannot map an image with a file
+        // missing, so only a mapping the flush made can answer below; the
+        // mapping itself outlives the unlink.
+        std::fs::remove_file(&segment).unwrap();
+        let hits = graph
+            .text_search("flush_remaps", 10)
+            .expect("the clean flush mapped the image back");
+        assert!(
+            hits.iter()
+                .any(|(key, _)| *key == RetrievalKey::Entity(entity.id)),
+            "{hits:?}"
+        );
     }
 
     #[test]
@@ -13177,6 +13700,61 @@ mod tests {
 
         graph.upsert_relation(&relation).unwrap();
         assert_eq!(graph.relation_count(), 1);
+    }
+
+    /// An identical re-offer is not a write, and it is not a pass either.
+    ///
+    /// The early return that keeps a re-offered language-server edge from
+    /// dropping the binding witness sits ahead of the endpoint gate. Held plus
+    /// identical was therefore answered `Ok` without asking whether the graph
+    /// still carries either end, so an endpoint unadmitted since the edge was
+    /// stored made the re-offer report success over a strand. Both arms are
+    /// graded here: the ordinary re-offer still returns `Ok` without a write,
+    /// and the same call over an unadmitted endpoint is refused.
+    #[test]
+    fn upsert_relation_refuses_an_identical_re_offer_whose_endpoint_was_unadmitted() {
+        let graph = InMemoryGraph::new();
+        let covered = test_entity("covered", "src/a.rs");
+        graph.upsert_entity(&covered).unwrap();
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "covers_a".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(covered.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/a.rs")),
+        };
+        graph.create_test_case(&test_case).unwrap();
+        let held = graph
+            .entities
+            .read()
+            .relations
+            .values()
+            .find(|relation| relation.src == GraphNodeId::Test(test_case.test_id))
+            .cloned()
+            .expect("create_test_case links the scope it was given");
+
+        // The control. While the endpoint is admitted the identical re-offer is
+        // accepted and changes nothing, which is the behavior the early return
+        // exists to preserve.
+        graph.upsert_relation(&held).unwrap();
+        assert_eq!(graph.relation_count(), 1);
+
+        // Unadmit the endpoint under the held edge, which is the state a
+        // production removal reaches between dropping a node and re-deriving
+        // what pointed at it.
+        graph
+            .verification
+            .write()
+            .test_cases
+            .remove(&test_case.test_id);
+
+        let message = graph.upsert_relation(&held).unwrap_err().to_string();
+        assert!(
+            message.contains("unadmitted source endpoint"),
+            "a re-offer over an unadmitted endpoint must be refused, got: {message}"
+        );
     }
 
     /// The control the fix is most likely to break. `create_test_case` inserts
@@ -15339,7 +15917,12 @@ mod tests {
             repository_authority,
             external_references,
             materialized_graph,
+            verified_binding_history,
         } = served;
+        assert_eq!(
+            *verified_binding_history, fresh.verified_binding_history,
+            "binding history capability"
+        );
         assert_eq!(*version, fresh.version, "version");
         // `ResolvedGraphState` carries no `PartialEq`, so the two are compared
         // through the exact MessagePack form they would be persisted in, which
@@ -19918,6 +20501,86 @@ mod tests {
 
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     #[test]
+    fn local_model_content_identity_owner_retains_loaded_identity_and_refuses_relabeling() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("captured_model", "src/captured.rs");
+        graph.upsert_entity(&entity).unwrap();
+        let runtime = crate::embed::EmbeddingRuntimeConfig {
+            provider: "local".into(),
+            model_id: format!("local-content-sha256:{}", "a".repeat(64)),
+            revision: "local-content-v1".into(),
+            dimensions: Some(2),
+            pipeline_epoch: "captured-pipeline".into(),
+        };
+        let embedder = CodeEmbedder::test_local_success(
+            2,
+            dir.path().join("cache"),
+            kin_infer::gpu::GpuBackend::Cpu,
+            vec![1.0, 0.0],
+        )
+        .with_test_runtime_identity(runtime.clone());
+        *graph.embedder.lock() = Some(Arc::new(embedder));
+        let identity_reads = crate::embed::model_identity_hash_reads();
+        assert_eq!(graph.process_embedding_queue(1).unwrap(), 1);
+        assert_eq!(graph.loaded_embedding_runtime(), Some(runtime.clone()));
+        for _ in 0..3 {
+            let results = graph
+                .semantic_search_with_producers("captured_model", 1)
+                .unwrap();
+            assert_eq!(results.matches.len(), 1);
+        }
+        assert_eq!(
+            crate::embed::model_identity_hash_reads(),
+            identity_reads,
+            "loaded semantic operations must use the captured identity"
+        );
+        let snapshot = dir.path().join("graph.kndb");
+        crate::storage::SnapshotManager::save_vector_index_for_graph(&snapshot, &graph, None)
+            .unwrap();
+        let metadata_path = dir.path().join("graph.kvec.meta.json");
+        let saved = std::fs::read(&metadata_path).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(metadata["embedding_model_id"], runtime.model_id);
+        assert_eq!(metadata["embedding_pipeline_epoch"], runtime.pipeline_epoch);
+        assert_eq!(
+            crate::embed::model_identity_hash_reads(),
+            identity_reads,
+            "saving a loaded owner must not rehash its model artifacts"
+        );
+
+        let index = graph.vector_index.lock().clone().unwrap();
+        index.set_descriptor(crate::vector::IndexDescriptor {
+            model_id: Some(format!("local-content-sha256:{}", "b".repeat(64))),
+            graph_root: None,
+        });
+        assert!(graph
+            .semantic_search_with_producers("query", 1)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match vector index"));
+        assert!(
+            crate::storage::SnapshotManager::save_vector_index_for_graph(&snapshot, &graph, None)
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to relabel")
+        );
+        assert_eq!(std::fs::read(metadata_path).unwrap(), saved);
+        assert_eq!(graph.embedding_status().indexed, 1);
+        index.set_descriptor(crate::vector::IndexDescriptor::default());
+        assert!(graph
+            .semantic_search_with_producers("query", 1)
+            .unwrap_err()
+            .to_string()
+            .contains("no model content identity"));
+        assert!(
+            crate::storage::SnapshotManager::save_vector_index_for_graph(&snapshot, &graph, None)
+                .is_err()
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
     fn non_oom_local_forward_error_preserves_cache_queue_and_vector_index() {
         let dir = tempfile::tempdir().unwrap();
         let graph = InMemoryGraph::new();
@@ -19957,7 +20620,7 @@ mod tests {
         assert_eq!(graph.embedding_status().indexed, 1);
         assert_eq!(graph.vector_actual_producers(), before_producers);
         assert_eq!(stats.primary_forward_calls(), 1);
-        assert_eq!(stats.cpu_model_calls(), 0);
+        assert_eq!(stats.cpu_twin_requests(), 0);
         assert_eq!(stats.cpu_forward_calls(), 0);
         let after_search = graph
             .search_loaded_vector_index_for_test(&[1.0, 0.0], 1)
@@ -20106,8 +20769,8 @@ mod tests {
         assert_eq!(stats.structured_artifact_count, 1);
         assert_eq!(stats.opaque_artifact_count, 1);
         assert_eq!(stats.working_tree_entry_count, 4);
-        assert_eq!(stats.text_indexed_entity_count, 3);
-        assert!((stats.text_index_coverage_percent - 100.0).abs() < f64::EPSILON);
+        assert_eq!(stats.text_indexed_entity_count, Some(3));
+        assert!((stats.text_index_coverage_percent.unwrap() - 100.0).abs() < f64::EPSILON);
         #[cfg(feature = "vector")]
         assert_eq!(stats.indexed_embedding_count, 1);
         #[cfg(not(feature = "vector"))]

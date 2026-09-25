@@ -13,6 +13,8 @@ repository = "https://github.com/firelock-ai/kin-db"
 doctest = false
 
 [features]
+# Scoped runtime observers for dependent crates' test-only process controls.
+test-support = []
 default = ["vector", "embeddings"]
 vector = ["dep:kin-vector"]
 embeddings = [

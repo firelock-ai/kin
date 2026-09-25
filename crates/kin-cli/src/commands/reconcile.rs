@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use super::repository_authority::ActiveRepositoryAuthority;
 use crate::commands::session_workspace::SessionWorkspaceBase;
+pub use crate::commands::write_back::{
+    SessionWriteBack, Toolchain, WithheldChange, WithheldReason,
+};
 
 pub const RECONCILE_SUMMARY_SCHEMA: &str = "kin.session-reconcile.v1";
 
@@ -50,6 +53,10 @@ pub struct ReconcileRequest {
     pub session_dir: PathBuf,
     #[serde(default)]
     pub confirm_mass_deletion: bool,
+    /// Which of the session's observed changes may be admitted. Absent reads
+    /// as a person's session: everything but new build outputs.
+    #[serde(default)]
+    pub write_back: SessionWriteBack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,11 +98,21 @@ pub struct ReconcileChange {
 #[serde(deny_unknown_fields)]
 pub struct ReconcileSummary {
     pub schema: String,
+    /// The session's own reconcile operation. An unchanged session commits
+    /// nothing under it.
     pub operation_id: kin_model::OperationId,
     pub repository_id: kin_model::RepositoryId,
+    /// Repository authority generation once this reconcile finished. A
+    /// publication reports its receipt's generation. An unchanged session
+    /// publishes nothing, so it reports the generation current when it closed,
+    /// which other writers may have advanced past the session's base.
     pub authority_generation: u64,
+    /// Workspace generation once this reconcile finished, by the same rule.
     pub workspace_generation: u64,
+    /// Tree the session was materialized from.
     pub previous_tree_hash: Hash256,
+    /// Tree the session's observation asks authority to hold. For an unchanged
+    /// session it equals `previous_tree_hash`, and nothing is published.
     pub desired_tree_hash: Hash256,
     pub idempotent_replay: bool,
     pub changed: bool,
@@ -108,6 +125,40 @@ pub struct ReconcileSummary {
     pub semantic_files_enriched: usize,
     pub semantic_enrichment_failures: usize,
     pub changes: Vec<ReconcileChange>,
+    /// Observed changes the session's write-back policy did not admit, each
+    /// with the reason. A withheld change is not in `changes` and is not
+    /// counted by `added`, `modified` or `removed`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<WithheldChange>,
+}
+
+/// Repository and workspace generations read from current authority when a
+/// session base was last authenticated.
+///
+/// An unchanged session may close against a base other writers have since
+/// advanced, so its summary reports these rather than the snapshot generations
+/// the base recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentAuthorityGenerations {
+    pub authority: u64,
+    pub workspace: u64,
+}
+
+/// Retained observation identities, with a separate durable location. Its
+/// private fields prevent construction without an exact session observation.
+pub struct RetainedSessionPublicationBinding {
+    binding: kin_db::storage::SessionPublicationBinding,
+    locator: kin_db::storage::SessionPublicationLocator,
+}
+
+impl RetainedSessionPublicationBinding {
+    pub fn binding(&self) -> &kin_db::storage::SessionPublicationBinding {
+        &self.binding
+    }
+
+    pub fn locator(&self) -> &kin_db::storage::SessionPublicationLocator {
+        &self.locator
+    }
 }
 
 /// Complete, twice-verified input to the daemon's authority transaction.
@@ -151,9 +202,73 @@ pub struct SessionReconcileObservation {
     observed_materialized_artifacts: usize,
     observed_body_bytes: u64,
     preserved_graph_only_artifacts: usize,
+    current_generations: Option<CurrentAuthorityGenerations>,
+    #[cfg(unix)]
+    filter: ObservationFilter,
+    withheld: Vec<WithheldChange>,
+}
+
+/// Which observed changes an observation admits.
+///
+/// A request names a [`SessionWriteBack`]. `Unfiltered` is what every session
+/// admitted before build outputs were withheld, and only the recovery of a
+/// publication prepared under it reads it: that publication's target is
+/// already acknowledged, and recovery must reproduce it exactly.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationFilter {
+    Unfiltered,
+    Policy(SessionWriteBack),
+}
+
+#[cfg(unix)]
+impl ObservationFilter {
+    /// Whether this filter withholds anything, and so whether the scan may
+    /// skip a generated directory graph truth holds nothing under.
+    fn filters(self) -> bool {
+        matches!(self, Self::Policy(_))
+    }
+
+    /// This filter when its policy satisfies `keep`, and `Unfiltered`
+    /// otherwise.
+    fn filter(self, keep: impl Fn(SessionWriteBack) -> bool) -> Self {
+        match self {
+            Self::Policy(policy) if keep(policy) => self,
+            _ => Self::Unfiltered,
+        }
+    }
+
+    /// Every filter a recovered publication may have been planned under.
+    fn recovery_candidates() -> Vec<Self> {
+        let mut candidates = vec![
+            Self::Policy(SessionWriteBack::ExceptBuildOutputs),
+            Self::Policy(SessionWriteBack::ToolchainManifests),
+        ];
+        candidates.extend(
+            crate::commands::write_back::Toolchain::ALL
+                .into_iter()
+                .map(|toolchain| Self::Policy(SessionWriteBack::ManifestsOf(toolchain))),
+        );
+        candidates.push(Self::Unfiltered);
+        candidates
+    }
 }
 
 impl SessionReconcileObservation {
+    /// Opaque identity of this observed session, including its exact base
+    /// bytes and retained no-follow directory chain. This is not a path ID.
+    pub fn publication_binding(&self) -> Result<RetainedSessionPublicationBinding> {
+        #[cfg(unix)]
+        {
+            self.retained
+                .publication_binding(&self.base, &self.base_bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("retained session publication binding is unavailable on this platform")
+        }
+    }
+
     pub fn base(&self) -> &SessionWorkspaceBase {
         &self.base
     }
@@ -178,8 +293,50 @@ impl SessionReconcileObservation {
         self.preserved_graph_only_artifacts
     }
 
+    /// Generations current when this observation's base was last
+    /// authenticated. `None` for an acknowledged preparation, whose receipt
+    /// reports its own generation.
+    pub const fn current_generations(&self) -> Option<CurrentAuthorityGenerations> {
+        self.current_generations
+    }
+
     pub fn changes(&self) -> Vec<ReconcileChange> {
         self.deltas.iter().map(reconcile_change).collect()
+    }
+
+    /// Observed changes the session's write-back policy did not admit.
+    pub fn withheld(&self) -> &[WithheldChange] {
+        &self.withheld
+    }
+
+    /// Re-scan under the retained no-follow capability before acknowledgement.
+    /// The already authorized target must remain byte-exact; this does not
+    /// authorize new changes or make an atomic claim about future writers.
+    pub fn revalidate_publication_inputs(
+        &self,
+        layout: &kin_core::KinLayout,
+        blobs: &kin_blobs::BlobStore,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let (scan, _) = scan_retained_projection(
+                &self.retained,
+                layout,
+                &self.base,
+                &self.base_bytes,
+                blobs,
+                self.filter,
+            )?;
+            if build_desired_tree(&self.base, &scan, self.filter)?.0 != self.desired_tree {
+                bail!("session target changed before publication acknowledgement");
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (layout, blobs);
+            bail!("retained session publication revalidation is unavailable on this platform")
+        }
     }
 
     /// Re-prove the retained capability still names the observed session.
@@ -232,6 +389,7 @@ pub async fn run_for_layout(
         .reconcile(&ReconcileRequest {
             session_dir: session_dir.clone(),
             confirm_mass_deletion,
+            write_back: SessionWriteBack::default(),
         })
         .await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -245,12 +403,119 @@ pub async fn run_for_layout(
     Ok(())
 }
 
+/// Observe a person's session: everything it changed except new build
+/// outputs. See [`observe_session_workspace_under`].
 pub fn observe_session_workspace(
     layout: &kin_core::KinLayout,
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     session_dir: &Path,
     blobs: &kin_blobs::BlobStore,
     confirm_mass_deletion: bool,
+) -> Result<SessionReconcileObservation> {
+    observe_session_workspace_under(
+        layout,
+        binding,
+        session_dir,
+        blobs,
+        confirm_mass_deletion,
+        SessionWriteBack::default(),
+    )
+}
+
+/// Observe one session under the write-back policy its caller names. The
+/// changes the policy does not admit are left out of the desired tree and
+/// reported by [`SessionReconcileObservation::withheld`].
+pub fn observe_session_workspace_under(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    session_dir: &Path,
+    blobs: &kin_blobs::BlobStore,
+    confirm_mass_deletion: bool,
+    write_back: SessionWriteBack,
+) -> Result<SessionReconcileObservation> {
+    observe_session_workspace_inner(
+        layout,
+        binding,
+        session_dir,
+        blobs,
+        confirm_mass_deletion,
+        None,
+        write_back,
+    )
+}
+
+/// Discover one retained session's acknowledged operation before taking the
+/// backend publication freeze. This loads through the caller's existing
+/// authority manager; it neither opens another manager nor authorizes replay.
+/// An operation ID alone is insufficient: its exact base, control identity and
+/// locator must still belong to this retained session.
+pub fn lookup_prepared_session_workspace(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    session_dir: &Path,
+    authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
+) -> Result<Option<kin_db::storage::PreparedSessionPublication>> {
+    #[cfg(unix)]
+    {
+        let retained = RetainedSession::open(layout, session_dir)?;
+        let base_bytes = retained.read_base()?;
+        let base: SessionWorkspaceBase =
+            serde_json::from_slice(&base_bytes).context("decode exact session base")?;
+        base.validate().context("validate exact session base")?;
+        validate_local_binding_identity(binding, &base)?;
+        if authority.read_authority().metadata().repository_id != base.repository_id {
+            bail!("session lookup authority belongs to another repository");
+        }
+        let prepared = authority.load_prepared_session_publication(base.reconcile_operation_id)?;
+        if let Some(prepared) = &prepared {
+            validate_prepared_base(&retained, &base, &base_bytes, prepared)?;
+        }
+        retained.revalidate_visible(layout, &base_bytes)?;
+        binding.revalidate_pinned_namespace()?;
+        Ok(prepared)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (layout, binding, session_dir, authority);
+        bail!("retained session publication lookup is unavailable on this platform")
+    }
+}
+
+/// Re-observe the immutable target of one acknowledged local preparation.
+/// The locator never resolves "latest" and legacy portable IDs are not paths.
+/// A preparation acknowledges only its exact desired tree, not permission to
+/// admit a newly observed mass deletion or another changed target.
+/// This checks the manager-admitted handle and retained namespace without
+/// reopening authority, so it can run under a publication freeze and can
+/// verify a historical receipt without replacing newer repository roots.
+pub fn observe_prepared_session_workspace(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    blobs: &kin_blobs::BlobStore,
+    prepared: &kin_db::storage::PreparedSessionPublication,
+) -> Result<SessionReconcileObservation> {
+    let kin_db::storage::SessionPublicationLocator::RetainedUnixV1 { session_leaf } =
+        prepared.recovery_locator()?;
+    validate_session_leaf(session_leaf)?;
+    observe_session_workspace_inner(
+        layout,
+        binding,
+        &layout.runs_dir().join(session_leaf),
+        blobs,
+        false,
+        Some(prepared),
+        SessionWriteBack::default(),
+    )
+}
+
+fn observe_session_workspace_inner(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    session_dir: &Path,
+    blobs: &kin_blobs::BlobStore,
+    confirm_mass_deletion: bool,
+    prepared: Option<&kin_db::storage::PreparedSessionPublication>,
+    write_back: SessionWriteBack,
 ) -> Result<SessionReconcileObservation> {
     #[cfg(unix)]
     {
@@ -259,44 +524,126 @@ pub fn observe_session_workspace(
         let base: SessionWorkspaceBase =
             serde_json::from_slice(&base_bytes).context("decode exact session base")?;
         base.validate().context("validate exact session base")?;
-        validate_base_authority_preflight(binding, &base)?;
+        if let Some(prepared) = prepared {
+            validate_local_binding_identity(binding, &base)?;
+            validate_prepared_base(&retained, &base, &base_bytes, prepared)?;
+            binding.revalidate_pinned_namespace()?;
+        } else {
+            // Authenticate before any projection byte is read. Whether a base
+            // that is no longer current may still close is decided once the
+            // exact deltas are known.
+            session_base_standing(binding, &base)?;
+        }
 
-        let mut graph_only_paths = Vec::new();
-        for artifact in base.source_workspace.tree.artifacts_by_path() {
-            let disposition =
-                kin_core::source_projection_disposition(&artifact.path, artifact.entry)
-                    .with_context(|| {
-                        format!(
-                            "classify exact session source projection member {}",
-                            artifact.path
-                        )
-                    })?;
-            if disposition != kin_core::SourceProjectionDisposition::Materialized {
-                graph_only_paths.push(artifact.path.clone());
+        // A fresh observation admits what its caller's policy admits. Recovery
+        // of an acknowledged publication must reproduce that publication's
+        // exact target, which was planned under a policy the recovery does not
+        // know, so it takes the first policy that does, the legacy unfiltered
+        // one included for a publication prepared before build outputs were
+        // withheld. The target is already acknowledged, so this admits
+        // nothing new: a session that matches none of them still fails.
+        let candidates = if prepared.is_some() {
+            ObservationFilter::recovery_candidates()
+        } else {
+            vec![ObservationFilter::Policy(write_back)]
+        };
+        let acknowledged = match prepared {
+            Some(prepared) => {
+                let mutation = prepared
+                    .transaction()
+                    .workspace_mutation
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("prepared session has no workspace target"))?;
+                let expected = base
+                    .source_workspace
+                    .tree
+                    .apply(&mutation.tree_deltas)
+                    .context("derive acknowledged exact session target")?;
+                Some((expected, mutation.new_tree_hash))
             }
+            None => None,
+        };
+        let mut chosen = None;
+        let mut filtered_scan: Option<(SessionScan, usize)> = None;
+        let mut unfiltered_scan: Option<(SessionScan, usize)> = None;
+        for filter in candidates.iter().copied() {
+            let slot = if filter.filters() {
+                &mut filtered_scan
+            } else {
+                &mut unfiltered_scan
+            };
+            if slot.is_none() {
+                *slot = Some(scan_retained_projection(
+                    &retained,
+                    layout,
+                    &base,
+                    &base_bytes,
+                    blobs,
+                    filter,
+                )?);
+            }
+            let (scan, graph_only_count) = slot.as_ref().expect("scanned above");
+            let (desired_tree, withheld) = build_desired_tree(&base, scan, filter)?;
+            if let Some((expected, expected_hash)) = &acknowledged {
+                if expected != &desired_tree
+                    || &kin_model::compute_resolved_tree_hash(&desired_tree)? != expected_hash
+                {
+                    continue;
+                }
+            }
+            chosen = Some((
+                filter,
+                desired_tree,
+                withheld,
+                scan.total_bytes,
+                scan.entries.len(),
+                *graph_only_count,
+            ));
+            break;
         }
-        let first = retained.scan(&graph_only_paths, Some(blobs))?;
-        let second = retained.scan(&graph_only_paths, None)?;
-        if first != second {
-            bail!("session projection changed between exact observations");
+        let Some((
+            filter,
+            desired_tree,
+            withheld,
+            observed_body_bytes,
+            observed_materialized_artifacts,
+            graph_only_count,
+        )) = chosen
+        else {
+            bail!("observed session differs from acknowledged immutable target");
+        };
+        if prepared.is_some() {
+            binding.revalidate_pinned_namespace()?;
         }
-        retained.revalidate_visible(layout, &base_bytes)?;
-        validate_base_authority_preflight(binding, &base)?;
 
-        let desired_tree = build_desired_tree(&base, &first)?;
         let deltas = kin_core::exact_tree_correction(&base.source_workspace.tree, &desired_tree)
             .context("plan exact session tree transition")?;
-        if deltas.is_empty() {
-            validate_base_is_current(binding, &base)?;
-        }
-        enforce_mass_deletion(
-            base.source_workspace.tree.len(),
-            &deltas,
-            confirm_mass_deletion,
-        )?;
-
-        let observed_body_bytes = first.total_bytes;
-        let observed_materialized_artifacts = first.entries.len();
+        let current_generations = if prepared.is_some() {
+            None
+        } else {
+            // Read after both scans, so authority that moved while the
+            // projection was observed is judged as it now stands.
+            let (standing, generations) = session_base_standing(binding, &base)?;
+            match standing {
+                SessionBaseStanding::Current => {}
+                SessionBaseStanding::Reconciled if !deltas.is_empty() => {}
+                SessionBaseStanding::Superseded if deltas.is_empty() => {}
+                SessionBaseStanding::Reconciled => bail!(
+                    "unchanged session base is stale or tampered: repository roots/workspace no \
+                     longer match its exact authority lease"
+                ),
+                SessionBaseStanding::Superseded => bail!(
+                    "session base is stale: repository authority advanced after this session was \
+                     materialized, and a changed session is never admitted onto newer authority"
+                ),
+            }
+            enforce_mass_deletion(
+                base.source_workspace.tree.len(),
+                &deltas,
+                confirm_mass_deletion,
+            )?;
+            Some(generations)
+        };
 
         Ok(SessionReconcileObservation {
             retained,
@@ -306,16 +653,115 @@ pub fn observe_session_workspace(
             deltas,
             observed_materialized_artifacts,
             observed_body_bytes,
-            preserved_graph_only_artifacts: graph_only_paths.len(),
+            preserved_graph_only_artifacts: graph_only_count,
+            current_generations,
+            filter,
+            withheld,
         })
     }
     #[cfg(not(unix))]
     {
-        let _ = (layout, binding, session_dir, blobs, confirm_mass_deletion);
+        let _ = (
+            layout,
+            binding,
+            session_dir,
+            blobs,
+            confirm_mass_deletion,
+            prepared,
+            write_back,
+        );
         bail!(
             "exact session reconciliation is fail-closed on this platform until retained \
              no-follow directory traversal is available"
         )
+    }
+}
+
+#[cfg(unix)]
+fn scan_retained_projection(
+    retained: &RetainedSession,
+    layout: &kin_core::KinLayout,
+    base: &SessionWorkspaceBase,
+    base_bytes: &[u8],
+    blobs: &kin_blobs::BlobStore,
+    filter: ObservationFilter,
+) -> Result<(SessionScan, usize)> {
+    retained.revalidate_visible(layout, base_bytes)?;
+    let context = ScanContext::new(&base.source_workspace.tree, filter);
+    let mut graph_only_paths = Vec::new();
+    for artifact in base.source_workspace.tree.artifacts_by_path() {
+        let disposition = kin_core::source_projection_disposition(&artifact.path, artifact.entry)
+            .with_context(|| {
+            format!(
+                "classify exact session source projection member {}",
+                artifact.path
+            )
+        })?;
+        if disposition != kin_core::SourceProjectionDisposition::Materialized {
+            graph_only_paths.push(artifact.path.clone());
+        }
+    }
+    let first = retained.scan(&graph_only_paths, &context, Some(blobs))?;
+    let second = retained.scan(&graph_only_paths, &context, None)?;
+    if first != second {
+        bail!("session projection changed between exact observations");
+    }
+    retained.revalidate_visible(layout, base_bytes)?;
+    Ok((first, graph_only_paths.len()))
+}
+
+#[cfg(unix)]
+fn validate_local_binding_identity(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    base: &SessionWorkspaceBase,
+) -> Result<()> {
+    if binding.repository_id() != &base.repository_id {
+        bail!("session base repository identity does not match this repository");
+    }
+    if binding.workspace_id() != base.source_workspace.workspace_id {
+        bail!("session base workspace identity does not match this workspace");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_prepared_base(
+    retained: &RetainedSession,
+    base: &SessionWorkspaceBase,
+    base_bytes: &[u8],
+    prepared: &kin_db::storage::PreparedSessionPublication,
+) -> Result<()> {
+    let observed = retained.publication_binding(base, base_bytes)?;
+    let transaction = prepared.transaction();
+    let mutation = transaction
+        .workspace_mutation
+        .as_ref()
+        .ok_or_else(|| anyhow!("prepared session has no workspace target"))?;
+    if observed.binding() != prepared.binding()
+        || observed.locator() != prepared.recovery_locator()?
+        || transaction.operation_id != base.reconcile_operation_id
+        || transaction.repository_id != base.repository_id
+        || transaction.expected_roots != base.authority_roots
+        || mutation.workspace_id != base.source_workspace.workspace_id
+        || mutation.expected != workspace_expectation(&base.source_workspace)
+    {
+        bail!("prepared session operation, base, locator, or retained control identity differs");
+    }
+    Ok(())
+}
+
+/// The complete compare-and-swap expectation a workspace mutation records for
+/// the exact workspace state it replaces.
+#[cfg(unix)]
+fn workspace_expectation(workspace: &kin_model::WorkspaceState) -> kin_model::WorkspaceExpectation {
+    kin_model::WorkspaceExpectation::MustEqual {
+        generation: workspace.generation,
+        head: workspace.head.clone(),
+        base_target: workspace.base_target.clone(),
+        base_tree_hash: workspace.base_tree_hash,
+        tree_hash: workspace.tree_hash,
+        semantic_overlay_hash: workspace.semantic_overlay_hash,
+        admission_policy: workspace.admission_policy,
     }
 }
 
@@ -374,19 +820,41 @@ fn validate_session_leaf(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// How an authenticated session base relates to current repository authority.
 #[cfg(unix)]
-fn validate_base_authority_preflight(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBaseStanding {
+    /// The exact lease the session was materialized from is still current.
+    Current,
+    /// The session's own reconcile operation is what advanced authority.
+    Reconciled,
+    /// Other operations advanced authority after an authentic base. Only an
+    /// exactly unchanged projection may close against it, and only as a no-op.
+    Superseded,
+}
+
+/// Bind an editable session base to persisted repository authority.
+///
+/// A base is current when its exact roots and workspace still are, and
+/// reconciled when a receipt proves the session's own operation moved
+/// authority from them. Any other base must be proven authentic history before
+/// it is read as superseded, and is refused otherwise: a forged base that
+/// matches the projection bytes would let an unchanged-looking close discard
+/// work nobody admitted.
+#[cfg(unix)]
+fn session_base_standing(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: &SessionWorkspaceBase,
-) -> Result<()> {
+) -> Result<(SessionBaseStanding, CurrentAuthorityGenerations)> {
+    validate_local_binding_identity(binding, base)?;
     let authority = ActiveRepositoryAuthority::open(binding)?;
     if authority.repository_id != base.repository_id {
         bail!("session base repository identity does not match this repository");
     }
     let lease = authority.manager().read_authority();
+    let metadata = lease.metadata();
     let roots = lease.roots();
-    let workspace = lease
-        .metadata()
+    let workspace = metadata
         .workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == authority.workspace_id)
@@ -396,69 +864,137 @@ fn validate_base_authority_preflight(
                 authority.workspace_id
             )
         })?;
+    let current = CurrentAuthorityGenerations {
+        authority: roots.generation,
+        workspace: workspace.generation,
+    };
     if roots == &base.authority_roots && workspace == &base.source_workspace {
-        return Ok(());
+        return Ok((SessionBaseStanding::Current, current));
     }
 
-    let receipt = lease
-        .metadata()
+    if let Some(receipt) = metadata
         .receipts
         .iter()
         .find(|receipt| receipt.operation_id == base.reconcile_operation_id)
-        .ok_or_else(|| {
-            anyhow!(
-                "session base is stale or tampered: repository roots/workspace no longer match \
-                 its exact authority lease"
-            )
-        })?;
-    // A persisted receipt names its operation record rather than repeating it
-    // (kin-db 0.7.89, FIR-3064), so it is validated against the log entry it
-    // names rather than against an embedded copy of it. That is the same set of
-    // comparisons `RepositoryCommitReceipt::validate` made.
-    let operation = lease
-        .metadata()
-        .operation_log
-        .iter()
-        .find(|operation| operation.operation_id == receipt.operation_id)
-        .ok_or_else(|| {
-            anyhow!("session base names an operation this repository's log does not hold")
-        })?;
-    receipt
-        .validate_against(operation)
-        .context("validate exact session recovery receipt")?;
-    if receipt.repository_id != base.repository_id
-        || receipt.roots_before != base.authority_roots
-        || &receipt.roots_after != roots
     {
-        bail!(
-            "session base is stale or tampered: its recovery receipt does not bind the retained \
-             authority roots"
-        );
+        // A persisted receipt names its operation record rather than repeating
+        // it (kin-db 0.7.89), so it is validated against the log entry it
+        // names rather than against an embedded copy of it. That is the same
+        // set of comparisons `RepositoryCommitReceipt::validate` made.
+        let operation = metadata
+            .operation_log
+            .iter()
+            .find(|operation| operation.operation_id == receipt.operation_id)
+            .ok_or_else(|| {
+                anyhow!("session base names an operation this repository's log does not hold")
+            })?;
+        receipt
+            .validate_against(operation)
+            .context("validate exact session recovery receipt")?;
+        if receipt.repository_id != base.repository_id
+            || receipt.roots_before != base.authority_roots
+            || &receipt.roots_after != roots
+        {
+            bail!(
+                "session base is stale or tampered: its recovery receipt does not bind the \
+                 retained authority roots"
+            );
+        }
+        return Ok((SessionBaseStanding::Reconciled, current));
     }
-    Ok(())
+
+    validate_superseded_base(metadata, workspace, base)?;
+    Ok((SessionBaseStanding::Superseded, current))
 }
 
+/// Prove a session base that is no longer current is authentic history.
+///
+/// The base file is editable, so finding its roots in history does not
+/// authenticate the workspace it carries: a forged base could pair genuine
+/// roots with any tree. Workspace authority changes only through a committed
+/// workspace mutation, and each mutation's compare-and-swap expectation
+/// records every stamp of the state it replaced. The first mutation of this
+/// workspace after the base's roots therefore names exactly the state the base
+/// must carry, and when no later operation touched the workspace, the current
+/// workspace is still that state. `SessionWorkspaceBase::validate` has already
+/// recomputed the tree, overlay and policy identities from the bodies the base
+/// carries, so equal stamps bind those bodies too.
 #[cfg(unix)]
-fn validate_base_is_current(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+fn validate_superseded_base(
+    metadata: &kin_db::PersistedRepositoryAuthority,
+    current: &kin_model::WorkspaceState,
     base: &SessionWorkspaceBase,
 ) -> Result<()> {
-    let authority = ActiveRepositoryAuthority::open(binding)?;
-    let (workspace, roots) = authority.workspace_with_roots()?;
-    if authority.repository_id != base.repository_id
-        || roots != base.authority_roots
-        || workspace != base.source_workspace
-    {
-        bail!(
-            "unchanged session base is stale or tampered: repository roots/workspace no longer \
-             match its exact authority lease"
-        );
+    let operations = &metadata.operation_log;
+    // The open validated the log as one exact root chain, so a bundle names at
+    // most one position in it: before the first operation or after one.
+    let (next, anchor) = operations
+        .iter()
+        .enumerate()
+        .find_map(|(index, operation)| {
+            if index == 0 && operation.roots_before == base.authority_roots {
+                Some((0, operation))
+            } else if operation.roots_after == base.authority_roots {
+                Some((index + 1, operation))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "session base is stale or tampered: its authority roots are not in this \
+                 repository's operation history"
+            )
+        })?;
+    let receipt = metadata
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == anchor.operation_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "session base is stale or tampered: the operation holding its authority roots \
+                 has no receipt"
+            )
+        })?;
+    receipt
+        .validate_against(anchor)
+        .context("validate the receipt holding the session base roots")?;
+
+    let workspace_id = base.source_workspace.workspace_id;
+    let first_later_mutation = operations[next..].iter().find_map(|operation| {
+        operation
+            .workspace_mutation
+            .as_ref()
+            .filter(|mutation| mutation.workspace_id == workspace_id)
+    });
+    match first_later_mutation {
+        Some(mutation) if mutation.expected == workspace_expectation(&base.source_workspace) => {
+            Ok(())
+        }
+        Some(_) => bail!(
+            "session base is stale or tampered: the next mutation of its workspace did not \
+             start from the workspace state the base carries"
+        ),
+        None if current == &base.source_workspace => Ok(()),
+        None => bail!(
+            "session base is stale or tampered: no later operation changed its workspace, and \
+             the current workspace differs from the one the base carries"
+        ),
     }
-    Ok(())
 }
 
+/// The tree a session asks authority to hold, and the observed changes its
+/// filter did not admit.
+///
+/// A withheld new file is left out, and a withheld change to or removal of a
+/// file graph truth holds keeps that file exactly as the base had it, so
+/// nothing the policy refuses reaches the transition.
 #[cfg(unix)]
-fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result<ResolvedTree> {
+fn build_desired_tree(
+    base: &SessionWorkspaceBase,
+    scan: &SessionScan,
+    filter: ObservationFilter,
+) -> Result<(ResolvedTree, Vec<WithheldChange>)> {
     let materialized = base
         .materialized_artifact_ids
         .iter()
@@ -472,6 +1008,15 @@ fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result
         .filter(|artifact| !materialized.contains(&artifact.artifact_id))
         .map(|artifact| (artifact.path.clone(), artifact.entry))
         .collect::<BTreeMap<_, _>>();
+    let mut withheld = scan
+        .skipped_generated
+        .iter()
+        .map(|path| WithheldChange {
+            kind: ReconcileChangeKind::Added,
+            path: ReconcilePath::from(path),
+            reason: WithheldReason::Generated,
+        })
+        .collect::<Vec<_>>();
 
     for (path, entry) in &scan.entries {
         let existing = base.source_workspace.tree.artifact_at_path(path);
@@ -489,7 +1034,61 @@ fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result
             }
             None => {}
         }
-        observed.insert(path.clone(), entry.entry);
+        let unchanged = existing.is_some_and(|existing| existing.entry == entry.entry);
+        let refusal = match filter {
+            _ if unchanged => None,
+            ObservationFilter::Unfiltered => None,
+            ObservationFilter::Policy(SessionWriteBack::ExceptBuildOutputs) => {
+                entry.new_file_withheld
+            }
+            ObservationFilter::Policy(policy) => crate::commands::write_back::agent_withheld(
+                path,
+                entry.new_file_withheld,
+                policy.toolchain(),
+            ),
+        };
+        match (refusal, existing) {
+            (None, _) => {
+                observed.insert(path.clone(), entry.entry);
+            }
+            (Some(reason), Some(existing)) => {
+                observed.insert(path.clone(), existing.entry);
+                withheld.push(WithheldChange {
+                    kind: ReconcileChangeKind::Modified,
+                    path: ReconcilePath::from(path),
+                    reason,
+                });
+            }
+            (Some(reason), None) => withheld.push(WithheldChange {
+                kind: ReconcileChangeKind::Added,
+                path: ReconcilePath::from(path),
+                reason,
+            }),
+        }
+    }
+
+    // An agent's run may remove a manifest it owns, and nothing else: a
+    // removed source file stays exactly as the base holds it.
+    if let ObservationFilter::Policy(policy) = filter.filter(|policy| policy.manifests_only()) {
+        for artifact in base.source_workspace.tree.artifacts_by_path() {
+            if !materialized.contains(&artifact.artifact_id)
+                || scan.entries.contains_key(&artifact.path)
+            {
+                continue;
+            }
+            if let Some(reason) = crate::commands::write_back::agent_withheld(
+                &artifact.path,
+                None,
+                policy.toolchain(),
+            ) {
+                observed.insert(artifact.path.clone(), artifact.entry);
+                withheld.push(WithheldChange {
+                    kind: ReconcileChangeKind::Removed,
+                    path: ReconcilePath::from(&artifact.path),
+                    reason,
+                });
+            }
+        }
     }
 
     let mut deltas = kin_core::plan_observed_tree_deltas(&base.source_workspace.tree, observed)?;
@@ -501,10 +1100,12 @@ fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result
             *artifact_id = deterministic_added_artifact_id(base.reconcile_operation_id, &new.path);
         }
     }
-    base.source_workspace
+    let desired = base
+        .source_workspace
         .tree
         .apply(&deltas)
-        .map_err(|error| anyhow!("build complete desired session tree: {error}"))
+        .map_err(|error| anyhow!("build complete desired session tree: {error}"))?;
+    Ok((desired, withheld))
 }
 
 #[cfg(unix)]
@@ -580,6 +1181,8 @@ impl EntryIdentity {
 
 #[cfg(unix)]
 struct RetainedSession {
+    workspace: cap_std::fs::Dir,
+    workspace_identity: EntryIdentity,
     kin: cap_std::fs::Dir,
     kin_identity: EntryIdentity,
     runs: cap_std::fs::Dir,
@@ -608,7 +1211,15 @@ impl RetainedSession {
             .ok_or_else(|| anyhow!("session identity must be UTF-8"))?;
         validate_session_leaf(session_name_text)?;
 
-        let kin = open_root_nofollow(layout.root())?;
+        let workspace = open_root_nofollow(layout.working_dir())?;
+        let workspace_identity = directory_identity(&workspace)?;
+        let kin = open_directory_nofollow(
+            &workspace,
+            layout
+                .root()
+                .file_name()
+                .ok_or_else(|| anyhow!("repository control root has no leaf"))?,
+        )?;
         let kin_identity = directory_identity(&kin)?;
         let runs = open_directory_nofollow(&kin, std::ffi::OsStr::new("runs"))
             .context("open retained repository session root")?;
@@ -621,6 +1232,8 @@ impl RetainedSession {
         let control_identity = directory_identity(&control)?;
 
         Ok(Self {
+            workspace,
+            workspace_identity,
             kin,
             kin_identity,
             runs,
@@ -630,6 +1243,49 @@ impl RetainedSession {
             control,
             control_identity,
             session_name: session_name.to_os_string(),
+        })
+    }
+
+    fn publication_binding(
+        &self,
+        base: &SessionWorkspaceBase,
+        base_bytes: &[u8],
+    ) -> Result<RetainedSessionPublicationBinding> {
+        use sha2::{Digest, Sha256};
+        let session_leaf = self
+            .session_name
+            .to_str()
+            .ok_or_else(|| anyhow!("session identity must be UTF-8"))?
+            .to_owned();
+        validate_session_leaf(&session_leaf)?;
+        let mut hash = Sha256::new();
+        hash.update(b"kin.retained-session.control.unix.v1\0");
+        for part in [
+            base.repository_id.to_string(),
+            base.source_workspace.workspace_id.to_string(),
+            session_leaf.clone(),
+        ] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part.as_bytes());
+        }
+        for identity in [
+            self.workspace_identity,
+            self.kin_identity,
+            self.runs_identity,
+            self.session_identity,
+            self.control_identity,
+        ] {
+            hash.update(identity.device.to_le_bytes());
+            hash.update(identity.inode.to_le_bytes());
+        }
+        let control_identity = Hash256::from_bytes(hash.finalize().into());
+        Ok(RetainedSessionPublicationBinding {
+            binding: kin_db::storage::SessionPublicationBinding {
+                session_id: format!("retained-{}", hex::encode(control_identity.as_bytes())),
+                base_identity: Hash256::from_bytes(Sha256::digest(base_bytes).into()),
+                control_identity,
+            },
+            locator: kin_db::storage::SessionPublicationLocator::RetainedUnixV1 { session_leaf },
         })
     }
 
@@ -646,11 +1302,14 @@ impl RetainedSession {
     fn scan(
         &self,
         graph_only_paths: &[RepoPath],
+        context: &ScanContext<'_>,
         persist_to: Option<&kin_blobs::BlobStore>,
     ) -> Result<SessionScan> {
         let mut scanner = SessionScanner {
             graph_only_paths,
+            context,
             entries: BTreeMap::new(),
+            skipped_generated: Vec::new(),
             total_bytes: 0,
             directories: 0,
             persist_to,
@@ -678,11 +1337,25 @@ impl RetainedSession {
         Ok(SessionScan {
             entries: scanner.entries,
             total_bytes: scanner.total_bytes,
+            skipped_generated: scanner.skipped_generated,
         })
     }
 
     fn revalidate_visible(&self, layout: &kin_core::KinLayout, expected_base: &[u8]) -> Result<()> {
-        let kin = open_root_nofollow(layout.root())?;
+        let workspace = open_root_nofollow(layout.working_dir())?;
+        require_directory_identity(&workspace, self.workspace_identity, "repository workspace")?;
+        require_directory_identity(
+            &self.workspace,
+            self.workspace_identity,
+            "retained workspace",
+        )?;
+        let kin = open_directory_nofollow(
+            &workspace,
+            layout
+                .root()
+                .file_name()
+                .ok_or_else(|| anyhow!("repository control root has no leaf"))?,
+        )?;
         require_directory_identity(&kin, self.kin_identity, "repository control root")?;
         require_directory_identity(&self.kin, self.kin_identity, "retained repository control")?;
         let runs = open_directory_nofollow(&kin, std::ffi::OsStr::new("runs"))?;
@@ -705,6 +1378,9 @@ impl RetainedSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedEntry {
     entry: TreeEntry,
+    /// For a path graph truth does not hold, why no session admits it: a
+    /// build output or a generated file. Always `None` for a tracked path.
+    new_file_withheld: Option<WithheldReason>,
 }
 
 #[cfg(unix)]
@@ -712,12 +1388,67 @@ struct ObservedEntry {
 struct SessionScan {
     entries: BTreeMap<RepoPath, ObservedEntry>,
     total_bytes: u64,
+    /// Generated directories graph truth holds nothing under, which a
+    /// filtering scan reports and does not walk.
+    skipped_generated: Vec<RepoPath>,
+}
+
+/// What a scan knows about the base it observes against.
+#[cfg(unix)]
+struct ScanContext<'a> {
+    base_tree: &'a ResolvedTree,
+    /// Every directory that holds a path graph truth tracks, as path bytes.
+    tracked_directories: BTreeSet<Vec<u8>>,
+    filter: ObservationFilter,
+}
+
+#[cfg(unix)]
+impl<'a> ScanContext<'a> {
+    fn new(base_tree: &'a ResolvedTree, filter: ObservationFilter) -> Self {
+        let mut tracked_directories = BTreeSet::new();
+        for artifact in base_tree.artifacts() {
+            let bytes = artifact.path.as_bytes();
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte == b'/' {
+                    tracked_directories.insert(bytes[..index].to_vec());
+                }
+            }
+        }
+        Self {
+            base_tree,
+            tracked_directories,
+            filter,
+        }
+    }
+
+    /// Whether a filtering scan leaves this directory unwalked: a generated
+    /// name, such as `node_modules` or `target`, with nothing graph truth
+    /// tracks beneath it. Its files are never admitted, and walking a
+    /// dependency tree or a build directory can cost more entries and bytes
+    /// than the whole repository.
+    fn skips_directory(&self, path: &RepoPath, name: &std::ffi::OsStr) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        self.filter.filters()
+            && crate::commands::write_back::is_generated_name(name.as_bytes())
+            && !self.tracked_directories.contains(path.as_bytes())
+    }
+
+    /// Why no session admits the file at `path`, when graph truth does not
+    /// hold it.
+    fn new_file_withheld(&self, path: &RepoPath, body: Option<&[u8]>) -> Option<WithheldReason> {
+        if self.base_tree.artifact_at_path(path).is_some() {
+            return None;
+        }
+        crate::commands::write_back::new_file_withheld(path, body)
+    }
 }
 
 #[cfg(unix)]
 struct SessionScanner<'a> {
     graph_only_paths: &'a [RepoPath],
+    context: &'a ScanContext<'a>,
     entries: BTreeMap<RepoPath, ObservedEntry>,
+    skipped_generated: Vec<RepoPath>,
     total_bytes: u64,
     directories: usize,
     persist_to: Option<&'a kin_blobs::BlobStore>,
@@ -775,7 +1506,12 @@ impl SessionScanner<'_> {
                 .symlink_metadata(&name)
                 .with_context(|| format!("inspect session entry {path}"))?;
             let identity = EntryIdentity::from_metadata(&metadata);
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && self.context.skips_directory(&path, &name)
+            {
+                self.skipped_generated.push(path);
+            } else if metadata.is_dir() && !metadata.file_type().is_symlink() {
                 let child = open_directory_nofollow(directory, &name)
                     .with_context(|| format!("open session directory {path}"))?;
                 require_directory_identity(&child, identity, "session directory")?;
@@ -799,7 +1535,7 @@ impl SessionScanner<'_> {
                 if self.entries.len() >= MAX_SESSION_ENTRIES {
                     bail!("session projection exceeds entry limit {MAX_SESSION_ENTRIES}");
                 }
-                let (entry, body) = if metadata.is_file() {
+                let (entry, body, new_file_withheld) = if metadata.is_file() {
                     use cap_std::fs::MetadataExt as _;
                     if metadata.nlink() > 1 {
                         bail!("session file {path} has external hard-link aliases");
@@ -827,7 +1563,8 @@ impl SessionScanner<'_> {
                         Hash256::from_bytes(kin_blobs::digest_bytes(&body)),
                         executable,
                     );
-                    (entry, body)
+                    let withheld = self.context.new_file_withheld(&path, Some(&body));
+                    (entry, body, withheld)
                 } else if metadata.file_type().is_symlink() {
                     if metadata.nlink() > 1 {
                         bail!("session symlink {path} has external hard-link aliases");
@@ -869,7 +1606,8 @@ impl SessionScanner<'_> {
                     }
                     kin_core::validate_source_entry(&path, entry, &body)
                         .with_context(|| format!("validate session symlink {path}"))?;
-                    (entry, body)
+                    let withheld = self.context.new_file_withheld(&path, None);
+                    (entry, body, withheld)
                 } else {
                     bail!("session path {path} is an unsupported special filesystem entry");
                 };
@@ -880,7 +1618,10 @@ impl SessionScanner<'_> {
                 if self.total_bytes > MAX_SESSION_TOTAL_BYTES {
                     bail!("session projection exceeds total body limit {MAX_SESSION_TOTAL_BYTES}");
                 }
-                if let Some(blobs) = self.persist_to {
+                // A file no session admits never reaches ingestion storage: a
+                // build leaves binaries of megabytes beside every run.
+                let admissible = new_file_withheld.is_none() || !self.context.filter.filters();
+                if let Some(blobs) = self.persist_to.filter(|_| admissible) {
                     let digest = blobs
                         .write(&body)
                         .with_context(|| format!("write observed session body for {path}"))?;
@@ -902,7 +1643,13 @@ impl SessionScanner<'_> {
                 }
                 if self
                     .entries
-                    .insert(path.clone(), ObservedEntry { entry })
+                    .insert(
+                        path.clone(),
+                        ObservedEntry {
+                            entry,
+                            new_file_withheld,
+                        },
+                    )
                     .is_some()
                 {
                     bail!("session projection contains duplicate path {path}");
@@ -1219,6 +1966,163 @@ mod tests {
         }
     }
 
+    /// A session projection over a fresh, empty repository, for the
+    /// write-back tests below. Every file a test writes into it is new.
+    #[cfg(unix)]
+    fn fresh_session(
+        leaf: &str,
+    ) -> (
+        tempfile::TempDir,
+        kin_core::KinLayout,
+        kin_core::LocalRepositoryAuthorityBinding,
+        kin_blobs::BlobStore,
+        PathBuf,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let blobs = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let session_dir = layout.runs_dir().join(leaf);
+        let request = crate::commands::session_workspace::SessionWorkspaceRequest {
+            session_dir: session_dir.display().to_string(),
+            strategy: None,
+            scope: None,
+        };
+        crate::commands::session_workspace::materialize_session_workspace(
+            &layout, &binding, &request,
+        )
+        .unwrap();
+        (repo, layout, binding, blobs, session_dir)
+    }
+
+    /// The paths a session observation would admit, as UTF-8 text.
+    #[cfg(unix)]
+    fn admitted_paths(observation: &SessionReconcileObservation) -> Vec<String> {
+        observation
+            .deltas()
+            .iter()
+            .filter_map(|delta| delta.new_state().or_else(|| delta.old_state()))
+            .filter_map(|entry| entry.path.as_utf8().map(str::to_string))
+            .collect()
+    }
+
+    /// The first bytes of a 64-bit Mach-O executable, which is what `go build`
+    /// leaves beside `main.go` on macOS, padded to a plausible size.
+    #[cfg(unix)]
+    fn mach_o_executable() -> Vec<u8> {
+        let mut body = vec![0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
+        body.resize(4096, 0);
+        body
+    }
+
+    /// A compiled program a command leaves in the session is a build output,
+    /// and no session admits one: in a clean `kin exec -- go build ./...` the
+    /// only new file is the binary, so nothing is published at all. The
+    /// ordinary edit beside it is admitted exactly as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_compiled_binary_is_never_admitted_from_a_session() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_repo, layout, binding, blobs, session_dir) = fresh_session("session-build-output");
+        let binary = session_dir.join("app");
+        std::fs::write(&binary, mach_o_executable()).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(session_dir.join("helper.o"), b"not even an object file").unwrap();
+        std::fs::write(session_dir.join("member.txt"), b"edited in session\n").unwrap();
+
+        let observation =
+            observe_session_workspace(&layout, &binding, &session_dir, &blobs, false).unwrap();
+        let admitted = admitted_paths(&observation);
+        assert_eq!(admitted, vec!["member.txt".to_string()], "{admitted:?}");
+        assert_eq!(
+            withheld_rows(&observation),
+            vec![
+                (
+                    "app".to_string(),
+                    ReconcileChangeKind::Added,
+                    WithheldReason::BuildOutput
+                ),
+                (
+                    "helper.o".to_string(),
+                    ReconcileChangeKind::Added,
+                    WithheldReason::BuildOutput
+                ),
+            ]
+        );
+
+        // With only the binary left, the session changes nothing and closes
+        // without publishing.
+        let (_repo, layout, binding, blobs, session_dir) = fresh_session("session-binary-only");
+        std::fs::write(session_dir.join("app"), mach_o_executable()).unwrap();
+        let observation =
+            observe_session_workspace(&layout, &binding, &session_dir, &blobs, false).unwrap();
+        assert!(
+            observation.deltas().is_empty(),
+            "{:?}",
+            admitted_paths(&observation)
+        );
+        assert_eq!(observation.withheld().len(), 1);
+    }
+
+    /// Each withheld change as (path, kind, reason).
+    #[cfg(unix)]
+    fn withheld_rows(
+        observation: &SessionReconcileObservation,
+    ) -> Vec<(String, ReconcileChangeKind, WithheldReason)> {
+        observation
+            .withheld()
+            .iter()
+            .map(|change| {
+                let ReconcilePath::Utf8(path) = &change.path else {
+                    panic!("a UTF-8 path");
+                };
+                (path.clone(), change.kind, change.reason)
+            })
+            .collect()
+    }
+
+    /// A dependency tree or build directory a command creates is reported
+    /// once and never walked, so its size cannot push the session past the
+    /// observation's entry and byte limits. Ambiguous names that routinely
+    /// hold source, such as `build` and `vendor`, are observed as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_directory_the_graph_holds_nothing_under_is_not_walked() {
+        let (_repo, layout, binding, blobs, session_dir) = fresh_session("session-generated");
+        let modules = session_dir.join("node_modules/left-pad");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(modules.join("index.js"), b"module.exports = 1;\n").unwrap();
+        std::fs::create_dir_all(session_dir.join("target/debug")).unwrap();
+        std::fs::write(session_dir.join("target/debug/app"), mach_o_executable()).unwrap();
+        std::fs::create_dir_all(session_dir.join("vendor/x")).unwrap();
+        std::fs::write(session_dir.join("vendor/x/y.go"), b"package x\n").unwrap();
+
+        let observation =
+            observe_session_workspace(&layout, &binding, &session_dir, &blobs, false).unwrap();
+        assert_eq!(
+            admitted_paths(&observation),
+            vec!["vendor/x/y.go".to_string()]
+        );
+        assert_eq!(
+            withheld_rows(&observation),
+            vec![
+                (
+                    "node_modules".to_string(),
+                    ReconcileChangeKind::Added,
+                    WithheldReason::Generated
+                ),
+                (
+                    "target".to_string(),
+                    ReconcileChangeKind::Added,
+                    WithheldReason::Generated
+                ),
+            ]
+        );
+        // Nothing under a skipped directory was read.
+        assert_eq!(observation.observed_materialized_artifacts(), 1);
+    }
+
     #[test]
     fn mass_deletion_requires_explicit_confirmation() {
         let source = (0..20)
@@ -1239,3 +2143,7 @@ mod tests {
         enforce_mass_deletion(source.len(), &deltas, true).unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "reconcile_session_publication_test.rs"]
+mod session_publication_tests;

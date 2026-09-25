@@ -672,6 +672,7 @@ fn init_with_config(
             canonical_working_dir.display()
         ))
     })?;
+    crate::init_staging::require_writable_init_directories(staging_parent, &canonical_working_dir)?;
     let staging_dir = staging_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
     let admission_case = detect_admission_case(&canonical_working_dir)?;
     let mut prepared =
@@ -1793,13 +1794,18 @@ where
                     "streamed Git bootstrap cannot use transfer admission".into(),
                 ))
             }
-            (None, Some(changes)) => {
-                authority.commit_git_bootstrap_with_changes(transaction, changes)
-            }
+            (None, Some(changes)) => authority.commit_git_bootstrap_with_binding_history(
+                transaction,
+                changes,
+                &kin_index::binding_history::LocalBindingHistoryVerifier,
+            ),
             (Some(case), None) => {
                 authority.commit_transferred_repository_transaction(transaction, Some(case))
             }
-            (None, None) => authority.commit_repository_transaction(transaction),
+            (None, None) => authority.commit_repository_transaction_with_binding_history(
+                transaction,
+                &kin_index::binding_history::LocalBindingHistoryVerifier,
+            ),
         }
         .map_err(graph_error)?
     };
@@ -3944,6 +3950,45 @@ mod tests {
         GitObjectBodyLoader, GitObjectFormat, Hash256, RefTarget, Timestamp, WorkspaceHead,
     };
     use sha2::{Digest, Sha256};
+
+    /// An unborn init under a parent this user cannot write refuses by name
+    /// before it stages anything, the same as a Git admission does.
+    #[cfg(unix)]
+    #[test]
+    fn an_unborn_init_under_a_read_only_parent_is_refused_by_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("app");
+        let working = parent.join("project");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        struct Restore<'a>(&'a Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Restore(&parent);
+        if std::fs::write(parent.join(".kin-write-probe"), b"").is_ok() {
+            eprintln!("skipped: this user can write a mode 0555 directory, so no refusal exists");
+            return;
+        }
+
+        let error = init(&working).unwrap_err().to_string();
+
+        let parent_shown = parent.canonicalize().unwrap().display().to_string();
+        assert!(error.contains("kin init cannot start"), "{error}");
+        assert!(error.contains(&format!("in {parent_shown}")), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(!working.join(".kin").exists());
+        let staged: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(INIT_STAGE_PREFIX))
+            .collect();
+        assert!(staged.is_empty(), "nothing may be staged: {staged:?}");
+    }
 
     /// A store may adopt a hosted repository identity, and it is the committed
     /// authority that has to carry it, not just the manifest.

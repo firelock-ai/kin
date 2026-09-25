@@ -46,17 +46,89 @@ use crate::pipeline::IndexPipeline;
 /// every store at creation and compares the record when a store is read, so
 /// `kin graph status`, `kin doctor` and the `_kin` envelope all disclose a gap
 /// between what a store was created under and what this build derives. Native
-/// transfer carries no version beside the history it moves, so admitting a pack
-/// durably discards the receiver's creation record rather than letting it stand
-/// in for transported provenance.
+/// transfer carries the sending store's creation record. Admission preserves
+/// the receiver's record only when that transported authoring version matches;
+/// an absent or mismatched version durably discards the local record.
 ///
-/// What bumping the dial still does not do: no path re-derives historical
-/// deltas for a repository that was already admitted, so a bump invalidates,
-/// migrates and re-enriches nothing. A repository admitted under an earlier
-/// version keeps whatever its past was authored to contain until it is admitted
-/// again. Carrying the authoring version on the wire, automatic re-derivation,
-/// migration and refusing to answer over a gap all remain open follow-up work.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 11;
+/// What bumping the dial does not do by itself: it re-derives nothing. Every
+/// store an earlier build admitted then reads behind, and `kin upgrade`
+/// re-derives the state such a store serves through [`rederive_tree_semantics`]
+/// and records each head's transition as a new change. History recorded
+/// before that change is not re-derived, because a change's identity hashes
+/// its deltas, and keeps what the build that recorded it authored.
+/// Version 19 records that `is_external_import_placeholder` now recognizes an
+/// `Overrides` crossing alongside `Calls` and `References`. The predicate
+/// decides which inferred imported crossings become persisted external target
+/// entities during replay, so a repository re-admitted under this build has
+/// external targets authored for base-class crossings its past did not carry.
+/// That is a replay-semantics change and it is recorded here rather than
+/// regenerated into the manifest in silence.
+/// Version 20 records three replay-semantics changes that landed after
+/// version 19 without moving this dial. `resolve_one_file` now resolves a Go
+/// call through a receiver whose method is promoted from an embedded type, so
+/// replay authors call edges it did not. Import edges are anchored on the line
+/// that carries the imported name rather than on the statement's first line,
+/// so replay authors different evidence positions. And the JavaScript,
+/// TypeScript, Go, Java, PHP, Kotlin and Swift adapters mint a file's module
+/// surface only when the file produced a declaration or an import, so replay
+/// authors no module entity for a file that produced neither a declaration nor an import.
+/// Version 21 records that `resolve_one_file`'s same-file tier no longer links
+/// a relation that resolved to a definition in its own file to every
+/// same-named entity in other files. Only a same-file prototype, or a
+/// same-file definition whose known arity rejects the call, still hands the
+/// relation on to those entities as name-only candidates, so replay authors
+/// fewer edges than it did: calls above all, and also the containment,
+/// reference and implements edges the same tier linked by name. No history
+/// re-admitted under this build carries the removed ones.
+/// Version 22 records that `make_external_reference_relation` no longer mints
+/// an external-import edge for a call on a receiver, other than the JavaScript
+/// imported-getter receiver. A method whose name matched an import, such as
+/// Rust's `cmd.env(..)` beside `use std::env;`, was persisted as a call edge to
+/// that import, so a repository re-admitted under this build carries none of
+/// those edges its past did. In Rust such a call now gets no edge at all: the
+/// adapter still pins it to the import by name, so it never reaches the
+/// receiver-method tier. A reference on a receiver is unchanged and still mints
+/// one: Python's class-body `session: Session` keeps the attribute in the
+/// receiver and names the imported `Session` itself.
+/// Version 23 records that the same-file tier no longer settles a relation
+/// locally in four shapes where version 21 did. A Kotlin or Swift top-level
+/// function is handed on to the same-named functions elsewhere, since another
+/// file of its package or module can overload it. A C++ function is handed on
+/// when the calling file or a header in its include closure declares another
+/// overload the call's argument count admits. A TypeScript ambient declaration,
+/// which the adapter now marks `declare`, counts as a declaration and is handed
+/// on like a C prototype. And a call that carries an import of the name it
+/// calls, from a language other than Rust, links its same-file match as a
+/// name-only candidate and goes on to the import tiers, which resolve the
+/// imported binding. A same-file definition whose arity rejects the call is
+/// now authored as a name-only candidate instead of a parser-certain edge, and
+/// a C++ definition reads its default arguments from its same-named
+/// declarations before its arity can reject anything. A Go call through an
+/// imported package, such as `errors.New` in a file that defines its own
+/// `New`, no longer reaches the same-file tier at all and is resolved inside
+/// the imported package, so replay stops authoring the edge to the calling
+/// file's own function. The tier also never hands a call on to a module entity
+/// that shares the called name. Replay therefore authors more name-only edges
+/// than version 21 in the hand-on shapes and for imported calls, a different
+/// confidence on the local edge in two shapes, and fewer edges for Go package
+/// calls.
+/// Version 26 binds Rust import edges to the importing file's own module
+/// coordinate, not the first module in stored entity order. Re-admission and
+/// explicit upgrade therefore author deterministic import owners; existing
+/// immutable changes retain the semantics under which they were recorded.
+/// Version 29 also excludes macro placeholder names and function declarations
+/// from Rust call extraction. Explicit replay uses the corrected parser while
+/// existing immutable changes keep their original recorded semantics.
+/// Version 30 records independently bound parser occurrence tiers on Calls.
+/// A stronger occurrence no longer lends its authority to weaker sites on the
+/// same logical edge. Explicit replay authors the new evidence; old immutable
+/// changes retain their original records and disclose unqualified site attribution.
+/// It also binds Go receiver methods to the unique type in their admitted package,
+/// withholding an ambiguous owner instead of selecting a same-named declaration.
+/// Version 31 retires Python language-server bindings obtained before initialize
+/// named the workspace. The explicit store upgrade keeps parser/history state
+/// and re-asks the server under that corrected scope.
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 31;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -253,6 +325,227 @@ impl HistoricalSemanticFold {
         }
         Ok(())
     }
+}
+
+/// The entity and relation state one exact tree derives under this build.
+///
+/// What [`rederive_tree_semantics`] returns: the state a change at this tree
+/// would carry had it been replayed by this build, keyed the way a resolved
+/// graph keys its domains.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RederivedTreeSemantics {
+    pub entities: BTreeMap<EntityId, Entity>,
+    pub relations: BTreeMap<RelationId, Relation>,
+    /// Entity-source files the derivation parsed.
+    pub source_files: usize,
+}
+
+/// A file path no tree can hold, so a held file's parse is never reused.
+///
+/// Repository paths are UTF-8 and never contain NUL, so the reuse test in
+/// [`semantic_state_for_tree`], which requires a parent file's recorded path to
+/// equal the artifact's, can never pass for a file carrying this one.
+const HELD_IDENTITIES_ONLY: &str = "\0held entity identities";
+
+/// How many times a derivation re-offers its own identities before refusing.
+///
+/// Identity assignment within a file takes the held entities of one name and
+/// kind in identity order. A declaration that is new to this build mints an
+/// identity that can sort before one it matched, so the first derivation is
+/// not always the one a second derivation over its own output reproduces; the
+/// second always is, and the third proves it.
+const IDENTITY_PASSES: usize = 3;
+
+/// Derive the complete entity and relation state `tree` holds under this
+/// build's replay semantics, carrying entity identities from `held`.
+///
+/// This is the store upgrade's derivation. A store admitted by an older build
+/// holds history its replay authored, and nothing about that history can be
+/// re-derived in place without renaming every change, because a change's
+/// identity hashes its deltas and parents. What can be brought current is the
+/// state a head serves. This returns that state exactly as the replay derives
+/// it for one change, by running [`semantic_state_for_tree`] itself: every
+/// source file is parsed from the CAS body the tree names and the whole tree
+/// is linked once, so the result is what a fresh admission of this tree under
+/// this build would serve, rather than a patch of what the older build left.
+///
+/// `held` is the state the store already serves at this tree. It supplies
+/// identity and nothing else. Each held entity is offered to the replay as a
+/// parent entity of the artifact the tree places at its file, which is the
+/// same way a parent change offers its entities to a child, so a declaration
+/// the older build also recognized keeps its identity, lineage and creating
+/// change, and an entity it minted that this build does not derive is simply
+/// absent from the result. The held files are marked so their parses are never
+/// reused: a parse is carried forward only between trees that hold identical
+/// bytes under identical semantics, and this call exists because the semantics
+/// changed.
+///
+/// The result is a fixed point: deriving the same tree again with the result as
+/// `held` reproduces it exactly. That is what lets a second `kin upgrade` find
+/// nothing to do, and what lets a verifier re-derive a committed graph and
+/// compare it for equality rather than for resemblance. When a derivation mints
+/// an identity, it is repeated over its own output until it reproduces itself,
+/// and a tree that never settles is refused rather than returned.
+///
+/// A held entity with no file origin, or whose file the tree does not hold as
+/// a source artifact, supplies nothing. External reference targets are
+/// re-derived from the linked relations, whose identity is a function of the
+/// import they name.
+pub fn rederive_tree_semantics<'held>(
+    tree: &ResolvedTree,
+    held: impl IntoIterator<Item = &'held Entity>,
+    blob_store: &BlobStore,
+) -> Result<RederivedTreeSemantics> {
+    let mut held: Vec<Entity> = held.into_iter().cloned().collect();
+    let mut previous: Option<RederivedTreeSemantics> = None;
+    for _ in 0..IDENTITY_PASSES {
+        let derived = derive_tree_semantics_once(tree, &held, blob_store)?;
+        match &previous {
+            Some(previous)
+                if previous.entities == derived.entities
+                    && previous.relations == derived.relations =>
+            {
+                return Ok(derived);
+            }
+            Some(_) => {}
+            None => {
+                // Every file-owned identity came from `held`, so a derivation
+                // over this output offers the same identities in the same order
+                // and reproduces it without being asked to.
+                let held_ids: HashSet<EntityId> = held.iter().map(|entity| entity.id).collect();
+                if derived
+                    .entities
+                    .values()
+                    .all(|entity| entity.file_origin.is_none() || held_ids.contains(&entity.id))
+                {
+                    return Ok(derived);
+                }
+            }
+        }
+        held = derived.entities.values().cloned().collect();
+        previous = Some(derived);
+    }
+    Err(invalid(
+        "entity identities did not settle across repeated derivations of one tree",
+    ))
+}
+
+/// Stage the bodies a derivation of `tree` reads into a scratch store, then
+/// derive it with [`rederive_tree_semantics`].
+///
+/// Only entity sources and Cargo manifests are read by a derivation, so only
+/// those are staged. `load_body` is the caller's store, returning the exact
+/// bytes a content address names or `None` when it holds none; a missing body
+/// is refused, and a body whose digest is not its address is refused, because
+/// a derivation is only as exact as the bytes it read. The scratch store lives
+/// for this call only.
+pub fn rederive_tree_semantics_from<'held>(
+    tree: &ResolvedTree,
+    held: impl IntoIterator<Item = &'held Entity>,
+    load_body: &mut dyn FnMut(kin_model::Hash256) -> std::result::Result<Option<Vec<u8>>, String>,
+) -> Result<RederivedTreeSemantics> {
+    let scratch = tempfile::Builder::new()
+        .prefix("kin-rederive-")
+        .tempdir()
+        .map_err(|error| invalid(format!("create a scratch source store: {error}")))?;
+    let bodies = BlobStore::new_ephemeral(scratch.path().join("cas"))?;
+    let mut staged = HashSet::new();
+    for artifact in tree.artifacts() {
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        let source = matches!(
+            FileClassifier::classify(Path::new(path)),
+            FileClassification::EntitySource
+        );
+        if !source && path.rsplit('/').next() != Some("Cargo.toml") {
+            continue;
+        }
+        if !staged.insert(hash) {
+            continue;
+        }
+        let body = load_body(hash)
+            .map_err(|error| invalid(format!("read the body of {path} ({hash}): {error}")))?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "the store holds no body for {path} ({hash}), and a derivation reads only \
+                     bytes the store keeps"
+                ))
+            })?;
+        let written = bodies.write(&body)?;
+        if written != hash {
+            return Err(invalid(format!(
+                "the body read for {path} does not hash to {hash}"
+            )));
+        }
+    }
+    rederive_tree_semantics(tree, held, &bodies)
+}
+
+/// One derivation of `tree`, offering `held` as the identities to keep.
+fn derive_tree_semantics_once(
+    tree: &ResolvedTree,
+    held: &[Entity],
+    blob_store: &BlobStore,
+) -> Result<RederivedTreeSemantics> {
+    let artifact_at_path = tree
+        .artifacts()
+        .filter_map(|artifact| {
+            let path = artifact.path.as_utf8()?;
+            matches!(artifact.entry, TreeEntry::Blob { .. })
+                .then(|| (path.to_string(), (artifact.artifact_id, artifact.entry)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut held_by_artifact = BTreeMap::<ArtifactId, (TreeEntry, Vec<Entity>)>::new();
+    for entity in held {
+        let Some(origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        let Some((artifact_id, entry)) = artifact_at_path.get(origin.0.as_str()) else {
+            continue;
+        };
+        held_by_artifact
+            .entry(*artifact_id)
+            .or_insert_with(|| (*entry, Vec::new()))
+            .1
+            .push(entity.clone());
+    }
+    let mut prior = SemanticTreeState::default();
+    for (artifact_id, (entry, mut entities)) in held_by_artifact {
+        // Offered in identity order, which is the order a replayed parent
+        // holds its entities in, so a file whose declarations share a name and
+        // kind pairs with them exactly as the replay of a later commit would.
+        entities.sort_by_key(|entity| entity.id);
+        prior.files.insert(
+            artifact_id,
+            SemanticFileState {
+                artifact_id,
+                entry,
+                completeness: Arc::new(ParseCompleteness::Full),
+                parse_data: Arc::new(FileParseData {
+                    file_path: HELD_IDENTITIES_ONLY.to_string(),
+                    entities,
+                    relations: Vec::new(),
+                    imports: Vec::new(),
+                }),
+            },
+        );
+    }
+    let state = semantic_state_for_tree(
+        tree,
+        &[&prior],
+        blob_store,
+        &IndexPipeline::new(),
+        &mut BTreeMap::new(),
+    )?;
+    Ok(RederivedTreeSemantics {
+        source_files: state.files.len(),
+        entities: state.entities,
+        relations: state.relations,
+    })
 }
 
 /// Enrich one change of a parent-first history against its exact tree.
@@ -461,15 +754,64 @@ fn semantic_state_for_tree(
     }
     parse_data.sort_by(|left, right| left.file_path.cmp(&right.file_path));
 
-    let linked =
-        link_cross_file_borrowed_with_completeness(&parse_data, &artifact_ids, &completeness)?;
+    let rust_project = if parse_data
+        .iter()
+        .any(|file| file.file_path.ends_with(".rs"))
+    {
+        Some(
+            crate::rust_project::RustProjectAuthority::observe_admitted_tree(
+                tree,
+                crate::rust_project::RustProjectLimits::default(),
+                |hash| {
+                    blob_store
+                        .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .map_err(invalid)?,
+        )
+    } else {
+        None
+    };
+    let linked = if let Some(authority) = rust_project
+        .as_ref()
+        .and_then(|observation| observation.authority())
+    {
+        crate::linker::link_cross_file_with_rust_project(
+            &parse_data,
+            &entities.values().collect::<Vec<_>>(),
+            &artifact_ids,
+            &completeness,
+            authority,
+        )?
+    } else {
+        link_cross_file_borrowed_with_completeness(&parse_data, &artifact_ids, &completeness)?
+    };
     entities.extend(external_reference_targets(
         &linked,
         &entities,
         external_fingerprints,
     ));
     let mut relations = BTreeMap::new();
-    for relation in linked {
+    for mut relation in linked {
+        if let Some(artifact) = match relation.src {
+            kin_model::GraphNodeId::Artifact(id) => files.get(&id),
+            _ => None,
+        } {
+            if crate::is_parse_coverage_relation(
+                &relation,
+                &artifact.parse_data.file_path,
+                artifact.artifact_id,
+            ) {
+                if let TreeEntry::Blob { hash, .. } = artifact.entry {
+                    crate::bind_parse_coverage_source(
+                        &mut relation,
+                        &artifact.parse_data.file_path,
+                        hash,
+                    );
+                }
+            }
+        }
         if let Some(absent) = absent_local_endpoint(&relation, &entities) {
             // A change carries the entity set of its own tree, so replaying it
             // can only bind an edge whose endpoints that tree defines. Every
@@ -1561,6 +1903,509 @@ mod tests {
             admitted.changes.read_at(1).unwrap().unwrap().entity_deltas,
             deltas[1].entity_deltas
         );
+    }
+
+    #[test]
+    fn cargo_manifest_only_history_rebinds_from_each_immutable_tree() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        let manifest = b"[package]\nname='fixture'\nedition='2021'\nautolib=false\nautobins=false\n[lib]\npath='app.rs'\n";
+        write(&repository, "Cargo.toml", manifest);
+        write(&repository, "app.rs", b"pub mod owner; pub mod caller;");
+        write(&repository, "owner.rs", b"pub fn work() {}");
+        write(
+            &repository,
+            "caller.rs",
+            b"use crate::owner::work; pub fn run() { work(); }",
+        );
+        write(&repository, "other.rs", b"pub fn unrelated() {}");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "bound root"]);
+        write(
+            &repository,
+            "Cargo.toml",
+            &String::from_utf8(manifest.to_vec())
+                .unwrap()
+                .replace("app.rs", "other.rs")
+                .into_bytes(),
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "manifest-only root change"]);
+        write(&repository, "Cargo.toml", manifest);
+        git(&repository, &["add", "--all"]);
+        git(
+            &repository,
+            &["commit", "-m", "manifest-only root recovery"],
+        );
+        let blobs = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("cargo-history").unwrap(),
+            &blobs,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blobs).unwrap();
+        let trees = trees_by_change(&plan, &snapshot, &blobs);
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        fs::remove_dir_all(&repository).unwrap();
+        let derived = derive_historical_semantic_deltas(&changes, &trees, &blobs).unwrap();
+        assert_eq!(derived.len(), 3);
+        let entity = |name: &str| {
+            derived[0]
+                .entity_deltas
+                .iter()
+                .filter_map(EntityDelta::new_state)
+                .find(|e| e.name == name && e.file_origin.is_some() && e.kind != EntityKind::Module)
+                .unwrap()
+                .id
+        };
+        let caller = entity("run");
+        let target = entity("work");
+        let exact = |relation: &Relation| {
+            relation.kind == kin_model::RelationKind::Calls
+                && relation.src.as_entity() == Some(caller)
+                && relation.dst.as_entity() == Some(target)
+        };
+        let original = derived[0]
+            .relation_deltas
+            .iter()
+            .find_map(|delta| match delta {
+                RelationDelta::Added { new } if exact(new) => Some(new),
+                _ => None,
+            })
+            .expect("Cargo-root call is authored from admitted history");
+        assert_eq!(original.confidence, 0.95);
+        assert!(derived[1]
+            .relation_deltas
+            .iter()
+            .any(|delta| matches!(delta, RelationDelta::Removed { old } if old == original)));
+        assert!(derived[2]
+            .relation_deltas
+            .iter()
+            .any(|delta| matches!(delta, RelationDelta::Added { new } if new == original)));
+        assert!(derived[1..].iter().flat_map(|delta| &delta.entity_deltas).all(|delta| !matches!(delta, EntityDelta::Removed { old } if old.id == caller || old.id == target)));
+        let bindings: Vec<_> = derived
+            .iter()
+            .map(|delta| {
+                kin_git::HistoricalSemanticBinding::borrowed(
+                    delta.change_id,
+                    &delta.entity_deltas,
+                    &delta.relation_deltas,
+                )
+            })
+            .collect();
+        let enriched = plan.with_historical_semantics(&blobs, bindings).unwrap();
+        let admitted = admit_semantic_git_import(&enriched, &blobs).unwrap();
+        admitted.validate(&blobs).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let admitted_changes = admitted
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        for change in &admitted_changes {
+            graph.create_change(change).unwrap();
+        }
+        for (index, change) in admitted_changes.iter().enumerate() {
+            let state = graph.resolve_graph_at(&change.id).unwrap();
+            assert_eq!(state.relations.values().any(exact), index != 1);
+        }
+    }
+
+    /// A two-commit history in four languages, replayed the way admission
+    /// replays it, and the state its head serves: the fold of every delta.
+    struct ReplayedHead {
+        _root: tempfile::TempDir,
+        blob_store: BlobStore,
+        tree: ResolvedTree,
+        entities: BTreeMap<EntityId, Entity>,
+        relations: BTreeMap<RelationId, Relation>,
+    }
+
+    fn replayed_head() -> ReplayedHead {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        write(
+            &repository,
+            "src/lib.rs",
+            b"mod util;\n\npub fn entry(value: u32) -> u32 {\n    util::helper(value) + 1\n}\n",
+        );
+        write(
+            &repository,
+            "src/util.rs",
+            b"pub fn helper(value: u32) -> u32 {\n    value * 2\n}\n",
+        );
+        write(&repository, "pkg/__init__.py", b"");
+        write(
+            &repository,
+            "pkg/b.py",
+            b"def double(value):\n    return value * 2\n",
+        );
+        write(
+            &repository,
+            "web/lib.mjs",
+            b"export function triple(value) {\n  return value * 3;\n}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "start"]);
+        write(
+            &repository,
+            "pkg/a.py",
+            b"from pkg.b import double\n\n\ndef run(value):\n    return double(value) + 1\n",
+        );
+        write(
+            &repository,
+            "web/index.mjs",
+            b"import { triple } from './lib.mjs';\n\nexport function main() {\n  return triple(2);\n}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "call across files"]);
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-rederivation").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan, &snapshot, &blob_store);
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        let deltas = derive_historical_semantic_deltas(&changes, &trees, &blob_store).unwrap();
+        let mut entities = BTreeMap::new();
+        let mut relations = BTreeMap::new();
+        for delta in &deltas {
+            for entity in &delta.entity_deltas {
+                match entity {
+                    EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => {
+                        entities.insert(new.id, new.clone());
+                    }
+                    EntityDelta::Removed { old } => {
+                        entities.remove(&old.id);
+                    }
+                }
+            }
+            for relation in &delta.relation_deltas {
+                match relation {
+                    RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
+                        relations.insert(new.id, new.clone());
+                    }
+                    RelationDelta::Removed { old } => {
+                        relations.remove(&old.id);
+                    }
+                }
+            }
+        }
+        let tree = trees.get(&changes[1].id).unwrap().clone();
+        ReplayedHead {
+            _root: root,
+            blob_store,
+            tree,
+            entities,
+            relations,
+        }
+    }
+
+    /// The upgrade's derivation of a head is the state the replay itself left
+    /// that head serving, identity for identity, when the same build did both.
+    #[test]
+    fn rederiving_a_replayed_head_reproduces_the_replay_exactly() {
+        let head = replayed_head();
+        assert!(
+            head.entities.len() >= 8 && head.relations.len() >= 4,
+            "the fixture replayed too little to prove anything: {} entities, {} relations",
+            head.entities.len(),
+            head.relations.len()
+        );
+        let derived =
+            rederive_tree_semantics(&head.tree, head.entities.values(), &head.blob_store).unwrap();
+        assert_eq!(derived.entities, head.entities);
+        assert_eq!(derived.relations, head.relations);
+        assert!(derived.source_files >= 6, "{}", derived.source_files);
+    }
+
+    /// What the store held that this build does not derive is gone, what this
+    /// build derives differently is restated, and every declaration it still
+    /// recognizes keeps its identity.
+    #[test]
+    fn rederiving_retires_held_state_this_build_does_not_derive_and_keeps_identities() {
+        let head = replayed_head();
+        let mut held = head.entities.clone();
+        // A declaration an older build minted for a file that declares nothing
+        // like it.
+        let stale = {
+            let mut stale = head
+                .entities
+                .values()
+                .find(|entity| entity.name == "double")
+                .unwrap()
+                .clone();
+            stale.id = EntityId::new();
+            stale.name = "receiver_minted_by_an_older_build".to_string();
+            stale
+        };
+        held.insert(stale.id, stale.clone());
+        // A declaration an older build placed differently.
+        let moved = held
+            .values_mut()
+            .find(|entity| entity.name == "helper")
+            .unwrap();
+        let helper_id = moved.id;
+        if let Some(span) = moved.span.as_mut() {
+            span.start_line += 40;
+            span.end_line += 40;
+        }
+        let derived = rederive_tree_semantics(&head.tree, held.values(), &head.blob_store).unwrap();
+        assert!(!derived.entities.contains_key(&stale.id));
+        assert!(
+            derived
+                .entities
+                .values()
+                .all(|entity| entity.name != "receiver_minted_by_an_older_build"),
+            "a declaration no parse produces survived the re-derivation"
+        );
+        assert_eq!(
+            derived.entities.get(&helper_id),
+            head.entities.get(&helper_id),
+            "the re-derivation must restate the declaration from its bytes under its own identity"
+        );
+        assert_eq!(derived.entities, head.entities);
+        assert_eq!(derived.relations, head.relations);
+    }
+
+    /// Identities a derivation mints settle: re-deriving the result reproduces
+    /// it, which is what makes a second upgrade find nothing to do.
+    #[test]
+    fn a_rederivation_is_a_fixed_point_of_itself() {
+        let head = replayed_head();
+        let first =
+            rederive_tree_semantics(&head.tree, std::iter::empty(), &head.blob_store).unwrap();
+        assert_eq!(first.entities.len(), head.entities.len());
+        let second =
+            rederive_tree_semantics(&head.tree, first.entities.values(), &head.blob_store).unwrap();
+        assert_eq!(second.entities, first.entities);
+        assert_eq!(second.relations, first.relations);
+    }
+
+    /// Bodies come from the caller's store and are checked against the
+    /// address that names them: a missing body and a wrong one both refuse.
+    #[test]
+    fn a_rederivation_refuses_a_missing_or_mismatched_body() {
+        let head = replayed_head();
+        let mut from_store = |hash: kin_model::Hash256| {
+            head.blob_store
+                .read(&hash)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        };
+        let derived =
+            rederive_tree_semantics_from(&head.tree, head.entities.values(), &mut from_store)
+                .unwrap();
+        assert_eq!(derived.entities, head.entities);
+
+        let mut missing = |_hash: kin_model::Hash256| Ok(None);
+        let error = rederive_tree_semantics_from(&head.tree, head.entities.values(), &mut missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("holds no body"), "{error}");
+
+        let mut wrong = |_hash: kin_model::Hash256| Ok(Some(b"not the body".to_vec()));
+        let error = rederive_tree_semantics_from(&head.tree, head.entities.values(), &mut wrong)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not hash to"), "{error}");
+    }
+
+    fn head_graph(head: &ReplayedHead) -> kin_db::GraphSnapshot {
+        let mut graph = kin_db::GraphSnapshot::empty();
+        graph.entities = head
+            .entities
+            .iter()
+            .map(|(id, entity)| (*id, entity.clone()))
+            .collect();
+        graph.relations = head
+            .relations
+            .iter()
+            .map(|(id, relation)| (*id, relation.clone()))
+            .collect();
+        graph.resolved_tree = head.tree.clone();
+        graph
+    }
+
+    fn verify(
+        head: &ReplayedHead,
+        graph: &kin_db::GraphSnapshot,
+    ) -> std::result::Result<(), String> {
+        let mut load = |hash: kin_model::Hash256| {
+            head.blob_store
+                .read(&hash)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        };
+        crate::binding_history::verify_rederived_graph(graph, &mut load)
+    }
+
+    /// The re-derivation verifier qualifies exactly a graph a derivation of its
+    /// own tree reproduces, and nothing the graph supplies can stand in for the
+    /// derivation: a changed payload, a missing or invented derived edge, or a
+    /// swapped identity each refuse, while an edge no derivation authors is
+    /// neither required nor refused.
+    #[test]
+    fn the_rederivation_verifier_qualifies_only_an_exact_derivation() {
+        let head = replayed_head();
+        let exact = head_graph(&head);
+        verify(&head, &exact).expect("an exact derivation qualifies");
+
+        let mut moved = exact.clone();
+        let entity = moved
+            .entities
+            .values_mut()
+            .find(|entity| entity.name == "helper")
+            .unwrap();
+        entity.signature.push_str(" /* edited */");
+        assert!(
+            verify(&head, &moved).is_err(),
+            "a changed payload qualified"
+        );
+
+        let mut invented = exact.clone();
+        let mut extra = exact.entities.values().next().unwrap().clone();
+        extra.id = EntityId::new();
+        extra.name = "invented".to_string();
+        invented.entities.insert(extra.id, extra);
+        assert!(
+            verify(&head, &invented).is_err(),
+            "an invented entity qualified"
+        );
+
+        let mut dropped = exact.clone();
+        let derived_edge = *dropped
+            .relations
+            .iter()
+            .find(|(_, relation)| crate::binding_history::relation_is_derived(relation))
+            .unwrap()
+            .0;
+        dropped.relations.remove(&derived_edge);
+        assert!(
+            verify(&head, &dropped).is_err(),
+            "a missing derived edge qualified"
+        );
+
+        let mut fabricated = exact.clone();
+        let mut edge = exact.relations.values().next().unwrap().clone();
+        edge.id = RelationId::new();
+        edge.origin = kin_model::RelationOrigin::Parsed;
+        fabricated.relations.insert(edge.id, edge.clone());
+        assert!(
+            verify(&head, &fabricated).is_err(),
+            "an invented derived edge qualified"
+        );
+
+        let mut asserted = exact.clone();
+        edge.origin = kin_model::RelationOrigin::Lsp;
+        asserted.relations.insert(edge.id, edge);
+        verify(&head, &asserted).expect("an edge no derivation authors is not refused");
+
+        // Two called declarations trading identities under edges that still
+        // name the old ones: the edges now bind the wrong targets, and the
+        // derivation, which binds by what the bytes call, says so.
+        let mut swapped = exact.clone();
+        let id_of = |name: &str| {
+            swapped
+                .entities
+                .values()
+                .find(|entity| entity.name == name)
+                .unwrap()
+                .id
+        };
+        let (left, right) = (id_of("helper"), id_of("double"));
+        let mut first = swapped.entities.remove(&left).unwrap();
+        let mut second = swapped.entities.remove(&right).unwrap();
+        std::mem::swap(&mut first.id, &mut second.id);
+        swapped.entities.insert(first.id, first);
+        swapped.entities.insert(second.id, second);
+        assert!(
+            verify(&head, &swapped).is_err(),
+            "swapped identities qualified"
+        );
+    }
+
+    /// A graph that owes local binding debt is refused even when every entity
+    /// and derived edge is exactly what a derivation produces. Debt is a
+    /// binding a later observation still has to settle, so no lineage can
+    /// start over it, and the store stays unproven.
+    #[test]
+    fn the_rederivation_verifier_refuses_a_graph_that_owes_binding_debt() {
+        let head = replayed_head();
+        let mut owing = head_graph(&head);
+        let blob_at = |path: &str| {
+            let id = owing
+                .resolved_tree
+                .artifact_id_at_path(&kin_model::RepoPath::from_utf8(path.to_string()).unwrap())
+                .unwrap_or_else(|| panic!("the fixture holds {path}"));
+            let TreeEntry::Blob { hash, .. } = owing.resolved_tree.get(&id).unwrap().entry else {
+                panic!("{path} is not a blob");
+            };
+            (id, hash)
+        };
+        let (source, source_digest) = blob_at("pkg/a.py");
+        let (target, _) = blob_at("pkg/b.py");
+        let call = owing
+            .relations
+            .values()
+            .find(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.evidence.iter().any(|evidence| {
+                        evidence
+                            .source_span
+                            .as_ref()
+                            .is_some_and(|span| span.file.0 == "pkg/a.py")
+                    })
+            })
+            .expect("the fixture calls across Python files")
+            .clone();
+        let debt = crate::binding_debt::build_local_binding_debt(
+            source,
+            crate::binding_debt::LocalBindingDebt {
+                source_file: FilePathId::new("pkg/a.py"),
+                observed_source_digest: source_digest,
+                obligations: vec![crate::binding_debt::LocalBindingObligation {
+                    retired_relation: call,
+                    source_name: "run".to_string(),
+                    source_digest,
+                    prior_source_file: None,
+                    target_artifact: target,
+                    target_file: FilePathId::new("pkg/b.py"),
+                    target_name: "double".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+        owing.relations.insert(debt.id, debt);
+        let error = verify(&head, &owing).unwrap_err();
+        assert!(error.contains("binding debt"), "{error}");
     }
 
     fn trees_by_change(

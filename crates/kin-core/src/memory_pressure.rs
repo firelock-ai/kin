@@ -3510,8 +3510,11 @@ mod tests {
                 },
             )
         });
+        // Liveness bounds, not timing assertions: a writer that never gets
+        // the lock never answers, and a loaded host can take far longer than a
+        // second to schedule one that will.
         second_contended_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .expect("the second writer must observe the first writer's owned lock");
         assert!(
             matches!(
@@ -3523,7 +3526,7 @@ mod tests {
         release_first_tx.send(()).expect("release first writer");
         assert!(first.join().expect("first writer did not panic"));
         second_read_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .expect("second writer proceeds after the first publishes");
         assert!(second.join().expect("second writer did not panic"));
         assert_eq!(

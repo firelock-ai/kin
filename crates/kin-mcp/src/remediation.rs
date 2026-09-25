@@ -115,6 +115,68 @@ pub fn spine_clipped(
     }
 }
 
+/// One node a trace's chain continues beneath after the per-step cap cut the
+/// node's fan-out, as the spine-clipping disclosure counts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpineNode {
+    pub entity_id: String,
+    pub entity_name: String,
+    /// Neighbors the cap dropped at this node.
+    pub dropped: usize,
+    /// How many of them lived outside this node's own file, or `None` when no
+    /// clip record says.
+    pub dropped_crossing_file: Option<usize>,
+    /// The cap that clipped this node, so the remediation names the value the
+    /// caller would raise.
+    pub limit_per_step: usize,
+}
+
+/// The `fanout_cap` / `spine_clipped` disclosure for the nodes a trace's chain
+/// continues beneath, given in walk order: its detail and its remediation, or
+/// `None` when there are none.
+///
+/// One producer for both walks and for the response-budget pass, which
+/// restates the disclosure after it cuts the chain further, so the three word
+/// one fact one way. The widest node is the first with the most dropped
+/// neighbors. How many of the dropped neighbors crossed a file is stated only
+/// when every node's count is known, so the number always covers the same
+/// nodes as the total beside it.
+pub fn spine_clipped_disclosure(nodes: &[SpineNode]) -> Option<(String, String)> {
+    let widest = nodes
+        .iter()
+        .fold(None, |widest: Option<&SpineNode>, node| match widest {
+            Some(widest) if widest.dropped >= node.dropped => Some(widest),
+            _ => Some(node),
+        })?;
+    let dropped: usize = nodes.iter().map(|node| node.dropped).sum();
+    let crossing = nodes
+        .iter()
+        .map(|node| node.dropped_crossing_file)
+        .sum::<Option<usize>>()
+        .filter(|crossing| *crossing > 0)
+        .map(|crossing| {
+            format!(", {crossing} of which lived outside the file of the node that offered them")
+        })
+        .unwrap_or_default();
+    let detail = format!(
+        "the walk continued beneath {} node(s) whose fan-out limit_per_step {} had already cut, \
+         dropping {dropped} neighbor(s) that were never followed{crossing}; the widest was '{}', \
+         which offered {} more than the cap kept. This chain is one route among the ones the cap \
+         left, so a hop it does not contain was not looked for and its absence proves nothing",
+        nodes.len(),
+        widest.limit_per_step,
+        widest.entity_name,
+        widest.dropped,
+    );
+    let remediation = spine_clipped(
+        &widest.entity_name,
+        &widest.entity_id,
+        widest.limit_per_step,
+        widest.dropped,
+    );
+    Some((detail, remediation))
+}
+
 /// The clause a bounded response ends with, about the budget knob itself.
 ///
 /// Three cases, and only the first is what shipped before this module existed.
@@ -160,6 +222,32 @@ pub fn response_budget_clause(param: &str, in_force: usize, needed: Option<usize
         "or raise {param}, up to the {RESPONSE_MAX_MAX_CHARS} this server will build, if the \
          caller's own result limit accepts a larger payload"
     )
+}
+
+/// The detail and remediation a trace discloses when the `target` it was asked
+/// to rank toward names no entity.
+///
+/// One producer for both walks. The CLI walk's copy of this sentence had lost
+/// its line continuations and carried runs of spaces where they had been,
+/// while the in-process walk's read cleanly, so the two worded one fact two
+/// ways.
+pub fn trace_target_not_resolved(target: &str) -> (String, String) {
+    (
+        format!(
+            "no entity matches target '{target}', so this walk ranked its fan-out by relevance \
+             alone and the question had no vote in what the cap kept"
+        ),
+        "check the target's spelling, or find it first with semantic_locate".to_string(),
+    )
+}
+
+/// `count` and the noun it counts, singular for exactly one: "1 step",
+/// "6 steps".
+///
+/// A budget disclosure states each count in a sentence, and "1 steps" reads as
+/// a typo that makes a reader doubt the number beside it.
+pub fn counted(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 #[cfg(test)]
@@ -292,5 +380,73 @@ mod tests {
             "a knob at its ceiling was told to rise: {at}"
         );
         assert!(at.contains("already at its 12 ceiling"), "{at}");
+    }
+
+    fn spine_node(name: &str, dropped: usize, crossing: Option<usize>) -> SpineNode {
+        SpineNode {
+            entity_id: format!("{name}-id"),
+            entity_name: name.to_string(),
+            dropped,
+            dropped_crossing_file: crossing,
+            limit_per_step: 3,
+        }
+    }
+
+    /// The disclosure counts the nodes it is given, totals what they dropped,
+    /// names the first widest one in the detail and the remediation alike, and
+    /// states the crossing count only when it knows every node's.
+    #[test]
+    fn the_spine_disclosure_describes_exactly_the_nodes_it_is_given() {
+        assert!(spine_clipped_disclosure(&[]).is_none());
+
+        let nodes = [
+            spine_node("root", 2, Some(1)),
+            spine_node("branch_0", 2, Some(0)),
+            spine_node("branch_1", 1, Some(2)),
+        ];
+        let (detail, remediation) = spine_clipped_disclosure(&nodes).expect("three nodes");
+        assert!(
+            detail.starts_with(
+                "the walk continued beneath 3 node(s) whose fan-out limit_per_step 3 had already \
+                 cut, dropping 5 neighbor(s) that were never followed, 3 of which lived outside"
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("the widest was 'root', which offered 2 more"),
+            "a tie goes to the first node in walk order: {detail}"
+        );
+        assert!(detail.ends_with("absence proves nothing"), "{detail}");
+        assert!(!detail.contains("  "), "no run of spaces: {detail}");
+        assert!(
+            remediation.contains("re-query 'root'"),
+            "the remediation names the node the detail names: {remediation}"
+        );
+
+        let (unknown, _) = spine_clipped_disclosure(&[
+            spine_node("root", 2, Some(1)),
+            spine_node("branch_0", 2, None),
+        ])
+        .expect("two nodes");
+        assert!(
+            !unknown.contains("of which lived outside"),
+            "a crossing count missing one node's share is not stated: {unknown}"
+        );
+        assert!(unknown.contains("dropping 4 neighbor(s)"), "{unknown}");
+    }
+
+    /// One takes the singular and every other count the plural.
+    #[test]
+    fn a_count_of_one_takes_the_singular() {
+        assert_eq!(counted(1, "step", "steps"), "1 step");
+        assert_eq!(counted(0, "step", "steps"), "0 steps");
+        assert_eq!(
+            counted(6, "inlined body", "inlined bodies"),
+            "6 inlined bodies"
+        );
+        assert_eq!(
+            counted(1, "inlined body", "inlined bodies"),
+            "1 inlined body"
+        );
     }
 }

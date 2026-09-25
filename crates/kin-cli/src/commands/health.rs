@@ -286,6 +286,7 @@ pub async fn run_health_checks() -> HealthReport {
         check_registry_authority(),
     ];
     checks.extend(check_mcp_clients());
+    checks.extend(check_discovery_blocks());
     checks.push(check_setup_ledger());
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
@@ -2714,8 +2715,10 @@ fn mcp_repo_argument(entry: &Value, topology: McpLauncherTopology) -> Option<&st
     args.get(repo_index)?.as_str()
 }
 
-/// Inspect a single MCP config file for a `kin` server entry carrying the
-/// agent-default tool profile.
+/// Inspect a single MCP config file for a `kin` server entry carrying a
+/// supported agent tool profile: `agent-default`, which `kin setup` writes for
+/// Claude Code and the Grok CLI, `agent-routed`, which it writes for the clients
+/// that send every tool with every request, or an operator's narrower choice.
 ///
 /// Handles both JSON configs (`mcpServers.kin`) and TOML configs such as
 /// Codex's `~/.codex/config.toml` (`mcp_servers.kin`); TOML is normalized to
@@ -2806,7 +2809,15 @@ fn evaluate_mcp_client_against(
                 .get("env")
                 .and_then(|e| e.get("KIN_MCP_TOOL_PROFILE"))
                 .and_then(|p| p.as_str());
-            match profile {
+            // Said beside the profile, because it decides what the next `kin
+            // setup` and `kin update` do with it: a pinned profile is kept, and
+            // an unpinned one Kin wrote moves with the client's default.
+            let pinned = entry
+                .get("env")
+                .and_then(|e| e.get(crate::commands::setup::PINNED_PROFILE_ENV))
+                .and_then(|p| p.as_str())
+                == Some("1");
+            let (status, detail) = match profile {
                 Some("agent-default") => (
                     HealthStatus::Healthy,
                     format!(
@@ -2823,6 +2834,27 @@ fn evaluate_mcp_client_against(
                     HealthStatus::Healthy,
                     format!(
                         "{servers_key}.kin present with the query-only agent-query profile ({})",
+                        path.display()
+                    ),
+                ),
+                // `kin setup` writes this one for a client that loads every
+                // tool it is handed eagerly, where one routed tool costs a
+                // fraction of the fifteen definitions the query belt re-sends
+                // with every request.
+                Some("agent-routed") => (
+                    HealthStatus::Healthy,
+                    format!(
+                        "{servers_key}.kin present with the one-tool agent-routed profile ({})",
+                        path.display()
+                    ),
+                ),
+                // The same one tool without a write path, for a client that
+                // should only query.
+                Some("agent-routed-query") => (
+                    HealthStatus::Healthy,
+                    format!(
+                        "{servers_key}.kin present with the one-tool read-only \
+                         agent-routed-query profile ({})",
                         path.display()
                     ),
                 ),
@@ -2853,10 +2885,18 @@ fn evaluate_mcp_client_against(
                 Some(other) => (
                     HealthStatus::Misconfigured,
                     format!(
-                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {other} (expected agent-default, agent-query, agent-search, or unset to take agent-default as the default) in {}",
+                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {other} (expected agent-default, agent-routed, agent-routed-query, agent-query, agent-search, or unset to take agent-default as the default) in {}",
                         path.display()
                     ),
                 ),
+            };
+            if pinned && matches!(status, HealthStatus::Healthy) {
+                (
+                    status,
+                    format!("{detail}; pinned, so `kin setup` and `kin update` keep it"),
+                )
+            } else {
+                (status, detail)
             }
         }
     }
@@ -3001,6 +3041,318 @@ fn evaluate_codex_binding(path: &Path) -> Option<(HealthStatus, String)> {
     evaluate_codex_binding_for(path, &expected_repo)
 }
 
+/// The MCP entries Kin's docs tell a reader to paste are entries this check
+/// grades healthy, for the client each doc gives them to.
+///
+/// The Codex and Cursor plugin READMEs handed out `npx -y @kinlab/kin-mcp`,
+/// which this check grades MISCONFIGURED, and `llms-install.md` gave Codex an
+/// entry with no `--repo`. A reader who followed either was told by `kin
+/// doctor` that the config the docs gave them was broken. Every fenced JSON or
+/// TOML block in these docs that carries a Kin entry is written to a config
+/// file and graded here, with the docs' placeholders standing in for the
+/// installed launcher and the repository.
+///
+/// Each doc's blocks are listed below in order, with the client the doc gives
+/// each one to. A block for a named client is graded by that client's rule, and
+/// the paragraph that introduces it has to name the client, so this list cannot
+/// quietly disagree with the doc. A block offered to any JSON client is graded
+/// by the rule of every JSON client that binds no repository. A doc whose block
+/// count changes fails, so a doc cannot drop out of this check by losing its
+/// entries.
+#[cfg(test)]
+mod documented_mcp_entry_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum GivenTo {
+        /// Offered to any client that reads `mcpServers` JSON and binds no
+        /// repository.
+        AnyJsonClient,
+        /// Offered to one client, which the introducing paragraph names.
+        Named {
+            client: &'static str,
+            name: &'static str,
+        },
+    }
+    use GivenTo::{AnyJsonClient, Named};
+
+    const CLAUDE_CODE: GivenTo = Named {
+        client: "claude",
+        name: "Claude Code",
+    };
+    const CODEX: GivenTo = Named {
+        client: "codex",
+        name: "Codex",
+    };
+    const CURSOR: GivenTo = Named {
+        client: "cursor",
+        name: "Cursor",
+    };
+
+    /// Every doc that hands out an MCP entry, with its entries in order.
+    const DOCS: &[(&str, &[GivenTo])] = &[
+        ("plugins/kin-codex/README.md", &[CODEX]),
+        ("plugins/kin-cursor/README.md", &[CURSOR]),
+        ("llms-install.md", &[AnyJsonClient, AnyJsonClient, CODEX]),
+        (
+            "docs/quickstart.md",
+            &[CLAUDE_CODE, AnyJsonClient, CODEX, AnyJsonClient],
+        ),
+        ("docs/readme-reference.md", &[AnyJsonClient, CODEX]),
+        ("docs/mcp-tools.md", &[CLAUDE_CODE]),
+        ("packages/kin/README.md", &[AnyJsonClient]),
+        ("packages/kin-mcp/README.md", &[AnyJsonClient]),
+    ];
+    /// The JSON clients whose entry binds no repository. Google Antigravity
+    /// reads the same JSON but binds one, so an entry offered to any JSON
+    /// client is not offered to it.
+    const UNBOUND_JSON_CLIENTS: &[&str] = &["claude", "cursor", "gemini", "windsurf", "lmstudio"];
+    /// Where the docs write the absolute path of the installed `kin`.
+    const LAUNCHER_PLACEHOLDER: &str = "/absolute/path/to/kin";
+    /// Where the docs write the absolute path of the repository an entry binds.
+    const REPOSITORY_PLACEHOLDER: &str = "/absolute/path/to/repository";
+
+    /// One fenced MCP entry: its language, its body, and the paragraph that
+    /// introduces it.
+    struct Entry {
+        language: String,
+        body: String,
+        lead_in: String,
+    }
+
+    /// Every fenced `json` or `toml` block in `markdown` that holds an MCP
+    /// server entry.
+    fn fenced_entries(markdown: &str) -> Vec<Entry> {
+        let lines: Vec<&str> = markdown.lines().collect();
+        let mut entries = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let Some(language) = lines[index].trim_start().strip_prefix("```") else {
+                index += 1;
+                continue;
+            };
+            let language = language.trim().to_string();
+            let start = index;
+            let mut body = String::new();
+            index += 1;
+            while index < lines.len() && !lines[index].trim_start().starts_with("```") {
+                body.push_str(lines[index]);
+                body.push('\n');
+                index += 1;
+            }
+            index += 1;
+            let holds_entry = body.contains("mcpServers")
+                || body.contains("mcp_servers")
+                || is_bare_client_entry(&body);
+            if matches!(language.as_str(), "json" | "toml") && holds_entry {
+                entries.push(Entry {
+                    language,
+                    body,
+                    lead_in: lead_in(&lines[..start]),
+                });
+            }
+        }
+        entries
+    }
+
+    /// The paragraph just before a fence.
+    fn lead_in(before: &[&str]) -> String {
+        let mut paragraph: Vec<&str> = before
+            .iter()
+            .rev()
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty() && !line.trim_start().starts_with("```"))
+            .copied()
+            .collect();
+        paragraph.reverse();
+        paragraph.join(" ")
+    }
+
+    /// A bare client entry launches a process, so its `args` is a list. The
+    /// routed `kin` tool's call shape also has `command` and `args`, but its
+    /// `args` is an object, and it is a tool call, not a client entry.
+    fn is_bare_client_entry(body: &str) -> bool {
+        serde_json::from_str::<Value>(body).is_ok_and(|entry| {
+            entry.get("command").is_some_and(Value::is_string)
+                && entry.get("args").is_some_and(Value::is_array)
+        })
+    }
+
+    fn replace_placeholder(value: &mut Value, repository: &str) {
+        match value {
+            Value::String(text) if text == REPOSITORY_PLACEHOLDER => *text = repository.to_string(),
+            Value::Array(items) => items
+                .iter_mut()
+                .for_each(|item| replace_placeholder(item, repository)),
+            Value::Object(fields) => fields
+                .values_mut()
+                .for_each(|field| replace_placeholder(field, repository)),
+            _ => {}
+        }
+    }
+
+    /// Grade one entry the way doctor grades `client`'s config, as
+    /// (status, detail).
+    fn grade(entry: &Entry, client: &str, dir: &Path, repository: &Path) -> (HealthStatus, String) {
+        let repository_text = repository.to_string_lossy();
+        if client == "codex" {
+            assert_eq!(
+                entry.language, "toml",
+                "a Codex entry is TOML:\n{}",
+                entry.body
+            );
+            let mut parsed: Value = serde_json::to_value(
+                toml::from_str::<toml::Value>(&entry.body).expect("a documented TOML entry parses"),
+            )
+            .unwrap();
+            replace_placeholder(&mut parsed, &repository_text);
+            let path = dir.join("config.toml");
+            let written: toml::Value = serde_json::from_value(parsed).unwrap();
+            std::fs::write(&path, toml::to_string(&written).unwrap()).unwrap();
+            let (status, detail) =
+                evaluate_mcp_client_against(&path, "codex", LAUNCHER_PLACEHOLDER);
+            if matches!(status, HealthStatus::Healthy) {
+                if let Some(binding) = evaluate_codex_binding_for(&path, repository) {
+                    return binding;
+                }
+            }
+            return (status, detail);
+        }
+        assert_eq!(
+            entry.language, "json",
+            "a {client} entry is JSON:\n{}",
+            entry.body
+        );
+        let mut parsed: Value =
+            serde_json::from_str(&entry.body).expect("a documented JSON entry parses");
+        replace_placeholder(&mut parsed, &repository_text);
+        // A bare entry, as the npm package README gives it, is what goes under
+        // `mcpServers.kin`.
+        if parsed.get("mcpServers").is_none() {
+            parsed = serde_json::json!({ "mcpServers": { "kin": parsed } });
+        }
+        let path = dir.join("mcp.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&parsed).unwrap()).unwrap();
+        evaluate_mcp_client_against(&path, client, LAUNCHER_PLACEHOLDER)
+    }
+
+    /// The clients whose rule grades an entry given `to` them.
+    fn clients(to: GivenTo) -> Vec<&'static str> {
+        match to {
+            AnyJsonClient => UNBOUND_JSON_CLIENTS.to_vec(),
+            Named { client, .. } => vec![client],
+        }
+    }
+
+    fn entry(language: &str, body: &str) -> Entry {
+        Entry {
+            language: language.to_string(),
+            body: body.to_string(),
+            lead_in: String::new(),
+        }
+    }
+
+    #[test]
+    fn every_documented_mcp_entry_is_one_doctor_grades_healthy() {
+        let kin_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("repository");
+        std::fs::create_dir_all(repository.join(".kin")).unwrap();
+        let repository = repository.canonicalize().unwrap();
+
+        for (doc, given) in DOCS {
+            let markdown = std::fs::read_to_string(kin_root.join(doc))
+                .unwrap_or_else(|error| panic!("{doc} is unreadable: {error}"));
+            let entries = fenced_entries(&markdown);
+            assert_eq!(
+                entries.len(),
+                given.len(),
+                "{doc} gives {} MCP entries and this test lists {}; list each one with the \
+                 client the doc gives it to",
+                entries.len(),
+                given.len()
+            );
+            for (index, (entry, to)) in entries.iter().zip(given.iter()).enumerate() {
+                if let Named { name, .. } = to {
+                    assert!(
+                        entry.lead_in.to_lowercase().contains(&name.to_lowercase()),
+                        "{doc} entry {index} is listed as {name}'s, and the paragraph before \
+                         it does not name {name}: {}",
+                        entry.lead_in
+                    );
+                }
+                for client in clients(*to) {
+                    let case = dir
+                        .path()
+                        .join(format!("{}-{index}-{client}", doc.replace('/', "_")));
+                    std::fs::create_dir_all(&case).unwrap();
+                    let (status, detail) = grade(entry, client, &case, &repository);
+                    assert!(
+                        matches!(status, HealthStatus::Healthy),
+                        "{doc} entry {index} is graded {status:?} for {client}: {detail}\n{}",
+                        entry.body
+                    );
+                }
+            }
+        }
+    }
+
+    /// The controls: entries doctor must still refuse, so the test above can
+    /// tell a wrong entry from a right one, and grades by the named client
+    /// rather than by what the entry happens to carry.
+    #[test]
+    fn the_documented_entry_check_refuses_entries_doctor_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("repository");
+        std::fs::create_dir_all(repository.join(".kin")).unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let refused = [
+            // What the plugin READMEs used to give.
+            (
+                entry(
+                    "json",
+                    r#"{ "mcpServers": { "kin": { "command": "npx", "args": ["-y", "@kinlab/kin-mcp"] } } }"#,
+                ),
+                "cursor",
+            ),
+            // What llms-install used to give Codex.
+            (
+                entry(
+                    "toml",
+                    "[mcp_servers.kin]\ncommand = \"npx\"\nargs = [\"-y\", \"@kinlab/kin\", \"mcp\", \"start\"]\n",
+                ),
+                "codex",
+            ),
+            // A repository-bound entry is right for Antigravity and wrong for
+            // Cursor, and it is graded as the client the doc names.
+            (
+                entry(
+                    "json",
+                    r#"{ "mcpServers": { "kin": { "command": "npx", "args": ["-y", "@kinlab/kin", "mcp", "start", "--repo", "/absolute/path/to/repository"] } } }"#,
+                ),
+                "cursor",
+            ),
+        ];
+        for (index, (entry, client)) in refused.iter().enumerate() {
+            let case = dir.path().join(format!("refused-{index}"));
+            std::fs::create_dir_all(&case).unwrap();
+            let (status, detail) = grade(entry, client, &case, &repository);
+            assert!(
+                matches!(status, HealthStatus::Misconfigured),
+                "control {index} must be graded misconfigured for {client}, got {status:?}: {detail}"
+            );
+        }
+
+        // And a doc that lost its entries is caught by its count.
+        assert!(fenced_entries("No entry here.\n\n```sh\nkin init .\n```\n").is_empty());
+        let named = fenced_entries(
+            "Add this to `~/.cursor/mcp.json`:\n\n```json\n{ \"mcpServers\": { \"kin\": {} } }\n```\n",
+        );
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].lead_in, "Add this to `~/.cursor/mcp.json`:");
+    }
+}
+
 /// Config files `kin setup` recorded merging a kin MCP server entry into.
 ///
 /// An AI client's config is not Kin's artifact. Kin merges one `kin` key into a
@@ -3070,6 +3422,49 @@ fn mcp_client_check_from(
             check
         }
     }
+}
+
+/// One row per instruction file that carries a Kin discovery block: healthy
+/// when every name the block tells an agent to call is one its client's
+/// profile carries, and misconfigured when it names one the client cannot
+/// call, which is a block written for another profile.
+fn check_discovery_blocks() -> Vec<HealthCheck> {
+    crate::commands::setup::discovery_block_findings()
+        .into_iter()
+        .map(discovery_block_check)
+        .collect()
+}
+
+fn discovery_block_check(finding: crate::commands::setup::DiscoveryBlockFinding) -> HealthCheck {
+    let id = format!("instructions_{}", finding.ledger_target.replace('-', "_"));
+    let label = format!("Instructions: {}", finding.label);
+    if finding.missing.is_empty() {
+        return HealthCheck::new(
+            &id,
+            &label,
+            HealthStatus::Healthy,
+            format!(
+                "the Kin block in {} names only what the {} profile serves",
+                finding.path.display(),
+                finding.profile
+            ),
+        );
+    }
+    HealthCheck::new(
+        &id,
+        &label,
+        HealthStatus::Misconfigured,
+        format!(
+            "the Kin block in {} names {}, which the {} profile this client is served does not \
+             carry, so an agent reading it looks for a tool it does not have",
+            finding.path.display(),
+            finding.missing.join(", "),
+            finding.profile
+        ),
+    )
+    .with_manual_fix(
+        "run `kin setup` or `kin update` to rewrite the block for this client's profile",
+    )
 }
 
 /// Build the row for a machine carrying no AI client config file at all.
@@ -3554,7 +3949,88 @@ async fn check_reference_edge_coverage(graph_status: &RunGraphStatus) -> HealthC
             &missing_servers,
         );
     };
-    reference_edge_coverage_health(coverage)
+    reference_edge_coverage_row(
+        coverage,
+        &readiness,
+        crate::commands::language_servers::server_path_on_this_path,
+    )
+}
+
+/// The coverage row: the daemon's measurement, with this shell's view of the
+/// language servers laid over it.
+///
+/// `shell` is this process's own readiness probe and `locate` names where this
+/// process resolves a language's server, both taken as arguments so the row is
+/// testable without a daemon or the servers a test machine happens to have.
+fn reference_edge_coverage_row(
+    coverage: &kin_core::reference_coverage::ReferenceEdgeCoverage,
+    shell: &kin_core::reference_coverage::LanguageServerReadinessMap,
+    locate: impl Fn(kin_model::LanguageId) -> Option<PathBuf>,
+) -> HealthCheck {
+    with_servers_only_this_shell_finds(
+        reference_edge_coverage_health(coverage),
+        &crate::commands::language_servers::servers_only_this_shell_finds(coverage, shell, locate),
+        &coverage.languages_missing_a_language_server(),
+    )
+}
+
+/// Say so when the daemon's view of language servers and this shell's differ.
+///
+/// The coverage row reports the servers the DAEMON found, and a daemon runs
+/// with the `PATH` of whatever started it. When that was an AI client, it can
+/// miss a server this shell reaches, and the row used to report the server
+/// missing to someone who could see it installed, with an install command as
+/// the fix. Each language the daemon found no server for, where this shell
+/// finds the one the daemon starts and its own probe finds it usable, is named
+/// here with where this shell finds it, and the fix leads with the step that
+/// closes this gap: record where this shell finds it, and restart the daemon so
+/// it looks there.
+///
+/// Recording closes nothing for the rest of `daemon_missing`: a language with
+/// no server the daemon would start anywhere, or one whose server the daemon
+/// found and could not start. While any of those remains, the row's own fix
+/// stays behind the recording step, whole, rather than being replaced by it.
+fn with_servers_only_this_shell_finds(
+    mut check: HealthCheck,
+    shell_only: &[(String, PathBuf)],
+    daemon_missing: &[&str],
+) -> HealthCheck {
+    if shell_only.is_empty() {
+        return check;
+    }
+    let named = shell_only
+        .iter()
+        .map(|(language, path)| format!("{language} at {}", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    check.detail = format!(
+        "the daemon serving this repository reports no language server for what this shell \
+         finds ({named}): a daemon runs with the PATH of whatever started it, which for an AI \
+         client is often not this shell's; {}",
+        check.detail
+    );
+    let found = shell_only
+        .iter()
+        .map(|(language, _)| language.as_str())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let record = format!(
+        "run `kin doctor --fix` in this shell to record where it finds the server for {found}, \
+         then `kin daemon stop` so the next daemon started looks there too, then `kin daemon \
+         sweep`"
+    );
+    let rest: Vec<&str> = daemon_missing
+        .iter()
+        .copied()
+        .filter(|missing| !shell_only.iter().any(|(language, _)| language == missing))
+        .collect();
+    let fix = match check.manual_fix.take() {
+        Some(install) if !rest.is_empty() => {
+            format!("{record}; for {}, {install}", rest.join(" and "))
+        }
+        _ => record,
+    };
+    check.with_manual_fix(fix)
 }
 
 /// This row's words for a graph status the run could not read, or the response
@@ -4373,60 +4849,74 @@ fn language_server_fix() -> String {
 /// retrieval capability — and why not, when a lever is off.
 /// One commit observation from a real converted repository.
 ///
-/// `peak_bytes` is a WHOLE-MACHINE total taken while the commit ran, not the
-/// commit's own demand: everything else resident at the time is inside it. That
-/// distinction is FIR-2643. Keying these totals to store size and reading the
-/// result as what a commit costs put this row roughly an order of magnitude out,
-/// because the one measurement that separated the terms found a docstring-only
-/// edit on a 500 MiB store costing about 0.9 GB over a resident baseline of
-/// 8.16 GB, while the store-size reading implied a 10.6 GiB floor.
+/// `peak_bytes` is a WHOLE-MACHINE total, not the commit's own demand:
+/// everything else resident at the time is inside it. Keying these totals to
+/// store size and reading the result as what a commit costs once put this row
+/// roughly an order of magnitude out, because the
+/// one measurement that separated the terms found a docstring-only edit on a
+/// 500 MiB store costing about 0.9 GB over a resident baseline of 8.16 GB.
+///
+/// It is the machine's high-water mark read after the commit had completed, so
+/// the whole machine never went past it while the commit ran. That is a bound
+/// on the total a commit completed inside, which is what a reader deciding
+/// whether a commit fits needs, and it makes no claim that the commit itself
+/// drove the machine there.
 ///
 /// `observed_ceiling_bytes` is the size of the machine the total was taken
 /// inside, and it travels with the total because a total means nothing without
-/// it. 12283 MiB is comfortable in 24 GiB and is the last reading before a kill
-/// in 12288 MiB, and it was the second.
+/// it. `kin_version` travels with it for the same reason: a total read on one
+/// release is a statement about that release, and a row that dropped its
+/// version is how a 0.5.40 reading was still being quoted as current fact to
+/// 8 GiB laptops on 0.7.21.
 struct MeasuredCommitPeak {
     repository: &'static str,
     store_bytes: u64,
     peak_bytes: u64,
     observed_ceiling_bytes: u64,
+    kin_version: &'static str,
 }
 
 const MIB: u64 = 1024 * 1024;
 
 /// Commit observations from converted repositories, smallest store first.
 ///
-/// Every row is one whole-machine total taken while a commit ran, never a fitted
-/// curve and never a commit's own demand, and the check below never interpolates
-/// or extrapolates between them. It quotes the largest row whose store is no
-/// larger than the store in front of it, so what a reader is told is always a
-/// machine that was actually measured rather than a prediction about theirs.
-/// Below the smallest row nothing is claimed at all.
+/// Every row is one whole-machine total a commit completed inside, never a
+/// fitted curve and never a commit's own demand, and the check below never
+/// interpolates or extrapolates between them. It quotes the largest row whose
+/// store is no larger than the store in front of it, so what a reader is told
+/// is always a machine that was actually measured rather than a prediction
+/// about theirs. Below the smallest row nothing is claimed at all.
 ///
-/// The two rows are the table's own argument against a curve. `expressjs/express`
-/// holds a store 47% the size of `psf/requests` and its total lands within 12% of
-/// it. A quantity that barely moves when the store nearly halves is not a
-/// quantity the store predicts, which is why this check compares one ceiling
-/// against one observation and stops there.
+/// Both rows come from one isolated first-contact run of kin 0.7.21 on
+/// 2026-09-18, in a 5 CPU container capped at 12 GiB. It converted both
+/// repositories, served both from their own daemons with background embedding
+/// running, and committed a one-file documentation edit to each; both commits
+/// landed, the cgroup counted no OOM kill, and `memory.peak` read
+/// 9,682,825,216 bytes after both. The stores are the sizes `kin doctor`
+/// reported at commit time. The one reading covers both commits, which is why
+/// the two rows carry the same total, and it is itself the table's argument
+/// against a curve: a store three times the size completed inside the same
+/// total.
 ///
-/// Both were taken in the same 5 CPU / 12 GiB container on `kin 0.5.40`, before
-/// the workspace-graph scoping in `plan_native_commit_inner` cut what a commit
-/// holds at its peak. A build that peaks lower than a row makes this check
-/// conservative rather than wrong, which is the safe direction for a warning:
-/// it can advise headroom nobody needs, and it cannot stay quiet about a
-/// ceiling somebody does.
+/// These replace two rows read in the same container shape on kin 0.5.40,
+/// 10.6 GiB for express and 12.0 GiB for requests. Those were current fact to
+/// nobody by 0.7.21, where the pre-init row still quoted the smaller of them to
+/// tell every machine under about 12 GiB that a commit had no measured room,
+/// on a run whose own container then completed both commits with 3 GiB left.
 const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
     MeasuredCommitPeak {
         repository: "expressjs/express",
-        store_bytes: 437 * MIB,
-        peak_bytes: 10809 * MIB,
-        observed_ceiling_bytes: 12288 * MIB,
+        store_bytes: 515 * MIB,
+        peak_bytes: 9_682_825_216,
+        observed_ceiling_bytes: 12_884_901_888,
+        kin_version: "0.7.21",
     },
     MeasuredCommitPeak {
         repository: "psf/requests",
-        store_bytes: 922 * MIB,
-        peak_bytes: 12283 * MIB,
-        observed_ceiling_bytes: 12288 * MIB,
+        store_bytes: 1536 * MIB,
+        peak_bytes: 9_682_825_216,
+        observed_ceiling_bytes: 12_884_901_888,
+        kin_version: "0.7.21",
     },
 ];
 
@@ -4434,17 +4924,15 @@ const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
 /// total, before this check calls it ok.
 ///
 /// This is a repeatability figure, not a scaling claim. Two commits observed in
-/// the SAME 12 GiB container produced totals 13.6% apart, so a total is not
-/// reproducible closer than that even with the machine held fixed. A ceiling
-/// merely level with a quoted total therefore has no room in it, and calling
-/// that ok is what told an isolated stranger run its 12288 MiB container was
-/// fine six hours before a commit was killed at 12283 MiB.
+/// the SAME 12 GiB container on kin 0.5.40 produced totals 13.6% apart, so a
+/// total is not reproducible closer than that even with the machine held fixed,
+/// and a ceiling merely level with a quoted total has no room in it. The rows
+/// now in the table share one reading and show no spread of their own, so the
+/// margin keeps the spread the last measured pair showed.
 ///
 /// FIR-2643: the margin used to be justified by "a larger store peaks higher",
-/// which the table's own two rows do not support and which put this row's
-/// forecast roughly an order of magnitude out. The band it opens is unchanged,
-/// because the kill it caught is unchanged. Only the reason it exists is stated
-/// correctly now.
+/// which the measured rows do not support and which put this row's forecast
+/// roughly an order of magnitude out.
 ///
 /// The number rounds the observed spread up, because the safe direction for a
 /// warning is to advise headroom nobody needs rather than to stay quiet about a
@@ -4553,10 +5041,18 @@ fn memory_floor_check_for(
 
     let (tier_clause, tier_is_full) = memory_floor_tier_clause(detection);
 
-    // The cheapest commit anybody has measured, so a ceiling under it is under
-    // every row in the table. A reader with no store cannot pick a row by store
-    // size the way `Commit memory headroom` does, so this quotes the floor of
-    // the table and names the repository it came from.
+    // The smallest total any measured commit completed inside, so a ceiling
+    // under it is under every row in the table. A reader with no store cannot
+    // pick a row by store size the way `Commit memory headroom` does, so this
+    // quotes the floor of the table and names the repository and the release it
+    // came from.
+    //
+    // What a ceiling under it is told matters as much as the comparison. The
+    // table holds totals commits completed inside, on a machine running more
+    // than one commit's worth of work, and nothing smaller has been measured.
+    // So a smaller ceiling is untested ground rather than known shortage, and
+    // saying "no measured room" to an 8 GiB laptop read as a verdict the
+    // measurement never made.
     let cheapest = MEASURED_COMMIT_PEAKS
         .iter()
         .min_by_key(|point| point.peak_bytes);
@@ -4570,27 +5066,27 @@ fn memory_floor_check_for(
                     / 100,
             );
             let clears = evidence.limit_bytes >= comfortable;
+            let observed = format!(
+                "A commit on {} ({} store) completed on kin {} inside a {} machine whose total, \
+                 everything else resident included, never passed {}",
+                point.repository,
+                format_health_bytes(point.store_bytes),
+                point.kin_version,
+                format_health_bytes(point.observed_ceiling_bytes),
+                format_health_bytes(point.peak_bytes),
+            );
             let clause = if clears {
                 format!(
-                    "The cheapest commit Kin has measured drove a {} machine to {} in total on \
-                     {} ({} store), and this ceiling clears that by at least {}%",
-                    format_health_bytes(point.observed_ceiling_bytes),
-                    format_health_bytes(point.peak_bytes),
-                    point.repository,
-                    format_health_bytes(point.store_bytes),
+                    "{observed}, and this ceiling clears that by at least {}%",
                     COMMIT_PEAK_COMFORT_MARGIN_PERCENT,
                 )
             } else {
                 format!(
-                    "The cheapest commit Kin has measured drove a {} machine to {} in total on \
-                     {} ({} store), and {available} is not {}% clear of that, so a commit here \
-                     has no measured room. That total is a whole-machine reading with everything \
-                     else resident inside it rather than a commit's own demand, so this compares \
-                     a ceiling against an observation and forecasts nothing about a write here",
-                    format_health_bytes(point.observed_ceiling_bytes),
-                    format_health_bytes(point.peak_bytes),
-                    point.repository,
-                    format_health_bytes(point.store_bytes),
+                    "{observed}. {available} is not {}% clear of that total, and no commit has \
+                     been measured on a machine this size, so the room a commit has here is \
+                     unmeasured rather than known to be short. That total is a whole-machine \
+                     reading rather than a commit's own demand, so this compares a ceiling against \
+                     an observation and forecasts nothing about a write here",
                     COMMIT_PEAK_COMFORT_MARGIN_PERCENT,
                 )
             };
@@ -4622,7 +5118,7 @@ fn memory_floor_check_for(
                 .to_string(),
         );
         moves.push(format!(
-            "raise this ceiling above {}",
+            "raise this ceiling above {} to put a commit here on measured ground",
             format_health_bytes(
                 cheapest
                     .map(|point| point.peak_bytes.saturating_add(
@@ -5396,10 +5892,10 @@ fn commit_memory_headroom_check_for(
             HealthStatus::Healthy,
             format!(
                 "{available} of memory here ({ceiling_source}); a commit on {} ({measured_store} \
-                 store) was observed driving a {measured_machine} machine to {needed} in total, \
-                 and this ceiling clears that peak by at least {}%. This {store_size} store is \
-                 {ratio} the measured one",
-                measured.repository, COMMIT_PEAK_COMFORT_MARGIN_PERCENT
+                 store) completed on kin {} inside a {measured_machine} machine whose total never \
+                 passed {needed}, and this ceiling clears that peak by at least {}%. This \
+                 {store_size} store is {ratio} the measured one",
+                measured.repository, measured.kin_version, COMMIT_PEAK_COMFORT_MARGIN_PERCENT
             ),
         );
     }
@@ -5407,20 +5903,21 @@ fn commit_memory_headroom_check_for(
         (
             HealthStatus::Stale,
             format!(
-                "{available} of memory here ({ceiling_source}) is parity with the {needed} a \
-                 commit on {} ({measured_store} store) was observed reaching inside a \
-                 {measured_machine} machine, {room}, not headroom over it",
-                measured.repository
+                "{available} of memory here ({ceiling_source}) is parity with the {needed} total \
+                 a {measured_machine} machine never passed while a commit on {} \
+                 ({measured_store} store) completed on kin {}, {room}, not headroom over it",
+                measured.repository, measured.kin_version
             ),
         )
     } else {
         (
             HealthStatus::Degraded,
             format!(
-                "only {available} of memory here ({ceiling_source}), under the {needed} a commit \
-                 on {} ({measured_store} store) was already observed reaching inside a \
-                 {measured_machine} machine, {room}",
-                measured.repository
+                "only {available} of memory here ({ceiling_source}), under the {needed} total a \
+                 {measured_machine} machine never passed while a commit on {} ({measured_store} \
+                 store) completed on kin {}, {room}, and no commit has been measured on a \
+                 machine this size",
+                measured.repository, measured.kin_version
             ),
         )
     };
@@ -5594,6 +6091,41 @@ mod tests {
     use super::*;
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    /// A Kin block that names a tool its client's profile does not serve fails
+    /// its row, says which names and which profile, and says how to fix it; a
+    /// block that matches passes.
+    #[test]
+    fn a_discovery_block_for_another_profile_fails_its_doctor_row() {
+        let finding = |missing: Vec<&str>| crate::commands::setup::DiscoveryBlockFinding {
+            ledger_target: "codex-agents",
+            label: "Codex CLI",
+            path: std::path::PathBuf::from("/home/me/.codex/AGENTS.md"),
+            profile: "agent-routed".to_string(),
+            missing: missing.into_iter().map(str::to_string).collect(),
+        };
+        let stale = discovery_block_check(finding(vec!["semantic_locate", "trace_data_flow"]));
+        assert_eq!(stale.id, "instructions_codex_agents");
+        assert!(matches!(stale.status, HealthStatus::Misconfigured));
+        assert!(
+            stale.detail.contains("semantic_locate, trace_data_flow"),
+            "{}",
+            stale.detail
+        );
+        assert!(stale.detail.contains("agent-routed"), "{}", stale.detail);
+        assert!(stale
+            .manual_fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("kin update")));
+        let em_dash = char::from_u32(0x2014).expect("a character");
+        assert!(!stale.detail.contains(em_dash), "{}", stale.detail);
+        let current = discovery_block_check(finding(Vec::new()));
+        assert!(
+            matches!(current.status, HealthStatus::Healthy),
+            "{}",
+            current.detail
+        );
+    }
 
     /// Grok's Kin entry names one repository, as Codex's does, and LM Studio's
     /// follows the session's working directory, as Cursor's does. Both are
@@ -6095,6 +6627,80 @@ mod tests {
         );
     }
 
+    /// An 8 GiB laptop is told the room a commit has there is unmeasured, from
+    /// the current release's reading, rather than that it has none.
+    ///
+    /// Before this, the row quoted a kin 0.5.40 total and told every machine
+    /// under about 12 GiB, before `kin init`, that "a commit here has no
+    /// measured room". Nothing was ever measured on an 8 GiB machine, and the
+    /// 12 GiB container the row said that to then completed commits on both
+    /// repositories under kin 0.7.21.
+    ///
+    /// Falsify by restoring the "no measured room" sentence or the 0.5.40 rows.
+    #[test]
+    #[serial]
+    fn an_8_gib_laptop_is_told_its_commit_room_is_unmeasured_rather_than_absent() {
+        let check = memory_floor_check_for(
+            &memory(8 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Standard, 8, 8.0),
+        );
+        assert!(
+            !check.detail.contains("no measured room"),
+            "an unmeasured size is not a measured shortage: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("0.5.40"),
+            "a reading from a release this old is not current fact: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("completed on kin 0.7.21"),
+            "the row names the release its observation was read on: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("no commit has been measured on a machine this size")
+                && check
+                    .detail
+                    .contains("unmeasured rather than known to be short"),
+            "the row says what is not known instead of a verdict: {}",
+            check.detail
+        );
+    }
+
+    /// The 12 GiB container two kin 0.7.21 commits completed in clears the
+    /// commit clause, and its fix line carries only the move it still needs.
+    ///
+    /// The same container read "a commit here has no measured room" before
+    /// `kin init` on that run.
+    #[test]
+    #[serial]
+    fn the_container_the_current_commits_completed_in_clears_the_commit_clause() {
+        let check = memory_floor_check_for(
+            &capped_memory(12288 * MIB),
+            &detected(crate::capability::LocateProfile::Standard, 5, 12.0),
+        );
+        assert!(
+            check
+                .detail
+                .contains("this ceiling clears that by at least 14%"),
+            "a machine a commit completed in with 3 GiB spare clears it: {}",
+            check.detail
+        );
+        let fix = check
+            .manual_fix
+            .clone()
+            .expect("the standard tier still owes its fix");
+        assert!(
+            !fix.contains("raise this ceiling"),
+            "a ceiling that clears the commit clause is not told to grow: {fix}"
+        );
+        assert!(fix.contains("multihop"), "the tier move stays: {fix}");
+    }
+
     /// The line a reader is told is the line that is scored.
     ///
     /// Two constants, read by the tier scorer and by this row, so the sentence
@@ -6316,8 +6922,12 @@ mod tests {
     /// beside the repository and an operator stands in either place.
     #[test]
     fn the_interrupted_conversion_row_scans_the_working_directory_and_its_parent() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
+        // Run from `root`, the scan also reads root's parent. That parent is
+        // an owned directory, never the shared temp directory, where staging
+        // a persistent CI runner kept from earlier runs would join the count.
+        let owned = tempfile::tempdir().unwrap();
+        let root = owned.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
         let repo = root.join("requests");
         std::fs::create_dir(&repo).unwrap();
 
@@ -6425,7 +7035,7 @@ mod tests {
             check.detail
         );
         assert!(
-            check.detail.contains("2.0x the measured one"),
+            check.detail.contains("1.2x the measured one"),
             "the reader cannot judge a floor without the store ratio: {}",
             check.detail
         );
@@ -6437,23 +7047,19 @@ mod tests {
 
     /// Parity with an observed total is the edge, and it used to round up to ok.
     ///
-    /// A one-file commit on a 922 MiB store peaked at 12283 MiB against a
-    /// 12288 MiB ceiling. `kin doctor` had both numbers and called it ok six
-    /// hours before the commit was killed, because it compared with `>=` and
-    /// 12288 clears 12283. Amber is the whole finding: it costs a reader
+    /// On kin 0.5.40 a one-file commit on a 922 MiB store peaked at 12283 MiB
+    /// against a 12288 MiB ceiling, and `kin doctor` had both numbers and called
+    /// it ok six hours before the commit was killed, because it compared with
+    /// `>=` and 12288 clears 12283. Amber is the whole finding: it costs a reader
     /// nothing to move the write to a smaller repository, and it costs them the
-    /// write not to.
+    /// write not to. That band is kept against the current rows, whose total is
+    /// the 9.0 GiB a 12 GiB container never passed while kin 0.7.21 committed
+    /// to both repositories.
     ///
     /// FIR-2643 changed what this test requires of the WORDS and deliberately
-    /// left what it requires of the BAND alone. It used to demand the row call
-    /// the quoted total "a floor here rather than a bound", which is the
-    /// store-size extrapolation that ran roughly an order of magnitude high;
-    /// that clause is gone, and continuing to assert it would have pinned the
-    /// defect in place. What replaces it is the claim that survives its own
-    /// evidence: the quoted number is a whole-machine total, and the row has to
-    /// say so. The band is untouched, so a commit that would exceed this ceiling
-    /// still cannot be reported as safe, which is the kill this test was bought
-    /// by.
+    /// left what it requires of the BAND alone. What it requires of the words is
+    /// the claim that survives its own evidence: the quoted number is a
+    /// whole-machine total, and the row has to say so.
     ///
     /// Falsify by restoring the `>=` comparison against the bare peak: both
     /// arms below go `Healthy` again and the assertions name the status.
@@ -6469,58 +7075,84 @@ mod tests {
             exactly_at.status
         );
 
-        // The container the isolated stranger run actually had: 5 MiB of margin
-        // on a 12 GiB budget, which is arithmetic rather than headroom.
-        let stranger =
-            commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(12288 * MIB));
+        // Inside the margin over the total: level with it, which is not room.
+        let level = commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(9728 * MIB));
         assert!(
-            matches!(stranger.status, HealthStatus::Stale),
-            "12288 MiB over a 12283 MiB peak is parity: {:?}",
-            stranger.status
+            matches!(level.status, HealthStatus::Stale),
+            "9.5 GiB over a 9.0 GiB total is parity: {:?}",
+            level.status
         );
         assert!(
-            stranger.detail.contains("parity"),
+            level.detail.contains("parity"),
             "the row has to say what band it is in: {}",
-            stranger.detail
+            level.detail
         );
         assert!(
-            stranger.detail.contains("psf/requests") && stranger.detail.contains("12.0 GiB"),
-            "parity must quote the peak it is at parity with: {}",
-            stranger.detail
+            level.detail.contains("psf/requests") && level.detail.contains("12.0 GiB"),
+            "parity must quote the observation it is at parity with: {}",
+            level.detail
         );
         assert!(
-            stranger.detail.contains("2.0x the measured one"),
+            level.detail.contains("kin 0.7.21"),
+            "the observation has to carry the release it was read on: {}",
+            level.detail
+        );
+        assert!(
+            level.detail.contains("1.2x the measured one"),
             "the reader cannot judge how far the observation sits from their case without the \
              store ratio: {}",
-            stranger.detail
+            level.detail
         );
         assert!(
-            stranger.detail.contains("whole-machine total"),
+            level.detail.contains("whole-machine total"),
             "the quoted number includes everything else that was resident, and a reader who \
              takes it for a commit's own demand is reading the defect: {}",
-            stranger.detail
+            level.detail
         );
         assert!(
-            stranger
+            level
                 .detail
-                .contains("5 MiB short of that machine's own ceiling"),
-            "12283 MiB inside 12288 MiB is the whole finding, and the row that omits the gap \
-             leaves a reader nothing to weigh: {}",
-            stranger.detail
+                .contains("3.0 GiB short of that machine's own ceiling"),
+            "a total is unreadable without the machine it was read in: {}",
+            level.detail
         );
         assert!(
-            !matches!(stranger.status, HealthStatus::Healthy),
+            !matches!(level.status, HealthStatus::Healthy),
             "a ceiling with no room over an observed total must never be reported as safe: {:?}",
-            stranger.status
+            level.status
         );
         assert!(
-            stranger.detail.contains("smaller repository"),
+            level.detail.contains("smaller repository"),
             "the row exists to redirect the write before the kill: {}",
-            stranger.detail
+            level.detail
         );
         assert!(
-            stranger.manual_fix.is_some(),
+            level.manual_fix.is_some(),
             "a warning a reader cannot act on is noise"
+        );
+    }
+
+    /// The container both kin 0.7.21 commits completed in is told it has room.
+    ///
+    /// Before the table carried the 0.7.21 reading, `kin doctor` in that exact
+    /// 12 GiB container called the requests commit parity with a 0.5.40 total,
+    /// and the commit then landed with 3 GiB of the container still unused.
+    ///
+    /// Falsify by restoring the 0.5.40 rows: this reads `Stale` again.
+    #[test]
+    fn the_container_both_current_commits_completed_in_reads_as_room() {
+        let check =
+            commit_memory_headroom_check_for(&footprint(1536 * MIB), &capped_memory(12288 * MIB));
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "the machine a commit completed in with 3 GiB spare has room for it: {:?} {}",
+            check.status,
+            check.detail
+        );
+        assert!(
+            check.detail.contains("completed on kin 0.7.21"),
+            "the row says which release the room was measured on: {}",
+            check.detail
         );
     }
 
@@ -6552,7 +7184,7 @@ mod tests {
             ),
             (
                 "parity",
-                commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(12288 * MIB)),
+                commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(9728 * MIB)),
             ),
         ];
         for (band, check) in bands {
@@ -6587,7 +7219,7 @@ mod tests {
                 check.detail
             );
             assert!(
-                check.detail.contains("2.0x the measured one"),
+                check.detail.contains("1.2x the measured one"),
                 "{band}: the row still owes the reader how far its store sits from that one: {}",
                 check.detail
             );
@@ -6710,7 +7342,7 @@ mod tests {
     fn no_commit_headroom_band_reports_the_install_as_broken() {
         for limit in [
             MEASURED_COMMIT_PEAKS[1].peak_bytes,
-            12288 * MIB,
+            9728 * MIB,
             8 * 1024 * MIB,
         ] {
             let check = commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(limit));
@@ -6753,7 +7385,7 @@ mod tests {
     #[test]
     fn doctor_reports_headroom_as_healthy_against_the_same_measured_peak() {
         let check =
-            commit_memory_headroom_check_for(&footprint(922 * MIB), &memory(64 * 1024 * MIB));
+            commit_memory_headroom_check_for(&footprint(1536 * MIB), &memory(64 * 1024 * MIB));
         assert!(
             matches!(check.status, HealthStatus::Healthy),
             "64 GiB clears every measured peak: {:?}",
@@ -6861,10 +7493,10 @@ mod tests {
     #[test]
     fn doctor_quotes_the_largest_measurement_the_store_actually_reaches() {
         let check =
-            commit_memory_headroom_check_for(&footprint(500 * MIB), &memory(8 * 1024 * MIB));
+            commit_memory_headroom_check_for(&footprint(1000 * MIB), &memory(8 * 1024 * MIB));
         assert!(
             check.detail.contains("expressjs/express"),
-            "a 500 MiB store has passed the express point and not the requests one: {}",
+            "a 1000 MiB store has passed the express point and not the requests one: {}",
             check.detail
         );
         assert!(!check.detail.contains("psf/requests"), "{}", check.detail);
@@ -7212,6 +7844,7 @@ mod tests {
             ),
             relation_census: Some(census_pair(&[], &[], Vec::new())),
             graph_section: Some(serving_section_state()),
+            conversion_source: None,
         }))
     }
 
@@ -7506,6 +8139,7 @@ mod tests {
                         reference_edge_coverage: None,
                         relation_census: None,
                         graph_section: None,
+                        conversion_source: None,
                     },
                 ))
             })
@@ -9731,6 +10365,261 @@ mod tests {
         assert!(blocks_readiness(&unreadable));
     }
 
+    /// One language's coverage as a daemon reports it: twelve files, no
+    /// cross-file edge resolved, and `enrichment` the state under test.
+    fn language_coverage(
+        language: &str,
+        enrichment: kin_core::reference_coverage::ReferenceEnrichment,
+    ) -> kin_core::reference_coverage::LanguageReferenceCoverage {
+        kin_core::reference_coverage::LanguageReferenceCoverage {
+            language: language.to_string(),
+            files: 12,
+            files_measured: 12,
+            entities: 46,
+            parsed_call_sites: Some(78),
+            call_sites_measured_files: 12,
+            parsed_import_statements: Some(16),
+            resolved_call_edges: 16,
+            resolved_import_statements: Some(0),
+            external_module_imports: None,
+            cross_file_reference_edges: 0,
+            intra_file_reference_edges: 16,
+            external_reference_edges: 0,
+            resolution: kin_core::reference_coverage::ReferenceResolution::PartiallyResolved,
+            reference_enrichment: enrichment,
+        }
+    }
+
+    fn coverage_of(
+        languages: &[(&str, kin_core::reference_coverage::ReferenceEnrichment)],
+    ) -> kin_core::reference_coverage::ReferenceEdgeCoverage {
+        kin_core::reference_coverage::ReferenceEdgeCoverage {
+            parse: None,
+            languages: languages
+                .iter()
+                .map(|(language, enrichment)| language_coverage(language, *enrichment))
+                .collect(),
+            totals: None,
+        }
+    }
+
+    /// An executable stub for each of `names` in `dir`, so a lookup resolves
+    /// against what the test put there rather than what this machine has.
+    #[cfg(unix)]
+    fn stub_executables(dir: &Path, names: &[&str]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for name in names {
+            let file = dir.join(name);
+            std::fs::write(&file, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// The daemon reports no server for a language this shell finds one for,
+    /// and the row says so instead of telling the operator to install what
+    /// they can see installed.
+    ///
+    /// A daemon an AI client starts runs with that client's PATH. The row
+    /// reports the daemon's view, so on a host whose pyright lives where the
+    /// client's PATH does not reach, it reported "no language server found"
+    /// with an install command while `which pyright-langserver` answered in
+    /// the operator's shell. Falsify by returning the check unchanged: the
+    /// path and the recording fix both disappear.
+    #[test]
+    fn the_coverage_row_names_a_server_only_this_shell_finds() {
+        use kin_core::reference_coverage::{
+            LanguageServerReadiness, LanguageServerReadinessMap, ReferenceEnrichment,
+        };
+
+        let coverage = coverage_of(&[("python", ReferenceEnrichment::NoLanguageServer)]);
+        let pyright = PathBuf::from("/home/u/.nvm/versions/node/v20.11.1/bin/pyright-langserver");
+        let locate = |_| Some(pyright.clone());
+
+        let mut usable = LanguageServerReadinessMap::new();
+        usable.insert(
+            kin_model::LanguageId::Python,
+            LanguageServerReadiness::Usable,
+        );
+        let check = reference_edge_coverage_row(&coverage, &usable, locate);
+        assert!(
+            check
+                .detail
+                .contains(&format!("python at {}", pyright.display())),
+            "the row names what this shell finds and where: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("PATH of whatever started it"),
+            "the row says why the two views differ: {}",
+            check.detail
+        );
+        let fix = check
+            .manual_fix
+            .clone()
+            .expect("the disagreement carries its fix");
+        assert!(
+            fix.contains("kin doctor --fix") && fix.contains("kin daemon stop"),
+            "the fix records the directory and restarts the daemon: {fix}"
+        );
+
+        // The control: a shell that finds no server either leaves the row as it
+        // was, because then the install advice is the right advice.
+        let mut absent = LanguageServerReadinessMap::new();
+        absent.insert(
+            kin_model::LanguageId::Python,
+            LanguageServerReadiness::Absent,
+        );
+        let unchanged = reference_edge_coverage_row(&coverage, &absent, locate);
+        assert_eq!(
+            unchanged.detail,
+            reference_edge_coverage_health(&coverage).detail
+        );
+        assert!(!unchanged.detail.contains("this shell finds"));
+    }
+
+    /// A shell that finds only pylsp and vtsls keeps the install advice.
+    ///
+    /// The daemon starts pyright-langserver for Python and
+    /// typescript-language-server for TypeScript, and nothing else. This
+    /// shell's readiness probe also accepts pylsp and vtsls, so on a host that
+    /// carries only those it calls both languages usable, and the row used to
+    /// blame the daemon's PATH and trade the install advice for `kin doctor
+    /// --fix` and a restart. Recording changes nothing a restarted daemon
+    /// starts, so the same row came back with the one fix that works gone.
+    /// Falsify by letting the lookup accept any binary discovery accepts: the
+    /// row names pylsp and vtsls and the install advice is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_with_only_pylsp_and_vtsls_keeps_the_install_advice() {
+        use kin_core::reference_coverage::{
+            LanguageServerReadiness, LanguageServerReadinessMap, ReferenceEnrichment,
+        };
+
+        let bin = tempfile::tempdir().unwrap();
+        stub_executables(bin.path(), &["pylsp", "vtsls"]);
+        let path = std::env::join_paths([bin.path()]).unwrap();
+        let coverage = coverage_of(&[
+            ("python", ReferenceEnrichment::NoLanguageServer),
+            ("typescript", ReferenceEnrichment::NoLanguageServer),
+        ]);
+        // What this shell's probe answers on such a host: usable, on the
+        // alternative binaries.
+        let mut shell = LanguageServerReadinessMap::new();
+        shell.insert(
+            kin_model::LanguageId::Python,
+            LanguageServerReadiness::Usable,
+        );
+        shell.insert(
+            kin_model::LanguageId::TypeScript,
+            LanguageServerReadiness::Usable,
+        );
+
+        let check = reference_edge_coverage_row(&coverage, &shell, |language| {
+            crate::commands::language_servers::server_path_on(language, Some(&path))
+        });
+        let daemon_view = reference_edge_coverage_health(&coverage);
+        assert!(
+            !check.detail.contains("pylsp") && !check.detail.contains("vtsls"),
+            "neither is a binary the daemon starts: {}",
+            check.detail
+        );
+        assert_eq!(
+            check.detail, daemon_view.detail,
+            "with no server the daemon would start in this shell either, the daemon's words stand"
+        );
+        assert_eq!(
+            check.manual_fix, daemon_view.manual_fix,
+            "and the install advice stands, because installing is the fix that closes this gap"
+        );
+    }
+
+    /// In a mixed repository the install step survives for the language with
+    /// no server anywhere, behind recording and restarting for the one this
+    /// shell finds.
+    ///
+    /// The row used to replace its fix outright whenever this shell found any
+    /// server the daemon lacked, so a Python and Go repository with pyright on
+    /// this shell's PATH and gopls nowhere lost the only instruction that gets
+    /// gopls installed. Falsify by replacing the fix instead of leading it.
+    #[cfg(unix)]
+    #[test]
+    fn a_mixed_repository_keeps_the_install_step_behind_record_and_restart() {
+        use kin_core::reference_coverage::{
+            LanguageServerReadiness, LanguageServerReadinessMap, ReferenceEnrichment,
+        };
+
+        let bin = tempfile::tempdir().unwrap();
+        stub_executables(bin.path(), &["pyright-langserver"]);
+        let path = std::env::join_paths([bin.path()]).unwrap();
+        let coverage = coverage_of(&[
+            ("python", ReferenceEnrichment::NoLanguageServer),
+            ("go", ReferenceEnrichment::NoLanguageServer),
+        ]);
+        let mut shell = LanguageServerReadinessMap::new();
+        shell.insert(
+            kin_model::LanguageId::Python,
+            LanguageServerReadiness::Usable,
+        );
+        shell.insert(kin_model::LanguageId::Go, LanguageServerReadiness::Absent);
+
+        let check = reference_edge_coverage_row(&coverage, &shell, |language| {
+            crate::commands::language_servers::server_path_on(language, Some(&path))
+        });
+        let pyright = bin.path().join("pyright-langserver");
+        assert!(
+            check
+                .detail
+                .contains(&format!("(python at {})", pyright.display())),
+            "the row names only the server this shell finds: {}",
+            check.detail
+        );
+        let fix = check.manual_fix.clone().expect("the row carries a fix");
+        let install = reference_edge_coverage_health(&coverage)
+            .manual_fix
+            .expect("the daemon's view carries the install advice");
+        assert!(
+            fix.starts_with("run `kin doctor --fix` in this shell"),
+            "recording and restarting comes first: {fix}"
+        );
+        assert!(
+            fix.contains(&format!("for go, {install}")),
+            "the install advice survives whole, for the language it is still for: {fix}"
+        );
+    }
+
+    /// A server the daemon found and could not start is not a PATH gap, so the
+    /// row does not put it down to the daemon's PATH.
+    ///
+    /// The daemon's list of languages missing a server carries both states,
+    /// and the row used to read them as one: a pyright the daemon found and
+    /// saw fail to start was reported as a server only this shell finds, with
+    /// recording a directory as the fix. Falsify by comparing against every
+    /// language that list names.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_the_daemon_could_not_start_is_not_put_down_to_its_path() {
+        use kin_core::reference_coverage::{
+            LanguageServerReadiness, LanguageServerReadinessMap, ReferenceEnrichment,
+        };
+
+        let bin = tempfile::tempdir().unwrap();
+        stub_executables(bin.path(), &["pyright-langserver"]);
+        let path = std::env::join_paths([bin.path()]).unwrap();
+        let coverage = coverage_of(&[("python", ReferenceEnrichment::LanguageServerUnusable)]);
+        let mut shell = LanguageServerReadinessMap::new();
+        shell.insert(
+            kin_model::LanguageId::Python,
+            LanguageServerReadiness::Usable,
+        );
+
+        let check = reference_edge_coverage_row(&coverage, &shell, |language| {
+            crate::commands::language_servers::server_path_on(language, Some(&path))
+        });
+        let daemon_view = reference_edge_coverage_health(&coverage);
+        assert_eq!(check.detail, daemon_view.detail);
+        assert_eq!(check.manual_fix, daemon_view.manual_fix);
+    }
+
     /// FIR-2358. A graph whose reference edges did not resolve must say so on
     /// the doctor surface, because every other readiness signal points away from
     /// the gap: `kin languages` lists the language as fully extracted and
@@ -11081,6 +11970,40 @@ mod tests {
             detail.contains("agent-query"),
             "the reader must be told which surface is wired: {detail}"
         );
+    }
+
+    /// The routed profile is what `kin setup` writes for an eager client, so
+    /// doctor must read it as wired, on a JSON config and on Codex's TOML.
+    #[test]
+    fn mcp_config_on_the_routed_profile_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-routed" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (status, detail) = evaluate_mcp_client_against(&path, "cursor", "kin");
+        assert!(matches!(status, HealthStatus::Healthy), "detail: {detail}");
+        assert!(detail.contains("agent-routed"), "detail: {detail}");
+
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\", \"--repo\", \"/repo\"]\nenv = { KIN_MCP_TOOL_PROFILE = \"agent-routed\" }\n",
+        )
+        .unwrap();
+        let (status, detail) = evaluate_mcp_client_against(&toml, "codex", "kin");
+        assert!(matches!(status, HealthStatus::Healthy), "detail: {detail}");
     }
 
     /// A profile that names a different surface is still a deliberate departure
@@ -12599,8 +13522,8 @@ mod tests {
         assert!(
             row.manual_fix
                 .as_deref()
-                .is_some_and(|fix| fix.contains("re-ingest")),
-            "a store this build can repair needs the re-ingest remedy: {row:?}"
+                .is_some_and(|fix| fix.starts_with("run `kin upgrade`")),
+            "a store this build can repair needs the in-place upgrade remedy: {row:?}"
         );
         assert!(
             !blocks_readiness(&row),
@@ -12622,14 +13545,14 @@ mod tests {
                 "unknown provenance must not trigger destructive advice: {unknown:?}"
             );
             // The doctor row a native store reads after a sync it could not
-            // match. It may not name re-ingest as a step that keeps this
-            // store's history, because a native store has no source to
-            // re-ingest from.
+            // match. It may not name re-ingest at all, because a native store
+            // has no source to re-ingest from, and `kin upgrade` keeps what a
+            // rebuild would drop.
             assert!(
-                !fix.contains("re-ingest the repository into a separate fresh store"),
-                "unknown provenance must not presume a source outside the store: {fix}"
+                !fix.contains("re-ingest") && !fix.contains("kin init"),
+                "unknown provenance must not advise rebuilding the store: {fix}"
             );
-            assert!(fix.contains("keeps serving its history"));
+            assert!(fix.contains("`kin upgrade`"), "{fix}");
             assert!(!blocks_readiness(&unknown));
         }
 
@@ -12641,10 +13564,34 @@ mod tests {
         let fix = ahead.manual_fix.as_deref().unwrap_or_default();
         assert!(fix.contains("upgrade this Kin build"), "{ahead:?}");
         assert!(
-            !fix.contains("re-ingest the repository"),
+            !fix.contains("re-ingest") && !fix.contains("kin upgrade`"),
             "an older binary must not replace a store recorded under newer replay semantics: {ahead:?}"
         );
         assert!(!blocks_readiness(&ahead));
+
+        // An upgraded store that matches this build is healthy and says how it
+        // came to match; one a later build left behind is stale with the same
+        // in-place remedy a created store gets.
+        let upgraded = hydration_semantics_check_for(&HydrationStanding::Rederived {
+            under: 10,
+            created_under: Some(9),
+            derives: 10,
+        });
+        assert!(
+            matches!(upgraded.status, HealthStatus::Healthy),
+            "{upgraded:?}"
+        );
+        assert!(upgraded.manual_fix.is_none());
+        let behind_upgrade = hydration_semantics_check_for(&HydrationStanding::Rederived {
+            under: 9,
+            created_under: Some(8),
+            derives: 10,
+        });
+        assert!(matches!(behind_upgrade.status, HealthStatus::Stale));
+        assert!(behind_upgrade
+            .manual_fix
+            .as_deref()
+            .is_some_and(|fix| fix.starts_with("run `kin upgrade`")));
     }
 
     /// The row exists because every other row on the page reads healthy after a

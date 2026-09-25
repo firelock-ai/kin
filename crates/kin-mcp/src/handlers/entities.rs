@@ -372,8 +372,7 @@ line span, kind, score, and a bounded inline source excerpt. Each hit carries th
 ONCE: read it from `body` on the fused pipeline (the default) and from `snippet` on the \
 cosine pipeline, and read `routing` if you need to know which answered. Set \
 granularity to \"entity\" \
-(default) for ranked declarations or \"file\" to roll results up to the most relevant \
-files. Two pipelines can answer. The default on every profile is the full fused \
+(the only supported granularity) for ranked declarations. Two pipelines can answer. The default on every profile is the full fused \
 retrieval pipeline `kin locate` serves: vector similarity, lexical search, and \
 graph-structure signals fused with role-aware ranking and exact-name promotion. The \
 legacy single-vector cosine ranking stays reachable per call with \
@@ -406,18 +405,13 @@ returns its best candidates: each hit carries `match_kind` (`name` when a query 
 that entity's name, else `semantic` or `text_fallback`), and an entity-granularity response carries \
 `all_fallback: true` when NOT ONE returned entity was named by the query. Asking for a \
 symbol that does not exist yields a full, confident-looking page with `all_fallback` set \
-— treat that as \"this symbol was not found\" rather than as the answer. Every hit also \
-states which id space it belongs to, because the retrieval index spans two and their ids \
-look alike. `id_space: \"entity\"` means the hit carries an `entity_id` that resolves in \
-the graph, so get_entity_source, get_context_pack, graph_neighborhood, and find_references \
-all take it. `id_space: \"artifact\"` means the hit is an artifact-level embedding — a \
-tracked file the parsers produced no entities for — so it carries `artifact_path` and NO \
-`entity_id`, and those tools will refuse it; read it with kin_artifact_read instead. Do \
-not synthesize an entity id from an artifact hit's path. The response attempts to bound its own size \
+— treat that as \"this symbol was not found\" rather than as the answer. Every returned hit carries a graph entity id accepted by get_entity_source, \
+get_context_pack, graph_neighborhood and find_references. Unparsed artifacts are not \
+entity answers: omitted candidates are disclosed as a conversion coverage gap, never \
+as a file-read fallback. The response attempts to bound its own size \
 (max_chars, default 45000 serialized characters, ceiling 60000): it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
 ask with explain=true or compact=false, and under pressure an entity-granularity response first \
-sheds its secondary per-file symbol roll-up. File granularity preserves those symbols because they \
-are primary answer detail. It then sheds inline snippets, and only then withholds hits from the end \
+sheds its secondary per-file symbol roll-up. It then sheds inline snippets, and only then withholds hits from the end \
 of the page. Any cut is reported \
 in `degradations` and in `_kin.response`, which carries the budget applied and what the response \
 measured before it. When primary rows are withheld and `next_cursor` can be rebased, every row \
@@ -429,13 +423,14 @@ response ship over budget, and it discloses that as `response_over_budget`. \
 Two response shapes exist and `surface` picks between them. The default is the shared schema above, \
 because this payload deserializes straight back into the type `kin locate --json` and `POST /locate` \
 serialize. `surface: \"compact\"` asks for the agent shape instead, and the `agent-default` profile \
-asks for it on its agents' behalf: per hit the `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, \
-plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause and \
+asks for it on its agents' behalf: per hit the entity `id`, `name`, `kind`, `file`, `line`, `signature`, `score` and \
+`matched` (`name`, `semantic` or `text_fallback`), plus `collapsed_rows` on a Go package's module row when the \
+ranking folded that package's other files into it (at least that many rows were folded), plus the ranked file \
+paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause and \
 the `semantic_coverage` object, and nothing else. It exists because the full shape spends most of \
 its bytes on the back-compat `files[].symbols` roll-up of entities `entities[]` already carries: on \
 a 730-entity store a twelve-hit page is 38,819 bytes full and 3,472 compact. Two arguments force the shared schema whatever else is set: `explain: true`, since every field an explanation adds lives on that shape, and an explicit \
-`include_snippet: true`, since that asks for source text per hit and the compact shape carries none. File granularity is always the full shape, \
-because there the file roll-up IS the answer.";
+`include_snippet: true`, since that asks for source text per hit and the compact shape carries none. Whole-file and artifact answers are not supported.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
@@ -453,9 +448,9 @@ pub fn handle_semantic_locate<G: GraphStore>(
     // when no daemon is present.
     let _query = get_string_param(args, "query")?;
     if let Some(granularity) = get_optional_string_param(args, "granularity") {
-        if granularity != "file" && granularity != "entity" {
+        if granularity != "entity" {
             return Err(McpError::InvalidParams(format!(
-                "invalid granularity '{granularity}': expected \"file\" or \"entity\""
+                "invalid granularity '{granularity}': expected \"entity\""
             )));
         }
     }
@@ -502,10 +497,14 @@ Return the exact implementation body of one entity by ID, served from graph-owne
 truth, along with its metadata (name, kind, language, file path, line range, \
 signature). This is how you read the actual code for a declaration once \
 semantic_search (or any traversal) has handed you its ID — no need to open the file \
-and hunt for line numbers yourself. It returns just the focal entity's body, so it is \
-the most economical way to inspect a single function/method/class; when you also need \
+and hunt for line numbers yourself. A name is accepted in place of the ID: one exact \
+name, or one owner's member when nothing is named exactly (`get` for the method \
+`Scaffold.get`), returns its body; twins, several owners' members or a partial name return \
+`ambiguous_focal` with every candidate's id and no body. It returns just \
+the focal entity's body, so it is the most economical way to inspect a single function/method/class; when you also need \
 the surrounding callers, callees, and imports, use get_context_pack or trace_data_flow \
-instead so you don't have to call this repeatedly.";
+instead so you don't have to call this repeatedly. Derived candidates have no independent \
+body or edit base; their validated shared generator is returned separately as generator_source.";
 
 pub const GET_ENTITY_BODY_DESC: &str = "\
 Alias for get_entity_source — same behavior and return shape. Provided so that whichever \
@@ -519,13 +518,49 @@ pub fn handle_get_entity_source<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
-    let entity_id = parse_entity_id(&id_str)?;
+    // An id is the exact address. A name is accepted the way the daemon's route
+    // and `kin graph source` accept one, through the strict rule every source
+    // path shares: one exact name, or one owner's member when nothing is named
+    // exactly, returns a body and an edit base. Anything else, twins, several
+    // owners' members or a partial name, lists the candidates and returns no
+    // body, because a guessed body is a guessed edit.
+    let entity = match parse_entity_id(&id_str) {
+        Ok(entity_id) => store.get_entity(&entity_id).map_err(McpError::graph)?,
+        Err(invalid) => {
+            let name = id_str.trim();
+            if name.is_empty() {
+                return Err(invalid);
+            }
+            match kin_ranking::entity_ranking::resolve_name_strictly(store, name)
+                .map_err(McpError::graph)?
+            {
+                kin_ranking::entity_ranking::StrictNameResolution::One(entity) => Some(entity),
+                kin_ranking::entity_ranking::StrictNameResolution::Candidates(
+                    reason,
+                    candidates,
+                ) => {
+                    return name_candidates_reply("get_entity_source", name, reason, &candidates);
+                }
+                kin_ranking::entity_ranking::StrictNameResolution::Missing => None,
+            }
+        }
+    };
 
-    match store.get_entity(&entity_id).map_err(McpError::graph)? {
+    match entity {
         Some(entity) => {
             let held = HeldSourceAuthority::new(store, repository_authority);
+            if let Some(value) = derived_entity_source_at(
+                &held,
+                &entity,
+                EntitySourceScope::WorkspaceHead,
+                1_000_000,
+            )? {
+                return Ok(ToolCallResult::text(
+                    serde_json::to_string_pretty(&value).map_err(McpError::Json)?,
+                ));
+            }
             let exact_source = read_entity_source_exact(&held, &entity, 1_000_000)?
-                .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
+                .ok_or_else(|| McpError::Context(entity_body_gap_reason(&entity)))?;
             let source_base =
                 crate::source_base::source_base_for_read(&held, &entity, &exact_source)?;
             let source = LAST_READ_SOURCE.with(|f| f.get());
@@ -545,6 +580,15 @@ pub fn handle_get_entity_source<G: GraphStore>(
             });
             if let Some(map) = value.as_object_mut() {
                 map.extend(source_provenance_fields(&exact_source));
+                // A body with no base is a body no guarded change can cite. Said by
+                // name, so a caller told to resend with the base knows it cannot.
+                if source_base.is_none() && exact_source.span_coherence == SpanCoherence::Unverified
+                {
+                    map.insert(
+                        "source_base_unavailable".to_string(),
+                        serde_json::json!(crate::source_base::SOURCE_BASE_UNAVAILABLE_UNVERIFIED),
+                    );
+                }
             }
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
@@ -554,6 +598,29 @@ pub fn handle_get_entity_source<G: GraphStore>(
             id_str
         ))),
     }
+}
+
+/// Resolve a candidate's generator separately from an independently editable body.
+/// A legacy or malformed candidate remains useful metadata with an explicit gap.
+pub fn derived_entity_source_at<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &kin_model::Entity,
+    scope: EntitySourceScope,
+    max_bytes: usize,
+) -> Result<Option<serde_json::Value>> {
+    let Some(fields) = derived_member_fields(entity) else {
+        return Ok(None);
+    };
+    let mut value = semantic_metadata_json(entity)?;
+    value
+        .as_object_mut()
+        .expect("entity object")
+        .extend(fields.as_object().expect("object").clone());
+    match derived_generator_source_at(held, entity, max_bytes, scope) {
+        Ok(generator) => value["generator_source"] = generator,
+        Err(error) => value["generator_source_unavailable"] = serde_json::json!(error.to_string()),
+    }
+    Ok(Some(value))
 }
 
 pub const GET_ENTITY_SOURCES_DESC: &str = "\
@@ -570,7 +637,8 @@ compact=true for signature-only rows when you only need to confirm shape, and \
 max_lines_per_body / max_bytes_per_body to bound each body. One bad ID never fails the \
 batch — an unresolved ID returns its own row with reason=\"not_found\" or \"no_source\". \
 Prefer get_context_pack when you need one entity plus its neighborhood rather than a \
-flat set of bodies.";
+flat set of bodies. Derived candidates retain body=null; separately named generator_source \
+bytes use the same batch budget and bounds, with body_complete=false when clipped.";
 
 /// Upper bound on IDs per `get_entity_sources` call. Smaller than
 /// `bulk_check_references`' 200 because each row can carry a full source body,
@@ -619,10 +687,19 @@ pub struct EntitySourceRow {
 pub enum ResolvedEntitySource {
     /// The entity resolved and its source body was read from graph truth.
     Found(EntitySourceRow),
+    /// Candidate metadata with a separately budgeted shared generator, never a member body.
+    Derived { value: serde_json::Value },
     /// The ID did not resolve (invalid, stale, or not a UUID). Non-retryable.
     NotFound { id: String, message: String },
     /// The ID resolved but no source body could be served.
     NoSource { id: String, message: String },
+    /// A name that names no one entity: twins, several owners' members, or a
+    /// partial name. The row lists every candidate rather than claiming the
+    /// entity is absent. `value` is the shared [`name_candidates_json`] answer.
+    Ambiguous {
+        id: String,
+        value: serde_json::Value,
+    },
 }
 
 /// Parsed, defaulted `get_entity_sources` options shared by both serving paths.
@@ -780,6 +857,51 @@ pub fn assemble_entity_sources_response(
                     None => results.push(source_row_json(&row, Some(body.as_str()), false, None)),
                 }
             }
+            ResolvedEntitySource::Derived { mut value } => {
+                let mut generator = value
+                    .as_object_mut()
+                    .expect("entity object")
+                    .remove("generator_source");
+                let body = generator
+                    .as_ref()
+                    .and_then(|generator| generator.get("body"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(body) = body {
+                    returned += 1;
+                    if opts.compact {
+                        value["omitted"] = serde_json::json!(false);
+                    } else {
+                        let clamped = clamp_source_body(
+                            body,
+                            opts.max_lines_per_body,
+                            opts.max_bytes_per_body,
+                        );
+                        let tokens = kin_context::estimate_tokens(&clamped);
+                        if budget_exhausted
+                            || opts
+                                .token_budget
+                                .is_some_and(|budget| budget_used.saturating_add(tokens) > budget)
+                        {
+                            budget_exhausted = true;
+                            truncated = true;
+                            value["omitted"] = serde_json::json!(true);
+                            value["reason"] = serde_json::json!("budget");
+                        } else {
+                            budget_used = budget_used.saturating_add(tokens);
+                            let complete = clamped == body;
+                            let generator = generator.as_mut().expect("generator with body");
+                            generator["body"] = serde_json::json!(clamped);
+                            generator["body_complete"] = serde_json::json!(complete);
+                            value["generator_source"] = generator.clone();
+                            value["omitted"] = serde_json::json!(false);
+                        }
+                    }
+                } else {
+                    value["omitted"] = serde_json::json!(true);
+                    value["reason"] = serde_json::json!("no_source");
+                }
+                results.push(value);
+            }
             ResolvedEntitySource::NotFound { id, message } => {
                 results.push(serde_json::json!({
                     "id": id,
@@ -795,6 +917,26 @@ pub fn assemble_entity_sources_response(
                     "reason": "no_source",
                     "message": message,
                 }));
+            }
+            ResolvedEntitySource::Ambiguous { id, value } => {
+                let mut row = serde_json::json!({
+                    "id": id,
+                    "omitted": true,
+                    "reason": "ambiguous_name",
+                    "message": value["degradations"][0]["detail"].clone(),
+                });
+                for key in [
+                    "resolution",
+                    "candidate_count",
+                    "candidates",
+                    "more_candidates",
+                    "omitted_candidates",
+                ] {
+                    if let Some(field) = value.get(key) {
+                        row[key] = field.clone();
+                    }
+                }
+                results.push(row);
             }
         }
     }
@@ -825,15 +967,56 @@ fn resolve_entity_source_generic<G: GraphStore>(
     let store = held.store();
     let entity_id = match parse_entity_id(id) {
         Ok(entity_id) => entity_id,
-        Err(_) => {
-            return ResolvedEntitySource::NotFound {
-                id: id.to_string(),
-                message: format!("invalid entity_id (not a UUID): {id}"),
-            };
-        }
+        // A name reads the way the single tool and the daemon's batch read it:
+        // one exact name, or one owner's member when nothing is named exactly,
+        // and otherwise a row that lists the candidates.
+        Err(_) => match kin_ranking::entity_ranking::resolve_name_strictly(store, id.trim()) {
+            Ok(kin_ranking::entity_ranking::StrictNameResolution::One(entity)) => entity.id,
+            Ok(kin_ranking::entity_ranking::StrictNameResolution::Candidates(
+                reason,
+                candidates,
+            )) => {
+                return ResolvedEntitySource::Ambiguous {
+                    id: id.to_string(),
+                    value: name_candidates_json(
+                        "get_entity_sources",
+                        id.trim(),
+                        reason,
+                        &candidates,
+                    ),
+                };
+            }
+            Ok(kin_ranking::entity_ranking::StrictNameResolution::Missing) => {
+                return ResolvedEntitySource::NotFound {
+                    id: id.to_string(),
+                    message: format!("no entity found matching '{}'", id.trim()),
+                };
+            }
+            Err(error) => {
+                return ResolvedEntitySource::NoSource {
+                    id: id.to_string(),
+                    message: format!("graph read failed: {error}"),
+                };
+            }
+        },
     };
     match store.get_entity(&entity_id) {
         Ok(Some(entity)) => {
+            match derived_entity_source_at(
+                held,
+                &entity,
+                EntitySourceScope::WorkspaceHead,
+                1_000_000,
+            ) {
+                Ok(Some(value)) => return ResolvedEntitySource::Derived { value },
+                Err(error) => {
+                    return ResolvedEntitySource::NoSource {
+                        id: id.to_string(),
+                        message: error.to_string(),
+                    }
+                }
+                Ok(None) => {}
+            }
             match read_entity_source_excerpt_detailed_held(
                 held,
                 &entity,
@@ -918,7 +1101,15 @@ contracts, work items and annotations. It returns them in one structured \
 response with the token accounting included. Reach for it when a question is about a \
 unit of code in context (\"what does X do and what does it touch?\") rather than a single \
 isolated body. It replaces an open-ended chain of get_entity_source and find_references \
-calls with one pack. `token_budget` and `max_response_chars` bound the \
+calls with one pack. Dependencies and dependents come back as signatures \
+(`projection: \"SignatureOnly\"`) and transitive rows as names and kinds; set \
+`neighbor_bodies: true` to also get the neighbours' exact bodies within the budget. Set \
+`focal_body: false` when you already hold the focal's body and want its neighbourhood \
+alone: the focal then comes back as its signature with `body_omitted: \"focal_body:false\"`. \
+Both apply to a single `entity_id` pack. The pack carries no `source_base`: to change an \
+entity, read it with get_entity_source, whose `source_base` the full-body and \
+anchored-patch mutate forms require, so a pack replaces get_entity_source for reading \
+only. `token_budget` and `max_response_chars` bound the \
 serialized context payload, including its envelope. `tokens_used` reports the estimated \
 token cost of that complete payload. \
 `focal_entity.body`, when `body_complete` is true, is the exact graph-owned source span, \
@@ -970,30 +1161,47 @@ pub fn handle_get_context_pack<G: GraphStore>(
     sessions: &SessionRegistry,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
-    use kin_context::{build_context_pack_with_traffic_and_provenance, ContextOptions};
-    use kin_model::context::TokenBudget;
+    use kin_context::{build_context_pack_with_scoped_traffic_and_provenance, ContextOptions};
 
     // Several focals, or a question the daemon already resolved into them, take
     // the multi-focal assembler. A call naming only `entity_id` keeps this
     // handler's original path and its original payload, so nothing reading
     // today's shape moves under it.
+    //
+    // The body controls shape the single-focal pack only. The multi-focal shape
+    // already serves its neighbours as signatures and budgets its focals' bodies
+    // itself, so a control it would silently ignore is refused instead.
+    let multi_focal = ["entities", "question", "question_focals"]
+        .iter()
+        .any(|key| args.contains_key(*key));
+    if multi_focal {
+        if let Some(control) = ["focal_body", "neighbor_bodies"]
+            .into_iter()
+            .find(|key| args.contains_key(*key))
+        {
+            return Ok(ToolCallResult::error(format!(
+                "`{control}` applies to a single `entity_id` context pack. A pack built from \
+                 `entities` or `question` serves each focal's body within the budget and its \
+                 neighbours as signatures."
+            )));
+        }
+    }
     if let Some(result) = multi_focal_pack_result(args, store, repository_authority)? {
         return Ok(result);
     }
 
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
-    let token_budget_val = get_optional_u64(args, "token_budget", 16000) as usize;
     let depth = get_optional_u64(args, "depth", 2) as u32;
     let include_traffic = get_optional_bool(args, "include_traffic", true);
     let compact = get_optional_bool(args, "compact", false);
+    // Neighbours are signatures unless the caller asks for their bodies, which is
+    // the shape the schema has always promised. The focal's body is served unless
+    // the caller already holds it and wants the neighbourhood alone.
+    let neighbor_bodies = get_optional_bool(args, "neighbor_bodies", false) && !compact;
+    let focal_body = get_optional_bool(args, "focal_body", true);
 
-    let budget = match token_budget_val {
-        0..=8000 => TokenBudget::Small8k,
-        8001..=16000 => TokenBudget::Medium16k,
-        16001..=32000 => TokenBudget::Large32k,
-        n => TokenBudget::Custom(n),
-    };
+    let budget = pack_token_budget(args);
 
     let opts = ContextOptions {
         budget,
@@ -1004,14 +1212,18 @@ pub fn handle_get_context_pack<G: GraphStore>(
 
     // Gather nearby intents for traffic awareness.
     let nearby_intents = if include_traffic {
-        sessions.get_traffic_near_entity(&entity_id)
+        sessions.context_traffic_snapshot()
     } else {
         vec![]
     };
 
-    let (traffic_pack, _) =
-        build_context_pack_with_traffic_and_provenance(store, &entity_id, &opts, &nearby_intents)
-            .map_err(McpError::from)?;
+    let (traffic_pack, _) = build_context_pack_with_scoped_traffic_and_provenance(
+        store,
+        &entity_id,
+        &opts,
+        &nearby_intents,
+    )
+    .map_err(McpError::from)?;
     let held = HeldSourceAuthority::new(store, repository_authority);
     let fields = ContextSourceFields::default();
     let mut provider = ContextSourceProvider {
@@ -1028,6 +1240,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
         repository_authority,
         entity_id,
         compact,
+        focal_body,
+        neighbor_bodies,
         include_traffic,
         budget,
         traffic: std::cell::RefCell::new(traffic_pack.traffic),
@@ -1041,7 +1255,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         &opts,
         &mut provider,
         limits,
-        !compact,
+        neighbor_bodies,
         |pack, selection, projections| {
             let mut result = render
                 .render(pack, selection, projections, &fields)
@@ -1058,6 +1272,28 @@ pub fn handle_get_context_pack<G: GraphStore>(
     )?))
 }
 
+/// Serve the focal as its signature because the caller asked for the
+/// neighbourhood alone.
+///
+/// Distinct from a budget cut or a missing span: `body_omitted` says the body
+/// was not requested, so no reader mistakes the absent body for one the graph
+/// could not serve or one the budget withheld.
+fn omit_focal_body(row: &mut serde_json::Value) {
+    if let Some(object) = row.as_object_mut() {
+        for key in [
+            "body",
+            "body_complete",
+            "body_elided",
+            "body_unavailable",
+            "projection_downgraded_from",
+        ] {
+            object.remove(key);
+        }
+        object.insert("projection".into(), serde_json::json!("SignatureOnly"));
+        object.insert("body_omitted".into(), serde_json::json!("focal_body:false"));
+    }
+}
+
 type ContextReferenceSnapshot = (
     Vec<kin_model::EntityId>,
     std::collections::HashSet<kin_model::EntityId>,
@@ -1070,6 +1306,8 @@ struct SingleContextRender<'a, G: GraphStore> {
     repository_authority: Option<&'a RequestRepositoryAuthority>,
     entity_id: kin_model::EntityId,
     compact: bool,
+    focal_body: bool,
+    neighbor_bodies: bool,
     include_traffic: bool,
     budget: kin_model::TokenBudget,
     traffic: std::cell::RefCell<Vec<kin_model::TrafficEntry>>,
@@ -1101,6 +1339,8 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
             repository_authority,
             entity_id,
             compact,
+            focal_body,
+            neighbor_bodies,
             include_traffic,
             budget,
             ..
@@ -1120,7 +1360,10 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 "start_line": entity_presentation_start_line(entity),
                 "end_line": entity_presentation_end_line(entity),
             });
-            attach_context_projection(entry, fields, projections, &mut row, true);
+            attach_context_projection(entry, fields, projections, &mut row, focal_body);
+            if !focal_body {
+                omit_focal_body(&mut row);
+            }
             row
         } else {
             serde_json::Value::Null
@@ -1152,7 +1395,15 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 }
                 if !compact {
                     obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
-                    attach_context_projection(entry, fields, projections, &mut obj, true);
+                    // A neighbour is a signature unless its body was asked for, so
+                    // only a request for bodies turns a missing one into a gap.
+                    attach_context_projection(
+                        entry,
+                        fields,
+                        projections,
+                        &mut obj,
+                        neighbor_bodies,
+                    );
                 }
                 Ok(obj)
             } else {
@@ -1529,17 +1780,33 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 crate::budget::ELISION_REASON_TOKEN_BUDGET,
             );
         }
+        // Reference authority can recover callers the builder's subgraph did
+        // not contain. Fit those rendered rows before returning their cost to
+        // the builder: otherwise each retry adds back rows it just removed and
+        // cannot converge, even after losing the focal source. The same fitter
+        // later charges the envelope, with the same core-first priorities and
+        // complete elision accounting. An impossible metadata floor remains
+        // above budget, so the builder still reports that refusal.
+        let _ = crate::budget::fit_context_payload(
+            &mut result,
+            "get_context_pack",
+            &crate::budget::ResponseBudget {
+                max_chars: usize::MAX,
+                ..crate::budget::ResponseBudget::default()
+            },
+        );
         Ok(result)
     }
 }
 
-/// The token budget a pack request names, in the tiers the builder takes.
+/// Honor positive caller budgets exactly, including the compact agent profile.
+/// Zero retains its legacy small-pack default instead of constructing an empty budget.
 fn pack_token_budget(args: &HashMap<String, serde_json::Value>) -> kin_model::context::TokenBudget {
     use kin_model::context::TokenBudget;
     match get_optional_u64(args, "token_budget", 16000) as usize {
-        0..=8000 => TokenBudget::Small8k,
-        8001..=16000 => TokenBudget::Medium16k,
-        16001..=32000 => TokenBudget::Large32k,
+        0 | 8000 => TokenBudget::Small8k,
+        16000 => TokenBudget::Medium16k,
+        32000 => TokenBudget::Large32k,
         n => TokenBudget::Custom(n),
     }
 }
@@ -1940,12 +2207,24 @@ pub fn handle_trace_computation<G: GraphStore>(
 
     if !merged.contains_key("entity_id") {
         if let Some(query) = get_optional_string_param(args, "query") {
-            let target = select_best_reference_target(store, &query).map_err(McpError::graph)?;
-            let Some(entity) = target else {
-                return Ok(ToolCallResult::error(format!(
-                    "trace_computation: no entity matches query '{}'",
-                    query
-                )));
+            let entity = match kin_ranking::entity_ranking::resolve_name(store, &query)
+                .map_err(McpError::graph)?
+            {
+                kin_ranking::entity_ranking::NameResolution::One(entity) => entity,
+                kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) => {
+                    return name_candidates_reply(
+                        "trace_computation",
+                        &query,
+                        kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                        &candidates,
+                    );
+                }
+                kin_ranking::entity_ranking::NameResolution::Missing => {
+                    return Ok(ToolCallResult::error(format!(
+                        "trace_computation: no entity matches query '{}'",
+                        query
+                    )));
+                }
             };
             merged.insert(
                 "entity_id".into(),
@@ -1976,7 +2255,10 @@ definition) and it returns ONE ROW PER REFERENCING ENTITY, with that caller's en
 name, kind, file path, its own definition line (start_line), and every line inside it \
 that references the focal (reference_lines). An owner-qualified name (`Receiver.method` \
 in Go, `Owner.member` in TypeScript, and the same shape in other languages where the \
-graph names members that way) is exact too. \
+graph names members that way) is exact too. An exact whole name answers first; with none, \
+a bare member name (`get` for the method `Scaffold.get`) reaches the owners' members, and \
+when several share it the reply answers each under `candidates_by_owner` instead of \
+choosing one. \
 Two callers in one file are two rows, and \
 `total_upstream` is the number of referencing entities, the same unit `kin refs` prints. \
 The `counts` object states the unit outright and adds `files` and `reference_sites`, so \
@@ -2037,10 +2319,11 @@ that question at file granularity rather than projecting any other list to paths
 Satisfaction is structural, so each row is a possible implementation and none is a \
 recorded one, and none is ever added to `total_upstream`. \
 `_kin.verdict` is the one verdict for the whole response and outranks every count in it. \
-The response bounds its own size (max_chars, default 45000 serialized characters, ceiling \
-60000): a symbol \
-with hundreds of call sites sheds its inline snippets before it withholds any row, and any cut \
-is reported in `degradations` and in `_kin.response` with the size the response had before the \
+The response budget (max_chars, in UTF-8 bytes, default 45000, clamped 2000..60000) is a \
+target, not a hard ceiling: a symbol with hundreds of call sites sheds its inline snippets before \
+it withholds any row, every list it cuts keeps at least one row, and a reply whose kept rows \
+still do not fit ships over the budget and says so under `response_over_budget`. Any cut is \
+reported in `degradations` and in `_kin.response` with the size the response had before the \
 budget, so a short answer is never mistaken for a complete one.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
@@ -2109,9 +2392,16 @@ pub struct FindReferencesAuthority<'a> {
     pub repo_id: &'a str,
     /// Exact root of the concrete live/session graph serving this request.
     pub graph_root: &'a str,
-    pub spine: Option<&'a dyn kin_spine::SpineBackend>,
+    /// The daemon's spine for this read, or why it has none. A spine whose
+    /// initialization was deferred is reported as unavailable, a gap in the
+    /// answer. Only an absent one reads as not configured.
+    pub spine: kin_spine::DaemonSpine<'a>,
 }
 
+// `Clone` lets `build_sectioned_reference_reply` hand each labelled section
+// its own copy: a sectioned answer calls `build_reference_reply_for_focal`
+// once per candidate, and every call needs this value, not just the first.
+#[derive(Clone)]
 enum FindReferencesAuthoritySource<'a> {
     Ambient(AmbientCrossRepoBinding),
     Daemon(FindReferencesAuthority<'a>),
@@ -2174,6 +2464,9 @@ fn spine_reference_rows(
             // A federated xref reaches the focal directly in the other
             // repository's graph; nothing here is composed over an override.
             via_override_of: None,
+            // Its edge lives in the other repository's graph, so there is no
+            // local edge to read a strength from, and the row is judged whole.
+            edges: Vec::new(),
         });
     }
 
@@ -2297,6 +2590,21 @@ fn reference_counts(
         .filter_map(|row| row.file_path.as_deref())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    // A caller can be counted for its proven sites and held for the sites only
+    // a weaker edge recorded, one row in each array. The ceiling counts callers,
+    // so such a caller is one entity in it, not two.
+    let counted_callers: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter_map(|row| row.entity_id.as_deref())
+        .collect();
+    let held_callers_not_counted = candidate_rows
+        .iter()
+        .filter(|row| {
+            row.entity_id
+                .as_deref()
+                .is_none_or(|id| !counted_callers.contains(id))
+        })
+        .count();
     let mut counts = serde_json::json!({
         "counted": "referencing_entities",
         "referencing_entities": rows.len(),
@@ -2320,7 +2628,7 @@ fn reference_counts(
         // floor of; it is not evidence that the extra rows are callers, which is
         // what `receiver_name_candidates` above and `candidates` themselves say.
         "upstream_including_unconfirmed": rows.len()
-            + candidate_rows.len()
+            + held_callers_not_counted
             + interface_dispatch_candidates.unwrap_or(0),
     });
     // Present only when the dispatch question applies to this focal, which is a
@@ -2347,6 +2655,40 @@ fn reference_counts(
 /// include closure singled the file out. Below it nothing at the site chose the
 /// target, so the row is a candidate and belongs in `candidates`.
 const DEFAULT_MIN_RESOLUTION: RelationResolution = RelationResolution::ImportScoped;
+
+/// The floor a focal's callers are counted at: `min_resolution`, unless
+/// nothing this focal's own edges or the store resolve for its language reaches
+/// above `name_only`, in which case `name_only`.
+///
+/// `find_references` and `bulk_check_references` both count through this, and
+/// through [`ReferenceEdge::is_held_at`] at the floor it returns, so the two
+/// read every direct edge at the same floor and by the same rule. They are not
+/// the same count in every case: `find_references` also composes callers over a
+/// proven override, which a batch does not. `known` caches the store's answer
+/// per language, because a batch asks it once per entity and the answer is a
+/// property of the store.
+fn counting_floor<G: GraphStore>(
+    store: &G,
+    language: kin_model::ids::LanguageId,
+    relation_kinds: &[RelationKind],
+    min_resolution: RelationResolution,
+    focal_has_a_proven_edge: bool,
+    known: &mut HashMap<kin_model::ids::LanguageId, bool>,
+) -> RelationResolution {
+    let resolves_above_name_only = focal_has_a_proven_edge
+        || *known.entry(language).or_insert_with(|| {
+            crate::edge_coverage::language_has_a_proven_cross_file_reference(
+                store,
+                language,
+                relation_kinds,
+            )
+        });
+    if resolves_above_name_only {
+        min_resolution
+    } else {
+        RelationResolution::NameOnly
+    }
+}
 
 /// Read the caller's resolution floor.
 ///
@@ -2828,9 +3170,11 @@ fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::
         // (an edge behind this row came from language-server enrichment, which
         // reports one site per edge), `producer_without_site_contract` (one was
         // hand-authored, or came from an origin with no checked contract, so it
-        // proves a reference rather than an occurrence count), or
+        // proves a reference rather than an occurrence count),
         // `incomplete_call_evidence` (one carries the linker's own marker saying
-        // the parse was recovered or the call extraction was not exhaustive).
+        // the parse was recovered or the call extraction was not exhaustive), or
+        // `unconfirmed_sites_in_candidates` (this caller has more sites only a
+        // weaker edge recorded, carried as its row in `candidates`).
         // Null when every edge behind the row came from a complete parse, and
         // then `reference_line_count` is the whole count for this caller.
         "reference_lines_partial_reason": row
@@ -2881,6 +3225,11 @@ pub const SPINE_REPO_UNREGISTERED: &str = "spine_repo_unregistered";
 /// The spine holds a root for this repository, but the live graph has advanced
 /// past it: stale cross-repo authority rather than a mismatched one.
 pub const SPINE_ROOT_STALE: &str = "spine_root_stale";
+/// The daemon's spine is switched on and not built yet, because its
+/// initialization stepped aside while a writer held graph authority, so no
+/// cross-repo authority stands behind this read. A read after the writer
+/// finishes builds it.
+pub const SPINE_INITIALIZATION_DEFERRED: &str = "spine_initialization_deferred";
 
 /// Split a spine unavailability reason into its code and human detail, or
 /// `None` for a reason that carries no recognized code (a binding failure, say,
@@ -2890,7 +3239,12 @@ pub const SPINE_ROOT_STALE: &str = "spine_root_stale";
 /// would promote the first word of an arbitrary error message into a machine
 /// label, which is the kind of guess this module exists to avoid.
 fn split_spine_unavailable_reason(reason: &str) -> (Option<&'static str>, &str) {
-    for code in [SPINE_REPO_UNREGISTERED, SPINE_ROOT_STALE] {
+    for code in [
+        SPINE_REPO_UNREGISTERED,
+        SPINE_ROOT_STALE,
+        SPINE_INITIALIZATION_DEFERRED,
+        kin_spine::SPINE_CANDIDATE_REPRESENTATION_GAP,
+    ] {
         if let Some(detail) = reason
             .strip_prefix(code)
             .and_then(|rest| rest.strip_prefix(": "))
@@ -2903,7 +3257,7 @@ fn split_spine_unavailable_reason(reason: &str) -> (Option<&'static str>, &str) 
 
 /// The cross-repo object for a spine that could not answer, carrying the code of
 /// the condition that held beside its human detail.
-fn cross_repo_unavailable_json(reason: &str) -> serde_json::Value {
+pub fn cross_repo_unavailable_json(reason: &str) -> serde_json::Value {
     let (code, detail) = split_spine_unavailable_reason(reason);
     let mut value = serde_json::json!({
         "status": "unavailable",
@@ -2915,13 +3269,17 @@ fn cross_repo_unavailable_json(reason: &str) -> serde_json::Value {
     value
 }
 
-fn daemon_spine_xref(
+/// The daemon's spine read for one focal, as the reference tools weigh it.
+///
+/// Public so `kin refs` words every spine state exactly the way
+/// `find_references` does.
+pub fn daemon_spine_xref(
     authority: FindReferencesAuthority<'_>,
     target_id: &kin_model::EntityId,
 ) -> std::result::Result<(String, kin_spine::SpineQuery<kin_spine::SpineXrefResponse>), String> {
     let repo_id = normalize_cross_repo_repo_id(Some(authority.repo_id))?;
     let query = match authority.spine {
-        Some(spine) => {
+        kin_spine::DaemonSpine::Ready(spine) => {
             let body = spine.cross_repo_xref_response(&repo_id, target_id);
             match body.authority_root_state(&repo_id, authority.graph_root) {
                 kin_spine::AuthorityRootState::Matches => kin_spine::SpineQuery::Found(body),
@@ -2950,7 +3308,22 @@ fn daemon_spine_xref(
                 }
             }
         }
-        None => kin_spine::SpineQuery::NotConfigured,
+        // The spine is switched on and nothing has built it yet, because its
+        // initialization stepped aside for a writer. No cross-repo authority
+        // stands behind this answer, which is a gap in it. Read as not
+        // configured, a fact about the install, such an answer certified.
+        kin_spine::DaemonSpine::Deferred(reason) => kin_spine::SpineQuery::Unavailable(format!(
+            "{SPINE_INITIALIZATION_DEFERRED}: cross-repo spine initialization for repository \
+             {repo_id} is deferred ({reason}), so no cross-repo authority stands behind this \
+             answer yet; a read after the writer finishes builds it"
+        )),
+        // The spine is switched on and refused this repository's graph for a
+        // standing reason, which the daemon's recorded reason names under its
+        // own code. A gap in the answer for as long as the reason stands.
+        kin_spine::DaemonSpine::Refused(reason) => {
+            kin_spine::SpineQuery::Unavailable(reason.to_string())
+        }
+        kin_spine::DaemonSpine::Absent => kin_spine::SpineQuery::NotConfigured,
     };
     Ok((repo_id, query))
 }
@@ -3080,7 +3453,33 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         let entity_id = parse_entity_id(&entity_id_str)?;
         store.get_entity(&entity_id).map_err(McpError::graph)?
     } else if let Some(query) = get_optional_string_param(args, "query") {
-        select_best_reference_target(store, &query).map_err(McpError::graph)?
+        // The name rule every surface shares. A bare name that several
+        // OWNER-QUALIFIED entities share is answered for every one of them,
+        // labelled and sectioned, instead of quietly keeping a ranked winner and
+        // discarding the rest; a name one owner carries is that owner's member.
+        // Two entities that carry an identical name with NEITHER of them
+        // owner-qualified (a `resolve` free function in each of two unrelated
+        // files, say) are not a shared member name, because there is no
+        // owner-qualified name a caller could retype to pin one. That case keeps
+        // its ranked single answer and the `ambiguous_name` disclosure below.
+        match kin_ranking::entity_ranking::resolve_name(store, &query).map_err(McpError::graph)? {
+            kin_ranking::entity_ranking::NameResolution::One(entity) => Some(entity),
+            kin_ranking::entity_ranking::NameResolution::SharedMemberName(siblings) => {
+                return build_sectioned_reference_reply(
+                    store,
+                    siblings,
+                    &query,
+                    &relation_kinds,
+                    include_snippets,
+                    min_resolution,
+                    authority_source,
+                    repository_authority,
+                    source_scope,
+                )
+                .await;
+            }
+            kin_ranking::entity_ranking::NameResolution::Missing => None,
+        }
     } else {
         return Err(McpError::InvalidParams(
             "missing required parameter: entity_id or query".into(),
@@ -3091,10 +3490,652 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         return Ok(ToolCallResult::error(FIND_REFERENCES_FOCAL_MISS));
     };
 
+    let result = build_reference_reply_for_focal(
+        store,
+        &target,
+        &relation_kinds,
+        include_snippets,
+        min_resolution,
+        authority_source,
+        repository_authority,
+        source_scope,
+        if addressed_by_name {
+            resolution_query.as_deref()
+        } else {
+            None
+        },
+    )
+    .await?;
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+/// Why a name answered with candidates, re-exported so a crate that reaches
+/// these answers through kin-mcp names the reason the same way.
+pub use kin_ranking::entity_ranking::CandidateReason;
+
+/// How many candidates a name-candidates answer describes in full: owner,
+/// kind, file and signature beside the id.
+pub const NAME_CANDIDATES_DETAILED_MAX: usize = 25;
+
+/// How many candidates a name-candidates answer lists at all. Past the first
+/// [`NAME_CANDIDATES_DETAILED_MAX`] each is listed by its id and name alone;
+/// past this the answer says how many it left out and how to narrow, so no
+/// candidate vanishes. It exists for the pathological name, such as `new` in a
+/// Rust workspace, that hundreds of owners define, or a two-letter partial one.
+pub const NAME_CANDIDATES_LISTED_MAX: usize = 200;
+
+/// One candidate, with what a caller needs to choose it: the name, the member
+/// name and owner when it is an owner's member, the kind, the file and the
+/// signature. The entity id is the exact address; the rest is context.
+pub fn name_candidate_json(entity: &kin_model::Entity) -> serde_json::Value {
+    serde_json::json!({
+        "entity_id": entity.id,
+        "name": entity.name,
+        "member_name": kin_ranking::entity_ranking::lookup_member_name(entity),
+        "owner": kin_ranking::entity_ranking::member_owner(entity),
+        "kind": entity.kind,
+        "file_path": entity.file_origin.as_ref().map(|path| path.to_string()),
+        "signature": entity.signature,
+    })
+}
+
+/// A candidate past [`NAME_CANDIDATES_DETAILED_MAX`]: its id and its name.
+pub fn name_candidate_brief_json(entity: &kin_model::Entity) -> serde_json::Value {
+    serde_json::json!({ "entity_id": entity.id, "name": entity.name })
+}
+
+/// The candidates a name reached, split the way every answer lists them:
+/// detailed rows, brief rows, and how many were left out.
+pub fn name_candidate_listing(
+    candidates: &[kin_model::Entity],
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>, usize) {
+    let detailed = candidates
+        .iter()
+        .take(NAME_CANDIDATES_DETAILED_MAX)
+        .map(name_candidate_json)
+        .collect();
+    let brief = candidates
+        .iter()
+        .skip(NAME_CANDIDATES_DETAILED_MAX)
+        .take(NAME_CANDIDATES_LISTED_MAX - NAME_CANDIDATES_DETAILED_MAX)
+        .map(name_candidate_brief_json)
+        .collect();
+    let omitted = candidates.len().saturating_sub(NAME_CANDIDATES_LISTED_MAX);
+    (detailed, brief, omitted)
+}
+
+/// What a name reached, in the words every surface uses for it.
+pub fn name_candidates_situation(
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    total: usize,
+) -> String {
+    use kin_ranking::entity_ranking::CandidateReason;
+    match reason {
+        CandidateReason::SameName => format!("{total} entities are named '{query}' exactly"),
+        CandidateReason::SharedMemberName => format!(
+            "No entity is named '{query}' exactly, and {total} members of different owners \
+             carry it as their member name"
+        ),
+        CandidateReason::SameLeafName => {
+            format!("'{query}' names no entity, and {total} entities are named by its last segment")
+        }
+        CandidateReason::PartialName => format!(
+            "No entity is named '{query}' exactly and no owner has a member by that name; \
+             {total} entities' names contain it"
+        ),
+    }
+}
+
+fn name_candidates_listing_sentence(total: usize, brief: usize, omitted: usize) -> String {
+    if total <= NAME_CANDIDATES_DETAILED_MAX {
+        "Every one is listed under `candidates`.".to_string()
+    } else if omitted == 0 {
+        format!(
+            "The first {NAME_CANDIDATES_DETAILED_MAX} (ordered by file, then name) are listed \
+             in full under `candidates` and the other {brief} by id under `more_candidates`."
+        )
+    } else {
+        format!(
+            "The first {NAME_CANDIDATES_DETAILED_MAX} (ordered by file, then name) are listed \
+             in full under `candidates`, the next {brief} by id under `more_candidates`, and \
+             {omitted} more are not listed; name the owner or a longer name to narrow."
+        )
+    }
+}
+
+/// The answer a surface that answers about ONE entity gives when the name it
+/// was handed does not name one: every candidate, and no answer about any of
+/// them.
+///
+/// `find_references` can answer for all of a shared member name's candidates
+/// at once, so it sections instead (see [`build_sectioned_reference_reply`]).
+/// A source read, a trace or a path has one focal, and picking one of three
+/// `get` methods by ranking and answering as though the name had meant it is
+/// the silent pick this reply exists to replace: `get_entity_source(entity_id:
+/// "get")` on pallets/flask returned the body of the tutorial's `get_db`. The
+/// `ambiguous_name` degradation is what the envelope folds into `_kin.verdict`,
+/// the same entry a sectioned `find_references` answer carries.
+pub fn name_candidates_json(
+    tool: &str,
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[kin_model::Entity],
+) -> serde_json::Value {
+    let total = candidates.len();
+    let (detailed, brief, omitted) = name_candidate_listing(candidates);
+    let detail = format!(
+        "{}, so {tool} answered about none of them rather than choosing one. {} Call {tool} \
+         again with one candidate's `entity_id`, or with its owner-qualified `name`.",
+        name_candidates_situation(query, reason, total),
+        name_candidates_listing_sentence(total, brief.len(), omitted),
+    );
+    let mut value = serde_json::json!({
+        "ambiguous_focal": true,
+        "query": query,
+        "resolution": reason.as_str(),
+        "candidate_count": total,
+        "candidates": detailed,
+        "degradations": [{
+            "component": "focal_resolution",
+            "reason": "ambiguous_name",
+            "detail": detail,
+        }],
+    });
+    if !brief.is_empty() {
+        value["more_candidates"] = serde_json::Value::Array(brief);
+    }
+    if omitted > 0 {
+        value["omitted_candidates"] = serde_json::json!(omitted);
+    }
+    value
+}
+
+/// [`name_candidates_json`] as the tool result a handler returns.
+pub fn name_candidates_reply(
+    tool: &str,
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[kin_model::Entity],
+) -> Result<ToolCallResult> {
+    let json = serde_json::to_string_pretty(&name_candidates_json(tool, query, reason, candidates))
+        .map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+/// [`name_candidates_json`] for a surface that answers in text, so `kin refs`,
+/// `kin trace`, `kin graph source`, `kin path` and a text tool say it in the
+/// same words: the situation, one row per candidate (kind, name, file, id),
+/// brief rows past the detailed cap, what was left out, and how to name one.
+/// No row carries a line number; the id is the address.
+pub fn name_candidates_lines(
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[kin_model::Entity],
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{}, so there is no one entity to answer about:",
+        name_candidates_situation(query, reason, candidates.len())
+    )];
+    for candidate in candidates.iter().take(NAME_CANDIDATES_DETAILED_MAX) {
+        lines.push(format!(
+            "  {:<9} {}  {}  {}",
+            kin_review::StableEntityIdentity::from_entity(candidate).kind,
+            candidate.name,
+            candidate
+                .file_origin
+                .as_ref()
+                .map(|path| path.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            candidate.id
+        ));
+    }
+    for candidate in candidates
+        .iter()
+        .skip(NAME_CANDIDATES_DETAILED_MAX)
+        .take(NAME_CANDIDATES_LISTED_MAX - NAME_CANDIDATES_DETAILED_MAX)
+    {
+        lines.push(format!("  {}  {}", candidate.name, candidate.id));
+    }
+    let omitted = candidates.len().saturating_sub(NAME_CANDIDATES_LISTED_MAX);
+    if omitted > 0 {
+        lines.push(format!(
+            "  ... and {omitted} more, not listed; name the owner or a longer name to narrow"
+        ));
+    }
+    if let Some(first) = candidates.first() {
+        lines.push(format!(
+            "Name one by its owner-qualified name, for example `{}`, or pass its id.",
+            first.name
+        ));
+    }
+    lines
+}
+
+/// The `trace_data_flow` degradation for a `target` that names several
+/// entities: the walk ranked by relevance alone rather than toward one of them,
+/// and every candidate by id, so none of them vanishes.
+pub fn target_ambiguous_degradation(
+    target: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[kin_model::Entity],
+) -> serde_json::Value {
+    let listed: Vec<serde_json::Value> = candidates
+        .iter()
+        .take(NAME_CANDIDATES_LISTED_MAX)
+        .map(name_candidate_brief_json)
+        .collect();
+    let omitted = candidates.len().saturating_sub(NAME_CANDIDATES_LISTED_MAX);
+    // The candidates ride in the sentence as well as in `candidates`, so a
+    // surface that carries a degradation as text alone, as the CLI walker does,
+    // still names every one of them by id.
+    let named: Vec<String> = candidates
+        .iter()
+        .take(NAME_CANDIDATES_LISTED_MAX)
+        .map(|entity| format!("{} ({})", entity.name, entity.id))
+        .collect();
+    let more = if omitted > 0 {
+        format!(", and {omitted} more not listed")
+    } else {
+        String::new()
+    };
+    let mut value = serde_json::json!({
+        "component": "target_reachability",
+        "reason": "target_ambiguous",
+        "target": target,
+        "resolution": reason.as_str(),
+        "candidate_count": candidates.len(),
+        "detail": format!(
+            "target '{target}': {}, so this walk ranked its fan-out by relevance alone rather \
+             than toward one of them. Candidates: {}{more}",
+            name_candidates_situation(target, reason, candidates.len()),
+            named.join(", "),
+        ),
+        "remediation": "name the target by its owner-qualified name or entity id",
+        "candidates": listed,
+    });
+    if omitted > 0 {
+        value["omitted_candidates"] = serde_json::json!(omitted);
+    }
+    value
+}
+
+/// Machine-readable identity listing, without duplicating the human explanation.
+pub fn trace_target_listing(disclosure: &serde_json::Value) -> serde_json::Value {
+    let mut listing = disclosure.clone();
+    if let Some(fields) = listing.as_object_mut() {
+        for key in ["component", "reason", "detail", "remediation"] {
+            fields.remove(key);
+        }
+    }
+    listing
+}
+
+/// Shed one whole target identity, retaining the exact total and omission count.
+/// The structured listing also lets later transport passes regenerate the text
+/// without parsing names (which may themselves contain commas or parentheses).
+pub fn compact_trace_target(disclosure: &mut serde_json::Value) -> bool {
+    let Some(rows) = disclosure["candidates"].as_array_mut() else {
+        return false;
+    };
+    if rows.pop().is_none() {
+        return false;
+    }
+    let listed = rows.len();
+    let total = disclosure["candidate_count"].as_u64().unwrap_or(0) as usize;
+    let omitted = total.saturating_sub(listed);
+    disclosure["omitted_candidates"] = serde_json::json!(omitted);
+    true
+}
+
+pub fn trace_target_detail(disclosure: &serde_json::Value) -> String {
+    let total = disclosure["candidate_count"].as_u64().unwrap_or(0) as usize;
+    let listed = disclosure["candidates"].as_array().map_or(0, Vec::len);
+    let omitted = total.saturating_sub(listed);
+    let names = disclosure["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            format!(
+                "{} ({})",
+                row["name"].as_str().unwrap_or_default(),
+                row["entity_id"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let listing = if listed == 0 {
+        format!("All {total} candidates are omitted from this listing")
+    } else {
+        format!("Candidates: {names}; {omitted} more not listed")
+    };
+    format!(
+        "target '{}': {total} candidates, so this walk ranked by relevance alone rather than toward one of them. {listing}",
+        disclosure["target"].as_str().unwrap_or_default())
+}
+
+/// Keep the text-only degradation synchronized with its structured candidate list.
+pub fn sync_trace_target_detail(payload: &mut serde_json::Value) {
+    let Some(target) = payload.get("target_ambiguity") else {
+        return;
+    };
+    let detail = serde_json::json!(trace_target_detail(target));
+    if let Some(entries) = payload["degradations"].as_array_mut() {
+        for entry in entries {
+            if entry["reason"] == "target_ambiguous" {
+                entry["detail"] = detail.clone();
+            }
+        }
+    }
+}
+
+/// Final ambiguity fence, including any transport envelope already attached.
+/// It never chooses an entity or cuts an identity string. Counts remain exact
+/// when detailed rows become brief rows and then an explicitly omitted suffix.
+pub fn fit_trace_ambiguity_payload(payload: &mut serde_json::Value, max_bytes: usize) -> bool {
+    let focal = payload["ambiguous_focal"] == true;
+    let target = payload
+        .get("target_ambiguity")
+        .is_some_and(serde_json::Value::is_object)
+        || payload["ambiguous_target"] == true;
+    if !focal && !target {
+        return true;
+    }
+    if payload["error"].is_string() {
+        if crate::budget::measure(payload) > max_bytes {
+            // A later transport may have added an envelope to this refusal.
+            // Reissue the same count-only refusal, never a successful answer
+            // with its integrity metadata removed. Its totals are already at
+            // the top level, including for a refused ambiguous target.
+            *payload = trace_ambiguity_refusal(
+                focal,
+                target,
+                payload["candidate_count"].clone(),
+                payload["resolution"].clone(),
+            );
+        }
+        return false;
+    }
+    let mut changed = false;
+    loop {
+        if changed
+            && payload
+                .pointer("/_kin/response")
+                .is_some_and(serde_json::Value::is_object)
+        {
+            payload["_kin"]["response"]["bounded"] = serde_json::json!(true);
+            // The final byte count includes its own decimal representation.
+            for _ in 0..16 {
+                let size = crate::budget::measure(payload);
+                if payload["_kin"]["response"]["chars_after_budget"] == size {
+                    break;
+                }
+                payload["_kin"]["response"]["chars_after_budget"] = serde_json::json!(size);
+            }
+        }
+        if crate::budget::measure(payload) <= max_bytes {
+            return true;
+        }
+        if focal {
+            let detailed = payload["candidates"].as_array_mut().and_then(Vec::pop);
+            if let Some(row) = detailed {
+                let brief = serde_json::json!({"entity_id":row["entity_id"],"name":row["name"]});
+                if !payload["more_candidates"].is_array() {
+                    payload["more_candidates"] = serde_json::json!([]);
+                }
+                payload["more_candidates"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, brief);
+            } else if payload["more_candidates"]
+                .as_array_mut()
+                .and_then(Vec::pop)
+                .is_none()
+            {
+                break;
+            }
+            let full = payload["candidates"].as_array().map_or(0, Vec::len);
+            let brief = payload["more_candidates"].as_array().map_or(0, Vec::len);
+            let total = payload["candidate_count"].as_u64().unwrap_or(0) as usize;
+            let omitted = total.saturating_sub(full + brief);
+            payload["omitted_candidates"] = serde_json::json!(omitted);
+            if let Some(entries) = payload["degradations"].as_array_mut() {
+                for entry in entries {
+                    if entry["reason"] == "ambiguous_name" {
+                        entry["detail"] = serde_json::json!(format!(
+                            "trace_data_flow answered about none of the {total} candidates. {full} are listed in full under candidates, {brief} by id under more_candidates, and {omitted} are omitted. Call again with an entity_id or owner-qualified name."));
+                    }
+                }
+            }
+        } else {
+            if !compact_trace_target(&mut payload["target_ambiguity"]) {
+                break;
+            }
+            sync_trace_target_detail(payload);
+        }
+        changed = true;
+    }
+    // A huge query or mandatory envelope can exceed even the count-only floor.
+    // Refuse without source/user-text echo while retaining the resolution total.
+    let (total, resolution) = if focal {
+        (
+            payload["candidate_count"].clone(),
+            payload["resolution"].clone(),
+        )
+    } else {
+        (
+            payload["target_ambiguity"]["candidate_count"].clone(),
+            payload["target_ambiguity"]["resolution"].clone(),
+        )
+    };
+    *payload = trace_ambiguity_refusal(focal, target, total, resolution);
+    false
+}
+
+fn trace_ambiguity_refusal(
+    focal: bool,
+    target: bool,
+    total: serde_json::Value,
+    resolution: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error":"trace ambiguity metadata cannot fit the UTF-8 byte budget; name the focal or target by its owner-qualified name or entity id",
+        "ambiguous_focal":focal,"ambiguous_target":target,"candidate_count":total,
+        "resolution":resolution,"omitted_candidates":total,
+    })
+}
+
+pub fn trace_name_candidates_reply(
+    query: &str,
+    candidates: &[kin_model::Entity],
+    max_bytes: usize,
+) -> Result<ToolCallResult> {
+    let mut value = name_candidates_json(
+        "trace_data_flow",
+        query,
+        CandidateReason::SharedMemberName,
+        candidates,
+    );
+    let fits = fit_trace_ambiguity_payload(&mut value, max_bytes);
+    let text = crate::budget::render(&value).map_err(McpError::Json)?;
+    Ok(if fits {
+        ToolCallResult::text(text)
+    } else {
+        ToolCallResult::error(text)
+    })
+}
+
+/// Top-level key a sectioned `find_references` answer files its labelled
+/// candidates under: one full reply body per entity the shared member rule
+/// found. Public so a caller reading the sections names them the same way.
+pub const AMBIGUOUS_CANDIDATES_KEY: &str = "candidates_by_owner";
+
+/// Answer `find_references` for every entity a bare name resolves to, rather
+/// than the resolver's single ranked winner.
+///
+/// `kin_ranking::entity_ranking::select_best_entity` has to pick one match and
+/// discard the rest, which is the right contract for a resolver with one
+/// winner to hand back. It is the wrong contract for `find_references`
+/// itself, whose graph already knows every candidate's own full reference
+/// list: a repository holding `Flask.dispatch_request`,
+/// `View.dispatch_request` and `MethodView.dispatch_request` answered
+/// `find_references(query: "dispatch_request")` with one of the three and its
+/// caller list, and nothing in the response said the other two existed or
+/// what called them.
+///
+/// Each `siblings` entry gets its own labelled section --
+/// [`build_reference_reply_for_focal`]'s ordinary reply body, addressed by
+/// that entity directly (`resolution_query_for_focal: None`), unchanged --
+/// filed under its own `owner_qualified_name` and `entity_id`. The response
+/// carries no top-level `focal_entity`, `references`, or `total_upstream`:
+/// there is no single one of those left to name, which is the fact this whole
+/// reply exists to disclose rather than paper over with a silent pick. Its
+/// top-level `degradations` entry is what a generic reader already folds into
+/// `_kin.verdict`: this query reported a degradation, so the answer did not
+/// run at full, single-focal capability.
+async fn build_sectioned_reference_reply<G: GraphStore>(
+    store: &G,
+    mut siblings: Vec<kin_model::Entity>,
+    query: &str,
+    relation_kinds: &[RelationKind],
+    include_snippets: bool,
+    min_resolution: RelationResolution,
+    authority_source: FindReferencesAuthoritySource<'_>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<ToolCallResult> {
+    let total_candidates = siblings.len();
+    // Bounded the way a resolution disclosure's own candidate list already is
+    // (`RESOLUTION_CANDIDATES_LISTED_MAX`): each section pays for a full
+    // reference collection, cross-repo lookup and edge-coverage scan, and an
+    // unbounded fan-out over a pathological collision would turn one call
+    // into dozens. The cap is disclosed, never silent, and every candidate past
+    // it is still listed by id, so none of them vanishes.
+    let unsectioned: Vec<kin_model::Entity> =
+        siblings.split_off(RESOLUTION_CANDIDATES_LISTED_MAX.min(siblings.len()));
+    let sectioned_count = siblings.len();
+
+    let mut sections = Vec::with_capacity(sectioned_count);
+    for sibling in &siblings {
+        let mut section = build_reference_reply_for_focal(
+            store,
+            sibling,
+            relation_kinds,
+            include_snippets,
+            min_resolution,
+            authority_source.clone(),
+            repository_authority,
+            source_scope,
+            None,
+        )
+        .await?;
+        if let Some(object) = section.as_object_mut() {
+            object.insert(
+                "owner_qualified_name".to_string(),
+                serde_json::Value::String(sibling.name.clone()),
+            );
+            object.insert("entity_id".to_string(), serde_json::json!(sibling.id));
+        }
+        sections.push(section);
+    }
+
+    let listed: Vec<serde_json::Value> = unsectioned
+        .iter()
+        .take(NAME_CANDIDATES_LISTED_MAX)
+        .map(|entity| {
+            let mut row = name_candidate_json(entity);
+            if let Some(object) = row.as_object_mut() {
+                object.remove("signature");
+            }
+            row
+        })
+        .collect();
+    let omitted = unsectioned.len().saturating_sub(NAME_CANDIDATES_LISTED_MAX);
+    let situation = format!(
+        "No entity is named '{query}' exactly, and {total_candidates} members of different \
+         owners carry it as their member name"
+    );
+    let coverage = if listed.is_empty() {
+        format!(
+            "this answer sections a full reply for every one of them under \
+             `{AMBIGUOUS_CANDIDATES_KEY}` rather than silently choosing one"
+        )
+    } else if omitted == 0 {
+        format!(
+            "this answer sections a full reply for the first {sectioned_count} (ordered by \
+             file, then name) under `{AMBIGUOUS_CANDIDATES_KEY}` rather than silently choosing \
+             one, and lists the other {} by id under `unsectioned_candidates`",
+            listed.len()
+        )
+    } else {
+        format!(
+            "this answer sections a full reply for the first {sectioned_count} (ordered by \
+             file, then name) under `{AMBIGUOUS_CANDIDATES_KEY}` rather than silently choosing \
+             one, lists the next {} by id under `unsectioned_candidates`, and leaves {omitted} \
+             more unlisted; name the owner to narrow",
+            listed.len()
+        )
+    };
+    let detail = format!(
+        "{situation}, so {coverage}. Address one directly by its owner-qualified name -- \
+         `{AMBIGUOUS_CANDIDATES_KEY}[].owner_qualified_name` -- or by its entity id for a \
+         single, unsectioned answer about just that entity."
+    );
+    let mut result = serde_json::json!({
+        "ambiguous_focal": true,
+        "resolution": kin_ranking::entity_ranking::CandidateReason::SharedMemberName.as_str(),
+        "candidate_count": total_candidates,
+        AMBIGUOUS_CANDIDATES_KEY: sections,
+        "degradations": [{
+            "component": "focal_resolution",
+            "reason": "ambiguous_name",
+            "detail": detail,
+        }],
+    });
+    if !listed.is_empty() {
+        result["unsectioned_candidates"] = serde_json::Value::Array(listed);
+    }
+    if omitted > 0 {
+        result["omitted_candidates"] = serde_json::json!(omitted);
+    }
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+/// Build one `find_references` reply body: reference rows, withheld
+/// candidates, counts, cross-repo xrefs, Go interface dispatch and
+/// implementations, edge coverage, caller arrival, this call's own
+/// `degradations`, and `focal_resolution` for `target`.
+///
+/// Every `find_references` answer is assembled this way, whether it serves
+/// the whole response for an unambiguous focal or one labelled section of a
+/// sectioned answer for a bare name several owner-qualified entities share
+/// (see [`build_sectioned_reference_reply`]). `resolution_query_for_focal` is
+/// the string [`focal_resolution_for`] counts ambiguity against: `Some`
+/// reproduces exactly what an ordinary name-addressed call reports, including
+/// its own `ambiguous_name` disclosure when the query's pattern match still
+/// carries more candidates than this one call answered for; `None` is what a
+/// call already pinned to one entity reports, which is what a labelled
+/// section IS once it has its label: `target` was not chosen by ranking a
+/// query against rivals, it is being answered for directly.
+async fn build_reference_reply_for_focal<G: GraphStore>(
+    store: &G,
+    target: &kin_model::Entity,
+    relation_kinds: &[RelationKind],
+    include_snippets: bool,
+    min_resolution: RelationResolution,
+    authority_source: FindReferencesAuthoritySource<'_>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+    resolution_query_for_focal: Option<&str>,
+) -> Result<serde_json::Value> {
     let mut rows = collect_graph_reference_rows_at(
         store,
         &target.id,
-        &relation_kinds,
+        relation_kinds,
         repository_authority,
         source_scope,
     )?;
@@ -3123,7 +4164,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             kin_spine::SpineQuery::Found(body) => {
                 let federated_rows = spine_reference_rows(&repo_id, &target.id, &body);
                 let relation_subtype_complete =
-                    reference_filter_covers_unknown_subtypes(&relation_kinds)
+                    reference_filter_covers_unknown_subtypes(relation_kinds)
                         || federated_rows.is_empty();
                 let reference_count = if relation_subtype_complete {
                     rows.extend(federated_rows.iter().cloned());
@@ -3177,9 +4218,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // or not: a `name_only` edge is still an edge of that class, and reading
     // only the resolved rows here would report a class absent on a graph
     // holding it.
-    let witnessed = answer_witnessed_classes(store, &target, &rows);
+    let witnessed = answer_witnessed_classes(store, target, &rows);
 
-    // FIR-1552. A `name_only` row was matched on a bare name with nothing at the
+    // A `name_only` row was matched on a bare name with nothing at the
     // reference site proving the destination. Counting one beside a proven
     // caller is how `find_references(HTTPAdapter.send)` on psf/requests answered
     // `total_upstream: 33` for a method `git grep` finds two call sites for,
@@ -3235,20 +4276,38 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     let any_row_is_proven = rows
         .iter()
         .any(|row| row.resolution.is_some_and(RelationResolution::is_proven));
-    let store_resolves_language_above_name_only = any_row_is_proven
-        || crate::edge_coverage::language_has_a_proven_cross_file_reference(
-            store,
-            target.language,
-            &relation_kinds,
-        );
-    let floor = if store_resolves_language_above_name_only {
-        min_resolution
-    } else {
-        RelationResolution::NameOnly
-    };
-    let (rows, candidate_rows): (Vec<ReferenceRow>, Vec<ReferenceRow>) = rows
-        .into_iter()
-        .partition(|row| !is_withheld_candidate(row, floor));
+    let floor = counting_floor(
+        store,
+        target.language,
+        relation_kinds,
+        min_resolution,
+        any_row_is_proven,
+        &mut HashMap::new(),
+    );
+    // Each row is cut at the floor by its own edges rather than judged whole.
+    // Judged whole, one proven edge counted every site its caller's other edges
+    // recorded: on the gh CLI that confirmed `RepoOwner()` calls on a
+    // `ghrepo.Interface` value as calls of `Repository.RepoOwner`, because the
+    // same caller also calls `Repository.RepoOwner` directly on other lines.
+    // Those sites now travel in `candidates` under the resolution they earned,
+    // and the proven ones stay here. A federated row has no local edge to cut
+    // and is judged whole, exactly as before.
+    let mut counted_rows = Vec::with_capacity(rows.len());
+    let mut candidate_rows = Vec::new();
+    for row in rows {
+        if row.edges.is_empty() {
+            if is_withheld_candidate(&row, floor) {
+                candidate_rows.push(row);
+            } else {
+                counted_rows.push(row);
+            }
+            continue;
+        }
+        let (counted, held) = split_reference_row(row, |edge| edge.is_held_at(floor));
+        counted_rows.extend(counted);
+        candidate_rows.extend(held);
+    }
+    let rows = counted_rows;
 
     // Rows this response counts at `name_only` only because the floor above
     // dropped to `name_only` for lack of anything stronger IN THE STORE, not
@@ -3256,9 +4315,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // itself at `name_only`, where nothing is withheld either way and there is
     // nothing to disclose). Counted while `rows` still holds only the kept
     // set, and disclosed below beside the other `degradations`.
-    let name_only_ceiling_kept = if store_resolves_language_above_name_only
-        || min_resolution == RelationResolution::NameOnly
-    {
+    let name_only_ceiling_kept = if floor == min_resolution {
         0
     } else {
         rows.iter()
@@ -3282,7 +4339,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // for, and the reader who most needs this one is the reader who got an empty
     // reference list and is deciding whether the method is dead.
     let dispatch =
-        collect_interface_dispatch_candidates(store, &target, repository_authority, source_scope)?;
+        collect_interface_dispatch_candidates(store, target, repository_authority, source_scope)?;
 
     // The other direction of the same gap, and the one a reader asks about more
     // often: where is this interface method implemented. A concrete method
@@ -3296,7 +4353,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // Held outside `references` deliberately. These rows are not references and
     // folding them in would both lie about what an edge proves and pad the
     // answer to "who calls this contract" with declarations nobody calls.
-    let implementations = collect_interface_implementations(store, &target)?;
+    let implementations = collect_interface_implementations(store, target)?;
 
     // What this answer counted, computed before the rows are projected. One row
     // is one referencing entity, so `referencing_entities` is the row count and
@@ -3333,8 +4390,8 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // paying a language scan for a fact it is holding.
     let edge_coverage = crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
         store,
-        &target,
-        &relation_kinds,
+        target,
+        relation_kinds,
         &witnessed,
     );
 
@@ -3375,7 +4432,10 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         // Same row shape as `references`, held apart because these are not
         // references: each is a same-name match whose destination nothing at the
         // reference site proves. Read them to widen a search by hand; never add
-        // them to `total_upstream`.
+        // them to `total_upstream`. A caller counted in `references` for its
+        // proven sites appears here too when a weaker edge recorded sites no
+        // proven one did, and its `references` row then reads
+        // `reference_lines_partial_reason: unconfirmed_sites_in_candidates`.
         "candidates": candidates,
         "cross_repo": cross_repo,
     });
@@ -3400,42 +4460,15 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // from here so the verdict and the evidence a reader audits it against are
     // the same object.
     result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
-        crate::caller_arrival::observe_caller_arrival(store, &target).to_json();
+        crate::caller_arrival::observe_caller_arrival(store, target).to_json();
     disclose_withheld_candidates(&mut result);
     disclose_interface_dispatch_candidates(&mut result);
     disclose_name_only_ceiling(&mut result, name_only_ceiling_kept, target.language);
 
-    // Say that a bare name was resolved, and to how many candidates.
-    //
-    // A repository holding both `Database.resolve` and `LinkGraph.resolve`
-    // answered `find_references(query: "resolve")` with one of them and its
-    // reference list, and nothing in the response said the other existed. The
-    // answer was right, and a rename driven by it on a colliding name is a
-    // rename driven by an unannounced guess. `trace_data_flow` already reports
-    // this as `focal_resolution`; the shape is copied deliberately so the two
-    // tools answer the same question with the same key.
-    //
-    // The count has to be taken against what the CALLER addressed, not against
-    // what the resolver returned. Taking it against the winner's own name made
-    // it structurally unable to count on any language that qualifies a method:
-    // `find_references(query: "dispatch_request")` on pallets/flask resolved
-    // `Flask.dispatch_request` and reported one candidate, while the graph held
-    // `View.dispatch_request` and `MethodView.dispatch_request` beside it and
-    // `semantic_search` for the same string returned six. An ambiguity counter
-    // pinned at one is worse than no counter: a reader who checks it is handed
-    // an explicit assurance that there was nothing to disambiguate (FIR-2475).
-    let resolution = focal_resolution_for(
-        store,
-        &target,
-        if addressed_by_name {
-            resolution_query.as_deref()
-        } else {
-            None
-        },
-    )?;
+    let resolution = focal_resolution_for(store, target, resolution_query_for_focal)?;
     let same_name_candidates = resolution["same_name_candidates"].as_u64().unwrap_or(1);
     result["focal_resolution"] = resolution;
-    if addressed_by_name && same_name_candidates > 1 {
+    if resolution_query_for_focal.is_some() && same_name_candidates > 1 {
         let entry = serde_json::json!({
             "component": "focal_resolution",
             "reason": "ambiguous_name",
@@ -3443,7 +4476,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
                 "{same_name_candidates} entities match the name '{}' that was queried, and this \
                  answer describes the one reported as focal_entity. Address it by entity_id, \
                  from focal_resolution.other_candidates, to pin the choice.",
-                resolution_query.as_deref().unwrap_or(target.name.as_str())
+                resolution_query_for_focal.unwrap_or(target.name.as_str())
             ),
         });
         match result
@@ -3455,8 +4488,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         }
     }
 
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(result)
 }
 
 /// Batched reachability check: classify many entities in a single call.
@@ -3552,6 +4584,8 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
     let mut federated_reference_count = 0usize;
     let mut saw_unknown_federated_subtype = false;
     let mut batch_languages: Vec<kin_model::ids::LanguageId> = Vec::new();
+    let mut languages_resolved_above_name_only: HashMap<kin_model::ids::LanguageId, bool> =
+        HashMap::new();
 
     for raw_id in &entity_ids_raw {
         let entity_id = match parse_entity_id(raw_id) {
@@ -3600,10 +4634,20 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             batch_languages.push(entity.language);
         }
 
-        let mut reference_count = 0usize;
-        let mut matched_kinds: Vec<RelationKind> = Vec::new();
-        for rel in store
-            .get_all_relations_for_entity(&entity_id)
+        let mut derived_candidate_count = 0usize;
+        // Callers, not edges, each counted by the rule `find_references` cuts
+        // its rows by: a caller counts when one of its direct edges is not held
+        // at this focal's floor. Counting every edge answered 2 for one caller
+        // holding a name-only reference and a receiver-name guess, which the
+        // single answer counts 0 under the ordinary floor and 1 under the
+        // degraded one, and never 2. A caller `find_references` reaches only
+        // by composing over a proven override is not counted here, as it was
+        // not before.
+        let mut edges_by_caller: std::collections::BTreeMap<
+            kin_model::EntityId,
+            Vec<ReferenceEdge>,
+        > = std::collections::BTreeMap::new();
+        for rel in kin_index::relation_read::relations_for_read(store, &entity_id)
             .map_err(McpError::graph)?
         {
             let Some(src_entity_id) = rel.src.as_entity() else {
@@ -3618,9 +4662,59 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             if src_entity_id == entity_id {
                 continue;
             }
+            if kin_index::resolution::is_derived_member_candidate(&rel) {
+                derived_candidate_count += 1;
+                continue;
+            }
+            edges_by_caller
+                .entry(src_entity_id)
+                .or_default()
+                .extend(super::common::reference_edges(&rel, None));
+        }
+        let floor = counting_floor(
+            store,
+            entity.language,
+            &relation_kinds,
+            DEFAULT_MIN_RESOLUTION,
+            edges_by_caller
+                .values()
+                .flatten()
+                .any(|edge| edge.resolution.is_proven()),
+            &mut languages_resolved_above_name_only,
+        );
+        let mut reference_count = 0usize;
+        // Callers every edge of which is held: the rows the single answer
+        // carries in `candidates`. They may be callers, so a count beside them
+        // is a floor and an absence beside them is not certified.
+        let mut unconfirmed_candidate_count = 0usize;
+        // Callers counted at `name_only` only because this store resolves
+        // nothing above it for the focal's language, the rows the single answer
+        // counts under its `name_only_ceiling` disclosure. Said per row, beside
+        // the floor that let them in, so a count carried by a name match is
+        // never read as one carried by a proven call.
+        let mut name_only_ceiling_kept = 0usize;
+        let mut matched_kinds: Vec<RelationKind> = Vec::new();
+        for edges in edges_by_caller.values() {
+            let counted: Vec<&ReferenceEdge> = edges
+                .iter()
+                .filter(|edge| !edge.is_held_at(floor))
+                .collect();
+            if counted.is_empty() {
+                unconfirmed_candidate_count += 1;
+                continue;
+            }
             reference_count += 1;
-            if !matched_kinds.contains(&rel.kind) {
-                matched_kinds.push(rel.kind);
+            if floor != DEFAULT_MIN_RESOLUTION
+                && counted
+                    .iter()
+                    .all(|edge| edge.resolution == RelationResolution::NameOnly)
+            {
+                name_only_ceiling_kept += 1;
+            }
+            for edge in counted {
+                if !matched_kinds.contains(&edge.kind) {
+                    matched_kinds.push(edge.kind);
+                }
             }
         }
 
@@ -3689,8 +4783,10 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             !relation_subtype_complete && entity_federated_reference_count > 0;
         saw_unknown_federated_subtype |= federated_count_incomplete;
         let federated_subtype_unknown = federated_count_incomplete && !known_positive;
-        let reference_count_complete =
-            entity_cross_repo_authority_complete && !federated_count_incomplete;
+        let reference_count_complete = entity_cross_repo_authority_complete
+            && !federated_count_incomplete
+            && derived_candidate_count == 0
+            && unconfirmed_candidate_count == 0;
         let has_references = if known_positive {
             Some(true)
         } else if reference_count_complete {
@@ -3700,7 +4796,11 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
         };
         let verdict_complete = has_references.is_some();
         let reported_reference_count = reference_count_complete.then_some(reference_count);
-        let verdict_reason = if federated_subtype_unknown {
+        let verdict_reason = if derived_candidate_count > 0 && !known_positive {
+            Some("derived member references remain candidates")
+        } else if unconfirmed_candidate_count > 0 && !known_positive {
+            Some("unconfirmed candidate references remain")
+        } else if federated_subtype_unknown {
             Some("federated relation subtype unavailable")
         } else if !entity_cross_repo_authority_complete && !known_positive {
             Some("cross-repo authority incomplete")
@@ -3714,6 +4814,10 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
                 "has_references": has_references,
                 "reference_count": reported_reference_count,
                 "known_reference_count": reference_count,
+                "derived_candidate_count": derived_candidate_count,
+                "unconfirmed_candidate_count": unconfirmed_candidate_count,
+                "counting_floor": floor.as_str(),
+                "name_only_ceiling_kept": name_only_ceiling_kept,
                 "reference_count_complete": reference_count_complete,
                 "federated_reference_count": entity_federated_reference_count,
                 "verdict_complete": verdict_complete,
@@ -3732,6 +4836,10 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
                 "has_references": has_references,
                 "reference_count": reported_reference_count,
                 "known_reference_count": reference_count,
+                "derived_candidate_count": derived_candidate_count,
+                "unconfirmed_candidate_count": unconfirmed_candidate_count,
+                "counting_floor": floor.as_str(),
+                "name_only_ceiling_kept": name_only_ceiling_kept,
                 "reference_count_complete": reference_count_complete,
                 "federated_reference_count": entity_federated_reference_count,
                 "verdict_complete": verdict_complete,
@@ -4012,9 +5120,20 @@ pub fn handle_explore_codebase<G: GraphStore>(
             };
             let matches = store.query_entities(&filter).map_err(McpError::graph)?;
 
-            if let Some(focal) =
-                select_best_reference_target(store, &trace_query.symbol).map_err(McpError::graph)?
+            let resolution = kin_ranking::entity_ranking::resolve_name(store, &trace_query.symbol)
+                .map_err(McpError::graph)?;
+            if let kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) =
+                &resolution
             {
+                for line in name_candidates_lines(
+                    &trace_query.symbol,
+                    kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                    candidates,
+                ) {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            } else if let kin_ranking::entity_ranking::NameResolution::One(focal) = resolution {
                 output.push_str(&format!(
                     "# Trace: {} ({:?}, {})\n",
                     focal.name, focal.kind, focal.language
@@ -4373,7 +5492,7 @@ fn dead_code_row<G: GraphStore>(
     memo: &mut crate::caller_arrival::AbsenceGapMemo,
 ) -> Result<serde_json::Value> {
     let factor = memo.limiting_factor(store, entity);
-    let mut row = serde_json::to_value(entity).map_err(McpError::Json)?;
+    let mut row = semantic_metadata_json(entity)?;
     match row.as_object_mut() {
         Some(object) => {
             object.insert(
@@ -4514,9 +5633,8 @@ fn has_incoming_reference_edge<G: GraphStore>(
     entity_id: &kin_model::EntityId,
     kinds: &[RelationKind],
 ) -> Result<bool> {
-    for relation in store
-        .get_all_relations_for_entity(entity_id)
-        .map_err(McpError::graph)?
+    for relation in
+        kin_index::relation_read::relations_for_read(store, entity_id).map_err(McpError::graph)?
     {
         let Some(source) = relation.src.as_entity() else {
             continue;
@@ -4609,8 +5727,7 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
         }
         let mut reference_count = 0usize;
         let mut proven_reference_count = 0usize;
-        for rel in store
-            .get_all_relations_for_entity(&entity.id)
+        for rel in kin_index::relation_read::relations_for_read(store, &entity.id)
             .map_err(McpError::graph)?
         {
             let Some(src_entity_id) = rel.src.as_entity() else {
@@ -4717,9 +5834,12 @@ return. It cannot trace a value back to its source. Its value is that the whole 
 happens substrate-side and comes back as one structured response, so you don't loop \
 get_entity_source per hop and exhaust your tool-call budget. Ask for the chain's SHAPE with \
 include_body=false (names, kinds, roles, spans, edges, no source) — that is the cheap call, and \
-the one to reach for unless you mean to read the code. The response bounds its own size \
-(max_response_chars, default 45000, ceiling 60000) and cuts bodies before edges, so it is never \
-refused for being too large; any cut is reported in `degradations` with the numbers. A budget \
+the one to reach for unless you mean to read the code. The response budget (max_response_chars, \
+in UTF-8 bytes, default 45000, clamped 2000..60000) is a target, not a hard ceiling: the tool \
+cuts bodies before edges, never refuses an unambiguous walk for size, and when even its smallest \
+walk does not fit it answers with that walk and discloses `response_over_budget`; a focal or \
+target several owners share is instead held to the budget and refused when it cannot fit. Any \
+cut is reported in `degradations` and `elisions.chain` with the numbers. A budget \
 that cut the chain never empties it: at least one step survives and `elisions.chain` names what \
 was kept, what was withheld, and why, so an empty `chain` always means the walk reached nothing. Tune depth and limit_per_step to control \
 breadth: the per-step cap keeps the most relevant neighbors (located over file-less, source over \
@@ -4840,6 +5960,7 @@ struct TraceFanoutCandidate {
     /// Evidence spans naming a file other than the caller's. This distinguishes
     /// unusable evidence from an edge whose parser recorded no span at all.
     reference_spans_outside_caller_file: usize,
+    reference_sites_withheld: bool,
 }
 
 impl TraceFanoutCandidate {
@@ -4874,6 +5995,8 @@ impl TraceFanoutCandidate {
     fn reference_lines_absent_reason(&self) -> Option<&'static str> {
         if !self.reference_lines.is_empty() {
             None
+        } else if self.reference_sites_withheld {
+            Some(ReferenceLinesAbsent::UnconfirmedSitesWithheld.as_str())
         } else if self.reference_spans_outside_caller_file > 0 {
             Some(ReferenceLinesAbsent::SpanOutsideCallerFile.as_str())
         } else {
@@ -4913,8 +6036,7 @@ fn trace_reach_set_toward<G: GraphStore>(
     for _ in 0..depth {
         let mut next = Vec::new();
         for node in frontier.drain(..) {
-            let relations = store
-                .get_all_relations_for_entity(&node)
+            let relations = kin_index::relation_read::relations_for_read(store, &node)
                 .map_err(McpError::graph)?;
             for rel in &relations {
                 if !allowed.contains(&rel.kind) {
@@ -5142,12 +6264,10 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
                 .collect()
         })
         .unwrap_or_default();
-    let mut spine_steps = 0usize;
-    let mut spine_crossing = 0usize;
     // Carries the clipped node's id as well as its name. The remediation at the
     // cap sends the caller to `graph_neighborhood`, which addresses by id, and a
     // name is not an address there.
-    let mut widest: Option<(String, String, u64, u64)> = None;
+    let mut nodes: Vec<crate::remediation::SpineNode> = Vec::new();
     if let Some(clips) = result["clipped_steps"].as_array_mut() {
         for clip in clips.iter_mut() {
             let on_spine = clip["step"]
@@ -5157,54 +6277,45 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
             if !on_spine {
                 continue;
             }
-            spine_steps += 1;
-            spine_crossing += clip["dropped_crossing_file"].as_u64().unwrap_or(0) as usize;
-            let dropped = clip["dropped_callees"].as_u64().unwrap_or(0)
-                + clip["dropped_callers"].as_u64().unwrap_or(0);
-            if widest
-                .as_ref()
-                .is_none_or(|(_, _, most, _)| dropped > *most)
-            {
-                widest = Some((
-                    clip["entity_id"].as_str().unwrap_or_default().to_string(),
-                    clip["entity_name"].as_str().unwrap_or_default().to_string(),
-                    dropped,
-                    clip["limit_per_step"].as_u64().unwrap_or(0),
-                ));
-            }
+            nodes.push(crate::remediation::SpineNode {
+                entity_id: clip["entity_id"].as_str().unwrap_or_default().to_string(),
+                entity_name: clip["entity_name"].as_str().unwrap_or_default().to_string(),
+                dropped: (clip["dropped_callees"].as_u64().unwrap_or(0)
+                    + clip["dropped_callers"].as_u64().unwrap_or(0))
+                    as usize,
+                dropped_crossing_file: Some(
+                    clip["dropped_crossing_file"].as_u64().unwrap_or(0) as usize
+                ),
+                limit_per_step: clip["limit_per_step"].as_u64().unwrap_or(0) as usize,
+            });
         }
     }
-    if spine_steps == 0 {
+    if nodes.is_empty() {
         return;
     }
-    result["spine_clipped_steps"] = serde_json::Value::from(spine_steps);
+    result["spine_clipped_steps"] = serde_json::Value::from(nodes.len());
+    let spine_crossing: usize = nodes
+        .iter()
+        .filter_map(|node| node.dropped_crossing_file)
+        .sum();
     if spine_crossing > 0 {
         result["spine_dropped_crossing_file"] = serde_json::Value::from(spine_crossing);
     }
-    let Some((id, name, dropped, limit)) = widest else {
+    // One producer for both walks and for the response-budget pass that
+    // restates this disclosure after it cuts the chain further. Its remediation
+    // is built from the ceiling the schema declares rather than from the cap
+    // that clipped, so the sentence cannot name a value the call refuses. See
+    // `crate::remediation::spine_clipped`.
+    let Some((detail, remediation)) = crate::remediation::spine_clipped_disclosure(&nodes) else {
         return;
-    };
-    let crossing = if spine_crossing > 0 {
-        format!(", {spine_crossing} of which lived outside the file of the node that offered them")
-    } else {
-        String::new()
     };
     append_trace_degradation(
         result,
         serde_json::json!({
             "component": "fanout_cap",
             "reason": "spine_clipped",
-            "detail": format!(
-                "the walk continued beneath {spine_steps} node(s) whose fan-out limit_per_step \
-                 {limit} had already cut, dropping neighbors that were never followed{crossing}; \
-                 the widest was '{name}', which offered {dropped} more than the cap kept. This \
-                 chain is one route among the ones the cap left, so a hop it does not contain \
-                 was not looked for and its absence proves nothing"
-            ),
-            // Built from the ceiling the schema declares rather than from the
-            // cap that clipped, so the sentence cannot name a value the call
-            // refuses. See `crate::remediation::spine_clipped`.
-            "remediation": crate::remediation::spine_clipped(&name, &id, limit as usize, dropped as usize),
+            "detail": detail,
+            "remediation": remediation,
         }),
     );
 }
@@ -5316,7 +6427,11 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
     fn measure(value: &serde_json::Value) -> usize {
         serde_json::to_string_pretty(value).map_or(usize::MAX, |json| json.len())
     }
-    if measure(result) <= max_chars {
+    // The size the walk measured before any cut. Recorded on the payload beside
+    // the cut's disclosure, because a pass that bounds the reply later can
+    // measure only what this hands it.
+    let walked_from = measure(result);
+    if walked_from <= max_chars {
         return;
     }
     let target = max_chars.saturating_sub(TRACE_DISCLOSURE_RESERVE_CHARS);
@@ -5335,6 +6450,7 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
             return;
         }
         result["steps_omitted"] = serde_json::Value::from(omitted);
+        result["chars_before_budget"] = serde_json::Value::from(walked_from);
         crate::budget::record_elision(result, "chain", full.len(), omitted);
         result["truncated"] = serde_json::Value::Bool(true);
         // `steps_omitted` and not a reason of its own: the reason code names
@@ -5345,10 +6461,10 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
             "component": "response_budget",
             "reason": "steps_omitted",
             "detail": format!(
-                "the response exceeded its {max_chars}-character budget, so {omitted} steps were \
-                 dropped as whole branches, least relevant first, rather than from the end of the \
-                 chain; re-query a node with a smaller limit_per_step, or raise \
-                 max_response_chars to receive them"
+                "the walk exceeded its {max_chars}-byte UTF-8 budget, so it dropped {} as whole \
+                 branches, least relevant first, rather than from the end of the chain; re-query \
+                 a node with a smaller limit_per_step, or raise max_response_chars to receive them",
+                crate::remediation::counted(omitted, "step", "steps")
             ),
         });
         append_trace_degradation(result, disclosure);
@@ -5387,6 +6503,7 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
         return;
     }
     result["steps_omitted"] = serde_json::Value::from(omitted);
+    result["chars_before_budget"] = serde_json::Value::from(walked_from);
     // The same loss in the shape every budgeted list reports it in, so a caller
     // reads one key whether the tool cut a chain or a bucket of tests.
     crate::budget::record_elision(result, "chain", kept, omitted);
@@ -5405,9 +6522,9 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
         "component": "response_budget",
         "reason": "steps_omitted",
         "detail": format!(
-            "the response exceeded its {max_chars}-character budget, so {omitted} steps were \
-             dropped from the end of the chain; this arm inlines no bodies, so steps are all it \
-             can shed"
+            "the walk exceeded its {max_chars}-byte UTF-8 budget, so it dropped {} from the end \
+             of the chain; this arm inlines no bodies, so steps are all it can shed",
+            crate::remediation::counted(omitted, "step", "steps")
         ),
         "remediation": format!(
             "narrow the walk with a smaller depth or limit_per_step; {}",
@@ -5473,14 +6590,26 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         None => "both",
     };
 
-    // Resolve focal: UUID first, then exact-name lookup via the ranking path.
+    // Resolve focal: UUID first, then the name rule every surface shares. A
+    // name several owners share as their member name answers with every
+    // candidate rather than a walk from one of them.
     let focal_id = uuid::Uuid::parse_str(trimmed).ok();
     let focal_entity = if let Some(uuid) = focal_id {
         store
             .get_entity(&kin_model::ids::EntityId(uuid))
             .map_err(McpError::graph)?
     } else {
-        select_best_reference_target(store, trimmed).map_err(McpError::graph)?
+        match kin_ranking::entity_ranking::resolve_name(store, trimmed).map_err(McpError::graph)? {
+            kin_ranking::entity_ranking::NameResolution::One(entity) => Some(entity),
+            kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) => {
+                return trace_name_candidates_reply(
+                    trimmed,
+                    &candidates,
+                    crate::budget::ResponseBudget::from_arguments(args).max_chars,
+                );
+            }
+            kin_ranking::entity_ranking::NameResolution::Missing => None,
+        }
     };
     let Some(focal_entity) = focal_entity else {
         return Ok(ToolCallResult::error(format!(
@@ -5541,6 +6670,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     // asked for is still the chain.
     let mut target_name: Option<String> = None;
     let mut target_unresolved: Option<String> = None;
+    let mut target_shared: Option<(String, Vec<kin_model::Entity>)> = None;
     let mut callee_reach: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
     let mut caller_reach: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
     if let Some(target) = get_optional_string_param(args, "target")
@@ -5551,7 +6681,19 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             Some(uuid) => store
                 .get_entity(&kin_model::ids::EntityId(uuid))
                 .map_err(McpError::graph)?,
-            None => select_best_reference_target(store, &target).map_err(McpError::graph)?,
+            None => match kin_ranking::entity_ranking::resolve_name(store, &target)
+                .map_err(McpError::graph)?
+            {
+                kin_ranking::entity_ranking::NameResolution::One(entity) => Some(entity),
+                kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) => {
+                    // Ranking toward one owner's member would be a silent pick
+                    // of the question itself; the walk ranks by relevance and
+                    // says why.
+                    target_shared = Some((target.clone(), candidates));
+                    None
+                }
+                kin_ranking::entity_ranking::NameResolution::Missing => None,
+            },
         };
         match resolved {
             Some(entity) => {
@@ -5567,6 +6709,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 }
                 target_name = Some(entity.name.clone());
             }
+            None if target_shared.is_some() => {}
             None => target_unresolved = Some(target),
         }
     }
@@ -5582,8 +6725,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             if node.depth >= depth {
                 continue;
             }
-            let relations = store
-                .get_all_relations_for_entity(&node.id)
+            let relations = kin_index::relation_read::relations_for_read(store, &node.id)
                 .map_err(McpError::graph)?;
             // Every neighbor is collected before any is kept: a per-step cap is
             // a choice between candidates, and a loop that admits as it reads
@@ -5692,6 +6834,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             crossing,
                             reference_lines: Vec::new(),
                             reference_spans_outside_caller_file: 0,
+                            reference_sites_withheld: false,
                         });
                         candidates.len() - 1
                     }
@@ -5717,7 +6860,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     } else {
                         candidates[candidate_at].entity.file_origin.as_ref()
                     };
-                    let tally = relation_reference_lines(rel, caller_file);
+                    let (tally, withheld) =
+                        super::common::proven_relation_reference_lines(rel, caller_file);
+                    candidates[candidate_at].reference_sites_withheld |= withheld;
                     candidates[candidate_at].reference_lines.extend(tally.lines);
                     candidates[candidate_at].reference_spans_outside_caller_file +=
                         tally.outside_caller_file;
@@ -5806,7 +6951,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             candidate.relation_kind,
                             include_type_edges,
                         );
-                        let promoted = trace_step_value(
+                        let mut promoted = trace_step_value(
                             existing,
                             chain[existing - 1]["role"].as_str().unwrap_or("callee"),
                             chain[existing - 1]["relation_kind"]
@@ -5831,6 +6976,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             promoted_terminal,
                             candidate.crossing.as_ref(),
                         );
+                        promoted["reference_lines_partial_reason"] =
+                            chain[existing - 1]["reference_lines_partial_reason"].clone();
                         chain[existing - 1] = promoted;
                         // The record that replaced the placeholder brings its
                         // own language, and the coverage verdict this step is
@@ -5878,6 +7025,12 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     terminal,
                     candidate.crossing.as_ref(),
                 ));
+                chain.last_mut().expect("new trace step")["reference_lines_partial_reason"] =
+                    if candidate.reference_sites_withheld {
+                        serde_json::json!("unconfirmed_sites_withheld")
+                    } else {
+                        serde_json::Value::Null
+                    };
                 step_language.insert(step_index, candidate.entity.language);
                 if terminal.is_none() && next_depth < depth {
                     next_frontier.push(TraceFrontierNode::at(
@@ -6025,17 +7178,27 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     if let Some(name) = target_name {
         result["target_name"] = serde_json::Value::from(name);
     }
+    if let Some((target, candidates)) = target_shared {
+        let disclosure =
+            target_ambiguous_degradation(&target, CandidateReason::SharedMemberName, &candidates);
+        result["target_ambiguity"] = trace_target_listing(&disclosure);
+        append_trace_degradation(
+            &mut result,
+            serde_json::json!({
+                "component":disclosure["component"],"reason":disclosure["reason"],
+                "detail":disclosure["detail"],"remediation":disclosure["remediation"],
+            }),
+        );
+    }
     if let Some(target) = target_unresolved {
+        let (detail, remediation) = crate::remediation::trace_target_not_resolved(&target);
         append_trace_degradation(
             &mut result,
             serde_json::json!({
                 "component": "target_reachability",
                 "reason": "target_not_resolved",
-                "detail": format!(
-                    "no entity matches target '{target}', so this walk ranked its fan-out by \
-                     relevance alone and the question had no vote in what the cap kept"
-                ),
-                "remediation": "check the target's spelling, or find it first with semantic_locate",
+                "detail": detail,
+                "remediation": remediation,
             }),
         );
     }
@@ -6045,11 +7208,12 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     if external_identities_merged > 0 {
         result["external_identities_merged"] = serde_json::Value::from(external_identities_merged);
     }
-    let max_response_chars = trace_response_budget(
-        args.get("max_response_chars")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize),
-    );
+    // Read by the rule the envelope pass grades the reply by: `max_chars` first,
+    // then the older `max_response_chars`, clamped the same way. Reading only
+    // the older spelling walked a `max_chars: 2000` call under the 45,000
+    // default while the envelope cut the reply to 2,000, and the payload's
+    // `max_response_chars` then contradicted `_kin.response.max_chars`.
+    let max_response_chars = crate::budget::ResponseBudget::from_arguments(args).max_chars;
     result["max_response_chars"] = serde_json::Value::from(max_response_chars);
     // Set before the bound so it is on every response, not only the cut ones.
     // The bounder returns at its first line when the payload already fits, and
@@ -6105,8 +7269,13 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         result["focal_terminal"] = serde_json::Value::from(focal_terminal.as_str());
     }
 
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    let fits = fit_trace_ambiguity_payload(&mut result, max_response_chars);
+    let json = crate::budget::render(&result).map_err(McpError::Json)?;
+    Ok(if fits {
+        ToolCallResult::text(json)
+    } else {
+        ToolCallResult::error(json)
+    })
 }
 
 /// How many entities carry `name` exactly, the focal included.
@@ -6127,7 +7296,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
 /// short query is a substring: `find_references(query: "get")` matches every
 /// getter in the repository, and a resolution note is not the place to
 /// enumerate them.
-const RESOLUTION_CANDIDATES_LISTED_MAX: usize = 10;
+pub const RESOLUTION_CANDIDATES_LISTED_MAX: usize = 10;
 
 /// How many entities the caller's QUERY could have meant, and which ones the
 /// resolver did not pick.
@@ -6208,6 +7377,22 @@ pub fn focal_resolution_for<G: GraphStore>(
     query: Option<&str>,
 ) -> Result<serde_json::Value> {
     let (same_name_candidates, other_candidates, matched_by) = match query {
+        // A bare member name that one owner carries resolved by the member
+        // rule, which excludes every name that merely contains the query, so
+        // the set it chose among is that one member. Counting the substring
+        // cousins here would call a settled answer ambiguous: `route` on
+        // pallets/flask resolves to `Scaffold.route` and used to report 16.
+        Some(query)
+            if kin_ranking::entity_ranking::is_member_name_match(target, query)
+                && matches!(
+                    kin_ranking::entity_ranking::reach_by_name(store, query)
+                        .map_err(McpError::graph)?,
+                    kin_ranking::entity_ranking::NameReach::Members(ref members)
+                        if members.len() == 1 && members[0].id == target.id
+                ) =>
+        {
+            (1, Vec::new(), "member_name")
+        }
         Some(query) => {
             let (count, others) = query_resolution_candidates(store, query, &target.id)?;
             (count, others, "query_name_pattern")
@@ -6352,8 +7537,7 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
             if current_depth >= depth {
                 continue;
             }
-            let edges = store
-                .get_all_relations_for_entity(&current)
+            let edges = kin_index::relation_read::relations_for_read(store, &current)
                 .map_err(McpError::graph)?;
             for rel in &edges {
                 let src_entity = rel.src.as_entity();
@@ -6709,6 +7893,15 @@ pub struct GraphStatusReport {
     /// is allowed into this schema.
     #[serde(default, rename = "_kin", skip_serializing_if = "Option::is_none")]
     pub response_envelope: Option<crate::envelope::Envelope>,
+    /// A separate bounded source observation; it does not attest these counters
+    /// and every earlier query read were captured atomically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_derivation: Option<crate::source_derivation::SourceDerivationObservation>,
+    /// The workspace instant a unit-addressed create or import change carries
+    /// as its `repository_base`. Read from repository authority when the
+    /// answer is sent, independently of the counters above, and only for HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_base: Option<crate::source_unit::RepositoryBase>,
 }
 
 #[derive(Deserialize)]
@@ -6741,6 +7934,10 @@ struct GraphStatusReportWire {
     stale: Option<GraphStatusStaleness>,
     #[serde(default, rename = "_kin")]
     response_envelope: Option<crate::envelope::Envelope>,
+    #[serde(default)]
+    source_derivation: Option<crate::source_derivation::SourceDerivationObservation>,
+    #[serde(default)]
+    repository_base: Option<crate::source_unit::RepositoryBase>,
 }
 
 impl<'de> Deserialize<'de> for GraphStatusReport {
@@ -6769,6 +7966,8 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             completion_attested: wire.completion_attested,
             stale: wire.stale,
             response_envelope: wire.response_envelope,
+            source_derivation: wire.source_derivation,
+            repository_base: wire.repository_base,
         };
         report.validate().map_err(serde::de::Error::custom)?;
         Ok(report)
@@ -6843,8 +8042,21 @@ impl GraphStatusReport {
                 return Err("stale.note is empty, so the disclosure says nothing".to_string());
             }
         }
+        if let Some(observation) = &self.source_derivation {
+            use crate::source_derivation::SourceObservationScope;
+            if self.scope == GraphStatusScope::TemporalSession
+                && observation.scope == SourceObservationScope::LiveHead
+            {
+                return Err("temporal graph status carries a live HEAD source observation".into());
+            }
+        }
         if let Some(envelope) = &self.response_envelope {
             self.validate_response_envelope(envelope)?;
+            if envelope.source_derivation != self.source_derivation {
+                return Err(
+                    "_kin source derivation differs from the selected producer observation".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -7016,6 +8228,8 @@ pub fn handle_daemon_graph_status_observation(
         completion_attested: false,
         stale: None,
         response_envelope: None,
+        source_derivation: None,
+        repository_base: None,
     };
     report.validate().map_err(crate::McpError::Other)?;
     Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
@@ -7056,9 +8270,40 @@ pub fn handle_daemon_graph_status_stale_observation(
         completion_attested: false,
         stale: Some(staleness),
         response_envelope: None,
+        source_derivation: None,
+        repository_base: None,
     };
     report.validate().map_err(crate::McpError::Other)?;
     Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
+}
+
+/// Attach the repository base a caller's next unit-addressed write carries.
+///
+/// The base is not a graph counter and is read outside the counters' fence,
+/// so it rides on an already-validated report rather than inside the
+/// observation. An error result, an unreadable report or an absent base
+/// leaves the answer exactly as it was.
+pub fn with_repository_base(
+    result: ToolCallResult,
+    base: Option<crate::source_unit::RepositoryBase>,
+) -> ToolCallResult {
+    let Some(base) = base else {
+        return result;
+    };
+    if result.is_error == Some(true) {
+        return result;
+    }
+    let Some(crate::types::ContentBlock::Text { text }) = result.content.first() else {
+        return result;
+    };
+    let Ok(mut report) = serde_json::from_str::<GraphStatusReport>(text) else {
+        return result;
+    };
+    report.repository_base = Some(base);
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) if report.validate().is_ok() => ToolCallResult::text(text),
+        _ => result,
+    }
 }
 
 /// Fail closed on the generic in-process dispatcher.
@@ -7444,6 +8689,7 @@ mod tests {
                 via_override_of: None,
                 receiver_name_guess: false,
                 role: Some(EntityRole::Test),
+                edges: Vec::new(),
             },
             false,
         );
@@ -7466,6 +8712,7 @@ mod tests {
                 via_override_of: None,
                 receiver_name_guess: false,
                 role: None,
+                edges: Vec::new(),
             },
             false,
         );
@@ -7797,6 +9044,14 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// An owner's member, a method the way every language adapter records one:
+    /// kind `Method`, named by its owner.
+    fn make_method_in(language: LanguageId, name: &str, file: &str) -> Entity {
+        let mut entity = make_entity_in(language, name, file);
+        entity.kind = EntityKind::Method;
+        entity
     }
 
     fn make_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
@@ -8554,6 +9809,140 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn derived_member_persisted_legacy_edges_remain_candidates_before_relink() {
+        let source = "const app = {}; for (const key of ['get']) { app[key] = () => 1; }";
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let hash = kin_blobs::BlobStore::new(blobs_dir.path().join("objects"))
+            .unwrap()
+            .write(source.as_bytes())
+            .unwrap();
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(&FilePathId::new("members.js"), source.as_bytes(), hash)
+            .unwrap()
+            .indexed_file;
+        let candidate = indexed
+            .entities
+            .iter()
+            .find(|e| e.name == "app.get")
+            .unwrap();
+        for representation in ["typed", "legacy", "malformed"] {
+            let mut target = candidate.clone();
+            if representation == "legacy" {
+                let derivation = kin_model::entity_derivation(&target).unwrap().unwrap();
+                target
+                    .metadata
+                    .extra
+                    .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+                target.span = Some(derivation.generator);
+                target.doc_summary =
+                    Some("Derived from a loop over `names`; no literal `get` declaration".into());
+            } else if representation == "malformed" {
+                target.metadata.extra.insert(
+                    kin_model::derivation::ENTITY_DERIVATION_KEY.into(),
+                    serde_json::json!({"schema": "unknown"}),
+                );
+            }
+            let graph = InMemoryGraph::new();
+            let caller = make_entity_in(LanguageId::JavaScript, "caller", "caller.js");
+            let ordinary = make_entity_in(LanguageId::JavaScript, "ordinary", "ordinary.js");
+            for entity in [&target, &caller, &ordinary] {
+                graph.upsert_entity(entity).unwrap();
+            }
+            let mut old_call = make_relation(caller.id, target.id, RelationKind::Calls);
+            old_call.origin = match representation {
+                "typed" => RelationOrigin::Manual,
+                "malformed" => RelationOrigin::Lsp,
+                _ => RelationOrigin::Parsed,
+            };
+            let mut old_override = make_relation(target.id, ordinary.id, RelationKind::Overrides);
+            old_override.origin = RelationOrigin::Lsp;
+            let ordinary_call = make_relation(caller.id, ordinary.id, RelationKind::Calls);
+            for relation in [&old_call, &old_override, &ordinary_call] {
+                graph.upsert_relation(relation).unwrap();
+            }
+            // Persist the pre-upgrade shape through the product snapshot format,
+            // close it and reopen without a parser or linker ever visiting it.
+            let dir = tempfile::tempdir().unwrap();
+            let snapshot_path = dir.path().join("legacy.kndb");
+            std::fs::write(&snapshot_path, graph.to_snapshot().to_bytes().unwrap()).unwrap();
+            drop(graph);
+            let snapshot = kin_db::storage::format::GraphSnapshot::from_bytes(
+                &std::fs::read(&snapshot_path).unwrap(),
+            )
+            .unwrap();
+            let graph = InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+            let raw = graph.get_all_relations_for_entity(&target.id).unwrap();
+            assert!(raw
+                .iter()
+                .all(|r| r.confidence == 1.0 && r.evidence.is_empty()));
+            assert!(raw.iter().all(|r| RelationResolution::of(r).is_proven()));
+            let view = kin_index::relation_read::relations_for_read(&graph, &target.id).unwrap();
+            assert_eq!(view.len(), 1, "{representation}");
+            assert_eq!(view[0].kind, RelationKind::Calls);
+            assert_eq!(view[0].confidence, 0.3);
+            assert!(!RelationResolution::of(&view[0]).is_proven());
+            assert!(kin_index::resolution::is_receiver_name_guess(&view[0]));
+            let ordinary_view =
+                kin_index::relation_read::relations_for_read(&graph, &ordinary.id).unwrap();
+            assert_eq!(ordinary_view.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&ordinary_view[0]).unwrap(),
+                serde_json::to_value(&ordinary_call).unwrap()
+            );
+            // Explicit candidate evidence cannot be laundered by ordinary
+            // endpoint records or a later language-server origin/confidence.
+            let mut marked = ordinary_call.clone();
+            marked.origin = RelationOrigin::Lsp;
+            marked.evidence.push(RelationEvidence {
+                parser_rule: Some(kin_model::derivation::DERIVED_MEMBER_CANDIDATE_RULE.into()),
+                ..Default::default()
+            });
+            let mut marked_view = vec![marked];
+            kin_index::relation_read::project_relations_for_read(&graph, &mut marked_view).unwrap();
+            assert_eq!(marked_view[0].confidence, 0.3);
+            assert!(kin_index::resolution::is_receiver_name_guess(
+                &marked_view[0]
+            ));
+            let args = HashMap::from([("entity_id".into(), serde_json::json!(target.id))]);
+            let refs = parsed_response(&handle_find_references(&args, &graph, None).await.unwrap());
+            assert_eq!(refs["total_upstream"], 0, "{representation}: {refs}");
+            assert_eq!(refs["candidates"].as_array().unwrap().len(), 1, "{refs}");
+            assert_eq!(refs["candidates"][0]["resolution"], "name_only");
+            assert!(
+                !has_incoming_reference_edge(&graph, &target.id, &[RelationKind::Calls]).unwrap()
+            );
+            let bulk_args = HashMap::from([(
+                "entity_ids".into(),
+                serde_json::json!([target.id, ordinary.id]),
+            )]);
+            let bulk = parsed_response(&handle_bulk_check_references(&bulk_args, &graph).unwrap());
+            let rows = bulk["results"].as_array().unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r["entity_id"] == serde_json::json!(target.id))
+                .unwrap();
+            assert!(row["has_references"].is_null(), "{representation}: {bulk}");
+            assert_eq!(row["known_reference_count"], 0);
+            assert_eq!(row["derived_candidate_count"], 1);
+            assert_eq!(row["verdict_complete"], false);
+            assert_eq!(row["reference_count_complete"], false);
+            let control = rows
+                .iter()
+                .find(|r| r["entity_id"] == serde_json::json!(ordinary.id))
+                .unwrap();
+            assert_eq!(control["has_references"], true);
+            assert_eq!(control["known_reference_count"], 1);
+            assert_eq!(control["derived_candidate_count"], 0);
+            // A semantic read neither rewrites history nor silently repairs the store.
+            assert_eq!(
+                serde_json::to_value(graph.get_all_relations_for_entity(&target.id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(raw).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn bulk_check_references_compact_and_verbose_shapes() {
         let store = InMemoryGraph::new();
@@ -8599,7 +9988,11 @@ mod tests {
             .unwrap();
         assert_eq!(live_row["has_references"], true);
         assert!(live_row["reference_count"].is_null());
-        assert_eq!(live_row["known_reference_count"], 2);
+        // One caller holding a `Calls` and an `Imports` edge is one caller, as
+        // `find_references` counts it. The batch counted edges and said 2.
+        assert_eq!(live_row["known_reference_count"], 1);
+        assert_eq!(live_row["counting_floor"], "import_scoped");
+        assert_eq!(live_row["name_only_ceiling_kept"], 0);
         assert_eq!(live_row["reference_count_complete"], false);
         assert_eq!(live_row["verdict_complete"], true);
         assert!(
@@ -9558,8 +10951,10 @@ mod tests {
         assert!(referenced.contains(&"cmd/app/emit.go"), "{body}");
     }
 
-    /// FIR-2475. The ambiguity counter above cannot count ambiguity on any
-    /// language that qualifies a method name, which is most of them.
+    /// The ambiguity counter alone cannot count ambiguity on any language
+    /// that qualifies a method name, which is most of them, and even naming
+    /// the count could only ever describe one winner and discard the other
+    /// candidates' own reference lists.
     ///
     /// Measured on pallets/flask at d318b683 with npm `@kinlab/kin@0.5.42`:
     /// `find_references(query: "dispatch_request")` resolved
@@ -9568,28 +10963,31 @@ mod tests {
     /// `total_matches: 6`. Three of those are source-role methods whose
     /// unqualified name is exactly `dispatch_request`, in two files.
     ///
-    /// Two bugs stack. The count is taken against the RESOLVED focal's qualified
-    /// name rather than against the query the caller typed, and it is taken with
-    /// exact string equality rather than the substring rule the resolver ranked
-    /// with. So for a qualified-name language the answer is pinned at one
-    /// whatever the caller asked, the `ambiguous_name` degradation can never
-    /// fire, and a reader following FIR-2439's own advice gets an explicit
-    /// assurance that there was nothing to disambiguate. The fixture above
-    /// passes only because its two entities carry bare identical names.
+    /// The original count bug is fixed elsewhere (the count is taken against
+    /// what the CALLER typed, not the resolved focal's qualified name, and by
+    /// the same pattern rule the resolver ranked with). This is the sharper
+    /// fix on top of it: rather than count three candidates and still answer
+    /// for only one, `find_references` now sections a full reply for each of
+    /// the three under `candidates_by_owner`, labelled by its own
+    /// owner-qualified name. `find_references_reports_an_ambiguous_name_resolution`
+    /// beside this test is the fixture that does NOT section: two bare,
+    /// unqualified identically-named functions have no owner-qualified name
+    /// to label a section with, so that case keeps the single-answer-plus-count
+    /// shape this one used to have.
     #[tokio::test]
     async fn find_references_counts_what_the_query_could_have_meant() {
         let store = InMemoryGraph::new();
-        let app = make_entity_in(
+        let app = make_method_in(
             LanguageId::Python,
             "Flask.dispatch_request",
             "src/flask/app.py",
         );
-        let base = make_entity_in(
+        let base = make_method_in(
             LanguageId::Python,
             "View.dispatch_request",
             "src/flask/views.py",
         );
-        let derived = make_entity_in(
+        let derived = make_method_in(
             LanguageId::Python,
             "MethodView.dispatch_request",
             "src/flask/views.py",
@@ -9599,8 +10997,8 @@ mod tests {
         }
 
         // The control. Three distinct entities really do answer to this query in
-        // this store, so a response reporting one candidate is reporting a fact
-        // the store contradicts rather than a small repository.
+        // this store, so a response reporting fewer is reporting a fact the
+        // store contradicts rather than a small repository.
         let matched = store
             .query_entities(&kin_model::graph::EntityFilter {
                 name_pattern: Some("dispatch_request".to_string()),
@@ -9618,35 +11016,57 @@ mod tests {
         args.insert("query".to_string(), serde_json::json!("dispatch_request"));
         let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
 
-        assert_eq!(body["focal_resolution"]["addressed_by"], "name");
         assert_eq!(
-            body["focal_resolution"]["same_name_candidates"], 3,
-            "the count must answer what the QUERY could have meant, not how many \
-             entities carry the winner's qualified name: {body}"
+            body["ambiguous_focal"], true,
+            "three owner-qualified entities share this bare name, so the answer must say so: \
+             {body}"
         );
         assert_eq!(
-            body["focal_resolution"]["matched"], "query_name_pattern",
-            "the response must name the rule it counted by, or the number is unreadable: {body}"
+            body["candidate_count"], 3,
+            "the count must answer what the QUERY could have meant, not how many entities \
+             carry any one winner's qualified name: {body}"
+        );
+        assert!(
+            body.get("focal_entity").is_none()
+                && body.get("references").is_none()
+                && body.get("total_upstream").is_none(),
+            "a sectioned answer names no single winner at the top level: {body}"
         );
 
-        // A count alone tells an agent it guessed and leaves it no way to ask
-        // again. The rejected candidates travel with it, addressable by id.
-        let others = body["focal_resolution"]["other_candidates"]
+        // Every candidate gets its own labelled, full section rather than being
+        // rejected and reduced to an id a caller could look up.
+        let sections = body[AMBIGUOUS_CANDIDATES_KEY]
             .as_array()
-            .unwrap_or_else(|| {
-                panic!("an ambiguous resolution must name what it did not pick: {body}")
-            });
-        assert_eq!(others.len(), 2, "two candidates were not chosen: {body}");
-        let focal_id = body["focal_entity"]["id"].as_str().unwrap().to_string();
-        for other in others {
-            assert_ne!(
-                other["id"].as_str().unwrap(),
-                focal_id,
-                "the chosen entity is not one of the rejected ones: {body}"
+            .unwrap_or_else(|| panic!("an ambiguous resolution must section every match: {body}"));
+        assert_eq!(sections.len(), 3, "{body}");
+        let mut owner_qualified_names: Vec<&str> = sections
+            .iter()
+            .map(|section| {
+                section["owner_qualified_name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("every section must label itself: {section}"))
+            })
+            .collect();
+        owner_qualified_names.sort_unstable();
+        assert_eq!(
+            owner_qualified_names,
+            vec![
+                "Flask.dispatch_request",
+                "MethodView.dispatch_request",
+                "View.dispatch_request",
+            ],
+            "every candidate is labelled by its own owner-qualified name, none dropped, none \
+             merged into another's section: {body}"
+        );
+        for section in sections {
+            let label = section["owner_qualified_name"].as_str().unwrap();
+            assert_eq!(
+                section["focal_entity"]["name"], label,
+                "a section's own focal_entity must be the entity its label names: {section}"
             );
             assert!(
-                other["name"].is_string() && other["file_path"].is_string(),
-                "a rejected candidate must be re-askable: {other}"
+                section["references"].is_array() && section["total_upstream"].is_number(),
+                "a section carries a single-focal reply's own fields: {section}"
             );
         }
 
@@ -9656,8 +11076,11 @@ mod tests {
         assert!(
             degradations
                 .iter()
-                .any(|entry| entry["reason"] == "ambiguous_name"),
-            "the ambiguity must be named: {body}"
+                .any(|entry| entry["reason"] == "ambiguous_name"
+                    && entry["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains('3'))),
+            "the ambiguity must be named, with how many candidates: {body}"
         );
 
         // The verdict half of this is asserted where `negative_for` is callable
@@ -9674,12 +11097,12 @@ mod tests {
     #[tokio::test]
     async fn find_references_addressed_by_id_counts_exact_name_twins() {
         let store = InMemoryGraph::new();
-        let app = make_entity_in(
+        let app = make_method_in(
             LanguageId::Python,
             "Flask.dispatch_request",
             "src/flask/app.py",
         );
-        let base = make_entity_in(
+        let base = make_method_in(
             LanguageId::Python,
             "View.dispatch_request",
             "src/flask/views.py",
@@ -9759,6 +11182,895 @@ mod tests {
         assert!(
             exact.get("degradations").is_none(),
             "pinning by id resolves nothing and must not degrade: {exact}"
+        );
+    }
+
+    /// A bare name that only ONE owner-qualified entity carries keeps today's
+    /// single-focal answer exactly as before: no sectioning, no
+    /// `ambiguous_focal`, and `focal_resolution.same_name_candidates` at 1.
+    ///
+    /// The control for the two tests beside it. Without it, a filter bug that
+    /// sectioned every owner-qualified query -- even one with nothing to
+    /// disambiguate -- could not be told apart from the feature working.
+    #[tokio::test]
+    async fn find_references_with_one_owner_qualified_match_is_not_sectioned() {
+        let store = InMemoryGraph::new();
+        let target = make_method_in(
+            LanguageId::Python,
+            "Flask.dispatch_request",
+            "src/flask/app.py",
+        );
+        store.upsert_entity(&target).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("dispatch_request"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert!(
+            body.get("ambiguous_focal").is_none() && body.get(AMBIGUOUS_CANDIDATES_KEY).is_none(),
+            "one match is not an ambiguity: {body}"
+        );
+        assert_eq!(
+            body["focal_entity"]["name"], "Flask.dispatch_request",
+            "{body}"
+        );
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 1,
+            "{body}"
+        );
+        assert!(
+            body.get("degradations").is_none(),
+            "one match must not degrade: {body}"
+        );
+    }
+
+    /// The core of this feature: a bare name two owner-qualified entities
+    /// share answers a full, labelled section for EACH of them in one reply,
+    /// with the ambiguity disclosed, rather than the resolver's single ranked
+    /// winner and the other's rows nowhere in the response.
+    ///
+    /// Each candidate gets its own caller, deliberately different ones, so a
+    /// version that merged the two candidates' rows into one undifferentiated
+    /// list -- or that answered for one and left the other's callers out --
+    /// fails this test where a same-shaped single-section answer would not.
+    #[tokio::test]
+    async fn find_references_sections_a_bare_name_two_owners_share() {
+        let store = InMemoryGraph::new();
+        let base = make_method_in(LanguageId::Python, "Database.resolve", "src/database.py");
+        let other = make_method_in(LanguageId::Python, "LinkGraph.resolve", "src/link_graph.py");
+        store.upsert_entity(&base).unwrap();
+        store.upsert_entity(&other).unwrap();
+
+        let base_caller = make_entity_in(LanguageId::Python, "load_record", "src/database.py");
+        store.upsert_entity(&base_caller).unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                base_caller.id,
+                base.id,
+                RelationKind::Calls,
+                "src/database.py",
+                10,
+            ))
+            .unwrap();
+
+        let other_caller = make_entity_in(LanguageId::Python, "walk_edges", "src/link_graph.py");
+        store.upsert_entity(&other_caller).unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                other_caller.id,
+                other.id,
+                RelationKind::Calls,
+                "src/link_graph.py",
+                20,
+            ))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("resolve"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        assert_eq!(body["ambiguous_focal"], true, "{body}");
+        assert_eq!(body["candidate_count"], 2, "{body}");
+        let sections = body[AMBIGUOUS_CANDIDATES_KEY].as_array().unwrap();
+        assert_eq!(sections.len(), 2, "{body}");
+
+        let section_for = |owner_qualified_name: &str| {
+            sections
+                .iter()
+                .find(|section| section["owner_qualified_name"] == owner_qualified_name)
+                .unwrap_or_else(|| panic!("no section labelled '{owner_qualified_name}': {body}"))
+        };
+
+        let base_section = section_for("Database.resolve");
+        assert_eq!(
+            base_section["entity_id"],
+            base.id.to_string(),
+            "{base_section}"
+        );
+        assert_eq!(base_section["total_upstream"], 1, "{base_section}");
+        let base_callers: Vec<&str> = base_section["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            base_callers,
+            vec!["load_record"],
+            "Database.resolve's own section must carry its own caller, not the other \
+             candidate's: {base_section}"
+        );
+
+        let other_section = section_for("LinkGraph.resolve");
+        assert_eq!(
+            other_section["entity_id"],
+            other.id.to_string(),
+            "{other_section}"
+        );
+        assert_eq!(other_section["total_upstream"], 1, "{other_section}");
+        let other_callers: Vec<&str> = other_section["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            other_callers,
+            vec!["walk_edges"],
+            "LinkGraph.resolve's own section must carry its own caller, and not \
+             Database.resolve's: {other_section}"
+        );
+
+        // Neither section's own `degradations` (if any) is what discloses the
+        // ambiguity -- that is a fact about the QUERY, not about one candidate
+        // -- so it travels once, at the top.
+        let degradations = body["degradations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a sectioned answer must degrade: {body}"));
+        let disclosure = degradations
+            .iter()
+            .find(|entry| entry["reason"] == "ambiguous_name")
+            .unwrap_or_else(|| panic!("the ambiguity must be named: {body}"));
+        assert_eq!(disclosure["component"], "focal_resolution", "{disclosure}");
+        let detail = disclosure["detail"].as_str().unwrap();
+        assert!(detail.contains("resolve"), "{detail}");
+        assert!(
+            detail.contains("owner-qualified"),
+            "the disclosure must point the caller at the remedy: {detail}"
+        );
+    }
+
+    /// The pallets/flask shape the bare-name benchmark arm lost 25 points on:
+    /// one owner-qualified `App.template_global` beside a substring cousin
+    /// that is referenced far more. Every name-ranking term used to tie or
+    /// favor the cousin, because no member's whole name is its bare name, so
+    /// the query answered about `Blueprint.app_template_global`.
+    #[tokio::test]
+    async fn a_lone_member_name_outranks_its_substring_cousins() {
+        let store = InMemoryGraph::new();
+        let member = make_method_in(
+            LanguageId::Python,
+            "App.template_global",
+            "src/flask/sansio/app.py",
+        );
+        let cousin = make_method_in(
+            LanguageId::Python,
+            "Blueprint.app_template_global",
+            "src/flask/sansio/blueprints.py",
+        );
+        store.upsert_entity(&member).unwrap();
+        store.upsert_entity(&cousin).unwrap();
+        for index in 0..3 {
+            let caller = make_entity_in(
+                LanguageId::Python,
+                &format!("caller_{index}"),
+                "tests/test_templating.py",
+            );
+            store.upsert_entity(&caller).unwrap();
+            store
+                .upsert_relation(&make_relation(caller.id, cousin.id, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("template_global"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(
+            body["focal_entity"]["name"], "App.template_global",
+            "the member the bare name names must win over a cousin that only contains it: {body}"
+        );
+        assert!(body.get("ambiguous_focal").is_none(), "{body}");
+        // The member rule settled the answer, so the resolution block counts the
+        // one member it chose among, and the cousin it excluded is no ambiguity.
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 1,
+            "{body}"
+        );
+        assert_eq!(body["focal_resolution"]["matched"], "member_name", "{body}");
+        assert!(
+            body["degradations"].as_array().is_none_or(|entries| entries
+                .iter()
+                .all(|entry| entry["reason"] != "ambiguous_name")),
+            "{body}"
+        );
+
+        let resolved =
+            kin_ranking::entity_ranking::resolve_name(&store, "template_global").unwrap();
+        assert!(
+            matches!(&resolved, kin_ranking::entity_ranking::NameResolution::One(entity) if entity.id == member.id),
+            "every single-answer surface resolves through this rule: {resolved:?}"
+        );
+    }
+
+    /// The name index answers a plain name with whole-name and token matches,
+    /// falls back to substrings only when it has neither, and drops a token
+    /// match set over its cap. On pallets/flask that hid `Request.blueprint`
+    /// behind the two `Blueprint` classes, so `blueprint` resolved to a class.
+    /// The member lookup asks the index by the owner separator's suffix, which
+    /// it answers whole.
+    #[tokio::test]
+    async fn a_member_the_name_index_hides_behind_whole_name_matches_is_still_reached() {
+        let store = InMemoryGraph::new();
+        let member = make_method_in(
+            LanguageId::Python,
+            "Request.blueprint",
+            "src/flask/wrappers.py",
+        );
+        store.upsert_entity(&member).unwrap();
+        for file in ["src/flask/blueprints.py", "src/flask/sansio/blueprints.py"] {
+            let mut class = make_entity_in(LanguageId::Python, "Blueprint", file);
+            class.kind = EntityKind::Class;
+            store.upsert_entity(&class).unwrap();
+        }
+        for index in 0..40 {
+            store
+                .upsert_entity(&make_entity_in(
+                    LanguageId::Python,
+                    &format!("test_blueprint_{index}"),
+                    "tests/test_blueprints.py",
+                ))
+                .unwrap();
+        }
+
+        // The control: the plain pattern really does leave the member out, or
+        // this test would pass without the suffix lookup.
+        let plain = store
+            .query_entities(&kin_model::graph::EntityFilter {
+                name_pattern: Some("blueprint".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            plain.iter().all(|entity| entity.id != member.id),
+            "control: the name index must hide the member for this fixture to mean anything"
+        );
+
+        let resolved = kin_ranking::entity_ranking::resolve_name(&store, "blueprint").unwrap();
+        assert!(
+            matches!(&resolved, kin_ranking::entity_ranking::NameResolution::One(entity) if entity.id == member.id),
+            "{resolved:?}"
+        );
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("blueprint"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(body["focal_entity"]["name"], "Request.blueprint", "{body}");
+    }
+
+    /// Three `get` members and a substring cousin, the pallets/flask shape
+    /// where `get_entity_source(entity_id: "get")` answered with the body of
+    /// the tutorial's `get_db` and said nothing about the choice.
+    fn shared_get_store() -> (InMemoryGraph, Vec<Entity>) {
+        let store = InMemoryGraph::new();
+        let scaffold = make_method_in(
+            LanguageId::Python,
+            "Scaffold.get",
+            "src/flask/sansio/scaffold.py",
+        );
+        let globals = make_method_in(LanguageId::Python, "_AppCtxGlobals.get", "src/flask/ctx.py");
+        let cousin = make_entity_in(LanguageId::Python, "get_db", "examples/flaskr/db.py");
+        for entity in [&scaffold, &globals, &cousin] {
+            store.upsert_entity(entity).unwrap();
+        }
+        (store, vec![globals, scaffold])
+    }
+
+    fn assert_lists_every_owner(body: &serde_json::Value, expected: &[Entity]) {
+        assert_eq!(body["ambiguous_focal"], true, "{body}");
+        assert_eq!(body["candidate_count"], expected.len(), "{body}");
+        let candidates = body["candidates"].as_array().expect("candidates");
+        let listed: Vec<(&str, &str, &str)> = candidates
+            .iter()
+            .map(|row| {
+                (
+                    row["name"].as_str().unwrap(),
+                    row["owner"].as_str().unwrap(),
+                    row["entity_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let wanted: Vec<(String, String, String)> = expected
+            .iter()
+            .map(|entity| {
+                (
+                    entity.name.clone(),
+                    entity.name.split('.').next().unwrap().to_string(),
+                    entity.id.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            wanted
+                .iter()
+                .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+                .collect::<Vec<_>>(),
+            "every owner's member, by file, with the id that addresses it: {body}"
+        );
+        assert!(
+            candidates.iter().all(|row| row["member_name"] == "get"),
+            "{body}"
+        );
+        assert!(
+            body.get("body").is_none() && body.get("focal_entity").is_none(),
+            "no single answer may ride beside the candidates: {body}"
+        );
+        assert!(
+            body["degradations"]
+                .as_array()
+                .is_some_and(|entries| entries
+                    .iter()
+                    .any(|entry| entry["reason"] == "ambiguous_name")),
+            "the envelope reads the ambiguity from this entry: {body}"
+        );
+    }
+
+    #[test]
+    fn get_entity_source_lists_every_owner_a_member_name_reaches() {
+        let (store, expected) = shared_get_store();
+        let mut args = HashMap::new();
+        args.insert("entity_id".to_string(), serde_json::json!("get"));
+        let body = parsed_response(&handle_get_entity_source(&args, &store, None).unwrap());
+        assert_lists_every_owner(&body, &expected);
+    }
+
+    #[test]
+    fn trace_tools_list_every_owner_a_member_name_reaches() {
+        let (store, expected) = shared_get_store();
+
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!("get"));
+        let body = parsed_response(&handle_trace_data_flow(&args, &store).unwrap());
+        assert_lists_every_owner(&body, &expected);
+
+        let sessions = SessionRegistry::empty_for_test();
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("get"));
+        let body =
+            parsed_response(&handle_trace_computation(&args, &store, &sessions, None).unwrap());
+        assert_lists_every_owner(&body, &expected);
+    }
+
+    /// A `target` is a hint that steers a walk, so a shared member name there
+    /// is disclosed rather than refused, and the walk still answers.
+    #[test]
+    fn a_shared_member_target_is_disclosed_and_the_walk_still_answers() {
+        let (store, _) = shared_get_store();
+        let focal = make_entity_in(LanguageId::Python, "dispatch", "src/flask/app.py");
+        store.upsert_entity(&focal).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!("dispatch"));
+        args.insert("target".to_string(), serde_json::json!("get"));
+        let body = parsed_response(&handle_trace_data_flow(&args, &store).unwrap());
+        assert_eq!(body["focal_entity"]["entity_name"], "dispatch", "{body}");
+        let degradations = body["degradations"].as_array().expect("degradations");
+        assert!(
+            degradations
+                .iter()
+                .any(|entry| entry["reason"] == "target_ambiguous"),
+            "{body}"
+        );
+        assert!(
+            degradations
+                .iter()
+                .all(|entry| entry["reason"] != "target_not_resolved"),
+            "the target is in the graph, so it must not read as unresolved: {body}"
+        );
+        assert!(body.get("target_name").is_none(), "{body}");
+    }
+
+    /// An exact whole name is its own tier and is never pooled with members:
+    /// `url_for` answers about the helper named `url_for`, not a section per
+    /// `Flask.url_for` beside it, and the answer still discloses the name's
+    /// other matches rather than hiding them.
+    #[tokio::test]
+    async fn an_exact_name_answers_ahead_of_members_that_share_it() {
+        let store = InMemoryGraph::new();
+        let helper = make_entity_in(LanguageId::Python, "url_for", "src/flask/helpers.py");
+        let method = make_method_in(LanguageId::Python, "Flask.url_for", "src/flask/app.py");
+        store.upsert_entity(&helper).unwrap();
+        store.upsert_entity(&method).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("url_for"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert!(
+            body.get("ambiguous_focal").is_none() && body.get(AMBIGUOUS_CANDIDATES_KEY).is_none(),
+            "an exact name is not sectioned with members: {body}"
+        );
+        assert_eq!(
+            body["focal_entity"]["id"],
+            serde_json::json!(helper.id),
+            "{body}"
+        );
+        let others: Vec<&str> = body["focal_resolution"]["other_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            others,
+            vec!["Flask.url_for"],
+            "the member is disclosed: {body}"
+        );
+
+        // The same holds for a struct and an enum variant of the same name, the
+        // Rust shape the review measured: the struct answers, and the variant
+        // is only a fallback when nothing is named exactly.
+        let store = InMemoryGraph::new();
+        let mut structure = make_entity_in(LanguageId::Rust, "Entity", "src/entity.rs");
+        structure.kind = EntityKind::Class;
+        let mut variant = make_entity_in(LanguageId::Rust, "GraphNodeId::Entity", "src/graph.rs");
+        variant.kind = EntityKind::EnumVariant;
+        store.upsert_entity(&structure).unwrap();
+        store.upsert_entity(&variant).unwrap();
+        match kin_ranking::entity_ranking::resolve_name(&store, "Entity").unwrap() {
+            kin_ranking::entity_ranking::NameResolution::One(entity) => {
+                assert_eq!(entity.id, structure.id)
+            }
+            other => panic!("the exact name must answer: {other:?}"),
+        }
+    }
+
+    /// The member contract is kind-qualified: an incidental last segment of a
+    /// module or a dotted function is never a member name.
+    #[test]
+    fn an_incidental_last_segment_is_not_a_member_name() {
+        let store = InMemoryGraph::new();
+        let mut module = make_entity_in(LanguageId::Python, "app.py", "app.py");
+        module.kind = EntityKind::Module;
+        let dotted = make_entity_in(LanguageId::JavaScript, "exports.render", "lib/view.js");
+        store.upsert_entity(&module).unwrap();
+        store.upsert_entity(&dotted).unwrap();
+        assert_eq!(
+            kin_ranking::entity_ranking::reach_by_name(&store, "py").unwrap(),
+            kin_ranking::entity_ranking::NameReach::Neither
+        );
+        assert_eq!(
+            kin_ranking::entity_ranking::reach_by_name(&store, "render").unwrap(),
+            kin_ranking::entity_ranking::NameReach::Neither
+        );
+    }
+
+    /// A source read answers only a name that names one entity. A partial name
+    /// used to hand back the best-ranked cousin's body and edit base: `get_d`
+    /// returned `get_db`. It lists candidates now, and so do exact twins; a
+    /// lone member and a single exact name still resolve, and an absent name
+    /// is still not found.
+    #[test]
+    fn a_source_read_never_selects_a_body_by_a_partial_or_ambiguous_name() {
+        let (store, _) = shared_get_store();
+        let route = make_method_in(
+            LanguageId::Python,
+            "Scaffold.route",
+            "src/flask/scaffold.py",
+        );
+        let twin_one = make_entity_in(LanguageId::Python, "resolve", "src/database.py");
+        let twin_two = make_entity_in(LanguageId::Python, "resolve", "src/link_graph.py");
+        for entity in [&route, &twin_one, &twin_two] {
+            store.upsert_entity(entity).unwrap();
+        }
+
+        let source = |name: &str| {
+            let mut args = HashMap::new();
+            args.insert("entity_id".to_string(), serde_json::json!(name));
+            handle_get_entity_source(&args, &store, None).unwrap()
+        };
+
+        let partial = parsed_response(&source("get_d"));
+        assert_eq!(partial["ambiguous_focal"], true, "{partial}");
+        assert_eq!(partial["resolution"], "partial_name", "{partial}");
+        assert_eq!(partial["candidates"][0]["name"], "get_db", "{partial}");
+        assert!(
+            partial.get("body").is_none() && partial.get("source_base").is_none(),
+            "a partial name must never hand back a body or an edit base: {partial}"
+        );
+
+        let twins = parsed_response(&source("resolve"));
+        assert_eq!(twins["resolution"], "same_name", "{twins}");
+        assert_eq!(twins["candidate_count"], 2, "{twins}");
+
+        use kin_ranking::entity_ranking::{resolve_name_strictly, StrictNameResolution};
+        assert!(matches!(
+            resolve_name_strictly(&store, "route").unwrap(),
+            StrictNameResolution::One(entity) if entity.id == route.id
+        ));
+        assert!(matches!(
+            resolve_name_strictly(&store, "get_db").unwrap(),
+            StrictNameResolution::One(entity) if entity.name == "get_db"
+        ));
+        assert!(matches!(
+            resolve_name_strictly(&store, "nothing_named_this").unwrap(),
+            StrictNameResolution::Missing
+        ));
+        let absent = source("nothing_named_this");
+        assert_eq!(absent.is_error, Some(true));
+    }
+
+    /// The batch source tool lists a name's candidates in its row rather than
+    /// calling the entity absent, on the offline path as on the daemon's.
+    #[test]
+    fn a_batch_row_for_an_ambiguous_name_lists_candidates_not_absence() {
+        let (store, expected) = shared_get_store();
+        let mut args = HashMap::new();
+        args.insert("entity_ids".to_string(), serde_json::json!(["get"]));
+        let body = parsed_response(&handle_get_entity_sources(&args, &store, None).unwrap());
+        let row = &body["results"][0];
+        assert_eq!(row["reason"], "ambiguous_name", "{body}");
+        assert_eq!(row["resolution"], "shared_member_name", "{body}");
+        assert_eq!(row["candidate_count"], expected.len(), "{body}");
+        let ids: Vec<&str> = row["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["entity_id"].as_str().unwrap())
+            .collect();
+        for entity in &expected {
+            assert!(ids.contains(&entity.id.to_string().as_str()), "{body}");
+        }
+        assert_ne!(row["reason"], "not_found");
+    }
+
+    fn trace_ambiguity_fixture() -> (InMemoryGraph, Vec<Entity>) {
+        let store = InMemoryGraph::new();
+        let start = make_entity("start", "src/start.rs");
+        let end = make_entity("finish", "src/end.rs");
+        for entity in [&start, &end] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(start.id, end.id, RelationKind::Calls))
+            .unwrap();
+        let members = (0..200)
+            .map(|n| {
+                make_method_in(
+                    LanguageId::Rust,
+                    &format!("Owner界{n:03}::new"),
+                    &format!("src/owner_{n:03}.rs"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for member in &members {
+            store.upsert_entity(member).unwrap();
+        }
+        (store, members)
+    }
+
+    fn assert_trace_ambiguity_count(value: &serde_json::Value, total: usize) {
+        let listed = value["candidates"].as_array().map_or(0, Vec::len)
+            + value["more_candidates"].as_array().map_or(0, Vec::len);
+        assert_eq!(value["candidate_count"], total);
+        assert_eq!(
+            listed + value["omitted_candidates"].as_u64().unwrap_or(0) as usize,
+            total
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_ambiguity_focal_and_target_fit_8000_bytes_after_enveloping() {
+        let (store, members) = trace_ambiguity_fixture();
+        for focal in [true, false] {
+            let mut args = HashMap::from([
+                (
+                    "focal".to_string(),
+                    serde_json::json!(if focal { "new" } else { "start" }),
+                ),
+                ("max_response_chars".to_string(), serde_json::json!(8000)),
+                ("include_body".to_string(), serde_json::json!(false)),
+            ]);
+            if !focal {
+                args.insert("target".into(), serde_json::json!("new"));
+            }
+            let built = handle_trace_data_flow(&args, &store).unwrap();
+            let budget = crate::budget::ResponseBudget::from_arguments(&args);
+            for result in [
+                built.clone(),
+                crate::envelope::finalize_bounded(
+                    built,
+                    crate::envelope::Envelope::offline(),
+                    "trace_data_flow",
+                    &budget,
+                ),
+            ] {
+                assert_ne!(result.is_error, Some(true), "{result:?}");
+                let crate::ContentBlock::Text { text } = &result.content[0];
+                assert!(text.len() <= 8000, "{} bytes", text.len());
+                let value = parsed_response(&result);
+                let listing = if focal {
+                    &value
+                } else {
+                    &value["target_ambiguity"]
+                };
+                assert_trace_ambiguity_count(listing, 200);
+                let ids = listing["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(listing["more_candidates"].as_array().into_iter().flatten())
+                    .map(|row| row["entity_id"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                assert!(!ids.is_empty());
+                assert_eq!(
+                    ids,
+                    members
+                        .iter()
+                        .take(ids.len())
+                        .map(|m| m.id.to_string())
+                        .collect::<Vec<_>>()
+                );
+                if focal {
+                    assert_eq!(value["ambiguous_focal"], true);
+                    for key in [
+                        "body",
+                        "source_base",
+                        "chain",
+                        "focal_entity",
+                        "bodies_included",
+                    ] {
+                        assert!(value.get(key).is_none(), "unexpected {key}: {value}");
+                    }
+                } else {
+                    assert!(!value["chain"].as_array().unwrap().is_empty());
+                    assert!(value.get("target_name").is_none());
+                    let note = value["degradations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|d| d["reason"] == "target_ambiguous")
+                        .unwrap();
+                    assert_eq!(note["detail"], trace_target_detail(listing));
+                }
+                if value.pointer("/_kin/response/chars_after_budget").is_some() {
+                    assert_eq!(value["_kin"]["response"]["chars_after_budget"], text.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trace_ambiguity_equality_count_only_and_bounded_refusal_keep_totals() {
+        let (_, members) = trace_ambiguity_fixture();
+        let mut value = name_candidates_json(
+            "trace_data_flow",
+            "new",
+            CandidateReason::SharedMemberName,
+            &members,
+        );
+        assert!(fit_trace_ambiguity_payload(&mut value, 8000));
+        let exact = crate::budget::measure(&value);
+        let before = value.clone();
+        assert!(fit_trace_ambiguity_payload(&mut value, exact));
+        assert_eq!(value, before);
+        assert!(fit_trace_ambiguity_payload(&mut value, exact - 1));
+        assert!(crate::budget::measure(&value) < exact);
+        assert_trace_ambiguity_count(&value, 200);
+
+        let long = (0..2)
+            .map(|n| {
+                make_method_in(
+                    LanguageId::Rust,
+                    &format!("Owner{n}{}::new", "界".repeat(1000)),
+                    "src/a.rs",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut count_only = name_candidates_json(
+            "trace_data_flow",
+            "new",
+            CandidateReason::SharedMemberName,
+            &long,
+        );
+        assert!(fit_trace_ambiguity_payload(&mut count_only, 2000));
+        assert_eq!(count_only["omitted_candidates"], 2);
+        assert_trace_ambiguity_count(&count_only, 2);
+        assert!(crate::budget::measure(&count_only) <= 2000);
+
+        let query = "界".repeat(5000);
+        let mut refused = name_candidates_json(
+            "trace_data_flow",
+            &query,
+            CandidateReason::SharedMemberName,
+            &members,
+        );
+        assert!(!fit_trace_ambiguity_payload(&mut refused, 2000));
+        assert!(
+            !fit_trace_ambiguity_payload(&mut refused, 2000),
+            "a second transport pass must preserve refusal"
+        );
+        assert_eq!(refused["candidate_count"], 200);
+        assert_eq!(refused["omitted_candidates"], 200);
+        assert!(crate::budget::measure(&refused) <= 2000);
+        assert!(!crate::budget::render(&refused).unwrap().contains(&query));
+    }
+
+    #[test]
+    fn trace_ambiguity_refusal_stays_bounded_after_transport_enveloping() {
+        let (_, members) = trace_ambiguity_fixture();
+        let query = "界".repeat(5000);
+        let budget = crate::budget::ResponseBudget {
+            max_chars: 2000,
+            explicit_max_chars: true,
+            ..Default::default()
+        };
+        for focal in [true, false] {
+            let mut refused = if focal {
+                name_candidates_json(
+                    "trace_data_flow",
+                    &query,
+                    CandidateReason::SharedMemberName,
+                    &members,
+                )
+            } else {
+                let disclosure = target_ambiguous_degradation(
+                    &query,
+                    CandidateReason::SharedMemberName,
+                    &members,
+                );
+                serde_json::json!({"target_ambiguity": trace_target_listing(&disclosure)})
+            };
+            assert!(!fit_trace_ambiguity_payload(&mut refused, budget.max_chars));
+            assert_eq!(refused["candidate_count"], members.len());
+            let mut fitting = refused.clone();
+            fitting["_kin"] = serde_json::json!({"graph_as_of": "small-marker"});
+            let unchanged = fitting.clone();
+            assert!(!fit_trace_ambiguity_payload(&mut fitting, budget.max_chars));
+            assert_eq!(fitting, unchanged, "a fitting refusal keeps its metadata");
+            let mut result = ToolCallResult::error(crate::budget::render(&refused).unwrap());
+            // The later transport attaches its own graph marker. It must not
+            // turn an already bounded refusal into an oversized wire response.
+            let mut envelope = crate::envelope::Envelope::offline();
+            envelope.graph_as_of = Some(serde_json::json!({"marker": "x".repeat(4000)}));
+            for _ in 0..2 {
+                result = crate::envelope::finalize_bounded(
+                    result,
+                    envelope.clone(),
+                    "trace_data_flow",
+                    &budget,
+                );
+                assert_eq!(result.is_error, Some(true));
+                let crate::ContentBlock::Text { text } = &result.content[0];
+                assert!(
+                    text.len() <= budget.max_chars,
+                    "{} bytes: {text}",
+                    text.len()
+                );
+                let value = parsed_response(&result);
+                assert_eq!(value["ambiguous_focal"], focal);
+                assert_eq!(value["ambiguous_target"], !focal);
+                assert_eq!(value["candidate_count"], members.len());
+                assert_eq!(value["omitted_candidates"], members.len());
+                assert_eq!(value["resolution"], "shared_member_name");
+                assert_eq!(value["error"], refused["error"]);
+                assert!(!text.contains(&query));
+                for key in ["body", "source_base", "chain", "focal_entity"] {
+                    assert!(value.get(key).is_none(), "unexpected {key}: {value}");
+                }
+            }
+        }
+    }
+
+    /// No candidate vanishes past a cap: past the detailed rows each is listed
+    /// by id, and past the listing the answer says how many it left out.
+    #[test]
+    fn every_capped_candidate_list_names_or_counts_the_rest() {
+        let candidates: Vec<Entity> = (0..230)
+            .map(|index| {
+                make_method_in(
+                    LanguageId::Rust,
+                    &format!("Owner{index:03}::new"),
+                    &format!("src/owner_{index:03}.rs"),
+                )
+            })
+            .collect();
+        let value = name_candidates_json(
+            "get_entity_source",
+            "new",
+            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            &candidates,
+        );
+        assert_eq!(value["candidate_count"], 230);
+        assert_eq!(value["candidates"].as_array().unwrap().len(), 25);
+        let more = value["more_candidates"].as_array().unwrap();
+        assert_eq!(more.len(), 175);
+        assert!(more.iter().all(|row| row["entity_id"].is_string()));
+        assert_eq!(value["omitted_candidates"], 30);
+        let detail = value["degradations"][0]["detail"].as_str().unwrap();
+        assert!(detail.contains("30 more are not listed"), "{detail}");
+
+        let lines = name_candidates_lines(
+            "new",
+            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            &candidates,
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("... and 30 more")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&candidates[199].id.to_string())),
+            "the last listed candidate carries its id"
+        );
+    }
+
+    /// The sectioned answer lists every candidate past its section cap by id.
+    #[tokio::test]
+    async fn a_sectioned_answer_lists_the_candidates_past_its_sections_by_id() {
+        let store = InMemoryGraph::new();
+        let mut members = Vec::new();
+        for index in 0..12 {
+            let member = make_method_in(
+                LanguageId::Python,
+                &format!("Owner{index:02}.handle"),
+                &format!("src/owner_{index:02}.py"),
+            );
+            store.upsert_entity(&member).unwrap();
+            members.push(member);
+        }
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("handle"));
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(body["candidate_count"], 12, "{body}");
+        assert_eq!(body[AMBIGUOUS_CANDIDATES_KEY].as_array().unwrap().len(), 10);
+        let rest: Vec<&str> = body["unsectioned_candidates"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the rest must be listed: {body}"))
+            .iter()
+            .map(|row| row["entity_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rest,
+            vec![members[10].id.to_string(), members[11].id.to_string()]
+        );
+        assert!(body.get("omitted_candidates").is_none(), "{body}");
+    }
+
+    /// A bare name matching no entity at all keeps today's refusal exactly:
+    /// sectioning only ever applies to a resolved focal, and this call never
+    /// reaches that code because nothing here resolves in the first place.
+    #[tokio::test]
+    async fn find_references_with_zero_matches_still_refuses() {
+        let store = InMemoryGraph::new();
+        // A single, unrelated entity, so the store is not simply empty.
+        store
+            .upsert_entity(&make_entity("unrelated_function", "src/lib.rs"))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "query".to_string(),
+            serde_json::json!("nothing_shares_this_name"),
+        );
+        let result = handle_find_references(&args, &store, None).await.unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = result.content.first().unwrap();
+        assert_eq!(
+            text, FIND_REFERENCES_FOCAL_MISS,
+            "a query matching nothing refuses exactly as it did before this feature existed"
         );
     }
 
@@ -9890,31 +12202,17 @@ mod tests {
     #[tokio::test]
     async fn find_references_reports_complete_sites_when_the_graph_carries_spans() {
         let store = InMemoryGraph::new();
-        let caller_file = FilePathId::new("src/a.rs");
-        let caller = make_entity("caller", "src/a.rs");
-        let target = make_entity("target", "src/b.rs");
+        // A sibling TypeScript import supplies a proven cross-file edge without
+        // introducing Rust project/module authority into this site-count test.
+        let caller = make_entity_in(LanguageId::TypeScript, "caller", "src/a.ts");
+        let target = make_entity_in(LanguageId::TypeScript, "target", "src/b.ts");
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&target).unwrap();
 
-        // Two call sites inside one caller, graph rows 11 and 41, which the
-        // agent-facing surface reports 1-based as 12 and 42.
-        let site_span = |row: u32| kin_model::entity::SourceSpan {
-            file: caller_file.clone(),
-            start_byte: 0,
-            end_byte: 1,
-            start_line: row,
-            start_col: 0,
-            end_line: row,
-            end_col: 1,
-        };
-        let mut relation = make_relation(caller.id, target.id, RelationKind::Calls);
-        relation.evidence = vec![11, 41]
-            .into_iter()
-            .map(|row| RelationEvidence {
-                source_span: Some(site_span(row)),
-                ..RelationEvidence::default()
-            })
-            .collect();
+        // The real linker proves each cross-file site through its parser-pinned
+        // import before aggregating both occurrences into one edge.
+        let relation =
+            super::super::confirmed_sites_tests::linked_calls(&caller, &target, &[12, 42]);
         store.upsert_relation(&relation).unwrap();
 
         let args = HashMap::from([(
@@ -10057,33 +12355,20 @@ mod tests {
     #[tokio::test]
     async fn find_references_floors_a_row_mixing_a_parsed_and_a_language_server_edge() {
         let store = InMemoryGraph::new();
-        let caller_file = FilePathId::new("src/a.rs");
-        let caller = make_entity("caller", "src/a.rs");
-        let target = make_entity("target", "src/b.rs");
+        // A sibling TypeScript import supplies a proven cross-file edge without
+        // introducing Rust project/module authority into this site-count test.
+        let caller = make_entity_in(LanguageId::TypeScript, "caller", "src/a.ts");
+        let target = make_entity_in(LanguageId::TypeScript, "target", "src/b.ts");
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&target).unwrap();
 
-        let site_span = |row: u32| kin_model::entity::SourceSpan {
-            file: caller_file.clone(),
-            start_byte: 0,
-            end_byte: 1,
-            start_line: row,
-            start_col: 0,
-            end_line: row,
-            end_col: 1,
-        };
-        let mut parsed = make_relation(caller.id, target.id, RelationKind::Calls);
-        parsed.evidence = vec![11, 41]
-            .into_iter()
-            .map(|row| RelationEvidence {
-                source_span: Some(site_span(row)),
-                ..RelationEvidence::default()
-            })
-            .collect();
+        // Keep the cross-file case: parser-pinned occurrences prove both sites,
+        // while the separate language-server contribution remains a floor.
+        let parsed = super::super::confirmed_sites_tests::linked_calls(&caller, &target, &[12, 42]);
         store.upsert_relation(&parsed).unwrap();
 
         let mut enriched =
-            make_relation_with_site(caller.id, target.id, RelationKind::Calls, "src/a.rs", 11);
+            make_relation_with_site(caller.id, target.id, RelationKind::Calls, "src/a.ts", 11);
         enriched.origin = RelationOrigin::Lsp;
         store.upsert_relation(&enriched).unwrap();
 
@@ -10378,7 +12663,7 @@ mod tests {
                 FindReferencesAuthority {
                     repo_id: "nk",
                     graph_root: &live_root,
-                    spine: None,
+                    spine: kin_spine::DaemonSpine::Absent,
                 },
                 None,
             )
@@ -10443,7 +12728,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &registered_root,
-                spine: Some(&spine),
+                spine: kin_spine::DaemonSpine::Ready(&spine),
             },
             None,
         )
@@ -10469,7 +12754,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &live_root,
-                spine: Some(&spine),
+                spine: kin_spine::DaemonSpine::Ready(&spine),
             },
             None,
         )
@@ -10524,7 +12809,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "nk",
                 graph_root: &live_root,
-                spine: Some(&spine),
+                spine: kin_spine::DaemonSpine::Ready(&spine),
             },
             None,
         )
@@ -11245,20 +13530,20 @@ mod tests {
             "an agent acting on a true verdict here deletes live code: {}",
             response["negative"]
         );
-        assert_eq!(response["negative"]["trust"], "inconclusive");
         // And the edge gap LEADS, ahead of the ambient path's own cross-repo
-        // binding gap, because it is the factor that limited this answer. Of
-        // the two edge clauses the class this build mints for no Rust program
-        // comes first, and the classes the graph simply holds none of still
-        // follow it.
+        // binding gap, because it is the factor that limited this answer. Rust
+        // now mints entity-level imports edges, so the gap is absent cross-file
+        // edges rather than unproduced.
         assert!(
-            trust_reason(&response).starts_with("cross_file_edges_unproduced"),
+            trust_reason(&response).starts_with("cross_file_edges_absent"),
             "{}",
             trust_reason(&response)
         );
         assert!(
-            trust_reason(&response).contains("cross_file_edges_absent"),
-            "the classes the graph holds none of are still named: {}",
+            trust_reason(&response).contains(
+                "the graph holds no cross-file calls, imports, references edges for Rust"
+            ),
+            "the absent classes are named: {}",
             trust_reason(&response)
         );
         // The half that makes the leading clause honest: no build mints that
@@ -11493,7 +13778,7 @@ mod tests {
                 FindReferencesAuthority {
                     repo_id: "nk",
                     graph_root: &registered_root,
-                    spine: Some(&spine),
+                    spine: kin_spine::DaemonSpine::Ready(&spine),
                 },
                 None,
             )
@@ -11610,7 +13895,7 @@ mod tests {
                 FindReferencesAuthority {
                     repo_id: "requests",
                     graph_root: &registered_root,
-                    spine: Some(&spine),
+                    spine: kin_spine::DaemonSpine::Ready(&spine),
                 },
                 None,
             )
@@ -11686,7 +13971,7 @@ mod tests {
                 FindReferencesAuthority {
                     repo_id: "requests",
                     graph_root: &registered_root,
-                    spine: Some(&spine),
+                    spine: kin_spine::DaemonSpine::Ready(&spine),
                 },
                 None,
             )
@@ -11942,7 +14227,7 @@ mod tests {
                 FindReferencesAuthority {
                     repo_id: "express",
                     graph_root: &registered_root,
-                    spine: Some(&spine),
+                    spine: kin_spine::DaemonSpine::Ready(&spine),
                 },
                 None,
             )
@@ -12095,7 +14380,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &provider_root,
-                spine: Some(&spine),
+                spine: kin_spine::DaemonSpine::Ready(&spine),
             },
             None,
         )
@@ -12124,7 +14409,7 @@ mod tests {
                 FindReferencesAuthority {
                     repo_id: "provider",
                     graph_root: &provider_root,
-                    spine: Some(&spine),
+                    spine: kin_spine::DaemonSpine::Ready(&spine),
                 },
                 None,
             )
@@ -12175,7 +14460,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &provider_root,
-                spine: Some(&spine),
+                spine: kin_spine::DaemonSpine::Ready(&spine),
             },
             None,
         )
@@ -12233,7 +14518,7 @@ mod tests {
         let authority = FindReferencesAuthority {
             repo_id: "provider",
             graph_root: &provider_root,
-            spine: Some(&spine),
+            spine: kin_spine::DaemonSpine::Ready(&spine),
         };
         let any = handle_bulk_check_references_with_authority(&args, &graph, authority).unwrap();
         let any = crate::finalize_with_envelope(
@@ -14401,6 +16686,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn agent_default_reference_answer_matches_explicit_full_response() {
+        let (store, focal, ..) = go_dispatch_graph();
+        let mut args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(focal.id.to_string()),
+        )]);
+        crate::agent_belt::apply_belt_defaults("find_references", &mut args);
+        let narrow: serde_json::Value = serde_json::from_str(&client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &ResponseBudget::from_arguments(&args),
+        ))
+        .unwrap();
+        args.insert("answer_only".to_string(), serde_json::json!(false));
+        crate::agent_belt::apply_belt_defaults("find_references", &mut args);
+        let whole: serde_json::Value = serde_json::from_str(&client_text(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            "find_references",
+            &ResponseBudget::from_arguments(&args),
+        ))
+        .unwrap();
+        assert_eq!(narrow["_kin"]["shape"], "answer_only");
+        assert!(whole["_kin"].get("shape").is_none());
+        assert!(whole.get("edge_coverage").is_some());
+        assert!(narrow.get("edge_coverage").is_none());
+        assert_eq!(narrow["references"], whole["references"]);
+        assert_eq!(narrow["total_upstream"], whole["total_upstream"]);
+        assert_eq!(
+            narrow["_kin"]["verdict"]["state"],
+            whole["_kin"]["verdict"]["state"]
+        );
+    }
+
     /// Every block an `answer_only` reply must not carry.
     const SHED_BY_ANSWER_ONLY: [&str; 7] = [
         "candidates",
@@ -14412,14 +16731,14 @@ mod tests {
         "focal_resolution",
     ];
 
-    /// The parameter serves the answer and the one verdict that qualifies it.
+    /// The parameter serves the same answer and the trust observations that qualify it.
     ///
     /// The published Go study compares assembled state: 25,167 bytes through
     /// text search against 2,241 through Kin. A caller could not get the 2,241
     /// from the tool, because the envelope shipped on every reply and no
     /// parameter asked for the answer alone. This is that parameter.
     #[tokio::test]
-    async fn answer_only_serves_the_answer_and_the_verdict_and_nothing_else() {
+    async fn answer_only_preserves_reference_rows_verdict_and_repository_trust() {
         let (store, buffer_write, ..) = go_dispatch_graph();
         let args = HashMap::from([(
             "entity_id".to_string(),
@@ -14477,10 +16796,25 @@ mod tests {
         );
         assert!(
             narrow["_kin"].get("completeness").is_none()
-                && narrow["_kin"].get("durability").is_none()
                 && narrow["_kin"]["verdict"].get("inputs").is_none(),
-            "the envelope was not reduced to the verdict: {narrow}"
+            "detailed diagnostic inputs survived: {narrow}"
         );
+        for key in [
+            "envelope_version",
+            "runtime",
+            "graph_as_of",
+            "graph_state",
+            "freshness",
+            "hydration_semantics",
+            "durability",
+            "degraded",
+        ] {
+            assert_eq!(
+                narrow["_kin"].get(key),
+                whole["_kin"].get(key),
+                "lost trust field {key}"
+            );
+        }
         assert!(
             !narrow_text.contains('\n'),
             "an answer-only reply is serialized compactly, and pretty printing was              14% of the measured payload"
@@ -15061,32 +17395,22 @@ mod tests {
         assert_bounded("graph_neighborhood", before, after);
     }
 
-    /// The pack's ceiling was binding too, and the wider one buys rows.
-    ///
-    /// `get_context_pack` bounds itself in tokens as well as characters, and it
-    /// would be easy to assume the token budget is always the tighter of the
-    /// two. It is not. Measured on 2026-09-16 on `wide_store(40)` through
-    /// `apply_belt_defaults`, at the pack's unchanged 2,500-token budget:
-    ///
-    /// | ceiling | characters | dependents kept |
-    /// | --- | ---: | ---: |
-    /// | 12,000 | 11,430 | 8 of 42 |
-    /// | 24,576 | 24,322 | 27 of 42 |
-    ///
-    /// So the response ceiling was shedding rows the builder had already paid
-    /// for, which is the same shape the trace defect has: the far end of the
-    /// answer goes, and the reader is left with a focal and almost nothing
-    /// around it. The token budget is untouched, because what the pack BUILDS is
-    /// a separate decision from what it may ship.
+    /// A larger byte ceiling can preserve rows when the token budget has room.
+    /// The original fixture requested 2,500 tokens but actually received 8,000
+    /// through tier rounding. Name that 8,000 explicitly so this remains a test
+    /// of the byte ceiling; separate tests cover exact smaller token limits.
     #[test]
     fn a_belt_pack_keeps_more_of_what_it_built_at_the_chain_ceiling() {
         let (store, focal_id) = wide_store(40);
         let sessions = SessionRegistry::empty_for_test();
         let kept_at = |ceiling: Option<u64>| {
-            let mut args = HashMap::from([(
-                "entity_id".to_string(),
-                serde_json::json!(focal_id.to_string()),
-            )]);
+            let mut args = HashMap::from([
+                (
+                    "entity_id".to_string(),
+                    serde_json::json!(focal_id.to_string()),
+                ),
+                ("token_budget".to_string(), serde_json::json!(8000)),
+            ]);
             if let Some(ceiling) = ceiling {
                 args.insert("max_chars".to_string(), serde_json::json!(ceiling));
             }
@@ -15098,13 +17422,17 @@ mod tests {
                 &budget,
             );
             let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
-            let kept = payload["elisions"]["dependents"]["kept"]
-                .as_u64()
-                .unwrap_or(0);
+            // The rows actually served. With neighbours as signatures the wider
+            // ceiling can fit every dependent, and then there is no elision
+            // block to read a kept count from.
+            let kept = payload["dependents"]
+                .as_array()
+                .map_or(0, |rows| rows.len() as u64);
             let reason = payload["elisions"]["dependents"]["reason"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
+            assert_eq!(payload["token_budget"], 8000);
             (text.len(), kept, reason)
         };
 
@@ -15125,12 +17453,6 @@ mod tests {
             after_chars <= crate::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS as usize,
             "the answer ships {after_chars} characters against the {} the belt asks for",
             crate::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS
-        );
-        // The builder's own budget did not move, so the extra rows are rows it
-        // had already built and the response was shedding on the way out.
-        assert_eq!(
-            crate::agent_belt::AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET,
-            2_500
         );
     }
 

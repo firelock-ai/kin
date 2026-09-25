@@ -878,7 +878,7 @@ pub fn generate_assistant_prompt(
     out.push_str("The graph is authority; files are the projection and execution surface. ");
     out.push_str("Use Kin tools instead of grep/find/cat for code discovery.\n\n");
     out.push_str("## Quick Start\n");
-    out.push_str("1. MCP: `semantic_locate` to find the right entity or file by meaning\n");
+    out.push_str("1. MCP: `semantic_locate` to find the right entity by meaning\n");
     out.push_str("2. MCP: `get_context_pack` to load the focused neighborhood\n");
     out.push_str(
         "3. MCP: `trace_data_flow` when lineage or cross-file dependency direction matters\n",
@@ -891,7 +891,8 @@ pub fn generate_assistant_prompt(
     out.push_str("7. CLI: `kin context <entity>` to get the full token-budgeted context pack\n\n");
     out.push_str("## Key Principle\n");
     out.push_str(
-        "Ask the graph first, read projected files second, and use raw filesystem reads last.\n",
+        "Read and change code through the graph, by entity. Kin serves no whole-file reads; \
+         where it has no answer it says so, and that gap is the answer.\n",
     );
 
     // Append summary stats if available
@@ -999,9 +1000,9 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
     out.push_str("# Kin-Native Repository\n\n");
     out.push_str("This repo uses Kin as the semantic system of record. Start with Kin graph tools, not broad filesystem discovery.\n\n");
     out.push_str("## Workflow\n");
-    out.push_str("1. If MCP is connected, start with `semantic_locate` to find the right entity or file by meaning\n");
+    out.push_str("1. If MCP is connected, start with `semantic_locate` to find the right entity by meaning\n");
     out.push_str(
-        "2. Use `get_context_pack` to load the focused neighborhood before reading broad files\n",
+        "2. Use `get_context_pack` for an entity's exact code and its focused neighborhood\n",
     );
     out.push_str(
         "3. Use `trace_data_flow` when lineage or cross-file dependency direction matters\n",
@@ -1017,7 +1018,7 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
     out.push_str("## Rules\n");
     out.push_str("- Prefer exact names like `parseStrict`, `parse`, or `$MyType`\n");
     out.push_str("- Avoid broad shotgun searches\n");
-    out.push_str("- Native sessions shim normal file reads/searches to the managed source view when needed\n");
+    out.push_str("- Change code through `kin_mutate` on entity ids; the shell is for building and running tests\n");
     out.push_str("- Legacy docs live under `.kin/docs/imported/`\n\n");
 
     out.push_str(&format!("## For {}\n", assistant_name));
@@ -1068,9 +1069,11 @@ fn generate_agents_md() -> String {
      Use `kin context <entity_name>` to get a token-budgeted context pack.\n\
      This gives you precise, relevant code — not entire files.\n\n\
      ### Making Changes\n\n\
-     1. Check impact before editing: `kin review`\n\
-     2. Edit files normally\n\
-     3. Kin tracks changes at the entity level (functions, classes, etc.)\n\n\
+     1. Read the entity you are changing with `get_entity_source`, which returns its `source_base`\n\
+     2. Open a session with `kin_session_start`, then change the entity by id with `kin_mutate`\n\
+     3. Check impact with `kin review` before committing\n\n\
+     These are Kin's MCP tools; without MCP, `kin call <tool> '<json>'` runs the same ones.\n\
+     Kin tracks changes at the entity level (functions, classes, etc.).\n\n\
      ### Committing\n\n\
      Use `kin commit -m \"message\"` instead of `git commit`.\n\
      Kin commits are semantic — they track entity changes, not line diffs.\n\n\
@@ -1143,7 +1146,7 @@ pub fn generate_config_snippets(kind: AssistantKind) -> Vec<ConfigSnippet> {
             content: r#"[mcp_servers.kin]
 command = "kin"
 args = ["mcp", "start"]
-env = { KIN_MCP_TOOL_PROFILE = "agent-default" }"#
+env = { KIN_MCP_TOOL_PROFILE = "agent-routed" }"#
                 .into(),
             target_path: "~/.codex/config.toml".into(),
         }],

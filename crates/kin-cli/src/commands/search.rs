@@ -178,6 +178,10 @@ struct SearchJsonEntity {
     id: String,
     kind: String,
     name: String,
+    /// The member segment of an owner's member's `name` (`get` for the method
+    /// `Scaffold.get`) and the whole name of anything else, the same field
+    /// `list_file_entities` and `semantic_search` carry.
+    member_name: String,
     file: String,
     line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1006,6 +1010,11 @@ fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
         DaemonSearchRecord::Entity(entity) => SearchJsonRecord::Entity(SearchJsonEntity {
             id: entity.id.clone(),
             kind: entity.kind.clone(),
+            member_name: kin_ranking::entity_ranking::lookup_member_name_of(
+                &entity.name,
+                kin_ranking::entity_ranking::is_member_kind_named(&entity.kind),
+            )
+            .to_string(),
             name: entity.name.clone(),
             file: entity.file.clone().unwrap_or_default(),
             // Already 1-based: the record's lines are converted at the one seam

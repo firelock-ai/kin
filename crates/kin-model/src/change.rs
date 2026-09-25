@@ -62,6 +62,119 @@ pub enum ChangeOrigin {
     GitCommit { oid: GitObjectId },
 }
 
+/// A query projection of a change onto one entity, never a replayable change.
+///
+/// The original content-addressed identity and ancestry remain exact. Counts
+/// describe the original change; only `entity_deltas` is narrowed. Keeping this
+/// separate from `SemanticChange` prevents a partial payload from being mistaken
+/// for the complete object whose hash is `id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityHistoryEntry {
+    pub id: SemanticChangeId,
+    pub origin: ChangeOrigin,
+    pub parents: Option<Vec<SemanticChangeId>>,
+    pub timestamp: Timestamp,
+    pub author: Option<AuthorId>,
+    pub message: Option<String>,
+    pub metadata_omissions: BTreeMap<String, usize>,
+    pub entity_deltas: Option<Vec<EntityDelta>>,
+    pub focal_delta_count: usize,
+    pub entity_deltas_omitted: usize,
+    pub focal_delta_operations: BTreeMap<String, usize>,
+    pub entity_delta_count: usize,
+    pub relation_delta_count: usize,
+    pub tree_delta_count: usize,
+    pub external_reference_delta_count: usize,
+    pub admission_policy_changed: bool,
+    pub projected_file_count: usize,
+    pub evidence_count: usize,
+    pub risk_summary_present: bool,
+    pub spec_link: Option<SpecId>,
+}
+
+/// A bounded page and the complete history's lightweight identity.
+#[derive(Debug, Clone)]
+pub struct EntityHistoryPage {
+    pub entries: Vec<EntityHistoryEntry>,
+    pub change_count: usize,
+    pub latest_change_id: Option<SemanticChangeId>,
+}
+
+impl EntityHistoryEntry {
+    pub fn for_entity(change: &SemanticChange, id: &EntityId) -> Option<Self> {
+        let focal: Vec<_> = change
+            .entity_deltas
+            .iter()
+            .filter(|delta| {
+                delta.old_state().is_some_and(|entity| entity.id == *id)
+                    || delta.new_state().is_some_and(|entity| entity.id == *id)
+            })
+            .collect();
+        if focal.is_empty() {
+            return None;
+        }
+        // Inspect a borrowed projection before cloning. A huge source preview
+        // or metadata value must not be copied into every history page.
+        struct SizeLimit(usize);
+        impl std::io::Write for SizeLimit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.0 {
+                    return Err(std::io::Error::other("focal history detail limit"));
+                }
+                self.0 -= bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let include_details = serde_json::to_writer(SizeLimit(12_000), &focal).is_ok();
+        let parents_fit = serde_json::to_writer(SizeLimit(12_000), &change.parents).is_ok();
+        let mut metadata_omissions = BTreeMap::new();
+        if !parents_fit {
+            metadata_omissions.insert("parents".into(), change.parents.len());
+        }
+        if change.author.0.len() > 512 {
+            metadata_omissions.insert("author_utf8_bytes".into(), change.author.0.len());
+        }
+        if change.message.len() > 4096 {
+            metadata_omissions.insert("message_utf8_bytes".into(), change.message.len());
+        }
+        let mut operations = BTreeMap::new();
+        for delta in &focal {
+            let operation = match delta {
+                EntityDelta::Added { .. } => "added",
+                EntityDelta::Modified { .. } => "modified",
+                EntityDelta::Removed { .. } => "removed",
+            };
+            *operations.entry(operation.to_string()).or_insert(0) += 1;
+        }
+        Some(Self {
+            id: change.id,
+            origin: change.origin,
+            parents: parents_fit.then(|| change.parents.clone()),
+            timestamp: change.timestamp.clone(),
+            author: (change.author.0.len() <= 512).then(|| change.author.clone()),
+            message: (change.message.len() <= 4096).then(|| change.message.clone()),
+            metadata_omissions,
+            entity_deltas: include_details
+                .then(|| focal.iter().map(|delta| (**delta).clone()).collect()),
+            focal_delta_count: focal.len(),
+            entity_deltas_omitted: if include_details { 0 } else { focal.len() },
+            focal_delta_operations: operations,
+            entity_delta_count: change.entity_deltas.len(),
+            relation_delta_count: change.relation_deltas.len(),
+            tree_delta_count: change.tree_deltas.len(),
+            external_reference_delta_count: change.external_reference_deltas.len(),
+            admission_policy_changed: change.admission_policy_delta.is_some(),
+            projected_file_count: change.projected_files.len(),
+            evidence_count: change.evidence.len(),
+            risk_summary_present: change.risk_summary.is_some(),
+            spec_link: change.spec_link,
+        })
+    }
+}
+
 impl SemanticChange {
     pub fn transaction_delta(&self) -> TransactionDelta {
         TransactionDelta {

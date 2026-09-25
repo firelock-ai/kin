@@ -1116,6 +1116,10 @@ pub struct WizardOptions {
     /// The curl installer makes this edit itself; an npm or npx install does
     /// not, so the wizard asks. This is the scripted answer of no.
     pub skip_path: bool,
+    /// The tool profile to write into every client this run configures, and
+    /// pin there. `None` gives each client its own default, and keeps a
+    /// profile set by hand. See [`choose_tool_profile`].
+    pub tool_profile: Option<String>,
 }
 
 /// First-run intent — what the user wants out of Kin. Each intent maps to a
@@ -1125,8 +1129,9 @@ pub struct WizardOptions {
 pub enum SetupIntent {
     /// CLI development on this machine: shell hook + auto-daemon, no MCP config.
     LocalOnly,
-    /// The agent wedge: write the agent-default MCP config to detected AI
-    /// clients + auto-daemon. The smallest path to value.
+    /// The agent wedge: write each detected AI client's Kin MCP entry, with
+    /// the profile [`setup_tool_profile`] names for it, + auto-daemon. The
+    /// smallest path to value.
     AgentOnly,
     /// Local-only plus a pointer to the kin-editor VS Code extension.
     Editor,
@@ -1679,14 +1684,346 @@ pub(crate) const CANONICAL_NPM_MCP_PACKAGE: &str = "@kinlab/kin";
 /// The entry starts the MCP server in single-repo mode: `kin mcp start`
 /// resolves the repo from the agent's working directory (or from
 /// `KIN_DAEMON_URL` when a session launch pinned one), so each agent session
-/// binds to the daemon of the repository it is actually working in.
-fn kin_mcp_entry() -> Result<serde_json::Value> {
+/// binds to the daemon of the repository it is actually working in. Its tool
+/// profile is the one [`setup_tool_profile`] names for the client.
+fn kin_mcp_entry(target_id: &str) -> Result<serde_json::Value> {
     let command = configured_mcp_launcher()?;
     Ok(serde_json::json!({
         "command": command,
         "args": ["mcp", "start"],
-        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+        "env": { "KIN_MCP_TOOL_PROFILE": setup_tool_profile(target_id) }
     }))
+}
+
+/// The tool profile `kin setup` writes for one client, by its setup target id.
+///
+/// A client that loads every tool it is handed and re-sends them all with every
+/// request gets `agent-routed`: one tool whose commands reach the query belt.
+/// In the corrected rerun pilot of 2026-09-22, Codex CLI re-sent the
+/// `agent-query` list as about 3,500 tokens on every request, and its model
+/// never called a Kin tool. Claude Code defers every tool schema behind its own
+/// tool search and the Grok CLI never sends schemas to its model at all, so a
+/// list's size costs them nothing per request; they keep the named
+/// `agent-default` belt, which also carries Kin's write tools. The routed
+/// profile carries none, because the approved command set has none; an eager
+/// client edits with its own file tools.
+pub(crate) fn setup_tool_profile(target_id: &str) -> &'static str {
+    match target_id {
+        "cursor"
+        | "codex"
+        | "gemini"
+        | "windsurf"
+        | "antigravity"
+        | "antigravity_workspace"
+        | "lmstudio" => "agent-routed",
+        _ => "agent-default",
+    }
+}
+
+/// The key Kin writes beside `KIN_MCP_TOOL_PROFILE` in a client's entry when
+/// that profile was named with `kin setup --tool-profile`, so later runs of
+/// `kin setup` and `kin update` keep it.
+pub(crate) const PINNED_PROFILE_ENV: &str = "KIN_MCP_TOOL_PROFILE_PINNED";
+
+/// The profile `kin setup` or `kin update` writes into one client's entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileChoice {
+    pub(crate) profile: String,
+    pub(crate) reason: ProfileReason,
+}
+
+/// Why a client's entry carries the profile it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileReason {
+    /// This run was asked for it with `--tool-profile`.
+    Requested,
+    /// The entry was already pinned, by an earlier `--tool-profile` or by an
+    /// earlier run that found the profile set by hand.
+    Pinned,
+    /// A person set it, and this run pins it.
+    SetByHand,
+    /// The client's default, which Kin keeps current.
+    ClientDefault,
+}
+
+impl ProfileChoice {
+    /// Whether the entry is marked as chosen, so later runs keep it. A profile
+    /// found set by hand is pinned too: once this run records the entry in the
+    /// install ledger, the ledger alone can no longer tell it from one Kin chose.
+    pub(crate) fn pinned(&self) -> bool {
+        !matches!(self.reason, ProfileReason::ClientDefault)
+    }
+
+    /// The words setup prints after the profile.
+    pub(crate) fn describe(&self) -> &'static str {
+        match self.reason {
+            ProfileReason::Requested => {
+                "pinned by --tool-profile, so later kin setup and kin update runs keep it"
+            }
+            ProfileReason::Pinned => "kept, because it is pinned",
+            ProfileReason::SetByHand => {
+                "kept, because it was set by hand, and pinned so later runs keep it"
+            }
+            ProfileReason::ClientDefault => "this client's default, which kin update keeps current",
+        }
+    }
+}
+
+/// What the install ledger says about the profile in one Kin entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileProvenance {
+    /// The entry is exactly the one Kin last wrote there.
+    AsKinWrote,
+    /// The entry is the one Kin last wrote there with only its profile
+    /// changed.
+    ChangedByHand,
+    /// The ledger has no record that says either.
+    Unknown,
+}
+
+/// The profiles some Kin has written into an entry as its client's default:
+/// `agent-default` for every client since setup first wrote a profile, and
+/// `agent-routed` for the clients that send every tool with every request.
+const DEFAULTED_PROFILES: &[&str] = &["agent-default", "agent-routed"];
+
+/// The profile one client's entry gets.
+///
+/// In order: `kin setup --tool-profile X` writes X and pins it. A pinned entry
+/// keeps its profile. A profile a person set is kept and pinned: the ledger
+/// shows the entry is Kin's last write with only the profile changed, or, with
+/// no ledger record to say, the profile is one no Kin has written as a default.
+/// Everything else gets the client's default: a new entry, one exactly as Kin
+/// last wrote it, and one still carrying a default an earlier Kin wrote. That
+/// is how `kin update` moves an entry forward when a client's default
+/// changes, as Codex CLI's did from `agent-default` to `agent-routed`.
+///
+/// A profile token this build does not know is not a choice anyone can be
+/// held to, so it is replaced by the client's default.
+pub(crate) fn choose_tool_profile(
+    target_id: &str,
+    requested: Option<&str>,
+    existing: Option<&serde_json::Value>,
+    provenance: ProfileProvenance,
+) -> ProfileChoice {
+    if let Some(requested) = requested {
+        return ProfileChoice {
+            profile: requested.to_string(),
+            reason: ProfileReason::Requested,
+        };
+    }
+    let env = existing.and_then(|entry| entry.get("env"));
+    let existing_profile = env
+        .and_then(|env| env.get("KIN_MCP_TOOL_PROFILE"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|profile| crate::commands::mcp::is_tool_profile_token(profile));
+    let pinned = env
+        .and_then(|env| env.get(PINNED_PROFILE_ENV))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        == Some("1");
+    let kept = |reason| ProfileChoice {
+        profile: existing_profile.unwrap_or_default().to_string(),
+        reason,
+    };
+    match (existing_profile, provenance) {
+        (Some(_), _) if pinned => kept(ProfileReason::Pinned),
+        (Some(_), ProfileProvenance::ChangedByHand) => kept(ProfileReason::SetByHand),
+        (Some(profile), ProfileProvenance::Unknown) if !DEFAULTED_PROFILES.contains(&profile) => {
+            kept(ProfileReason::SetByHand)
+        }
+        _ => ProfileChoice {
+            profile: setup_tool_profile(target_id).to_string(),
+            reason: ProfileReason::ClientDefault,
+        },
+    }
+}
+
+thread_local! {
+    /// The profile `--tool-profile` asked this setup run for, while one
+    /// client is being configured. See [`RequestedProfileScope`].
+    static REQUESTED_PROFILE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// Each choice the writers made inside the current scope, by config path,
+    /// so setup can say why an entry carries its profile. `None` outside a
+    /// scope, where nothing is noted.
+    static PROFILE_CHOICES: std::cell::RefCell<Option<Vec<(PathBuf, ProfileChoice)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hands the profile this run was asked for to the writers that configure
+/// one client, for the length of that synchronous call.
+///
+/// A scope rather than a parameter, because the profile reaches the writers
+/// through every client's own configure function and the repair writer they
+/// share with `kin update`, which is never asked for one. It is held only
+/// across a synchronous call, so it cannot leak across an await to another
+/// task on the same thread.
+pub(crate) struct RequestedProfileScope {
+    previous: Option<String>,
+    previous_choices: Option<Vec<(PathBuf, ProfileChoice)>>,
+}
+
+impl RequestedProfileScope {
+    pub(crate) fn enter(profile: Option<&str>) -> Self {
+        let previous =
+            REQUESTED_PROFILE.with(|requested| requested.replace(profile.map(str::to_string)));
+        let previous_choices = PROFILE_CHOICES.with(|choices| choices.replace(Some(Vec::new())));
+        Self {
+            previous,
+            previous_choices,
+        }
+    }
+
+    /// The choice a writer made for the entry at `path` in this scope.
+    pub(crate) fn choice_for(&self, path: &Path) -> Option<ProfileChoice> {
+        PROFILE_CHOICES.with(|choices| {
+            choices
+                .borrow()
+                .iter()
+                .flatten()
+                .rev()
+                .find(|(written, _)| written == path)
+                .map(|(_, choice)| choice.clone())
+        })
+    }
+}
+
+impl Drop for RequestedProfileScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        REQUESTED_PROFILE.with(|requested| {
+            requested.replace(previous);
+        });
+        let previous_choices = self.previous_choices.take();
+        PROFILE_CHOICES.with(|choices| {
+            choices.replace(previous_choices);
+        });
+    }
+}
+
+fn requested_profile() -> Option<String> {
+    REQUESTED_PROFILE.with(|requested| requested.borrow().clone())
+}
+
+/// What the install ledger says about the profile in the Kin entry at
+/// `path`: whether the entry is exactly Kin's last write there, or that write
+/// with only its profile changed, which is a person choosing a profile.
+fn profile_provenance(
+    target_id: &str,
+    path: &Path,
+    entry: &serde_json::Value,
+) -> ProfileProvenance {
+    use crate::commands::setup_ledger::{
+        fingerprint_mcp_entry, ledger_path, ArtifactKind, SetupLedger,
+    };
+    let Ok(ledger) = ledger_path().and_then(|path| SetupLedger::load(&path)) else {
+        return ProfileProvenance::Unknown;
+    };
+    let same_path = |recorded: &Path| {
+        recorded == path
+            || matches!(
+                (fs::canonicalize(recorded), fs::canonicalize(path)),
+                (Ok(left), Ok(right)) if left == right
+            )
+    };
+    let recorded: Vec<&str> = ledger
+        .entries
+        .iter()
+        .filter(|recorded| {
+            recorded.kind == ArtifactKind::McpConfig
+                && recorded.target == target_id
+                && same_path(&recorded.path)
+        })
+        .map(|recorded| recorded.fingerprint.as_str())
+        .collect();
+    if recorded.contains(&fingerprint_mcp_entry(entry).as_str()) {
+        return ProfileProvenance::AsKinWrote;
+    }
+    let current = entry
+        .get("env")
+        .and_then(|env| env.get("KIN_MCP_TOOL_PROFILE"))
+        .and_then(serde_json::Value::as_str);
+    for profile in crate::commands::mcp::tool_profile_tokens() {
+        if Some(profile) == current {
+            continue;
+        }
+        let mut rewound = entry.clone();
+        if let Some(env) = rewound
+            .get_mut("env")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            env.insert(
+                "KIN_MCP_TOOL_PROFILE".to_string(),
+                serde_json::Value::String(profile.to_string()),
+            );
+        }
+        if recorded.contains(&fingerprint_mcp_entry(&rewound).as_str()) {
+            return ProfileProvenance::ChangedByHand;
+        }
+    }
+    ProfileProvenance::Unknown
+}
+
+/// The profile the entry at `path` gets on this run.
+fn tool_profile_choice(
+    target_id: &str,
+    path: &Path,
+    existing: Option<&serde_json::Value>,
+) -> ProfileChoice {
+    let provenance = existing.map_or(ProfileProvenance::Unknown, |entry| {
+        profile_provenance(target_id, path, entry)
+    });
+    choose_tool_profile(
+        target_id,
+        requested_profile().as_deref(),
+        existing,
+        provenance,
+    )
+}
+
+/// Note the choice a writer wrote into the entry at `path`, for
+/// [`RequestedProfileScope::choice_for`]. Outside a scope nothing is noted.
+fn note_profile_choice(path: &Path, choice: ProfileChoice) {
+    PROFILE_CHOICES.with(|choices| {
+        if let Some(choices) = choices.borrow_mut().as_mut() {
+            choices.push((path.to_path_buf(), choice));
+        }
+    });
+}
+
+/// Write a choice into a JSON entry's `env`.
+fn apply_profile_choice_json(
+    env: &mut serde_json::Map<String, serde_json::Value>,
+    choice: &ProfileChoice,
+) {
+    env.insert(
+        "KIN_MCP_TOOL_PROFILE".to_string(),
+        serde_json::Value::String(choice.profile.clone()),
+    );
+    if choice.pinned() {
+        env.insert(
+            PINNED_PROFILE_ENV.to_string(),
+            serde_json::Value::String("1".to_string()),
+        );
+    } else {
+        env.remove(PINNED_PROFILE_ENV);
+    }
+}
+
+/// The setup target id for an assistant index, as the install ledger records it.
+fn setup_target_id_for_index(idx: usize) -> Option<&'static str> {
+    Some(match idx {
+        IDX_CLAUDE_CODE => "claude",
+        IDX_CURSOR => "cursor",
+        IDX_CODEX => "codex",
+        IDX_GEMINI => "gemini",
+        IDX_WINDSURF => "windsurf",
+        IDX_ANTIGRAVITY => "antigravity",
+        IDX_LMSTUDIO => "lmstudio",
+        IDX_GROK => "grok",
+        _ => return None,
+    })
 }
 
 /// Describes an AI assistant we can auto-configure.
@@ -1975,7 +2312,7 @@ fn merge_mcp_config_with_topology(
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = kin_mcp_entry()?;
+    let desired = kin_mcp_entry(target_id)?;
     let desired = desired
         .as_object()
         .context("generated Kin MCP entry is not an object")?;
@@ -1989,6 +2326,7 @@ fn merge_mcp_config_with_topology(
         );
     }
     let entry_preexisted = servers.contains_key("kin");
+    let choice = tool_profile_choice(target_id, path, servers.get("kin"));
     let entry = servers
         .entry("kin".to_string())
         .or_insert_with(|| serde_json::json!({}))
@@ -2018,9 +2356,11 @@ fn merge_mcp_config_with_topology(
             env.insert(key.clone(), value.clone());
         }
     }
+    apply_profile_choice_json(env, &choice);
     let owned_entry = root["mcpServers"]["kin"].clone();
     let formatted = serde_json::to_vec_pretty(&root).context("failed to serialize MCP config")?;
     lock.write_guarded(path, &formatted, original.as_deref())?;
+    note_profile_choice(path, choice);
     record_mcp_entry_in_ledger(target_id, path, &owned_entry)
 }
 
@@ -2106,7 +2446,7 @@ fn merge_mcp_config_toml_with_topology(
     _topology: &McpTopologyLock,
 ) -> Result<()> {
     let lock = ConfigLock::acquire(path)?;
-    let entry = kin_mcp_entry()?;
+    let entry = kin_mcp_entry(target_id)?;
     let command = entry
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -2167,6 +2507,10 @@ fn merge_mcp_config_toml_locked(
         doc.insert("mcp_servers", Item::Table(servers));
     }
 
+    let existing_entry = original
+        .as_deref()
+        .and_then(|bytes| read_kin_mcp_entry_from_bytes(path, bytes));
+    let choice = tool_profile_choice(target_id, path, existing_entry.as_ref());
     let servers = doc["mcp_servers"]
         .as_table_mut()
         .expect("mcp_servers was normalized to a table");
@@ -2199,16 +2543,31 @@ fn merge_mcp_config_toml_locked(
     if !entry_preexisted {
         kin.remove("cwd");
     }
+    let profile = choice.profile.as_str();
+    let pinned = choice.pinned();
     match kin.get_mut("env") {
         Some(Item::Value(toml_edit::Value::InlineTable(env))) => {
-            env.insert("KIN_MCP_TOOL_PROFILE", "agent-default".into());
+            env.insert("KIN_MCP_TOOL_PROFILE", profile.into());
+            if pinned {
+                env.insert(PINNED_PROFILE_ENV, "1".into());
+            } else {
+                env.remove(PINNED_PROFILE_ENV);
+            }
         }
         Some(Item::Table(env)) => {
-            env.insert("KIN_MCP_TOOL_PROFILE", value("agent-default"));
+            env.insert("KIN_MCP_TOOL_PROFILE", value(profile));
+            if pinned {
+                env.insert(PINNED_PROFILE_ENV, value("1"));
+            } else {
+                env.remove(PINNED_PROFILE_ENV);
+            }
         }
         None => {
             let mut env = InlineTable::new();
-            env.insert("KIN_MCP_TOOL_PROFILE", "agent-default".into());
+            env.insert("KIN_MCP_TOOL_PROFILE", profile.into());
+            if pinned {
+                env.insert(PINNED_PROFILE_ENV, "1".into());
+            }
             kin.insert("env", value(env));
         }
         Some(_) => anyhow::bail!(
@@ -2219,6 +2578,7 @@ fn merge_mcp_config_toml_locked(
 
     let formatted = doc.to_string();
     lock.write_guarded(path, formatted.as_bytes(), original.as_deref())?;
+    note_profile_choice(path, choice);
     let owned_entry =
         read_kin_mcp_entry_from_bytes(path, formatted.as_bytes()).with_context(|| {
             format!(
@@ -2412,10 +2772,14 @@ fn configure_antigravity() -> Result<PathBuf> {
 // Discovery reminder injection
 // ---------------------------------------------------------------------------
 
-/// Kin-first discovery reminder appended to agent instruction files.
+/// The Kin-first discovery block an earlier Kin appended once and never
+/// rewrote.
 ///
-/// Tells the agent to lead with Kin's semantic tools (`semantic_locate`,
-/// `get_context_pack`, `trace_data_flow`) instead of grep/read loops.
+/// Kept verbatim so a run that finds it can replace it with the managed block
+/// for the client's profile, and so `kin setup uninstall` can still excise a
+/// copy an earlier run recorded. It names `semantic_locate`,
+/// `get_context_pack` and `trace_data_flow`, which a routed client does not
+/// hold as tools, and it was never rewritten when a client's profile changed.
 const KIN_DISCOVERY_REMINDER: &str = r#"
 ## Kin-first discovery (added by `kin setup`)
 
@@ -2430,9 +2794,130 @@ These tools operate on the graph-native substrate and return richer, more
 accurate results than filesystem heuristics. Use them first.
 "#;
 
-/// Heading the reminder is recognized by, and the line setup names before it
+/// Heading the block is recognized by, and the line setup names before it
 /// appends anything to a user's global instruction file.
 const KIN_DISCOVERY_MARKER: &str = "## Kin-first discovery (added by `kin setup`)";
+
+/// The first line of the block Kin owns in an instruction file. Everything
+/// from here to [`DISCOVERY_BLOCK_END`] is rewritten by `kin setup` and `kin
+/// update` for the client's current tool profile.
+const DISCOVERY_BLOCK_BEGIN: &str = "<!-- kin-managed:discovery. kin setup and kin update \
+rewrite this block for this client's Kin tool profile; edit outside it. -->";
+
+/// The last line of the block Kin owns.
+const DISCOVERY_BLOCK_END: &str = "<!-- /kin-managed:discovery -->";
+
+/// The steps the block gives, worded for what a profile serves: the same
+/// procedure the server's own instructions carry, so an instruction file and
+/// the server never send an agent to different tools.
+///
+/// On a routed profile every `kin ...` span is a spelling the routed tool takes
+/// and the CLI runs too, so an agent that types one into a shell gets the same
+/// answer. The block keeps `kin graph source`, the spelling it was first
+/// written with, although `kin source` now runs in both places as well. A
+/// profile that can write gets the edit step, and a read-only profile never
+/// names a tool it does not serve. `describe`, `call`, `session` and `mutate`
+/// are named as the `kin` tool's commands, which is what the block teaches; in a
+/// shell `kin describe` and `kin call` answer the same, and the write commands
+/// are the tool's alone.
+fn discovery_steps(profile: &str) -> String {
+    match profile {
+        "agent-routed" | "agent-routed-query" => {
+            let (rest, third) = if profile == "agent-routed" {
+                (
+                    "every other Kin tool",
+                    "3. To change code: `kin graph source` on the entity id for its source base,\n\
+                     then the `kin` tool's `session` command once and its `mutate` command on\n\
+                     that entity id\n",
+                )
+            } else {
+                (
+                    "every other read-only Kin tool",
+                    "3. `kin graph source`: one entity's code, when `kin context` withheld its body\n",
+                )
+            };
+            format!(
+                "In a Kin repository, use Kin's one MCP tool, `kin`, instead of grep or file\n\
+                 reads. Call it with a command and that command's args:\n\
+                 \n\
+                 1. `kin locate` or `kin search`: find code by what it does, or by name\n\
+                 2. `kin context`: an entity's exact code with its callers and callees; `kin refs`\n\
+                 for every reference\n\
+                 {third}\
+                 \n\
+                 The shell is for building and running tests.\n\
+                 The `kin` tool's `describe` command lists {rest}, and its `call` command\n\
+                 runs any of them. Read `_kin.verdict` first; inconclusive means the counts\n\
+                 are a lower bound.\n"
+            )
+        }
+        "agent-search" => {
+            "In a Kin repository, use Kin's MCP tools instead of grep or file reads:\n\
+             \n\
+             1. `semantic_locate`: find code by what it does\n\
+             2. `get_context_pack` and `trace_data_flow`: an entity's exact code with its\n\
+             neighbourhood, and its call chain\n\
+             3. `kin_tool_call` with tool `get_entity_source`: one entity's code, when the pack\n\
+             withheld its body\n\
+             \n\
+             The shell is for building and running tests. `kin_tool_search` finds every other\n\
+             read-only Kin tool, and `kin_tool_call` runs it. Read `_kin.verdict` first;\n\
+             inconclusive means the counts are a lower bound.\n"
+                .to_string()
+        }
+        _ => {
+            let third = if profile.ends_with("-query") {
+                "3. `get_entity_source`: one entity's code, when the pack withheld its body\n"
+            } else {
+                "3. To change code: `get_entity_source` on the entity id for its source base,\n\
+                 `kin_session_start` once, then `kin_mutate` that entity by id\n"
+            };
+            format!(
+                "In a Kin repository, use Kin's MCP tools instead of grep or file reads:\n\
+                 \n\
+                 1. `semantic_locate` or `semantic_search`: find code by what it does, or by name\n\
+                 2. `get_context_pack` and `find_references`: an entity's exact code with its\n\
+                 neighbourhood, and every reference to it\n\
+                 {third}\
+                 \n\
+                 The shell is for building and running tests. Read `_kin.verdict` first;\n\
+                 inconclusive means the counts are a lower bound.\n"
+            )
+        }
+    }
+}
+
+/// The managed discovery block for a client served `profile`, markers
+/// included, exactly as it is written and as the ledger records it.
+pub fn discovery_block(profile: &str) -> String {
+    format!(
+        "{DISCOVERY_BLOCK_BEGIN}\n{KIN_DISCOVERY_MARKER}\n\n{}{DISCOVERY_BLOCK_END}\n",
+        discovery_steps(profile)
+    )
+}
+
+/// The byte span of the managed block in `content`, end marker and its line
+/// ending included.
+fn managed_block_span(content: &str) -> Option<(usize, usize)> {
+    let start = content.find(DISCOVERY_BLOCK_BEGIN)?;
+    let end_marker = start + content[start..].find(DISCOVERY_BLOCK_END)?;
+    let mut end = end_marker + DISCOVERY_BLOCK_END.len();
+    if content[end..].starts_with('\n') {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// The Kin-owned discovery text in an instruction file: the managed block, or
+/// the block an earlier Kin appended verbatim.
+pub(crate) fn kin_discovery_text(content: &str) -> Option<&str> {
+    if let Some((start, end)) = managed_block_span(content) {
+        return Some(&content[start..end]);
+    }
+    content
+        .find(KIN_DISCOVERY_REMINDER)
+        .map(|at| &content[at..at + KIN_DISCOVERY_REMINDER.len()])
+}
 
 /// Whether an instruction file already carries Kin's reminder heading.
 fn discovery_reminder_marker_present(path: &Path) -> bool {
@@ -2441,35 +2926,74 @@ fn discovery_reminder_marker_present(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Append the Kin-first discovery reminder to an agent instruction file
-/// (e.g. `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`).
+/// What writing the block did to one instruction file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockWrite {
+    /// The file had no Kin block, and now ends with one.
+    Appended,
+    /// A managed block, or the block an earlier Kin appended, was replaced.
+    Replaced,
+    /// The managed block already said this.
+    Unchanged,
+    /// The file carries Kin's heading in a block a person edited, so it was
+    /// left alone.
+    LeftAsEdited,
+}
+
+/// Write `block` into an instruction file as the one Kin-managed block.
 ///
-/// Idempotent: skips if the marker is already present.
-fn inject_discovery_reminder(path: &PathBuf) -> Result<()> {
+/// Kin owns only the text between its markers. The block an earlier Kin
+/// appended with no markers is replaced where it is found verbatim; a copy a
+/// person edited is theirs, and is left alone rather than duplicated.
+fn upsert_discovery_block(path: &Path, block: &str) -> Result<BlockWrite> {
     let existing = if path.exists() {
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
     } else {
         String::new()
     };
-
-    if existing.contains(KIN_DISCOVERY_MARKER) {
-        return Ok(());
-    }
-
+    let (content, outcome) = if let Some((start, end)) = managed_block_span(&existing) {
+        if &existing[start..end] == block {
+            return Ok(BlockWrite::Unchanged);
+        }
+        (
+            format!("{}{block}{}", &existing[..start], &existing[end..]),
+            BlockWrite::Replaced,
+        )
+    } else if let Some(at) = existing.find(KIN_DISCOVERY_REMINDER) {
+        (
+            format!(
+                "{}\n{block}{}",
+                &existing[..at],
+                &existing[at + KIN_DISCOVERY_REMINDER.len()..]
+            ),
+            BlockWrite::Replaced,
+        )
+    } else if existing.contains(KIN_DISCOVERY_MARKER) {
+        return Ok(BlockWrite::LeftAsEdited);
+    } else {
+        let mut content = existing;
+        if !content.is_empty() {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push('\n');
+        }
+        content.push_str(block);
+        (content, BlockWrite::Appended)
+    };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
-
-    let mut content = existing;
-    if !content.ends_with('\n') && !content.is_empty() {
-        content.push('\n');
-    }
-    content.push_str(KIN_DISCOVERY_REMINDER);
-
     fs::write(path, &content).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(outcome)
+}
 
-    Ok(())
+/// Write the discovery block for the default profile. Kept for the callers
+/// that name no client.
+#[cfg(test)]
+fn inject_discovery_reminder(path: &PathBuf) -> Result<()> {
+    upsert_discovery_block(path, &discovery_block("agent-default")).map(|_| ())
 }
 
 /// One agent instruction file setup can append the Kin-first discovery reminder
@@ -2502,30 +3026,66 @@ fn discovery_reminder_targets(home: &Path) -> Vec<DiscoveryReminderTarget> {
     ]
 }
 
-/// Whether Kin's discovery reminder is already appended to an instruction file.
+/// Whether a Kin discovery block, managed or the one an earlier Kin appended,
+/// is in an instruction file.
 fn discovery_reminder_present(path: &Path) -> bool {
     fs::read_to_string(path)
-        .map(|content| content.contains(KIN_DISCOVERY_REMINDER))
+        .map(|content| kin_discovery_text(&content).is_some())
         .unwrap_or(false)
 }
 
-/// Append the Kin-first discovery reminder to each instruction file whose client
-/// this run registered, and report what was written as `(ledger target, path)`.
+/// One block setup wrote: which file, and the exact text, for the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrittenReminder {
+    target: &'static str,
+    path: PathBuf,
+    snippet: String,
+}
+
+/// The profile a client's entry carries, as `kin mcp start` will read it: the
+/// entry's `KIN_MCP_TOOL_PROFILE`, or `agent-default` when it names none.
+fn client_profile_for_index(idx: usize) -> Option<String> {
+    let path = mcp_config_path_for_index(idx)?;
+    let entry = read_kin_mcp_entry(&path)?;
+    Some(
+        entry
+            .get("env")
+            .and_then(|env| env.get("KIN_MCP_TOOL_PROFILE"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+            .unwrap_or("agent-default")
+            .to_string(),
+    )
+}
+
+/// The line setup prints under a configured client: the profile its entry now
+/// carries, and why.
+fn written_profile_line(choice: &ProfileChoice) -> String {
+    format!("profile {}, {}", choice.profile, choice.describe())
+}
+
+/// Append or rewrite the Kin-first discovery block in each instruction file
+/// whose client this run registered, worded for the profile each client's
+/// entry carries, and report what was written.
 ///
-/// The reminder is a standing behavioral directive: it tells the agent to reach
-/// for Kin's semantic MCP tools before grep or raw file reads, in every
-/// repository, for every session. That instruction is only true for a client
-/// whose MCP server is actually registered, so each file is gated on its own
-/// client appearing in `registered_clients`. Writing it for an unregistered
-/// client aims the agent at tools that are not wired, and every call it makes
-/// fails.
+/// The block is a standing behavioral directive: it tells the agent to reach
+/// for Kin's MCP tools before grep or raw file reads, in every repository, for
+/// every session. That instruction is only true for a client whose MCP server
+/// is actually registered, so each file is gated on its own client appearing in
+/// `registered_clients`, and only true in the words of the tools that client
+/// holds, so the block is worded for its profile. Writing it for an
+/// unregistered client aims the agent at tools that are not wired, and naming
+/// `semantic_locate` to a client served one routed tool aims it at a tool that
+/// is not listed.
 ///
 /// `home` is taken by argument rather than resolved here so this is exercisable
 /// without mutating the process environment that the rest of the suite reads.
-fn apply_discovery_reminders(
+fn apply_discovery_reminders_for(
     home: &Path,
     registered_clients: &[usize],
-) -> Vec<(&'static str, PathBuf)> {
+    profile_of: &dyn Fn(usize) -> Option<String>,
+) -> Vec<WrittenReminder> {
     let mut written = Vec::new();
     for target in discovery_reminder_targets(home) {
         let DiscoveryReminderTarget {
@@ -2551,6 +3111,13 @@ fn apply_discovery_reminders(
             }
             continue;
         }
+        let profile = profile_of(client).unwrap_or_else(|| {
+            setup_target_id_for_index(client)
+                .map(setup_tool_profile)
+                .unwrap_or("agent-default")
+                .to_string()
+        });
+        let block = discovery_block(&profile);
         if !discovery_reminder_marker_present(&path) {
             println!(
                 "  {} {label}: appending the \"{KIN_DISCOVERY_MARKER}\" block to {}, a global \
@@ -2559,19 +3126,249 @@ fn apply_discovery_reminders(
                 path.display()
             );
         }
-        match inject_discovery_reminder(&path) {
-            Ok(()) => {
+        match upsert_discovery_block(&path, &block) {
+            Ok(BlockWrite::LeftAsEdited) => println!(
+                "  {} {label}: {} carries a Kin-first discovery block that was edited by hand, \
+                 so it was left as it is. Delete that block and run `kin setup` again to have \
+                 Kin keep it current for the {profile} profile.",
+                style("!").yellow(),
+                path.display()
+            ),
+            Ok(_) => {
                 println!(
-                    "  {} {label} discovery reminder ensured ({})",
+                    "  {} {label} discovery reminder ensured for the {profile} profile ({})",
                     style("✓").green(),
                     path.display()
                 );
-                written.push((ledger_target, path));
+                written.push(WrittenReminder {
+                    target: ledger_target,
+                    path,
+                    snippet: block,
+                });
             }
             Err(e) => println!("  {} {label} reminder failed: {e}", style("!").yellow()),
         }
     }
     written
+}
+
+/// [`apply_discovery_reminders_for`] with each client's default profile, for
+/// the callers that configure no entry first.
+#[cfg(test)]
+fn apply_discovery_reminders(
+    home: &Path,
+    registered_clients: &[usize],
+) -> Vec<(&'static str, PathBuf)> {
+    apply_discovery_reminders_for(home, registered_clients, &|_| None)
+        .into_iter()
+        .map(|written| (written.target, written.path))
+        .collect()
+}
+
+/// Rewrite each Kin discovery block already present in an instruction file for
+/// the profile its client's entry carries now, and record the new text.
+///
+/// Called by `kin update` after it repairs the MCP entries, which can move a
+/// client's profile: a block written for `agent-default` names tools a client
+/// now served `agent-routed` does not hold. A file with no Kin block is not
+/// given one here; that is setup's decision, gated on the client being
+/// registered. Returns one line per file it changed or could not.
+pub(crate) fn refresh_discovery_blocks() -> Vec<String> {
+    let Ok(home) = home_dir() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let mut written = Vec::new();
+    for target in discovery_reminder_targets(&home) {
+        if !discovery_reminder_present(&target.path) {
+            continue;
+        }
+        let Some(profile) = client_profile_for_index(target.client) else {
+            continue;
+        };
+        let block = discovery_block(&profile);
+        match upsert_discovery_block(&target.path, &block) {
+            Ok(BlockWrite::Replaced) => {
+                lines.push(format!(
+                    "Rewrote the Kin discovery block in {} for the {profile} profile",
+                    target.path.display()
+                ));
+                written.push(WrittenReminder {
+                    target: target.ledger_target,
+                    path: target.path,
+                    snippet: block,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => lines.push(format!(
+                "Could not rewrite the Kin discovery block in {}: {error:#}",
+                target.path.display()
+            )),
+        }
+    }
+    if !written.is_empty() {
+        record_discovery_reminders(&written);
+    }
+    lines
+}
+
+/// One name a Kin discovery block tells an agent to call, as it names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlockName {
+    /// `kin X`: the routed tool called with command `X`, which may be more
+    /// than one word, as in `kin graph source`.
+    Command(String),
+    /// Any other code span that is a name: a tool's, or, as in the `kin`
+    /// tool's `describe` command, one of the routed tool's commands.
+    Tool(String),
+}
+
+/// Every name a block tells an agent to call: each code span that reads as
+/// a routed command or a tool name. Other spans, `_kin.verdict` among them,
+/// name no call, and neither does the heading, which names `kin setup` as the
+/// block's author.
+pub(crate) fn names_in_discovery_block(block: &str) -> Vec<BlockName> {
+    let body = block.replace(KIN_DISCOVERY_MARKER, "");
+    let mut names = Vec::new();
+    for (index, span) in body.split('`').enumerate() {
+        if index % 2 == 0 {
+            continue;
+        }
+        if let Some(command) = span.strip_prefix("kin ") {
+            // Every word up to the first flag, so `kin graph source` is read
+            // the way the routed tool reads it and not as `kin graph`.
+            let words: Vec<&str> = command
+                .split_whitespace()
+                .take_while(|word| !word.starts_with('-'))
+                .collect();
+            if !words.is_empty() {
+                names.push(BlockName::Command(words.join(" ")));
+            }
+        } else if !span.is_empty()
+            && span
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            names.push(BlockName::Tool(span.to_string()));
+        }
+    }
+    names
+}
+
+/// The names in `block` that a client served `profile` cannot call, spelled
+/// as the block spells them.
+///
+/// A named profile can call a tool it serves, and, when it serves the
+/// read-only dispatcher `kin_tool_call`, any read-only tool through it. A
+/// routed profile can call its one tool, and through it any `kin X` spelling
+/// its surface accepts, `kin graph source` included, and any command its
+/// surface serves when the block names the command bare. A bare tool name is
+/// still a direct call, which a routed connection refuses. A token no build
+/// serves is read as `agent-default`, the profile `kin mcp start` falls back
+/// to.
+pub(crate) fn names_missing_from_profile(block: &str, profile: &str) -> Vec<String> {
+    const DISPATCHER: &str = "kin_tool_call";
+    let resolved = crate::commands::mcp::tool_profile_for_token(profile);
+    let routed = resolved.and_then(|profile| profile.routed_surface());
+    let served: Option<std::collections::HashSet<String>> = match resolved {
+        Some(profile) => profile.allowed_tool_names().map(kin_mcp::tool_name_set),
+        None => Some(kin_mcp::tool_name_set(kin_mcp::agent_default_tool_names())),
+    };
+    let catalogue = kin_mcp::tool_definitions();
+    let registered = |tool: &str| {
+        catalogue
+            .tools
+            .iter()
+            .find(|definition| definition.name == tool)
+    };
+    let named_callable = |tool: &str| match &served {
+        None => registered(tool).is_some(),
+        Some(served) => {
+            served.contains(tool)
+                || (served.contains(DISPATCHER)
+                    && registered(tool)
+                        .is_some_and(|definition| definition.annotations.read_only_hint))
+        }
+    };
+    let mut missing = Vec::new();
+    for name in names_in_discovery_block(block) {
+        let callable = match (&name, routed) {
+            (BlockName::Command(command), Some(surface)) => {
+                kin_mcp::routed::accepts(surface, command)
+            }
+            (BlockName::Command(_), None) => false,
+            (BlockName::Tool(tool), Some(surface)) => {
+                tool == kin_mcp::routed::TOOL_NAME
+                    || kin_mcp::routed::command_names(surface).contains(&tool.as_str())
+            }
+            (BlockName::Tool(tool), None) => named_callable(tool),
+        };
+        if !callable {
+            let spelled = match name {
+                BlockName::Command(command) => format!("kin {command}"),
+                BlockName::Tool(tool) => tool,
+            };
+            if !missing.contains(&spelled) {
+                missing.push(spelled);
+            }
+        }
+    }
+    missing
+}
+
+/// What `kin doctor` reads about one instruction file's Kin block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveryBlockFinding {
+    pub(crate) ledger_target: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) path: PathBuf,
+    /// The profile the file's client is served.
+    pub(crate) profile: String,
+    /// Names the block tells an agent to call that the profile does not carry.
+    pub(crate) missing: Vec<String>,
+}
+
+/// Each instruction file that carries a Kin block, for a client with a Kin
+/// MCP entry, checked against the profile that entry carries.
+pub(crate) fn discovery_block_findings() -> Vec<DiscoveryBlockFinding> {
+    let Ok(home) = home_dir() else {
+        return Vec::new();
+    };
+    discovery_reminder_targets(&home)
+        .into_iter()
+        .filter_map(|target| {
+            let content = fs::read_to_string(&target.path).ok()?;
+            let block = kin_discovery_text(&content)?.to_string();
+            let profile = client_profile_for_index(target.client)?;
+            let missing = names_missing_from_profile(&block, &profile);
+            Some(DiscoveryBlockFinding {
+                ledger_target: target.ledger_target,
+                label: target.label,
+                path: target.path,
+                profile,
+                missing,
+            })
+        })
+        .collect()
+}
+
+/// Record the blocks written, with their exact text, in the install ledger.
+fn record_discovery_reminders(written: &[WrittenReminder]) {
+    use crate::commands::setup_ledger::{ledger_path, ArtifactKind, LedgerEntry, SetupLedger};
+    let Ok(path) = ledger_path() else {
+        return;
+    };
+    let _ = SetupLedger::update(&path, |ledger| {
+        for reminder in written {
+            ledger.record(LedgerEntry::appended(
+                ArtifactKind::DiscoveryReminder,
+                reminder.target,
+                reminder.path.clone(),
+                reminder.snippet.clone(),
+            ));
+        }
+        Ok(())
+    });
 }
 
 /// Check if a given MCP config file already has the "kin" server entry.
@@ -2730,6 +3527,11 @@ fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, St
 
     let source_line = rc_source_line(shell_name, &hook_file);
 
+    // Every file is tried even after one refuses. zsh keeps its PATH line in
+    // `.zshenv` and its hook in `.zshrc`, and a person who keeps one of them
+    // read-only still gets the other. The refusals are returned together once
+    // every file has had its turn.
+    let mut refused: Vec<String> = Vec::new();
     for target in rc_write_plan(shell_name)? {
         // A declined PATH line narrows the plan: a file that carried only the
         // PATH block is dropped, and one that carried both keeps the hook. The
@@ -2742,50 +3544,68 @@ fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, St
         }) else {
             continue;
         };
-        let rc_path = target.path.as_path();
-        let existed = rc_path.exists();
-        let rc_content = if existed {
-            fs::read_to_string(rc_path)?
-        } else {
-            // A file Kin creates from nothing may owe the user something before
-            // Kin's own blocks. A `.bash_profile` that exists only because Kin
-            // wrote it still has to behave like one a bash user would recognize.
-            target.seed_when_absent.unwrap_or_default().to_string()
-        };
-
-        let update = plan_rc_update(
-            &rc_content,
-            shell_name,
-            &source_line,
-            rc_path,
-            &bin_dir,
-            bin_dir.is_dir(),
-            blocks,
-        );
-        for line in update.already_present.iter().chain(&update.skipped) {
-            println!("{line}");
+        if let Err(error) = write_rc_target(&target, blocks, shell_name, &source_line, &bin_dir) {
+            refused.push(format!("{error:#}"));
         }
-        if !update.applied.is_empty() {
-            if let Some(parent) = rc_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
-            fs::write(rc_path, &update.content)
-                .with_context(|| format!("failed to update {}", rc_path.display()))?;
-            if !existed && target.seed_when_absent.is_some() {
-                println!(
-                    "  Created {}, which is the file a bash login shell reads; \
-                     it sources ~/.bashrc when the shell is interactive",
-                    rc_path.display()
-                );
-            }
-            for line in &update.applied {
-                println!("{line}");
-            }
-        }
+    }
+    if !refused.is_empty() {
+        anyhow::bail!("{}", refused.join("; "));
     }
 
     Ok((hook_file, source_line))
+}
+
+/// Append this target's missing blocks to its file, saying what changed.
+fn write_rc_target(
+    target: &RcTarget,
+    blocks: RcBlocks,
+    shell_name: &str,
+    source_line: &str,
+    bin_dir: &Path,
+) -> Result<()> {
+    let rc_path = target.path.as_path();
+    let existed = rc_path.exists();
+    let rc_content = if existed {
+        fs::read_to_string(rc_path)
+            .with_context(|| format!("failed to read {}", rc_path.display()))?
+    } else {
+        // A file Kin creates from nothing may owe the user something before
+        // Kin's own blocks. A `.bash_profile` that exists only because Kin
+        // wrote it still has to behave like one a bash user would recognize.
+        target.seed_when_absent.unwrap_or_default().to_string()
+    };
+
+    let update = plan_rc_update(
+        &rc_content,
+        shell_name,
+        source_line,
+        rc_path,
+        bin_dir,
+        bin_dir.is_dir(),
+        blocks,
+    );
+    for line in update.already_present.iter().chain(&update.skipped) {
+        println!("{line}");
+    }
+    if !update.applied.is_empty() {
+        if let Some(parent) = rc_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(rc_path, &update.content)
+            .with_context(|| format!("failed to update {}", rc_path.display()))?;
+        if !existed && target.seed_when_absent.is_some() {
+            println!(
+                "  Created {}, which is the file a bash login shell reads; \
+                 it sources ~/.bashrc when the shell is interactive",
+                rc_path.display()
+            );
+        }
+        for line in &update.applied {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 /// The files this shell's integration is written to, and what each one carries.
@@ -2886,6 +3706,15 @@ impl RcBlocks {
         match self {
             RcBlocks::HookAndPath | RcBlocks::HookOnly => Some(RcBlocks::HookOnly),
             RcBlocks::PathOnly => None,
+        }
+    }
+
+    /// The same responsibility with the hook's `source` line dropped, or
+    /// `None` when nothing is left for this file to carry.
+    fn without_hook(self) -> Option<Self> {
+        match self {
+            RcBlocks::HookAndPath | RcBlocks::PathOnly => Some(RcBlocks::PathOnly),
+            RcBlocks::HookOnly => None,
         }
     }
 }
@@ -3007,8 +3836,9 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
     restore_shim_from_sources(&dest, &sources)
 }
 
-/// Re-merge the kin MCP server entry (with the agent-default profile) into the
-/// config files of every AI client that already has a config present.
+/// Re-merge the kin MCP server entry (with the profile [`setup_tool_profile`]
+/// names for each client) into the config files of every AI client that
+/// already has a config present.
 ///
 /// Used by `kin doctor --fix` to repair `mcp_client_*` checks. Returns the
 /// paths that were re-merged.
@@ -12009,6 +12839,7 @@ fn merge_json_mcp_target_locked(
         anyhow::bail!("existing mcpServers.kin value is not an object");
     }
     let entry_preexisted = servers.contains_key("kin");
+    let choice = tool_profile_choice(&target.id, &target.path, servers.get("kin"));
     let entry = servers
         .entry("kin")
         .or_insert_with(|| serde_json::json!({}))
@@ -12042,13 +12873,11 @@ fn merge_json_mcp_target_locked(
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .expect("Kin MCP env was validated as an object");
-    env.insert(
-        "KIN_MCP_TOOL_PROFILE".to_string(),
-        serde_json::Value::String("agent-default".to_string()),
-    );
+    apply_profile_choice_json(env, &choice);
     let owned_entry = root["mcpServers"]["kin"].clone();
     let formatted = serde_json::to_vec_pretty(&root)?;
     lock.write_guarded(&target.path, &formatted, original.as_deref())?;
+    note_profile_choice(&target.path, choice);
     record_mcp_entry_in_ledger(&target.id, &target.path, &owned_entry)
 }
 
@@ -12278,12 +13107,13 @@ fn mcp_entry_matches_repair_target(
     target: &McpRepairTarget,
     command: &str,
 ) -> bool {
+    let expected_profile = tool_profile_choice(&target.id, &target.path, Some(entry)).profile;
     if entry.get("command").and_then(serde_json::Value::as_str) != Some(command)
         || entry
             .get("env")
             .and_then(|env| env.get("KIN_MCP_TOOL_PROFILE"))
             .and_then(serde_json::Value::as_str)
-            != Some("agent-default")
+            != Some(expected_profile.as_str())
     {
         return false;
     }
@@ -13140,7 +13970,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         &mut skipped,
     )?;
 
-    let applied = apply_plan(&plan, &assistants, shell_name).await?;
+    let applied = apply_plan(&plan, &assistants, shell_name, opts.tool_profile.as_deref()).await?;
 
     print_intent_followups(&plan, interactive, editor_extension_installed);
 
@@ -13151,6 +13981,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     // the failed start at debug level, and every cross-file call fell back to
     // matching names.
     provision_language_servers_in_wizard(&opts, interactive).await;
+    record_language_tool_dirs_in_wizard();
 
     report_notification_identity(interactive);
 
@@ -13174,12 +14005,16 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     print_next_steps(
         intent,
-        plan.install_shell_hook,
+        &applied.shell_integration,
         &applied.configured_assistants,
         &applied.deferred_clients,
     );
 
-    Ok(())
+    // Last, so it is the line the run ends on and the status a script reads.
+    match failed_clients_error(&applied.failed_clients) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Offer the missing language servers during first-run setup.
@@ -13205,6 +14040,35 @@ async fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive:
         println!("  {} {line}", style("✓").green());
     }
     outcome.print_unfinished();
+}
+
+/// Record where this shell finds language servers, so a daemon an AI client
+/// starts with its own `PATH` looks there too.
+///
+/// Setup is run from the operator's shell, which is the one `PATH` that knows
+/// where their servers are. A daemon an AI client starts inherits the client's
+/// `PATH` instead, and without this it found only the usual install places and
+/// Kin's own directories. Silent when there is nothing new to record.
+fn record_language_tool_dirs_in_wizard() {
+    match language_servers::record_language_tool_dirs() {
+        Ok(added) if added.is_empty() => {}
+        Ok(added) => {
+            println!();
+            println!(
+                "  {} {}",
+                style("✓").green(),
+                language_servers::recorded_tool_dirs_line(&added)
+            );
+        }
+        Err(error) => {
+            println!();
+            println!(
+                "  {} could not record where this shell finds language servers, so a daemon an \
+                 AI client starts may not find them: {error}",
+                style("!").yellow()
+            );
+        }
+    }
 }
 
 /// Get the notification identity working, and say so when it cannot be.
@@ -13536,53 +14400,62 @@ struct AppliedSetup {
     configured_assistants: Vec<(String, Option<PathBuf>)>,
     /// Clients whose binding is waiting on `kin init`, in the order tried.
     deferred_clients: Vec<String>,
+    /// Clients on this machine whose configuration genuinely failed, as the
+    /// client name and the reason, in the order tried. Never a deferral.
+    failed_clients: Vec<(String, String)>,
+    /// What became of the shell-profile step.
+    shell_integration: ShellIntegration,
 }
 
-/// Apply a [`SetupPlan`]: install the shell hook, write MCP configs, inject
-/// discovery reminders, and persist the daemon config. Existing config is
+/// The error a setup run ends with when a client it set out to configure
+/// could not be configured, or `None` when every client was written or is only
+/// waiting on `kin init`.
+///
+/// A failed write used to be one line in the middle of a long run, and setup
+/// still exited 0, so a first install that lost its Claude Code config read as
+/// a success to the person and to every script that ran it. The run still
+/// finishes every other step first; it just cannot report success for a client
+/// that cannot call Kin.
+fn failed_clients_error(failed: &[(String, String)]) -> Option<anyhow::Error> {
+    // A reason is an error message and may already end its own sentence.
+    let reason = |reason: &str| reason.trim_end().trim_end_matches('.').to_string();
+    let message = match failed {
+        [] => return None,
+        [(name, why)] => format!(
+            "kin setup could not configure {name}: {}. {name} cannot call Kin until this \
+             is fixed. Everything else finished. Fix it, then run `kin setup` again.",
+            reason(why)
+        ),
+        several => format!(
+            "kin setup could not configure {} clients: {}. They cannot call Kin until this \
+             is fixed. Everything else finished. Fix them, then run `kin setup` again.",
+            several.len(),
+            several
+                .iter()
+                .map(|(name, why)| format!("{name} ({})", reason(why)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    };
+    Some(anyhow::anyhow!(message))
+}
+
+/// Apply a [`SetupPlan`]: write MCP configs, inject discovery reminders,
+/// install the shell hook, and persist the daemon config. Existing config is
 /// detected and the user is told what changes before it is touched.
 async fn apply_plan(
     plan: &SetupPlan,
     assistants: &[AiAssistant],
     shell_name: &str,
+    requested_profile: Option<&str>,
 ) -> Result<AppliedSetup> {
-    // Shell integration.
-    if plan.install_shell_hook {
-        let rc_path = shell_rc(shell_name)?;
-        let already = rc_path.exists()
-            && std::fs::read_to_string(&rc_path)
-                .map(|c| c.contains("kin-vfs"))
-                .unwrap_or(false);
-        if already {
-            println!(
-                "Shell integration: {} already sources the kin-vfs hook, so the hook file is refreshed in place and your rc is left untouched.",
-                rc_path.display()
-            );
-        } else {
-            println!(
-                "Shell integration: adding one `source` line to {}.",
-                rc_path.display()
-            );
-        }
-        install_shell_hook(shell_name, plan.add_bin_to_path)?;
-        if cfg!(target_os = "windows") {
-            println!(
-                "  {} On Windows the VFS shim/ProjFS is an optional feature and is not \
-                 shell-auto-injected. The PowerShell hook only manages env state.",
-                style("!").yellow()
-            );
-        }
-        println!("  Shell integration installed.");
-    } else {
-        println!("Shell integration: skipped.");
-    }
-    println!();
-
     // AI client MCP configuration.
     let mut configured_assistants: Vec<(String, Option<PathBuf>)> = Vec::new();
     // Clients whose binding is waiting on `kin init`, so the closing next steps
     // can name them after the health checklist has scrolled their own line away.
     let mut deferred_clients: Vec<String> = Vec::new();
+    // Clients whose configuration failed, which the run ends on as an error.
+    let mut failed_clients: Vec<(String, String)> = Vec::new();
     // Assistant indices whose MCP server this run actually registered. Gates the
     // discovery reminders below so a directive is never written for a client
     // Kin did not wire up.
@@ -13598,10 +14471,10 @@ async fn apply_plan(
             if let Some(p) = &existing_path {
                 if has_kin_mcp_config(p) {
                     println!(
-                        "  {} {} already has a kin MCP entry at {}, so it is re-merged to the agent-default profile (other servers untouched).",
+                        "  {} {} already has a kin MCP entry at {}, so it is re-merged (other servers untouched).",
                         style("→").cyan(),
                         a.name,
-                        p.display()
+                        p.display(),
                     );
                 } else if p.exists() {
                     println!(
@@ -13612,7 +14485,17 @@ async fn apply_plan(
                     );
                 }
             }
-            let result = configure_assistant_by_index(*idx);
+            // The profile this run was asked for reaches the writers for the
+            // length of this one synchronous call and no further.
+            let (result, choice) = {
+                let scope = RequestedProfileScope::enter(requested_profile);
+                let result = configure_assistant_by_index(*idx);
+                let choice = match &result {
+                    Some(Ok(path)) => scope.choice_for(path),
+                    _ => None,
+                };
+                (result, choice)
+            };
             match result {
                 Some(Ok(path)) => {
                     println!(
@@ -13620,6 +14503,9 @@ async fn apply_plan(
                         style("✓").green(),
                         client_write_summary(a.name, a.detected, &path)
                     );
+                    if let Some(choice) = &choice {
+                        println!("      {}", written_profile_line(choice));
+                    }
                     // Which repository a client ends up bound to is decided by
                     // the directory this ran in, and nothing said so. A later
                     // run from a different directory rebound the client
@@ -13645,8 +14531,11 @@ async fn apply_plan(
                             println!("      {line}");
                         }
                     }
-                    if register == ClientNotConfigured::Deferred {
-                        deferred_clients.push(a.name.to_string());
+                    match register {
+                        ClientNotConfigured::Deferred => deferred_clients.push(a.name.to_string()),
+                        ClientNotConfigured::Failed => {
+                            failed_clients.push((a.name.to_string(), e.to_string()))
+                        }
                     }
                     // Recorded as not configured either way. A deferral is a
                     // quieter register, never a claim that the client is wired
@@ -13694,12 +14583,30 @@ async fn apply_plan(
     // on its own client's registration succeeding this run. Writing it for an
     // unregistered client aims the agent at tools that are not wired, and every
     // call it makes fails.
-    let mut written_reminders: Vec<(&'static str, PathBuf)> = Vec::new();
+    let mut written_reminders: Vec<WrittenReminder> = Vec::new();
     if plan.inject_discovery_reminders {
         println!("Agent discovery reminders:");
-        written_reminders = apply_discovery_reminders(&home_dir()?, &registered_clients);
+        written_reminders = apply_discovery_reminders_for(
+            &home_dir()?,
+            &registered_clients,
+            &client_profile_for_index,
+        );
         println!();
     }
+
+    // Shell integration comes after the clients on purpose, and its failure
+    // is reported rather than returned. It is the one step here that edits a
+    // file the user may keep read-only, such as dotfiles Nix home-manager
+    // links out of its store, and it used to run first and end the run on
+    // the first refused write, so a machine like that got no client
+    // configured at all. Nothing after it depends on it.
+    let shell_integration = if plan.install_shell_hook {
+        apply_shell_integration(shell_name, plan.add_bin_to_path)
+    } else {
+        println!("Shell integration: skipped.");
+        ShellIntegration::NotPlanned
+    };
+    println!();
 
     // Daemon auto-start config.
     write_auto_daemon_config(plan.auto_daemon)?;
@@ -13727,7 +14634,144 @@ async fn apply_plan(
     Ok(AppliedSetup {
         configured_assistants,
         deferred_clients,
+        failed_clients,
+        shell_integration,
     })
+}
+
+/// What became of the shell-profile step.
+#[derive(Debug)]
+enum ShellIntegration {
+    /// The plan did not ask for it.
+    NotPlanned,
+    /// Written, or already in place.
+    Installed,
+    /// A write was refused. Setup carried on, and the closing summary names
+    /// the reason and every block still missing, per file, so the person can
+    /// add them by hand.
+    NotWritten {
+        reason: String,
+        by_hand: Vec<(PathBuf, String)>,
+    },
+}
+
+/// Install the shell hook and the PATH line, reporting a failure instead of
+/// returning it.
+fn apply_shell_integration(shell_name: &str, allow_path: bool) -> ShellIntegration {
+    let attempt = || -> Result<()> {
+        let rc_path = shell_rc(shell_name)?;
+        let already = rc_path.exists()
+            && std::fs::read_to_string(&rc_path)
+                .map(|c| c.contains("kin-vfs"))
+                .unwrap_or(false);
+        if already {
+            println!(
+                "Shell integration: {} already sources the kin-vfs hook, so the hook file is refreshed in place and your rc is left untouched.",
+                rc_path.display()
+            );
+        } else {
+            println!(
+                "Shell integration: adding one `source` line to {}.",
+                rc_path.display()
+            );
+        }
+        install_shell_hook(shell_name, allow_path)?;
+        if cfg!(target_os = "windows") {
+            println!(
+                "  {} On Windows the VFS shim/ProjFS is an optional feature and is not \
+                 shell-auto-injected. The PowerShell hook only manages env state.",
+                style("!").yellow()
+            );
+        }
+        Ok(())
+    };
+    match attempt() {
+        Ok(()) => {
+            println!("  Shell integration installed.");
+            ShellIntegration::Installed
+        }
+        Err(error) => {
+            let reason = format!("{error:#}");
+            println!(
+                "  {} Shell integration was not written: {reason}",
+                style("✗").red()
+            );
+            println!(
+                "      Setup carries on without it. The lines to add by hand are listed at the \
+                 end of this run."
+            );
+            ShellIntegration::NotWritten {
+                reason,
+                by_hand: pending_shell_profile_additions(shell_name, allow_path),
+            }
+        }
+    }
+}
+
+/// Every block the shell-profile step would still append, per file, read
+/// from the files as they are now.
+///
+/// This is `plan_rc_update` run without the write, so what a person is told to
+/// add is exactly what setup would have added, and a block a file already
+/// carries is not listed. The hook's `source` line is left out when the hook
+/// file itself was never written, because a line sourcing a missing file would
+/// break the shell it is added to.
+fn pending_shell_profile_additions(shell_name: &str, allow_path: bool) -> Vec<(PathBuf, String)> {
+    let Ok(kin_home) = kin_dir() else {
+        return Vec::new();
+    };
+    let Ok(targets) = rc_write_plan(shell_name) else {
+        return Vec::new();
+    };
+    let bin_dir = kin_home.join("bin");
+    let hook_file = kin_home.join("shell").join(hook_filename(shell_name));
+    let hook_written = hook_file.is_file();
+    let source_line = rc_source_line(shell_name, &hook_file);
+    targets
+        .into_iter()
+        .filter_map(|target| {
+            let blocks = if allow_path {
+                Some(target.blocks)
+            } else {
+                target.blocks.without_path()
+            }?;
+            let blocks = if hook_written {
+                blocks
+            } else {
+                blocks.without_hook()?
+            };
+            let existing = fs::read_to_string(&target.path).unwrap_or_default();
+            let update = plan_rc_update(
+                &existing,
+                shell_name,
+                &source_line,
+                &target.path,
+                &bin_dir,
+                bin_dir.is_dir(),
+                blocks,
+            );
+            let addition = update.content.get(existing.len()..)?.trim().to_string();
+            (!addition.is_empty()).then_some((target.path, addition))
+        })
+        .collect()
+}
+
+/// The closing lines for a shell-profile step that could not write.
+fn shell_integration_by_hand_lines(reason: &str, by_hand: &[(PathBuf, String)]) -> Vec<String> {
+    let mut lines = vec![format!("Shell integration was not written: {reason}.")];
+    if by_hand.is_empty() {
+        lines.push(
+            "  Nothing is left to add by hand; run `kin setup` again once the cause is fixed."
+                .to_string(),
+        );
+        return lines;
+    }
+    lines.push("  To finish it by hand, add these lines yourself:".to_string());
+    for (path, block) in by_hand {
+        lines.push(format!("  to {}:", path.display()));
+        lines.extend(block.lines().map(|line| format!("      {line}")));
+    }
+    lines
 }
 
 /// Read the kin MCP server sub-value from a client config, if present.
@@ -13748,7 +14792,6 @@ pub(crate) fn read_kin_mcp_entry_from_bytes(
     root.get("mcpServers")?.get("kin").cloned()
 }
 
-#[cfg(test)]
 fn read_kin_mcp_entry(path: &Path) -> Option<serde_json::Value> {
     let content = fs::read(path).ok()?;
     read_kin_mcp_entry_from_bytes(path, &content)
@@ -13767,11 +14810,7 @@ fn read_kin_mcp_entry(path: &Path) -> Option<serde_json::Value> {
 /// by an earlier run survive regardless: [`SetupLedger::record`] upserts and
 /// never prunes, so `kin setup uninstall` can still remove a reminder appended
 /// before that gate existed.
-fn record_setup_ledger(
-    plan: &SetupPlan,
-    shell_name: &str,
-    written_reminders: &[(&'static str, PathBuf)],
-) {
+fn record_setup_ledger(plan: &SetupPlan, shell_name: &str, written_reminders: &[WrittenReminder]) {
     use crate::commands::setup_ledger::{ArtifactKind, LedgerEntry, SetupLedger};
 
     let Ok(ledger_path) = crate::commands::setup_ledger::ledger_path() else {
@@ -13847,13 +14886,18 @@ fn record_setup_ledger(
         }
 
         if plan.inject_discovery_reminders {
-            for (target, path) in written_reminders {
-                if discovery_reminder_present(path) {
+            for reminder in written_reminders {
+                // The exact block written, so verification finds it verbatim
+                // and uninstall excises exactly it.
+                let present = fs::read_to_string(&reminder.path)
+                    .map(|content| content.contains(&reminder.snippet))
+                    .unwrap_or(false);
+                if present {
                     ledger.record(LedgerEntry::appended(
                         ArtifactKind::DiscoveryReminder,
-                        *target,
-                        path.clone(),
-                        KIN_DISCOVERY_REMINDER,
+                        reminder.target,
+                        reminder.path.clone(),
+                        reminder.snippet.clone(),
                     ));
                 }
             }
@@ -14014,40 +15058,84 @@ fn hosted_followup_lines(
     }
 }
 
+/// What Kin leaves on this machine and how to remove it, for the close of a
+/// setup run.
+///
+/// The install ledger records what setup wrote, and that is not everything Kin
+/// keeps: a daemon per repository and a supervisor run in the background, the
+/// embedding model sits in the Hugging Face cache under a name with no "kin" in
+/// it, and every repository holds its own store. None of that was named where a
+/// person reads, so someone clearing Kin off a machine found it with `ps` and
+/// `du` instead.
+///
+/// `model_dir` is `None` when this configuration fetches no model at all.
+fn footprint_lines(
+    kin_home: &Path,
+    model_dir: Option<&str>,
+    model_bytes: Option<u64>,
+) -> Vec<String> {
+    let mut lines = vec![
+        "What stays on this machine:".to_string(),
+        "  Background daemons: one per repository you use, plus a supervisor. They exit on \
+         their own when nothing uses them. Stop the idle ones now with \
+         `kin daemon stop --all --when-unused`."
+            .to_string(),
+        format!(
+            "  {}: Kin, its logs and its embedding cache.",
+            kin_home.display()
+        ),
+    ];
+    if let Some(dir) = model_dir {
+        let size = model_bytes
+            .map(|bytes| format!(", about {} MB", bytes / (1024 * 1024)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "  {dir}: the embedding model{size}, once Kin has embedded a repository."
+        ));
+    }
+    lines.push("  .kin/ in each repository: that repository's graph.".to_string());
+    lines.push(if model_dir.is_some() {
+        "  To remove all of it: `kin setup uninstall --all`, then delete the model directory \
+         and each repository's .kin/."
+            .to_string()
+    } else {
+        "  To remove all of it: `kin setup uninstall --all`, then delete each repository's .kin/."
+            .to_string()
+    });
+    lines
+}
+
 /// Closing next-steps block, tailored to the chosen intent.
 fn print_next_steps(
     intent: SetupIntent,
-    installed_shell: bool,
+    shell_integration: &ShellIntegration,
     configured_assistants: &[(String, Option<PathBuf>)],
     deferred_clients: &[String],
 ) {
     println!();
-    if installed_shell {
-        println!("Open a new shell session to load the shell hook.");
-        println!();
+    match shell_integration {
+        ShellIntegration::NotPlanned => {}
+        ShellIntegration::Installed => {
+            println!("Open a new shell session to load the shell hook.");
+            println!();
+        }
+        ShellIntegration::NotWritten { reason, by_hand } => {
+            let mut lines = shell_integration_by_hand_lines(reason, by_hand).into_iter();
+            if let Some(first) = lines.next() {
+                println!("{} {first}", style("!").yellow());
+            }
+            for line in lines {
+                println!("{line}");
+            }
+            println!();
+        }
     }
-    println!("Next steps:");
-    println!("  kin init             -- initialize a Kin repository in the current directory");
-    println!("  kin setup status     -- show what's installed");
-    println!("  kin setup doctor     -- run health checks (use --fix to repair)");
-    println!("  kin setup ledger     -- show what setup wrote + verify it on disk");
-    println!("  kin setup uninstall  -- remove exactly what setup wrote (ledger-verified)");
-    // Named here because this is the list a first run reads to the end. Cross-file
-    // reference edges are the answer Kin is sold on and they need a server per
-    // language, so a host missing one is owed the command rather than the
-    // discovery that `find_references` returns nothing.
-    let missing_servers = language_servers::missing_enrichable_languages();
-    if !missing_servers.is_empty() {
-        println!(
-            "  kin doctor --fix --install-language-servers  -- install the {} language \
-             server{} this host is missing, which is what cross-file reference edges need",
-            missing_servers
-                .iter()
-                .map(|language| language.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            if missing_servers.len() == 1 { "" } else { "s" }
-        );
+    for line in install_check_block() {
+        println!("{line}");
+    }
+    println!();
+    for line in aftercare_block() {
+        println!("{line}");
     }
 
     if let Some(waiting) = deferred_clients_next_step(deferred_clients) {
@@ -14055,15 +15143,131 @@ fn print_next_steps(
         println!("  {} {waiting}", style("→").cyan());
     }
 
+    if let Ok(kin_home) = kin_dir() {
+        let model = crate::embed_model::EmbedModelFetch::probe(false);
+        println!();
+        for line in footprint_lines(&kin_home, model.cache_dir.as_deref(), model.expected_bytes) {
+            println!("{line}");
+        }
+    }
+
+    println!();
+    // Named here because this is the list a first run reads to the end. Cross-file
+    // reference edges are the answer Kin is sold on and they need a server per
+    // language, so a host missing one is owed the command rather than the
+    // discovery that `find_references` returns nothing.
+    let missing_servers: Vec<String> = language_servers::missing_enrichable_languages()
+        .iter()
+        .map(|language| language.to_string())
+        .collect();
+    for line in next_step_block(&missing_servers) {
+        println!("{line}");
+    }
+
     let configured_any = configured_assistants.iter().any(|(_, p)| p.is_some());
     if matches!(intent, SetupIntent::AgentOnly | SetupIntent::Advanced) && configured_any {
         println!();
-        println!("Try this next prompt in your AI agent:");
-        println!();
-        println!("  Use Kin to explore this codebase: run semantic_locate to find the");
-        println!("  main entry point, then get_context_pack on that file.");
+        for line in first_agent_prompt_block() {
+            println!("{line}");
+        }
     }
     println!();
+}
+
+/// The commands that check the install.
+fn install_check_block() -> Vec<String> {
+    let steps = [
+        ("kin setup status", "show what's installed"),
+        (
+            "kin setup doctor",
+            "run health checks (use --fix to repair)",
+        ),
+        (
+            "kin setup ledger",
+            "show what setup wrote + verify it on disk",
+        ),
+    ];
+    padded_steps("Check the install:", &steps)
+}
+
+/// What a person needs when they are done with Kin, said at setup time.
+///
+/// Kin keeps a background process for each repository and they outlive the
+/// editor that started them, and a stranger found hundreds of megabytes left in
+/// their home directory with nothing that said how to remove it.
+fn aftercare_block() -> Vec<String> {
+    let steps = [
+        (
+            "kin daemon stop --all",
+            "stop the background process Kin keeps for each repository",
+        ),
+        (
+            "kin setup uninstall",
+            "remove exactly what setup wrote (ledger-verified)",
+        ),
+    ];
+    padded_steps("When you are done with Kin:", &steps)
+}
+
+/// The first steps after setup, last in the closing output: set a repository
+/// up, install the language servers this host lacks, then ask the first
+/// question.
+///
+/// The first question is the one `kin init` ends on, `kin refs` on a function
+/// the reader knows, because it shows what the graph knows that a text search
+/// does not and the reader can check it in the source. The closing block used
+/// to be `kin init` and four maintenance commands, so a first run ended with no
+/// question at all.
+fn next_step_block(missing_servers: &[String]) -> Vec<String> {
+    let servers = if missing_servers.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "install the {} language server{} this host is missing, which cross-file \
+             references need",
+            missing_servers.join(", "),
+            if missing_servers.len() == 1 { "" } else { "s" }
+        ))
+    };
+    let mut steps: Vec<(&str, &str)> = vec![(
+        "kin init",
+        "in a new terminal, inside a small repository you know",
+    )];
+    if let Some(servers) = servers.as_deref() {
+        steps.push(("kin doctor --fix --install-language-servers", servers));
+    }
+    steps.push((
+        super::init::FIRST_QUESTION_COMMAND,
+        "ask what calls a function you know; check the answer in the source",
+    ));
+    padded_steps("Next steps:", &steps)
+}
+
+/// The first prompt to try in a configured agent: the same first question,
+/// asked the way an agent is asked.
+fn first_agent_prompt_block() -> Vec<String> {
+    vec![
+        "Try this first prompt in your AI agent:".to_string(),
+        String::new(),
+        "  Use Kin to find everything that calls <a function you know> in this".to_string(),
+        "  repository, then show me one of those calls in the source.".to_string(),
+    ]
+}
+
+/// A heading and its steps, each description starting in one column.
+fn padded_steps(heading: &str, steps: &[(&str, &str)]) -> Vec<String> {
+    let widest = steps
+        .iter()
+        .map(|(command, _)| command.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![heading.to_string()];
+    lines.extend(
+        steps
+            .iter()
+            .map(|(command, description)| format!("  {command:<widest$}  -- {description}")),
+    );
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -14619,8 +15823,8 @@ async fn apply_language_server_provisioning(
         return ProvisioningOutcome::default();
     }
 
-    let reports = language_servers::provision(
-        missing,
+    let reports = language_servers::provision_async(
+        missing.to_vec(),
         consent,
         |recipe| recipe.installed(),
         language_servers::resolve_route,
@@ -14639,7 +15843,27 @@ async fn apply_language_server_provisioning(
             prompt_yn("  Install it now?", false, true)
         },
         language_servers::run_install,
-    );
+    )
+    .await;
+    let reports = match reports {
+        Ok(reports) => reports,
+        Err(error) => {
+            let reason = format!("the language server installation worker did not finish: {error}");
+            println!("  {} {reason}", style("✗").red());
+            return ProvisioningOutcome {
+                applied: Vec::new(),
+                unfinished: vec![UnfinishedRepair {
+                    what: "install language servers".to_string(),
+                    reason,
+                    remediation: vec![
+                        "re-run `kin doctor --fix --install-language-servers` to retry the unfinished installation"
+                            .to_string(),
+                    ],
+                    requested: true,
+                }],
+            };
+        }
+    };
 
     let mut applied = Vec::new();
     let mut unfinished: Vec<UnfinishedRepair> = Vec::new();
@@ -15195,6 +16419,35 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                     requested: false,
                 });
             }
+        }
+    }
+
+    // Always attempted, because it is cheap, it only ever adds a line, and the
+    // shell running `--fix` is the one PATH that knows where the operator's
+    // language servers are. It is the repair the coverage row names when the
+    // daemon reports a server missing that this shell finds.
+    match crate::commands::language_servers::record_language_tool_dirs() {
+        Ok(added) if added.is_empty() => {}
+        Ok(added) => {
+            applied.push(crate::commands::language_servers::recorded_tool_dirs_line(
+                &added,
+            ));
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            println!(
+                "  {} could not record where this shell finds language servers: {reason}",
+                style("✗").red()
+            );
+            unfinished.push(UnfinishedRepair {
+                what: "record where this shell finds language servers".to_string(),
+                reason,
+                remediation: vec![format!(
+                    "make {} writable, then run `kin doctor --fix` again",
+                    kin_core::tool_prefix::managed_tool_root().display()
+                )],
+                requested: false,
+            });
         }
     }
 
@@ -17652,6 +18905,7 @@ mod tests {
             embedding_model: None,
             embedding_provider: None,
             skip_path: false,
+            tool_profile: None,
         }
     }
 
@@ -18854,6 +20108,36 @@ wait
                 .unwrap(),
             "a, b and c still need a repository to bind to. Run `kin init`, then `kin setup` again from inside that repository."
         );
+    }
+
+    /// The close of a setup run names what stays on the machine and how to
+    /// remove it: the background daemons and the command that stops the idle
+    /// ones, Kin's home, the model directory whose name carries no "kin", and
+    /// the per-repository stores.
+    #[test]
+    fn the_closing_block_names_what_stays_on_the_machine() {
+        let home = Path::new("/home/dev/.kin");
+        let model = "/home/dev/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5";
+        let lines = footprint_lines(home, Some(model), Some(523 * 1024 * 1024)).join("\n");
+        for expected in [
+            "kin daemon stop --all --when-unused",
+            "/home/dev/.kin",
+            &format!("{model}: the embedding model, about 523 MB"),
+            ".kin/ in each repository",
+            "kin setup uninstall --all",
+            "delete the model directory",
+        ] {
+            assert!(
+                lines.contains(expected),
+                "missing {expected:?} in:\n{lines}"
+            );
+        }
+
+        // A configuration that fetches no model has no model line to print and
+        // nothing to tell the reader to delete.
+        let remote = footprint_lines(home, None, None).join("\n");
+        assert!(!remote.contains("embedding model"), "{remote}");
+        assert!(!remote.contains("model directory"), "{remote}");
     }
 
     /// The wiring, not just the wording: the error the two repository-bound
@@ -22282,6 +23566,103 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         );
     }
 
+    /// `kin setup` writes the routed profile for every client that sends every
+    /// tool with every request, and the named agent belt for the two that do
+    /// not: Claude Code, which defers schemas behind its own tool search, and
+    /// the Grok CLI, which never sends them to its model.
+    /// Setup's closing output ends on the first question, names how to stop
+    /// and remove Kin, and says nothing a reader cannot run.
+    #[test]
+    fn the_closing_output_ends_on_the_first_question_and_names_aftercare() {
+        let next = next_step_block(&["go".to_string()]);
+        assert_eq!(next[0], "Next steps:");
+        assert!(next[1].contains("kin init"), "{next:?}");
+        assert!(
+            next[2].contains("kin doctor --fix --install-language-servers")
+                && next[2].contains("go")
+        );
+        assert!(
+            next.last()
+                .is_some_and(|line| line.contains("kin refs YourFunctionName")),
+            "{next:?}"
+        );
+        assert_eq!(
+            next_step_block(&[]).len(),
+            3,
+            "no server line when none is missing"
+        );
+        let aftercare = aftercare_block().join("\n");
+        assert!(aftercare.contains("kin daemon stop --all"), "{aftercare}");
+        assert!(aftercare.contains("kin setup uninstall"), "{aftercare}");
+        let prompt = first_agent_prompt_block().join(" ");
+        assert!(prompt.contains("calls <a function you know>"), "{prompt}");
+        for block in [
+            next,
+            aftercare_block(),
+            install_check_block(),
+            first_agent_prompt_block(),
+        ] {
+            for line in block {
+                assert!(!line.contains('\u{2014}'), "{line}");
+            }
+        }
+        // One column for every description in a block.
+        let starts: Vec<usize> = install_check_block()[1..]
+            .iter()
+            .map(|line| line.find("-- ").unwrap())
+            .collect();
+        assert!(
+            starts.windows(2).all(|pair| pair[0] == pair[1]),
+            "{starts:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn setup_writes_the_routed_profile_for_eager_clients_and_the_named_one_for_claude_code() {
+        for (id, profile) in [
+            ("claude", "agent-default"),
+            ("grok", "agent-default"),
+            ("cursor", "agent-routed"),
+            ("codex", "agent-routed"),
+            ("gemini", "agent-routed"),
+            ("windsurf", "agent-routed"),
+            ("antigravity", "agent-routed"),
+            ("antigravity_workspace", "agent-routed"),
+            ("lmstudio", "agent-routed"),
+        ] {
+            assert_eq!(setup_tool_profile(id), profile, "{id}");
+        }
+        // Every assistant setup can configure has a target id, so none falls
+        // through to the named default by accident.
+        for idx in 0..detect_ai_assistants().len() {
+            assert!(
+                setup_target_id_for_index(idx).is_some(),
+                "assistant {idx} has no setup target id"
+            );
+        }
+
+        // The bytes on disk, from the real JSON writer.
+        let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let profile_in = |path: &Path| {
+            read_kin_mcp_entry(path).expect("an entry")["env"]["KIN_MCP_TOOL_PROFILE"]
+                .as_str()
+                .map(str::to_string)
+        };
+        for (id, profile) in [("cursor", "agent-routed"), ("claude", "agent-default")] {
+            let path = dir.path().join(format!("{id}.json"));
+            merge_mcp_config(&path, id).unwrap();
+            assert_eq!(profile_in(&path).as_deref(), Some(profile), "{id}");
+        }
+
+        // Each profile setup writes is one `kin mcp start` resolves by name.
+        for profile in ["agent-routed", "agent-default"] {
+            let resolved = crate::commands::mcp::resolve_tool_profile(None, Some(profile));
+            assert_eq!(resolved.profile.token(), profile);
+        }
+    }
+
     #[test]
     #[serial]
     fn claude_writer_uses_fallback_only_while_primary_is_absent() {
@@ -22409,6 +23790,590 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert_eq!(fs::read_to_string(&claude_md).unwrap(), once);
     }
 
+    /// The profile rule: asked for, pinned, set by hand, and the client's
+    /// default for a new entry, one exactly as Kin last wrote it, and one
+    /// still carrying a default an earlier Kin wrote.
+    #[test]
+    fn a_profile_is_kept_when_chosen_and_moves_with_the_default_when_kin_chose_it() {
+        use ProfileProvenance::{AsKinWrote, ChangedByHand, Unknown};
+        let entry = |profile: &str, pinned: bool| {
+            let mut env = serde_json::json!({"KIN_MCP_TOOL_PROFILE": profile});
+            if pinned {
+                env[PINNED_PROFILE_ENV] = serde_json::json!("1");
+            }
+            serde_json::json!({"command": "kin", "args": ["mcp", "start"], "env": env})
+        };
+        let chosen =
+            |choice: ProfileChoice| (choice.profile.clone(), choice.reason, choice.pinned());
+
+        assert_eq!(
+            chosen(choose_tool_profile(
+                "codex",
+                Some("agent-query"),
+                None,
+                Unknown
+            )),
+            ("agent-query".to_string(), ProfileReason::Requested, true)
+        );
+        assert_eq!(
+            chosen(choose_tool_profile(
+                "codex",
+                None,
+                Some(&entry("agent-query", true)),
+                AsKinWrote
+            )),
+            ("agent-query".to_string(), ProfileReason::Pinned, true)
+        );
+        // Kin's last write with only the profile changed: a person chose it,
+        // even when the profile they chose is an old default.
+        assert_eq!(
+            chosen(choose_tool_profile(
+                "codex",
+                None,
+                Some(&entry("agent-default", false)),
+                ChangedByHand
+            )),
+            ("agent-default".to_string(), ProfileReason::SetByHand, true)
+        );
+        // Kin wrote agent-default for Codex once; its default is agent-routed now.
+        assert_eq!(
+            chosen(choose_tool_profile(
+                "codex",
+                None,
+                Some(&entry("agent-default", false)),
+                AsKinWrote
+            )),
+            (
+                "agent-routed".to_string(),
+                ProfileReason::ClientDefault,
+                false
+            )
+        );
+        // With no ledger record to say, an old default moves and anything else
+        // is somebody's choice.
+        assert_eq!(
+            chosen(choose_tool_profile(
+                "codex",
+                None,
+                Some(&entry("agent-default", false)),
+                Unknown
+            )),
+            (
+                "agent-routed".to_string(),
+                ProfileReason::ClientDefault,
+                false
+            )
+        );
+        assert_eq!(
+            chosen(choose_tool_profile(
+                "codex",
+                None,
+                Some(&entry("agent-query", false)),
+                Unknown
+            )),
+            ("agent-query".to_string(), ProfileReason::SetByHand, true)
+        );
+        assert_eq!(
+            chosen(choose_tool_profile("claude", None, None, Unknown)),
+            (
+                "agent-default".to_string(),
+                ProfileReason::ClientDefault,
+                false
+            )
+        );
+        assert_eq!(
+            choose_tool_profile("cursor", None, Some(&entry("everything", true)), Unknown).profile,
+            "agent-routed",
+            "a token no build serves is not a choice"
+        );
+    }
+
+    /// Every block setup writes names only what its profile serves, and a block
+    /// written for one profile is caught on another: the check `kin doctor`
+    /// runs can fail.
+    #[test]
+    fn each_discovery_block_names_only_what_its_profile_serves() {
+        for profile in [
+            "agent-default",
+            "agent-query",
+            "agent-search",
+            "agent-routed",
+            "agent-routed-query",
+            "full",
+        ] {
+            let block = discovery_block(profile);
+            assert!(block.contains(KIN_DISCOVERY_MARKER), "{profile}");
+            assert!(
+                block.starts_with(DISCOVERY_BLOCK_BEGIN)
+                    && block.ends_with(&format!("{DISCOVERY_BLOCK_END}\n"))
+            );
+            assert!(!block.contains('\u{2014}'), "{block}");
+            assert!(
+                !names_in_discovery_block(&block).is_empty(),
+                "{profile}: the block names nothing to call"
+            );
+            assert_eq!(
+                names_missing_from_profile(&block, profile),
+                Vec::<String>::new(),
+                "{profile}: {block}"
+            );
+        }
+        assert!(
+            !names_missing_from_profile(&discovery_block("agent-default"), "agent-routed")
+                .is_empty()
+        );
+        assert!(
+            !names_missing_from_profile(&discovery_block("agent-routed"), "agent-default")
+                .is_empty()
+        );
+        // A profile that can write is told how to change code, and the only
+        // names its block adds over the read-only surface are those writes.
+        assert_eq!(
+            names_missing_from_profile(&discovery_block("agent-routed"), "agent-routed-query"),
+            vec!["session".to_string(), "mutate".to_string()],
+            "the routed block names the read-only surface plus the two write commands"
+        );
+        assert_eq!(
+            names_missing_from_profile(KIN_DISCOVERY_REMINDER, "agent-routed"),
+            vec!["semantic_locate", "get_context_pack", "trace_data_flow"]
+        );
+        assert!(names_missing_from_profile(KIN_DISCOVERY_REMINDER, "agent-default").is_empty());
+    }
+
+    /// The routed block spells every command so it runs both through the
+    /// routed tool and in a shell, and keeps the spellings instruction files
+    /// already carry: `kin graph source`, and `describe` and `call` as the
+    /// `kin` tool's commands. `kin source`, `kin describe` and `kin call` run
+    /// in both places too, but a new spelling here would rewrite every file
+    /// that carries the block. The check `kin doctor` runs reads those
+    /// spellings the way the routed tool does, and the CLI's own test holds
+    /// them against its command tree.
+    #[test]
+    fn the_routed_block_uses_spellings_the_routed_tool_and_the_cli_share() {
+        for profile in ["agent-routed", "agent-routed-query"] {
+            let block = discovery_block(profile);
+            assert!(block.contains("`kin graph source`"), "{block}");
+            assert!(
+                block.contains("The `kin` tool's `describe` command")
+                    && block.contains("its `call` command"),
+                "{block}"
+            );
+            for unwritten in ["`kin source`", "`kin describe`", "`kin call`"] {
+                assert!(!block.contains(unwritten), "{unwritten} in {block}");
+            }
+            let names = names_in_discovery_block(&block);
+            for expected in [
+                BlockName::Command("graph source".into()),
+                BlockName::Tool("describe".into()),
+                BlockName::Tool("call".into()),
+            ] {
+                assert!(names.contains(&expected), "{expected:?} in {names:?}");
+            }
+        }
+
+        // A multi-word spelling is read whole, up to its first flag.
+        assert_eq!(
+            names_in_discovery_block("`kin graph source --json`"),
+            vec![BlockName::Command("graph source".into())]
+        );
+        for profile in ["agent-routed", "agent-routed-query"] {
+            assert!(
+                names_missing_from_profile("`kin graph source`", profile).is_empty(),
+                "{profile}"
+            );
+            assert!(
+                names_missing_from_profile("the `kin` tool's `describe` command", profile)
+                    .is_empty(),
+                "{profile}"
+            );
+        }
+        // Each rule can still fail: half a spelling, a write on the read-only
+        // surface, a bare tool name on a routed connection, and the routed
+        // tool's commands on a named profile.
+        assert_eq!(
+            names_missing_from_profile("`kin graph`", "agent-routed"),
+            vec!["kin graph"]
+        );
+        assert_eq!(
+            names_missing_from_profile("`kin mutate`", "agent-routed-query"),
+            vec!["kin mutate"]
+        );
+        assert_eq!(
+            names_missing_from_profile("`semantic_locate`", "agent-routed"),
+            vec!["semantic_locate"]
+        );
+        assert_eq!(
+            names_missing_from_profile(
+                "`kin graph source`, and the `kin` tool's `describe` command",
+                "agent-default"
+            ),
+            vec!["kin graph source", "kin", "describe"]
+        );
+    }
+
+    /// Kin owns only the text between its markers: the block an earlier Kin
+    /// appended is replaced, a profile change rewrites the block in place, a
+    /// person's text around it survives, and a copy of the old block a person
+    /// edited is left alone.
+    #[test]
+    fn the_managed_block_replaces_the_old_one_and_follows_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let mine = "# My rules\n\nAlways run the tests.\n";
+        fs::write(
+            &path,
+            format!("{mine}{KIN_DISCOVERY_REMINDER}\n## After\n\nMore of mine.\n"),
+        )
+        .unwrap();
+
+        let routed = discovery_block("agent-routed");
+        assert_eq!(
+            upsert_discovery_block(&path, &routed).unwrap(),
+            BlockWrite::Replaced
+        );
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with(mine), "{content}");
+        assert!(content.contains("More of mine."));
+        assert!(!content.contains(KIN_DISCOVERY_REMINDER));
+        assert!(content.contains(&routed));
+        assert_eq!(content.matches(KIN_DISCOVERY_MARKER).count(), 1);
+
+        assert_eq!(
+            upsert_discovery_block(&path, &routed).unwrap(),
+            BlockWrite::Unchanged
+        );
+        let named = discovery_block("agent-default");
+        assert_eq!(
+            upsert_discovery_block(&path, &named).unwrap(),
+            BlockWrite::Replaced
+        );
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&named) && !content.contains(&routed));
+        assert!(content.starts_with(mine) && content.contains("More of mine."));
+
+        let edited = dir.path().join("CLAUDE.md");
+        let hand_edited =
+            KIN_DISCOVERY_REMINDER.replace("Use them first.", "Use them when you like.");
+        fs::write(&edited, &hand_edited).unwrap();
+        assert_eq!(
+            upsert_discovery_block(&edited, &named).unwrap(),
+            BlockWrite::LeftAsEdited
+        );
+        assert_eq!(fs::read_to_string(&edited).unwrap(), hand_edited);
+
+        let fresh = dir.path().join("new/AGENTS.md");
+        assert_eq!(
+            upsert_discovery_block(&fresh, &named).unwrap(),
+            BlockWrite::Appended
+        );
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), named);
+    }
+
+    /// The rule on the real writers, `kin setup`'s and `kin update`'s repair
+    /// writer alike: an entry exactly as Kin wrote it moves to the client's
+    /// default, a profile a person changed is kept and pinned, and a profile
+    /// `--tool-profile` asked for is pinned and kept by every later run.
+    #[test]
+    #[serial]
+    fn setup_and_update_keep_chosen_profiles_and_move_the_ones_kin_chose() {
+        let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let profile_of = |path: &Path| -> (String, bool) {
+            let entry = read_kin_mcp_entry(path).unwrap();
+            (
+                entry["env"]["KIN_MCP_TOOL_PROFILE"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                entry["env"][PINNED_PROFILE_ENV].as_str() == Some("1"),
+            )
+        };
+        // Edit the entry as a person or an older Kin would, recording it in the
+        // ledger only when Kin is the one writing.
+        let edit_entry =
+            |path: &Path, target: &str, record: bool, edit: &dyn Fn(&mut serde_json::Value)| {
+                let mut root: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                edit(&mut root["mcpServers"]["kin"]);
+                fs::write(path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+                if record {
+                    record_mcp_entry_in_ledger(target, path, &root["mcpServers"]["kin"]).unwrap();
+                }
+            };
+        let set_profile = |profile: &'static str| {
+            move |entry: &mut serde_json::Value| {
+                entry["env"]["KIN_MCP_TOOL_PROFILE"] = serde_json::json!(profile);
+            }
+        };
+        let repair = |path: &Path, target: &str| {
+            let target = McpRepairTarget {
+                id: target.to_string(),
+                path: path.to_path_buf(),
+                repo_root: None,
+                captured_config_sha256: "0".repeat(64),
+            };
+            let lock = ConfigLock::acquire(path).unwrap();
+            merge_json_mcp_target_locked(&target, "kin", &lock).unwrap();
+        };
+
+        let cursor = dir.path().join("cursor.json");
+        merge_mcp_config(&cursor, "cursor").unwrap();
+        assert_eq!(profile_of(&cursor), ("agent-routed".to_string(), false));
+        // An older Kin wrote agent-default here, and the ledger says so.
+        edit_entry(&cursor, "cursor", true, &set_profile("agent-default"));
+        merge_mcp_config(&cursor, "cursor").unwrap();
+        assert_eq!(
+            profile_of(&cursor),
+            ("agent-routed".to_string(), false),
+            "Kin's own choice moves forward"
+        );
+        // A person set agent-query after that.
+        edit_entry(&cursor, "cursor", false, &set_profile("agent-query"));
+        merge_mcp_config(&cursor, "cursor").unwrap();
+        assert_eq!(
+            profile_of(&cursor),
+            ("agent-query".to_string(), true),
+            "a profile set by hand is kept"
+        );
+        repair(&cursor, "cursor");
+        merge_mcp_config(&cursor, "cursor").unwrap();
+        assert_eq!(
+            profile_of(&cursor),
+            ("agent-query".to_string(), true),
+            "and every later run keeps it"
+        );
+
+        // A person who puts a routed client back on the named belt is heard too.
+        let gemini = dir.path().join("gemini.json");
+        merge_mcp_config(&gemini, "gemini").unwrap();
+        edit_entry(&gemini, "gemini", false, &set_profile("agent-default"));
+        repair(&gemini, "gemini");
+        assert_eq!(profile_of(&gemini), ("agent-default".to_string(), true));
+
+        // An entry changed in more than its profile, still on an old default,
+        // has no ledger record to say who chose it, so it moves forward and the
+        // rest of what was changed stays.
+        let windsurf = dir.path().join("windsurf.json");
+        merge_mcp_config(&windsurf, "windsurf").unwrap();
+        edit_entry(
+            &windsurf,
+            "windsurf",
+            false,
+            &|entry: &mut serde_json::Value| {
+                entry["env"]["KIN_MCP_TOOL_PROFILE"] = serde_json::json!("agent-default");
+                entry["env"]["KIN_EMBED_BACKEND"] = serde_json::json!("cpu");
+            },
+        );
+        repair(&windsurf, "windsurf");
+        assert_eq!(profile_of(&windsurf), ("agent-routed".to_string(), false));
+        assert_eq!(
+            read_kin_mcp_entry(&windsurf).unwrap()["env"]["KIN_EMBED_BACKEND"],
+            "cpu"
+        );
+
+        // An explicit run pins its profile, says so, and later runs keep it.
+        let lmstudio = dir.path().join("lmstudio.json");
+        {
+            let scope = RequestedProfileScope::enter(Some("agent-routed-query"));
+            merge_mcp_config(&lmstudio, "lmstudio").unwrap();
+            let choice = scope
+                .choice_for(&lmstudio)
+                .expect("the writer noted its choice");
+            assert_eq!(choice.reason, ProfileReason::Requested);
+            assert!(written_profile_line(&choice).starts_with("profile agent-routed-query, pinned"));
+        }
+        assert!(
+            requested_profile().is_none(),
+            "the scope ended with its block"
+        );
+        assert_eq!(
+            profile_of(&lmstudio),
+            ("agent-routed-query".to_string(), true)
+        );
+        merge_mcp_config(&lmstudio, "lmstudio").unwrap();
+        repair(&lmstudio, "lmstudio");
+        assert_eq!(
+            profile_of(&lmstudio),
+            ("agent-routed-query".to_string(), true)
+        );
+    }
+
+    /// For every client setup supports, from a fresh home: setup writes the
+    /// client's own profile, and every command or tool the instruction block it
+    /// writes names is one that profile serves.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn every_client_setup_supports_is_told_only_what_its_profile_serves() {
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _scan_root =
+            EnvVarGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &repo);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&repo).unwrap();
+        let _cwd = CurrentDirGuard(previous);
+
+        let clients = detect_ai_assistants().len();
+        let mut registered = Vec::new();
+        for idx in 0..clients {
+            let target = setup_target_id_for_index(idx).expect("every client has a target id");
+            let path = {
+                let _requested = RequestedProfileScope::enter(None);
+                configure_assistant_by_index(idx)
+                    .expect("every client setup lists is configurable")
+                    .unwrap_or_else(|error| panic!("{target}: {error:#}"))
+            };
+            let written = client_profile_for_index(idx)
+                .unwrap_or_else(|| panic!("{target}: no entry at {}", path.display()));
+            assert_eq!(written, setup_tool_profile(target), "{target}");
+            registered.push(idx);
+        }
+
+        let blocks = apply_discovery_reminders_for(&home, &registered, &client_profile_for_index);
+        assert_eq!(
+            blocks.iter().map(|block| block.target).collect::<Vec<_>>(),
+            vec!["claude-md", "codex-agents"]
+        );
+        for block in &blocks {
+            let client = if block.target == "claude-md" {
+                IDX_CLAUDE_CODE
+            } else {
+                IDX_CODEX
+            };
+            let profile = client_profile_for_index(client).unwrap();
+            assert_eq!(
+                names_missing_from_profile(&block.snippet, &profile),
+                Vec::<String>::new(),
+                "{}: {}",
+                block.target,
+                block.snippet
+            );
+            assert!(fs::read_to_string(&block.path)
+                .unwrap()
+                .contains(&block.snippet));
+        }
+        // Claude Code is told the named tools; Codex, which sends every tool
+        // with every request, the routed commands.
+        assert!(blocks[0].snippet.contains("`semantic_locate`"));
+        assert!(blocks[1].snippet.contains("`kin locate`"));
+        let findings = discovery_block_findings();
+        assert_eq!(findings.len(), 2);
+        assert!(
+            findings.iter().all(|finding| finding.missing.is_empty()),
+            "{findings:?}"
+        );
+    }
+
+    /// The managed block is recorded exactly as written, so uninstall removes
+    /// exactly it and nothing of the person's own.
+    #[test]
+    fn uninstall_removes_the_managed_block_setup_recorded() {
+        use crate::commands::setup_ledger::{uninstall_entry, LedgerEntry};
+
+        let (_dir, home) = reminder_fixture();
+        let agents = home.join(".codex").join("AGENTS.md");
+        fs::create_dir_all(agents.parent().unwrap()).unwrap();
+        fs::write(&agents, "# Mine\n\nKeep this.").unwrap();
+        let written = apply_discovery_reminders_for(&home, &[IDX_CODEX], &|_| {
+            Some("agent-routed".to_string())
+        });
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].snippet, discovery_block("agent-routed"));
+        let entry = LedgerEntry::appended(
+            ArtifactKind::DiscoveryReminder,
+            written[0].target,
+            written[0].path.clone(),
+            written[0].snippet.clone(),
+        );
+        uninstall_entry(&entry, false, false);
+        let after = fs::read_to_string(&agents).unwrap();
+        assert!(
+            !after.contains(DISCOVERY_BLOCK_BEGIN) && !after.contains(KIN_DISCOVERY_MARKER),
+            "{after}"
+        );
+        assert!(after.starts_with("# Mine\n\nKeep this."), "{after}");
+    }
+
+    /// `kin update` moves an entry's profile, and the block follows it: the
+    /// block an earlier Kin appended is rewritten for the profile the client's
+    /// entry carries now, recorded for uninstall, and `kin doctor`'s finding
+    /// turns on the moment the two disagree.
+    #[test]
+    #[serial]
+    fn update_rewrites_the_block_for_the_profile_its_client_carries_now() {
+        use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let entry_with = |profile: &str| {
+            format!(
+                "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\", \"--repo\", \"/r\"]\n\n\
+                 [mcp_servers.kin.env]\nKIN_MCP_TOOL_PROFILE = \"{profile}\"\n"
+            )
+        };
+        fs::write(codex.join("config.toml"), entry_with("agent-routed")).unwrap();
+        let agents = codex.join("AGENTS.md");
+        fs::write(&agents, format!("# Mine\n{KIN_DISCOVERY_REMINDER}")).unwrap();
+
+        let stale = discovery_block_findings();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].profile, "agent-routed");
+        assert_eq!(
+            stale[0].missing,
+            vec!["semantic_locate", "get_context_pack", "trace_data_flow"],
+            "the block an earlier Kin wrote names tools a routed client does not hold"
+        );
+
+        let lines = refresh_discovery_blocks();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("agent-routed"), "{lines:?}");
+        let content = fs::read_to_string(&agents).unwrap();
+        assert!(
+            content.starts_with("# Mine\n") && content.contains(&discovery_block("agent-routed"))
+        );
+        let ledger = SetupLedger::load(&ledger_path().unwrap()).unwrap();
+        assert!(ledger
+            .entries
+            .iter()
+            .any(|entry| entry.kind == ArtifactKind::DiscoveryReminder
+                && entry.snippet.as_deref() == Some(discovery_block("agent-routed").as_str())));
+        assert!(discovery_block_findings()[0].missing.is_empty());
+        assert!(
+            refresh_discovery_blocks().is_empty(),
+            "a current block is left alone"
+        );
+
+        // A person puts Codex back on the named belt.
+        fs::write(codex.join("config.toml"), entry_with("agent-default")).unwrap();
+        assert!(!discovery_block_findings()[0].missing.is_empty());
+        refresh_discovery_blocks();
+        assert!(fs::read_to_string(&agents)
+            .unwrap()
+            .contains(&discovery_block("agent-default")));
+        assert!(discovery_block_findings()[0].missing.is_empty());
+        // A file with no Kin block is not given one: that is setup's call.
+        assert!(!home.join(".claude").join("CLAUDE.md").exists());
+    }
+
     /// A reminder appended by a Kin that predates the gate stays removable:
     /// uninstall excises exactly the recorded block and leaves the user's own
     /// text alone.
@@ -22418,9 +24383,10 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
 
         let (_dir, home) = reminder_fixture();
         let claude_md = home.join(".claude").join("CLAUDE.md");
-        apply_discovery_reminders(&home, &[IDX_CLAUDE_CODE]);
+        fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        // The block an earlier Kin appended, with no markers.
         let user_text = "# My own instructions\n\nKeep this.\n";
-        let with_user = format!("{user_text}{}", fs::read_to_string(&claude_md).unwrap());
+        let with_user = format!("{user_text}{KIN_DISCOVERY_REMINDER}");
         fs::write(&claude_md, &with_user).unwrap();
 
         let entry = LedgerEntry::appended(
@@ -22604,7 +24570,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let root: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
         let kin = &root["mcpServers"]["kin"];
         assert_eq!(kin["args"], serde_json::json!(["mcp", "start"]));
-        assert_eq!(kin["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default");
+        assert_eq!(kin["env"]["KIN_MCP_TOOL_PROFILE"], "agent-routed");
         assert!(Path::new(kin["command"].as_str().unwrap()).is_absolute());
         assert_eq!(
             root["mcpServers"]["other"]["command"], "other-server",
@@ -22787,8 +24753,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert_eq!(kin["args"][3].as_str(), repo.to_str());
         assert_eq!(
             kin["env"]["KIN_MCP_TOOL_PROFILE"].as_str(),
-            Some("agent-default"),
-            "agent-default profile must be set"
+            Some("agent-routed"),
+            "Codex loads every tool eagerly, so it gets the routed profile"
         );
     }
 
@@ -22822,7 +24788,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         );
         let ledger_entry = read_kin_mcp_entry(&path).expect("ledger read must parse TOML");
         assert_eq!(
-            ledger_entry["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default",
+            ledger_entry["env"]["KIN_MCP_TOOL_PROFILE"], "agent-routed",
             "ledger entry must normalize the TOML entry to JSON"
         );
     }
@@ -22853,7 +24819,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert_eq!(kin["env"]["USER_POLICY"].as_str(), Some("keep"));
         assert_eq!(
             kin["env"]["KIN_MCP_TOOL_PROFILE"].as_str(),
-            Some("agent-default")
+            Some("agent-routed")
         );
         assert_eq!(kin["args"][3].as_str(), repo.to_str());
     }

@@ -115,9 +115,41 @@ import path from "node:path";
 //
 // So nothing was ported this time either. Only the pin moved, as in the
 // kin#1069, kin#1060, kin#1652 and working-copy exit-code resyncs.
+//
+// Resynced 2026-09-23 against install-proof.yml carrying per-client MCP tool
+// profiles. Setup now writes agent-routed for Cursor, Codex, Gemini, Windsurf
+// and Antigravity and keeps agent-default for Claude Code, so the mirrored step
+// names the profile each expected entry must carry instead of requiring
+// agent-default in all nine. This one was the other kind: an assertion moved,
+// and it is ported below.
+//
+// Compared two ways before moving the pin, as the 2026-09-15 resync was.
+//
+// First, by range. The hunks between the two whole-file shas fall at old lines
+// 830 to 842 (the Windows repo-free step's JSON configs), 1202 to 1322 (the MCP
+// tool-call step) and 2020 to 2043. The mirrored "Validate installed capability
+// proof" step occupies old lines 1731 to 2141 of 2434, so only the last range
+// touches it.
+//
+// Second, by content. Extracting that step from its `- name:` line to the next
+// sibling `- name:` gives 411 lines, sha256
+// 66c9b40238d20d8dccb634d947af9e2aca9f3fec34ce100b239842d9fa8e67a6, at the old
+// pin, the figure the resync above recorded, and 413 lines, sha256
+// 68d39ea447259eef156869a961891a7fc503b7d0a986f4c533f2cf9735f65a02, at the new
+// one. The whole difference is a `profile` field on each of the nine expected
+// entries and the comparison against it, which is what is ported below: Claude
+// Code and the Claude fallback keep agent-default, and the other seven entries
+// are agent-routed.
+//
+// Neither other range is an assertion this file mirrors. The Windows repo-free
+// step does not run in this preflight, whose legs are macOS and Linux. The MCP
+// tool-call step is a producer step, and proof-flow.sh beside this file carries
+// its change: the call and the tools/list check both follow the launched
+// entry's profile, so a routed entry is listed and called as the one `kin`
+// tool and any other profile as `semantic_search`.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "d47741379d11b3e04a18903b47ef0120f07f0ad5e91340ebcaeba8175bd689b7",
+  sha256: "0f0180fecafbe30df58b9e9bda0da70a786500daf4cf83bba4199dddac757076",
 };
 
 class Unreadable extends Error {}
@@ -541,16 +573,18 @@ check("MCP client configs bind the installed launcher", () => {
   const repoRoot = fs.realpathSync(process.cwd());
   const ordinaryArgs = ["mcp", "start"];
   const repositoryArgs = ["mcp", "start", "--repo", repoRoot];
+  // Profiles as setup assigns them: Claude Code keeps agent-default,
+  // and Cursor, Gemini, Windsurf, Codex and Antigravity get agent-routed.
   const mcpConfigs = [
-    { path: path.join(home, ".claude.json"), args: ordinaryArgs },
-    { path: path.join(home, ".cursor", "mcp.json"), args: ordinaryArgs },
-    { path: path.join(home, ".gemini", "settings.json"), args: ordinaryArgs },
-    { path: path.join(home, ".codeium", "windsurf", "mcp_config.json"), args: ordinaryArgs },
-    { path: path.join(captures, "kin-claude-fallback-config.json"), args: ordinaryArgs },
-    { path: path.join(captures, "kin-codex-config.json"), args: repositoryArgs },
-    { path: path.join(home, ".gemini", "config", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
-    { path: path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
-    { path: path.join(repoRoot, ".agents", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
+    { path: path.join(home, ".claude.json"), args: ordinaryArgs, profile: "agent-default" },
+    { path: path.join(home, ".cursor", "mcp.json"), args: ordinaryArgs, profile: "agent-routed" },
+    { path: path.join(home, ".gemini", "settings.json"), args: ordinaryArgs, profile: "agent-routed" },
+    { path: path.join(home, ".codeium", "windsurf", "mcp_config.json"), args: ordinaryArgs, profile: "agent-routed" },
+    { path: path.join(captures, "kin-claude-fallback-config.json"), args: ordinaryArgs, profile: "agent-default" },
+    { path: path.join(captures, "kin-codex-config.json"), args: repositoryArgs, profile: "agent-routed" },
+    { path: path.join(home, ".gemini", "config", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot, profile: "agent-routed" },
+    { path: path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot, profile: "agent-routed" },
+    { path: path.join(repoRoot, ".agents", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot, profile: "agent-routed" },
   ];
   const stripVerbatim = (p) => (typeof p === "string" && p.startsWith("\\\\?\\") ? p.slice(4) : p);
   for (const expected of mcpConfigs) {
@@ -560,7 +594,7 @@ check("MCP client configs bind the installed launcher", () => {
       !entry ||
       entry.command !== installedKin ||
       JSON.stringify(entryArgs) !== JSON.stringify(expected.args) ||
-      entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default" ||
+      entry.env?.KIN_MCP_TOOL_PROFILE !== expected.profile ||
       (expected.cwd !== undefined && stripVerbatim(entry.cwd) !== expected.cwd)
     ) {
       throw new Error(`${expected.path}: Kin MCP entry is missing or malformed`);

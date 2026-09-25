@@ -103,8 +103,10 @@ pub struct SupportJson {
     structured_artifact_count: usize,
     opaque_artifact_count: usize,
     working_tree_entry_count: usize,
-    text_indexed_entity_count: usize,
-    text_index_coverage_percent: f64,
+    /// `None` when the daemon's text index could not be read, which is
+    /// unavailable and not zero. A daemon from before this could only say 0.
+    text_indexed_entity_count: Option<usize>,
+    text_index_coverage_percent: Option<f64>,
     indexed_embedding_count: usize,
     pending_embedding_count: usize,
     queued_embedding_count: usize,
@@ -249,12 +251,18 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
             "  working tree entries: {}",
             report.working_tree_entry_count
         ),
-        format!(
-            "  text index coverage: {} / {} entities ({:.1}%)",
+        match (
             report.text_indexed_entity_count,
-            report.total_entities,
-            report.text_index_coverage_percent
-        ),
+            report.text_index_coverage_percent,
+        ) {
+            (Some(indexed), Some(percent)) => format!(
+                "  text index coverage: {} / {} entities ({:.1}%)",
+                indexed, report.total_entities, percent
+            ),
+            _ => "  text index coverage: unavailable (the text index's committed image cannot \
+                  be read until it maps again, so this is unknown rather than 0%)"
+                .to_string(),
+        },
         format!(
             "  embedding coverage: {} / {} entities ({:.1}%)",
             report.indexed_embedding_count,
@@ -463,8 +471,8 @@ mod tests {
             structured_artifact_count: 0,
             opaque_artifact_count: 0,
             working_tree_entry_count: 0,
-            text_indexed_entity_count: 0,
-            text_index_coverage_percent: 0.0,
+            text_indexed_entity_count: Some(0),
+            text_index_coverage_percent: Some(0.0),
             indexed_embedding_count: 0,
             pending_embedding_count: 0,
             queued_embedding_count: 0,
@@ -515,8 +523,8 @@ mod tests {
             structured_artifact_count: 5,
             opaque_artifact_count: 6,
             working_tree_entry_count: 7,
-            text_indexed_entity_count: 2,
-            text_index_coverage_percent: 66.7,
+            text_indexed_entity_count: Some(2),
+            text_index_coverage_percent: Some(66.7),
             indexed_embedding_count: 1,
             pending_embedding_count: 1,
             queued_embedding_count: 0,
@@ -617,8 +625,8 @@ mod tests {
             structured_artifact_count: 0,
             opaque_artifact_count: 0,
             working_tree_entry_count: 0,
-            text_indexed_entity_count: 0,
-            text_index_coverage_percent: 0.0,
+            text_indexed_entity_count: Some(0),
+            text_index_coverage_percent: Some(0.0),
             indexed_embedding_count: 0,
             pending_embedding_count: 0,
             queued_embedding_count: 0,
@@ -676,8 +684,8 @@ mod tests {
             structured_artifact_count: 2,
             opaque_artifact_count: 3,
             working_tree_entry_count: 4,
-            text_indexed_entity_count: 1,
-            text_index_coverage_percent: 50.0,
+            text_indexed_entity_count: Some(1),
+            text_index_coverage_percent: Some(50.0),
             indexed_embedding_count: 1,
             pending_embedding_count: 0,
             queued_embedding_count: 0,
@@ -717,7 +725,7 @@ mod tests {
         assert_eq!(payload.total_relations, 1);
         assert_eq!(payload.file_layout_count, 1);
         assert_eq!(payload.working_tree_entry_count, 4);
-        assert_eq!(payload.text_indexed_entity_count, 1);
+        assert_eq!(payload.text_indexed_entity_count, Some(1));
         assert_eq!(payload.indexed_embedding_count, 1);
         assert_eq!(payload.entity_counts.get("Function"), Some(&2));
         assert_eq!(payload.relation_counts.get("Calls"), Some(&1));
@@ -813,5 +821,35 @@ mod tests {
         // byte-identical to the one it sent before this field existed.
         let wire = serde_json::to_string(&bare).expect("serializes");
         assert!(!wire.contains("daemon_memory"), "{wire}");
+    }
+
+    /// A text index that cannot be read reports its coverage as unavailable on
+    /// both surfaces, rather than as 0 percent of a store whose documents are
+    /// all still on disk.
+    #[test]
+    fn unreadable_text_coverage_is_unavailable_rather_than_zero() {
+        let mut stats = bare_stats();
+        stats.total_entities = 5;
+        stats.text_indexed_entity_count = None;
+        stats.text_index_coverage_percent = None;
+        let payload = SupportJson::from_parts(&stats, bare_health());
+
+        let rendered = render_support_json(&payload);
+        let line = rendered
+            .iter()
+            .find(|line| line.starts_with("  text index coverage:"))
+            .expect("the coverage row is still printed");
+        assert!(line.contains("unavailable"), "{line}");
+        assert!(
+            !line.contains("0.0%") && !line.contains("0 / 5"),
+            "an unreadable index is not an empty one: {line}"
+        );
+
+        let wire = serde_json::to_value(&payload).expect("serializes");
+        assert!(wire["text_indexed_entity_count"].is_null(), "{wire}");
+        assert!(wire["text_index_coverage_percent"].is_null(), "{wire}");
+        let parsed: SupportJson = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(parsed.text_indexed_entity_count, None);
+        assert_eq!(parsed.text_index_coverage_percent, None);
     }
 }

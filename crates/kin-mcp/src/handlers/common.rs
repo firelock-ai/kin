@@ -334,9 +334,8 @@ pub fn outgoing_related_entities<G: GraphStore>(
     let mut seen = HashSet::new();
     let mut entities = Vec::new();
 
-    for rel in store
-        .get_all_relations_for_entity(entity_id)
-        .map_err(McpError::graph)?
+    for rel in
+        kin_index::relation_read::relations_for_read(store, entity_id).map_err(McpError::graph)?
     {
         let Some(related_entity_id) = rel.dst.as_entity() else {
             continue;
@@ -368,9 +367,8 @@ pub fn outgoing_related_entities_with_kinds<G: GraphStore>(
     let mut seen = HashSet::new();
     let mut entities = Vec::new();
 
-    for rel in store
-        .get_all_relations_for_entity(entity_id)
-        .map_err(McpError::graph)?
+    for rel in
+        kin_index::relation_read::relations_for_read(store, entity_id).map_err(McpError::graph)?
     {
         let Some(related_entity_id) = rel.dst.as_entity() else {
             continue;
@@ -1127,6 +1125,214 @@ pub struct ReferenceRow {
     /// would report every cross-repo caller as product code on no evidence at
     /// all. Absent, not guessed.
     pub role: Option<kin_model::EntityRole>,
+    /// Every edge behind this row, each with its own strength and its own
+    /// sites.
+    ///
+    /// The fields above summarize the row: the strongest resolution, the
+    /// union of every site line. A surface that holds weak rows out of what it
+    /// counts cannot decide from that summary alone, because one proven edge
+    /// lifts the whole row. On the gh CLI, `NewCreateContext` reaches
+    /// `Repository.RepoOwner` through a language-server edge at lines 678 and
+    /// 723 and through the parser's receiver fan-out at 649, 678, 697 and 723,
+    /// and 649 and 697 are calls on a `ghrepo.Interface` value. Read as one
+    /// row it confirmed all four. [`split_reference_row`] reads these instead.
+    ///
+    /// Empty for a federated row, whose edge lives in another repository's
+    /// graph.
+    pub edges: Vec<ReferenceEdge>,
+}
+
+/// One edge behind a [`ReferenceRow`]: how strongly it was resolved, and the
+/// sites it recorded.
+#[derive(Debug, Clone)]
+pub struct ReferenceEdge {
+    pub kind: RelationKind,
+    pub resolution: RelationResolution,
+    /// A receiver-method call the linker matched on the bare leaf name. See
+    /// [`ReferenceRow::receiver_name_guess`].
+    pub receiver_name_guess: bool,
+    /// The base this edge reaches the focal through, when it was composed over
+    /// a proven override. Both of its legs are proven.
+    pub via_override_of: Option<String>,
+    /// 1-based site lines inside the caller's own file, from this edge's own
+    /// evidence.
+    pub lines: Vec<u32>,
+    /// Spans this edge carried that named another file.
+    pub outside_caller_file: usize,
+    /// Why this edge's lines cannot license a site total, and `None` when they
+    /// can.
+    pub site_contract_gap: Option<ReferenceLinesPartial>,
+}
+
+impl ReferenceEdge {
+    /// The edge `rel` contributes to its caller's row: its resolution, whether
+    /// it is a receiver-name guess, and the sites it recorded inside
+    /// `caller_file`. This is the scalar representation. Occurrence-aware
+    /// readers use [`reference_edges`] before counting or attributing sites.
+    pub fn of(
+        rel: &kin_model::relation::Relation,
+        caller_file: Option<&kin_model::ids::FilePathId>,
+    ) -> Self {
+        let tally = relation_reference_lines(rel, caller_file);
+        Self {
+            kind: rel.kind,
+            resolution: RelationResolution::of(rel),
+            receiver_name_guess: kin_index::resolution::is_receiver_name_guess(rel),
+            via_override_of: None,
+            lines: tally.lines,
+            outside_caller_file: tally.outside_caller_file,
+            site_contract_gap: edge_site_contract_gap(rel),
+        }
+    }
+
+    /// Whether this edge alone would be held out of a count at `floor`, on the
+    /// same two grounds a surface applies to a whole row: the receiver fan-out
+    /// at every floor, and anything else under the floor. An edge composed over
+    /// a proven override is never held, because both of its legs are proven.
+    ///
+    /// `find_references` cuts its rows by this and `bulk_check_references`
+    /// counts callers by it, so the two read one edge the same way.
+    pub fn is_held_at(&self, floor: RelationResolution) -> bool {
+        if self.receiver_name_guess {
+            return true;
+        }
+        if self.via_override_of.is_some() {
+            return false;
+        }
+        self.resolution < floor
+    }
+}
+
+/// Cut `row` in two: the part `held` does not hold, and the sites only a held
+/// edge recorded.
+///
+/// A row used to be counted or held whole, and one proven edge was enough to
+/// count it. Every site any other edge of the same caller recorded rode along
+/// under the proven edge's resolution, so a site nothing proved read as
+/// confirmed. On the gh CLI that is every false call site a compiler-graded
+/// measurement of Go callers found: `RepoOwner()` calls on a
+/// `ghrepo.Interface` value, recorded only by the parser's receiver fan-out,
+/// confirmed as calls of `Repository.RepoOwner` beside the two sites gopls
+/// resolved there. The same union confirmed direct `Repository.RepoOwner`
+/// calls as calls of the interface method.
+///
+/// So the counted part is built from the edges `held` leaves alone and
+/// nothing else: their sites, kinds and resolution. The held part carries the
+/// sites only held edges recorded, under the resolution those edges earned, so
+/// it reads as the candidate it is. A site both kinds of edge recorded is
+/// proven and stays counted. A held edge that adds no site of its own adds
+/// nothing, since its caller is counted already. When the caller keeps sites
+/// in the held part, the counted part's lines are a floor and say why.
+///
+/// A row whose edges are all held, or none of them, comes back whole, exactly
+/// as before. So does a row with no edges, a federated one, which the caller
+/// judges as it always has.
+pub fn split_reference_row(
+    row: ReferenceRow,
+    held: impl Fn(&ReferenceEdge) -> bool,
+) -> (Option<ReferenceRow>, Option<ReferenceRow>) {
+    if row.edges.is_empty() {
+        return (Some(row), None);
+    }
+    let (held_edges, counted_edges): (Vec<ReferenceEdge>, Vec<ReferenceEdge>) =
+        row.edges.iter().cloned().partition(|edge| held(edge));
+    if held_edges.is_empty() {
+        return (Some(row), None);
+    }
+    if counted_edges.is_empty() {
+        return (None, Some(row));
+    }
+    let counted_lines: HashSet<u32> = counted_edges
+        .iter()
+        .flat_map(|edge| edge.lines.iter().copied())
+        .collect();
+    // Only the lines no counted edge recorded, and only the held edges that
+    // recorded one of them: a held edge whose every site is proven, or that
+    // recorded none, has nothing to add.
+    let held_edges: Vec<ReferenceEdge> = held_edges
+        .into_iter()
+        .filter_map(|mut edge| {
+            edge.lines.retain(|line| !counted_lines.contains(line));
+            (!edge.lines.is_empty()).then_some(edge)
+        })
+        .collect();
+    let mut counted = rebuild_reference_row(&row, counted_edges);
+    if held_edges.is_empty() {
+        return (Some(counted), None);
+    }
+    if !counted.reference_lines.is_empty() {
+        merge_site_contract_gap(
+            &mut counted.reference_lines_partial,
+            Some(ReferenceLinesPartial::UnconfirmedSitesInCandidates),
+        );
+    }
+    let held_row = rebuild_reference_row(&row, held_edges);
+    (Some(counted), Some(held_row))
+}
+
+/// `row`'s caller, summarized again from `edges` alone.
+///
+/// The same summary [`collect_reference_rows`] takes over every edge: lines
+/// ascending and deduplicated, the strongest resolution, a receiver-name guess
+/// only when every edge is one, the most specific site gap, and an absence
+/// reason when no line survives.
+fn rebuild_reference_row(row: &ReferenceRow, edges: Vec<ReferenceEdge>) -> ReferenceRow {
+    let mut rebuilt = ReferenceRow {
+        reference_lines: Vec::new(),
+        reference_lines_partial: None,
+        reference_lines_absent: None,
+        relation_kinds: Vec::new(),
+        resolution: None,
+        via_override_of: None,
+        receiver_name_guess: true,
+        edges: Vec::new(),
+        ..row.clone()
+    };
+    let mut outside_caller_file = 0usize;
+    for edge in &edges {
+        rebuilt.reference_lines.extend(edge.lines.iter().copied());
+        outside_caller_file += edge.outside_caller_file;
+        push_reference_kind(&mut rebuilt.relation_kinds, edge.kind);
+        merge_site_contract_gap(&mut rebuilt.reference_lines_partial, edge.site_contract_gap);
+        rebuilt.resolution = Some(match rebuilt.resolution {
+            Some(current) => current.max(edge.resolution),
+            None => edge.resolution,
+        });
+        rebuilt.receiver_name_guess &= edge.receiver_name_guess;
+        if rebuilt.via_override_of.is_none() {
+            rebuilt.via_override_of = edge.via_override_of.clone();
+        }
+    }
+    rebuilt.edges = edges;
+    finish_reference_row(&mut rebuilt, outside_caller_file);
+    rebuilt
+}
+
+/// Put a row's summary in its served form: kinds ranked, lines ascending and
+/// deduplicated, and exactly one of a floor reason or an absence reason when
+/// either applies.
+fn finish_reference_row(row: &mut ReferenceRow, spans_outside_caller_file: usize) {
+    row.relation_kinds.sort_by_key(relation_kind_rank);
+    row.reference_lines.sort_unstable();
+    row.reference_lines.dedup();
+    // A row with no lines has nothing to call a floor: `reference_lines_absent`
+    // below is the whole story, and carrying both would state one absence
+    // twice under two names.
+    let qualification_missing = row.edges.iter().any(|edge| {
+        edge.site_contract_gap == Some(ReferenceLinesPartial::OccurrenceQualificationUnavailable)
+    });
+    if row.reference_lines.is_empty() {
+        row.reference_lines_partial = None;
+    }
+    row.reference_lines_absent = if !row.reference_lines.is_empty() {
+        None
+    } else if qualification_missing {
+        Some(ReferenceLinesAbsent::UnconfirmedSitesWithheld)
+    } else if spans_outside_caller_file > 0 {
+        Some(ReferenceLinesAbsent::SpanOutsideCallerFile)
+    } else {
+        Some(ReferenceLinesAbsent::NoEvidenceSpan)
+    };
 }
 
 /// Why a reference row carries no site lines.
@@ -1148,6 +1354,8 @@ pub enum ReferenceLinesAbsent {
     /// A federated cross-repository xref: the resolving edge and its span live in
     /// the other repository's graph.
     FederatedXref,
+    /// Sites exist but their occurrence authority does not license attribution.
+    UnconfirmedSitesWithheld,
 }
 
 impl ReferenceLinesAbsent {
@@ -1156,6 +1364,7 @@ impl ReferenceLinesAbsent {
             Self::NoEvidenceSpan => "no_evidence_span",
             Self::SpanOutsideCallerFile => "span_outside_caller_file",
             Self::FederatedXref => "federated_xref",
+            Self::UnconfirmedSitesWithheld => "unconfirmed_sites_withheld",
         }
     }
 }
@@ -1203,6 +1412,16 @@ pub enum ReferenceLinesPartial {
     /// real line and an explicit statement that the line is not the whole set:
     /// the one shape a check reading only [`RelationOrigin`] cannot see.
     IncompleteCallEvidence,
+    /// This caller has more sites that only a weaker edge recorded, and they
+    /// travel as a candidate row for the same caller rather than here.
+    ///
+    /// Set by [`split_reference_row`]. A receiver-method call matched on its
+    /// bare name may still be a call of this entity, so the sites here are the
+    /// proven ones and not necessarily all of them, and the candidate row
+    /// beside this one names the rest under the resolution they earned.
+    UnconfirmedSitesInCandidates,
+    /// The retained parser aggregate lacks valid per-occurrence authority.
+    OccurrenceQualificationUnavailable,
 }
 
 impl ReferenceLinesPartial {
@@ -1211,18 +1430,24 @@ impl ReferenceLinesPartial {
             Self::LanguageServerEdge => "language_server_edge",
             Self::ProducerWithoutSiteContract => "producer_without_site_contract",
             Self::IncompleteCallEvidence => "incomplete_call_evidence",
+            Self::UnconfirmedSitesInCandidates => "unconfirmed_sites_in_candidates",
+            Self::OccurrenceQualificationUnavailable => "occurrence_qualification_unavailable",
         }
     }
 
     /// Which gap is the more useful one to report when a row has several.
     ///
     /// They all mean the same thing to a caller, that the lines are a floor, so
-    /// the only question is which names the most specific cause. An edge whose
-    /// own evidence declares the parse incomplete has said so outright, which
-    /// beats anything inferred from its producer; a measured one-site-per-edge
-    /// producer beats the general case of a producer nobody has checked.
+    /// the only question is which names the most specific cause. Sites this
+    /// same answer carries as candidates are the one gap a reader can close
+    /// without asking again, so it is named first. An edge whose own evidence
+    /// declares the parse incomplete has said so outright, which beats anything
+    /// inferred from its producer; a measured one-site-per-edge producer beats
+    /// the general case of a producer nobody has checked.
     fn specificity(self) -> u8 {
         match self {
+            Self::OccurrenceQualificationUnavailable => 4,
+            Self::UnconfirmedSitesInCandidates => 3,
             Self::IncompleteCallEvidence => 2,
             Self::LanguageServerEdge => 1,
             Self::ProducerWithoutSiteContract => 0,
@@ -1270,7 +1495,7 @@ fn evidence_declares_incomplete_calls(evidence: &kin_model::RelationEvidence) ->
 /// `Parsed` or `Inferred` edge can carry a real line beside its producer's own
 /// statement that it did not see every call. An origin check alone reads that
 /// edge as complete.
-fn edge_site_contract_gap(
+pub fn edge_site_contract_gap(
     relation: &kin_model::relation::Relation,
 ) -> Option<ReferenceLinesPartial> {
     if relation
@@ -1551,6 +1776,7 @@ fn merge_dispatch_row(held: &mut ReferenceRow, incoming: ReferenceRow) {
     for kind in incoming.relation_kinds {
         push_reference_kind(&mut held.relation_kinds, kind);
     }
+    held.edges.extend(incoming.edges);
 }
 
 /// One implementation candidate row: the concrete method's declaration, which
@@ -1833,9 +2059,8 @@ fn collect_reference_rows<G: GraphStore>(
     // authority recovery and a whole-history replay once per caller found.
     let held = HeldSourceAuthority::new(store, repository_authority);
 
-    for rel in store
-        .get_all_relations_for_entity(entity_id)
-        .map_err(McpError::graph)?
+    for rel in
+        kin_index::relation_read::relations_for_read(store, entity_id).map_err(McpError::graph)?
     {
         let Some(source_entity_id) = rel.src.as_entity() else {
             continue;
@@ -1889,6 +2114,7 @@ fn collect_reference_rows<G: GraphStore>(
                 // one, so this starts true and any other edge clears it.
                 receiver_name_guess: true,
                 role: Some(entity.role),
+                edges: Vec::new(),
             });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
@@ -1904,26 +2130,22 @@ fn collect_reference_rows<G: GraphStore>(
         // sites rather than the first. Only spans inside the referencing
         // entity's own file are taken: a cross-file evidence span would be a
         // line number the row's `file_path` does not explain.
-        let tally = relation_reference_lines(&rel, entity.file_origin.as_ref());
-        entry.reference_lines.extend(tally.lines);
-        *spans_outside_caller_file
-            .entry(source_entity_id)
-            .or_default() += tally.outside_caller_file;
-        push_reference_kind(&mut entry.relation_kinds, rel.kind);
-        // Any contribution without an every-site contract keeps the row a floor.
-        // A parsed edge holds every site the PARSE saw, which is not evidence
-        // about the occurrences some other edge stands for, and no coverage
-        // witness in the graph joins the two.
-        merge_site_contract_gap(
-            &mut entry.reference_lines_partial,
-            edge_site_contract_gap(&rel),
-        );
-        let resolution = RelationResolution::of(&rel);
-        entry.resolution = Some(match entry.resolution {
-            Some(current) => current.max(resolution),
-            None => resolution,
-        });
-        entry.receiver_name_guess &= kin_index::resolution::is_receiver_name_guess(&rel);
+        for edge in reference_edges(&rel, entity.file_origin.as_ref()) {
+            entry.reference_lines.extend(edge.lines.iter().copied());
+            *spans_outside_caller_file
+                .entry(source_entity_id)
+                .or_default() += edge.outside_caller_file;
+            push_reference_kind(&mut entry.relation_kinds, edge.kind);
+            // A qualifying occurrence never certifies sibling occurrences on
+            // this same logical edge. Retain each group's own site contract.
+            merge_site_contract_gap(&mut entry.reference_lines_partial, edge.site_contract_gap);
+            entry.resolution = Some(match entry.resolution {
+                Some(current) => current.max(edge.resolution),
+                None => edge.resolution,
+            });
+            entry.receiver_name_guess &= edge.receiver_name_guess;
+            entry.edges.push(edge);
+        }
     }
 
     // Compose over proven overrides.
@@ -1947,8 +2169,7 @@ fn collect_reference_rows<G: GraphStore>(
     // caller's own reference lines, recorded by the parser at the real call
     // site, survive the composition.
     for (base_id, base_name) in proven_override_bases(store, entity_id)? {
-        for rel in store
-            .get_all_relations_for_entity(&base_id)
+        for rel in kin_index::relation_read::relations_for_read(store, &base_id)
             .map_err(McpError::graph)?
         {
             if rel.dst != GraphNodeId::Entity(base_id) || !allowed.contains(&rel.kind) {
@@ -1996,17 +2217,16 @@ fn collect_reference_rows<G: GraphStore>(
                     // here in `candidates` if the assignment were ever removed.
                     receiver_name_guess: false,
                     role: Some(entity.role),
+                    edges: Vec::new(),
                 });
             let tally = relation_reference_lines(&rel, entity.file_origin.as_ref());
-            entry.reference_lines.extend(tally.lines);
+            entry.reference_lines.extend(tally.lines.iter().copied());
             *spans_outside_caller_file
                 .entry(source_entity_id)
                 .or_default() += tally.outside_caller_file;
             push_reference_kind(&mut entry.relation_kinds, rel.kind);
-            merge_site_contract_gap(
-                &mut entry.reference_lines_partial,
-                edge_site_contract_gap(&rel),
-            );
+            let site_contract_gap = edge_site_contract_gap(&rel);
+            merge_site_contract_gap(&mut entry.reference_lines_partial, site_contract_gap);
             let resolution = RelationResolution::of(&rel);
             entry.resolution = Some(match entry.resolution {
                 Some(current) => current.max(resolution),
@@ -2019,30 +2239,26 @@ fn collect_reference_rows<G: GraphStore>(
             if entry.via_override_of.is_none() {
                 entry.via_override_of = Some(base_name.clone());
             }
+            entry.edges.extend(
+                reference_edges(&rel, entity.file_origin.as_ref())
+                    .into_iter()
+                    .map(|mut edge| {
+                        if edge.resolution.is_proven() && !edge.receiver_name_guess {
+                            edge.via_override_of = Some(base_name.clone());
+                        }
+                        edge
+                    }),
+            );
         }
     }
 
     let mut rows = Vec::with_capacity(grouped.len());
     for (source_entity_id, mut row) in grouped {
-        row.relation_kinds.sort_by_key(relation_kind_rank);
-        row.reference_lines.sort_unstable();
-        row.reference_lines.dedup();
-        // A row with no lines has nothing to call a floor: `reference_lines_absent`
-        // below is the whole story, and carrying both would state one absence
-        // twice under two names.
-        if row.reference_lines.is_empty() {
-            row.reference_lines_partial = None;
-        }
-        row.reference_lines_absent = if !row.reference_lines.is_empty() {
-            None
-        } else if spans_outside_caller_file
+        let outside = spans_outside_caller_file
             .get(&source_entity_id)
-            .is_some_and(|dropped| *dropped > 0)
-        {
-            Some(ReferenceLinesAbsent::SpanOutsideCallerFile)
-        } else {
-            Some(ReferenceLinesAbsent::NoEvidenceSpan)
-        };
+            .copied()
+            .unwrap_or(0);
+        finish_reference_row(&mut row, outside);
         rows.push(row);
     }
     Ok(rows)
@@ -2061,9 +2277,8 @@ fn proven_override_bases<G: GraphStore>(
     entity_id: &EntityId,
 ) -> Result<Vec<(EntityId, String)>> {
     let mut bases = Vec::new();
-    for rel in store
-        .get_all_relations_for_entity(entity_id)
-        .map_err(McpError::graph)?
+    for rel in
+        kin_index::relation_read::relations_for_read(store, entity_id).map_err(McpError::graph)?
     {
         if rel.kind != RelationKind::Overrides || rel.src != GraphNodeId::Entity(*entity_id) {
             continue;
@@ -2112,6 +2327,64 @@ pub struct RelationSpanTally {
     /// this row. Counted rather than discarded so an empty `lines` can be
     /// explained.
     pub outside_caller_file: usize,
+}
+
+/// One logical edge may contain differently resolved parser occurrences.
+/// Group them before caller-level counting; never apply its strongest scalar to
+/// every line. These groups carry no graph identity and cannot duplicate callers.
+pub fn reference_edges(
+    rel: &kin_model::Relation,
+    caller_file: Option<&kin_model::FilePathId>,
+) -> Vec<ReferenceEdge> {
+    kin_index::occurrence::groups(rel)
+        .into_iter()
+        .map(|group| {
+            let tally = span_reference_lines(group.sites.iter(), caller_file);
+            ReferenceEdge {
+                kind: rel.kind,
+                resolution: group.resolution,
+                receiver_name_guess: group.receiver_name_guess,
+                via_override_of: None,
+                lines: tally.lines,
+                outside_caller_file: tally.outside_caller_file,
+                site_contract_gap: if group.qualification_missing {
+                    Some(ReferenceLinesPartial::OccurrenceQualificationUnavailable)
+                } else {
+                    edge_site_contract_gap(rel)
+                },
+            }
+        })
+        .collect()
+}
+
+/// Trace and path views disclose held occurrences instead of folding them into
+/// a stronger hop. Reference surfaces use `reference_edges` to expose candidates.
+pub fn proven_relation_reference_lines(
+    rel: &kin_model::Relation,
+    caller_file: Option<&kin_model::FilePathId>,
+) -> (RelationSpanTally, bool) {
+    let (sites, withheld) = kin_index::occurrence::proven_sites(rel);
+    (span_reference_lines(sites.iter(), caller_file), withheld)
+}
+
+fn span_reference_lines<'a>(
+    sites: impl Iterator<Item = &'a kin_model::SourceSpan>,
+    caller_file: Option<&kin_model::FilePathId>,
+) -> RelationSpanTally {
+    let mut tally = RelationSpanTally {
+        lines: Vec::new(),
+        outside_caller_file: 0,
+    };
+    for span in sites {
+        if caller_file.is_none_or(|file| &span.file == file) {
+            tally.lines.push(presentation_line(span.start_line));
+        } else {
+            tally.outside_caller_file += 1;
+        }
+    }
+    tally.lines.sort_unstable();
+    tally.lines.dedup();
+    tally
 }
 
 /// 1-based reference-site lines a single relation records, restricted to the
@@ -2358,8 +2631,7 @@ pub struct ExactEntitySource {
 ///
 /// A path whose bytes are not valid UTF-8 has no lossless plain form, so there
 /// the byte-exact spelling is the only representation those bytes have and the
-/// field is kept. `artifact_id` is emitted either way, and `kin_artifact_read`
-/// resolves the byte-exact path from it.
+/// field is kept. `artifact_id` is emitted either way as provenance.
 pub fn source_provenance_fields(
     source: &ExactEntitySource,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -2785,6 +3057,9 @@ fn resolve_entity_source_authority<G: GraphStore>(
     scope: EntitySourceScope,
 ) -> Result<Option<(ExactEntitySource, Arc<Vec<u8>>, SourceSpan)>> {
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
+    if kin_model::require_independent_source(entity).is_err() {
+        return Ok(None);
+    }
 
     let Some(recorded_span) = entity.span.as_ref() else {
         return Ok(None);
@@ -2812,7 +3087,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
     // names. A head read and a history read are genuinely different questions and
     // resolve through different authority, so they are kept apart here rather
     // than approximated by one path.
-    let (provenance, current_artifact, span) = match scope {
+    let (provenance, current_artifact, source_entity, span) = match scope {
         // HEAD: the workspace's exact graph-owned tree paired with the live
         // entity's own span -- byte-for-byte the pair `get_entity_source` reads, so
         // the body-shaped surfaces cannot diverge on the same repository.
@@ -2907,7 +3182,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
                 }
             }
 
-            (provenance, artifact, recorded_span.clone())
+            (provenance, artifact, None, recorded_span.clone())
         }
         // HISTORY: replay the COMPLETE first-parent history at the named change,
         // then read this entity's active revision out of that state.
@@ -2993,6 +3268,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
                     change_id: source_change_id,
                 },
                 current_artifact,
+                Some(revision.entity),
                 span,
             )
         }
@@ -3051,6 +3327,8 @@ fn resolve_entity_source_authority<G: GraphStore>(
             bytes.len()
         )));
     }
+    kin_parser::validate_module_source_span(source_entity.as_ref().unwrap_or(entity), &bytes)
+        .map_err(|error| graph_source_gap(error.to_string()))?;
     LAST_READ_SOURCE.with(|f| f.set("graph"));
     Ok(Some((
         ExactEntitySource {
@@ -3125,6 +3403,179 @@ pub fn read_entity_source_excerpt_detailed_held<G: GraphStore>(
     Ok(Some(source))
 }
 
+/// Candidate metadata is useful context but never priced as an independent body.
+pub fn derived_member_fields(entity: &Entity) -> Option<serde_json::Value> {
+    match kin_model::entity_derivation(entity) {
+        Ok(None) => None,
+        Ok(Some(derivation)) => Some(serde_json::json!({
+            "derivation":derivation, "independently_editable":false, "definition_status":"derived_candidate",
+            "body":null,"source_base":null,"generator_read":{"tool":"get_entity_source","entity_id":entity.id},
+            "body_unavailable":kin_model::require_independent_source(entity).unwrap_err()
+        })),
+        Err(reason) => Some(
+            serde_json::json!({"definition_status":"untrusted_derivation", "independently_editable":false,
+            "body":null,"source_base":null,"span":null,"start_line":null,"end_line":null,"derivation_error":reason}),
+        ),
+    }
+}
+
+/// Read the actual generator from graph authority, separately from the member.
+/// Both the recorded digest and a graph-owned DerivedFrom artifact must agree.
+pub fn derived_generator_source<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    max_bytes: usize,
+) -> Result<serde_json::Value> {
+    derived_generator_source_at(held, entity, max_bytes, EntitySourceScope::WorkspaceHead)
+}
+
+/// A generator read follows the selected graph's scope, including its own
+/// committed candidate revision. A candidate has no independent source span.
+pub fn derived_generator_source_at<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    max_bytes: usize,
+    scope: EntitySourceScope,
+) -> Result<serde_json::Value> {
+    let derivation = kin_model::entity_derivation(entity)
+        .map_err(McpError::Context)?
+        .ok_or_else(|| McpError::Context("entity has no generator evidence".into()))?;
+    let (source, bytes, span) = match scope {
+        EntitySourceScope::WorkspaceHead => {
+            let mut generator = entity.clone();
+            generator.span = Some(derivation.generator.clone());
+            generator.doc_summary = None;
+            generator
+                .metadata
+                .extra
+                .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+            generator.metadata.extra.insert(
+                "blob_hash".into(),
+                serde_json::json!(derivation.source_blob_hash),
+            );
+            resolve_entity_source_authority(held, &generator, scope)?
+                .ok_or_else(|| McpError::Context("generator source is unavailable".into()))?
+        }
+        EntitySourceScope::At(change_id) => {
+            let committed = held.graph_at(&change_id).map_err(McpError::graph)?;
+            let revision = committed
+                .entity_revisions
+                .get(&entity.id)
+                .and_then(|revisions| {
+                    revisions
+                        .iter()
+                        .rev()
+                        .find(|revision| revision.ended_by.is_none())
+                })
+                .ok_or_else(|| {
+                    graph_source_gap(format!(
+                        "candidate {} has no active revision at {change_id}",
+                        entity.id
+                    ))
+                })?;
+            if revision.entity.name != entity.name
+                || kin_model::entity_derivation(&revision.entity).map_err(McpError::Context)?
+                    != Some(derivation.clone())
+            {
+                return Err(graph_source_gap(
+                    "selected candidate does not match its committed generator revision",
+                ));
+            }
+            let path = RepoPath::from_utf8(derivation.generator.file.0.clone())
+                .map_err(|error| graph_source_gap(error.to_string()))?;
+            let artifact = committed
+                .tree
+                .artifact_at_path(&path)
+                .ok_or_else(|| graph_source_gap("committed generator artifact is absent"))?;
+            let introduced = held
+                .tree_at(&revision.introduced_by)
+                .map_err(McpError::graph)?;
+            if introduced
+                .artifact_at_path(&path)
+                .map(|artifact| artifact.artifact_id)
+                != Some(artifact.artifact_id)
+            {
+                return Err(graph_source_gap(
+                    "committed generator path has a different artifact identity",
+                ));
+            }
+            let TreeEntry::Blob { hash, .. } = artifact.entry else {
+                return Err(graph_source_gap("committed generator is not a source blob"));
+            };
+            if hash.to_string() != derivation.source_blob_hash {
+                return Err(graph_source_gap(
+                    "committed generator digest does not match candidate evidence",
+                ));
+            }
+            if !committed.relations.values().any(|relation| {
+                kin_model::derivation::generator_relation_matches(
+                    &revision.entity,
+                    relation,
+                    artifact.artifact_id,
+                    &derivation.source_blob_hash,
+                )
+            }) {
+                return Err(graph_source_gap(
+                    "committed generator lacks matching artifact provenance",
+                ));
+            }
+            let bytes = held.load_source_blob(held.authority()?, hash)?;
+            (
+                ExactEntitySource {
+                    body: String::new(),
+                    provenance: SourceProvenance::Committed { change_id },
+                    span_coherence: SpanCoherence::CoherentByConstruction,
+                    artifact_id: artifact.artifact_id,
+                    path,
+                    entry: artifact.entry,
+                },
+                bytes,
+                derivation.generator.clone(),
+            )
+        }
+    };
+    let relations = held
+        .store
+        .traverse(
+            &kin_model::GraphNodeId::Entity(entity.id),
+            &[RelationKind::DerivedFrom],
+            1,
+        )
+        .map_err(McpError::graph)?
+        .relations;
+    if !relations.iter().any(|relation| {
+        kin_model::derivation::generator_relation_matches(
+            entity,
+            relation,
+            source.artifact_id,
+            &derivation.source_blob_hash,
+        )
+    }) {
+        return Err(McpError::Context(
+            "generator lacks matching graph artifact provenance; re-admit the file".into(),
+        ));
+    }
+    let body = bytes
+        .get(span.start_byte..span.end_byte)
+        .ok_or_else(|| graph_source_gap("generator span is outside its source blob"))?;
+    if body.len() > max_bytes {
+        return Err(McpError::Context(
+            "shared generator exceeds inline limit; select a narrower entity or request bounded entity context".into(),
+        ));
+    }
+    let body = std::str::from_utf8(body)
+        .map_err(|error| McpError::Context(format!("generator is not UTF-8: {error}")))?;
+    let mut value = serde_json::json!({"kind":"shared_generator", "span":span,
+        "source_blob_hash":derivation.source_blob_hash,"body":body,"body_complete":true,
+        "independent_member_body":false,
+        "edit_scope":"generator source; edits may affect every generated sibling", "source":"graph"});
+    value
+        .as_object_mut()
+        .expect("object")
+        .extend(source_provenance_fields(&source));
+    Ok(value)
+}
+
 /// Read the exact graph span, refusing an oversized body before copying it.
 pub fn read_entity_source_exact<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
@@ -3138,7 +3589,7 @@ pub fn read_entity_source_exact<G: GraphStore>(
     };
     let body = &bytes[span.start_byte..span.end_byte];
     if body.len() > max_bytes {
-        return Err(McpError::Context(format!("entity {} whole source span is {} bytes, above the {} byte inline limit; use kin_artifact_read", entity.id, body.len(), max_bytes)));
+        return Err(McpError::Context(format!("entity {} whole source span is {} bytes, above the {} byte inline limit; select a narrower entity or request bounded entity context", entity.id, body.len(), max_bytes)));
     }
     source.body = std::str::from_utf8(body)
         .map_err(|error| {
@@ -3165,6 +3616,14 @@ impl<G: GraphStore> kin_context::ContextProjectionProvider for ContextSourceProv
         entity: &Entity,
         limits: kin_context::ProjectionLimits,
     ) -> kin_context::Result<kin_context::BodyCandidate> {
+        if let Some(fields) = derived_member_fields(entity) {
+            self.fields
+                .borrow_mut()
+                .insert(entity.id, fields.as_object().expect("object").clone());
+            return Ok(kin_context::BodyCandidate::Unavailable {
+                reason: entity_body_gap_reason(entity),
+            });
+        }
         let resolved = match resolve_entity_source_authority(
             self.held,
             entity,
@@ -3291,6 +3750,13 @@ pub fn attach_context_body<G: GraphStore>(
     row: &mut serde_json::Value,
     budget: &mut ContextBodyBudget,
 ) -> Result<()> {
+    if let Some(fields) = derived_member_fields(entity) {
+        if let Some(row) = row.as_object_mut() {
+            row.extend(fields.as_object().expect("object").clone());
+        }
+        downgrade_context_body(row, &entity_body_gap_reason(entity));
+        return Ok(());
+    }
     let resolved =
         match resolve_entity_source_authority(held, entity, EntitySourceScope::WorkspaceHead) {
             Ok(source) => source,
@@ -3345,6 +3811,9 @@ pub fn downgrade_context_body(row: &mut serde_json::Value, reason: &str) {
 /// names the missing coordinate so an agent stops asking for the body instead of
 /// retrying, and never mistakes absence for an empty implementation.
 pub fn entity_body_gap_reason(entity: &Entity) -> String {
+    if let Err(reason) = kin_model::require_independent_source(entity) {
+        return reason;
+    }
     let missing = match (entity.file_origin.is_some(), entity.span.is_some()) {
         (false, false) => "no file origin and no source span",
         (false, true) => "no file origin",
@@ -3676,12 +4145,61 @@ pub fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usiz
 
 // ── Entity JSON formatting ──
 
+/// Serialize semantic metadata without server-owned retrieval source fragments.
+/// Applies to an Entity or a report containing Entities; stored ranking inputs
+/// remain intact. Match the serialized Entity shape so unrelated domain metadata
+/// and arbitrary user objects are not rewritten by key name alone.
+pub fn semantic_metadata_json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value> {
+    fn project(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                let is_entity = ["id", "kind", "name", "language", "fingerprint", "signature"]
+                    .iter()
+                    .all(|key| object.contains_key(*key));
+                if is_entity {
+                    if let Some(metadata) = object
+                        .get_mut("metadata")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        for key in [
+                            "embedding_body_preview",
+                            "file_import_context",
+                            "file_surface_context",
+                        ] {
+                            metadata.remove(key);
+                        }
+                    }
+                }
+                for child in object.values_mut() {
+                    project(child);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    project(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(value).map_err(McpError::Json)?;
+    project(&mut value);
+    Ok(value)
+}
+
 pub fn entity_response_json<G: GraphStore>(
     store: &G,
     entity: &Entity,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<serde_json::Value> {
-    let mut value = serde_json::to_value(entity).map_err(McpError::Json)?;
+    let mut value = semantic_metadata_json(entity)?;
+    if let Some(fields) = derived_member_fields(entity) {
+        value
+            .as_object_mut()
+            .expect("entity object")
+            .extend(fields.as_object().expect("object").clone());
+        return Ok(value);
+    }
     let Some(obj) = value.as_object_mut() else {
         return Ok(value);
     };
@@ -3850,6 +4368,10 @@ pub fn parse_capabilities(
 
 // ── Search filter helpers ──
 
+/// Shared by the served schema and invalid-kind errors. Keep aliases and the
+/// role-based `test` filter visible without a case-sensitive schema enum.
+pub const SEMANTIC_SEARCH_KIND_GUIDANCE: &str = "Accepted kinds (case-insensitive): function (fn), method, command (cmd, subcommand), class, interface, trait (traitdef), type_alias, module, package, test, schema, api_endpoint, event_contract, enum (enumdef), constant. `test` filters the test role. Omit kind to search all declaration kinds. Files are not declarations. Select a semantic entity by name or kind; missing parsed coverage is a graph gap, not a file-read fallback.";
+
 pub fn build_semantic_search_request(
     args: &HashMap<String, serde_json::Value>,
 ) -> Result<(String, usize, EntityFilter)> {
@@ -3857,8 +4379,24 @@ pub fn build_semantic_search_request(
     let query = get_string_param(args, "query")?;
     let limit = (get_optional_u64(args, "limit", 20) as usize).clamp(1, MAX_LIMIT);
 
-    let kind_str = args.get("kind").and_then(|v| v.as_str());
+    let kind_str = args
+        .get("kind")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                McpError::InvalidParams(format!(
+                    "kind must be a string. {SEMANTIC_SEARCH_KIND_GUIDANCE}"
+                ))
+            })
+        })
+        .transpose()?;
     let kind_filter = kind_str.and_then(parse_kind_filter);
+    if let Some(kind) = kind_str {
+        if kind_filter.is_none() && !kind.eq_ignore_ascii_case("test") {
+            return Err(McpError::InvalidParams(format!(
+                "unsupported semantic_search kind {kind:?}. {SEMANTIC_SEARCH_KIND_GUIDANCE}"
+            )));
+        }
+    }
     let role_filter = match kind_str {
         Some(k) if k.eq_ignore_ascii_case("test") => Some(vec![kin_model::EntityRole::Test]),
         _ => None,
@@ -3956,19 +4494,27 @@ pub struct SemanticSearchResponse {
 pub struct SemanticSearchResult {
     pub id: EntityId,
     pub name: String,
+    /// The member segment of `name`, `get` for `Scaffold.get`, the same field
+    /// `list_file_entities` carries.
+    pub member_name: String,
     pub kind: EntityKind,
     pub language: LanguageId,
     pub file_path: Option<String>,
     pub start_line: Option<u32>,
     pub signature: String,
     pub doc_summary: Option<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<serde_json::Value>,
 }
 
 impl From<kin_model::entity::Entity> for SemanticSearchResult {
     fn from(entity: kin_model::entity::Entity) -> Self {
+        let derivation = derived_member_fields(&entity);
         let start_line = entity_presentation_start_line(&entity);
         Self {
+            derivation,
             id: entity.id,
+            member_name: kin_ranking::entity_ranking::lookup_member_name(&entity).to_string(),
             name: entity.name,
             kind: entity.kind,
             language: entity.language,
@@ -3993,20 +4539,28 @@ pub struct CompactSearchResponse {
 pub struct CompactSearchResult {
     pub id: EntityId,
     pub name: String,
+    /// The member segment of `name`, `get` for `Scaffold.get`, the same field
+    /// `list_file_entities` carries.
+    pub member_name: String,
     pub kind: EntityKind,
     pub language: LanguageId,
     pub file_path: Option<String>,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
     pub signature: String,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<serde_json::Value>,
 }
 
 impl From<kin_model::entity::Entity> for CompactSearchResult {
     fn from(entity: kin_model::entity::Entity) -> Self {
+        let derivation = derived_member_fields(&entity);
         let start_line = entity_presentation_start_line(&entity);
         let end_line = entity_presentation_end_line(&entity);
         Self {
+            derivation,
             id: entity.id,
+            member_name: kin_ranking::entity_ranking::lookup_member_name(&entity).to_string(),
             name: entity.name,
             kind: entity.kind,
             language: entity.language,
@@ -4059,8 +4613,8 @@ pub fn resolve_diff<G: GraphStore>(
                     "no entity resolved from the given files, so nothing was diffed: [{}]. \
                      These paths named no entities in this graph, which is what a tracked file \
                      the parsers emit no entities for looks like; no base or head was \
-                     compared. Confirm the paths with kin_artifact_list, or pass entity_ids \
-                     for the declarations you mean.",
+                     compared. Find declarations with semantic_search or semantic_locate and pass \
+                     their entity_ids.",
                     files.join(", ")
                 )),
                 other => McpError::Review(other.to_string()),

@@ -125,7 +125,8 @@ def main():
         for reopen in ([False, True] if label == "recorded-fixed" else [False]):
             name = label + ("-reopen" if reopen else "")
             command = [sys.executable, str(root / "probe_startup_binary.py"),
-                       "--daemon", str(args.daemon.resolve()), "--fixture", str(fixture),
+                       "--daemon", str(args.daemon.resolve()), "--kin", str(args.kin.resolve()),
+                       "--fixture", str(fixture),
                        "--output", str(output / name), "--expect", "recovered", "--empty-control"]
             if label == "recorded-fixed":
                 command += ["--require-orphan-debt", "--orphan-body", receipt["orphan_body"]]

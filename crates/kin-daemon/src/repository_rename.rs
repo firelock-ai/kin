@@ -14,8 +14,8 @@ use kin_cli::commands::rename::{
     plan_rename, RenameEdit, RenamePlan, RenameReport, RenameRequest, RenameResponse,
 };
 use kin_model::{
-    ChangeStore, EntityDelta, EntityKind, EntityStore, FileLayout, FilePathId, GraphNodeId,
-    Hash256, LocatedEntry, ParseCompleteness, RepoPath, SourceRegion, TransactionDelta, TreeDelta,
+    ChangeStore, EntityDelta, EntityKind, EntityStore, FileLayout, FilePathId, Hash256,
+    LocatedEntry, ParseCompleteness, RepoPath, SourceRegion, TransactionDelta, TreeDelta,
     TreeEntry,
 };
 use serde::{Deserialize, Serialize};
@@ -170,8 +170,9 @@ fn plan_commit_and_retain_authority(
         Ok(load_native_source_blob(&authority_context, hash)?)
     })?;
     let metadata = RenameCommitMetadata::from_plan(request, &plan)?;
-    let (prospective, layouts) = apply_plan_in_memory(state, &authority_context, &base, &plan)?;
-    prove_plan_postconditions(&base.graph, &prospective, &plan)?;
+    let (prospective, layouts, admitted_external) =
+        apply_plan_in_memory(state, &authority_context, &base, &plan)?;
+    prove_plan_postconditions(&base.graph, &prospective, &plan, &admitted_external)?;
 
     let previous_tree = base.tree.clone();
     let desired_tree = prospective.resolved_tree();
@@ -422,7 +423,11 @@ fn apply_plan_in_memory(
     authority_context: &LocalRepositoryAuthorityContext,
     base: &crate::repository_commit::NativeCommitBase,
     plan: &RenamePlan,
-) -> Result<(kin_db::InMemoryGraph, Vec<FileLayout>)> {
+) -> Result<(
+    kin_db::InMemoryGraph,
+    Vec<FileLayout>,
+    BTreeSet<kin_model::RelationId>,
+)> {
     let prospective = kin_db::InMemoryGraph::from_snapshot(base.graph.to_snapshot())
         .context("create prospective rename graph")?;
     let mut by_file = BTreeMap::<String, Vec<RenameEdit>>::new();
@@ -434,6 +439,7 @@ fn apply_plan_in_memory(
     }
     let pipeline = kin_index::IndexPipeline::new();
     let mut layouts = Vec::new();
+    let mut admitted_external = BTreeSet::new();
     for (file_path, mut edits) in by_file {
         let file_id = FilePathId::new(file_path);
         edits.sort_by_key(|edit| edit.start_byte);
@@ -480,16 +486,27 @@ fn apply_plan_in_memory(
         let reconcile = reconciler
             .reconcile_indexed_content(&indexed, state.blobs.as_ref(), &prospective)
             .with_context(|| format!("derive renamed semantics for {file_id}"))?;
-        if let Some(delta) = reconcile.delta.entity_deltas.iter().find(|delta| {
-            matches!(
-                delta,
-                EntityDelta::Added { .. } | EntityDelta::Removed { .. }
-            )
-        }) {
+        if let Some(delta) = crate::source_entity_guard::first_unsupported_entity_change(
+            &reconcile.delta,
+            &prospective,
+            &file_id,
+        )? {
             bail!(
                 "rename of {} would create or remove an entity while reparsing {file_id} ({delta:?}); refusing identity loss",
                 plan.entity_id
             );
+        }
+        for change in &reconcile.delta.relation_deltas {
+            if let kin_model::RelationDelta::Added { new } = change {
+                if crate::source_entity_guard::admitted_external_relation(
+                    new,
+                    &reconcile.delta,
+                    &prospective,
+                    &file_id,
+                )? {
+                    admitted_external.insert(new.id);
+                }
+            }
         }
         prospective
             .apply_transaction_delta(&reconcile.delta)
@@ -502,7 +519,7 @@ fn apply_plan_in_memory(
         prospective.upsert_file_layout(&layout)?;
         layouts.push(layout);
     }
-    Ok((prospective, layouts))
+    Ok((prospective, layouts, admitted_external))
 }
 
 fn retain_target_identity(indexed: &mut kin_index::IndexedFile, plan: &RenamePlan) -> Result<()> {
@@ -533,28 +550,17 @@ fn retain_target_identity(indexed: &mut kin_index::IndexedFile, plan: &RenamePla
             plan.entity_id
         );
     }
-    indexed.entities[*index].id = plan.entity_id;
-    for relation in &mut indexed.relations {
-        if relation.src == GraphNodeId::Entity(parsed_id) {
-            relation.src = GraphNodeId::Entity(plan.entity_id);
-        }
-        if relation.dst == GraphNodeId::Entity(parsed_id) {
-            relation.dst = GraphNodeId::Entity(plan.entity_id);
-        }
-    }
-    for relation in &mut indexed.unresolved_relations {
-        if relation.src_entity_id == parsed_id {
-            relation.src_entity_id = plan.entity_id;
-        }
-    }
-    for region in &mut indexed.file_layout.regions {
-        if let SourceRegion::EntityRef { entity_id, .. } = region {
-            if *entity_id == parsed_id {
-                *entity_id = plan.entity_id;
-            }
-        }
-    }
-    Ok(())
+    // The renamed declaration's own call edges carry occurrence certificates
+    // bound to the parser's id. Retaining the identity must rebind them with the
+    // endpoints, or admission refuses the rename as invalid occurrence evidence.
+    indexed
+        .retain_entity_identity(parsed_id, plan.entity_id)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "renamed declaration could not keep identity {}: {error}",
+                plan.entity_id
+            )
+        })
 }
 
 fn validate_non_overlapping_edits(file: &FilePathId, edits: &[RenameEdit]) -> Result<()> {
@@ -598,6 +604,7 @@ fn prove_plan_postconditions(
     before: &kin_db::InMemoryGraph,
     after: &kin_db::InMemoryGraph,
     plan: &RenamePlan,
+    admitted_external: &BTreeSet<kin_model::RelationId>,
 ) -> Result<()> {
     let old = before.get_entity(&plan.entity_id)?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -634,7 +641,11 @@ fn prove_plan_postconditions(
         .keys()
         .copied()
         .collect::<BTreeSet<_>>();
-    if before_ids != after_ids {
+    if !before_ids.is_subset(&after_ids)
+        || after_ids
+            .difference(&before_ids)
+            .any(|id| !admitted_external.contains(id))
+    {
         let dropped = before_ids
             .difference(&after_ids)
             .copied()
@@ -653,7 +664,7 @@ fn prove_plan_postconditions(
         let current = after_snapshot
             .relations
             .get(relation_id)
-            .expect("relation identity sets were proven equal");
+            .expect("all prior relation identities were proven retained");
         if prior.kind != current.kind || prior.src != current.src || prior.dst != current.dst {
             bail!(
                 "rename reparse rewired graph relation {} from {:?} {} -> {} to {:?} {} -> {}; refusing semantic drift",
@@ -830,7 +841,9 @@ mod tests {
         Annotation, AnnotationId, AnnotationKind, IdentityRef, SemanticAnchor, StalenessState,
         WorkScope,
     };
-    use kin_model::{AuthorId, RelationDelta, RelationId, RelationKind, Timestamp, WorkStore};
+    use kin_model::{
+        AuthorId, GraphNodeId, RelationDelta, RelationId, RelationKind, Timestamp, WorkStore,
+    };
 
     fn install_test_registry_override() {
         static REGISTRY_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -890,13 +903,13 @@ mod tests {
         let target = target_indexed
             .entities
             .iter()
-            .find(|entity| entity.name == "target")
+            .find(|entity| entity.name == "target" && entity.kind != EntityKind::Module)
             .unwrap()
             .clone();
         let caller = caller_indexed
             .entities
             .iter()
-            .find(|entity| entity.name == "caller")
+            .find(|entity| entity.name == "caller" && entity.kind != EntityKind::Module)
             .unwrap()
             .clone();
         let target_artifact = kin_model::ArtifactId::new();
@@ -947,9 +960,18 @@ mod tests {
         // and build their graphs by hand. What the rename path needs from this
         // fixture is that the repeated edge really is one edge with two
         // occurrences, and that is what the count below states.
+        // The linker also appends a span-free occurrence certificate per site,
+        // after the sites. Those are proofs about the sites, not sites, so the
+        // producer records are read through `original_evidence`, which rejects
+        // the relation unless every certificate validates against them.
+        let originals = kin_index::occurrence::original_evidence(relation)
+            .expect("every occurrence certificate validates against the sites");
         assert!(
-            relation
-                .evidence
+            !originals.is_empty(),
+            "the edge keeps its producer records: {relation:?}"
+        );
+        assert!(
+            originals
                 .iter()
                 .all(|evidence| evidence.source_span.is_some()),
             "the Rust adapter records a call site, so both occurrences carry one: {relation:?}"
@@ -1057,6 +1079,68 @@ mod tests {
         };
         let error = apply_edits(&file, b"fn other() {}", &[edit]).unwrap_err();
         assert!(error.to_string().contains("no longer matches"));
+    }
+
+    #[test]
+    fn external_target_rename_postconditions_still_refuse_untracked_relation_drift() {
+        let fixture = exact_rename_fixture();
+        let before = fixture.state.graph.as_ref();
+        let target = before.get_entity(&fixture.target_id).unwrap().unwrap();
+        let mut renamed = target.clone();
+        renamed.name = "renamed_target".into();
+        let plan = RenamePlan {
+            entity_id: target.id,
+            entity_kind: target.kind,
+            old_name: target.name,
+            new_name: renamed.name.clone(),
+            declaration_file: fixture.target_file,
+            edits: Vec::new(),
+            relation_ids: vec![fixture.relation_id],
+        };
+        let after = kin_db::InMemoryGraph::from_snapshot(before.to_snapshot()).unwrap();
+        after.upsert_entity(&renamed).unwrap();
+        prove_plan_postconditions(before, &after, &plan, &BTreeSet::new()).unwrap();
+        let relation = before
+            .to_snapshot()
+            .relations
+            .get(&fixture.relation_id)
+            .unwrap()
+            .clone();
+        let mut added = relation.clone();
+        added.id = RelationId::new();
+        after.upsert_relation(&added).unwrap();
+        assert!(
+            prove_plan_postconditions(before, &after, &plan, &BTreeSet::new())
+                .unwrap_err()
+                .to_string()
+                .contains("adding")
+        );
+        after
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![
+                    RelationDelta::Removed { old: added },
+                    RelationDelta::Removed {
+                        old: relation.clone(),
+                    },
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            prove_plan_postconditions(before, &after, &plan, &BTreeSet::new())
+                .unwrap_err()
+                .to_string()
+                .contains("dropping")
+        );
+        let mut rewired = relation;
+        rewired.src = rewired.dst;
+        after.upsert_relation(&rewired).unwrap();
+        assert!(
+            prove_plan_postconditions(before, &after, &plan, &BTreeSet::new())
+                .unwrap_err()
+                .to_string()
+                .contains("rewired")
+        );
     }
 
     #[test]
@@ -1433,5 +1517,82 @@ mod tests {
             attached[0].scopes,
             vec![WorkScope::Entity(fixture.target_id)]
         );
+    }
+
+    /// The renamed declaration's own call edges carry occurrence certificates
+    /// bound to the parser's id. Rewriting only the endpoint fields left those
+    /// certificates naming that id, so admission refused the rename of any
+    /// declaration that calls into its own file as invalid occurrence evidence.
+    /// The fixtures above rename a declaration with no such edge.
+    #[test]
+    fn retaining_the_planned_identity_keeps_the_renamed_callers_certificates_valid() {
+        let file = FilePathId::new("mod.py");
+        let source =
+            b"def helper(value):\n    return value\n\n\ndef renamed(value):\n    return helper(value)\n";
+        let kin_index::IndexedAny::EntitySource(mut indexed) = kin_index::IndexPipeline::new()
+            .index_any_content(&file, source, kin_blobs::digest(source))
+            .unwrap()
+        else {
+            panic!("fixture must classify as source");
+        };
+        let named = |indexed: &kin_index::IndexedFile, name: &str| {
+            indexed
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap()
+                .clone()
+        };
+        let parsed = named(&indexed, "renamed");
+        let helper = named(&indexed, "helper").id;
+        let call = |indexed: &kin_index::IndexedFile, src: kin_model::EntityId| {
+            indexed
+                .relations
+                .iter()
+                .find(|relation| {
+                    relation.kind == RelationKind::Calls
+                        && relation.src == GraphNodeId::Entity(src)
+                        && relation.dst == GraphNodeId::Entity(helper)
+                })
+                .cloned()
+        };
+        let parsed_call =
+            call(&indexed, parsed.id).expect("the parser resolves the same-file call");
+        assert!(
+            parsed_call
+                .evidence
+                .iter()
+                .any(kin_index::occurrence::is_certificate),
+            "the fresh call carries an occurrence certificate: {parsed_call:?}"
+        );
+        let plan = RenamePlan {
+            entity_id: kin_model::EntityId::new(),
+            entity_kind: parsed.kind,
+            old_name: "before".to_string(),
+            new_name: "renamed".to_string(),
+            declaration_file: file,
+            edits: Vec::new(),
+            relation_ids: Vec::new(),
+        };
+
+        retain_target_identity(&mut indexed, &plan).unwrap();
+
+        assert_eq!(named(&indexed, "renamed").id, plan.entity_id);
+        assert!(call(&indexed, parsed.id).is_none());
+        let retained =
+            call(&indexed, plan.entity_id).expect("the call follows the retained identity");
+        assert!(
+            kin_index::occurrence::original_evidence(&retained).is_some(),
+            "every certificate validates against the retained endpoints: {retained:?}"
+        );
+        // Admission maps the edge to its stable identity through the same check.
+        let mut admitted = retained.clone();
+        kin_index::occurrence::rebind_identity(
+            &mut admitted,
+            retained.id,
+            retained.src,
+            retained.dst,
+        )
+        .expect("admission accepts the retained call edge");
     }
 }

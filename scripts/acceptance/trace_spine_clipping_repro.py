@@ -165,10 +165,36 @@ ADAPTERS_FILE = "adapters.py"
 # Calibrated against the built binaries on 2026-08-28 by sweeping 3000 to 11000: below 4500
 # nothing separates the arms, at 7000 and above both keep the target, and 5500 to 6500 is the
 # plateau where the named arm keeps it by branch narrowing and the unnamed arm loses it.
-RESPONSE_BUDGET = 6000
+#
+# Recalibrated on 2026-09-22, DOWNWARD. That sweep was run while this suite
+# measured a pretty re-print of the response rather than the compact line the
+# CLI emits for a body-free chain, and a ceiling that governs a payload about a
+# third larger cuts about a third harder. Measured again against the built
+# binaries by sweeping 3000 to 6000 on the same fixture: at 3400 and below the
+# named arm collapses to one step, at 5500 and above both arms keep the target,
+# and 4200 to 5000 is the plateau where the named arm keeps it by branch
+# narrowing and the unnamed control loses it. 4600 is the middle of it.
+#
+# Recalibrated on 2026-09-23, DOWNWARD again, once the size check started
+# counting the final disclosures and the walk's steps rendered leaner: at 4600
+# both arms kept the target, so the control proved nothing. Swept 2600 to 5200
+# in steps of 100 against the built binaries: at 2700 and below the named arm
+# collapses to one step, from 2800 to 3200 the unnamed arm's cut is a suffix
+# rather than a narrowing, at 4400 and above both arms keep the target, and
+# 3300 to 4300 is the plateau where the named arm keeps it by branch narrowing
+# and the unnamed control loses it. 3800 is the middle of it.
+#
+# This number is the `--max-response-chars` this fixture passes, not a product
+# ceiling: the shipped default is kin-mcp's RESPONSE_DEFAULT_MAX_CHARS. It has
+# only ever moved down.
+RESPONSE_BUDGET = 3800
 # The synthetic graders run against small payloads, so they get their own budget. The real
-# constant above is the one the product is judged on.
-SELFTEST_RESPONSE_BUDGET = 1300
+# constant above is the one the product is judged on. Recalibrated on 2026-09-22 from 1300
+# when the size check stopped re-printing the payload and started measuring what the CLI
+# emitted: the fixtures render compact, so every fixture length moved down by about a third.
+# The window is [841, 990] -- the unnamed arm is 841 bytes and has to fit, the wide premise
+# is 991 and has to overflow -- and 900 sits inside it.
+SELFTEST_RESPONSE_BUDGET = 900
 WIDE_RESPONSE_BUDGET = 60000
 ELISION_DEPTH = 3
 ELISION_LIMIT = 25
@@ -375,9 +401,42 @@ def graph_bounds_problem(payload, budget):
     return ", ".join(mismatches) if mismatches else None
 
 
-def pretty_serialized_bytes(payload):
-    """Match serde_json::to_string_pretty(...).len() for the ASCII fixture."""
-    return len(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+class EmittedResponse(dict):
+    """A parsed response that remembers the bytes `kin` printed for it.
+
+    A dict subclass so every grader reads it unchanged, and an attribute rather
+    than a key so nothing the graders walk can see it.
+    """
+
+    emitted_bytes = None
+
+
+def emitted_response_bytes(payload):
+    """Bytes the caller actually received for this response.
+
+    `max_response_chars` bounds what the CLI emits, and the producer's own
+    `measure_response` counts that same rendering, so re-printing the parsed
+    payload in some other format measures a string no caller ever saw. A
+    body-free chain is emitted compact; re-printing it with a two-space indent
+    read 6562 bytes for a 4500-byte response and failed a response that fit.
+
+    A live arm carries the exact line it was parsed from. A self-test fixture
+    has no binary behind it, so it falls back to the format the CLI would have
+    chosen for that payload: compact unless a step carries a body.
+    """
+    recorded = getattr(payload, "emitted_bytes", None)
+    if isinstance(recorded, int):
+        return recorded
+    chain = payload.get("chain") if isinstance(payload, dict) else None
+    carries_body = payload.get("focal") is not None or any(
+        isinstance(step, dict) and step.get("body") is not None
+        for step in (chain or [])
+    )
+    if carries_body:
+        rendered = json.dumps(payload, indent=2, ensure_ascii=False)
+    else:
+        rendered = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return len(rendered.encode("utf-8"))
 
 
 def fanout_clip_problem(payload):
@@ -511,9 +570,9 @@ def wide_premise_problem(payload):
     bounds = graph_bounds_problem(payload, WIDE_RESPONSE_BUDGET)
     if bounds:
         return "wide bounds drifted: " + bounds
-    rendered_chars = pretty_serialized_bytes(payload)
+    rendered_chars = emitted_response_bytes(payload)
     if rendered_chars > WIDE_RESPONSE_BUDGET:
-        return "the wide response serializes to %d bytes, above its %d-byte budget" % (
+        return "the wide response was emitted as %d bytes, above its %d-byte budget" % (
             rendered_chars, WIDE_RESPONSE_BUDGET,
         )
     clips = fanout_clip_problem(payload)
@@ -543,18 +602,18 @@ def bounded_elision_problem(payload, wide, budget):
     bounds = graph_bounds_problem(payload, budget)
     if bounds:
         return "bounded bounds drifted: " + bounds
-    rendered_chars = pretty_serialized_bytes(payload)
+    rendered_chars = emitted_response_bytes(payload)
     if rendered_chars > budget:
-        return "the bounded response serializes to %d bytes, above its %d-byte budget" % (
+        return "the bounded response was emitted as %d bytes, above its %d-byte budget" % (
             rendered_chars, budget,
         )
     # The cut has to be attributable to the budget. A discovery universe that already
     # fits cannot overflow it, so a response that trims anyway trimmed for some other
     # reason and labelled it response_budget.
-    wide_chars = pretty_serialized_bytes(wide)
+    wide_chars = emitted_response_bytes(wide)
     if wide_chars <= budget:
         return (
-            "the wide discovery serializes to %d bytes, inside the %d-byte budget, so nothing "
+            "the wide discovery was emitted as %d bytes, inside the %d-byte budget, so nothing "
             "here can be attributed to the response budget" % (wide_chars, budget)
         )
     clips = fanout_clip_problem(payload)
@@ -826,6 +885,7 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         os.makedirs(self.env["KIN_HOME"])
         self._repo = None
+        self.owned_repos = set()
         self._elision_arms = None
         self._caller_trace = None
 
@@ -841,6 +901,7 @@ class Suite(object):
             return self._repo
         path = os.path.join(self.workdir, "sessions")
         os.makedirs(path)
+        self.owned_repos.add(path)
         for rel, body in (("sessions.py", SESSIONS_SRC), ("adapters.py", ADAPTERS_SRC)):
             with open(os.path.join(path, rel), "w") as handle:
                 handle.write(body)
@@ -875,9 +936,13 @@ class Suite(object):
         if rc != 0:
             return None
         try:
-            return json.loads(out)
-        except ValueError:
+            payload = EmittedResponse(json.loads(out))
+        except (ValueError, TypeError):
             return None
+        # The bytes the budget governs are the ones this process just printed.
+        # `println!` adds the terminator, and nothing else is written to stdout.
+        payload.emitted_bytes = len(out.strip("\r\n").encode("utf-8"))
+        return payload
 
     def elision_arms(self):
         """One wide premise and a paired target/no-target response cut."""
@@ -912,12 +977,39 @@ class Suite(object):
             )
         return self._caller_trace
 
-    def close(self):
-        if self._repo is None:
-            return
-        rc, out, err = self.kin_run(["daemon", "stop", "--json"], self._repo, timeout=60)
-        if self.verbose and rc != 0:
-            print("  daemon stop returned rc=%s: %s" % (rc, (err or out)[-300:]))
+    def shutdown(self):
+        """Stop only this run's repositories, including a failed initialization."""
+        records = []
+        errors = []
+        for repo in sorted(self.owned_repos):
+            record = {"repo": repo}
+            records.append(record)
+            # Never let discovery walk upward and select an unrelated repository.
+            if not os.path.isfile(os.path.join(repo, ".kin", "manifest.json")):
+                record["error"] = "fixture manifest missing; stop was not attempted"
+                errors.append("%s: %s" % (repo, record["error"]))
+                continue
+            try:
+                proc = subprocess.run(
+                    [self.kin, "daemon", "stop", "--json"], cwd=repo, env=self.env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                    timeout=60)
+                rc, out, err = proc.returncode, proc.stdout, proc.stderr
+                record.update({"returncode": rc, "stdout": out, "stderr": err})
+                report = json.loads(out) if rc == 0 else None
+                if not stop_confirmed(rc, report):
+                    record["error"] = "worker stop and endpoint retirement were not confirmed"
+                    errors.append("%s: %s" % (repo, record["error"]))
+            except Exception as error:
+                record["error"] = "%s: %s" % (type(error).__name__, error)
+                errors.append("%s: %s" % (repo, record["error"]))
+        evidence = os.path.join(self.workdir, "daemon-cleanup.json")
+        with open(evidence, "w") as handle:
+            json.dump(records, handle, indent=2)
+            handle.write("\n")
+        detail = ("; ".join(errors) + "; see " + evidence if errors else
+                  "%d owned fixture workers stopped and endpoints retired" % len(records))
+        return cleanup_result(FAIL if errors else PASS, detail)
 
 
 class Result(object):
@@ -1604,12 +1696,56 @@ def self_test():
     return 1 if failures else 0
 
 
+def cleanup_result(status, detail):
+    return Result("cleanup", status, detail)
+
+
+def stop_confirmed(rc, report):
+    """A successful exit alone does not prove that a worker was retired."""
+    if not isinstance(report, dict):
+        return False
+    stopped = report.get("stopped")
+    return (rc == 0 and isinstance(stopped, list)
+            and report.get("schema") == "kin.daemon-stop.v1"
+            and report.get("scope") == "current-repo"
+            and report.get("all_stopped") is True
+            and report.get("endpoints_retired", not stopped) is True
+            and all(isinstance(row, dict)
+                    and row.get("result") in ("stopped", "not-running")
+                    and "preserved_endpoint" not in row for row in stopped))
+
+
+def finish_run_root(workdir, results, keep, explicit=False):
+    """Only a successful, stopped, disposable run may lose its fixtures."""
+    reasons = []
+    if keep:
+        reasons.append("--keep")
+    if explicit:
+        reasons.append("caller-owned workdir")
+    if not results or any(result.status != PASS for result in results):
+        reasons.append("failed or unreadable check or cleanup")
+    if not reasons:
+        try:
+            shutil.rmtree(workdir)
+        except OSError as error:
+            removal = cleanup_result(FAIL, "fixture removal failed: %s" % error)
+            removal.ident = "cleanup-root"
+            results.append(removal)
+            reasons.append("fixture removal failed; remaining evidence retained")
+    if reasons:
+        print("fixtures kept at %s (%s)" % (workdir, "; ".join(reasons)))
+    return {"run_root": workdir, "run_root_retained": bool(reasons),
+            "run_root_retention_reason": "; ".join(reasons) if reasons else "successful disposable run"}
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kin", default=os.environ.get("KIN_BIN") or shutil.which("kin"))
     parser.add_argument("--daemon", default=os.environ.get("KIN_DAEMON_BIN"))
     parser.add_argument("--json", default=None, help="write the machine-readable report here")
     parser.add_argument("--label", default=os.environ.get("KIN_ACCEPTANCE_LABEL") or "")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the run root whatever the result")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     opts = parser.parse_args(argv)
@@ -1633,7 +1769,11 @@ def main(argv):
         return 3
 
     workdir = tempfile.mkdtemp(prefix="trace-spine-clipping-")
+    print("run root: %s" % workdir)
     suite = None
+    results = []
+    report_path = None
+    verdict_reached = False
     try:
         suite = Suite(kin, workdir, daemon=daemon, verbose=opts.verbose)
         results = []
@@ -1668,15 +1808,35 @@ def main(argv):
                     sort_keys=True,
                 )
                 handle.write("\n")
-        if any(result.status == FAIL for result in results):
-            return 1
-        if any(result.status == UNREADABLE for result in results):
-            return 2
-        return 0
+        verdict_reached = True
     finally:
+        # Stopped whatever happened, and a stop that raised is a cleanup FAIL.
+        cleanup = []
         if suite is not None:
-            suite.close()
-        shutil.rmtree(workdir, ignore_errors=True)
+            try:
+                cleanup.append(suite.shutdown())
+            except Exception as error:
+                cleanup.append(cleanup_result(FAIL, "cleanup raised: %s" % error))
+        rows = results + cleanup
+        if not verdict_reached:
+            rows.append(Result("run", UNREADABLE, "the run ended before its verdict"))
+        retention = finish_run_root(workdir, rows, opts.keep)
+    cleanup = rows[len(results):]
+    for result in cleanup:
+        print("CHECK %s %s %s" % (result.ident, result.status, result.detail))
+    if report_path is not None:
+        with open(report_path) as handle:
+            report = json.load(handle)
+        report["results"].extend(result.row() for result in cleanup)
+        report.update(retention)
+        with open(report_path, "w") as handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    if any(result.status == FAIL for result in rows):
+        return 1
+    if any(result.status == UNREADABLE for result in rows):
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

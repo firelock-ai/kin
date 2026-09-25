@@ -39,7 +39,8 @@ search.
 ## Requirements
 
 Node 20 or newer for `npx`, and network access on the first run to fetch the Kin release.
-macOS, Linux, and Windows x64 are supported. On Windows, WSL2 is the recommended path.
+macOS and Linux are supported. On Windows, use WSL2: native Windows x64 support is early,
+and review workflows are not yet tested there.
 
 ## Links
 

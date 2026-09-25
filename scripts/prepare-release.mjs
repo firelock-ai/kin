@@ -55,6 +55,29 @@ function replaceSpinePin(manifest, from, to) {
   return manifest.replace(pattern, `$1${to}$2`);
 }
 
+/**
+ * The MCP Registry entry at `to`, or a refusal when it names neither version.
+ *
+ * `server.json` names the release a registry install runs, top-level and per
+ * package, so it moves with every other versioned manifest. It used to be left
+ * behind and stamped only by the publish job, and the checked-in entry said
+ * 0.5.27 for twenty releases after it stopped being true.
+ */
+export function stampServerVersion(server, from, to) {
+  const named = [server.version, ...(server.packages ?? []).map((pkg) => pkg.version)];
+  if (named.every((version) => version === to)) {
+    return server;
+  }
+  if (!named.every((version) => version === from)) {
+    throw new Error(`server.json names ${named.join(', ')}, expected ${from} or ${to}`);
+  }
+  return {
+    ...server,
+    version: to,
+    packages: server.packages.map((pkg) => ({ ...pkg, version: to })),
+  };
+}
+
 export function updateWorkspaceLock(lock, from, to) {
   const chunks = lock.split('[[package]]');
   if (from === to) {
@@ -278,6 +301,13 @@ async function main() {
         `${path} is ${manifest.version}, expected ${workingVersion} or ${target}`,
       );
     }
+  }
+
+  const serverPath = 'server.json';
+  const server = JSON.parse(await fs.readFile(serverPath, 'utf8'));
+  const stamped = stampServerVersion(server, workingVersion, target);
+  if (stamped !== server) {
+    await fs.writeFile(serverPath, `${JSON.stringify(stamped, null, 2)}\n`);
   }
 
   const lockPath = 'Cargo.lock';

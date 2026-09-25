@@ -57,6 +57,19 @@ pub(crate) struct RequestBinding {
     operations_count: usize,
     request: Option<Value>,
     receipt: Option<PublicationProof>,
+    // Omitted for existing v2 records so their integrity digests remain valid.
+    // Refusal retains both the original request and its exact staging snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_refusal: Option<TerminalRefusal>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalRefusal {
+    schema: String,
+    code: String,
+    reason: String,
+    transaction: Option<kin_mcp::McpTransaction>,
 }
 
 /// Fixed-size publication evidence. The full response's changed-file list can
@@ -229,6 +242,23 @@ fn validate_binding(binding: &RequestBinding, expected_key: &str) -> Result<(), 
     } else if binding.receipt.is_none() {
         return Err(recovery("unfinished request is missing its bound payload"));
     }
+    if let Some(refusal) = &binding.terminal_refusal {
+        if refusal.schema != "kin.mutate.refusal.v1"
+            || refusal.code != "semantic_operation_required"
+            || binding.request.is_none()
+            || binding.receipt.is_some()
+            || refusal.transaction.as_ref().is_some_and(|transaction| {
+                transaction.transaction_id != binding.transaction_id
+                    || transaction.session_id != binding.identity.session_id
+                    || !matches!(
+                        transaction.state.as_str(),
+                        "active" | "validated" | "committing" | "aborted"
+                    )
+            })
+        {
+            return Err(recovery("invalid terminal refusal custody"));
+        }
+    }
     Ok(())
 }
 
@@ -321,7 +351,7 @@ fn load_index(state: &DaemonState, index: &mut RequestIndex) -> Result<(), Strin
         {
             return Err(recovery("multiple request records claim one transaction"));
         }
-        let charge = if binding.request.is_some() {
+        let charge = if binding.request.is_some() && binding.terminal_refusal.is_none() {
             MAX_RECORD_BYTES
         } else {
             size
@@ -411,7 +441,7 @@ fn persist(state: &DaemonState, binding: &RequestBinding, completed: bool) -> Re
         if index.records.len() >= limits.records
             || retained_bytes.saturating_add(MAX_RECORD_BYTES) > limits.bytes
         {
-            return Err(format!("request_admission_quota_exceeded: {} retained bindings reserve {retained_bytes} bytes; a pending request reserves {MAX_RECORD_BYTES} bytes until compact receipt persistence. Limits are KIN_MUTATE_MAX_REQUESTS={} and KIN_MUTATE_MAX_STORAGE_BYTES={}. Raise these validated limits to admit new keys; existing keys remain recoverable and must not be deleted to free capacity", index.records.len(), limits.records, limits.bytes));
+            return Err(format!("request_admission_quota_exceeded: {} retained bindings reserve {retained_bytes} bytes; a pending request reserves {MAX_RECORD_BYTES} bytes until terminal record persistence. Limits are KIN_MUTATE_MAX_REQUESTS={} and KIN_MUTATE_MAX_STORAGE_BYTES={}. Raise these validated limits to admit new keys; existing keys remain recoverable and must not be deleted to free capacity", index.records.len(), limits.records, limits.bytes));
         }
     }
     let file = path(state, &record_key);
@@ -451,7 +481,7 @@ fn persist(state: &DaemonState, binding: &RequestBinding, completed: bool) -> Re
         }
         return Err(recovery(error));
     }
-    let charge = if binding.request.is_some() {
+    let charge = if binding.request.is_some() && binding.terminal_refusal.is_none() {
         MAX_RECORD_BYTES
     } else {
         bytes.len() as u64
@@ -634,6 +664,7 @@ fn complete(
     binding: &mut RequestBinding,
     committed: &NativeCommitResult,
     replay: bool,
+    operations: Option<&Value>,
 ) -> Result<kin_mcp::ToolCallResult, String> {
     let original = receipt(binding, committed)?;
     let proof = PublicationProof::from_commit(committed);
@@ -646,16 +677,103 @@ fn complete(
             "cached mutation receipt disagrees with repository authority",
         ));
     }
-    if binding.receipt.is_none() {
+    if binding.receipt.is_none() && binding.terminal_refusal.is_none() {
         binding.receipt = Some(proof);
         binding.request = None;
         persist(state, binding, true)?;
     }
     let mut payload = serde_json::to_value(original).map_err(recovery)?;
     payload["already_applied"] = Value::Bool(replay);
+    payload["publication_accounting"] =
+        crate::publication_accounting::project(committed, operations);
     Ok(kin_mcp::ToolCallResult::text(
         serde_json::to_string(&payload).map_err(recovery)?,
     ))
+}
+
+/// Preserve a permanently refused request before releasing its unfinished slot.
+/// The caller has already checked exact request identity and authoritative receipt
+/// recovery under the coordination lock. Never infer non-publication from the mirror.
+fn refuse_unpublished(
+    state: &Arc<DaemonState>,
+    binding: &mut RequestBinding,
+    reason: Option<String>,
+) -> Result<kin_mcp::ToolCallResult, String> {
+    let transactions =
+        crate::state::load_persisted_mcp_transactions_checked(&state.layout).map_err(recovery)?;
+    let current = transactions.get(&binding.transaction_id).cloned();
+    if binding.terminal_refusal.is_none() {
+        if current.as_ref().is_some_and(|transaction| {
+            transaction.transaction_id != binding.transaction_id
+                || transaction.session_id != binding.identity.session_id
+                || !matches!(
+                    transaction.state.as_str(),
+                    "active" | "validated" | "committing" | "aborted"
+                )
+        }) {
+            return Err(recovery(
+                "unpublished request has contradictory transaction custody",
+            ));
+        }
+        binding.terminal_refusal = Some(TerminalRefusal {
+            schema: "kin.mutate.refusal.v1".into(),
+            code: "semantic_operation_required".into(),
+            reason: reason.ok_or_else(|| recovery("terminal refusal has no reason"))?,
+            transaction: current.clone(),
+        });
+        // A bounded preservation failure leaves the original binding and staging
+        // intact. Never abort first or replace the payload with a summary.
+        persist(state, binding, true)?;
+    }
+    fault(state, 21)?;
+    let refusal = binding
+        .terminal_refusal
+        .as_ref()
+        .expect("refusal persisted");
+    if let Some(current) = current {
+        let original = refusal.transaction.as_ref().ok_or_else(|| {
+            recovery(
+            "staging appeared after terminal refusal; retain both records for explicit recovery")
+        })?;
+        let mut terminal = original.clone();
+        terminal.state = "aborted".into();
+        terminal.staged_operations.clear();
+        terminal.commit_payload_hash = None;
+        let current_value = serde_json::to_value(&current).map_err(recovery)?;
+        if current_value != serde_json::to_value(&terminal).map_err(recovery)? {
+            if current_value != serde_json::to_value(original).map_err(recovery)? {
+                return Err(recovery(
+                    "staging differs from the saved refused transaction; retain both records",
+                ));
+            }
+            // A previous rename may have succeeded while its final directory
+            // sync returned an error. Re-establish custody before discarding
+            // the mirror, including on replay, without rewriting saved bytes.
+            fault(state, 22)?;
+            std::fs::File::open(path(state, &key(&binding.identity)))
+                .and_then(|file| file.sync_all())
+                .map_err(recovery)?;
+            fault(state, 23)?;
+            sync_directory(&directory(state)).map_err(recovery)?;
+            fault(state, 24)?;
+            let sessions = kin_mcp::SessionRegistry::new();
+            sessions.replace_transactions(transactions.into_values().collect());
+            let mut retained = sessions.list_transactions();
+            *retained
+                .iter_mut()
+                .find(|tx| tx.transaction_id == binding.transaction_id)
+                .ok_or_else(|| recovery("refused transaction disappeared"))? = terminal;
+            sessions.replace_transactions(retained);
+            crate::api::persist_mcp_lifecycle_transactions(state, &sessions).map_err(recovery)?;
+        }
+    }
+    Ok(kin_mcp::ToolCallResult::error(serde_json::json!({
+        "schema":"kin.mutate.refusal.v1", "code":refusal.code, "status":"refused", "state":"aborted",
+        "published":false, "request_id":binding.identity.request_id,
+        "transaction_id":binding.transaction_id, "request_hash":binding.request_hash,
+        "reason":refusal.reason, "request_and_staging_preserved":true,
+        "remedy":"This exact request is terminally refused. Its original request and staging remain in the durable request record. Use a fresh request_id for independent semantic work; do not reuse this key with changed arguments."
+    }).to_string()))
 }
 
 async fn execute(state: Arc<DaemonState>, request: PreparedRequest) -> kin_mcp::ToolCallResult {
@@ -700,7 +818,13 @@ fn execute_locked(
             uuid::Uuid::parse_str(&binding.transaction_id).map_err(recovery)?,
         );
         if let Some(committed) = recover_native_commit(&authority, operation).map_err(recovery)? {
-            let result = complete(state, binding, &committed, true)?;
+            let result = complete(
+                state,
+                binding,
+                &committed,
+                true,
+                request.arguments.get("operations"),
+            )?;
             crate::api::forget_mcp_transaction(state, &binding.transaction_id);
             return Ok(result);
         }
@@ -708,6 +832,15 @@ fn execute_locked(
             return Err(recovery(
                 "cached success has no repository operation receipt",
             ));
+        }
+        if binding.terminal_refusal.is_some() {
+            return refuse_unpublished(state, binding, None);
+        }
+        if let Some(operations) = request.arguments.get("operations") {
+            let parsed = kin_mcp::session::parse_staged_operations(operations)?;
+            if let Err(reason) = kin_mcp::session::validate_semantic_operations(&parsed) {
+                return refuse_unpublished(state, binding, Some(reason));
+            }
         }
     }
     validate_request_fields(&request.arguments)?;
@@ -728,11 +861,10 @@ fn execute_locked(
     {
         return Err("request_session_expired: the bound session lease is stale; only an already-published receipt can be recovered".to_string());
     }
-    if !session.capabilities.can_write || !session.capabilities.can_commit {
-        return Err(
-            "request_capability_refused: the registered session requires can_write and can_commit"
-                .to_string(),
-        );
+    if let Some(refusal) =
+        kin_mcp::session::read_only_session_refusal(kin_mcp::session::WriteDoor::Mutate, &session)
+    {
+        return Err(refusal);
     }
     state.coordinator.heartbeat(&session_id).map_err(recovery)?;
     let operations = kin_mcp::handlers::sessions::checked_mutate_operations(&request.arguments)
@@ -775,6 +907,7 @@ fn execute_locked(
         operations_count: parsed.len(),
         request: Some(serde_json::to_value(&request.arguments).expect("serializable request")),
         receipt: None,
+        terminal_refusal: None,
     });
     // Re-sync an existing pending reservation too: it may have been renamed
     // into view by an earlier attempt whose final directory sync failed.
@@ -877,18 +1010,32 @@ fn execute_locked(
                 // Receipt replay reads authority only; a new exact commit
                 // still passes the existing daemon-workspace freshness guard.
                 let original = receipt(&binding, &committed)?;
-                let cache_error = complete(state, &mut binding, &committed, false).err();
+                let cache_error = complete(
+                    state,
+                    &mut binding,
+                    &committed,
+                    false,
+                    request.arguments.get("operations"),
+                )
+                .err();
                 return Ok(kin_mcp::ToolCallResult::error(serde_json::json!({
                     "schema": "kin.mutate.recovery.v1",
                     "code": "publication_completed_daemon_recovery_required",
                     "published": true,
                     "receipt": original,
+                    "publication_accounting": crate::publication_accounting::project(&committed, request.arguments.get("operations")),
                     "finalization_error": result,
                     "receipt_cache_error": cache_error,
                     "remedy": "Reopen the daemon to recover current repository authority. Retry the same session_id, request_id and complete request only to retrieve this original receipt; do not publish a replacement."
                 }).to_string()));
             }
-            let result = complete(state, &mut binding, &committed, false)?;
+            let result = complete(
+                state,
+                &mut binding,
+                &committed,
+                false,
+                request.arguments.get("operations"),
+            )?;
             crate::api::forget_mcp_transaction(state, &binding.transaction_id);
             Ok(result)
         }
@@ -909,8 +1056,112 @@ pub(crate) fn validate_bound_commit(
     if stored.transaction_id != transaction_id
         || stored.request_hash != binding.request_hash
         || stored.receipt.is_some()
+        || stored.terminal_refusal.is_some()
     {
         return Err(recovery("request reservation changed before publication"));
     }
     Ok(())
+}
+
+/// Test-only retained state from the former file-operation request boundary.
+/// Production admission never constructs this obsolete request shape.
+#[cfg(test)]
+pub(crate) fn retain_legacy_request_fixture(
+    state: &DaemonState,
+    arguments: Value,
+    transaction_id: &str,
+) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "X-Kin-Session",
+        arguments["session_id"].as_str().unwrap().parse().unwrap(),
+    );
+    let prepared = prepare(
+        state,
+        &headers,
+        serde_json::from_value(arguments).unwrap(),
+        true,
+    )
+    .unwrap();
+    let operations_count = prepared.arguments["operations"].as_array().unwrap().len();
+    let binding = RequestBinding {
+        schema: SCHEMA.into(),
+        record_digest: String::new(),
+        identity: prepared.identity,
+        workspace_id: prepared.workspace_id,
+        request_hash: prepared.hash,
+        transaction_id: transaction_id.into(),
+        operations_count,
+        request: Some(serde_json::to_value(prepared.arguments).unwrap()),
+        receipt: None,
+        terminal_refusal: None,
+    };
+    persist(state, &binding, false).unwrap();
+}
+
+#[cfg(test)]
+mod keyed_schema_rule_tests {
+    use super::*;
+
+    /// The daemon's half of the conditional `allOf` `kin_mutate`'s schema
+    /// carried until it was flattened: a keyed call takes `scope` absent or
+    /// exactly `repository`, and no field but operations, session_id, scope,
+    /// request_id and summary. Checked the way `prepare` reaches it, after the
+    /// missing scope is defaulted, over the inputs the old `then` clause
+    /// accepted and refused. The session half is the MCP adapter's, and its
+    /// test lives beside it.
+    #[test]
+    fn a_keyed_call_keeps_the_scope_and_fields_the_old_schema_allowed() {
+        let base = || {
+            HashMap::from([
+                ("request_id".to_string(), serde_json::json!("key-1")),
+                (
+                    "session_id".to_string(),
+                    serde_json::json!("11111111-1111-4111-8111-111111111111"),
+                ),
+                ("operations".to_string(), serde_json::json!([])),
+            ])
+        };
+        let checked = |mut arguments: HashMap<String, Value>| {
+            arguments
+                .entry("scope".to_string())
+                .or_insert_with(|| Value::String("repository".to_string()));
+            validate_request_fields(&arguments)
+        };
+        // Accepted by the old schema: scope absent or repository, summary.
+        for (field, value) in [
+            (None, Value::Null),
+            (Some("scope"), serde_json::json!("repository")),
+            (Some("summary"), serde_json::json!("one sentence")),
+        ] {
+            let mut arguments = base();
+            if let Some(field) = field {
+                arguments.insert(field.to_string(), value);
+            }
+            assert!(checked(arguments.clone()).is_ok(), "{arguments:?}");
+        }
+        // Refused by the old schema: any other scope, any other field.
+        for (field, value, code) in [
+            (
+                "scope",
+                serde_json::json!("workspace"),
+                "unsupported_request_scope",
+            ),
+            (
+                "max_chars",
+                serde_json::json!(1000),
+                "unsupported_request_field",
+            ),
+            (
+                "transaction_id",
+                serde_json::json!("t"),
+                "unsupported_request_field",
+            ),
+        ] {
+            let mut arguments = base();
+            arguments.insert(field.to_string(), value);
+            let refusal = checked(arguments.clone()).expect_err(&format!("{arguments:?}"));
+            assert!(refusal.starts_with(code), "{refusal}");
+        }
+    }
 }

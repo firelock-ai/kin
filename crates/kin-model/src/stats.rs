@@ -24,9 +24,14 @@ pub struct GraphStats {
     /// Number of exact entries in the graph-owned working tree.
     pub working_tree_entry_count: usize,
     /// Number of entities currently visible in the committed text index.
-    pub text_indexed_entity_count: usize,
-    /// Text index coverage relative to total entities.
-    pub text_index_coverage_percent: f64,
+    ///
+    /// `None` when the text index cannot answer, which is unavailable and not
+    /// zero: its committed image is on disk but not mapped, and every read of
+    /// it refuses until it maps again.
+    pub text_indexed_entity_count: Option<usize>,
+    /// Text index coverage relative to total entities. `None` exactly when
+    /// `text_indexed_entity_count` is.
+    pub text_index_coverage_percent: Option<f64>,
     /// Number of entities currently present in the vector index.
     pub indexed_embedding_count: usize,
     /// Entities in the graph that carry no vector in the index: exactly

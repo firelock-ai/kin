@@ -2,7 +2,7 @@
   "name": "kin",
   "version": "0.5.27",
   "description": "Kin keeps a living map of the software itself so humans and agents can understand what every change touches. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
-  "contextFileName": "GEMINI.md",
+  "contextFileName": "docs/gemini-extension-context.md",
   "mcpServers": {
     "kin": {
       "command": "npx",

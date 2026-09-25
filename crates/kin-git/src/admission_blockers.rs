@@ -1189,10 +1189,16 @@ mod tests {
                 other.to_str().expect("utf8 test path"),
             ],
         );
+        // A commit made at that detached HEAD is anchored nowhere else.
+        git(
+            &other,
+            &["commit", "--allow-empty", "-m", "anchored only here"],
+        );
 
         let refusal = fixture.refusal();
         assert!(refusal.contains("detached-worktree"), "{refusal}");
         assert!(refusal.contains("detached HEAD"), "{refusal}");
+        assert!(refusal.contains("switch -c"), "{refusal}");
         assert!(refusal.contains("git worktree remove"), "{refusal}");
     }
 

@@ -37,6 +37,7 @@ def wait_ready(port, token, process, deadline, observations):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--daemon', type=pathlib.Path, required=True)
+parser.add_argument('--kin', type=pathlib.Path, required=True)
 parser.add_argument('--fixture', type=pathlib.Path, required=True)
 parser.add_argument('--output', type=pathlib.Path, required=True)
 parser.add_argument('--expect', choices=['recovered', 'broken'], required=True)
@@ -44,8 +45,9 @@ parser.add_argument('--empty-control', action='store_true')
 parser.add_argument('--require-orphan-debt', action='store_true')
 parser.add_argument('--orphan-body')
 args = parser.parse_args()
-daemon, fixture, output = (p.resolve() for p in (args.daemon, args.fixture, args.output))
+daemon, kin, fixture, output = (p.resolve() for p in (args.daemon, args.kin, args.fixture, args.output))
 assert daemon.is_file() and os.access(daemon, os.X_OK)
+assert kin.is_file() and os.access(kin, os.X_OK)
 assert (fixture / '.kin').is_dir() and (fixture / 'orphan.py').is_file()
 assert not (fixture / '.kin/daemon.port').exists(), 'fixture must not have a live endpoint'
 output.mkdir(parents=True, exist_ok=False)
@@ -60,20 +62,38 @@ command = [str(daemon), '--repo', str(fixture), '--port', '0', '--storage', 'loc
 result = {'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
           'command': command, 'fixture': str(fixture), 'expect': args.expect,
           'binary_sha256': hashlib.sha256(daemon.read_bytes()).hexdigest(),
+          'kin_sha256': hashlib.sha256(kin.read_bytes()).hexdigest(),
           'orphan_observations': []}
 print('COMMAND', command, flush=True)
 
-def debt():
+def legacy_debt():
+    # The owed parses an earlier build left beside the store. This build reads
+    # them only as migration input, and removes them once a transaction carries
+    # what they still owe into repository authority.
     marker = fixture / '.kin/semantic-debt.json'
     return json.loads(marker.read_text()) if marker.exists() else []
 
-result['debt_before_start'] = debt()
+def owed():
+    # The owed derivation records repository authority holds, read by the
+    # candidate CLI with no daemon and no admission.
+    completed = subprocess.run([str(kin), 'graph', 'owed', '--json'], cwd=fixture, env=env,
+                               capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, 'kin graph owed refused: ' + completed.stderr
+    ledger = json.loads(completed.stdout)
+    assert ledger['schema'] == 'kin.graph.owed-derivations.v1', 'unexpected owed ledger schema'
+    return [record for workspace in ledger['workspaces'] for record in workspace['records']]
+
+result['debt_before_start'] = legacy_debt()
+result['owed_before_start'] = owed()
 def owes_orphan(entries):
     return any(e['path'] == 'orphan.py' and e['body'] == args.orphan_body for e in entries)
 
 if args.require_orphan_debt:
     assert args.orphan_body and len(args.orphan_body) == 64, 'exact orphan body is required'
-    assert owes_orphan(result['debt_before_start']), 'fixture owes exact orphan semantics'
+    # A first start finds the debt in the earlier build's record; a reopen finds
+    # it in the ledger the first start carried it into.
+    assert (owes_orphan(result['debt_before_start'])
+            or owes_orphan(result['owed_before_start'])), 'fixture owes exact orphan semantics'
     result['expected_orphan_body'] = args.orphan_body
 
 def certified_empty(answer):
@@ -148,7 +168,7 @@ with (output / 'daemon.log').open('w') as log:
             empty = tool('empty.pyi')
             result['legitimate_empty_control'] = empty
             assert certified_empty(empty), 'legitimate empty CAS parse must still certify enumeration'
-        result['debt_before_stop'] = debt()
+        result['debt_before_stop'] = owed()
         if args.require_orphan_debt:
             assert owes_orphan(result['debt_before_stop']), 'uncommitted exact orphan debt was cleared'
         result['verdict'] = 'PASS'
@@ -168,7 +188,7 @@ with (output / 'daemon.log').open('w') as log:
         result['owned_process_exit'] = process.returncode
         if args.require_orphan_debt:
             try:
-                result['debt_after_stop'] = debt()
+                result['debt_after_stop'] = owed()
                 assert owes_orphan(result['debt_after_stop']), 'exact orphan debt lost after stop'
             except Exception as error:
                 result['post_stop_error'] = repr(error)

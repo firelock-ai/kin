@@ -15,7 +15,8 @@ and compatibility boundaries.
 
 ### 1. Install Kin
 
-The primary command, the same on macOS, Linux, Windows and WSL, needing Node.js 20 or newer:
+The primary command on macOS, Linux and WSL2, needing Node.js 20 or newer. Native Windows
+installs with PowerShell instead, as the end of this step says:
 
 ```sh
 npx -y @kinlab/kin setup
@@ -62,8 +63,9 @@ the asset matrix, what to do when a global npm install hits `EACCES`, how the
 Homebrew formula is regenerated from each release rather than hand-maintained,
 and `kin setup uninstall` when you want the integrations gone.
 
-On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
-Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
+On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell. It installs
+the CLI and does not run setup, so it connects no AI clients there.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
 Read [Platform and maturity](#platform-and-maturity) below before choosing a
 Windows install path.
 
@@ -570,13 +572,14 @@ kin agent run --task "Find where the retry backoff is computed and document it" 
 
 What makes it different from pointing another agent at the MCP server is that the
 rule is enforced inside the agent rather than borrowed from a vendor's permission
-layer. It has Kin's tools plus exactly two local ones, `edit_file` and
-`write_file`. There is no shell, no grep and no file-reading tool, so it cannot
-answer a repository question from raw file search, and a tool it invents is
-refused by name. When Kin reports that an empty result cannot be trusted, the
+layer. It has Kin's tools and nothing else: there is no shell, no grep, no
+file-reading tool and no file-writing tool, so it cannot answer a repository
+question from raw file search, and a tool it invents is refused by name. It
+changes code through `kin_mutate`, naming the entity it changes. When Kin reports that an empty result cannot be trusted, the
 agent is told the answer is unknown and given the named gap instead of concluding
-the thing does not exist. Every edit runs inside a Kin transaction under a Kin
-session, so the change carries provenance naming the agent. Run `kin agent doctor
+the thing does not exist. Every change runs under a Kin session, so it carries
+provenance naming the agent. It creates only what `kin_mutate` can create, and
+it says so rather than working around a change it cannot make. Run `kin agent doctor
 --base-url <url>` first to check both halves answer. See
 [the CLI reference](cli-reference.md#kin-agent) for the full surface.
 
@@ -625,7 +628,9 @@ Cline takes the standard entry below rather than a one-liner. Its CLI reads
 `~/.cline/mcp.json`. In the VS Code extension, open the MCP Servers panel, then
 the Configure tab, then Configure MCP Servers, and add the entry there.
 
-Every other client that reads a standard MCP config takes this entry:
+Every other client that reads a standard MCP config takes this entry. Google Antigravity
+is the exception: its entry names one repository with `--repo`, which `kin setup` writes
+for you.
 
 ```json
 {
@@ -644,7 +649,16 @@ working for configurations that already name it; new ones should point at
 
 The wrapper needs Node 20 or newer, and on its first run it downloads the
 matching Kin release, verifies its published SHA-256, and caches the binaries per
-user. Codex CLI wants the same thing as TOML under `[mcp_servers.kin]`.
+user.
+
+Codex CLI reads TOML, and applies its config to every project, so its entry names one
+repository with `--repo`. Use the absolute path of a repository you ran `kin init` in:
+
+```toml
+[mcp_servers.kin]
+command = "npx"
+args = ["-y", "@kinlab/kin", "mcp", "start", "--repo", "/absolute/path/to/repository"]
+```
 
 One caveat worth repeating: these tools answer from the graph, so the repository
 has to be admitted with `kin init .` and embedded with `kin embed` before
@@ -682,7 +696,7 @@ boundaries:
 | --- | --- | --- |
 | macOS, Apple Silicon and Intel | Native graph, vector, daemon, setup, MCP, and review surfaces ship in the release archive. | Shipped and exercised on both architectures. It uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
 | Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. | The public VFS executable and shim are GNU/glibc builds, not musl builds. They are built against a pinned glibc floor of 2.31 and link OpenSSL 3, so a projection host needs both; Debian 12 loads them, and Alpine and other musl distributions are not supported projection hosts. The release refuses to publish a Linux archive whose binaries ask for more glibc than that floor. The arm64 release proof runs on Ubuntu 24.04. |
-| Native Windows x86_64 | Early support: repositories admit and graph and lexical queries answer natively, but MCP and review workflows are not yet covered end to end by the install proof. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+| Native Windows x86_64 | Early support: repositories admit, graph and lexical queries answer natively, and the install proof runs agent setup and graph-backed MCP tool calls there, but review workflows are not yet tested on Windows. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
 
 The graph is the authority in every case above. The shim, an NFS mount, a FUSE
 mount, and Windows ProjFS are four ways to see that truth as files, and Kin

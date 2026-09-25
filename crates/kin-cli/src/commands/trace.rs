@@ -847,6 +847,9 @@ fn render_entity_source(
     max_lines: usize,
     max_chars: usize,
 ) -> Result<Option<String>> {
+    if kin_model::is_derived_member(entity) {
+        return Ok(None);
+    }
     let Some(span) = entity.span.as_ref() else {
         return Ok(None);
     };
@@ -1099,6 +1102,16 @@ fn resolve_trace_target(
             lines: trace_not_found_guidance(entity),
         }));
     }
+    // The member rule every surface shares: with no entity named it exactly, a
+    // bare name that owners carry as their member name reaches those members
+    // rather than every name it occurs in, so `kin trace get` and
+    // `get_entity_source` meet the same candidates. An exact name is never
+    // pooled with them.
+    let (matches, by_member) = match kin_ranking::entity_ranking::reach_by_name(graph, entity)? {
+        kin_ranking::entity_ranking::NameReach::Members(members) => (members, true),
+        kin_ranking::entity_ranking::NameReach::Exact(_)
+        | kin_ranking::entity_ranking::NameReach::Neither => (matches, false),
+    };
 
     let name_candidates = matches.clone();
     let mut candidates = matches;
@@ -1110,6 +1123,17 @@ fn resolve_trace_target(
                 entity,
                 &qualifiers.labels(),
                 &name_candidates,
+            ),
+        }));
+    }
+    // Several owners' members answer to the name and nothing pinned one, so a
+    // trace of one of them would be a choice the caller never made.
+    if by_member && candidates.len() > 1 {
+        return Err(anyhow::Error::new(TraceMiss {
+            lines: crate::entity_identity::name_candidate_lines(
+                entity,
+                kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                &candidates,
             ),
         }));
     }
@@ -1449,6 +1473,22 @@ mod tests {
         assert_eq!(
             response.entities[0].file, "src/buffer.c",
             "the definition must be ranked first, not the header's declaration"
+        );
+    }
+
+    #[test]
+    fn derived_member_trace_never_reads_a_legacy_span_as_a_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(temp.path().to_path_buf());
+        let binding = absent_binding(&layout);
+        let mut entity = buffer_grow_twin("members.js", "app.get()", 0);
+        entity.doc_summary =
+            Some("Derived from a loop over `names`; no literal `get` declaration".into());
+        let graph = InMemoryGraph::new();
+        assert!(
+            super::render_entity_source(&binding, &graph, &entity, 20, 2400)
+                .unwrap()
+                .is_none()
         );
     }
 

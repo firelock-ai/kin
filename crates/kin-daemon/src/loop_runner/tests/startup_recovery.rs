@@ -1,7 +1,7 @@
 fn startup_diagnostic_trace(stage: &str, state: &DaemonState) {
     let file_id = FilePathId::new("orphan.py");
     let layout = state.graph.get_file_layout(&file_id).unwrap();
-    let marker = std::fs::read(unpublished_enrichment_marker_path(state))
+    let marker = std::fs::read(state.layout.root().join("unpublished-enrichment.json"))
         .ok()
         .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
     println!(
@@ -25,8 +25,8 @@ async fn startup_diagnostic_query(state: Arc<DaemonState>) -> serde_json::Value 
         .header("content-type", "application/json")
         .body(axum::body::Body::from(
             serde_json::json!({
-                "name": "list_file_entities",
-                "arguments": {"path": "orphan.py"}
+                "name": "semantic_search",
+                "arguments": {"query": "orphan"}
             })
             .to_string(),
         ))
@@ -59,7 +59,10 @@ fn startup_diagnostic_admit_without_consuming_semantics(state: &Arc<DaemonState>
         matches!(&admitted.semantic_events[0], FileEvent::Changed(path) if path.ends_with("orphan.py"))
     );
     assert_eq!(state.graph.entity_count(), 0);
-    assert!(!unpublished_enrichment_marker_path(state).exists());
+    assert!(
+        !state.layout.root().join("unpublished-enrichment.json").exists(),
+        "this build writes no enrichment marker"
+    );
     crate::background_work::record_durable_admission(
         &state.layout,
         state.graph.resolved_tree().len() as u64,
@@ -87,12 +90,30 @@ fn startup_diagnostic_admit_without_consuming_semantics(state: &Arc<DaemonState>
     parsed.entities.len()
 }
 
+/// [`startup_diagnostic_admit_without_consuming_semantics`] as a build from
+/// before the owed derivation ledger performed it: the publication records
+/// nothing in authority.
+fn startup_diagnostic_admit_as_a_legacy_build(state: &Arc<DaemonState>) -> usize {
+    crate::semantic_debt::recording_nothing(|| {
+        startup_diagnostic_admit_without_consuming_semantics(state)
+    })
+}
+
+/// Leave the record an earlier build's daemon kept of the paths it derived
+/// entities for, in the form that build wrote it.
+fn startup_diagnostic_write_legacy_marker(state: &DaemonState, paths: &[&str]) {
+    std::fs::write(
+        state.layout.root().join("unpublished-enrichment.json"),
+        serde_json::to_vec(paths).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn startup_diagnostic_admission_gap_must_schedule_recovery_after_reopen() {
     let repo = tempfile::tempdir().unwrap();
     let state = open_test_state(&repo);
-    let fresh_count = startup_diagnostic_admit_without_consuming_semantics(&state);
-    startup_diagnostic_legacy_without_debt(&state);
+    let fresh_count = startup_diagnostic_admit_as_a_legacy_build(&state);
     drop(state);
     let restarted =
         Arc::new(DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap());
@@ -108,7 +129,11 @@ fn startup_diagnostic_admission_gap_must_schedule_recovery_after_reopen() {
             .unwrap()
             .is_empty()
     );
-    let marker_repair = plan_unpublished_enrichment_repair(&restarted).unwrap();
+    let marker_repair = plan_unpublished_enrichment_repair(
+        &restarted,
+        &crate::semantic_debt::read_legacy_enrichment(&restarted),
+    )
+    .unwrap();
     let layout_repair = backfill_missing_file_layouts(&restarted).unwrap();
     startup_diagnostic_trace("after_both_startup_repair_planners", &restarted);
     println!(
@@ -132,16 +157,19 @@ fn startup_diagnostic_admission_gap_must_schedule_recovery_after_reopen() {
 fn startup_diagnostic_marker_positive_control_recovers_the_known_function() {
     let repo = tempfile::tempdir().unwrap();
     let state = open_test_state(&repo);
-    startup_diagnostic_admit_without_consuming_semantics(&state);
-    startup_diagnostic_legacy_without_debt(&state);
-    mark_enrichment_unpublished(&state, &FilePathId::new("orphan.py"));
+    startup_diagnostic_admit_as_a_legacy_build(&state);
+    startup_diagnostic_write_legacy_marker(&state, &["orphan.py"]);
     drop(state);
     let restarted =
         Arc::new(DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap());
     startup_diagnostic_trace("marked_reopen_before_planning", &restarted);
-    let repair = plan_unpublished_enrichment_repair(&restarted).unwrap();
+    let repair = plan_unpublished_enrichment_repair(
+        &restarted,
+        &crate::semantic_debt::read_legacy_enrichment(&restarted),
+    )
+    .unwrap();
     assert_eq!(repair.len(), 1);
-    assert_eq!(repair[0].as_utf8(), Some("orphan.py"));
+    assert_eq!(repair[0].0.as_utf8(), Some("orphan.py"));
     derive_semantics(&restarted, "orphan.py");
     startup_diagnostic_trace("marked_positive_control_after_real_reconcile", &restarted);
     assert!(restarted
@@ -157,9 +185,8 @@ fn startup_diagnostic_marker_positive_control_recovers_the_known_function() {
 async fn startup_diagnostic_watch_arms_before_marked_repair_is_live() {
     let repo = tempfile::tempdir().unwrap();
     let first = open_test_state(&repo);
-    startup_diagnostic_admit_without_consuming_semantics(&first);
-    startup_diagnostic_legacy_without_debt(&first);
-    mark_enrichment_unpublished(&first, &FilePathId::new("orphan.py"));
+    startup_diagnostic_admit_as_a_legacy_build(&first);
+    startup_diagnostic_write_legacy_marker(&first, &["orphan.py"]);
     drop(first);
     let state =
         Arc::new(DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap());
@@ -191,6 +218,7 @@ async fn startup_diagnostic_watch_arms_before_marked_repair_is_live() {
             "response": query_at_arm.as_ref().ok(),
         })
     );
+    let coverage_at_arm = file_coverage(&state, "orphan.py");
     drop(held_gate);
 
     let recovered = tokio::time::timeout(Duration::from_secs(15), async {
@@ -224,9 +252,9 @@ async fn startup_diagnostic_watch_arms_before_marked_repair_is_live() {
     assert_eq!(live_at_arm, 0);
     assert_eq!(durable_at_arm, Some(0));
     let answer = query_at_arm.expect("HTTP query must complete while the startup gate is held");
-    assert!(answer["entities"].as_array().unwrap().is_empty());
+    assert!(answer["results"].as_array().unwrap().is_empty());
     assert_eq!(
-        answer["file_coverage"]["certifies_enumeration"],
+        coverage_at_arm["certifies_enumeration"],
         serde_json::json!(false)
     );
     recovered.expect("releasing the gate must let the real startup loop recover the function");
@@ -238,8 +266,7 @@ async fn startup_diagnostic_watch_arms_before_marked_repair_is_live() {
 async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
     let repo = tempfile::tempdir().unwrap();
     let first = open_test_state(&repo);
-    startup_diagnostic_admit_without_consuming_semantics(&first);
-    startup_diagnostic_legacy_without_debt(&first);
+    startup_diagnostic_admit_as_a_legacy_build(&first);
     drop(first);
     let state =
         Arc::new(DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap());
@@ -249,7 +276,7 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
         .is_some());
     assert_eq!(state.graph.entity_count(), 0);
     assert_eq!(state.durable_entity_count(), Some(0));
-    assert!(!unpublished_enrichment_marker_path(&state).exists());
+    assert!(!state.layout.root().join("unpublished-enrichment.json").exists());
     assert!(crate::semantic_debt::outstanding(&state).is_empty());
     assert!(
         plan_catch_up_events(&state, startup_catch_up_window(&state).unwrap())
@@ -338,30 +365,20 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
         })
     );
     assert!(
-        !answer["entities"].as_array().unwrap().is_empty()
-            || answer["file_coverage"]["certifies_enumeration"] != serde_json::json!(true),
+        !answer["results"].as_array().unwrap().is_empty()
+            || answer["source_derivation"]["report"]["body_binding"] != "current",
         "the full startup loop must not certify an empty enumeration for a known admitted function"
     );
     completed.expect("the full loop must recover the known function from its startup queue");
-    assert!(answer["entities"]
+    assert!(answer["results"]
         .as_array()
         .unwrap()
         .iter()
         .any(|entity| entity["name"] == "orphan"));
     assert_eq!(
-        answer["file_coverage"]["certifies_enumeration"],
+        file_coverage(&state, "orphan.py")["certifies_enumeration"],
         serde_json::json!(true)
     );
-}
-
-fn startup_diagnostic_legacy_without_debt(state: &DaemonState) {
-    // Older admissions left no recovery record. Reproduce that retained-store
-    // state independently of the admission path's current recording behavior.
-    match std::fs::remove_file(state.layout.root().join("semantic-debt.json")) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("cannot prepare legacy recovery fixture: {error}"),
-    }
 }
 
 #[test]
@@ -373,7 +390,7 @@ fn startup_diagnostic_standalone_admission_retains_exact_body_debt() {
         2
     );
     let recorded = crate::semantic_debt::outstanding(&state);
-    let (owed, _) = crate::semantic_debt::partition_against_tree(&state, &recorded);
+    let owed = crate::semantic_debt::owed_against_tree(&state, &recorded);
     assert!(
         owed.contains(&test_repo_path("orphan.py")),
         "published source must retain exact-body recovery debt: {recorded:?}"
@@ -381,7 +398,7 @@ fn startup_diagnostic_standalone_admission_retains_exact_body_debt() {
     drop(state);
     let restarted =
         Arc::new(DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap());
-    let (owed, _) = crate::semantic_debt::partition_against_tree(
+    let owed = crate::semantic_debt::owed_against_tree(
         &restarted,
         &crate::semantic_debt::outstanding(&restarted),
     );
@@ -391,11 +408,18 @@ fn startup_diagnostic_standalone_admission_retains_exact_body_debt() {
     );
 }
 
+/// A publication records what it owes in authority, not beside the store, so
+/// the paths an earlier build's records occupied can hold anything and the
+/// publication still lands.
+///
+/// The build before the ledger wrote its record ahead of the publication and
+/// refused the publication when that write failed, which is what the two
+/// directories below used to provoke. Falsify by writing either record file
+/// anywhere on the publication path: the publication refuses.
 #[test]
-fn startup_diagnostic_unwritable_debt_refuses_before_authority_moves() {
+fn startup_diagnostic_a_publication_records_its_debt_in_authority_not_beside_it() {
     let repo = tempfile::tempdir().unwrap();
     let state = open_test_state(&repo);
-    let before = authority_tree(&state);
     let generation = authority_generation(&state);
     std::fs::write(
         repo.path().join("orphan.py"),
@@ -403,148 +427,72 @@ fn startup_diagnostic_unwritable_debt_refuses_before_authority_moves() {
     )
     .unwrap();
     std::fs::create_dir(state.layout.root().join("semantic-debt.json")).unwrap();
+    std::fs::create_dir(state.layout.root().join("unpublished-enrichment.json")).unwrap();
     let observation = BTreeSet::from([test_repo_path("orphan.py")]);
-    let result = exact_tree_admission(&state, Some(&observation), TreePublication::Standalone);
-    assert!(
-        result.is_err(),
-        "admission must refuse when its recovery record cannot be prepared"
-    );
-    assert_eq!(
-        authority_tree(&state),
-        before,
-        "failed recovery recording must not move repository authority"
-    );
-    assert_eq!(authority_generation(&state), generation);
-    assert!(state.layout.root().join("semantic-debt.json").is_dir());
-    assert_eq!(
-        std::fs::read(repo.path().join("orphan.py")).unwrap(),
-        b"def orphan():\n    return 7\n"
-    );
-    assert!(state
-        .graph
-        .artifact_id_at_path(&test_repo_path("orphan.py"))
-        .is_none());
-}
-
-#[tokio::test]
-async fn startup_diagnostic_spent_proposal_does_not_settle_older_owed_body() {
-    let repo = tempfile::tempdir().unwrap();
-    let state = open_test_state(&repo);
-    startup_diagnostic_admit_without_consuming_semantics(&state);
-    let hash = state
+    exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
+    assert!(authority_generation(&state) > generation, "the publication lands");
+    let body = state
         .graph
         .get_tree_entry(&FilePathId::new("orphan.py"))
         .unwrap()
         .unwrap()
         .blob_identity()
-        .unwrap();
-    let old = crate::semantic_debt::SemanticDebt {
-        path: "orphan.py".into(),
-        body: hash.to_string(),
-    };
-    let proposed = crate::semantic_debt::SemanticDebt {
-        path: "orphan.py".into(),
-        body: "0".repeat(64),
-    };
-    assert_ne!(old.body, proposed.body);
-    crate::semantic_debt::record(&state, &[old.clone(), proposed]);
-    assert_eq!(crate::semantic_debt::outstanding(&state).len(), 2);
-    drain_semantic_debt(&state).await.unwrap();
-    assert!(state
-        .graph
-        .query_entities(&EntityFilter::default())
         .unwrap()
-        .iter()
-        .any(|entity| entity.name == "orphan"));
+        .to_string();
+    let recorded = crate::semantic_debt::outstanding(&state);
     assert!(
-        crate::semantic_debt::outstanding(&state).contains(&old),
-        "a spent proposal must not erase the debt whose current-body parse is still not durable"
+        recorded
+            .iter()
+            .any(|debt| debt.path == "orphan.py" && debt.body == body),
+        "the publication records the parse it owes in authority: {recorded:?}"
     );
+    assert!(state.layout.root().join("semantic-debt.json").is_dir());
+    assert!(state
+        .layout
+        .root()
+        .join("unpublished-enrichment.json")
+        .is_dir());
 }
 
+/// An earlier build's owed-parse record that will not read stops no
+/// publication, and the start that meets it treats it as owing every source
+/// body the graph holds no parse certificate for.
+///
+/// This build never writes that record, so a publication leaves it exactly as
+/// it found it, and only the migration boundary at a daemon start reads it.
+/// Falsify by reading a record that will not read as an empty one: nothing is
+/// owed, and whatever work it held is dropped.
 #[test]
-fn startup_diagnostic_corrupt_debt_is_preserved_before_publication() {
+fn startup_diagnostic_a_corrupt_legacy_record_owes_every_uncertified_source() {
     let repo = tempfile::tempdir().unwrap();
     let state = open_test_state(&repo);
-    let before = authority_tree(&state);
     let generation = authority_generation(&state);
     let marker = state.layout.root().join("semantic-debt.json");
     let corrupt = b"[{unknown recovery work";
     std::fs::write(&marker, corrupt).unwrap();
-    std::fs::write(
-        repo.path().join("orphan.py"),
-        b"def orphan():\n    return 7\n",
-    )
-    .unwrap();
-    let observation = BTreeSet::from([test_repo_path("orphan.py")]);
-    assert!(exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).is_err());
-    assert_eq!(authority_tree(&state), before);
-    assert_eq!(authority_generation(&state), generation);
-    assert_eq!(std::fs::read(marker).unwrap(), corrupt);
-    assert_eq!(
-        std::fs::read(repo.path().join("orphan.py")).unwrap(),
-        b"def orphan():\n    return 7\n"
-    );
-}
-
-#[test]
-fn startup_diagnostic_prepublication_keeps_current_and_proposed_bodies() {
-    let repo = tempfile::tempdir().unwrap();
-    let state = open_test_state(&repo);
-    startup_diagnostic_admit_without_consuming_semantics(&state);
-    let old = crate::semantic_debt::outstanding(&state)
-        .into_iter()
-        .find(|entry| entry.path == "orphan.py")
-        .unwrap();
-    let unrelated = crate::semantic_debt::SemanticDebt {
-        path: "other.py".into(),
-        body: "1".repeat(64),
-    };
-    crate::semantic_debt::record(&state, std::slice::from_ref(&unrelated));
-    let proposed = crate::semantic_debt::SemanticDebt {
-        path: "orphan.py".into(),
-        body: "0".repeat(64),
-    };
-    assert_ne!(old.body, proposed.body);
-    let concurrent = crate::semantic_debt::SemanticDebt {
-        path: "orphan.py".into(),
-        body: "2".repeat(64),
-    };
-    let mut outstanding = crate::semantic_debt::outstanding(&state);
-    outstanding.push(concurrent.clone());
-    std::fs::write(
-        state.layout.root().join("semantic-debt.json"),
-        serde_json::to_vec(&outstanding).unwrap(),
-    )
-    .unwrap();
-    let generation = authority_generation(&state);
-    crate::semantic_debt::record_before_standalone_publication(
-        &state,
-        std::slice::from_ref(&proposed),
-    )
-    .unwrap();
-    let recorded = crate::semantic_debt::outstanding(&state);
+    startup_diagnostic_admit_as_a_legacy_build(&state);
     assert!(
-        recorded.contains(&old),
-        "preparing a new body must retain the currently owed body"
+        authority_generation(&state) > generation,
+        "the record stops no publication"
     );
-    assert!(recorded.contains(&proposed));
-    assert!(recorded.contains(&unrelated));
-    assert!(
-        recorded.contains(&concurrent),
-        "prepublication must retain a body a concurrent publication could make authoritative"
-    );
-    assert_eq!(recorded.len(), 4);
-    assert_eq!(authority_generation(&state), generation);
-    crate::semantic_debt::record_before_standalone_publication(
-        &state,
-        std::slice::from_ref(&proposed),
-    )
-    .unwrap();
     assert_eq!(
-        crate::semantic_debt::outstanding(&state),
-        recorded,
-        "preparing the same body must not duplicate debt"
+        std::fs::read(&marker).unwrap(),
+        corrupt,
+        "and nothing this build does rewrites it"
+    );
+    drop(state);
+    let restarted =
+        Arc::new(DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap());
+    let record = crate::semantic_debt::read_legacy_debt(&restarted);
+    assert!(matches!(
+        record,
+        crate::semantic_debt::LegacyRecord::Unknown(_)
+    ));
+    let owed = crate::semantic_debt::judge_legacy_debt(&restarted, &record);
+    assert!(
+        owed.iter()
+            .any(|(path, _)| path.as_utf8() == Some("orphan.py")),
+        "a record that will not read owes every source body no parse answers for: {owed:?}"
     );
 }
 
@@ -748,45 +696,12 @@ async fn startup_diagnostic_refused_commit_retains_fallback_debt_and_recovers_af
         .any(|entry| entry.path == "orphan.py" && entry.body == body);
     println!(
         "STARTUP_FALLBACK {}",
-        serde_json::json!({"before": before, "after": after, "expected": original_line + 17, "debt": recorded})
+        serde_json::json!({"before": before, "after": after, "expected": original_line + 17, "debt": format!("{recorded:?}")})
     );
     assert_eq!(
         (owes_exact_body, after),
         (true, original_line + 17),
         "a successful fallback must retain and recover its exact uncommitted parse"
-    );
-}
-
-#[tokio::test]
-#[serial_test::serial(commit_phase_capture)]
-async fn startup_diagnostic_refused_commit_resets_when_fallback_debt_cannot_be_written() {
-    let repo = tempfile::tempdir().unwrap();
-    let state = startup_diagnostic_committed_orphan(&repo).await;
-    let previous = authority_tree(&state);
-    let generation = authority_generation(&state);
-    startup_diagnostic_lease_orphan(&state);
-    let content = b"\n\ndef orphan():\n    return 8\n";
-    std::fs::write(repo.path().join("orphan.py"), content).unwrap();
-    let marker = state.layout.root().join("semantic-debt.json");
-    std::fs::create_dir(&marker).unwrap();
-    let (status, refusal) = startup_diagnostic_commit(&state).await;
-    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refusal}");
-    assert!(refusal.contains("semantics_behind_tree"), "{refusal}");
-    assert_eq!(
-        authority_generation(&state),
-        generation,
-        "unrecorded fallback bytes must not reach authority"
-    );
-    assert_eq!(authority_tree(&state), previous);
-    assert_eq!(
-        state.graph.resolved_tree(),
-        previous,
-        "the refused fallback must reset the derived tree"
-    );
-    assert!(marker.is_dir());
-    assert_eq!(
-        std::fs::read(repo.path().join("orphan.py")).unwrap(),
-        content
     );
 }
 
@@ -825,7 +740,7 @@ async fn startup_diagnostic_deferred_drain_keeps_the_previous_authority_body_owe
 
 #[tokio::test]
 #[serial_test::serial(commit_phase_capture)]
-async fn startup_diagnostic_refused_publication_retains_both_bodies() {
+async fn startup_diagnostic_a_refused_publication_records_nothing() {
     let repo = tempfile::tempdir().unwrap();
     let state = startup_diagnostic_committed_orphan(&repo).await;
     let canonical_body = b"\ndef orphan():\n    return 8\n";
@@ -873,8 +788,9 @@ async fn startup_diagnostic_refused_publication_retains_both_bodies() {
     assert_eq!(state.graph.resolved_tree(), previous);
     let recorded = crate::semantic_debt::outstanding(&state);
     assert!(
-        recorded.contains(&old) && recorded.contains(&proposed),
-        "a refused publication retains both authority and proposed debt: {recorded:?}"
+        recorded.contains(&old) && !recorded.contains(&proposed),
+        "a refused publication records nothing, and the record authority already held \
+         stands: {recorded:?}"
     );
     // Canonical repair does not re-admit the host proposal. It may settle live
     // spans against authority while both proposed files remain refused on disk.
@@ -1072,28 +988,6 @@ async fn startup_diagnostic_purge_records_changed_body_for_reopen() {
     );
 }
 
-#[tokio::test]
-#[serial_test::serial(commit_phase_capture)]
-async fn startup_diagnostic_purge_refuses_unrecorded_changed_body() {
-    let repo = tempfile::tempdir().unwrap();
-    let state = startup_diagnostic_purge_fixture(&repo).await;
-    let previous = authority_tree(&state);
-    let generation = authority_generation(&state);
-    let marker = state.layout.root().join("semantic-debt.json");
-    assert!(!marker.exists());
-    std::fs::create_dir(&marker).unwrap();
-    let (status, body) = startup_diagnostic_purge(&state).await;
-    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        authority_generation(&state),
-        generation,
-        "purge cannot publish a changed body without durable recovery debt"
-    );
-    assert_eq!(authority_tree(&state), previous);
-    assert_eq!(state.graph.resolved_tree(), previous);
-    assert!(marker.is_dir());
-}
-
 /// A standalone publication owes a parse only for the paths that have one.
 ///
 /// #1626 began recording semantic debt at `publish_exact_workspace_tree`, the
@@ -1179,11 +1073,12 @@ async fn a_standalone_publication_owes_no_parse_for_a_non_source_artifact() {
          keys and this test asserts nothing"
     );
 
-    let recorded = crate::semantic_debt::outstanding(&state);
-    let (owed, _spent) = crate::semantic_debt::partition_against_tree(&state, &recorded);
-    let owed_paths: BTreeSet<String> = owed
-        .iter()
-        .filter_map(|path| path.as_utf8().map(|path| path.to_string()))
+    // Read off the record itself. The sync above parsed the source file into
+    // the live graph, so the planners no longer count it as owed there, and
+    // what this test grades is which paths the publication recorded.
+    let owed_paths: BTreeSet<String> = crate::semantic_debt::outstanding(&state)
+        .into_iter()
+        .map(|entry| entry.path)
         .collect();
     assert!(
         owed_paths.contains("probe.py"),
