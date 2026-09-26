@@ -36,6 +36,10 @@ pub use kin_model::{
     EntityDelta, ExternalReference, ExternalReferenceDelta, LocatedEntry, RelationDelta,
     SemanticChange, TransactionDelta, TreeDelta,
 };
+pub use kin_model::{
+    ResolutionRecord, ResolutionRecordDelta, ResolutionRecordId, ResolutionRecordPlan,
+    ResolutionRecordSet,
+};
 
 // Graph query types
 pub use kin_model::{EntityFilter, SubGraph};

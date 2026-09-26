@@ -469,7 +469,15 @@ body. Use it when you already hold an entity ID (typically from semantic_search 
 graph traversal) and want the authoritative facts about that declaration without \
 pulling in its implementation. It is the lightweight counterpart to get_entity_source: \
 reach for get_entity when you only need to confirm what/where a symbol is, and \
-get_entity_source when you actually need to read the code.";
+get_entity_source when you actually need to read the code. An id of the form \
+`external_reference:<uuid>` names a symbol outside the repository, such as `Array.map` in \
+TypeScript's own library, and the answer is its record: `kind: \"external_symbol\"`, \
+`name`, `package` (manager, name and version), `stdlib`, `symbol` (its SCIP descriptor \
+chain) and `caller_count`. No path or line of that declaration is served, because none is \
+recorded. An entity whose calls a language server proved into such symbols also carries \
+`external_calls`, one row per target with `site_state: \"proven_external\"`, a `proof` \
+naming the resolver and proof context, and `sites`, each a `line_in_entity` counted from 0 \
+at the entity's first line with the `callee` text found there.";
 
 pub fn handle_get_entity<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -477,11 +485,27 @@ pub fn handle_get_entity<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
+    // A symbol outside the repository is addressed as `external_reference:<uuid>`,
+    // the spelling every answer that names one emits.
+    if let Some(node) = super::external_symbols::lookup_external_symbol(store, &id_str)? {
+        let value = super::external_symbols::external_symbol_record_json(store, &node)?;
+        let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
+        return Ok(ToolCallResult::text(json));
+    }
+    if super::external_symbols::is_external_address(&id_str) {
+        return Ok(super::external_symbols::external_symbol_not_found(&id_str));
+    }
     let entity_id = parse_entity_id(&id_str)?;
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let value = entity_response_json(store, &entity, repository_authority)?;
+            let mut value = entity_response_json(store, &entity, repository_authority)?;
+            // Calls a language server proved into packages outside the
+            // repository. Read after the entity's own source excerpt, since the
+            // excerpt reports what it read through state a body read shares.
+            let held = HeldSourceAuthority::new(store, repository_authority);
+            let text = super::external_symbols::CalleeText::new(&held);
+            super::external_symbols::attach_external_calls(store, &entity, &text, &mut value)?;
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
@@ -504,7 +528,10 @@ name, or one owner's member when nothing is named exactly (`get` for the method 
 the focal entity's body, so it is the most economical way to inspect a single function/method/class; when you also need \
 the surrounding callers, callees, and imports, use get_context_pack or trace_data_flow \
 instead so you don't have to call this repeatedly. Derived candidates have no independent \
-body or edit base; their validated shared generator is returned separately as generator_source.";
+body or edit base; their validated shared generator is returned separately as generator_source. \
+A symbol outside the repository (`external_reference:<uuid>`) has no source in this graph, so \
+the call is refused with the error code `external_symbol_has_no_repository_source` and \
+nothing is read; find_references lists its callers.";
 
 pub const GET_ENTITY_BODY_DESC: &str = "\
 Alias for get_entity_source — same behavior and return shape. Provided so that whichever \
@@ -518,6 +545,11 @@ pub fn handle_get_entity_source<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
+    // A symbol outside the repository has no source here to serve, and it is
+    // never looked for anywhere else: the refusal says what the graph does hold.
+    if let Some(node) = super::external_symbols::lookup_external_symbol(store, &id_str)? {
+        return Ok(super::external_symbols::external_source_refusal(&node));
+    }
     // An id is the exact address. A name is accepted the way the daemon's route
     // and `kin graph source` accept one, through the strict rule every source
     // path shares: one exact name, or one owner's member when nothing is named
@@ -911,10 +943,18 @@ pub fn assemble_entity_sources_response(
                 }));
             }
             ResolvedEntitySource::NoSource { id, message } => {
+                // A symbol outside the repository is refused by its own code on
+                // every route, the daemon's included, which carries the refusal
+                // as a source outcome's message.
+                let (reason, message) =
+                    match super::external_symbols::external_source_refusal_parts(&message) {
+                        Some((code, sentence)) => (code, sentence),
+                        None => ("no_source".to_string(), message),
+                    };
                 results.push(serde_json::json!({
                     "id": id,
                     "omitted": true,
-                    "reason": "no_source",
+                    "reason": reason,
                     "message": message,
                 }));
             }
@@ -965,6 +1005,21 @@ fn resolve_entity_source_generic<G: GraphStore>(
     id: &str,
 ) -> ResolvedEntitySource {
     let store = held.store();
+    match super::external_symbols::lookup_external_symbol(store, id) {
+        Ok(Some(node)) => {
+            return ResolvedEntitySource::NoSource {
+                id: id.to_string(),
+                message: super::external_symbols::external_source_refusal_text(&node),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return ResolvedEntitySource::NoSource {
+                id: id.to_string(),
+                message: format!("graph read failed: {error}"),
+            };
+        }
+    }
     let entity_id = match parse_entity_id(id) {
         Ok(entity_id) => entity_id,
         // A name reads the way the single tool and the daemon's batch read it:
@@ -1152,8 +1207,30 @@ contributed; `routes`, the entities between each connected pair; `route_search.b
 true when a search stopped at its bound so an absent route is not evidence there is none; \
 and `measured_tokens`, what the rendered pack costs, which is never above `token_budget` \
 because rows are dropped until it is not. \
+`external_calls` lists the calls a focal makes into packages outside the repository that a \
+language server proved, each with the symbol's record, `site_state`, `proof` and `sites`, \
+and `caller_id` naming the focal in a pack built from several; `dependencies` holds only \
+repository entities. \
+`call_sites` reads the focal's own call sites from its call-site ledger: one row per site \
+with `line_in_entity`, the `callee` text cut from the focal's own body, its `state` \
+(`proven_target`, `proven_external`, `proven_outside`, `proven_declaration`, `binding`, \
+`not_in_build`, `server_failed` or `unresolved`), the `reason` behind an unsettled state and \
+the proven `target` id, beside the counts by state, a `reading` of `owed_enrichment` while no \
+ledger describes the focal yet, and the `clauses` the verdict reads. A site that is not \
+settled makes the answer inconclusive. A pack built from several focals carries the counts \
+without rows. \
 If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
+
+/// Why a context pack cannot be built around a symbol outside the repository,
+/// in the words that finish its refusal.
+const CONTEXT_PACK_EXTERNAL_WHY: &str =
+    "has no body or neighborhood of its own here to build a pack around";
+
+/// Why a data-flow walk cannot start from a symbol outside the repository.
+/// Public so the walk the daemon serves refuses in the same bytes.
+pub const TRACE_EXTERNAL_WHY: &str = "has no body or edges of its own here to start a walk from, \
+     and a walk from one of its callers reaches it as a leaf step";
 
 pub fn handle_get_context_pack<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -1191,6 +1268,17 @@ pub fn handle_get_context_pack<G: GraphStore>(
     }
 
     let id_str = get_string_param(args, "entity_id")?;
+    // A symbol outside the repository has no body or neighborhood of its own
+    // in this graph; what the graph holds about it is its record and callers.
+    if let Some(node) = super::external_symbols::lookup_external_symbol(store, &id_str)? {
+        return super::external_symbols::external_not_served(
+            store,
+            &node,
+            "get_context_pack",
+            "entity_id",
+            CONTEXT_PACK_EXTERNAL_WHY,
+        );
+    }
     let entity_id = parse_entity_id(&id_str)?;
     let depth = get_optional_u64(args, "depth", 2) as u32;
     let include_traffic = get_optional_bool(args, "include_traffic", true);
@@ -1248,6 +1336,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
         traffic_withheld: std::cell::Cell::new(0),
         entities: std::cell::RefCell::new(HashMap::new()),
         references: std::cell::OnceCell::new(),
+        external_calls: std::cell::OnceCell::new(),
+        call_sites: std::cell::OnceCell::new(),
     };
     let (pack, selection, projections) = kin_context::build_context_pack_with_provider(
         store,
@@ -1314,7 +1404,17 @@ struct SingleContextRender<'a, G: GraphStore> {
     traffic_withheld: std::cell::Cell<usize>,
     entities: std::cell::RefCell<HashMap<kin_model::EntityId, Option<kin_model::Entity>>>,
     references: std::cell::OnceCell<std::result::Result<ContextReferenceSnapshot, String>>,
+    /// The focal's calls into symbols outside the repository, rendered once:
+    /// the builder renders the pack again on every budget retry, and these
+    /// rows do not depend on what the budget kept.
+    external_calls: std::cell::OnceCell<std::result::Result<ExternalCallRows, String>>,
+    /// The focal's own call sites, read once for the same reason: the block
+    /// describes the focal's ledger, which the budget does not touch.
+    call_sites: std::cell::OnceCell<serde_json::Value>,
 }
+
+/// Rendered external call rows and how many calls there were before the cap.
+type ExternalCallRows = (Vec<serde_json::Value>, usize);
 
 impl<G: GraphStore> SingleContextRender<'_, G> {
     fn entity(&self, id: &kin_model::EntityId) -> Result<Option<kin_model::Entity>> {
@@ -1594,6 +1694,43 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
             .map(|entry| project_dep(entry, None))
             .collect::<Result<Vec<_>>>()?;
 
+        // Calls the focal makes into packages outside the repository. The
+        // dependency section is built from entity-to-entity edges and has no
+        // row for them, so a function whose every call lands in a dependency
+        // read as calling nothing. Served as their own group, always present,
+        // because "calls nothing outside" and "not reported" must not read alike.
+        let (external_calls, external_calls_total) = self
+            .external_calls
+            .get_or_init(|| {
+                (|| -> Result<ExternalCallRows> {
+                    let Some(focal) = focal_entity.as_ref() else {
+                        return Ok((Vec::new(), 0));
+                    };
+                    let held = HeldSourceAuthority::new(store, repository_authority);
+                    let text = super::external_symbols::CalleeText::new(&held);
+                    super::external_symbols::external_call_rows(store, focal, &text)
+                })()
+                .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map_err(McpError::Context)?;
+        let external_calls_returned = external_calls.len();
+        let external_calls_capped = external_calls_total.saturating_sub(external_calls_returned);
+
+        // The focal's own call sites, one row per site its ledger holds and the
+        // tally the verdict reads, through the one site-state reading every
+        // surface shares. The text at each site is cut from the focal's own
+        // body by the same reader the external calls above use.
+        let call_sites = focal_entity.as_ref().map(|focal| {
+            self.call_sites
+                .get_or_init(|| {
+                    let held = HeldSourceAuthority::new(store, repository_authority);
+                    let text = super::external_symbols::CalleeText::new(&held);
+                    crate::call_sites::focal_block(store, focal, &text)
+                })
+                .clone()
+        });
+
         // The cap and the fallback are both invisible in the rows themselves: six
         // neighbours out of twenty-four look exactly like six dependencies. This
         // says which selection ran and what it dropped, in every mode, because a
@@ -1612,10 +1749,12 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
             // edges across files is an answer, and an empty group on one that does
             // not is a gap, and both used to serialize as `[]`.
             "dependents": dependents,
+            super::external_symbols::EXTERNAL_CALLS_KEY: external_calls,
             "dependency_selection": {
                 "source": selection.source().as_str(),
                 "returned": returned,
                 "dependents_returned": dependents_returned,
+                "external_calls_returned": external_calls_returned,
                 // What the reference authority certified, stated beside what the
                 // group returned so the two can be compared. They differ when the
                 // pack sees an arriving edge of a class that authority does not
@@ -1639,6 +1778,9 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
             "token_budget": budget.max_tokens(),
             "tokens_used": pack.actual_tokens,
         });
+        if let Some(call_sites) = call_sites {
+            result[crate::call_sites::CALL_SITES_KEY] = call_sites;
+        }
 
         if !compact {
             if !transitive.is_empty() {
@@ -1733,6 +1875,16 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 kept,
                 elided,
                 crate::budget::ELISION_REASON_TOKEN_BUDGET,
+            );
+        }
+        if external_calls_capped > 0 {
+            result["external_calls_withheld"] = serde_json::json!(external_calls_capped);
+            crate::budget::record_elision_for(
+                &mut result,
+                super::external_symbols::EXTERNAL_CALLS_KEY,
+                external_calls_returned,
+                external_calls_capped,
+                crate::budget::ELISION_REASON_EXTERNAL_CALLS_CAP,
             );
         }
         // The certified-dependents cap is the third cutter on this payload, and it
@@ -1877,8 +2029,20 @@ fn multi_focal_pack_result<G: GraphStore>(
     // A caller may name `entity_id` and `entities` together; the single id
     // leads, because it is the more specific claim.
     if let Some(id_str) = get_optional_string_param(args, "entity_id") {
-        let entity_id = parse_entity_id(&id_str)?;
-        if let Some(entity) = store.get_entity(&entity_id).map_err(McpError::graph)? {
+        // A symbol outside the repository is no focal, and beside other focals
+        // it is reported unresolved by what it is, as a single-id pack
+        // refuses it, rather than as an id no entity carries.
+        if let Some(node) = super::external_symbols::lookup_external_symbol(store, &id_str)? {
+            unresolved.push(external_unresolved_focal(store, &node, &id_str)?);
+        } else if super::external_symbols::is_external_address(&id_str) {
+            unresolved.push(serde_json::json!({
+                "query": id_str,
+                "reason": "external symbol not found",
+            }));
+        } else if let Some(entity) = store
+            .get_entity(&parse_entity_id(&id_str)?)
+            .map_err(McpError::graph)?
+        {
             ids.push(entity.id);
             resolutions.push(FocalResolution::by_id(id_str));
         } else {
@@ -1890,6 +2054,22 @@ fn multi_focal_pack_result<G: GraphStore>(
         let Some(id_str) = hit.get("entity_id").and_then(serde_json::Value::as_str) else {
             continue;
         };
+        // The daemon hands a symbol outside the repository on under its
+        // address rather than dropping it as a miss, and it is reported here
+        // by what it is, under the token the caller typed.
+        if let Some(node) = super::external_symbols::lookup_external_symbol(store, id_str)? {
+            let query = hit
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(id_str);
+            if !unresolved
+                .iter()
+                .any(|row| row["symbol"]["id"] == node.address().as_str())
+            {
+                unresolved.push(external_unresolved_focal(store, &node, query)?);
+            }
+            continue;
+        }
         let Ok(entity_id) = parse_entity_id(id_str) else {
             continue;
         };
@@ -1952,6 +2132,17 @@ fn multi_focal_pack_result<G: GraphStore>(
         coverage: get_optional_string_param(args, "coverage"),
     };
     let held = HeldSourceAuthority::new(store, repository_authority);
+    // Each focal's calls into symbols outside the repository, read once before
+    // the builder renders the pack on every budget retry.
+    let external_calls = multi_focal_external_calls(store, &held, &ids)?;
+    // Every focal's own call sites, tallied once into one block. Rows belong
+    // to a block about one caller, so this one carries the tally alone.
+    let focal_entities: Vec<kin_model::Entity> = ids
+        .iter()
+        .filter_map(|id| store.get_entity(id).ok().flatten())
+        .collect();
+    let call_sites =
+        crate::call_sites::callers_block(store, &focal_entities, crate::call_sites::FOCALS_SCOPE);
     let fields = ContextSourceFields::default();
     let mut provider = ContextSourceProvider {
         held: &held,
@@ -1976,19 +2167,79 @@ fn multi_focal_pack_result<G: GraphStore>(
                 &unresolved,
                 &fields,
                 projections,
+                &external_calls,
             )
             .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+            result[crate::call_sites::CALL_SITES_KEY] = call_sites.clone();
             let json = serialize_with_measured_tokens(&mut result)
                 .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
             Ok(kin_context::estimate_tokens(&json))
         },
     )
     .map_err(McpError::from)?;
-    let mut result =
-        render_multi_context(store, &pack, report, &unresolved, &fields, &projections)?;
+    let mut result = render_multi_context(
+        store,
+        &pack,
+        report,
+        &unresolved,
+        &fields,
+        &projections,
+        &external_calls,
+    )?;
+    result[crate::call_sites::CALL_SITES_KEY] = call_sites;
     Ok(Some(ToolCallResult::text(serialize_with_measured_tokens(
         &mut result,
     )?)))
+}
+
+/// The `unresolved` row a pack built from several focals gives a symbol
+/// outside the repository that `query` named: the sentence and record a
+/// single-id pack refuses it with.
+fn external_unresolved_focal<G: GraphStore>(
+    store: &G,
+    node: &super::external_symbols::ExternalSymbolNode,
+    query: &str,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "query": query,
+        "reason": super::external_symbols::EXTERNAL_SYMBOL_NOT_SERVED,
+        "detail": super::external_symbols::external_not_served_message(
+            node,
+            "get_context_pack",
+            CONTEXT_PACK_EXTERNAL_WHY,
+        ),
+        "symbol": super::external_symbols::external_symbol_record_json(store, node)?,
+    }))
+}
+
+/// Every focal's calls into symbols outside the repository, each row naming
+/// its caller in `caller_id`, at most
+/// [`super::external_symbols::EXTERNAL_CALLS_MAX`] rows in all, and how many
+/// there were.
+fn multi_focal_external_calls<G: GraphStore>(
+    store: &G,
+    held: &HeldSourceAuthority<'_, G>,
+    focals: &[kin_model::EntityId],
+) -> Result<ExternalCallRows> {
+    let text = super::external_symbols::CalleeText::new(held);
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    for id in focals {
+        let Some(focal) = store.get_entity(id).map_err(McpError::graph)? else {
+            continue;
+        };
+        let (focal_rows, focal_total) =
+            super::external_symbols::external_call_rows(store, &focal, &text)?;
+        total += focal_total;
+        for mut row in focal_rows {
+            if rows.len() >= super::external_symbols::EXTERNAL_CALLS_MAX {
+                break;
+            }
+            row["caller_id"] = serde_json::json!(focal.id.to_string());
+            rows.push(row);
+        }
+    }
+    Ok((rows, total))
 }
 
 fn render_multi_context<G: GraphStore>(
@@ -1998,6 +2249,7 @@ fn render_multi_context<G: GraphStore>(
     unresolved: &[serde_json::Value],
     fields: &ContextSourceFields,
     projections: &kin_context::ProjectionReport,
+    external_calls: &ExternalCallRows,
 ) -> Result<serde_json::Value> {
     let row =
         |entry: &kin_model::context::ContextEntry, section: &str| -> Result<serde_json::Value> {
@@ -2070,6 +2322,7 @@ fn render_multi_context<G: GraphStore>(
         "measured_tokens": report.measured_tokens,
         "measurement_scope": "complete context payload before envelope and response-budget cuts; tokens_used measures the final output",
         "entities": entities,
+        super::external_symbols::EXTERNAL_CALLS_KEY: external_calls.0,
         "lines": kin_context::render_multi_focal_lines(&pack, &report),
         "lines_note": "rendered selected projections; whole graph source bodies appear only for FullBody entries",
         "tokens_used": 0,
@@ -2084,6 +2337,17 @@ fn render_multi_context<G: GraphStore>(
             elision.kept,
             elision.elided,
             &elision.reason,
+        );
+    }
+    let external_capped = external_calls.1.saturating_sub(external_calls.0.len());
+    if external_capped > 0 {
+        result["external_calls_withheld"] = serde_json::json!(external_capped);
+        crate::budget::record_elision_for(
+            &mut result,
+            super::external_symbols::EXTERNAL_CALLS_KEY,
+            external_calls.0.len(),
+            external_capped,
+            crate::budget::ELISION_REASON_EXTERNAL_CALLS_CAP,
         );
     }
 
@@ -2205,6 +2469,20 @@ pub fn handle_trace_computation<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let mut merged: HashMap<String, serde_json::Value> = args.clone();
 
+    // Refused here rather than by the pack this delegates to, so the refusal
+    // names the tool the caller called.
+    if let Some(id) = get_optional_string_param(args, "entity_id") {
+        if let Some(node) = super::external_symbols::lookup_external_symbol(store, &id)? {
+            return super::external_symbols::external_not_served(
+                store,
+                &node,
+                "trace_computation",
+                "entity_id",
+                "has no body or neighborhood of its own here to trace",
+            );
+        }
+    }
+
     if !merged.contains_key("entity_id") {
         if let Some(query) = get_optional_string_param(args, "query") {
             let entity = match kin_ranking::entity_ranking::resolve_name(store, &query)
@@ -2324,7 +2602,17 @@ target, not a hard ceiling: a symbol with hundreds of call sites sheds its inlin
 it withholds any row, every list it cuts keeps at least one row, and a reply whose kept rows \
 still do not fit ships over the budget and says so under `response_over_budget`. Any cut is \
 reported in `degradations` and in `_kin.response` with the size the response had before the \
-budget, so a short answer is never mistaken for a complete one.";
+budget, so a short answer is never mistaken for a complete one. \
+Given `external_reference:<uuid>`, a symbol outside the repository, it returns the entities \
+with an edge into that symbol, one row each, with `site_state`, `proof` (resolver, resolver \
+version, proof context and rule) and `sites`, each a `line_in_entity` counted from 0 at the \
+caller's first line with the `callee` text found there, never a file line. Only a call a \
+language server proved is an edge into such a symbol, so that list is a floor. \
+`caller_arrival.count_exact` is true when every caller in the files that import the focal's \
+file holds a current call-site ledger, so each file's unaccounted count is exactly the sites \
+no resolver settled; otherwise that file keeps the parse-against-edge count and \
+`owed_callers` names the callers no ledger describes yet. `call_sites` tallies those callers' \
+sites by state with the `clauses` the verdict reads, as get_context_pack does for its focal.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
     raw.map(str::trim)
@@ -3450,6 +3738,24 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     // string, and the resolver consumes it and hands back a winner.
     let resolution_query = get_optional_string_param(args, "query");
     let target = if let Some(entity_id_str) = get_optional_string_param(args, "entity_id") {
+        // A symbol outside the repository: its callers are the entities with
+        // an edge into it, each with the sites the resolver proved.
+        if let Some(node) = super::external_symbols::lookup_external_symbol(store, &entity_id_str)?
+        {
+            let result = super::external_symbols::external_references_reply(
+                store,
+                &node,
+                &relation_kinds,
+                include_snippets,
+                min_resolution,
+                repository_authority,
+            )?;
+            let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+            return Ok(ToolCallResult::text(json));
+        }
+        if super::external_symbols::is_external_address(&entity_id_str) {
+            return Ok(ToolCallResult::error(FIND_REFERENCES_FOCAL_MISS));
+        }
         let entity_id = parse_entity_id(&entity_id_str)?;
         store.get_entity(&entity_id).map_err(McpError::graph)?
     } else if let Some(query) = get_optional_string_param(args, "query") {
@@ -4459,8 +4765,18 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     // about the caller it missed. The gate in `crate::negative` reads it back
     // from here so the verdict and the evidence a reader audits it against are
     // the same object.
-    result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
-        crate::caller_arrival::observe_caller_arrival(store, target).to_json();
+    let arrival = crate::caller_arrival::observe_caller_arrival(store, target);
+    result[crate::caller_arrival::CALLER_ARRIVAL_KEY] = arrival.to_json();
+    // Every caller in the files that can reach the focal, tallied through the
+    // one site-state reading, so the verdict reads this answer's sites the way
+    // it reads a pack's. Absent when the family could not be established,
+    // which `caller_arrival` already says.
+    // Qualified by the owed callers outside the family, since a caller can
+    // reach the focal without importing its file.
+    if let Some(tally) = arrival.call_sites.as_ref() {
+        result[crate::call_sites::CALL_SITES_KEY] =
+            crate::call_sites::family_block(tally, arrival.owed_outside.as_deref());
+    }
     disclose_withheld_candidates(&mut result);
     disclose_interface_dispatch_candidates(&mut result);
     disclose_name_only_ceiling(&mut result, name_only_ceiling_kept, target.language);
@@ -4588,6 +4904,45 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
         HashMap::new();
 
     for raw_id in &entity_ids_raw {
+        // Reachability is a question about repository entities. A symbol
+        // outside the repository is not one, so its row says what it is and
+        // which tools answer about it, in the shape every error row has,
+        // rather than reading as an invalid id or a miss.
+        let external = super::external_symbols::lookup_external_symbol(store, raw_id)?;
+        if external.is_some() || super::external_symbols::is_external_address(raw_id) {
+            let error = if external.is_some() {
+                super::external_symbols::EXTERNAL_SYMBOL_NOT_SERVED
+            } else {
+                "external symbol not found"
+            };
+            let mut row = serde_json::json!({
+                "entity_id": raw_id,
+                "error": error,
+                "has_references": null,
+                "reference_count": null,
+                "known_reference_count": null,
+                "reference_count_complete": false,
+                "verdict_complete": false,
+            });
+            if let Some(node) = &external {
+                row["detail"] =
+                    serde_json::json!(super::external_symbols::external_not_served_message(
+                        node,
+                        "bulk_check_references",
+                        "classifies the reachability of repository entities only",
+                    ));
+                row["symbol"] = super::external_symbols::external_symbol_record_json(store, node)?;
+            }
+            if !compact {
+                row["name"] = serde_json::Value::Null;
+                row["kind"] = serde_json::Value::Null;
+                row["file_path"] = serde_json::Value::Null;
+                row["matched_kinds"] = serde_json::json!([]);
+                row["federated_reference_count"] = serde_json::Value::Null;
+            }
+            results.push(row);
+            continue;
+        }
         let entity_id = match parse_entity_id(raw_id) {
             Ok(id) => id,
             Err(_) => {
@@ -5876,6 +6231,11 @@ stdlib name into a hub that joins unrelated code into the chain. An edge that me
 a type is a leaf carrying `terminal: \"type_annotation\"`, because two entities that annotate \
 with the same class share no data; pass include_type_edges=true to walk through those when \
 the type is one this repository defines, which is a real flow for a field or a return. \
+A call a language server proved into a package outside the repository is such a leaf too, \
+named by its `external_reference:<uuid>` id with `entity_kind: \"external_symbol\"`, and it \
+carries `package`, `stdlib`, `symbol`, `site_state: \"proven_external\"`, `proof` and \
+`sites`, each site a `line_in_entity` inside the parent with the `callee` text, in place of \
+file lines; every other step carries those six keys as null. \
 `terminal_external_steps` and `terminal_annotation_steps` count them, kept apart because only \
 the second is recoverable by a parameter. Neither sets `truncated`: a boundary means the chain \
 ends there, not that you received less of one that exists. \
@@ -6241,6 +6601,38 @@ fn trace_step_value(
             target.insert(key.clone(), entry.clone());
         }
     }
+    super::external_symbols::fill_external_trace_keys(&mut value);
+    value
+}
+
+/// A chain step on a symbol outside the repository: a callee leaf with the
+/// keys every step carries, stopped at `external_reference`, its sites served
+/// inside the parent under `sites` rather than as file lines.
+fn trace_external_step_value<T: super::external_symbols::SiteText + ?Sized>(
+    step: usize,
+    parent_step: usize,
+    depth: usize,
+    edge: &kin_context::ExternalEdge,
+    parent: Option<&kin_model::entity::Entity>,
+    text: &T,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "step": step,
+        "role": "callee",
+        "relation_kind": format!("{:?}", edge.relation.kind),
+        "resolution": RelationResolution::of(&edge.relation).as_str(),
+        "parent_step": parent_step,
+        "depth": depth,
+        "reference_lines": [],
+        "reference_lines_absent_reason": ReferenceLinesAbsent::SitesInEntity.as_str(),
+        "reference_lines_partial_reason": serde_json::Value::Null,
+        "fanout_truncated": false,
+        "fanout_dropped": 0,
+        "terminal": TraceTerminal::ExternalReference.as_str(),
+    });
+    value.as_object_mut().expect("step object").extend(
+        super::external_symbols::external_trace_record(edge, parent, text),
+    );
     value
 }
 
@@ -6590,6 +6982,19 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         None => "both",
     };
 
+    // A symbol outside the repository is where a walk stops, never where one
+    // starts, so it is refused by what it is rather than as a focal no entity
+    // matched. An address naming nothing held stays that miss below.
+    if let Some(node) = super::external_symbols::lookup_external_symbol(store, trimmed)? {
+        return super::external_symbols::external_not_served(
+            store,
+            &node,
+            "trace_data_flow",
+            "focal",
+            TRACE_EXTERNAL_WHY,
+        );
+    }
+
     // Resolve focal: UUID first, then the name rule every surface shares. A
     // name several owners share as their member name answers with every
     // candidate rather than a walk from one of them.
@@ -6713,6 +7118,16 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             None => target_unresolved = Some(target),
         }
     }
+
+    // Calls a language server proved into symbols outside the repository have
+    // no entity at the far end, so the relation read below never lists them.
+    // Each one is a leaf step, reached once however many nodes call it. This
+    // arm holds no repository authority, so a site's text is not quoted here.
+    let mut external_reader = kin_context::ExternalEdgeReader::new(store);
+    let mut visited_external: std::collections::HashSet<kin_model::ExternalReferenceId> =
+        std::collections::HashSet::new();
+    let external_held = HeldSourceAuthority::new(store, None);
+    let external_text = super::external_symbols::CalleeText::new(&external_held);
 
     // Frontier: (step, entity, depth, file, dir) — the expanded node's own
     // location travels with it, because relevance is scored against the node
@@ -6869,6 +7284,19 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 }
             }
 
+            let mut external_callees = if want_callees {
+                let (callees, admissible) = super::external_symbols::trace_external_callees(
+                    &mut external_reader,
+                    &node.id,
+                    &allowed,
+                    &visited_external,
+                )?;
+                admissible_neighbors += admissible;
+                callees
+            } else {
+                Vec::new()
+            };
+
             // This node's relations were read to the end, so what the graph held
             // for it is now a fact rather than a guess.
             expansion.insert(
@@ -6890,6 +7318,13 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 apply_trace_fanout_cap(&mut callees, node.file.as_deref(), limit_per_step);
             let (dropped_callers, crossing_callers) =
                 apply_trace_fanout_cap(&mut callers, node.file.as_deref(), limit_per_step);
+            // An external call is a callee too, and takes a slot only after the
+            // repository's own callees, which are the hops a walk can continue
+            // through.
+            let external_room = limit_per_step.saturating_sub(callees.len());
+            let dropped_external = external_callees.len().saturating_sub(external_room);
+            external_callees.truncate(external_room);
+            let dropped_callees = dropped_callees + dropped_external;
 
             if dropped_callees + dropped_callers > 0 {
                 truncated = true;
@@ -7037,6 +7472,27 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         step_index,
                         next_depth,
                         &candidate.entity,
+                    ));
+                }
+            }
+            if !external_callees.is_empty() {
+                let parent = store.get_entity(&node.id).map_err(McpError::graph)?;
+                for edge in external_callees {
+                    if chain.len() >= MAX_TOTAL_STEPS {
+                        truncated = true;
+                        break;
+                    }
+                    if !visited_external.insert(edge.target) {
+                        continue;
+                    }
+                    let step_index = chain.len() + 1;
+                    chain.push(trace_external_step_value(
+                        step_index,
+                        node.step,
+                        node.depth + 1,
+                        &edge,
+                        parent.as_ref(),
+                        &external_text,
                     ));
                 }
             }
@@ -7472,7 +7928,14 @@ implemented. Read `interface_implementations.files` instead; it is derived from 
 above it, so it and their lines cannot disagree, and it stays complete when `limit` \
 truncates `entities`. Satisfaction is structural, so each row is a possible \
 implementation and none is a recorded one. The rows also appear among `entities`, marked \
-`implements: interface_candidate`.";
+`implements: interface_candidate`. A call a language server proved into a package outside \
+the repository reaches a leaf row with `kind: \"external_symbol\"` and an id of the form \
+`external_reference:<uuid>`, and its edge row carries `to`, `site_state`, `proof` and \
+`sites`. The walk never expands such a leaf, because every other caller of `Array.map` is \
+that symbol's neighborhood and not the focal's. Pass the id as `entity_id` to walk from the \
+symbol to its callers. A walk that follows the focal's own calls, 'out' or 'both', also \
+carries `call_sites`, the focal's call sites as get_context_pack serves them, and a site \
+that is not settled makes the answer inconclusive.";
 
 /// Traverse the neighborhood around a focal entity in the requested direction.
 ///
@@ -7489,6 +7952,18 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    handle_graph_neighborhood_with_authority(args, store, None)
+}
+
+/// [`handle_graph_neighborhood`] with the repository authority a request holds,
+/// which the sites of an edge into an external symbol quote their text from.
+pub fn handle_graph_neighborhood_with_authority<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+) -> Result<ToolCallResult> {
+    use super::external_symbols as external;
+
     // Bidirectional traversal widens the frontier: a hot callee's incoming edge
     // set is unbounded in a way its outgoing set is not, so the walk is capped
     // and reports the cap through `truncated` rather than returning a partial
@@ -7496,7 +7971,19 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     const MAX_VISITED_ENTITIES: usize = 2_000;
 
     let id_str = get_string_param(args, "entity_id")?;
-    let entity_id = parse_entity_id(&id_str)?;
+    // A symbol outside the repository is a focal too: its neighbours are the
+    // entities with an edge into it, and it has no outgoing edge of its own.
+    let external_focal = external::lookup_external_symbol(store, &id_str)?;
+    if external_focal.is_none() && external::is_external_address(&id_str) {
+        return Ok(ToolCallResult::error(format!(
+            "External symbol not found: {}",
+            id_str.trim()
+        )));
+    }
+    let focal_entity_id = match external_focal {
+        Some(_) => None,
+        None => Some(parse_entity_id(&id_str)?),
+    };
     let depth = get_optional_u64(args, "depth", 2) as u32;
     let limit = get_optional_u64(args, "limit", 30) as usize;
     let direction = match get_optional_string_param(args, "direction") {
@@ -7522,15 +8009,66 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     let mut seen_relations: std::collections::HashSet<kin_model::ids::RelationId> =
         std::collections::HashSet::new();
     let mut truncated = false;
+    // Edges with an external end are not among an entity's entity-to-entity
+    // relations, so they are read beside them, and their far ends are counted
+    // against the same cap.
+    let held = HeldSourceAuthority::new(store, repository_authority);
+    let text = external::CalleeText::new(&held);
+    let mut external_reader = kin_context::ExternalEdgeReader::new(store);
+    let mut visited_external: std::collections::HashSet<kin_model::ExternalReferenceId> =
+        std::collections::HashSet::new();
 
-    // The focal itself is part of its own neighborhood, matching what the
-    // previous traversal returned so counts stay comparable across the change.
-    if let Some(focal) = store.get_entity(&entity_id).map_err(McpError::graph)? {
-        visited.insert(entity_id);
-        entities.push(compact_entity_summary(&focal));
+    let mut frontier: Vec<(kin_model::ids::EntityId, u32)> = Vec::new();
+    match (&external_focal, focal_entity_id) {
+        (Some(node), _) => {
+            visited_external.insert(node.id);
+            entities.push(external::external_symbol_json(
+                &node.id,
+                Some(&node.reference),
+            ));
+            if want_incoming && depth > 0 {
+                let address = node.address();
+                for edge in external_reader
+                    .incoming(&node.id, external::EXTERNAL_EDGE_KINDS)
+                    .map_err(McpError::from)?
+                {
+                    let caller = store.get_entity(&edge.entity).map_err(McpError::graph)?;
+                    if seen_relations.insert(edge.relation.id) {
+                        relations.push(external::external_relation_row(
+                            &edge,
+                            "incoming",
+                            address.clone(),
+                            edge.entity.to_string(),
+                            caller.as_ref(),
+                            &text,
+                        ));
+                    }
+                    if !visited.insert(edge.entity) {
+                        continue;
+                    }
+                    if visited.len() + visited_external.len() > MAX_VISITED_ENTITIES {
+                        truncated = true;
+                        break;
+                    }
+                    if let Some(caller) = caller {
+                        entities.push(compact_entity_summary(&caller));
+                    }
+                    frontier.push((edge.entity, 1));
+                }
+            }
+        }
+        (None, Some(entity_id)) => {
+            // The focal itself is part of its own neighborhood, matching what the
+            // previous traversal returned so counts stay comparable across the change.
+            if let Some(focal) = store.get_entity(&entity_id).map_err(McpError::graph)? {
+                visited.insert(entity_id);
+                entities.push(compact_entity_summary(&focal));
+            }
+            frontier.push((entity_id, 0));
+        }
+        (None, None) => unreachable!("an id names an entity or an external symbol"),
     }
 
-    let mut frontier: Vec<(kin_model::ids::EntityId, u32)> = vec![(entity_id, 0)];
     while !frontier.is_empty() && !truncated {
         let mut next_frontier: Vec<(kin_model::ids::EntityId, u32)> = Vec::new();
         for (current, current_depth) in frontier.drain(..) {
@@ -7577,7 +8115,7 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
                 if !visited.insert(neighbor) {
                     continue;
                 }
-                if visited.len() > MAX_VISITED_ENTITIES {
+                if visited.len() + visited_external.len() > MAX_VISITED_ENTITIES {
                     truncated = true;
                     break;
                 }
@@ -7585,6 +8123,40 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
                     entities.push(compact_entity_summary(&entity));
                 }
                 next_frontier.push((neighbor, current_depth + 1));
+            }
+            // A symbol outside the repository is reached as a leaf and never
+            // expanded: every other entity calling `Array.map` is that symbol's
+            // neighbourhood, not this entity's.
+            if want_outgoing && !truncated {
+                let outgoing = external_reader
+                    .outgoing(&current, None)
+                    .map_err(McpError::from)?;
+                if !outgoing.is_empty() {
+                    let caller = store.get_entity(&current).map_err(McpError::graph)?;
+                    for edge in outgoing {
+                        if seen_relations.insert(edge.relation.id) {
+                            relations.push(external::external_relation_row(
+                                &edge,
+                                "outgoing",
+                                current.to_string(),
+                                external::external_address(&edge.target),
+                                caller.as_ref(),
+                                &text,
+                            ));
+                        }
+                        if !visited_external.insert(edge.target) {
+                            continue;
+                        }
+                        if visited.len() + visited_external.len() > MAX_VISITED_ENTITIES {
+                            truncated = true;
+                            break;
+                        }
+                        entities.push(external::external_symbol_json(
+                            &edge.target,
+                            edge.reference.as_ref(),
+                        ));
+                    }
+                }
             }
             if truncated {
                 break;
@@ -7605,9 +8177,13 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     // same discipline `kin refs --kind dispatch` uses for the other direction.
     // The rows are spliced in behind the focal rather than appended, so `limit`
     // cannot truncate away the part of the answer that was asked for.
+    let focal_entity = match focal_entity_id {
+        Some(entity_id) => store.get_entity(&entity_id).map_err(McpError::graph)?,
+        None => None,
+    };
     let implementations = if want_incoming {
-        match store.get_entity(&entity_id).map_err(McpError::graph)? {
-            Some(focal) => collect_interface_implementations(store, &focal)?,
+        match focal_entity.as_ref() {
+            Some(focal) => collect_interface_implementations(store, focal)?,
             None => None,
         }
     } else {
@@ -7652,8 +8228,13 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     // Cap relations to match the entity limit to avoid unbounded output.
     relations.truncate(limit * 3);
 
+    let focal_id = match (&external_focal, focal_entity_id) {
+        (Some(node), _) => node.address(),
+        (None, Some(entity_id)) => entity_id.to_string(),
+        (None, None) => String::new(),
+    };
     let mut result = serde_json::json!({
-        "focal_id": entity_id.to_string(),
+        "focal_id": focal_id,
         "direction": direction,
         "depth": depth,
         "entity_count": total_entities,
@@ -7665,6 +8246,16 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     if let Some(implementations) = implementations.as_ref() {
         result[INTERFACE_IMPLEMENTATIONS_KEY] = interface_implementations_json(implementations);
     }
+    // The focal's own call sites, whenever the walk follows the focal's own
+    // calls. An incoming walk reads its callers' edges and none of the focal's
+    // sites, so its answer is not qualified by them. A symbol outside the
+    // repository has no body here and so no site.
+    if want_outgoing {
+        if let Some(focal) = focal_entity.as_ref() {
+            result[crate::call_sites::CALL_SITES_KEY] =
+                crate::call_sites::focal_block(store, focal, &text);
+        }
+    }
 
     // A walk that expanded no edge is claiming the focal has no neighbors on the
     // side that was walked, and for an incoming walk that is the same claim
@@ -7673,9 +8264,8 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     // and the observation says so rather than guessing one, so the
     // focal-not-in-graph gap stays the limiting factor a reader is handed.
     if total_relations == 0 {
-        let focal_languages = store
-            .get_entity(&entity_id)
-            .map_err(McpError::graph)?
+        let focal_languages = focal_entity
+            .as_ref()
             .map(|entity| vec![entity.language])
             .unwrap_or_default();
         result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
@@ -7902,6 +8492,13 @@ pub struct GraphStatusReport {
     /// answer is sent, independently of the counters above, and only for HEAD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_base: Option<crate::source_unit::RepositoryBase>,
+    /// Every call site the selected graph's ledgers hold, by the state each
+    /// reads as through the one site-state reading, each state's share of that
+    /// census, and the callers no current ledger describes. Read from the
+    /// graph when the answer is sent, outside the counters' fence, so it rides
+    /// on an already-validated report the way `repository_base` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_sites: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -7938,6 +8535,8 @@ struct GraphStatusReportWire {
     source_derivation: Option<crate::source_derivation::SourceDerivationObservation>,
     #[serde(default)]
     repository_base: Option<crate::source_unit::RepositoryBase>,
+    #[serde(default)]
+    call_sites: Option<serde_json::Value>,
 }
 
 impl<'de> Deserialize<'de> for GraphStatusReport {
@@ -7968,6 +8567,7 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             response_envelope: wire.response_envelope,
             source_derivation: wire.source_derivation,
             repository_base: wire.repository_base,
+            call_sites: wire.call_sites,
         };
         report.validate().map_err(serde::de::Error::custom)?;
         Ok(report)
@@ -8177,7 +8777,11 @@ block giving that reading's age in milliseconds, which state blocked the live sa
 authority_epoch that was current when it was abandoned. Read those counters as of that \
 earlier instant, not as of now. \
 Enrichment completeness is not attested \
-(completion_attested=false), so a populated graph is not by itself a complete one. This \
+(completion_attested=false), so a populated graph is not by itself a complete one. \
+`call_sites` counts every call site the graph's call-site ledgers hold by the state each \
+reads as, with each state's share of that census, the callers no current ledger describes \
+(`callers_owed`) and the files holding them, and the `clauses` the verdict reads, so a \
+status over sites not yet settled is inconclusive. This \
 tool requires the Kin daemon; it does not invent an offline approximation.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8230,6 +8834,7 @@ pub fn handle_daemon_graph_status_observation(
         response_envelope: None,
         source_derivation: None,
         repository_base: None,
+        call_sites: None,
     };
     report.validate().map_err(crate::McpError::Other)?;
     Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
@@ -8272,6 +8877,7 @@ pub fn handle_daemon_graph_status_stale_observation(
         response_envelope: None,
         source_derivation: None,
         repository_base: None,
+        call_sites: None,
     };
     report.validate().map_err(crate::McpError::Other)?;
     Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
@@ -8300,6 +8906,35 @@ pub fn with_repository_base(
         return result;
     };
     report.repository_base = Some(base);
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) if report.validate().is_ok() => ToolCallResult::text(text),
+        _ => result,
+    }
+}
+
+/// Attach the selected graph's store-wide call-site block to a status answer.
+///
+/// Read from the graph when the answer is sent, like the repository base, so
+/// it rides on an already-validated report rather than inside the counters'
+/// fence. The block is [`crate::call_sites::store_block`]'s: the census the
+/// ledgers hold, each state's share of it, the callers owed and the files
+/// holding them, and the clauses the verdict reads. An error result, an
+/// unreadable report or a graph that cannot be read leaves the answer exactly
+/// as it was.
+pub fn with_call_site_status<G: GraphStore>(result: ToolCallResult, store: &G) -> ToolCallResult {
+    if result.is_error == Some(true) {
+        return result;
+    }
+    let Some(crate::types::ContentBlock::Text { text }) = result.content.first() else {
+        return result;
+    };
+    let Ok(mut report) = serde_json::from_str::<GraphStatusReport>(text) else {
+        return result;
+    };
+    let Ok(block) = crate::call_sites::store_block(store) else {
+        return result;
+    };
+    report.call_sites = Some(block);
     match serde_json::to_string_pretty(&report) {
         Ok(text) if report.validate().is_ok() => ToolCallResult::text(text),
         _ => result,

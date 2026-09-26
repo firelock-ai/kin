@@ -38,6 +38,7 @@ pub mod admission;
 #[cfg(test)]
 pub(crate) mod alloc_probe;
 pub mod branch;
+pub mod call_site_reading;
 pub(crate) mod canonical_ser;
 pub mod change;
 pub mod collaboration;
@@ -50,6 +51,7 @@ pub mod error;
 pub mod evidence;
 pub mod external;
 pub mod external_reference;
+pub mod external_symbol;
 pub mod federation;
 pub mod git_authority;
 pub mod graph;
@@ -63,6 +65,7 @@ pub mod provenance;
 pub mod refs;
 pub mod relation;
 pub mod repository;
+pub mod resolution;
 pub mod retrieval;
 pub mod review;
 pub mod scope;
@@ -85,6 +88,10 @@ pub use admission::{
     SensitiveArtifactKind, SharedAdmissionPolicy, ADMISSION_POLICY_SEMANTICS_VERSION,
 };
 pub use branch::MergeState;
+pub use call_site_reading::{
+    in_a_file_without_calls, read_caller_sites, site_state_reason, CallSiteFacts, CallSiteTally,
+    CallerSites, NoResolver, SiteStateKind,
+};
 pub use change::{
     ChangeOrigin, EntityDelta, LocatedEntry, RelationDelta, ResolvedArtifact, ResolvedTree,
     SemanticChange, TransactionDelta, TreeDelta, TreeEntry, TreeStateError,
@@ -113,6 +120,10 @@ pub use external::{
 pub use external_reference::{
     ExternalReference, ExternalReferenceDelta, ExternalReferenceId,
     EXTERNAL_REFERENCE_ID_NAMESPACE_V1, EXTERNAL_REFERENCE_SCHEMA_VERSION,
+};
+pub use external_symbol::{
+    decode_descriptors, is_stdlib_package, DescriptorSuffix, ExternalSymbol, ScipDescriptor,
+    ScipPackage, EXTERNAL_SYMBOL_NAMESPACE,
 };
 pub use federation::{
     ActorRef, GraphCapabilitySet, GraphLocator, GraphManifest, RemoteRelation, RemoteRelationKind,
@@ -156,6 +167,13 @@ pub use preset::{
     ProjectionMode, ReconcilePolicy, ReconcilePolicyProvider, ValidationLevel, WorldPreset,
 };
 pub use projection::{Projection, ProjectionKind};
+pub use resolution::{
+    proof_context_digest, site_key, validate_keyed_record, validate_resolution_records, CallSite,
+    CallSiteLedger, CallSiteState, DispatchProvenance, DispatchScope, DispatchSet,
+    DispatchSoundness, DispatchWorld, ProofContext, ResolutionRecord, ResolutionRecordDelta,
+    ResolutionRecordId, ResolutionRecordPlan, ResolutionRecordSet, ServerFailure, UnresolvedReason,
+    PROOF_CONTEXT_TOKEN_PREFIX, RESOLUTION_RECORD_ID_NAMESPACE_V1,
+};
 pub use review::{
     Review, ReviewAssignment, ReviewComment, ReviewCompletionState, ReviewDecision,
     ReviewDecisionState, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewFilter,
@@ -180,7 +198,9 @@ pub use relation::{
     LSP_PROVEN_METHOD_REFERENCES_RULE, LSP_REFERENCES_RULE,
 };
 pub use repository::{
-    compute_resolved_tree_hash, AuthorityRoot, RepositoryAuthorityStore, RepositoryCommitOutcome,
+    compute_resolved_tree_hash, enrichment_ledgers_by_file, enrichment_relations_by_owner_file,
+    enrichment_relations_digest, settle_enrichment_marks, AuthorityRoot, EnrichmentMark,
+    EnrichmentMarksDelta, RepositoryAuthorityStore, RepositoryCommitOutcome,
     RepositoryCommitReceipt, RepositoryOperationRecord, RepositoryTransaction, RootBundle,
     WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta, WorkspaceSemanticOverlay,
     WorkspaceSnapshotBinding, WorkspaceState, REPOSITORY_ROOT_SCHEMA_VERSION,

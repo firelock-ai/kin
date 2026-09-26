@@ -96,6 +96,31 @@ fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager
     Ok(crate::backend::open_kindb_snapshot(layout)?)
 }
 
+/// What `kin note add` says for a target the graph holds nothing to anchor a
+/// note to, in the words the other commands use for the same argument.
+fn unanchored_note_lines(target: kin_mcp::handlers::common::UnanchoredTarget) -> Vec<String> {
+    use kin_mcp::handlers::common::UnanchoredTarget;
+    match target {
+        UnanchoredTarget::External(node) => crate::commands::external_symbols::refusal_lines(
+            &node,
+            "`kin note add` anchors a note to a repository entity and has nothing of it here \
+             to anchor one to; annotate one of its callers instead",
+        ),
+        UnanchoredTarget::UnknownExternalAddress(text) => {
+            crate::commands::external_symbols::unknown_address_lines(&text)
+        }
+        UnanchoredTarget::NotInGraph(entity_id) => vec![
+            format!(
+                "entity:{entity_id} names nothing this repository's graph holds, so a note on \
+                 it would anchor to nothing any read recalls."
+            ),
+            "hint: find the entity with `kin locate <name>` and add the note to the id it \
+             prints."
+                .to_string(),
+        ],
+    }
+}
+
 fn build_annotation(
     graph: &kin_db::InMemoryGraph,
     target: &str,
@@ -103,6 +128,13 @@ fn build_annotation(
     body: String,
 ) -> Result<(Annotation, WorkLink)> {
     let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    // The check the `kin_annotation_add` tool makes, so neither surface
+    // stores a note the other refuses, and none is stored without an anchor.
+    if let Some(unanchored) =
+        kin_mcp::handlers::common::unanchored_annotation_target(graph, target)?
+    {
+        anyhow::bail!(unanchored_note_lines(unanchored).join("\n"));
+    }
     let target = parse_annotation_target(target)?;
     let (scopes, anchored, attached_target) = match &target {
         AnnotationTarget::Scope(scope) => {
@@ -376,5 +408,65 @@ mod tests {
         assert_eq!(anns.len(), 1);
         assert_eq!(anns[0].annotation_id, ann.annotation_id);
         assert_eq!(anns[0].scopes, work.scopes);
+    }
+
+    /// An annotation is anchored to a repository entity. `kin note add`
+    /// refuses a symbol outside the repository, by its address, as an
+    /// `entity:` scope or by its bare id, naming the symbol and the command
+    /// that lists its callers, and refuses an entity id this graph holds
+    /// nothing under. Neither writes an annotation, and a held entity is
+    /// annotated as before.
+    #[test]
+    fn note_add_refuses_an_external_symbol_and_an_entity_the_graph_does_not_hold() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let add = |target: String| {
+            execute_note_request(
+                &layout,
+                &store.graph,
+                NoteRequest::Add {
+                    target,
+                    kind: "warning".into(),
+                    body: "never call this in a loop".into(),
+                },
+            )
+        };
+        for target in [
+            store.address(),
+            format!("entity:{}", store.node.id),
+            store.node.id.to_string(),
+        ] {
+            let error = match add(target.clone()) {
+                Ok(_) => panic!("{target} was annotated"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains("Array.map"), "{error}");
+            assert!(
+                error.contains(&format!("kin refs {}", store.address())),
+                "{error}"
+            );
+        }
+        let unheld = EntityId::new();
+        for target in [format!("entity:{unheld}"), unheld.to_string()] {
+            let error = match add(target.clone()) {
+                Ok(_) => panic!("{target} was annotated"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(&unheld.to_string()), "{error}");
+            assert!(error.contains("kin locate"), "{error}");
+        }
+        assert!(
+            store
+                .graph
+                .list_annotations(&AnnotationFilter {
+                    include_stale: true,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "a refused target writes nothing"
+        );
+        add(format!("entity:{}", store.caller.id)).expect("a held entity is annotated");
     }
 }

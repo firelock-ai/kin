@@ -404,6 +404,7 @@ mod tests {
                 tree_deltas: tree,
                 admission_policy_delta: None,
                 external_reference_deltas: vec![],
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -490,6 +491,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: vec![],
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         let tree = graph.resolved_tree();

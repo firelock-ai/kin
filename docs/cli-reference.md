@@ -125,7 +125,7 @@ it:
 | `sweep_enriched_nothing` | The sweep walked files and enriched none of them. |
 | `sweep_languages_unserved` | The sweep could not serve at least one language. `cause` names each one. |
 | `sweep_files_owed` | The language server left questions about some files unanswered, for example because it stopped partway through. Those files are owed: the next sweep after a backoff asks again, and `kin daemon sweep` asks at once. `cause` names the first one and why. |
-| `sweep_budget_spent` | The sweep did not finish within 900 seconds. It resumes on the next daemon start. |
+| `sweep_budget_spent` | The sweep did not finish in the 900 seconds `kin init` waits. The daemon keeps sweeping, publishes the rest when it finishes, and then exits; `kin daemon sweep` waits for it. |
 | `sweep_outcome_unreadable` | The run could not read what its sweep did (`state` is `unknown`). |
 
 `daemon_spawn_disabled` and `loopback_blocked` are decided before anything is started, so the phase
@@ -349,6 +349,22 @@ qualifier that excludes every match, which reports what the name alone does reac
 claiming the entity is absent. `kin context`, `kin refs`, `kin xref` and `kin impact` refuse the
 same way.
 
+A call the focal makes into a symbol outside the repository, such as `Array.map` in TypeScript's
+own library, is a leaf row under `--- External calls ---`, or under `--- Deps ---` with
+`--compact`. The row is the line `kin context` prints for the call, ending in `leaf`: the graph
+holds the symbol's identity and no body or edges, so nothing past it can be followed, which is
+also where `trace_data_flow` stops. A focal whose calls all leave the repository still reaches
+something, so the trace does not qualify it as an absence.
+
+```
+[Calls ->] Array.map (external symbol, npm typescript 5.6.3, standard library) proven_external by lsp:tsserver 5.6.3 (lsp_definition), sites +2 `map`, +5 `map`, id external_reference:<uuid>, leaf
+```
+
+Given an `external_reference:<uuid>` id, or its bare uuid, `kin trace` and `kin trace --json`
+refuse: the message names the symbol and gives `kin refs <id>` as the command that lists its
+callers. An `external_reference` id this repository's graph holds no symbol under is refused as
+that, not as a missing entity.
+
 ### `kin path`
 
 Find the shortest routes from one entity to another over the graph's call, instantiation, reference, import and include edges. Each end is an entity name, an entity id, or `name@file` to pin one of two same-named entities. A class stands for its members, so a route between two classes runs through the methods that carry it. Exits 3 when the graph holds no route inside the depth bound, with the gap on stderr.
@@ -373,6 +389,8 @@ kin path <from> <to> [options]
 | `--json` |  | Output machine-readable JSON, `_kin` envelope included |
 | `--compact` |  | One line per hop and nothing else, sized for a prompt |
 
+An end given as an `external_reference:<uuid>` id, or its bare uuid, names a symbol outside the repository, which has no route of its own here. `kin path` refuses it as a request that names the wrong kind of end, with the symbol named and `kin refs <id>` given as the command that lists its callers, and a route to one of those callers ends one call short of it. An `external_reference` id the graph holds no symbol under is reported as an end that did not resolve.
+
 Every hop names the entity, its kind, its file and line, the relation that joins it to the next hop and the 1-based lines of the syntax that produced that edge (or, when the graph recorded no site, why under `site_lines_absent_reason`). The answer says which sense held (`direction`), how many shortest routes exist (`routes_total`), what each walk explored and why it stopped (`explored`), and how each end resolved, including how many entities carry the same exact name (`same_name_candidates`). A qualified name (`Worker::search`) that names no entity resolves to its bare leaf when exactly one entity carries it, and is refused with the candidates listed when several do, so a twin is never chosen silently under a qualifier. A no-route answer is explicit: `found: false`, an empty `routes`, and a `gap` naming what stopped the walk (`frontier_exhausted`, `depth_bound`, `edge_ceiling`, `time_budget`) with the remedy, and the `_kin.verdict` beside it says whether that absence can be trusted. The same query is served to agents as the `trace_path` MCP tool.
 
 ### `kin impact`
@@ -394,6 +412,13 @@ kin impact <entity> [options]
 | `--kind <kind>` |  | Exact entity-kind qualifier (for example: function or method) |
 | `--signature <signature>` |  | Whitespace-normalized declaration signature for overload resolution |
 | `--json` |  | Emit the ranked graph-evidence report as JSON; ambiguous identities fail closed |
+
+An `external_reference:<uuid>` id, or its bare uuid, names a symbol outside the
+repository, which has no dependents of its own here to walk. `kin impact`
+refuses it with resolution `external_symbol`, names the symbol, and gives
+`kin refs <id>` as the command that lists the entities a change to it reaches.
+An `external_reference` id this repository's graph holds no symbol under is
+reported with resolution `not_found`.
 
 ### `kin refs`
 
@@ -454,6 +479,58 @@ and nothing at the site settles the destination. A reader working through an
 agent has no grep to check a row against, so the tier is the whole of what it
 has.
 
+A symbol outside the repository, such as `Array.map` in TypeScript's own
+library, is named by the `external_reference:<uuid>` id that `kin context`,
+`kin trace` and the MCP tools print for it, or by its bare uuid. `kin refs`
+then lists the entities in this repository that call it. The first line names
+the symbol, its package and version, and whether it is a standard library.
+Each row is one caller: where it is declared, the relation, its resolution
+tier, its sites and the proof, which names the language server and version
+that proved the call. A site is written `+N`, N lines below the caller's first
+line, the offset a numbered body shows. The graph records no location for the
+external declaration, so none is printed for it. Only calls a language server
+proved are recorded, so the list is a floor, and the answer says so. The rows
+are the ones `find_references` returns for the same id.
+
+```
+kin refs external_reference:<uuid>
+References to 'external_reference:<uuid>' -> Array.map (external symbol, npm typescript 5.6.3, standard library)
+referenced by 1 entity:
+  render @ src/app.ts:11 [Calls] (type_resolved) sites +2, +5 proven_external by lsp:tsserver 5.6.3 (lsp_definition)
+```
+
+An `external_reference` id this repository's graph holds no symbol under is
+refused as that, not as a missing entity. `--bulk-json` classifies repository
+entities, so an external id there is an error row with `error:
+"external_symbol_not_served"`, the `symbol` record `kin refs` names, and a
+`detail` naming the symbol and the `kin refs` command that lists its callers.
+The `bulk_check_references` MCP tool gives it the same row.
+
+`kin refs` lists incoming references only, so an entity's own calls out of the
+repository are listed by `kin context` and `kin trace` instead.
+
+Every answer about a repository entity ends with the call sites of the callers
+in the files that import the entity's file, the block the `find_references`
+MCP tool serves as `call_sites` over the same files. It counts the callers read,
+the callers still owed a call-site ledger, and the sites their ledgers hold,
+then prints one `not settled:` line per unsettled kind in the words the verdict
+reads, or says every site in scope is settled. A caller no ledger describes yet
+is owed enrichment while a resolver for its language can still prove its sites,
+and a site the resolver left unresolved, failed at, found outside any build or
+read as a value binding is not settled; either way a caller of the entity may be
+among those sites. When no resolver can prove a caller's sites on this host now,
+because the daemon runs with language-server enrichment switched off, no
+language server serves the language, or the one that does cannot start, the
+caller is not owed: the header counts it as one no resolver can prove, and its
+`not settled: call_sites_unproven_no_resolver:` line names why for each
+language. Waiting does not settle those; installing the server does, once the
+next sweep runs. The daemon's JSON carries the block under `call_sites`.
+
+```
+Call sites in the files that import the focal's file: 12 across 5 caller(s), 1 caller(s) owed
+  not settled: call_sites_owed: 1 of the 5 callers in the files that import the focal's file have call sites the graph has not settled yet because their derivation or enrichment is owed, so a call there is not accounted for
+```
+
 ### `kin context`
 
 Build a context pack for one entity, several, or a question
@@ -509,6 +586,44 @@ unrelated. It is true when a route search stopped at its own bound, in which
 case an absent route says nobody looked far enough rather than that the graph
 joins nothing.
 
+A pack lists the calls its focals make into symbols outside the repository
+that a language server proved, such as `Array.map` in TypeScript's own
+library, under `--- External calls ---` after the pack. Each line names the
+symbol, its package and version, whether it is a standard library, the proof,
+the sites as `+N` offsets inside the focal with the text at each one, and the
+`external_reference:<uuid>` id that `kin refs` takes to list the symbol's
+callers. A pack built from several focals starts each line with the focal
+that makes the call. The header counts them on an `External calls` line when
+there are any. `--json` carries the same rows under `external_calls`, in the
+shape `get_context_pack` serves, with `dependency_selection.external_calls_returned`
+and, for several focals, the calling focal's id in `caller_id`. The rows sit
+beside the pack rather than inside the part fitted to `--budget`, at most 50
+of them, and `measured_tokens` counts them.
+
+Given an `external_reference:<uuid>` id, or its bare uuid, as a focal,
+`kin context` refuses the way `get_context_pack` does: the symbol has no body
+or neighborhood in this repository to build a pack around, so the message
+names it and gives `kin refs <id>` as the command that lists its callers.
+Beside other focals it is reported as unresolved with the same message.
+
+A pack also lists its focal's own call sites under `--- Call sites ---`, from
+the focal's call-site ledger: one line per site, `+N` lines below the focal's
+first line with the text at the site, its state, the reason behind an
+unsettled state and the id of the target a resolver proved. The section ends
+with one `not settled:` line per unsettled kind, or says every site is
+settled. A focal no ledger describes yet reads as `owed_enrichment` and lists
+no site. A pack built from several focals counts the sites of every focal
+without listing them. `--json` carries the same block under `call_sites`, in
+the shape `get_context_pack` serves.
+
+```
+Call sites in the focal's own body: 3 across 1 caller(s) (current)
+  +1 `load` proven_outside
+  +2 `fetch` proven_target -> entity:<uuid>
+  +3 `render` unresolved (no_answer)
+  not settled: call_sites_unresolved: 1 of the 3 call sites in the focal's own body got an answer that proves no target
+```
+
 ### `kin source`
 
 Print the exact implementation body for an entity
@@ -555,6 +670,11 @@ kin history <entity> [options]
 | `--all-revisions` |  | List every file-level revision, including ones that did not change this entity |
 | `--ref <ref>` |  | Resolve history against a specific ref. Accepts `HEAD`, `HEAD~N`, branch names, `branch:&lt;name&gt;`, imported Git commits as `git:&lt;sha&gt;` or bare 40-hex SHAs, and semantic changes as `kin:&lt;id&gt;`, `change:&lt;id&gt;`, or bare change IDs. |
 
+A symbol outside the repository, named by its `external_reference:<uuid>` id or
+its bare uuid, has no revisions in this repository, at the head or at any ref.
+`kin history` and `kin blame` refuse it, naming the symbol and giving
+`kin refs <id>` as the command that lists its callers.
+
 ### `kin blame`
 
 Show blame (version history) for an entity
@@ -573,6 +693,9 @@ kin blame <entity> [options]
 | `--kind <kind>` |  | Exact entity-kind qualifier (for example: function or method) |
 | `--all-revisions` |  | List every file-level revision, including ones that did not change this entity |
 | `--ref <ref>` |  | Resolve blame against a specific ref. Accepts `HEAD`, `HEAD~N`, branch names, `branch:&lt;name&gt;`, imported Git commits as `git:&lt;sha&gt;` or bare 40-hex SHAs, and semantic changes as `kin:&lt;id&gt;`, `change:&lt;id&gt;`, or bare change IDs. |
+
+`kin blame` refuses a symbol outside the repository the way `kin history` does,
+since it has no revisions here to attribute.
 
 ### `kin overview`
 
@@ -612,6 +735,11 @@ kin xref <entity>
 | --- | --- | --- |
 | `<entity>` | yes | Entity name or ID |
 
+`kin xref` anchors its cross-repo lookup on an entity of this repository. A
+symbol outside every repository, named by its `external_reference:<uuid>` id or
+its bare uuid, is no such anchor, so it is refused with the symbol named and
+`kin refs <id>` given as the command that lists its callers here.
+
 ### `kin dead-code`
 
 Find dead code (whole-repo scan, or seeded by semantic query)
@@ -641,6 +769,8 @@ kin trace-data-flow [options]
 | `--direction <dir>` |  | Traversal direction: `calls`, `callers`, or `both` (default both). |
 | `--limit-per-step <m>` |  | Max relations expanded per step (default 5, capped at 25). |
 | `--max-response-chars <c>` |  | UTF-8 bytes the printed JSON may occupy (default 45,000; a value below 2,000 or above 60,000 is served as 2,000 or 60,000). Bodies go first, then whole branches, and at least one step is kept. A walk whose smallest retained form still does not fit is refused with an error naming that floor, rather than printed over the limit. The MCP `trace_data_flow` tool answers the same walk with a disclosed overrun instead. |
+
+A symbol outside the repository is where a walk stops, never where one starts. A focal naming one, by its `external_reference:<uuid>` id or its bare uuid, is refused with the JSON error the `trace_data_flow` MCP tool gives, code `external_symbol_not_served`, which names the symbol and carries its record. A walk from one of its callers reaches it as a leaf step.
 
 ### `kin security`
 
@@ -1079,6 +1209,13 @@ kin review [<subcommand>] [change] [options]
 | `--files <files>` |  | Comma-separated file paths to review |
 | `--changes <changes>` |  | Comma-separated change IDs to combine into one review |
 
+`--entities` reviews repository entities, and reads an id no entity carries as
+a removed entity. A symbol outside the repository, named by its
+`external_reference:<uuid>` id or its bare uuid, was never removed from it, so
+it is refused before anything is reviewed, with the symbol named and
+`kin refs <id>` given as the command that lists its callers. An
+`external_reference` id the graph holds no symbol under is refused as that.
+
 Run `kin review` with no subcommand for the default behavior above, or one of:
 
 #### `kin review shadow`
@@ -1287,6 +1424,13 @@ kin verify entity <entity>
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<entity>` | yes | Entity name or ID |
+
+Tests link to repository entities, so a symbol outside the repository, named
+by its `external_reference:<uuid>` id or its bare uuid, has none here. `kin
+verify entity`, `kin verify plan` and `kin verify run` refuse it with the
+symbol named and `kin refs <id>` given as the command that lists its callers,
+rather than reporting that no entity matched. An `external_reference` id the
+graph holds no symbol under is reported as no entity matching it.
 
 #### `kin verify plan`
 
@@ -2155,6 +2299,15 @@ kin note add <target> [options]
 | `-k, --kind <kind>` |  | Annotation kind: comment, warning, instruction, reasoning |
 | `-b, --body <body>` |  | Annotation body |
 
+A note is anchored to what the graph holds. An entity id, given as
+`entity:<uuid>` or bare, that the graph holds no entity under is refused and
+nothing is written, with `kin locate` given as the way to find the id. A
+symbol outside the repository, named by its `external_reference:<uuid>` id,
+as an `entity:` target or by its bare uuid, is refused with the symbol named
+and `kin refs <id>` given as the command that lists its callers, since a note
+belongs on one of them. The `kin_annotation_add` MCP tool refuses the same
+targets.
+
 #### `kin note list`
 
 List annotations for a semantic scope or work item
@@ -2674,8 +2827,34 @@ Subcommands:
 Quick health check of the semantic graph
 
 ```
-kin graph status
+kin graph status [options]
 ```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--json` |  | Output machine-readable JSON: the rendered lines beside the structured reference-edge coverage, relation census, graph section and call-site shares |
+
+Among its lines it counts every call site the graph's call-site ledgers hold, by
+the state each reads as, with each state's share of that census, the callers no
+current ledger describes yet, and the files holding them. The block is the one
+the `kin_graph_status` MCP tool serves as `call_sites`, and `--json` carries it
+under `call_sites` with `census`, `shares` (for every state its `sites` and its
+`share` of the census, which add up to it), `callers_owed` and `owed_files`.
+Callers no resolver can prove on this host now are counted apart, under
+`callers_unproven_no_resolver` with their reasons in `no_resolver`, and are not
+owed files, since no sweep will reach them until the host changes.
+
+```
+Call sites in the store: 1840 across 612 caller(s), 14 caller(s) owed
+  by state: proven_target 1102 (60%), proven_external 431 (23%), proven_outside 229 (12%), unresolved 78 (4%)
+  owed enrichment: src/cli/main.py (9 caller(s))
+  owed enrichment: src/io/files.py (5 caller(s))
+  not settled: call_sites_owed: 14 of the 612 callers in the store have call sites the graph has not settled yet because their derivation or enrichment is owed, so a call there is not accounted for
+  not settled: call_sites_unresolved: 78 of the 1840 call sites in the store got an answer that proves no target
+```
+
+In `--json` a critical graph health issue still exits non-zero after the JSON
+is printed.
 
 #### `kin graph validate`
 
@@ -2687,7 +2866,7 @@ kin graph validate
 
 #### `kin graph owed`
 
-Show the owed derivation ledger repository authority holds: each source body owed a parse, and the re-derivation that last paid the workspace. Reads the local store only; starts no daemon, admits nothing, and migrates no earlier build's records
+Show the owed derivation ledger repository authority holds: each source body owed a parse, and the re-derivation that last paid the workspace, then the files whose callers are owed enrichment. Reads the local store only; starts no daemon, admits nothing, and migrates no earlier build's records
 
 ```
 kin graph owed [options]
@@ -2697,17 +2876,19 @@ kin graph owed [options]
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON (`kin.graph.owed-derivations.v1`) |
 
-It reports the owed derivation records persisted in repository authority, and nothing else. It reads the authority snapshot and its acknowledged journal, checks both against the digests the authority record names, replays the journal onto the snapshot's envelope and runs the ledger checks a full open runs. When that read cannot answer, it validates the store in full: the recovery, whole-history replay and body checks a full open runs. Either way the ledger it prints is one an open would accept.
+It reports the owed derivation records persisted in repository authority, then the owed enrichment described below. For the ledger it reads the authority snapshot and its acknowledged journal, checks both against the digests the authority record names, replays the journal onto the snapshot's envelope and runs the ledger checks a full open runs. When that read cannot answer, it validates the store in full: the recovery, whole-history replay and body checks a full open runs. Either way the ledger it prints is one an open would accept.
 
 It writes nothing to the store on either path. An open also records its history validation, and finishes what an interrupted write or promotion left behind, such as a superseded snapshot or a staged authority record; this command does neither, so every file in the store is as it found it, and a record an interrupted write left staged is refused until a daemon or another command finishes that write. It never contacts or starts a daemon, admits nothing and reads nothing from the working copy.
 
-It can run while a daemon serves the repository. It reads under the repository authority lock, which a daemon also takes while it commits, and it waits up to 10 seconds in total for the store lock: while another process holds it, the command retries, holding nothing, and when the 10 seconds are spent it refuses with a message that another process held the repository authority lock. How long it then holds the lock depends on the path. The envelope read holds it only while it reads the snapshot and the journal and checks them against the authority record. The full validation, taken only when that read cannot answer, holds it through the whole recovery, history replay and body check until the ledger is printed, which on a large store can take much longer, and a daemon's commit waits for it.
+It can run while a daemon serves the repository. It reads under the repository authority lock, which a daemon also takes while it commits, and it waits up to 10 seconds in total for the store lock: while another process holds it, the command retries, holding nothing, and when the 10 seconds are spent it refuses with a message that another process held the repository authority lock. How long it then holds the lock depends on the path. The envelope read holds it only while it reads the snapshot and the journal and checks them against the authority record. The full validation, taken only when that read cannot answer, holds it through the whole recovery, history replay and body check until the ledger is printed, which on a large store can take much longer, and a daemon's commit waits for it. The owed enrichment below always takes the full validation, and holds the lock until the workspace graph is materialized.
 
 It does not migrate legacy state. The `semantic-debt.json` and `unpublished-enrichment.json` files an earlier build kept beside the store are not ledger records: a daemon of this build judges them at its first start and carries what they still owe into repository authority with its next transaction, and until then this command does not show them. A workspace with no records therefore reads "no owed derivation records in repository authority", which says what the ledger holds and not that no semantic work is owed: an earlier build's record that has not migrated, or enrichment that is still incomplete, can remain.
 
 Every workspace authority holds is listed with its records and, whenever authority records one, its last payment, even when no records remain. The JSON carries `schema`, `repository_id`, the logical `generation` the ledger was read at, and `workspaces`, each with `workspace_id`, `records` and `payment`. A record has `path` (its UTF-8 rendering, or `null` when the path has none), `path_hex` (the exact path bytes), `body` (the digest of the body the parse is owed for), `recorded_at` (the logical generation that recorded it) and `cause` (`publication`, or `legacy` for a record carried in from an earlier build's file). A payment has `paid_through` (the generation the paying commit was taken against), `operation_id` and `hydration_version`.
 
 When authority cannot be read, for example a store layout newer than this build, damaged authority, a ledger that fails its checks, or a lock still held when its 10 seconds are spent, it prints nothing on stdout, names the cause on stderr, and exits non-zero.
+
+After the ledger it reports owed enrichment for this store's own workspace: every file holding an entity with source text that no current call-site ledger describes, with how many such callers each holds. Until a language-server sweep writes a caller's ledger, its call sites are not accounted for, whatever the derivation ledger says. The workspace graph is derived state, so this half validates authority in full, still writing nothing and within the same 10-second lock budget, materializes the workspace graph from it, and releases the lock before it reads the graph. Each caller is read in the order every Kin surface reads it: an owed derivation, then no ledger, then a stale proof context, then the ledger. The line reads `owed enrichment in workspace <id>: <owed> of the <callers> callers with source text hold no current call-site ledger, in <n> file(s)`, followed by one `<path>: <n> caller(s)` line per file, or says every caller holds a current ledger or sits in a file the parser read no call in, which needs none. When the graph cannot be read, the line names why and says it was not read; the ledger above is still reported and the command still exits zero. The JSON carries it as `owed_enrichment`, with `workspace_id`, `callers`, `callers_owed`, `files` (each with `file` and `callers`) and, when the graph could not be read, `unavailable`.
 
 #### `kin graph inspect`
 
@@ -2724,6 +2905,10 @@ kin graph inspect <name> [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON ({lines, error}); missing entities exit 0 with structured error. |
+
+An `external_reference:<uuid>` id, or its bare uuid, names a symbol outside the
+repository, which has no entity record here. It is refused with the symbol
+named and `kin refs <id>` given as the command that lists its callers.
 
 #### `kin graph source`
 
@@ -3035,7 +3220,13 @@ Ask this repository's daemon for a language-server enrichment sweep
 kin daemon sweep [options]
 ```
 
-The sweep derives the cross-file reference, override and type-use edges a single-file parse cannot, and it skips files the graph already holds server evidence for. `kin init` runs one and every daemon start queues one, so this is the surface for the case those did not finish: a sweep killed with its daemon, a store converted before a language server was installed, or a repository whose sweeps the daemon has stopped queueing because the last three all died without enriching anything. It prints the daemon's own answer, waits for the sweep by default, and fails loudly when no daemon answers or when the daemon has no language server to enrich with.
+The sweep derives the cross-file reference, override and type-use edges a single-file parse cannot, and it skips files the graph already holds server evidence for. `kin init` runs one and every daemon start queues one, so this is the surface for the case those did not finish: a sweep killed with its daemon, a store converted before a language server was installed, or a repository whose sweeps the daemon has stopped queueing because the last three all died without enriching anything. It prints the daemon's own answer, waits for the sweep by default, and fails loudly when no daemon answers or when the daemon has no language server to enrich with. The wait lasts up to 900 seconds. When it runs out the command exits non-zero and says how far the sweep has reached, and the sweep keeps running in the daemon, which publishes it when it ends. The sweep commits its progress as it goes, so a sweep whose daemon is stopped before it ends resumes on the next daemon start, skipping the files already recorded as finished. A question the language server answers in a way Kin cannot prove, such as a call hierarchy prepared for a different entity, gets the same answer every time, so it is recorded as unprovable and the file still finishes; `/lsp/sweep/status` names those files under `unprovable_files`. Only a question that got no answer, a timeout or a server that stopped answering, leaves its file owed.
+
+The record of finished files lives in the store's repository authority, and a store that holds one is written at authority snapshot format version 21 (22 when it carries a graph section) and journal frame version 6. The operation that recorded it stays in the store's operation log, so the store keeps those versions after its files are edited. A Kin build that reads at most snapshot version 20 and frame version 5 refuses such a store at the header with an `incompatible snapshot schema` or `unsupported authority frame version` error that names the version it needs, and no path back to such a build is promised for a store this build has swept.
+
+When the language server answers that a call names a declaration outside the repository, in a standard library or an installed dependency, the sweep records the call as a proven call into that symbol. The symbol is named by the package that holds it, at the version the server loaded, and by the chain of declarations the server's own symbols give it, the way SCIP names symbols: `Array.map` in TypeScript 5.6.3 is `npm typescript 5.6.3` and `` `lib.es5.d.ts`/Array#map(). ``, and it is the same symbol in every repository on that version. Each such proof names the proof context it was made under: the language server, its version, and hashes of its configuration and of the environment it answered against. A later sweep under another context records each site it proves again under that context. A declaration outside the repository that the server's symbols do not name still retires the in-repository guesses at the call, and records no symbol. A store that holds these symbols or proof contexts is written at authority snapshot format version 23 (24 when it carries a graph section) and journal frame version 7, which a Kin build that reads at most snapshot version 22 and frame version 6 refuses at the header. Every store is swept once more after upgrading to this build, because files an earlier sweep finished recorded no such proofs.
+
+Every entity with source text in a file the sweep finishes gets a call-site ledger: how many call expressions Kin's parser reads in its body, and one state for each of them, keyed by where its callee sits inside the entity. A site is proven (to a repository declaration, to a named external symbol, or outside the repository with no symbol to name), a call through a value binding that proves no target, in a file no build compiles, a site where the language server timed out, crashed or broke protocol, or unresolved, with the reason. An entity with no call gets a ledger that counts none, so an entity without a ledger is one whose enrichment is still owed. A file is recorded as finished only once every entity in it has a ledger, and an edit that changes an entity drops its ledger and the file's record together. A proven site is carried by a call edge whose evidence names the proof context. When a file is proven again after every pass over it finished, a proof its ledgers no longer hold, including one made under another context or under none, leaves its edge, and an edge left with no site is removed; a file whose passes failed keeps its proofs. A file whose language server keeps failing on the same bytes under the same proof context is recorded on its third attempt with the sites the server failed at, so the sweep stops asking about it. A store that holds call-site ledgers is written at authority snapshot format version 25 (26 when it carries a graph section), journal frame version 8 and graph delta version 7, which a Kin build that reads at most snapshot version 24, frame version 7 and delta version 6 refuses at the header. Every store is swept once more after upgrading to this build, because files an earlier sweep finished have no ledgers.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -3221,7 +3412,7 @@ kin setup [<subcommand>] [options]
 | `--auto-daemon` |  | Auto-start kin-daemon when entering workspaces |
 | `--no-interactive` |  | Run non-interactively using defaults or provided flags |
 | `--skip-mcp-check` |  | Skip the MCP round trip that proves each configured AI client can actually call Kin (for a scripted install with no repository yet) |
-| `--install-language-servers` |  | Install the missing language servers this build enriches with, without asking. Each install is a network download into a shared prefix, so an interactive run asks first and a scripted one needs this flag |
+| `--install-language-servers` |  | Install the missing language servers without asking: only for the languages the repository setup runs in uses, and for every language outside one. An install can write outside Kin's directory, and the run says so before it does, so an interactive run asks first and a scripted one needs this flag |
 | `--resource-profile <profile>` |  | Record this machine's resource profile without the advanced prompt: proof, interactive, throughput, or ci |
 | `--embedding-model <when>` | `later` | When the embedding model is fetched: `later`, or `never` on a machine that does not fetch it. Setup never downloads it either way |
 | `--embedding-provider <where>` | `local` | Where vectors are computed: `local`, or `remote` for an OpenAI-compatible endpoint. `remote` collects no credential |

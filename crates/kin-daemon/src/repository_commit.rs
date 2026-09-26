@@ -2448,7 +2448,8 @@ fn plan_native_commit_inner(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
-        external_reference_deltas: Vec::new(),
+        external_reference_deltas: deltas.external_reference_deltas,
+        resolution_record_deltas: deltas.resolution_record_deltas,
     };
     change.id = compute_semantic_change_id(&change)?;
     let entity_scope_ids = change
@@ -2663,6 +2664,21 @@ pub(crate) fn load_native_source_blob(
     hash: Hash256,
 ) -> Result<Vec<u8>> {
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    load_native_source_blob_from(&authority, hash)
+}
+
+/// [`load_native_source_blob`] through an authority the caller already holds.
+///
+/// Repository CAS is content-addressed and immutable, so every open authority
+/// over one store reads the same bytes for one digest, and the read verifies
+/// them against it. Opening the store again to read one body decodes the whole
+/// persisted authority and re-verifies every body in CAS first: about four
+/// seconds a read on a converted 3,600-file TypeScript repository, paid three
+/// times by every guarded entity edit.
+pub(crate) fn load_native_source_blob_from(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    hash: Hash256,
+) -> Result<Vec<u8>> {
     authority.load_source_blob(hash)?.ok_or_else(|| {
         invalid(format!(
             "repository source CAS is missing exact body {hash}"
@@ -3338,6 +3354,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         artifact
@@ -5215,6 +5232,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         let plan = plan_native_commit(

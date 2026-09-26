@@ -299,6 +299,15 @@ fn plan_and_commit(
 
     let entity_deltas = entity_transition(&previous_state, &target_state);
     let relation_deltas = relation_transition(&previous_state, &target_state);
+    // The restored state's external symbols and resolution records, exactly.
+    let restored_nodes = kin_core::with_resolution_node_transition(
+        kin_model::WorkspaceSemanticDelta::default(),
+        &previous_state.external_references,
+        &previous_state.resolution_records,
+        &target_state.external_references,
+        &target_state.resolution_records,
+    )
+    .context("plan the exact restoration of external symbols and resolution records")?;
     let tree_deltas = kin_core::exact_tree_correction(&previous_state.tree, &target_tree)
         .context("plan the exact artifact restoration")?;
     if entity_deltas.is_empty() && relation_deltas.is_empty() && tree_deltas.is_empty() {
@@ -335,7 +344,8 @@ fn plan_and_commit(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
-        external_reference_deltas: Vec::new(),
+        external_reference_deltas: restored_nodes.external_reference_deltas().to_vec(),
+        resolution_record_deltas: restored_nodes.resolution_record_deltas().to_vec(),
     };
     change.id =
         compute_semantic_change_id(&change).context("compute the rollback change identity")?;
@@ -350,26 +360,18 @@ fn plan_and_commit(
         compute_resolved_tree_hash(&target_tree).context("hash the restored tree")?;
     let workspace_tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &target_tree)
         .context("plan the exact workspace restoration")?;
-    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
-        &workspace_graph.entities,
-        &workspace_graph.relations,
-        &target_state.entities,
-        &target_state.relations,
-    )
-    .context("plan the exact workspace semantic restoration")?;
-    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+    let workspace_semantic_delta =
+        crate::local_repository_authority::plan_workspace_graph_transition(
+            crate::local_repository_authority::TargetGraph::of_snapshot(&workspace_graph),
+            crate::local_repository_authority::TargetGraph::of_state(&target_state),
+        )
+        .context("plan the exact workspace semantic restoration")?;
+    let mut daemon_delta = crate::local_repository_authority::plan_daemon_graph_transition(
         state,
-        &target_state.entities,
-        &target_state.relations,
+        crate::local_repository_authority::TargetGraph::of_state(&target_state),
     )
     .context("plan the exact workspace semantic restoration for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: workspace_tree_deltas.clone(),
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+    daemon_delta.tree_deltas = workspace_tree_deltas.clone();
     preflight_rollback_delta(state, &workspace.tree, &target_state, &daemon_delta)?;
 
     let new_target = RefTarget::change(inverse_change_id);

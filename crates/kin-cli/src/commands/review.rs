@@ -389,6 +389,18 @@ fn compute_review(
     Option<(kin_model::SemanticChangeId, kin_model::SemanticChange)>,
 )> {
     if let Some(entity_csv) = entities {
+        // The review reads an id no entity carries as a removed entity, and a
+        // symbol declared outside the repository was never removed from it,
+        // so such an id is refused by what it is before anything is reviewed.
+        for id in entity_csv.split(',') {
+            if let Some(lines) = crate::commands::external_symbols::entity_argument_refusal(
+                graph,
+                id,
+                "`kin review` has no change of its own here to review",
+            )? {
+                anyhow::bail!(lines.join("\n"));
+            }
+        }
         let entity_ids = parse_entity_ids(&entity_csv)?;
         let mut text = String::new();
         writeln!(
@@ -1695,6 +1707,7 @@ mod tests {
             risk_summary: None,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         base.id = kin_model::compute_semantic_change_id(&base).unwrap();
         let base_id = base.id;
@@ -1716,6 +1729,7 @@ mod tests {
             risk_summary: None,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         head.id = kin_model::compute_semantic_change_id(&head).unwrap();
         let head_id = head.id;
@@ -1738,5 +1752,57 @@ mod tests {
             serde_json::from_str(response.json.as_deref().expect("json response")).unwrap();
         assert!(json.get("hydrated_changes").is_none());
         assert_eq!(json["review_mutations"], 0);
+    }
+
+    /// A review of named entities reads each one's changes. A symbol outside
+    /// the repository has none here, and read as a removed entity it would
+    /// be reviewed as a deletion that never happened, so `--entities` refuses
+    /// it by what it is, by its address or its bare id, alone or beside a
+    /// repository entity.
+    #[test]
+    fn review_entities_refuses_an_external_symbol() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let binding = absent_binding(&layout);
+        for entities in [
+            store.address(),
+            store.node.id.to_string(),
+            format!("{},{}", store.caller.id, store.address()),
+        ] {
+            let error = match compute_review(
+                &binding,
+                &store.graph,
+                None,
+                Some(entities.clone()),
+                None,
+                None,
+            ) {
+                Ok(_) => panic!("{entities} was reviewed"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains("Array.map"), "{error}");
+            assert!(
+                error.contains(&format!("kin refs {}", store.address())),
+                "{error}"
+            );
+            assert!(!error.contains("invalid entity UUID"), "{error}");
+        }
+        let unknown = "external_reference:00000000-0000-8000-8000-000000000000";
+        let error = match compute_review(
+            &binding,
+            &store.graph,
+            None,
+            Some(unknown.to_string()),
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("an unknown address was reviewed"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("names no symbol outside the repository"),
+            "{error}"
+        );
     }
 }

@@ -81,6 +81,35 @@ pub enum LanguageServerReadiness {
 pub type LanguageServerReadinessMap =
     std::collections::HashMap<LanguageId, LanguageServerReadiness>;
 
+/// The words a sweep's skip reason uses when no server is installed where the
+/// daemon looks.
+///
+/// Shared so the daemon that writes a skip reason and the CLI that reads one
+/// agree on the one fact the CLI acts on: whether installing a server is the
+/// repair. `kin init` printed "enriched none" over a Go repository with no
+/// gopls and never named the install command, because nothing on the reading
+/// side could tell a missing server from a broken one.
+const NOT_ON_DAEMON_PATH: &str = "is on this daemon's PATH";
+
+/// The skip reason for a server that is not installed where this daemon looks.
+///
+/// `command` is the server the daemon tried to start, when it knows which.
+pub fn no_server_on_daemon_path(command: Option<&str>) -> String {
+    match command {
+        Some(command) => format!("no `{command}` {NOT_ON_DAEMON_PATH}"),
+        None => format!("no server for it {NOT_ON_DAEMON_PATH}"),
+    }
+}
+
+/// Whether a skip reason says no server is installed, which installing one
+/// repairs.
+///
+/// A server that was found and would not start is a different repair and does
+/// not match: its reason carries the server's own complaint instead.
+pub fn skip_reason_is_missing_server(reason: &str) -> bool {
+    reason.contains(NOT_ON_DAEMON_PATH)
+}
+
 /// Whether cross-file reference evidence is available for one language.
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1521,6 +1550,46 @@ pub const PARSE_HOLE_LIMITING_FACTOR: &str = "parse_hole";
 #[cfg(test)]
 mod tests {
     use crate::retained_parse::{ObservedParse, RetainedParseRead};
+
+    /// A reader can tell "no server is installed" from "a server would not
+    /// start", in the wording the daemon actually writes.
+    ///
+    /// The first is repaired by installing a server and the second is not, so
+    /// `kin init` names the install command only for the first.
+    #[test]
+    fn a_missing_server_reason_is_told_apart_from_a_broken_one() {
+        use super::{no_server_on_daemon_path, skip_reason_is_missing_server};
+
+        // The daemon's words, byte for byte, so the text a user already sees
+        // does not change under them.
+        assert_eq!(
+            no_server_on_daemon_path(Some("gopls")),
+            "no `gopls` is on this daemon's PATH"
+        );
+        assert_eq!(
+            no_server_on_daemon_path(None),
+            "no server for it is on this daemon's PATH"
+        );
+        // Wrapped the way the sweep wraps a start failure.
+        let wrapped = format!(
+            "the `gopls` language server did not start ({}), so nothing in this language was \
+             enriched",
+            no_server_on_daemon_path(Some("gopls"))
+        );
+        assert!(skip_reason_is_missing_server(&wrapped), "{wrapped}");
+        assert!(skip_reason_is_missing_server(&no_server_on_daemon_path(
+            None
+        )));
+        // Controls: a server that was found and refused is not a missing one.
+        assert!(!skip_reason_is_missing_server(
+            "`rust-analyzer` on this daemon's PATH is rustup's proxy, and no installed \
+             toolchain ships it"
+        ));
+        assert!(!skip_reason_is_missing_server(
+            "the `pyright-langserver` language server did not start (initialize failed), so \
+             nothing in this language was enriched"
+        ));
+    }
 
     /// A host where exactly these languages have a usable server.
     fn usable(languages: &[LanguageId]) -> LanguageServerReadinessMap {

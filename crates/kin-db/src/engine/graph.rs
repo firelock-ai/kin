@@ -1295,6 +1295,8 @@ struct EntityData {
     entities: HashMap<EntityId, Entity>,
     entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
     external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    /// Resolution records, indexed by the nodes and records they name.
+    resolution_records: ResolutionRecordSet,
     relations: HashMap<RelationId, Relation>,
     /// Entity → outgoing relation IDs (entity's dependencies).
     outgoing: HashMap<EntityId, Vec<RelationId>>,
@@ -1461,11 +1463,28 @@ impl PublicationPhaseTimer {
 /// event names which term paid it.
 const SLOW_CHANGE_INSTALL: std::time::Duration = std::time::Duration::from_millis(250);
 
+#[cfg(test)]
+thread_local! {
+    /// Elements the sequential pending-delta helpers scanned on this thread,
+    /// so a test can tell a linear recording from a quadratic one without
+    /// timing it.
+    static PENDING_DELTA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_pending_delta_scan<K, V>(delta: &CollectionDelta<K, V>) {
+    PENDING_DELTA_SCANS.with(|scans| {
+        scans.set(scans.get() + delta.added.len() + delta.modified.len() + delta.removed.len())
+    });
+}
+
 fn delta_map_upsert<K, V>(delta: &mut CollectionDelta<K, V>, key: K, value: V)
 where
     K: Eq + Clone,
     V: Clone,
 {
+    #[cfg(test)]
+    note_pending_delta_scan(delta);
     delta.removed.retain(|removed| removed != &key);
     if let Some((_, existing)) = delta
         .added
@@ -1539,10 +1558,172 @@ where
     delta.removed.retain(|key| !restored.contains(key));
 }
 
+/// Sequential [`delta_map_upsert`] and [`delta_map_remove`] calls against one
+/// pending [`CollectionDelta`], at constant cost each.
+///
+/// The vectors are indexed once when recording starts, removals leave holes,
+/// and dropping the recorder writes back exactly the vectors the same calls in
+/// the same order would have left, holes closed in place. One transaction
+/// records every entity, relation and edge list it moves, and materializing a
+/// workspace applies its whole semantic overlay as one transaction, so the
+/// per-call scans made that recording quadratic in the overlay.
+struct IndexedDeltaRecorder<'a, K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    target: &'a mut CollectionDelta<K, V>,
+    added: Vec<Option<(K, V)>>,
+    modified: Vec<Option<(K, V)>>,
+    removed: Vec<Option<K>>,
+    /// Every live position of each key in the vector of the same name, in
+    /// ascending order.
+    added_at: HashMap<K, Vec<usize>>,
+    modified_at: HashMap<K, Vec<usize>>,
+    removed_at: HashMap<K, Vec<usize>>,
+}
+
+impl<'a, K, V> IndexedDeltaRecorder<'a, K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    fn new(target: &'a mut CollectionDelta<K, V>) -> Self {
+        fn positions<K: Eq + std::hash::Hash + Clone>(
+            keys: impl Iterator<Item = K>,
+        ) -> HashMap<K, Vec<usize>> {
+            let mut at: HashMap<K, Vec<usize>> = HashMap::new();
+            for (index, key) in keys.enumerate() {
+                at.entry(key).or_default().push(index);
+            }
+            at
+        }
+        let added: Vec<Option<(K, V)>> = std::mem::take(&mut target.added)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let modified: Vec<Option<(K, V)>> = std::mem::take(&mut target.modified)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let removed: Vec<Option<K>> = std::mem::take(&mut target.removed)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let added_at = positions(added.iter().flatten().map(|(key, _)| key.clone()));
+        let modified_at = positions(modified.iter().flatten().map(|(key, _)| key.clone()));
+        let removed_at = positions(removed.iter().flatten().cloned());
+        Self {
+            target,
+            added,
+            modified,
+            removed,
+            added_at,
+            modified_at,
+            removed_at,
+        }
+    }
+
+    /// What [`delta_map_upsert`] does, without scanning.
+    fn upsert(&mut self, key: K, value: V) {
+        if let Some(positions) = self.removed_at.remove(&key) {
+            for position in positions {
+                self.removed[position] = None;
+            }
+        }
+        if let Some(&first) = self.added_at.get(&key).and_then(|at| at.first()) {
+            if let Some((_, existing)) = self.added[first].as_mut() {
+                *existing = value;
+            }
+            return;
+        }
+        if let Some(&first) = self.modified_at.get(&key).and_then(|at| at.first()) {
+            if let Some((_, existing)) = self.modified[first].as_mut() {
+                *existing = value;
+            }
+            return;
+        }
+        let index = self.modified.len();
+        self.modified.push(Some((key.clone(), value)));
+        self.modified_at.entry(key).or_default().push(index);
+    }
+
+    /// What [`delta_map_remove`] does, without scanning.
+    fn remove(&mut self, key: K) {
+        if let Some(positions) = self.added_at.remove(&key) {
+            for position in positions {
+                self.added[position] = None;
+            }
+        }
+        if let Some(positions) = self.modified_at.remove(&key) {
+            for position in positions {
+                self.modified[position] = None;
+            }
+        }
+        if !self.removed_at.contains_key(&key) {
+            let index = self.removed.len();
+            self.removed.push(Some(key.clone()));
+            self.removed_at.insert(key, vec![index]);
+        }
+    }
+}
+
+impl<K, V> Drop for IndexedDeltaRecorder<'_, K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    fn drop(&mut self) {
+        self.target.added = std::mem::take(&mut self.added)
+            .into_iter()
+            .flatten()
+            .collect();
+        self.target.modified = std::mem::take(&mut self.modified)
+            .into_iter()
+            .flatten()
+            .collect();
+        self.target.removed = std::mem::take(&mut self.removed)
+            .into_iter()
+            .flatten()
+            .collect();
+    }
+}
+
+/// [`record_edge_list_delta`] through indexed recorders.
+fn record_edge_list_delta_indexed(
+    outgoing_delta: &mut IndexedDeltaRecorder<'_, EntityId, Vec<RelationId>>,
+    incoming_delta: &mut IndexedDeltaRecorder<'_, EntityId, Vec<RelationId>>,
+    ent: &EntityData,
+    entity_id: EntityId,
+) {
+    match ent.outgoing.get(&entity_id).cloned() {
+        Some(outgoing) => outgoing_delta.upsert(entity_id, outgoing),
+        None => outgoing_delta.remove(entity_id),
+    }
+    match ent.incoming.get(&entity_id).cloned() {
+        Some(incoming) => incoming_delta.upsert(entity_id, incoming),
+        None => incoming_delta.remove(entity_id),
+    }
+}
+
+/// [`record_relation_edge_delta`] through indexed recorders.
+fn record_relation_edge_delta_indexed(
+    outgoing_delta: &mut IndexedDeltaRecorder<'_, EntityId, Vec<RelationId>>,
+    incoming_delta: &mut IndexedDeltaRecorder<'_, EntityId, Vec<RelationId>>,
+    ent: &EntityData,
+    relation: &Relation,
+) {
+    if let Some(src) = relation.src.as_entity() {
+        record_edge_list_delta_indexed(outgoing_delta, incoming_delta, ent, src);
+    }
+    if let Some(dst) = relation.dst.as_entity() {
+        record_edge_list_delta_indexed(outgoing_delta, incoming_delta, ent, dst);
+    }
+}
+
 fn delta_map_remove<K, V>(delta: &mut CollectionDelta<K, V>, key: K)
 where
     K: Eq + Clone,
 {
+    #[cfg(test)]
+    note_pending_delta_scan(delta);
     delta.added.retain(|(existing_key, _)| existing_key != &key);
     delta
         .modified
@@ -2492,6 +2673,7 @@ impl InMemoryGraph {
                 entities: HashMap::new(),
                 entity_revisions: HashMap::new(),
                 external_references: HashMap::new(),
+                resolution_records: ResolutionRecordSet::default(),
                 relations: HashMap::new(),
                 outgoing: HashMap::new(),
                 incoming: HashMap::new(),
@@ -2860,6 +3042,7 @@ impl InMemoryGraph {
             // served one; loading it again here would be reading the answer
             // twice.
             materialized_graph: _,
+            resolution_records,
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
             if entity_revisions.is_empty() && !changes.is_empty() {
@@ -3019,6 +3202,7 @@ impl InMemoryGraph {
             entities: entities.into_iter().collect(),
             entity_revisions,
             external_references: external_references.into_iter().collect(),
+            resolution_records: ResolutionRecordSet::from_records(resolution_records),
             relations,
             outgoing,
             incoming,
@@ -3251,6 +3435,8 @@ impl InMemoryGraph {
                 entity_revisions
             },
             external_references,
+            // The locate projection carries no resolution record.
+            resolution_records: ResolutionRecordSet::default(),
             relations,
             outgoing,
             incoming,
@@ -4063,6 +4249,7 @@ impl InMemoryGraph {
                 entities: &ent.entities,
                 entity_revisions: &ent.entity_revisions,
                 external_references: &ent.external_references,
+                resolution_records: &ent.resolution_records,
                 relations: &ent.relations,
                 outgoing: &ent.outgoing,
                 incoming: &ent.incoming,
@@ -4244,6 +4431,81 @@ impl InMemoryGraph {
         self.entities.read().external_references.get(id).cloned()
     }
 
+    /// One resolution record by its identity.
+    pub fn get_resolution_record(&self, id: &ResolutionRecordId) -> Option<ResolutionRecord> {
+        self.entities.read().resolution_records.get(id).cloned()
+    }
+
+    /// Every resolution record the graph holds, in identity order.
+    pub fn list_resolution_records(&self) -> Vec<ResolutionRecord> {
+        let ent = self.entities.read();
+        let mut ids: Vec<_> = ent.resolution_records.records().keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .filter_map(|id| ent.resolution_records.get(id).cloned())
+            .collect()
+    }
+
+    /// How many resolution records the graph holds.
+    pub fn resolution_record_count(&self) -> usize {
+        self.entities.read().resolution_records.len()
+    }
+
+    /// Apply resolution-record transitions that move no entity, relation,
+    /// external reference or tree entry.
+    ///
+    /// The records are planned, checked against the nodes the graph holds and
+    /// recorded for persistence exactly as a transaction that carries only
+    /// these deltas would, and refused the same way. What this skips is the
+    /// whole-graph validation copy a transaction makes of the entity and
+    /// relation maps, which such a transition has nothing to validate
+    /// against, and which on a large graph costs far more than the records.
+    pub fn apply_resolution_record_deltas(
+        &self,
+        deltas: &[kin_model::ResolutionRecordDelta],
+    ) -> Result<(), KinDbError> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let mut ent = self.entities_write();
+        let plan = ent
+            .resolution_records
+            .plan_parts(&[], &[], deltas)
+            .map_err(|error| {
+                KinDbError::StorageError(format!("transaction resolution records: {error}"))
+            })?;
+        if plan.is_empty() {
+            return Ok(());
+        }
+        {
+            let held = &*ent;
+            held.resolution_records
+                .check_references(&plan, |node| match node {
+                    GraphNodeId::Entity(id) => held.entities.contains_key(id),
+                    GraphNodeId::ExternalReference(id) => held.external_references.contains_key(id),
+                    GraphNodeId::Artifact(_)
+                    | GraphNodeId::Test(_)
+                    | GraphNodeId::Contract(_)
+                    | GraphNodeId::Work(_)
+                    | GraphNodeId::VerificationRun(_) => false,
+                })
+                .map_err(|error| {
+                    KinDbError::StorageError(format!("transaction resolution records: {error}"))
+                })?;
+        }
+        let mut pending = self.pending_delta.lock();
+        ent.resolution_records.apply(&plan);
+        let mut record = IndexedDeltaRecorder::new(&mut pending.delta.resolution_records);
+        for record_delta in &plan.effective {
+            let id = record_delta.target_id();
+            match record_delta.new_state() {
+                Some(new) => record.upsert(id, new.clone()),
+                None => record.remove(id),
+            }
+        }
+        Ok(())
+    }
+
     /// Return every persisted external symbol coordinate.
     pub fn list_external_references(&self) -> Vec<ExternalReference> {
         let mut references: Vec<_> = self
@@ -4312,6 +4574,11 @@ impl InMemoryGraph {
             .collect();
         snapshot.resolved_tree = ent.resolved_tree.clone();
         snapshot.verified_binding_history = ent.verified_binding_history.clone();
+        if !ent.resolution_records.is_empty() {
+            snapshot.resolution_records = ent.resolution_records.records().clone();
+            snapshot.version =
+                GraphSnapshot::graph_only_version(snapshot.resolution_records.values());
+        }
         snapshot
     }
 
@@ -4388,8 +4655,10 @@ impl InMemoryGraph {
             // body with no section serializes as v13, so declaring
             // CURRENT_VERSION here would build a snapshot `to_bytes` refuses.
             // The version a snapshot carries is a statement about its own
-            // contents, not about the binary that built it.
-            version: GraphSnapshot::MIN_SUPPORTED_VERSION,
+            // contents, not about the binary that built it: v13, v23 when the
+            // graph holds resolution records, or v25 when one of them is a
+            // call-site ledger.
+            version: GraphSnapshot::graph_only_version(ent.resolution_records.records().values()),
             entities: ent.entities.into_iter().collect(),
             entity_revisions: ent.entity_revisions.into_iter().collect(),
             relations: ent.relations.into_iter().collect(),
@@ -4427,6 +4696,7 @@ impl InMemoryGraph {
             // A live mutable graph has no published change to resolve at, so it
             // has nothing to bind a section to. The publication path writes one.
             materialized_graph: None,
+            resolution_records: ent.resolution_records.into_records(),
         }
     }
 
@@ -4475,6 +4745,7 @@ impl InMemoryGraph {
                 .map(|(id, reference)| (*id, reference.clone()))
                 .collect(),
             resolved_tree: ent.resolved_tree.clone(),
+            resolution_records: ent.resolution_records.records().clone(),
         }
     }
 
@@ -4499,6 +4770,7 @@ impl InMemoryGraph {
             relations: ent.relations.into_iter().collect(),
             external_references: ent.external_references.into_iter().collect(),
             resolved_tree: ent.resolved_tree,
+            resolution_records: ent.resolution_records.into_records(),
         }
     }
 
@@ -4569,6 +4841,7 @@ impl InMemoryGraph {
             if target.entities != source.entities
                 || target.relations != source.relations
                 || target.external_references != source.external_references
+                || target.resolution_records != source.resolution_records
                 || target.resolved_tree != source.resolved_tree
             {
                 return false;
@@ -7851,6 +8124,7 @@ impl InMemoryGraph {
             tree_deltas: vec![tree_delta],
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         })
         .expect("test artifact admission");
         artifact_id
@@ -7877,6 +8151,7 @@ impl InMemoryGraph {
             }],
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         })
         .expect("test artifact removal");
         Some(artifact.entry)
@@ -8445,6 +8720,59 @@ impl EntityStore for InMemoryGraph {
         // Canonical, insertion-order-independent ordering.
         result.sort_unstable_by_key(|r| r.id.0);
         Ok(result)
+    }
+
+    fn lookup_external_reference(
+        &self,
+        id: &ExternalReferenceId,
+    ) -> Result<Option<ExternalReference>, KinDbError> {
+        Ok(self.get_external_reference(id))
+    }
+
+    fn get_external_relations_for_entity(
+        &self,
+        id: &EntityId,
+    ) -> Result<Vec<Relation>, KinDbError> {
+        let ent = self.entities.read();
+        let mut result: Vec<Relation> = ent
+            .outgoing
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|rid| ent.relations.get(rid))
+            .filter(|relation| matches!(relation.dst, GraphNodeId::ExternalReference(_)))
+            .cloned()
+            .collect();
+        result.sort_unstable_by_key(|relation| relation.id.0);
+        result.dedup_by_key(|relation| relation.id);
+        Ok(result)
+    }
+
+    fn relations_of_external_reference(
+        &self,
+        id: &ExternalReferenceId,
+    ) -> Result<Vec<Relation>, KinDbError> {
+        let ent = self.entities.read();
+        let node = GraphNodeId::ExternalReference(*id);
+        let mut result: Vec<Relation> = ent
+            .node_incoming
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .chain(ent.node_outgoing.get(&node).into_iter().flatten())
+            .filter_map(|rid| ent.relations.get(rid))
+            .cloned()
+            .collect();
+        result.sort_unstable_by_key(|relation| relation.id.0);
+        result.dedup_by_key(|relation| relation.id);
+        Ok(result)
+    }
+
+    fn lookup_resolution_record(
+        &self,
+        id: &ResolutionRecordId,
+    ) -> Result<Option<ResolutionRecord>, KinDbError> {
+        Ok(self.get_resolution_record(id))
     }
 
     fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, KinDbError> {
@@ -9295,6 +9623,33 @@ impl EntityStore for InMemoryGraph {
             }
             let prospective_external_reference_ids: HashSet<ExternalReferenceId> =
                 prospective_external_references.keys().copied().collect();
+            // Resolution records move with the graph they describe: the
+            // transaction's own record deltas, plus the ledgers of callers it
+            // modifies or removes and every record naming a node it removes.
+            // Planned against the pre-transaction records and checked against
+            // the prospective nodes, before anything changes.
+            let record_plan = ent.resolution_records.plan(delta).map_err(|error| {
+                KinDbError::StorageError(format!("transaction resolution records: {error}"))
+            })?;
+            if !record_plan.is_empty() {
+                ent.resolution_records
+                    .check_references(&record_plan, |node| match node {
+                        GraphNodeId::Entity(id) => prospective_entity_ids.contains(id),
+                        GraphNodeId::ExternalReference(id) => {
+                            prospective_external_reference_ids.contains(id)
+                        }
+                        // Records name repository entities and external
+                        // symbols only.
+                        GraphNodeId::Artifact(_)
+                        | GraphNodeId::Test(_)
+                        | GraphNodeId::Contract(_)
+                        | GraphNodeId::Work(_)
+                        | GraphNodeId::VerificationRun(_) => false,
+                    })
+                    .map_err(|error| {
+                        KinDbError::StorageError(format!("transaction resolution records: {error}"))
+                    })?;
+            }
             let mut prospective_relations = ent.relations.clone();
             for relation_delta in &delta.relation_deltas {
                 match relation_delta {
@@ -9419,17 +9774,22 @@ impl EntityStore for InMemoryGraph {
             }
 
             // 2. Publish exact repository-tree truth and its persistence delta.
-            for tree_delta in &delta.tree_deltas {
-                let artifact_id = tree_delta.artifact_id();
-                if let Some(new) = tree_delta.new_state() {
-                    delta_map_upsert(&mut pending.delta.resolved_tree, artifact_id, new.clone());
-                } else {
-                    delta_map_remove(&mut pending.delta.resolved_tree, artifact_id);
+            if !delta.tree_deltas.is_empty() {
+                let mut tree_record = IndexedDeltaRecorder::new(&mut pending.delta.resolved_tree);
+                for tree_delta in &delta.tree_deltas {
+                    let artifact_id = tree_delta.artifact_id();
+                    if let Some(new) = tree_delta.new_state() {
+                        tree_record.upsert(artifact_id, new.clone());
+                    } else {
+                        tree_record.remove(artifact_id);
+                    }
                 }
             }
             ent.resolved_tree = staged_tree;
 
             // 3. Process entity deltas.
+            let mut entity_record = (!delta.entity_deltas.is_empty())
+                .then(|| IndexedDeltaRecorder::new(&mut pending.delta.entities));
             for ent_delta in &delta.entity_deltas {
                 match ent_delta {
                     EntityDelta::Added { new: entity } => {
@@ -9440,7 +9800,9 @@ impl EntityStore for InMemoryGraph {
                             entity.kind,
                         );
                         ent.entities.insert(entity.id, entity.clone());
-                        delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
+                        if let Some(record) = entity_record.as_mut() {
+                            record.upsert(entity.id, entity.clone());
+                        }
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
                         // Upstream validation permits one delta per entity, but
@@ -9471,7 +9833,9 @@ impl EntityStore for InMemoryGraph {
                         }
 
                         ent.entities.insert(entity.id, entity.clone());
-                        delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
+                        if let Some(record) = entity_record.as_mut() {
+                            record.upsert(entity.id, entity.clone());
+                        }
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
                         if entity_embedding_text_unchanged(old, entity) {
@@ -9487,13 +9851,16 @@ impl EntityStore for InMemoryGraph {
                         ent.entities.remove(&old.id);
                         ent.indexes
                             .remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
-                        delta_map_remove(&mut pending.delta.entities, old.id);
+                        if let Some(record) = entity_record.as_mut() {
+                            record.remove(old.id);
+                        }
                         affected.insert(old.id);
                         merkle_seeds.insert(old.id);
                         deleted_entities.insert(old.id);
                     }
                 }
             }
+            drop(entity_record);
 
             // 4. Process immutable external-reference deltas before relations,
             // so one pending persistence batch can introduce a reference and
@@ -9517,41 +9884,79 @@ impl EntityStore for InMemoryGraph {
                 }
             }
 
-            // 5. Process relation deltas.
-            for rel_delta in &delta.relation_deltas {
-                match rel_delta {
-                    RelationDelta::Added { new: relation } => {
-                        insert_relation_indexes(&mut ent, relation);
-                        ent.relations.insert(relation.id, relation.clone());
-                        delta_map_upsert(
-                            &mut pending.delta.relations,
-                            relation.id,
-                            relation.clone(),
-                        );
-                        record_relation_edge_delta(&mut pending, &ent, relation);
-                        affected.extend(entity_ids_for_relation(relation));
-                        merkle_seeds.extend(entity_ids_for_relation(relation));
+            // 4b. Move the resolution records the plan names, explicit and
+            // implied, in the same persistence batch.
+            if !record_plan.is_empty() {
+                ent.resolution_records.apply(&record_plan);
+                let mut record = IndexedDeltaRecorder::new(&mut pending.delta.resolution_records);
+                for record_delta in &record_plan.effective {
+                    let id = record_delta.target_id();
+                    match record_delta.new_state() {
+                        Some(new) => record.upsert(id, new.clone()),
+                        None => record.remove(id),
                     }
-                    RelationDelta::Modified { old, new } => {
-                        ent.relations.remove(&old.id);
-                        affected.extend(entity_ids_for_relation(old));
-                        merkle_seeds.extend(entity_ids_for_relation(old));
-                        remove_relation_indexes(&mut ent, old);
-                        insert_relation_indexes(&mut ent, new);
-                        ent.relations.insert(new.id, new.clone());
-                        delta_map_upsert(&mut pending.delta.relations, new.id, new.clone());
-                        record_relation_edge_delta(&mut pending, &ent, old);
-                        record_relation_edge_delta(&mut pending, &ent, new);
-                        affected.extend(entity_ids_for_relation(new));
-                        merkle_seeds.extend(entity_ids_for_relation(new));
-                    }
-                    RelationDelta::Removed { old } => {
-                        ent.relations.remove(&old.id);
-                        affected.extend(entity_ids_for_relation(old));
-                        merkle_seeds.extend(entity_ids_for_relation(old));
-                        remove_relation_indexes(&mut ent, old);
-                        delta_map_remove(&mut pending.delta.relations, old.id);
-                        record_relation_edge_delta(&mut pending, &ent, old);
+                }
+            }
+
+            // 5. Process relation deltas, recorded through indexed recorders so
+            // a transaction carrying a whole workspace overlay records it in
+            // linear work.
+            if !delta.relation_deltas.is_empty() {
+                let pending_delta = &mut pending.delta;
+                let mut relation_record = IndexedDeltaRecorder::new(&mut pending_delta.relations);
+                let mut outgoing_record = IndexedDeltaRecorder::new(&mut pending_delta.outgoing);
+                let mut incoming_record = IndexedDeltaRecorder::new(&mut pending_delta.incoming);
+                for rel_delta in &delta.relation_deltas {
+                    match rel_delta {
+                        RelationDelta::Added { new: relation } => {
+                            insert_relation_indexes(&mut ent, relation);
+                            ent.relations.insert(relation.id, relation.clone());
+                            relation_record.upsert(relation.id, relation.clone());
+                            record_relation_edge_delta_indexed(
+                                &mut outgoing_record,
+                                &mut incoming_record,
+                                &ent,
+                                relation,
+                            );
+                            affected.extend(entity_ids_for_relation(relation));
+                            merkle_seeds.extend(entity_ids_for_relation(relation));
+                        }
+                        RelationDelta::Modified { old, new } => {
+                            ent.relations.remove(&old.id);
+                            affected.extend(entity_ids_for_relation(old));
+                            merkle_seeds.extend(entity_ids_for_relation(old));
+                            remove_relation_indexes(&mut ent, old);
+                            insert_relation_indexes(&mut ent, new);
+                            ent.relations.insert(new.id, new.clone());
+                            relation_record.upsert(new.id, new.clone());
+                            record_relation_edge_delta_indexed(
+                                &mut outgoing_record,
+                                &mut incoming_record,
+                                &ent,
+                                old,
+                            );
+                            record_relation_edge_delta_indexed(
+                                &mut outgoing_record,
+                                &mut incoming_record,
+                                &ent,
+                                new,
+                            );
+                            affected.extend(entity_ids_for_relation(new));
+                            merkle_seeds.extend(entity_ids_for_relation(new));
+                        }
+                        RelationDelta::Removed { old } => {
+                            ent.relations.remove(&old.id);
+                            affected.extend(entity_ids_for_relation(old));
+                            merkle_seeds.extend(entity_ids_for_relation(old));
+                            remove_relation_indexes(&mut ent, old);
+                            relation_record.remove(old.id);
+                            record_relation_edge_delta_indexed(
+                                &mut outgoing_record,
+                                &mut incoming_record,
+                                &ent,
+                                old,
+                            );
+                        }
                     }
                 }
             }
@@ -11933,6 +12338,7 @@ mod tests {
             }],
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         text_index_rebuilds::reset();
@@ -12149,6 +12555,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(regular));
@@ -12164,6 +12571,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(executable));
@@ -12179,6 +12587,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(symlink));
@@ -12217,6 +12626,7 @@ mod tests {
                 external_reference_deltas: vec![ExternalReferenceDelta::Added {
                     new: reference.clone(),
                 }],
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -12272,6 +12682,7 @@ mod tests {
                 external_reference_deltas: vec![ExternalReferenceDelta::Removed {
                     old: reference.clone(),
                 }],
+                resolution_record_deltas: Vec::new(),
             })
             .expect_err("a referenced external endpoint cannot be removed alone");
         assert!(error
@@ -12293,6 +12704,7 @@ mod tests {
                 external_reference_deltas: vec![ExternalReferenceDelta::Removed {
                     old: reference.clone(),
                 }],
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(graph.get_external_reference(&reference.id), None);
@@ -12304,6 +12716,299 @@ mod tests {
                 .external_references
                 .is_empty(),
             "an add followed by an exact removal before persistence is a net no-op"
+        );
+    }
+
+    fn records_context() -> kin_model::ResolutionRecord {
+        kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "0.3.2600".to_string(),
+            configuration_hash: Hash256::from_bytes([0x41; 32]),
+            environment_hash: Hash256::from_bytes([0x42; 32]),
+            environment_summary: "rust 1.90.0; crates locked by Cargo.lock".to_string(),
+        })
+    }
+
+    fn records_ledger(
+        caller: EntityId,
+        target: kin_model::CallSiteState,
+        context: kin_model::ResolutionRecordId,
+    ) -> kin_model::ResolutionRecord {
+        kin_model::ResolutionRecord::CallSites(kin_model::CallSiteLedger {
+            caller,
+            behavior_hash: Hash256::from_bytes([0; 32]),
+            body_hash: Hash256::from_bytes([0x43; 32]),
+            context,
+            census: 1,
+            sites: vec![kin_model::CallSite {
+                offset: 12,
+                length: 4,
+                state: target,
+            }],
+        })
+    }
+
+    fn unplaced_entity(name: &str) -> Entity {
+        let mut entity = test_entity(name, "unused.rs");
+        entity.file_origin = None;
+        entity
+    }
+
+    /// Resolution records live in the graph beside entities and move in the
+    /// same transaction: a ledger leaves with its caller's change, a record
+    /// naming a removed node leaves with the node, a record naming a node the
+    /// graph does not hold is refused, and a graph that holds a call-site
+    /// ledger persists at v25, owned and borrowed alike, back to v23 once only
+    /// its proof context is left.
+    #[test]
+    fn record_only_deltas_apply_as_a_transaction_carrying_them_would() {
+        let caller = unplaced_entity("caller");
+        let context = records_context();
+        let ledger = records_ledger(
+            caller.id,
+            kin_model::CallSiteState::ProvenTarget { target: caller.id },
+            context.id(),
+        );
+        let seeded = || {
+            let graph = InMemoryGraph::new();
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    entity_deltas: vec![EntityDelta::Added {
+                        new: caller.clone(),
+                    }],
+                    resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                        new: context.clone(),
+                    }],
+                    ..TransactionDelta::default()
+                })
+                .unwrap();
+            graph
+        };
+        let records = vec![kin_model::ResolutionRecordDelta::Added {
+            new: ledger.clone(),
+        }];
+        let direct = seeded();
+        direct.apply_resolution_record_deltas(&records).unwrap();
+        let through_transaction = seeded();
+        through_transaction
+            .apply_transaction_delta(&TransactionDelta {
+                resolution_record_deltas: records.clone(),
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        assert_eq!(
+            direct.list_resolution_records(),
+            through_transaction.list_resolution_records()
+        );
+        let recorded = |graph: &InMemoryGraph| {
+            let pending = graph.pending_delta_snapshot(7).unwrap().resolution_records;
+            (pending.added, pending.modified, pending.removed)
+        };
+        assert_eq!(
+            recorded(&direct),
+            recorded(&through_transaction),
+            "and records the same persistence"
+        );
+
+        // A ledger naming a node the graph does not hold is refused and changes
+        // nothing, as a transaction refuses it.
+        let stranger = records_ledger(
+            unplaced_entity("stranger").id,
+            kin_model::CallSiteState::ProvenOutside,
+            context.id(),
+        );
+        let refused = direct
+            .apply_resolution_record_deltas(&[kin_model::ResolutionRecordDelta::Added {
+                new: stranger,
+            }])
+            .unwrap_err();
+        assert!(refused.to_string().contains("does not hold"), "{refused}");
+        assert_eq!(direct.resolution_record_count(), 2);
+        // Adding what the graph already holds is refused too.
+        assert!(direct.apply_resolution_record_deltas(&records).is_err());
+        direct.apply_resolution_record_deltas(&[]).unwrap();
+    }
+
+    #[test]
+    fn transaction_persists_and_retires_resolution_records_with_their_nodes() {
+        let graph = InMemoryGraph::new();
+        let (plain_bytes, _) = graph.serialize_snapshot_borrowed().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(plain_bytes[4..8].try_into().unwrap()),
+            GraphSnapshot::MIN_SUPPORTED_VERSION,
+            "a graph without records keeps the v13 body"
+        );
+        let caller = unplaced_entity("caller");
+        let other = unplaced_entity("other");
+        let reference =
+            ExternalReference::new_resolved("kin-scip-v1", "cargo std 1.90.0", "vec/Vec#push().")
+                .unwrap();
+        let context = records_context();
+        let ledger = records_ledger(
+            caller.id,
+            kin_model::CallSiteState::ProvenExternal {
+                target: reference.id,
+            },
+            context.id(),
+        );
+        let other_ledger = records_ledger(
+            other.id,
+            kin_model::CallSiteState::ProvenTarget { target: caller.id },
+            context.id(),
+        );
+        let add = TransactionDelta {
+            entity_deltas: vec![
+                EntityDelta::Added {
+                    new: caller.clone(),
+                },
+                EntityDelta::Added { new: other.clone() },
+            ],
+            external_reference_deltas: vec![ExternalReferenceDelta::Added {
+                new: reference.clone(),
+            }],
+            resolution_record_deltas: vec![
+                kin_model::ResolutionRecordDelta::Added {
+                    new: context.clone(),
+                },
+                kin_model::ResolutionRecordDelta::Added {
+                    new: ledger.clone(),
+                },
+                kin_model::ResolutionRecordDelta::Added {
+                    new: other_ledger.clone(),
+                },
+            ],
+            ..TransactionDelta::default()
+        };
+        graph.apply_transaction_delta(&add).unwrap();
+        assert_eq!(graph.resolution_record_count(), 3);
+        assert_eq!(
+            graph.get_resolution_record(&ledger.id()),
+            Some(ledger.clone())
+        );
+        let pending = graph.pending_delta_snapshot(7).unwrap();
+        assert_eq!(pending.resolution_records.change_count(), 3);
+
+        let snapshot = graph.to_snapshot();
+        assert_eq!(snapshot.version, GraphSnapshot::CALL_SITE_LEDGERS_VERSION);
+        let owned_bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(owned_bytes[4..8].try_into().unwrap()),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION
+        );
+        assert_eq!(
+            graph.semantic_observation().version,
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
+            "the semantic observation declares the ledger rung too"
+        );
+        let owned = GraphSnapshot::from_bytes(&owned_bytes).unwrap();
+        assert_eq!(owned.resolution_records.len(), 3);
+        // Every decoder of the positional body reads the 37-element width.
+        GraphSnapshot::prove_pre_validated_round_trip(&owned_bytes).unwrap();
+        let (locate, _) =
+            crate::storage::format::LocateGraphSnapshot::from_bytes_with_persisted_root_hash(
+                &owned_bytes,
+            )
+            .unwrap();
+        assert_eq!(locate.entities.len(), 2);
+        let (borrowed_bytes, _) = graph.serialize_snapshot_borrowed().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(borrowed_bytes[4..8].try_into().unwrap()),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
+            "the borrowed save declares the same version"
+        );
+        assert_eq!(
+            GraphSnapshot::from_bytes(&borrowed_bytes)
+                .unwrap()
+                .resolution_records,
+            snapshot.resolution_records
+        );
+        let reopened = InMemoryGraph::from_snapshot(owned).unwrap();
+        assert_eq!(
+            reopened.get_resolution_record(&ledger.id()),
+            Some(ledger.clone())
+        );
+
+        // A record naming a node the graph does not hold is refused, and the
+        // refused transaction moves nothing.
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                    new: records_ledger(
+                        EntityId::new(),
+                        kin_model::CallSiteState::ProvenOutside,
+                        context.id(),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .expect_err("a ledger of an absent caller is refused");
+        assert!(
+            error.to_string().contains("which the graph does not hold"),
+            "{error}"
+        );
+        assert_eq!(graph.resolution_record_count(), 3);
+
+        // Changing a caller retires its ledger, and the ledger that names it
+        // as a target stays: only its removal retires that one.
+        let mut edited = caller.clone();
+        edited.signature = "fn caller(x: u8)".to_string();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: caller.clone(),
+                    new: edited.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        assert_eq!(graph.get_resolution_record(&ledger.id()), None);
+        assert!(graph.get_resolution_record(&other_ledger.id()).is_some());
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Removed { old: edited }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        assert_eq!(graph.get_resolution_record(&other_ledger.id()), None);
+        assert_eq!(graph.list_resolution_records(), vec![context.clone()]);
+        let (records_bytes, _) = graph.serialize_snapshot_borrowed().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(records_bytes[4..8].try_into().unwrap()),
+            GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+            "a graph whose ledgers are gone and whose proof context stays writes v23"
+        );
+        assert_eq!(
+            graph.to_snapshot().version,
+            GraphSnapshot::RESOLUTION_RECORDS_VERSION
+        );
+        let pending = graph.pending_delta_snapshot(8).unwrap();
+        assert!(
+            pending
+                .resolution_records
+                .modified
+                .iter()
+                .chain(&pending.resolution_records.added)
+                .all(|(id, _)| *id == context.id()),
+            "the retired ledgers leave the pending persistence batch too"
+        );
+
+        // A context a record still names cannot be removed; once nothing
+        // names it, it can.
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Removed {
+                    old: context,
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        assert_eq!(graph.resolution_record_count(), 0);
+        let (bytes, _) = graph.serialize_snapshot_borrowed().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            GraphSnapshot::MIN_SUPPORTED_VERSION,
+            "a graph whose records are gone writes the v13 body again"
         );
     }
 
@@ -12337,6 +13042,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -12417,6 +13123,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
         graph.clear_pending_delta();
@@ -12460,6 +13167,7 @@ mod tests {
                 }],
                 external_reference_deltas: Vec::new(),
                 admission_policy_delta: None,
+                resolution_record_deltas: Vec::new(),
             })
             .expect("retiring must succeed");
         assert!(
@@ -12526,6 +13234,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
         graph.clear_pending_delta();
@@ -12565,6 +13274,7 @@ mod tests {
                 }],
                 external_reference_deltas: Vec::new(),
                 admission_policy_delta: None,
+                resolution_record_deltas: Vec::new(),
             })
             .expect("retiring the entity must succeed");
 
@@ -12622,6 +13332,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
         let live_revision = graph
@@ -12678,6 +13389,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
         assert!(graph
@@ -12701,6 +13413,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -12781,6 +13494,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -12841,6 +13555,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -12905,6 +13620,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -12931,6 +13647,7 @@ mod tests {
                 tree_deltas: Vec::new(),
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -12960,6 +13677,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .expect_err("a tree transition cannot silently orphan semantic authority");
 
@@ -12996,6 +13714,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -13037,6 +13756,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .expect("derived cache failure cannot reverse committed authority");
 
@@ -13291,6 +14011,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -13361,6 +14082,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -13399,6 +14121,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -13465,6 +14188,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -14824,6 +15548,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let genesis_id = genesis.id;
         graph.create_change(&genesis).unwrap();
@@ -14844,6 +15569,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let child_id = child.id;
         graph.create_change(&child).unwrap();
@@ -14876,6 +15602,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
 
         graph.create_change(&change).unwrap();
@@ -14926,6 +15653,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
 
@@ -14970,6 +15698,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         let error = graph
@@ -15001,6 +15730,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         let error = graph
@@ -15028,6 +15758,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         let mut snapshot = GraphSnapshot::empty();
         snapshot.changes.insert(spoofed.id, spoofed);
@@ -15056,6 +15787,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         graph.changes.write().changes.insert(spoofed.id, spoofed);
 
@@ -15087,6 +15819,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&parent).unwrap();
         graph.clear_pending_delta();
@@ -15110,6 +15843,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
 
         let (at_revision_tx, at_revision_rx) = mpsc::channel();
@@ -15196,6 +15930,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         for _ in 0..2 {
@@ -15227,6 +15962,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let mut spoofed = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
@@ -15244,6 +15980,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         spoofed.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xff; 32]));
         let error = graph
@@ -15279,6 +16016,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let mut conflicting = first.clone();
         let EntityDelta::Added { new: entity } = &mut conflicting.entity_deltas[0] else {
@@ -15317,6 +16055,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let source = test_entity("source", "src/source.rs");
         let target = test_entity("target", "src/target.rs");
@@ -15338,6 +16077,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         let error = graph
@@ -15379,6 +16119,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let genesis_id = genesis.id;
         let first_child = seal_change(SemanticChange {
@@ -15400,6 +16141,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let first_child_id = first_child.id;
         let second_child = seal_change(SemanticChange {
@@ -15418,6 +16160,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let second_child_id = second_child.id;
         let changes = vec![genesis, first_child, second_child];
@@ -15565,6 +16308,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
         };
         let changes = vec![
@@ -15606,6 +16350,140 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
             "batch registration must preserve sequential delta slot order even when a removal precedes an add"
+        );
+    }
+
+    /// Materializing a workspace applies its whole semantic overlay as one
+    /// transaction, and the graph records every relation it applies into its
+    /// pending persistence delta. Each record scanned the whole pending delta,
+    /// so an overlay of n relations cost n squared: on a 3,590-file TypeScript
+    /// repository whose overlay reached about 200,000 relations, recording
+    /// them was 69 of the 98 seconds one sweep checkpoint took, paid three
+    /// times per checkpoint. The work must stay linear in the delta.
+    #[test]
+    fn a_large_relation_delta_is_recorded_in_linear_work() {
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("caller", "src/a.rs");
+        let callee = test_entity("callee", "src/b.rs");
+        let mut tree_deltas = Vec::new();
+        for file in ["src/a.rs", "src/b.rs"] {
+            tree_deltas.push(TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: test_located(
+                    file,
+                    TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false),
+                ),
+            });
+        }
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: callee.clone(),
+                    },
+                ],
+                relation_deltas: Vec::new(),
+                tree_deltas,
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
+            })
+            .unwrap();
+        let count = 4_096usize;
+        let mut relation_deltas: Vec<RelationDelta> = (0..count)
+            .map(|_| RelationDelta::Added {
+                new: Relation {
+                    id: RelationId::new(),
+                    kind: RelationKind::References,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(callee.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Lsp,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                },
+            })
+            .collect();
+        relation_deltas.sort_by_key(|delta| match delta {
+            RelationDelta::Added { new } => new.id,
+            _ => unreachable!(),
+        });
+
+        PENDING_DELTA_SCANS.with(|scans| scans.set(0));
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas,
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
+            })
+            .unwrap();
+        let scanned = PENDING_DELTA_SCANS.with(std::cell::Cell::get);
+        assert!(
+            scanned < count * 16,
+            "recording {count} relations scanned {scanned} pending-delta elements"
+        );
+        let pending = graph.pending_delta_snapshot(0).unwrap();
+        assert_eq!(
+            pending.relations.added.len() + pending.relations.modified.len(),
+            count,
+            "every relation is recorded once"
+        );
+    }
+
+    /// The indexed recorder leaves exactly the vectors the sequential helpers
+    /// leave for the same calls in the same order, including a key already
+    /// held twice, a removal between upserts of one key, and removal order.
+    #[test]
+    fn the_indexed_recorder_matches_sequential_upserts_and_removals() {
+        let base = CollectionDelta {
+            added: vec![(1u64, 10u64), (7, 70), (1, 12)],
+            modified: vec![(2, 20), (8, 80), (2, 22)],
+            removed: vec![3, 4, 3],
+        };
+        // A deterministic mix over a small key space, so every kind of
+        // collision happens many times.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let operations: Vec<(bool, u64, u64)> = (0..4_000)
+            .map(|_| {
+                let roll = next();
+                (roll % 3 != 0, (roll >> 8) % 12, roll >> 32)
+            })
+            .collect();
+        let mut sequential = base.clone();
+        for (upsert, key, value) in &operations {
+            if *upsert {
+                delta_map_upsert(&mut sequential, *key, *value);
+            } else {
+                delta_map_remove(&mut sequential, *key);
+            }
+        }
+        let mut indexed = base;
+        {
+            let mut record = IndexedDeltaRecorder::new(&mut indexed);
+            for (upsert, key, value) in &operations {
+                if *upsert {
+                    record.upsert(*key, *value);
+                } else {
+                    record.remove(*key);
+                }
+            }
+        }
+        assert_eq!(
+            rmp_serde::to_vec(&sequential).unwrap(),
+            rmp_serde::to_vec(&indexed).unwrap()
         );
     }
 
@@ -15715,6 +16593,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -15739,6 +16618,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -15767,6 +16647,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -15805,6 +16686,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -15829,6 +16711,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -15857,6 +16740,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -15919,12 +16803,17 @@ mod tests {
             external_references,
             materialized_graph,
             verified_binding_history,
+            resolution_records,
         } = served;
         assert_eq!(
             *verified_binding_history, fresh.verified_binding_history,
             "binding history capability"
         );
         assert_eq!(*version, fresh.version, "version");
+        assert_eq!(
+            *resolution_records, fresh.resolution_records,
+            "resolution_records"
+        );
         // `ResolvedGraphState` carries no `PartialEq`, so the two are compared
         // through the exact MessagePack form they would be persisted in, which
         // is the comparison that matters for a section anyway.
@@ -16125,6 +17014,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
         (graph, genesis, anchor)
@@ -16152,6 +17042,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         })
     }
 
@@ -16231,6 +17122,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16255,6 +17147,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16282,6 +17175,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16321,6 +17215,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16345,6 +17240,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16372,6 +17268,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16426,6 +17323,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16454,6 +17352,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16477,6 +17376,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16554,6 +17454,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16584,6 +17485,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16621,6 +17523,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16653,6 +17556,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16674,6 +17578,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16708,6 +17613,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16740,6 +17646,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16763,6 +17670,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16822,6 +17730,7 @@ mod tests {
                 external_reference_deltas: vec![ExternalReferenceDelta::Added {
                     new: reference.clone(),
                 }],
+                resolution_record_deltas: Vec::new(),
             },
         );
         let remove_id = admit_change(
@@ -16846,6 +17755,7 @@ mod tests {
                 external_reference_deltas: vec![ExternalReferenceDelta::Removed {
                     old: reference.clone(),
                 }],
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16884,6 +17794,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16911,6 +17822,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16943,6 +17855,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16967,6 +17880,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -16993,6 +17907,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17019,6 +17934,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17052,6 +17968,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17076,6 +17993,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17104,6 +18022,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17127,6 +18046,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17170,6 +18090,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17201,6 +18122,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17222,6 +18144,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17259,6 +18182,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17286,6 +18210,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17312,6 +18237,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17336,6 +18262,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17373,6 +18300,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17400,6 +18328,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17426,6 +18355,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17464,6 +18394,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17491,6 +18422,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17517,6 +18449,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -17663,6 +18596,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: vec![ExternalReferenceDelta::Added { new: reference }],
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -18302,6 +19236,7 @@ mod tests {
                     }],
                     admission_policy_delta: None,
                     external_reference_deltas: Vec::new(),
+                    resolution_record_deltas: Vec::new(),
                 })
                 .unwrap();
         }
@@ -18682,6 +19617,7 @@ mod tests {
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         }
     }
 
@@ -18741,6 +19677,7 @@ mod tests {
                 tree_deltas: Vec::new(),
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -18904,6 +19841,7 @@ mod tests {
                 tree_deltas: Vec::new(),
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -19110,6 +20048,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
         graph
@@ -19119,6 +20058,7 @@ mod tests {
                 tree_deltas: Vec::new(),
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
     }
@@ -19296,6 +20236,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
         graph.batch_upsert_entities(entities).unwrap();
@@ -20829,6 +21770,7 @@ mod tests {
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             },
         );
 
@@ -20855,6 +21797,7 @@ mod tests {
                     origin: kin_model::ChangeOrigin::Native,
                     admission_policy_delta: None,
                     external_reference_deltas: Vec::new(),
+                    resolution_record_deltas: Vec::new(),
                 },
             );
             previous = id;

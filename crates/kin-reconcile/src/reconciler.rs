@@ -1986,6 +1986,18 @@ impl Reconciler {
         if !existing.is_empty() {
             self.cross_file.refresh_if_behind(graph, &file_id.0);
         }
+        // The other files this pass re-derives are the ones that bind against
+        // this file. When the edit leaves everything they bind against as it
+        // was, re-deriving them could only undo what refined their edges after
+        // they were linked, so only this file is resolved.
+        let dependents = if self.cross_file.is_seeded()
+            && !crate::linker_surface::edit_moves_linker_surface(
+                file_id, indexed, &existing, &added, &removed, blob_store,
+            ) {
+            crate::cross_file::Dependents::Unaffected
+        } else {
+            crate::cross_file::Dependents::Rebind
+        };
         let cross_file = self.cross_file.resolve_after_edit_checked(
             graph,
             blob_store,
@@ -1994,6 +2006,7 @@ impl Reconciler {
             &indexed.extracted_relations,
             &indexed.imports,
             kin_model::ParseCompleteness::from_parse_state(&indexed.parse_state),
+            dependents,
         )?;
         if let Some(error) = &cross_file.failure {
             return Err(ReconcileError::Graph(format!(

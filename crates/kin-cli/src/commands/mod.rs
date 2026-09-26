@@ -19,6 +19,8 @@ pub mod blame;
 pub mod branch;
 mod byte_fmt;
 pub mod cache;
+#[cfg(test)]
+pub(crate) mod call_site_fixture;
 pub mod capabilities;
 pub mod checkout;
 pub mod clone;
@@ -36,6 +38,7 @@ pub mod diff;
 pub mod drift;
 pub mod eject;
 pub mod embed;
+pub mod external_symbols;
 pub mod git;
 pub mod graph;
 pub mod graph_export;

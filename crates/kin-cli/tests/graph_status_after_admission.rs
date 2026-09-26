@@ -890,6 +890,10 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
         "init and status share the committed durable authority generation"
     );
     assert_eq!(
+        status_payload["repository"]["generation"], init_payload["authority_generation"],
+        "init reports the generation the store ended at, which is the one status reads"
+    );
+    assert_eq!(
         status_payload["semantic_enrichment"]["view"],
         "durable_repository_authority"
     );

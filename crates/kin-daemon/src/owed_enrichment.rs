@@ -38,6 +38,10 @@ pub(crate) struct OwedFile {
     pub(crate) last_attempt_unix_s: u64,
     /// What failed, in the words the sweep logged.
     pub(crate) reason: String,
+    /// The proof context the server answered under at those attempts, as
+    /// its record id, when the sweep knew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context: Option<String>,
 }
 
 /// Every owed file, by repository path.
@@ -71,19 +75,29 @@ pub(crate) fn retry_after(owed: &OwedFile, blob: &str, now_unix_s: u64) -> Optio
     (due > now_unix_s).then(|| Duration::from_secs(due - now_unix_s))
 }
 
-/// Record one more failed attempt for `file` at `blob`.
+/// How many consecutive failed attempts over the same bytes, under the same
+/// proof context, a file gets before the sweep settles it with the sites its
+/// server failed at, rather than owing it forever.
+pub(crate) const SETTLE_AFTER_ATTEMPTS: u32 = 3;
+
+/// Record one more failed attempt for `file` at `blob`, under the proof
+/// context `context` names.
 ///
-/// Attempts count consecutive failures over the same bytes. A failure over new
-/// bytes starts again at one.
+/// Attempts count consecutive failures over the same bytes and the same
+/// context. A failure over new bytes, or under another context, starts again
+/// at one.
 pub(crate) fn record_failure(
     owed: &mut OwedFiles,
     file: &str,
     blob: &str,
+    context: Option<&str>,
     reason: String,
     now_unix_s: u64,
 ) {
     let attempts = match owed.get(file) {
-        Some(previous) if previous.blob == blob => previous.attempts.saturating_add(1),
+        Some(previous) if previous.blob == blob && previous.context.as_deref() == context => {
+            previous.attempts.saturating_add(1)
+        }
         _ => 1,
     };
     owed.insert(
@@ -93,8 +107,27 @@ pub(crate) fn record_failure(
             attempts,
             last_attempt_unix_s: now_unix_s,
             reason,
+            context: context.map(str::to_string),
         },
     );
+}
+
+/// Whether the attempt a sweep is making now at `file`, over `blob` under
+/// `context`, is its last allowed one: the record already holds
+/// [`SETTLE_AFTER_ATTEMPTS`] less one failures over the same bytes and
+/// context.
+pub(crate) fn attempts_exhausted(
+    owed: &OwedFiles,
+    file: &str,
+    blob: Option<&str>,
+    context: &str,
+) -> bool {
+    let (Some(previous), Some(blob)) = (owed.get(file), blob) else {
+        return false;
+    };
+    previous.blob == blob
+        && previous.context.as_deref() == Some(context)
+        && previous.attempts.saturating_add(1) >= SETTLE_AFTER_ATTEMPTS
 }
 
 /// Seconds since the Unix epoch, which is what the record stores.
@@ -173,7 +206,14 @@ mod tests {
     #[test]
     fn a_failure_waits_its_backoff_unless_the_bytes_change() {
         let mut owed = OwedFiles::new();
-        record_failure(&mut owed, "pkg/a.go", "blob-1", "timed out".into(), 1_000);
+        record_failure(
+            &mut owed,
+            "pkg/a.go",
+            "blob-1",
+            None,
+            "timed out".into(),
+            1_000,
+        );
         let entry = &owed["pkg/a.go"];
         assert_eq!(entry.attempts, 1);
         assert_eq!(
@@ -183,10 +223,73 @@ mod tests {
         assert_eq!(retry_after(entry, "blob-1", 1_300), None);
         assert_eq!(retry_after(entry, "blob-2", 1_000), None);
 
-        record_failure(&mut owed, "pkg/a.go", "blob-1", "timed out".into(), 1_300);
+        record_failure(
+            &mut owed,
+            "pkg/a.go",
+            "blob-1",
+            None,
+            "timed out".into(),
+            1_300,
+        );
         assert_eq!(owed["pkg/a.go"].attempts, 2);
-        record_failure(&mut owed, "pkg/a.go", "blob-2", "timed out".into(), 1_400);
+        record_failure(
+            &mut owed,
+            "pkg/a.go",
+            "blob-2",
+            None,
+            "timed out".into(),
+            1_400,
+        );
         assert_eq!(owed["pkg/a.go"].attempts, 1, "new bytes start again");
+    }
+
+    #[test]
+    fn a_file_is_settled_after_its_last_attempt_under_one_context() {
+        let mut owed = OwedFiles::new();
+        assert!(!attempts_exhausted(
+            &owed,
+            "pkg/a.go",
+            Some("blob-1"),
+            "ctx-1"
+        ));
+        for at in 0..SETTLE_AFTER_ATTEMPTS - 1 {
+            assert!(
+                !attempts_exhausted(&owed, "pkg/a.go", Some("blob-1"), "ctx-1"),
+                "attempt {at} is not the last"
+            );
+            record_failure(
+                &mut owed,
+                "pkg/a.go",
+                "blob-1",
+                Some("ctx-1"),
+                "timed out".into(),
+                u64::from(at),
+            );
+        }
+        assert!(
+            attempts_exhausted(&owed, "pkg/a.go", Some("blob-1"), "ctx-1"),
+            "the attempt after the ones recorded is the last"
+        );
+        assert!(
+            !attempts_exhausted(&owed, "pkg/a.go", Some("blob-1"), "ctx-2"),
+            "another context starts again"
+        );
+        assert!(
+            !attempts_exhausted(&owed, "pkg/a.go", Some("blob-2"), "ctx-1"),
+            "so do new bytes"
+        );
+        record_failure(
+            &mut owed,
+            "pkg/a.go",
+            "blob-1",
+            Some("ctx-2"),
+            "timed out".into(),
+            9,
+        );
+        assert_eq!(
+            owed["pkg/a.go"].attempts, 1,
+            "a new context counts from one"
+        );
     }
 
     #[test]
@@ -195,7 +298,14 @@ mod tests {
         let layout = kin_core::init(root.path()).unwrap().layout;
         assert!(load(&layout).is_empty());
         let mut owed = OwedFiles::new();
-        record_failure(&mut owed, "pkg/a.go", "blob-1", "timed out".into(), 7);
+        record_failure(
+            &mut owed,
+            "pkg/a.go",
+            "blob-1",
+            Some("ctx"),
+            "timed out".into(),
+            7,
+        );
         persist(&layout, &owed);
         assert_eq!(load(&layout), owed);
         persist(&layout, &OwedFiles::new());

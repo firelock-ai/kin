@@ -700,11 +700,9 @@ fn fast_forward(
         compute_resolved_tree_hash(&target_tree).context("hash exact fast-forward target tree")?;
     let tree_deltas = kin_core::exact_tree_correction(&plan.workspace.tree, &target_tree)
         .context("plan exact fast-forward workspace transition")?;
-    let semantic_delta = kin_core::diff_workspace_semantics(
-        &plan.workspace_graph.entities,
-        &plan.workspace_graph.relations,
-        &theirs_state.entities,
-        &theirs_state.relations,
+    let semantic_delta = crate::local_repository_authority::plan_workspace_graph_transition(
+        crate::local_repository_authority::TargetGraph::of_snapshot(&plan.workspace_graph),
+        crate::local_repository_authority::TargetGraph::of_state(&theirs_state),
     )
     .context("plan exact fast-forward semantic transition")?;
     let theirs_policy = {
@@ -713,19 +711,12 @@ fn fast_forward(
         drop(lease);
         policy
     };
-    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+    let mut daemon_delta = crate::local_repository_authority::plan_daemon_graph_transition(
         state,
-        &theirs_state.entities,
-        &theirs_state.relations,
+        crate::local_repository_authority::TargetGraph::of_state(&theirs_state),
     )
     .context("plan the exact fast-forward semantic transition for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: tree_deltas.clone(),
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+    daemon_delta.tree_deltas = tree_deltas.clone();
     preflight_merge_delta(
         state,
         &plan.workspace.tree,
@@ -914,6 +905,23 @@ fn three_way(
         &merged_relations,
     )
     .context("author exact merge semantics against the first parent")?;
+    // The merge holds the first parent's external symbols and resolution
+    // records, and the second parent's that a merged relation names.
+    let (merged_references, merged_records) = kin_core::desired_resolution_nodes(
+        &ours_state.external_references,
+        &ours_state.resolution_records,
+        &theirs_state.external_references,
+        &theirs_state.resolution_records,
+        merged_relations.values(),
+    );
+    let change_delta = kin_core::with_resolution_node_transition(
+        change_delta,
+        &ours_state.external_references,
+        &ours_state.resolution_records,
+        &merged_references,
+        &merged_records,
+    )
+    .context("author exact merge external symbols against the first parent")?;
     let change_tree_deltas = kin_core::exact_tree_correction(&ours_state.tree, &desired_tree)
         .context("author exact merge tree deltas against the first parent")?;
     let mut change = SemanticChange {
@@ -931,7 +939,8 @@ fn three_way(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
-        external_reference_deltas: Vec::new(),
+        external_reference_deltas: change_delta.external_reference_deltas().to_vec(),
+        resolution_record_deltas: change_delta.resolution_record_deltas().to_vec(),
     };
     change.id = compute_semantic_change_id(&change).context("hash exact merge change")?;
     let merge_target = RefTarget::change(change.id);
@@ -964,26 +973,18 @@ fn three_way(
     let workspace_tree_deltas =
         kin_core::exact_tree_correction(&plan.workspace.tree, &desired_tree)
             .context("plan exact merged workspace transition")?;
-    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
-        &plan.workspace_graph.entities,
-        &plan.workspace_graph.relations,
-        &authoritative.entities,
-        &authoritative.relations,
-    )
-    .context("plan exact merged workspace semantics")?;
-    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+    let workspace_semantic_delta =
+        crate::local_repository_authority::plan_workspace_graph_transition(
+            crate::local_repository_authority::TargetGraph::of_snapshot(&plan.workspace_graph),
+            crate::local_repository_authority::TargetGraph::of_state(&authoritative),
+        )
+        .context("plan exact merged workspace semantics")?;
+    let mut daemon_delta = crate::local_repository_authority::plan_daemon_graph_transition(
         state,
-        &authoritative.entities,
-        &authoritative.relations,
+        crate::local_repository_authority::TargetGraph::of_state(&authoritative),
     )
     .context("plan the exact merged workspace semantics for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: workspace_tree_deltas.clone(),
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+    daemon_delta.tree_deltas = workspace_tree_deltas.clone();
     preflight_merge_delta(
         state,
         &plan.workspace.tree,
@@ -1342,6 +1343,23 @@ pub(crate) fn publish_resolved_merge(
         &merged_relations,
     )
     .context("author exact merge semantics against the first parent")?;
+    // The merge holds the first parent's external symbols and resolution
+    // records, and the second parent's that a merged relation names.
+    let (merged_references, merged_records) = kin_core::desired_resolution_nodes(
+        &ours_state.external_references,
+        &ours_state.resolution_records,
+        &theirs_state.external_references,
+        &theirs_state.resolution_records,
+        merged_relations.values(),
+    );
+    let change_delta = kin_core::with_resolution_node_transition(
+        change_delta,
+        &ours_state.external_references,
+        &ours_state.resolution_records,
+        &merged_references,
+        &merged_records,
+    )
+    .context("author exact merge external symbols against the first parent")?;
     let change_tree_deltas = kin_core::exact_tree_correction(&ours_state.tree, &desired_tree)
         .context("author exact merge tree deltas against the first parent")?;
     let mut change = SemanticChange {
@@ -1362,7 +1380,8 @@ pub(crate) fn publish_resolved_merge(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
-        external_reference_deltas: Vec::new(),
+        external_reference_deltas: change_delta.external_reference_deltas().to_vec(),
+        resolution_record_deltas: change_delta.resolution_record_deltas().to_vec(),
     };
     change.id = compute_semantic_change_id(&change).context("hash exact merge change")?;
     let merge_target = RefTarget::change(change.id);
@@ -1391,26 +1410,18 @@ pub(crate) fn publish_resolved_merge(
         compute_resolved_tree_hash(&desired_tree).context("hash exact merged tree")?;
     let workspace_tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &desired_tree)
         .context("plan exact merged workspace transition")?;
-    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
-        &workspace_graph.entities,
-        &workspace_graph.relations,
-        &authoritative.entities,
-        &authoritative.relations,
-    )
-    .context("plan exact merged workspace semantics")?;
-    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+    let workspace_semantic_delta =
+        crate::local_repository_authority::plan_workspace_graph_transition(
+            crate::local_repository_authority::TargetGraph::of_snapshot(&workspace_graph),
+            crate::local_repository_authority::TargetGraph::of_state(&authoritative),
+        )
+        .context("plan exact merged workspace semantics")?;
+    let mut daemon_delta = crate::local_repository_authority::plan_daemon_graph_transition(
         state,
-        &authoritative.entities,
-        &authoritative.relations,
+        crate::local_repository_authority::TargetGraph::of_state(&authoritative),
     )
     .context("plan the exact merged workspace semantics for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: workspace_tree_deltas.clone(),
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+    daemon_delta.tree_deltas = workspace_tree_deltas.clone();
     preflight_merge_delta(
         state,
         &workspace.tree,
@@ -2654,7 +2665,17 @@ fn workspace_mutation(
         new_base_tree_hash: Some(new_tree_hash),
         tree_deltas,
         new_tree_hash,
-        semantic_delta,
+        // A merge moves the cross-file bindings every enrichment mark vouched
+        // for, so it retires them in the same transaction, and the sweep the
+        // merge asks for derives them again.
+        semantic_delta: if workspace.enrichment_marks.is_empty() {
+            semantic_delta
+        } else {
+            semantic_delta.with_enrichment_marks(kin_model::EnrichmentMarksDelta {
+                retire_all: true,
+                marks: Vec::new(),
+            })?
+        },
         new_shared_admission_policy: shared_policy.clone(),
         new_admission_policy: EffectiveAdmissionPolicyStamp {
             shared: shared_policy.stamp(),

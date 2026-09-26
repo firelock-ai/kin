@@ -243,7 +243,9 @@ mod tests {
             )
             .unwrap();
             if accepted {
-                let relations = answer.expect("source-backed initializer is accepted");
+                let relations = answer
+                    .expect("source-backed initializer is accepted")
+                    .relations;
                 assert!(
                     relations
                         .iter()
@@ -468,7 +470,7 @@ mod tests {
         )
         .await;
         server.shutdown().await.unwrap();
-        let relations = answer.unwrap();
+        let relations = answer.unwrap().relations;
         assert!(
             relations
                 .iter()

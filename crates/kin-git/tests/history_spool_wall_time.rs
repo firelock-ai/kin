@@ -49,6 +49,7 @@ fn change_for_commit(oid_hex: &str, subject: &str) -> SemanticChange {
         evidence: Vec::new(),
         risk_summary: None,
         external_reference_deltas: Vec::new(),
+        resolution_record_deltas: Vec::new(),
     }
 }
 

@@ -89,6 +89,34 @@ impl LspError {
         matches!(self, LspError::Declined { .. })
     }
 
+    /// Whether this failure refuses the question for good: the server
+    /// answered, and the answer is one this build cannot prove or decode, so
+    /// asking the same server about the same bytes returns it again.
+    ///
+    /// A prepared call hierarchy item that is not the queried entity, a range
+    /// that names no position in the admitted text, a declaration whose name
+    /// its own line does not spell, a site in a file the graph does not
+    /// admit, and an answer whose shape does not decode are all refusals. The
+    /// entity they are about is unprovable by this server, which settles it:
+    /// retrying costs a query and learns nothing.
+    ///
+    /// The one error a server returns itself that is a refusal is a
+    /// TypeScript compiler's internal assertion (see
+    /// [`typescript_internal_assertion`]): the compiler asserts on the same
+    /// bytes the same way every time.
+    ///
+    /// Not a refusal: a timeout, a server that stopped answering, and any
+    /// other error the server returned itself, which may be load, a restart
+    /// or a request it cancelled. Those may answer if asked again, so their
+    /// work stays owed. A decline is its own class and never reaches here.
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            LspError::Protocol(_) | LspError::Json(_) => true,
+            LspError::JsonRpc(error) => typescript_internal_assertion(error),
+            _ => false,
+        }
+    }
+
     /// The one classification every pass applies, in its one order:
     /// session-ending, then timeout, then decline, then failure.
     pub fn class(&self) -> QueryErrorClass {
@@ -102,6 +130,29 @@ impl LspError {
             QueryErrorClass::Failed
         }
     }
+}
+
+/// Whether a JSON-RPC error is TypeScript's compiler failing one of its own
+/// assertions: typescript-language-server relays it as `TypeScript Server
+/// Error (<version>)` with a `Debug Failure.` line, from `Debug.fail` and
+/// `Debug.assert` inside the compiler.
+///
+/// Such an assertion is a property of the program and the position, not of
+/// load: on drizzle-orm TypeScript 5.6.3 failed 514 definition queries in
+/// `getTextOfPropertyName`, the same ones in every sweep, and holding their
+/// 230 files owed asked them again for nothing.
+pub fn typescript_internal_assertion(error: &str) -> bool {
+    let Ok(error) = serde_json::from_str::<serde_json::Value>(error) else {
+        return false;
+    };
+    let Some(message) = error.get("message").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let mut lines = message.lines();
+    lines
+        .next()
+        .is_some_and(|first| first.contains("TypeScript Server Error"))
+        && lines.any(|line| line.trim_start().starts_with("Debug Failure."))
 }
 
 /// How a known declining message is matched.
@@ -234,6 +285,64 @@ mod tests {
         )
         .is_none());
         assert!(declined_answer("textDocument/references", "not json").is_none());
+    }
+
+    /// Only an answer this build cannot prove or decode refuses a question
+    /// for good; everything that may answer if asked again does not.
+    #[test]
+    fn only_an_unprovable_answer_is_a_refusal() {
+        assert!(LspError::Protocol(
+            "prepared call hierarchy source is not the queried entity".into()
+        )
+        .is_refusal());
+        let undecodable = serde_json::from_str::<Vec<u32>>("{}").unwrap_err();
+        assert!(LspError::Json(undecodable).is_refusal());
+        for unanswered in [
+            LspError::Timeout,
+            LspError::ServerDied,
+            LspError::JsonRpc(rpc(-32801, "content modified")),
+            LspError::Io(std::io::Error::other("broken pipe")),
+            LspError::Declined {
+                method: "textDocument/references".into(),
+                message: "no identifier found".into(),
+            },
+        ] {
+            assert!(!unanswered.is_refusal(), "{unanswered}");
+        }
+    }
+
+    /// TypeScript answers a question its own compiler asserts on with the
+    /// assertion, and asks of the same bytes assert the same way every time:
+    /// on drizzle-orm TypeScript 5.6.3 failed 514 definition queries in
+    /// `getTextOfPropertyName`, identically in every sweep. That is a
+    /// refusal. Any other error tsserver returns, and one that only mentions
+    /// the words, is not.
+    #[test]
+    fn a_typescript_internal_assertion_is_a_refusal() {
+        let assertion = rpc(
+            1,
+            "<main> TypeScript Server Error (5.6.3)\nDebug Failure.\nError: Debug Failure.\n    \
+             at getTextOfPropertyName (/repo/node_modules/typescript/lib/typescript.js:17277:16)",
+        );
+        assert!(LspError::JsonRpc(assertion).is_refusal());
+        let false_expression = rpc(
+            1,
+            "<semantic> TypeScript Server Error (5.9.3)\nDebug Failure. False expression: \
+             Expected node to be a declaration\nError: Debug Failure. False expression",
+        );
+        assert!(LspError::JsonRpc(false_expression).is_refusal());
+        for other in [
+            rpc(1, "<main> TypeScript Server Error (5.6.3)\nNo Project."),
+            rpc(
+                1,
+                "<main> TypeScript Server Error (5.6.3)\nCould not find source file",
+            ),
+            rpc(0, "Debug Failure."),
+            rpc(-32603, "the request mentions a Debug Failure. somewhere"),
+            "not json".to_string(),
+        ] {
+            assert!(!LspError::JsonRpc(other.clone()).is_refusal(), "{other}");
+        }
     }
 
     /// The one order: session-ending, then timeout, then decline, then failure.

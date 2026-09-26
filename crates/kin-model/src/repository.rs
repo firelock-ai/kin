@@ -20,8 +20,9 @@ use crate::{
     ExternalObjectRecord, ExternalReferenceDelta, FrozenLocalOverlayDelta,
     GitExternalAuthorityDelta, GitObjectId, Hash256, MergeTransactionDelta, ModelError,
     OperationId, RefMutation, RefName, RefTarget, RelationDelta, RepositoryId, RepositoryRef,
-    ResolvedTree, Result, SealedObservationBinding, SemanticChange, SemanticChangeId,
-    SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead, WorkspaceId,
+    ResolutionRecordDelta, ResolvedTree, Result, SealedObservationBinding, SemanticChange,
+    SemanticChangeId, SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead,
+    WorkspaceId,
 };
 
 /// Clean-slate transaction schema whose persistence authority owns both exact
@@ -43,15 +44,84 @@ pub const WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION: u32 = 1;
 /// is stored cumulatively in [`WorkspaceState::semantic_overlay`] relative to
 /// `base_target`. Exact repository membership remains independently
 /// authoritative in [`WorkspaceState::tree`].
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSemanticDelta {
     version: u32,
     entity_deltas: Vec<EntityDelta>,
     relation_deltas: Vec<RelationDelta>,
-    /// Deliberately last for additive positional-wire compatibility.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Additive for positional-wire compatibility: the hand-written
+    /// `Serialize` below omits it when it is empty and nothing after it is
+    /// present, and writes it, even empty, whenever enrichment marks follow.
+    /// It declares no serde skip of its own because it is not the last field,
+    /// and a derive honouring one would shift the marks into its place.
+    #[serde(default)]
     external_reference_deltas: Vec<ExternalReferenceDelta>,
+    /// Kin's own record of which files its language-server enrichment finished,
+    /// written by the enrichment publication. Never part of an overlay.
+    ///
+    /// Omitted when empty and nothing after it is present, so every delta
+    /// written before it keeps its exact bytes and its identity; written, even
+    /// empty, whenever resolution records follow.
+    #[serde(default)]
+    enrichment_marks: EnrichmentMarksDelta,
+    /// Exact transitions of resolution records, which are graph state and so
+    /// ride in overlays like entities and relations do.
+    ///
+    /// Deliberately last and omitted when empty, so every delta written before
+    /// it keeps its exact bytes and its identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resolution_record_deltas: Vec<ResolutionRecordDelta>,
+}
+
+/// Positional-wire serialization. Operation records persist this delta inside
+/// a MessagePack snapshot, where a struct is an array and position decides the
+/// mapping, so a trailing field may be omitted only when every field after it
+/// is omitted too. `external_reference_deltas` is written, even empty, whenever
+/// enrichment marks or resolution records follow it, and the marks whenever
+/// resolution records follow them; a delta carrying none of them serializes to
+/// the bytes it always did.
+///
+/// A name-keyed format writes the external references exactly as it did
+/// before resolution records existed (whenever marks follow them), and each
+/// later field only when it is non-empty, so no identity computed over the
+/// JSON of a delta without resolution records moves.
+impl Serialize for WorkspaceSemanticDelta {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let positional = !serializer.is_human_readable();
+        let has_records = !self.resolution_record_deltas.is_empty();
+        let has_marks = !self.enrichment_marks.is_empty() || (has_records && positional);
+        let has_external = !self.external_reference_deltas.is_empty()
+            || !self.enrichment_marks.is_empty()
+            || (has_records && positional);
+        let mut out = serializer.serialize_struct(
+            "WorkspaceSemanticDelta",
+            3 + usize::from(has_external) + usize::from(has_marks) + usize::from(has_records),
+        )?;
+        out.serialize_field("version", &self.version)?;
+        out.serialize_field("entity_deltas", &self.entity_deltas)?;
+        out.serialize_field("relation_deltas", &self.relation_deltas)?;
+        if has_external {
+            out.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        } else {
+            out.skip_field("external_reference_deltas")?;
+        }
+        if has_marks {
+            out.serialize_field("enrichment_marks", &self.enrichment_marks)?;
+        } else {
+            out.skip_field("enrichment_marks")?;
+        }
+        if has_records {
+            out.serialize_field("resolution_record_deltas", &self.resolution_record_deltas)?;
+        } else {
+            out.skip_field("resolution_record_deltas")?;
+        }
+        out.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -62,6 +132,308 @@ struct WorkspaceSemanticDeltaWire {
     relation_deltas: Vec<RelationDelta>,
     #[serde(default)]
     external_reference_deltas: Vec<ExternalReferenceDelta>,
+    #[serde(default)]
+    enrichment_marks: EnrichmentMarksDelta,
+    #[serde(default)]
+    resolution_record_deltas: Vec<ResolutionRecordDelta>,
+}
+
+/// One file whose language-server enrichment Kin finished, bound to the exact
+/// bytes it was asked about and to the relations authority holds for it.
+///
+/// This is Kin's own bookkeeping, kept in the workspace authority rather than
+/// beside it so it moves with the workspace generation and is committed in the
+/// same transaction as the relations it describes. A cold sweep that is
+/// interrupted resumes after every file carrying a mark that still holds.
+///
+/// Storage keeps a mark only while it holds: the workspace tree still carries
+/// `body` at `path`, and the relations [`enrichment_relations_digest`] reads
+/// for `path` still hash to `relations`. Any workspace mutation that changes
+/// either drops the mark, so a stale mark cannot outlive the state it
+/// described.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnrichmentMark {
+    /// Repository path, in its UTF-8 rendering.
+    pub path: String,
+    /// The body the language server was asked about.
+    pub body: Hash256,
+    /// The enrichment version that finished the file. A build that asks more
+    /// does not skip a file an older enrichment finished.
+    pub version: u32,
+    /// [`enrichment_relations_digest`] of the relations authority holds for
+    /// the file, taken when the mark was committed.
+    pub relations: Hash256,
+}
+
+/// How one enrichment publication changes the workspace's enrichment marks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnrichmentMarksDelta {
+    /// Drop every mark the workspace carries before applying `marks`. A merge
+    /// sets it, because the cross-file bindings every mark vouched for moved.
+    #[serde(default)]
+    pub retire_all: bool,
+    /// Marks to record, replacing any mark for the same path. Sorted by path,
+    /// one per path. A mark that does not hold against the successor is
+    /// dropped rather than recorded.
+    #[serde(default)]
+    pub marks: Vec<EnrichmentMark>,
+}
+
+impl EnrichmentMarksDelta {
+    pub fn is_empty(&self) -> bool {
+        !self.retire_all && self.marks.is_empty()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self
+            .marks
+            .windows(2)
+            .any(|pair| pair[0].path >= pair[1].path)
+        {
+            return Err(ModelError::InvalidOperation(
+                "enrichment marks are not in canonical unique path order".to_string(),
+            ));
+        }
+        if self.marks.iter().any(|mark| mark.version == 0) {
+            return Err(ModelError::InvalidOperation(
+                "an enrichment mark must name the enrichment version that wrote it".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether an evidence record of `relation` answers a references query.
+///
+/// A references query is asked about the relation's destination, by the pass
+/// of the file that declares it, and its record's span is the referencing site,
+/// which is usually in another file. It is the one query that mints a
+/// `References` relation under a references rule. The uses-type arm records
+/// its `UsesType` relations under the same rule, but it asks at a position in
+/// its own entity, the relation's source, so its span names the asking file
+/// like every other query's.
+fn answers_a_references_query(
+    relation: &crate::Relation,
+    evidence: &crate::RelationEvidence,
+) -> bool {
+    relation.kind == crate::RelationKind::References
+        && matches!(
+            evidence.parser_rule.as_deref(),
+            Some(crate::LSP_REFERENCES_RULE | crate::LSP_PROVEN_METHOD_REFERENCES_RULE)
+        )
+}
+
+/// Call `owner` with every file whose enrichment produced or settled
+/// `relation`, which is every file whose [`EnrichmentMark`] vouches for it.
+///
+/// A mark says its own file's enrichment is done and still holds, so it
+/// vouches for what that file's passes produced and settled, and for nothing
+/// another file's pass adds:
+///
+/// - A language-server relation belongs to the pass that asked each query its
+///   evidence answers. A references query belongs to the file declaring the
+///   relation's destination, wherever the site it found lies. Every other
+///   query (a definition, a call hierarchy, a member's binding, a used type)
+///   is asked at a position in the file its record's span names, including a
+///   used type recorded under the references rule.
+/// - A `Calls` relation of any other origin is a name-only guess, and belongs
+///   to the file its sites are in, because enriching that file settles it: a
+///   guess a language server contradicted at its call site leaves the graph.
+///   A mutation that binds such a guess again, even with the file's bytes and
+///   language-server relations unchanged, moves the file's digest and retires
+///   its mark in the same transaction, so the next sweep settles the file
+///   again rather than resuming past a guess the server refuted.
+/// - Nothing else belongs to any file's enrichment.
+///
+/// So a later file whose reference query finds a site inside a file already
+/// marked adds an edge that file's mark does not vouch for, and the mark holds.
+///
+/// `entity_file` names the file an entity is declared in.
+fn for_each_enrichment_owner<'e>(
+    relation: &crate::Relation,
+    entity_file: &impl Fn(&crate::EntityId) -> Option<&'e str>,
+    mut owner: impl FnMut(&str),
+) {
+    if relation.origin == crate::RelationOrigin::Lsp {
+        for evidence in &relation.evidence {
+            if answers_a_references_query(relation, evidence) {
+                if let crate::GraphNodeId::Entity(destination) = &relation.dst {
+                    if let Some(file) = entity_file(destination) {
+                        owner(file);
+                    }
+                }
+            } else if let Some(span) = &evidence.source_span {
+                owner(&span.file.0);
+            }
+        }
+    } else if relation.kind == crate::RelationKind::Calls {
+        for evidence in &relation.evidence {
+            if let Some(span) = &evidence.source_span {
+                owner(&span.file.0);
+            }
+        }
+    }
+}
+
+/// The digest an [`EnrichmentMark`] binds: the sorted identities of the
+/// relations whose enrichment belongs to `path`, as
+/// [`for_each_enrichment_owner`] assigns them, and the sorted identities of
+/// the call-site ledgers of the callers declared in `path`.
+///
+/// A mark says its file's call sites each have one state, so it covers the
+/// ledgers that hold those states as well as the edges that prove them: a
+/// transaction that retires a ledger (its caller changed or left) moves the
+/// digest and retires the mark with it, and the file is owed enrichment again.
+/// `ledgers` are the identities of the ledgers the graph holds for callers in
+/// `path`, as [`enrichment_ledgers_by_file`] groups them.
+///
+/// One definition for the daemon that writes a mark and the storage that keeps
+/// it, so the two cannot disagree about what a mark vouches for.
+pub fn enrichment_relations_digest<'a, 'e>(
+    path: &str,
+    relations: impl IntoIterator<Item = &'a crate::Relation>,
+    entity_file: impl Fn(&crate::EntityId) -> Option<&'e str>,
+    ledgers: impl IntoIterator<Item = crate::ResolutionRecordId>,
+) -> Hash256 {
+    let mut ids: Vec<[u8; 16]> = relations
+        .into_iter()
+        .filter(|relation| {
+            let mut owned = false;
+            for_each_enrichment_owner(relation, &entity_file, |file| owned |= file == path);
+            owned
+        })
+        .map(|relation| *relation.id.0.as_bytes())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut ledger_ids: Vec<[u8; 16]> = ledgers
+        .into_iter()
+        .map(|ledger| *ledger.0.as_bytes())
+        .collect();
+    ledger_ids.sort_unstable();
+    ledger_ids.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-enrichment-relations-v4\0");
+    hasher.update((ids.len() as u64).to_le_bytes());
+    for id in &ids {
+        hasher.update(id);
+    }
+    hasher.update((ledger_ids.len() as u64).to_le_bytes());
+    for id in &ledger_ids {
+        hasher.update(id);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Hash256::from_bytes(digest)
+}
+
+/// The call-site ledgers among `records`, grouped by the file that declares
+/// each ledger's caller, for digesting many marks with one walk.
+///
+/// `entity_file` names the file an entity is declared in. A ledger whose
+/// caller it cannot place belongs to no file.
+pub fn enrichment_ledgers_by_file<'a, 'e>(
+    records: impl IntoIterator<Item = &'a crate::ResolutionRecord>,
+    entity_file: impl Fn(&crate::EntityId) -> Option<&'e str>,
+) -> BTreeMap<String, Vec<crate::ResolutionRecordId>> {
+    let mut by_path: BTreeMap<String, Vec<crate::ResolutionRecordId>> = BTreeMap::new();
+    for record in records {
+        let Some(ledger) = record.as_call_sites() else {
+            continue;
+        };
+        let Some(file) = entity_file(&ledger.caller) else {
+            continue;
+        };
+        match by_path.get_mut(file) {
+            Some(held) => held.push(record.id()),
+            None => {
+                by_path.insert(file.to_string(), vec![record.id()]);
+            }
+        }
+    }
+    by_path
+}
+
+/// Every relation an [`EnrichmentMark`] vouches for, grouped by the files
+/// whose enrichment it belongs to, for digesting many marks with one walk.
+pub fn enrichment_relations_by_owner_file<'a, 'e>(
+    relations: impl IntoIterator<Item = &'a crate::Relation>,
+    entity_file: impl Fn(&crate::EntityId) -> Option<&'e str>,
+) -> BTreeMap<String, Vec<&'a crate::Relation>> {
+    let mut by_path: BTreeMap<String, Vec<&'a crate::Relation>> = BTreeMap::new();
+    let mut owners: BTreeSet<String> = BTreeSet::new();
+    for relation in relations {
+        owners.clear();
+        for_each_enrichment_owner(relation, &entity_file, |file| {
+            if !owners.contains(file) {
+                owners.insert(file.to_string());
+            }
+        });
+        for path in &owners {
+            match by_path.get_mut(path.as_str()) {
+                Some(held) => held.push(relation),
+                None => {
+                    by_path.insert(path.clone(), vec![relation]);
+                }
+            }
+        }
+    }
+    by_path
+}
+
+/// The marks a workspace successor carries, and the paths of marks the delta
+/// named that do not hold.
+///
+/// Starts from what the workspace held, unless the delta retires all of it,
+/// applies the delta's marks over it, and keeps a mark only while the successor
+/// tree holds its body at its path and `relations_for` still digests to its
+/// recorded relations. Anything else is dropped, whether carried or newly
+/// named: a mark that does not hold only costs its file a question, while
+/// refusing the transaction over one would also refuse the relations
+/// published beside it. The caller reports the named ones, since a writer that
+/// described a state this workspace is not in is worth knowing about.
+pub fn settle_enrichment_marks(
+    current: &[EnrichmentMark],
+    delta: &EnrichmentMarksDelta,
+    successor_tree: &ResolvedTree,
+    mut relations_for: impl FnMut(&str) -> Hash256,
+) -> Result<(Vec<EnrichmentMark>, Vec<String>)> {
+    delta.validate()?;
+    let mut settled: BTreeMap<String, EnrichmentMark> = if delta.retire_all {
+        BTreeMap::new()
+    } else {
+        current
+            .iter()
+            .map(|mark| (mark.path.clone(), mark.clone()))
+            .collect()
+    };
+    let named: BTreeSet<&str> = delta.marks.iter().map(|mark| mark.path.as_str()).collect();
+    for mark in &delta.marks {
+        settled.insert(mark.path.clone(), mark.clone());
+    }
+    let mut kept = Vec::with_capacity(settled.len());
+    let mut dropped_named = Vec::new();
+    for (path, mark) in settled {
+        let holds =
+            mark_body_holds(&mark, successor_tree) && relations_for(&path) == mark.relations;
+        if holds {
+            kept.push(mark);
+        } else if named.contains(path.as_str()) {
+            dropped_named.push(path);
+        }
+    }
+    Ok((kept, dropped_named))
+}
+
+fn mark_body_holds(mark: &EnrichmentMark, tree: &ResolvedTree) -> bool {
+    let Ok(path) = crate::RepoPath::from_utf8(mark.path.clone()) else {
+        return false;
+    };
+    matches!(
+        tree.artifact_at_path(&path).map(|artifact| &artifact.entry),
+        Some(crate::TreeEntry::Blob { hash, .. }) if *hash == mark.body
+    )
 }
 
 impl<'de> Deserialize<'de> for WorkspaceSemanticDelta {
@@ -75,6 +447,8 @@ impl<'de> Deserialize<'de> for WorkspaceSemanticDelta {
             entity_deltas: wire.entity_deltas,
             relation_deltas: wire.relation_deltas,
             external_reference_deltas: wire.external_reference_deltas,
+            enrichment_marks: wire.enrichment_marks,
+            resolution_record_deltas: wire.resolution_record_deltas,
         };
         delta.validate().map_err(serde::de::Error::custom)?;
         Ok(delta)
@@ -102,9 +476,40 @@ impl WorkspaceSemanticDelta {
             entity_deltas,
             relation_deltas,
             external_reference_deltas,
+            enrichment_marks: EnrichmentMarksDelta::default(),
+            resolution_record_deltas: Vec::new(),
         };
         delta.validate()?;
         Ok(delta)
+    }
+
+    /// This delta, also moving `deltas` of resolution records.
+    pub fn with_resolution_records(
+        mut self,
+        mut deltas: Vec<ResolutionRecordDelta>,
+    ) -> Result<Self> {
+        deltas.sort_by_key(ResolutionRecordDelta::target_id);
+        self.resolution_record_deltas = deltas;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn resolution_record_deltas(&self) -> &[ResolutionRecordDelta] {
+        &self.resolution_record_deltas
+    }
+
+    /// This delta, also recording `marks` in the workspace it is applied to.
+    pub fn with_enrichment_marks(mut self, mut marks: EnrichmentMarksDelta) -> Result<Self> {
+        marks
+            .marks
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        marks.validate()?;
+        self.enrichment_marks = marks;
+        Ok(self)
+    }
+
+    pub fn enrichment_marks(&self) -> &EnrichmentMarksDelta {
+        &self.enrichment_marks
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -144,6 +549,18 @@ impl WorkspaceSemanticDelta {
                     .to_string(),
             ));
         }
+        if self
+            .resolution_record_deltas
+            .windows(2)
+            .any(|pair| pair[0].target_id() >= pair[1].target_id())
+        {
+            return Err(ModelError::InvalidOperation(
+                "workspace semantic resolution-record deltas are not in canonical unique target \
+                 order"
+                    .to_string(),
+            ));
+        }
+        self.enrichment_marks.validate()?;
         validate_transaction_delta(&self.transaction_delta())
     }
 
@@ -187,6 +604,7 @@ impl WorkspaceSemanticDelta {
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
             external_reference_deltas: self.external_reference_deltas.clone(),
+            resolution_record_deltas: self.resolution_record_deltas.clone(),
         }
     }
 
@@ -194,6 +612,8 @@ impl WorkspaceSemanticDelta {
         self.entity_deltas.is_empty()
             && self.relation_deltas.is_empty()
             && self.external_reference_deltas.is_empty()
+            && self.enrichment_marks.is_empty()
+            && self.resolution_record_deltas.is_empty()
     }
 
     fn sort_canonical(&mut self) {
@@ -201,6 +621,8 @@ impl WorkspaceSemanticDelta {
         self.relation_deltas.sort_by_key(RelationDelta::target_id);
         self.external_reference_deltas
             .sort_by_key(ExternalReferenceDelta::target_id);
+        self.resolution_record_deltas
+            .sort_by_key(ResolutionRecordDelta::target_id);
     }
 }
 
@@ -211,6 +633,8 @@ impl Default for WorkspaceSemanticDelta {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
             external_reference_deltas: Vec::new(),
+            enrichment_marks: EnrichmentMarksDelta::default(),
+            resolution_record_deltas: Vec::new(),
         }
     }
 }
@@ -255,6 +679,13 @@ impl WorkspaceSemanticOverlay {
                 self.0.version
             )));
         }
+        if !self.0.enrichment_marks.is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "a workspace semantic overlay never carries enrichment marks; the workspace \
+                 records them itself"
+                    .to_string(),
+            ));
+        }
         self.0.validate()
     }
 
@@ -291,6 +722,16 @@ impl WorkspaceSemanticOverlay {
         self.0.external_reference_deltas()
     }
 
+    pub fn resolution_record_deltas(&self) -> &[ResolutionRecordDelta] {
+        self.0.resolution_record_deltas()
+    }
+
+    /// This overlay, also carrying `deltas` of resolution records relative to
+    /// the same base.
+    pub fn with_resolution_records(self, deltas: Vec<ResolutionRecordDelta>) -> Result<Self> {
+        Ok(Self(self.0.with_resolution_records(deltas)?))
+    }
+
     pub fn transaction_delta(&self) -> TransactionDelta {
         self.0.transaction_delta()
     }
@@ -307,13 +748,28 @@ impl WorkspaceSemanticOverlay {
     /// workspace already holds, and every relation it writes carries
     /// [`RelationOrigin::Lsp`](crate::RelationOrigin::Lsp). An overlay that
     /// holds exactly that is Kin's own derived state rather than work anyone
-    /// has not committed yet. An entity, an external reference, a removal, or
-    /// a relation of any other origin is something else, and makes this false.
+    /// has not committed yet, and so are the external symbols its proofs name
+    /// and the resolution records it adds. An entity, any other external
+    /// reference, a removal, or a relation of any other origin is something
+    /// else, and makes this false.
     /// An empty overlay holds no enrichment either, so it is false too.
     pub fn is_language_server_enrichment_only(&self) -> bool {
+        // An external symbol a language server's proof named, and the
+        // resolution records it made its proofs under, are that enrichment's
+        // own additions too.
         !self.is_empty()
             && self.entity_deltas().is_empty()
-            && self.external_reference_deltas().is_empty()
+            && self.external_reference_deltas().iter().all(|delta| {
+                matches!(
+                    delta,
+                    ExternalReferenceDelta::Added { new }
+                        if new.resolution_namespace == crate::EXTERNAL_SYMBOL_NAMESPACE
+                )
+            })
+            && self
+                .resolution_record_deltas()
+                .iter()
+                .all(|delta| matches!(delta, ResolutionRecordDelta::Added { .. }))
             && self.relation_deltas().iter().all(|delta| match delta {
                 RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
                     new.origin == crate::RelationOrigin::Lsp
@@ -503,6 +959,16 @@ pub struct WorkspaceState {
     /// `.gitignore` or `.kinignore`.
     pub shared_admission_policy: SharedAdmissionPolicy,
     pub admission_policy: EffectiveAdmissionPolicyStamp,
+    /// Files whose language-server enrichment Kin finished for exactly the
+    /// bytes and relations this workspace holds, sorted by path. Kin's derived
+    /// bookkeeping, never work anyone has to commit.
+    ///
+    /// Deliberately last and omitted when empty. Workspaces persist inside a
+    /// MessagePack snapshot where position decides the mapping, so a workspace
+    /// written before this existed decodes to no marks, and a workspace that
+    /// carries none keeps its exact bytes and local authority root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrichment_marks: Vec<EnrichmentMark>,
 }
 
 impl WorkspaceState {
@@ -539,9 +1005,18 @@ impl WorkspaceState {
             semantic_overlay_hash,
             shared_admission_policy,
             admission_policy,
+            enrichment_marks: Vec::new(),
         };
         state.validate()?;
         Ok(state)
+    }
+
+    /// This workspace, carrying `marks`, each of which must hold against its
+    /// tree.
+    pub fn with_enrichment_marks(mut self, marks: Vec<EnrichmentMark>) -> Result<Self> {
+        self.enrichment_marks = marks;
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -575,6 +1050,21 @@ impl WorkspaceState {
             return Err(ModelError::InvalidOperation(format!(
                 "workspace semantic overlay hash {} recomputes to {}",
                 self.semantic_overlay_hash, computed_overlay
+            )));
+        }
+        EnrichmentMarksDelta {
+            retire_all: false,
+            marks: self.enrichment_marks.clone(),
+        }
+        .validate()?;
+        if let Some(mark) = self
+            .enrichment_marks
+            .iter()
+            .find(|mark| !mark_body_holds(mark, &self.tree))
+        {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} carries an enrichment mark for {} whose body its tree does not hold",
+                self.workspace_id, mark.path
             )));
         }
         Ok(())
@@ -983,6 +1473,25 @@ struct RepositoryOperationIdentity<'a> {
 }
 
 impl RepositoryOperationRecord {
+    /// Whether this record's workspace mutation records or retires enrichment
+    /// marks, which a reader older than the marks cannot decode.
+    pub fn carries_enrichment_marks(&self) -> bool {
+        self.workspace_mutation
+            .as_ref()
+            .is_some_and(|mutation| !mutation.semantic_delta.enrichment_marks().is_empty())
+    }
+
+    /// Whether this record's workspace mutation moves resolution records,
+    /// which a reader older than them cannot decode.
+    pub fn carries_resolution_records(&self) -> bool {
+        self.workspace_mutation.as_ref().is_some_and(|mutation| {
+            !mutation
+                .semantic_delta
+                .resolution_record_deltas()
+                .is_empty()
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.operation_id.as_uuid().is_nil() {
             return Err(ModelError::InvalidOperation(
@@ -1758,6 +2267,7 @@ struct CanonicalWorkspaceSemanticDelta<'a> {
     entity_deltas: Vec<&'a EntityDelta>,
     relation_deltas: Vec<&'a RelationDelta>,
     external_reference_deltas: Vec<&'a ExternalReferenceDelta>,
+    resolution_record_deltas: Vec<&'a ResolutionRecordDelta>,
 }
 
 impl<'a> CanonicalWorkspaceSemanticDelta<'a> {
@@ -1772,11 +2282,16 @@ impl<'a> CanonicalWorkspaceSemanticDelta<'a> {
             source.external_reference_deltas.iter().collect();
         external_reference_deltas.sort_by_key(|delta| ExternalReferenceDelta::target_id(delta));
 
+        let mut resolution_record_deltas: Vec<&'a ResolutionRecordDelta> =
+            source.resolution_record_deltas.iter().collect();
+        resolution_record_deltas.sort_by_key(|delta| ResolutionRecordDelta::target_id(delta));
+
         Self {
             source,
             entity_deltas,
             relation_deltas,
             external_reference_deltas,
+            resolution_record_deltas,
         }
     }
 }
@@ -1789,14 +2304,29 @@ impl Serialize for CanonicalWorkspaceSemanticDelta<'_> {
         use serde::ser::SerializeStruct;
 
         const ALWAYS_PRESENT_FIELD_COUNT: usize = 3;
-        let field_count =
-            ALWAYS_PRESENT_FIELD_COUNT + usize::from(!self.external_reference_deltas.is_empty());
+        // Resolution records bind the identity whenever a delta carries some,
+        // and a delta without any hashes exactly as it did before they existed.
+        // On a positional encoding the fields ahead of them are written so the
+        // records keep their own place, as the delta's own `Serialize` does.
+        let has_records = !self.resolution_record_deltas.is_empty();
+        let positional_tail = has_records && !serializer.is_human_readable();
+        let has_external = !self.external_reference_deltas.is_empty() || positional_tail;
+        let field_count = ALWAYS_PRESENT_FIELD_COUNT
+            + usize::from(has_external)
+            + usize::from(positional_tail)
+            + usize::from(has_records);
         let mut state = serializer.serialize_struct("WorkspaceSemanticDelta", field_count)?;
         state.serialize_field("version", &self.source.version)?;
         state.serialize_field("entity_deltas", &self.entity_deltas)?;
         state.serialize_field("relation_deltas", &self.relation_deltas)?;
-        if !self.external_reference_deltas.is_empty() {
+        if has_external {
             state.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        }
+        if positional_tail {
+            state.serialize_field("enrichment_marks", &self.source.enrichment_marks)?;
+        }
+        if has_records {
+            state.serialize_field("resolution_record_deltas", &self.resolution_record_deltas)?;
         }
         state.end()
     }
@@ -2414,6 +2944,8 @@ mod tests {
             entity_deltas: vec![high.clone(), low.clone()],
             relation_deltas: Vec::new(),
             external_reference_deltas: Vec::new(),
+            enrichment_marks: EnrichmentMarksDelta::default(),
+            resolution_record_deltas: Vec::new(),
         };
         assert!(
             descending.validate().is_err(),
@@ -4396,6 +4928,7 @@ mod tests {
                         .unwrap(),
                 },
             ],
+            resolution_record_deltas: Vec::new(),
         };
         change.id = crate::compute_semantic_change_id(&change).unwrap();
         change
@@ -6583,5 +7116,402 @@ mod tests {
             collaboration_delta: None,
         };
         assert!(transaction.validate().is_err());
+    }
+
+    fn lsp_relation(id: u128, file: &str) -> crate::Relation {
+        crate::Relation {
+            id: crate::RelationId(Uuid::from_u128(id)),
+            kind: crate::RelationKind::Calls,
+            src: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(1))),
+            dst: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(2))),
+            confidence: 1.0,
+            origin: crate::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: vec![crate::RelationEvidence {
+                source_span: Some(crate::SourceSpan {
+                    file: crate::FilePathId::new(file),
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 0,
+                    end_col: 1,
+                }),
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn no_entity_files(_: &EntityId) -> Option<&'static str> {
+        None
+    }
+
+    fn mark(path: &str, byte: u8, relations: &[crate::Relation]) -> EnrichmentMark {
+        EnrichmentMark {
+            path: path.to_string(),
+            body: Hash256::from_bytes([byte; 32]),
+            version: 2,
+            relations: enrichment_relations_digest(path, relations, no_entity_files, []),
+        }
+    }
+
+    /// A mark is carried only while the successor holds both the body it was
+    /// taken over and the relations it recorded, and a mark a mutation writes
+    /// that does not hold is refused rather than stored.
+    #[test]
+    fn enrichment_marks_hold_only_while_their_body_and_relations_do() {
+        let tree = ResolvedTree::default()
+            .apply(&[
+                add_artifact(ArtifactId(Uuid::from_u128(10)), "src/a.rs", 1, false),
+                add_artifact(ArtifactId(Uuid::from_u128(11)), "src/b.rs", 2, false),
+            ])
+            .unwrap();
+        let a_relations = vec![lsp_relation(100, "src/a.rs")];
+        let held = vec![mark("src/a.rs", 1, &a_relations), mark("src/b.rs", 2, &[])];
+        let digest_of = |relations: &[crate::Relation]| {
+            let relations = relations.to_vec();
+            move |path: &str| enrichment_relations_digest(path, &relations, no_entity_files, [])
+        };
+
+        let (kept, _) = settle_enrichment_marks(
+            &held,
+            &EnrichmentMarksDelta::default(),
+            &tree,
+            digest_of(&a_relations),
+        )
+        .unwrap();
+        assert_eq!(kept, held, "an unrelated mutation carries every mark");
+
+        let more = vec![lsp_relation(100, "src/a.rs"), lsp_relation(101, "src/a.rs")];
+        let (kept, _) = settle_enrichment_marks(
+            &held,
+            &EnrichmentMarksDelta::default(),
+            &tree,
+            digest_of(&more),
+        )
+        .unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|mark| mark.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/b.rs"],
+            "a file whose relations moved is not finished any more"
+        );
+
+        let edited = tree
+            .apply(&[TreeDelta::Updated {
+                artifact_id: ArtifactId(Uuid::from_u128(11)),
+                old: LocatedEntry::new(
+                    RepoPath::from_bytes("src/b.rs").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([2; 32]), false),
+                ),
+                new: LocatedEntry::new(
+                    RepoPath::from_bytes("src/b.rs").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([3; 32]), false),
+                ),
+            }])
+            .unwrap();
+        let (kept, _) = settle_enrichment_marks(
+            &held,
+            &EnrichmentMarksDelta::default(),
+            &edited,
+            digest_of(&a_relations),
+        )
+        .unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|mark| mark.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a.rs"],
+            "an edit retires the mark for the bytes it replaced"
+        );
+
+        let (retired, _) = settle_enrichment_marks(
+            &held,
+            &EnrichmentMarksDelta {
+                retire_all: true,
+                marks: Vec::new(),
+            },
+            &tree,
+            digest_of(&a_relations),
+        )
+        .unwrap();
+        assert!(retired.is_empty(), "a merge retires every mark");
+
+        let (kept, dropped) = settle_enrichment_marks(
+            &[],
+            &EnrichmentMarksDelta {
+                retire_all: false,
+                marks: vec![mark("src/a.rs", 1, &a_relations), mark("src/b.rs", 9, &[])],
+            },
+            &tree,
+            digest_of(&a_relations),
+        )
+        .unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|mark| mark.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a.rs"],
+            "a named mark that does not hold is dropped, and the rest of the delta stands"
+        );
+        assert_eq!(dropped, ["src/b.rs"], "and the writer is told which");
+    }
+
+    /// A mark covers the call-site ledgers of the callers its file declares, so
+    /// a transaction that retires one of them moves the digest and the file is
+    /// owed enrichment again. A ledger of a caller in another file does not
+    /// move it.
+    #[test]
+    fn an_enrichment_mark_covers_its_files_ledgers() {
+        let proof = lsp_relation(100, "src/a.rs");
+        let context = crate::ResolutionRecord::ProofContext(crate::ProofContext {
+            language: crate::LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "1".to_string(),
+            configuration_hash: Hash256::from_bytes([1; 32]),
+            environment_hash: Hash256::from_bytes([2; 32]),
+            environment_summary: String::new(),
+        });
+        let ledger_of = |caller: u128| {
+            crate::ResolutionRecord::CallSites(crate::CallSiteLedger {
+                caller: EntityId(Uuid::from_u128(caller)),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                body_hash: Hash256::from_bytes([4; 32]),
+                context: context.id(),
+                census: 0,
+                sites: Vec::new(),
+            })
+        };
+        // Entities 1 and 2 are declared in `src/a.rs`, entity 3 in `src/b.rs`.
+        let entity_file = |id: &EntityId| match id.0.as_u128() {
+            1 | 2 => Some("src/a.rs"),
+            3 => Some("src/b.rs"),
+            _ => None,
+        };
+        let records = [ledger_of(1), ledger_of(2), ledger_of(3), context.clone()];
+        let by_file = enrichment_ledgers_by_file(records.iter(), entity_file);
+        assert_eq!(by_file["src/a.rs"].len(), 2);
+        assert_eq!(by_file["src/b.rs"], [ledger_of(3).id()]);
+        assert_eq!(by_file.len(), 2, "a proof context is not a ledger");
+
+        let digest = |ledgers: &[crate::ResolutionRecordId]| {
+            enrichment_relations_digest("src/a.rs", [&proof], entity_file, ledgers.to_vec())
+        };
+        let whole = digest(&by_file["src/a.rs"]);
+        assert_ne!(
+            digest(&[ledger_of(1).id()]),
+            whole,
+            "a retired ledger moves the digest"
+        );
+        assert_ne!(digest(&[]), whole, "so does a file with no ledgers");
+        let mut reversed = by_file["src/a.rs"].clone();
+        reversed.reverse();
+        assert_eq!(
+            digest(&reversed),
+            whole,
+            "the order ledgers arrive in does not"
+        );
+        assert_ne!(
+            enrichment_relations_digest("src/a.rs", [&proof], entity_file, []),
+            enrichment_relations_digest("src/a.rs", [], entity_file, []),
+            "the relations still count"
+        );
+    }
+
+    /// A mark vouches for its file's calls whatever their origin, since
+    /// enrichment settles the name-only guesses among them, and for nothing
+    /// else a parser derived.
+    #[test]
+    fn an_enrichment_mark_vouches_for_its_files_calls() {
+        let proof = lsp_relation(100, "src/a.rs");
+        let mut guess = lsp_relation(101, "src/a.rs");
+        guess.origin = crate::RelationOrigin::Parsed;
+        let mut import = lsp_relation(102, "src/a.rs");
+        import.origin = crate::RelationOrigin::Parsed;
+        import.kind = crate::RelationKind::Imports;
+        let settled = enrichment_relations_digest("src/a.rs", [&proof], no_entity_files, []);
+        assert_ne!(
+            enrichment_relations_digest("src/a.rs", [&proof, &guess], no_entity_files, []),
+            settled,
+            "a call guess bound again moves the digest"
+        );
+        assert_eq!(
+            enrichment_relations_digest("src/a.rs", [&proof, &import], no_entity_files, []),
+            settled,
+            "a parsed import does not"
+        );
+        assert_eq!(
+            enrichment_relations_by_owner_file([&proof, &guess, &import], no_entity_files)
+                ["src/a.rs"]
+                .len(),
+            2
+        );
+    }
+
+    /// A mark vouches for what its own file's passes produced, and not for
+    /// what a later file's passes add. A reference query is its destination
+    /// file's, wherever the site it found lies; every other query is the file
+    /// its site is in.
+    #[test]
+    fn an_enrichment_mark_vouches_for_its_own_passes_and_not_a_later_files_references() {
+        // Entity 1 and 3 are declared in `src/a.rs`, entity 2 in `src/b.rs`.
+        let entity_file = |id: &EntityId| match id.0.as_u128() {
+            1 | 3 => Some("src/a.rs"),
+            2 => Some("src/b.rs"),
+            _ => None,
+        };
+        let with_rule = |id: u128, src: u128, dst: u128, file: &str, rule: &str| {
+            let mut relation = lsp_relation(id, file);
+            relation.kind = crate::RelationKind::References;
+            relation.src = crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(src)));
+            relation.dst = crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(dst)));
+            relation.evidence[0].parser_rule = Some(rule.to_string());
+            relation
+        };
+        // `a.rs`'s definitions pass, at a site in `a.rs`.
+        let own = with_rule(100, 1, 2, "src/a.rs", "lsp_definition");
+        // `b.rs`'s reference query about entity 2 found a site in `a.rs`.
+        let found_by_b = with_rule(101, 3, 2, "src/a.rs", crate::LSP_REFERENCES_RULE);
+        // `a.rs`'s reference query about entity 1 found a site in `b.rs`.
+        let found_by_a = with_rule(102, 2, 1, "src/b.rs", crate::LSP_REFERENCES_RULE);
+        // `b.rs`'s uses-type arm, asked at a position in its own entity 2,
+        // found a type entity 1 declares; the arm records under the references
+        // rule too.
+        let mut uses_by_b = with_rule(103, 2, 1, "src/b.rs", crate::LSP_REFERENCES_RULE);
+        uses_by_b.kind = crate::RelationKind::UsesType;
+        let digest = |path: &str, relations: &[&crate::Relation]| {
+            enrichment_relations_digest(path, relations.iter().copied(), entity_file, [])
+        };
+
+        assert_eq!(
+            digest("src/a.rs", &[&own, &found_by_b]),
+            digest("src/a.rs", &[&own]),
+            "a later file's reference query does not move an earlier file's digest"
+        );
+        assert_ne!(
+            digest("src/b.rs", &[&found_by_b]),
+            digest("src/b.rs", &[]),
+            "it is the digest of the file that asked"
+        );
+        assert_ne!(
+            digest("src/a.rs", &[&own, &found_by_a]),
+            digest("src/a.rs", &[&own]),
+            "a file's own reference query is vouched for by its own mark"
+        );
+        assert_eq!(
+            digest("src/b.rs", &[&found_by_a]),
+            digest("src/b.rs", &[]),
+            "and not by the file the site it found is in"
+        );
+        assert_eq!(
+            digest("src/a.rs", &[&own, &uses_by_b]),
+            digest("src/a.rs", &[&own]),
+            "a later file's used type does not move the digest of the file declaring the type"
+        );
+        assert_ne!(
+            digest("src/b.rs", &[&uses_by_b]),
+            digest("src/b.rs", &[]),
+            "it is the digest of the file whose entity uses the type"
+        );
+        let grouped = enrichment_relations_by_owner_file(
+            [&own, &found_by_b, &found_by_a, &uses_by_b],
+            entity_file,
+        );
+        let ids = |path: &str| {
+            grouped[path]
+                .iter()
+                .map(|relation| relation.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("src/a.rs"), [own.id, found_by_a.id]);
+        assert_eq!(ids("src/b.rs"), [found_by_b.id, uses_by_b.id]);
+    }
+
+    /// Operation records persist this delta positionally in MessagePack. A
+    /// delta without marks keeps the bytes and the identity it had before
+    /// marks existed, and one with marks but no external references still
+    /// decodes each field into its own place.
+    #[test]
+    fn enrichment_marks_keep_the_semantic_delta_wire_compatible() {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            version: u32,
+            entity_deltas: &'a [EntityDelta],
+            relation_deltas: &'a [RelationDelta],
+        }
+        let plain = WorkspaceSemanticDelta::default();
+        let legacy = Legacy {
+            version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+            entity_deltas: &[],
+            relation_deltas: &[],
+        };
+        assert_eq!(
+            rmp_serde::to_vec(&plain).unwrap(),
+            rmp_serde::to_vec(&legacy).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&plain).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        assert_eq!(
+            messagepack_array_len(&rmp_serde::to_vec(&plain).unwrap()),
+            3
+        );
+
+        let marked = WorkspaceSemanticDelta::default()
+            .with_enrichment_marks(EnrichmentMarksDelta {
+                retire_all: false,
+                marks: vec![mark("src/b.rs", 2, &[]), mark("src/a.rs", 1, &[])],
+            })
+            .unwrap();
+        assert_eq!(
+            marked
+                .enrichment_marks()
+                .marks
+                .iter()
+                .map(|mark| mark.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a.rs", "src/b.rs"],
+            "marks are held in canonical path order"
+        );
+        // Marks without external references still take the fifth place: the
+        // fourth is written, empty, rather than skipped, so a positional
+        // decoder never reads the marks as external references.
+        let wire = rmp_serde::to_vec(&marked).unwrap();
+        assert_eq!(messagepack_array_len(&wire), 5);
+        let positions: (
+            u32,
+            Vec<EntityDelta>,
+            Vec<RelationDelta>,
+            Vec<ExternalReferenceDelta>,
+            EnrichmentMarksDelta,
+        ) = rmp_serde::from_slice(&wire).unwrap();
+        assert!(positions.3.is_empty());
+        assert_eq!(&positions.4, marked.enrichment_marks());
+        let decoded: WorkspaceSemanticDelta = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!(decoded, marked);
+        let decoded: WorkspaceSemanticDelta =
+            serde_json::from_slice(&serde_json::to_vec(&marked).unwrap()).unwrap();
+        assert_eq!(decoded, marked);
+        assert_ne!(
+            marked.identity_hash().unwrap(),
+            plain.identity_hash().unwrap()
+        );
+        assert!(!marked.is_empty(), "a marks-only delta is not a no-op");
+    }
+
+    /// An overlay is derived by storage from graph facts, and marks are not
+    /// graph facts, so an overlay carrying one is refused.
+    #[test]
+    fn an_overlay_never_carries_enrichment_marks() {
+        let marked = WorkspaceSemanticDelta::default()
+            .with_enrichment_marks(EnrichmentMarksDelta {
+                retire_all: true,
+                marks: Vec::new(),
+            })
+            .unwrap();
+        assert!(WorkspaceSemanticOverlay(marked).validate().is_err());
     }
 }

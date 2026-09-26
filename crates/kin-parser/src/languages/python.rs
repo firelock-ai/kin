@@ -583,11 +583,19 @@ fn extract_py_node(
                     // The declaration owns its decorators, including their call
                     // sites. A class extraction can append methods after the
                     // class, so retain the declaration's exact emission index.
+                    //
+                    // Python evaluates a decorator in the enclosing scope while
+                    // it runs the definition, not when the decorated function
+                    // runs. The declaration entity spans that whole definition,
+                    // decorators included, so it is the innermost owner of the
+                    // call site, which is the same rule every other call site
+                    // follows. What the call can reach is a separate question,
+                    // settled by its receiver below.
                     if !decorators.is_empty() {
                         if let Some(declaration) = entities.get_mut(declaration_index) {
                             let prefix = decorators
                                 .iter()
-                                .map(|(name, _)| format!("@{}", name))
+                                .map(|decorator| format!("@{}", decorator.name))
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             declaration.signature = format!("{} {}", prefix, declaration.signature);
@@ -597,15 +605,15 @@ fn extract_py_node(
                         }
                         if let Some(declaration) = entities.get(declaration_index) {
                             let src_name = declaration.name.clone();
-                            for (dec, site) in &decorators {
-                                if is_valid_callee_name(dec) {
+                            for decorator in &decorators {
+                                if is_valid_callee_name(&decorator.name) {
                                     relations.push(ExtractedRelation {
-                                        site: Some(site.clone()),
-                                        receiver: None,
+                                        site: Some(decorator.site.clone()),
+                                        receiver: decorator.receiver.clone(),
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Calls,
                                         src_name: src_name.clone(),
-                                        dst_name: dec.clone(),
+                                        dst_name: decorator.name.clone(),
                                         import_source: None,
                                     });
                                 }
@@ -1281,23 +1289,37 @@ fn looks_like_py_constant_name(name: &str) -> bool {
     (!has_lower && name.len() >= 2) || has_underscore
 }
 
-/// Extract decorator names from a `decorated_definition` node.
-/// Returns a list of decorator names (e.g., ["staticmethod", "property"]).
-/// Each decorator's name paired with the site of the `@decorator` syntax that
-/// named it.
+/// One `@decorator` line on a definition, as the call it makes.
+struct PythonDecorator {
+    /// The callee's trailing identifier (`route` for `@app.route("/")`).
+    name: String,
+    /// The receiver as written when the decorator is an attribute (`app` for
+    /// `@app.route("/")`), `None` for a bare `@name`. See
+    /// [`extract_decorator_payload`] for why it has to travel.
+    receiver: Option<String>,
+    /// The `@decorator` syntax itself.
+    site: RelationSite,
+}
+
+/// Extract the decorators of a `decorated_definition` node, each with the site
+/// of the `@decorator` syntax that named it.
 ///
 /// A decorator IS a call, and its `Calls` edge merges with any body call to the
 /// same target, so a decorator contributing no site would leave that merged edge
 /// reporting fewer lines than it has sites while its completeness flag still
 /// read true.
-fn extract_decorators(node: &tree_sitter::Node, source: &[u8]) -> Vec<(String, RelationSite)> {
+fn extract_decorators(node: &tree_sitter::Node, source: &[u8]) -> Vec<PythonDecorator> {
     let mut decorators = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "decorator" {
-            if let Some(name) = extract_decorator_payload_name(&child, source) {
+            if let Some((name, receiver)) = extract_decorator_payload(&child, source) {
                 if !name.is_empty() {
-                    decorators.push((name, site_from_node(&child)));
+                    decorators.push(PythonDecorator {
+                        name,
+                        receiver,
+                        site: site_from_node(&child),
+                    });
                 }
             }
         }
@@ -1309,24 +1331,40 @@ fn extract_decorators(node: &tree_sitter::Node, source: &[u8]) -> Vec<(String, R
 /// Handles `@name`, `@mod.name`, and `@mod.name(args)` — always returning the
 /// trailing identifier (e.g., "route" for `@app.route("/")`).
 fn extract_decorator_payload_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    extract_decorator_payload(node, source).map(|(name, _)| name)
+}
+
+/// Resolve a decorator's bare name and, for an attribute, its receiver as
+/// written: `("route", Some("app"))` for `@app.route("/")`, `("wraps",
+/// Some("functools"))` for `@functools.wraps(f)`, `("register", None)` for
+/// `@register`.
+///
+/// The receiver is what [`extract_named_callee`] records for the same call
+/// written in a body, and it has to travel for the same reason. `@app.post(...)`
+/// calls the member `post` of the value `app`; without its receiver it reaches
+/// the linker as a bare `post(...)`, which binds any free function named `post`
+/// in the repository. On fastapi that turned every route decorator into a call
+/// to an unrelated test handler that happened to be named `post` or `get`.
+fn extract_decorator_payload(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, Option<String>)> {
+    let text = |node: tree_sitter::Node| node.utf8_text(source).unwrap_or("").to_string();
+    let attribute = |node: &tree_sitter::Node| {
+        let name = text(node.child_by_field_name("attribute")?);
+        let receiver = node.child_by_field_name("object").map(text);
+        Some((name, receiver))
+    };
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "identifier" => {
-                return Some(child.utf8_text(source).unwrap_or("").to_string());
-            }
-            "attribute" => {
-                return child
-                    .child_by_field_name("attribute")
-                    .map(|f| f.utf8_text(source).unwrap_or("").to_string());
-            }
+            "identifier" => return Some((text(child), None)),
+            "attribute" => return attribute(&child),
             "call" => {
                 if let Some(function) = child.child_by_field_name("function") {
                     return match function.kind() {
-                        "identifier" => Some(function.utf8_text(source).unwrap_or("").to_string()),
-                        "attribute" => function
-                            .child_by_field_name("attribute")
-                            .map(|f| f.utf8_text(source).unwrap_or("").to_string()),
+                        "identifier" => Some((text(function), None)),
+                        "attribute" => attribute(&function),
                         _ => None,
                     };
                 }

@@ -28,11 +28,11 @@ use kin_model::{
     MergeTransactionRecord, ModelError, OperationId, RefExpectation, RefMutation, RefName,
     RefTarget, RefUpdatePolicy, RelationDelta, RepoPath, RepositoryAuthorityStore,
     RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
-    RepositoryRef, RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree,
-    RootBundle, SemanticChange, SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy,
-    Timestamp, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
-    WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
-    REPOSITORY_ROOT_SCHEMA_VERSION,
+    RepositoryRef, RepositoryRefState, RepositoryTransaction, ResolutionRecordDelta,
+    ResolvedArtifact, ResolvedTree, RootBundle, SemanticChange, SemanticChangeId,
+    SensitiveArtifactKind, SharedAdmissionPolicy, Timestamp, TreeDelta, TreeEntry, WorkspaceHead,
+    WorkspaceId, WorkspaceSemanticOverlay, WorkspaceSnapshotBinding, WorkspaceState,
+    WorkspaceTreeArtifact, WorkspaceTreeSnapshot, REPOSITORY_ROOT_SCHEMA_VERSION,
 };
 
 use crate::admission::{
@@ -126,7 +126,10 @@ pub const MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 /// later one, so the two must land in the order that keeps each value
 /// unambiguous, or the revision must move to separate them.
 // Existing root .kinignore transitions now admit a checked same-observation unignore.
-const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 4;
+// Revision 5: open validation checks resolution records, in history replay and in
+// snapshot admission: their identities, and that every node and record they name
+// exists.
+const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 5;
 
 /// Version of the complete open-time validation a durable history-validation
 /// record stands for.
@@ -805,6 +808,53 @@ impl Serialize for PersistedRepositoryAuthority {
 }
 
 impl PersistedRepositoryAuthority {
+    /// Whether this envelope carries language-server enrichment marks: a
+    /// workspace that holds some, or a logged operation that recorded or
+    /// retired some. A reader older than the marks decodes neither, so a store
+    /// carrying them declares a snapshot version that reader refuses at the
+    /// header, and a store without them keeps its version and its bytes.
+    pub(crate) fn carries_enrichment_marks(&self) -> bool {
+        self.workspaces
+            .iter()
+            .any(|workspace| !workspace.enrichment_marks.is_empty())
+            || self
+                .operation_log
+                .iter()
+                .any(RepositoryOperationRecord::carries_enrichment_marks)
+    }
+
+    /// Whether this envelope carries resolution records: a workspace overlay
+    /// that holds some, or a logged operation that moved some. A reader older
+    /// than them decodes neither, so a store carrying them declares a snapshot
+    /// version that reader refuses at the header.
+    pub(crate) fn carries_resolution_records(&self) -> bool {
+        self.workspaces.iter().any(|workspace| {
+            !workspace
+                .semantic_overlay
+                .resolution_record_deltas()
+                .is_empty()
+        }) || self
+            .operation_log
+            .iter()
+            .any(RepositoryOperationRecord::carries_resolution_records)
+    }
+
+    /// Whether this envelope carries a call-site ledger: a workspace overlay
+    /// that holds one, or a logged operation that moved one. A reader older
+    /// than ledgers decodes both and then mishandles the ledger, so a store
+    /// carrying one declares a snapshot version that reader refuses at the
+    /// header.
+    pub(crate) fn carries_call_site_ledgers(&self) -> bool {
+        self.workspaces.iter().any(|workspace| {
+            super::format::moves_call_site_ledgers(
+                workspace.semantic_overlay.resolution_record_deltas(),
+            )
+        }) || self
+            .operation_log
+            .iter()
+            .any(super::format::operation_moves_call_site_ledgers)
+    }
+
     pub(crate) fn empty(
         repository_id: RepositoryId,
         snapshot: &GraphSnapshot,
@@ -1158,6 +1208,11 @@ pub struct RepositoryAuthorityState {
     /// belongs to the object persistence acknowledged, which is what lets a
     /// freeze vouch for that object.
     durable: std::sync::OnceLock<DurableAuthorityIdentity>,
+    /// SHA-256 of the exact local publication record the commit that
+    /// acknowledged this state installed, taken under the lock that installed
+    /// it. Unset on a state an open loaded, and on one whose record its writer
+    /// cannot name. Bound and carried exactly as `durable` is.
+    installed_record: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl Clone for RepositoryAuthorityState {
@@ -1168,6 +1223,7 @@ impl Clone for RepositoryAuthorityState {
             authenticated_gitlinks: Arc::clone(&self.authenticated_gitlinks),
             prepared: self.prepared.clone(),
             durable: std::sync::OnceLock::new(),
+            installed_record: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1200,6 +1256,7 @@ impl RepositoryAuthorityState {
             authenticated_gitlinks: Arc::new(authenticated_gitlinks),
             prepared: None,
             durable: std::sync::OnceLock::new(),
+            installed_record: std::sync::OnceLock::new(),
         }
     }
 
@@ -1235,6 +1292,7 @@ impl RepositoryAuthorityState {
             // one that could only ever refuse.
             prepared: None,
             durable: std::sync::OnceLock::new(),
+            installed_record: std::sync::OnceLock::new(),
         }
     }
 
@@ -1256,6 +1314,7 @@ impl RepositoryAuthorityState {
             authenticated_gitlinks: Arc::clone(&current.authenticated_gitlinks),
             prepared: None,
             durable: std::sync::OnceLock::new(),
+            installed_record: std::sync::OnceLock::new(),
         }
     }
 
@@ -1274,6 +1333,24 @@ impl RepositoryAuthorityState {
         &self.metadata().roots
     }
 
+    /// The language-server enrichment marks one workspace carries, or none
+    /// when the workspace is not registered.
+    pub fn workspace_enrichment_marks(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> &[kin_model::EnrichmentMark] {
+        self.snapshot
+            .repository_authority
+            .as_ref()
+            .and_then(|authority| {
+                authority
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == *workspace_id)
+            })
+            .map_or(&[], |workspace| workspace.enrichment_marks.as_slice())
+    }
+
     /// The durable bytes this exact state was loaded from or written as, once
     /// the persistence that read or wrote them has bound them.
     fn durable_identity(&self) -> Option<&DurableAuthorityIdentity> {
@@ -1287,6 +1364,18 @@ impl RepositoryAuthorityState {
     /// head only ever sends a freeze to the full path.
     fn bind_durable_identity(&self, identity: DurableAuthorityIdentity) {
         let _ = self.durable.set(identity);
+    }
+
+    /// The local publication record the commit that acknowledged this exact
+    /// state installed, by SHA-256, once that commit has bound it.
+    fn installed_record(&self) -> Option<&[u8; 32]> {
+        self.installed_record.get()
+    }
+
+    /// Bind the record the commit that acknowledged this state installed.
+    /// Bound once, like the head beside it.
+    fn bind_installed_record(&self, record: [u8; 32]) {
+        let _ = self.installed_record.set(record);
     }
 
     fn authenticated_gitlinks(&self) -> &BTreeSet<(ArtifactId, GitObjectId)> {
@@ -1502,6 +1591,11 @@ struct PersistenceState {
     /// over the bytes it loaded or installed. `None` whenever this writer
     /// cannot name them, which only ever sends a freeze to the full path.
     head: Option<DurableAuthorityIdentity>,
+    /// SHA-256 of the exact local publication record this writer's commit
+    /// installed at `cursor`, taken under the lock that installed it. `None`
+    /// whenever this writer did not install the record at `cursor` itself: an
+    /// open, a reconciliation, and every backend without local records.
+    record: Option<[u8; 32]>,
     /// Serialized length of the full snapshot the acknowledged journal extends.
     base_bytes: u64,
     /// Number of acknowledged authority frames since that snapshot.
@@ -1605,6 +1699,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             state: Mutex::new(PersistenceState {
                 cursor,
                 head: head.filter(|head| head.head_generation() == cursor.backend_generation()),
+                record: None,
                 base_bytes,
                 journal_frames,
                 journal_bytes,
@@ -1621,11 +1716,13 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     ///
     /// `head` receives the committed backend generation. An identity naming
     /// any other head is dropped rather than kept beside a cursor it does not
-    /// describe.
+    /// describe. `record` is the local publication record the save installed,
+    /// when it installed one this thread could name.
     fn record_save_outcome(
         state: &mut PersistenceState,
         outcome: SnapshotSaveOutcome,
         head: impl FnOnce(Generation) -> Option<DurableAuthorityIdentity>,
+        record: Option<[u8; 32]>,
     ) -> PersistOutcome {
         match outcome {
             SnapshotSaveOutcome::Committed {
@@ -1634,6 +1731,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                 let generation = committed_cursor.backend_generation();
                 state.cursor = committed_cursor;
                 state.head = head(generation).filter(|head| head.head_generation() == generation);
+                state.record = record.filter(|_| state.head.is_some());
                 PersistOutcome::Committed
             }
             SnapshotSaveOutcome::Committed {
@@ -1647,23 +1745,46 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         }
     }
 
+    /// Run one synchronous save, and name the local publication record it
+    /// installed when it installed one on this thread.
+    ///
+    /// The receipt is cleared before the save and taken after it, so the
+    /// digest is the one the save's own record write computed under its lock,
+    /// never one left behind by an earlier write.
+    fn installing_record<T>(&self, save: impl FnOnce() -> T) -> (T, Option<[u8; 32]>) {
+        let repository = self.repository_id.as_str();
+        let _ = super::backend::take_installed_local_authority_record(repository);
+        let saved = save();
+        (
+            saved,
+            super::backend::take_installed_local_authority_record(repository),
+        )
+    }
+
     /// Every successor persisted here descends from an open that established
     /// complete history validity, and carries its own new changes through
     /// `validate_history_replay` in `prepare_successor`. So the bytes being
     /// written are validated bytes, and the durable record says exactly that.
     fn persist_bytes(&self, bytes: &[u8], state: &mut PersistenceState) -> PersistOutcome {
-        let outcome = self.backend.save_snapshot_validated(
-            self.repository_id.as_str(),
-            bytes,
-            state.cursor,
-            Some(HISTORY_VALIDATION_VERSION),
-        );
-        let outcome = Self::record_save_outcome(state, outcome, |generation| {
-            Some(DurableAuthorityIdentity::full_snapshot(
-                generation,
-                hex::encode(Sha256::digest(bytes)),
-            ))
+        let (outcome, record) = self.installing_record(|| {
+            self.backend.save_snapshot_validated(
+                self.repository_id.as_str(),
+                bytes,
+                state.cursor,
+                Some(HISTORY_VALIDATION_VERSION),
+            )
         });
+        let outcome = Self::record_save_outcome(
+            state,
+            outcome,
+            |generation| {
+                Some(DurableAuthorityIdentity::full_snapshot(
+                    generation,
+                    hex::encode(Sha256::digest(bytes)),
+                ))
+            },
+            record,
+        );
         if matches!(outcome, PersistOutcome::Committed) {
             let retired = self.note_full_snapshot_committed(state, bytes.len());
             self.clear_retired_frames(retired);
@@ -1693,7 +1814,8 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         // The digest the writer measured over the bytes it streamed, which the
         // staged install verifies before the record names them.
         let streamed_sha256 = std::cell::Cell::new(None);
-        let outcome = {
+        let cursor = state.cursor;
+        let (outcome, record) = self.installing_record(|| {
             let mut produce = |out: &mut dyn std::io::Write| {
                 let shape = snapshot.stream_pre_validated(out)?;
                 written.set(shape.byte_len);
@@ -1703,16 +1825,21 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             self.backend.save_snapshot_streamed(
                 self.repository_id.as_str(),
                 &mut produce,
-                state.cursor,
+                cursor,
                 Some(HISTORY_VALIDATION_VERSION),
             )
-        };
-        let snapshot_bytes = written.get() as usize;
-        let outcome = Self::record_save_outcome(state, outcome, |generation| {
-            streamed_sha256.get().map(|sha256| {
-                DurableAuthorityIdentity::full_snapshot(generation, hex::encode(sha256))
-            })
         });
+        let snapshot_bytes = written.get() as usize;
+        let outcome = Self::record_save_outcome(
+            state,
+            outcome,
+            |generation| {
+                streamed_sha256.get().map(|sha256| {
+                    DurableAuthorityIdentity::full_snapshot(generation, hex::encode(sha256))
+                })
+            },
+            record,
+        );
         if matches!(outcome, PersistOutcome::Committed) {
             let retired = self.note_full_snapshot_committed(state, snapshot_bytes);
             self.clear_retired_frames(retired);
@@ -1804,17 +1931,25 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
 
     /// Append one validated authority frame at the current cursor.
     fn persist_frame_bytes(&self, frame: &[u8], state: &mut PersistenceState) -> PersistOutcome {
-        let outcome = self.backend.save_authority_frame(
-            self.repository_id.as_str(),
-            frame,
-            state.cursor,
-            Some(HISTORY_VALIDATION_VERSION),
-        );
-        let extended = state.head.clone();
-        let outcome = Self::record_save_outcome(state, outcome, |generation| {
-            extended
-                .and_then(|head| head.with_frame(generation, hex::encode(Sha256::digest(frame))))
+        let (outcome, record) = self.installing_record(|| {
+            self.backend.save_authority_frame(
+                self.repository_id.as_str(),
+                frame,
+                state.cursor,
+                Some(HISTORY_VALIDATION_VERSION),
+            )
         });
+        let extended = state.head.clone();
+        let outcome = Self::record_save_outcome(
+            state,
+            outcome,
+            |generation| {
+                extended.and_then(|head| {
+                    head.with_frame(generation, hex::encode(Sha256::digest(frame)))
+                })
+            },
+            record,
+        );
         if matches!(outcome, PersistOutcome::Committed) {
             state.journal_frames = state.journal_frames.saturating_add(1);
             state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
@@ -1954,6 +2089,9 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                     installed_cursor.backend_generation(),
                     hex::encode(Sha256::digest(&bytes)),
                 ));
+                // Found rather than installed by this call, so the record
+                // bytes are not ones this writer can name.
+                state.record = None;
                 let retired = self.note_full_snapshot_committed(&mut state, bytes.len());
                 self.clear_retired_frames(retired);
                 PersistOutcome::Committed
@@ -2024,6 +2162,9 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                     hex::encode(Sha256::digest(frame)),
                 )
             });
+            // Found rather than installed by this call, so the record bytes are
+            // not ones this writer can name.
+            state.record = None;
             state.journal_frames = state.journal_frames.saturating_add(1);
             state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
             return Ok(PersistOutcome::Committed);
@@ -2182,21 +2323,22 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
         let serialize_ms = timer.lap_ms();
         let snapshot_bytes = bytes.len();
         let mut state = self.state.lock();
-        let persisted = match session_digest {
+        let cursor = state.cursor;
+        let (persisted, record) = self.installing_record(|| match session_digest {
             Some(digest) => self.backend.save_prepared_session_snapshot_and_freeze(
                 self.repository_id.as_str(),
                 &bytes,
-                state.cursor,
+                cursor,
                 HISTORY_VALIDATION_VERSION,
                 digest,
             ),
             None => self.backend.save_snapshot_and_freeze(
                 self.repository_id.as_str(),
                 &bytes,
-                state.cursor,
+                cursor,
                 Some(HISTORY_VALIDATION_VERSION),
             ),
-        };
+        });
         let outcome = match persisted {
             Ok((committed_cursor, retained)) if committed_cursor != state.cursor => {
                 state.cursor = committed_cursor;
@@ -2205,8 +2347,12 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
                 // exactly what was serialized into them.
                 state.head = Some(retained.identity().clone())
                     .filter(|head| head.head_generation() == committed_cursor.backend_generation());
+                state.record = record.filter(|_| state.head.is_some());
                 if let Some(head) = state.head.clone() {
                     next.bind_durable_identity(head);
+                }
+                if let Some(record) = state.record {
+                    next.bind_installed_record(record);
                 }
                 let retired = self.note_full_snapshot_committed(&mut state, snapshot_bytes);
                 // The lock stays with the caller, so cleanup goes through it
@@ -2343,6 +2489,9 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     ) {
         if let (PersistOutcome::Committed, Some(head)) = (outcome, state.head.as_ref()) {
             next.bind_durable_identity(head.clone());
+            if let Some(record) = state.record {
+                next.bind_installed_record(record);
+            }
         }
     }
 }
@@ -4190,6 +4339,22 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
 }
 
 impl RepositoryAuthorityManager<LocalFileBackend> {
+    /// Whether these are the exact local publication record bytes this
+    /// manager's own commit installed for the state it now publishes.
+    ///
+    /// Byte for byte, against the digest the committing write computed under
+    /// the repository lock, so no record anyone else wrote qualifies: not a
+    /// newer head, and not a rewrite of this same head either, such as a
+    /// history-validation proof, a prepared session, or a record from a newer
+    /// Kin that an open would refuse. A reader that labels a held manager by
+    /// the record it read before the load can then keep holding it across the
+    /// manager's own commit, and reopens for every other record. `false` for
+    /// a state an open loaded, since an open installs no record of its own.
+    pub fn publication_record_is_own_commit(&self, record: &[u8]) -> bool {
+        let digest: [u8; 32] = Sha256::digest(record).into();
+        self.read_authority().installed_record() == Some(&digest)
+    }
+
     pub fn commit_repository_transaction_and_freeze(
         &self,
         transaction: RepositoryTransaction,
@@ -5117,6 +5282,7 @@ fn validate_unscoped_history_caches(snapshot: &GraphSnapshot) -> Result<(), KinD
         || !snapshot.outgoing.is_empty()
         || !snapshot.incoming.is_empty()
         || !snapshot.external_references.is_empty()
+        || !snapshot.resolution_records.is_empty()
         || !snapshot.resolved_tree.is_empty()
         || !snapshot.entity_revisions.is_empty()
         || !snapshot.shallow_files.is_empty()
@@ -6285,6 +6451,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         current,
         derived_semantic_overlay,
     )?;
+    let next = settle_workspace_enrichment_marks(current, mutation, &desired, next)?;
     // The successor's own materialization follows immediately and is compared
     // against the desired graph, which subsumes the materialize-and-discard
     // check the validating entry point ends with.
@@ -6336,6 +6503,68 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         count.set(WORKSPACE_BASE_CHANGES.with(|total| total.get()) - base_changes_before)
     });
     Ok(())
+}
+
+/// Carry the workspace's enrichment marks into its successor.
+///
+/// A mark is kept only while it holds against the successor: the tree still
+/// carries the body it was taken over, and the relations the successor graph
+/// holds that its file's enrichment produced or settled, with the call-site
+/// ledgers of the callers the file declares (see
+/// `kin_model::enrichment_relations_digest`), still digest to what it recorded.
+/// So a mutation that edits a file, replaces the relations its passes
+/// produced, binds a call guess its enrichment settled, or retires one of its
+/// callers' ledgers, retires its mark in the same transaction, and a mark can
+/// never vouch for a state the workspace has left. An edge another file's pass adds with a site in the file leaves
+/// the mark holding. A mark the mutation itself records that does not
+/// hold is dropped and reported, never allowed to refuse the relations it was
+/// published beside.
+///
+/// Free for a workspace that carries no marks and a mutation that records
+/// none, which is every mutation outside language-server enrichment.
+fn settle_workspace_enrichment_marks(
+    current: Option<&WorkspaceState>,
+    mutation: &kin_model::WorkspaceMutation,
+    desired: &WorkspaceGraphFacts,
+    next: WorkspaceState,
+) -> Result<WorkspaceState, KinDbError> {
+    let held: &[kin_model::EnrichmentMark] =
+        current.map_or(&[], |workspace| workspace.enrichment_marks.as_slice());
+    let delta = mutation.semantic_delta.enrichment_marks();
+    if held.is_empty() && delta.is_empty() {
+        return Ok(next);
+    }
+    let entity_file = |id: &kin_model::EntityId| {
+        desired
+            .entities
+            .get(id)
+            .and_then(|entity| entity.file_origin.as_ref())
+            .map(|file| file.0.as_str())
+    };
+    let by_path =
+        kin_model::enrichment_relations_by_owner_file(desired.relations.values(), entity_file);
+    let ledgers_by_path =
+        kin_model::enrichment_ledgers_by_file(desired.resolution_records.values(), entity_file);
+    let (marks, dropped) = kin_model::settle_enrichment_marks(held, delta, &next.tree, |path| {
+        kin_model::enrichment_relations_digest(
+            path,
+            by_path.get(path).into_iter().flatten().copied(),
+            entity_file,
+            ledgers_by_path.get(path).into_iter().flatten().copied(),
+        )
+    })
+    .map_err(|error| storage(format!("workspace enrichment marks refused: {error}")))?;
+    if !dropped.is_empty() {
+        tracing::warn!(
+            workspace = %next.workspace_id,
+            dropped = dropped.len(),
+            first = %dropped[0],
+            "enrichment marks that do not describe the body and relations this workspace holds \
+             were not recorded; their files are asked about again"
+        );
+    }
+    next.with_enrichment_marks(marks)
+        .map_err(|error| storage(format!("workspace enrichment marks refused: {error}")))
 }
 
 /// Recompute repository admission from the successor authority itself.
@@ -7680,6 +7909,7 @@ fn materialize_workspace_graph_snapshot_from_base(
         && delta.relation_deltas.is_empty()
         && delta.tree_deltas.is_empty()
         && delta.external_reference_deltas.is_empty()
+        && delta.resolution_record_deltas.is_empty()
         && delta.admission_policy_delta.is_none()
     {
         if base.resolved_tree != workspace.tree {
@@ -8074,6 +8304,7 @@ fn resolve_workspace_base_graph_snapshot_capturing(
                         relations: section.state.relations.clone(),
                         external_references: section.state.external_references.clone(),
                         tree: section.state.tree.clone(),
+                        resolution_records: section.state.resolution_records.clone(),
                     });
                 }
                 if let Err(refusal) = section {
@@ -8156,38 +8387,49 @@ fn resolve_workspace_base_graph_snapshot_capturing(
             captured = Some(CapturedBaseGraph::capture(change_id, state.clone()));
         }
     }
-    let (entities, relations, entity_revisions, resolved_tree, external_references) =
-        match (current_projection, resolved) {
-            (Some(state), _) => (
-                state.entities,
-                state.relations,
-                HashMap::new(),
-                state.tree,
-                state.external_references,
-            ),
-            (None, Some(state)) => (
-                state.entities,
-                state.relations,
-                state.entity_revisions,
-                state.tree,
-                state.external_references,
-            ),
-            (None, None) => (
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                ResolvedTree::default(),
-                HashMap::new(),
-            ),
-        };
+    let (
+        entities,
+        relations,
+        entity_revisions,
+        resolved_tree,
+        external_references,
+        resolution_records,
+    ) = match (current_projection, resolved) {
+        (Some(state), _) => (
+            state.entities,
+            state.relations,
+            HashMap::new(),
+            state.tree,
+            state.external_references,
+            state.resolution_records,
+        ),
+        (None, Some(state)) => (
+            state.entities,
+            state.relations,
+            state.entity_revisions,
+            state.tree,
+            state.external_references,
+            state.resolution_records,
+        ),
+        (None, None) => (
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            ResolvedTree::default(),
+            HashMap::new(),
+            HashMap::new(),
+        ),
+    };
     // Every field is named so that a new snapshot domain refuses to compile
     // here until someone decides whether a workspace base carries it. The
     // carried domains are cloned exactly as the whole-snapshot clone carried
     // them; adjacency is rebuilt below from the resolved relations, so the
     // persisted authority adjacency is never copied at all.
     let mut base = GraphSnapshot {
-        // Materialized graph has no authority envelope or materialized section.
-        version: GraphSnapshot::MIN_SUPPORTED_VERSION,
+        // Materialized graph has no authority envelope or materialized section,
+        // so it is v13, v23 when its history holds resolution records, or v25
+        // when one of them is a call-site ledger.
+        version: GraphSnapshot::graph_only_version(resolution_records.values()),
         entities,
         relations,
         outgoing: HashMap::new(),
@@ -8237,6 +8479,7 @@ fn resolve_workspace_base_graph_snapshot_capturing(
         // envelope, so there is no change it can claim to be the resolution at
         // and nothing a reader could validate a section against.
         materialized_graph: None,
+        resolution_records,
     };
     let domain_clone_ms = timer.lap_ms();
     rebuild_snapshot_adjacency(&mut base);
@@ -8353,12 +8596,39 @@ fn derive_workspace_semantic_overlay(
         .into_iter()
         .flatten()
         .collect();
-    WorkspaceSemanticOverlay::new_with_external_references(
+    let resolution_record_deltas: Vec<ResolutionRecordDelta> = base
+        .resolution_records
+        .keys()
+        .chain(desired.resolution_records.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|record_id| {
+            match (
+                base.resolution_records.get(&record_id),
+                desired.resolution_records.get(&record_id),
+            ) {
+                (None, Some(new)) => Some(ResolutionRecordDelta::Added { new: new.clone() }),
+                (Some(old), Some(new)) if old != new => Some(ResolutionRecordDelta::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                }),
+                (Some(old), None) => Some(ResolutionRecordDelta::Removed { old: old.clone() }),
+                (Some(_), Some(_)) | (None, None) => None,
+            }
+        })
+        .collect();
+    let overlay = WorkspaceSemanticOverlay::new_with_external_references(
         entity_deltas,
         relation_deltas,
         external_reference_deltas,
-    )
-    .map_err(Into::into)
+    )?;
+    if resolution_record_deltas.is_empty() {
+        return Ok(overlay);
+    }
+    overlay
+        .with_resolution_records(resolution_record_deltas)
+        .map_err(Into::into)
 }
 
 fn validate_exact_workspace_graph(
@@ -8381,6 +8651,12 @@ fn validate_exact_workspace_graph(
     if desired.external_references != rematerialized.external_references {
         return Err(storage(format!(
             "workspace {} cumulative semantic overlay did not reproduce the desired external references",
+            workspace.workspace_id
+        )));
+    }
+    if desired.resolution_records != rematerialized.resolution_records {
+        return Err(storage(format!(
+            "workspace {} cumulative semantic overlay did not reproduce the desired resolution records",
             workspace.workspace_id
         )));
     }
@@ -9984,6 +10260,9 @@ fn storage(message: String) -> KinDbError {
 mod tests {
     include!("binding_history_tests.rs");
     include!("derivation_ledger_tests.rs");
+    include!("enrichment_marks_format_tests.rs");
+    include!("resolution_records_format_tests.rs");
+    include!("call_site_ledgers_format_tests.rs");
     include!("repository/session_publication_tests.rs");
     use super::*;
     use crate::storage::backend::{HistoryValidationProof, VerifiedSourceBlob};
@@ -11055,6 +11334,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
 
@@ -11889,6 +12169,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         parent_change.id = compute_semantic_change_id(&parent_change).unwrap();
         let mut head_change = SemanticChange {
@@ -11942,6 +12223,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         head_change.id = compute_semantic_change_id(&head_change).unwrap();
 
@@ -12028,6 +12310,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         mutation.new_base_target = Some(RefTarget::change(change.id));
@@ -12266,6 +12549,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
 
@@ -12769,6 +13053,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         native.id = compute_semantic_change_id(&native).unwrap();
         let native_id = native.id;
@@ -12840,6 +13125,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         native.id = compute_semantic_change_id(&native).unwrap();
         fixture.transaction.changes.push(native);
@@ -13145,6 +13431,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         change
@@ -13546,6 +13833,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         genesis.id = compute_semantic_change_id(&genesis).unwrap();
 
@@ -13572,6 +13860,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         invalid_child.id = compute_semantic_change_id(&invalid_child).unwrap();
 
@@ -13619,6 +13908,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         genesis.id = compute_semantic_change_id(&genesis).unwrap();
 
@@ -13641,6 +13931,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         branch.id = compute_semantic_change_id(&branch).unwrap();
 
@@ -13663,6 +13954,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         merge.id = compute_semantic_change_id(&merge).unwrap();
 
@@ -13939,6 +14231,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         let base_target = RefTarget::change(change.id);
@@ -14438,6 +14731,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         next_change.id = compute_semantic_change_id(&next_change).unwrap();
         let next_target = RefTarget::change(next_change.id);
@@ -15400,6 +15694,7 @@ mod tests {
                 spec_link: None,
                 evidence: Vec::new(),
                 risk_summary: None,
+                resolution_record_deltas: Vec::new(),
             };
             change.id = compute_semantic_change_id(&change).unwrap();
             let target = RefTarget::change(change.id);
@@ -16220,6 +16515,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         next_change.id = compute_semantic_change_id(&next_change).unwrap();
         let new_target = RefTarget::change(next_change.id);
@@ -16578,6 +16874,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         native.id = compute_semantic_change_id(&native).unwrap();
         let native_id = native.id;
@@ -17299,6 +17596,7 @@ mod tests {
                 spec_link: None,
                 evidence: Vec::new(),
                 risk_summary: None,
+                resolution_record_deltas: Vec::new(),
             };
             change.id = compute_semantic_change_id(&change).unwrap();
             changes.push(change);
@@ -18531,8 +18829,8 @@ mod tests {
         // HISTORY_VALIDATION_COVERAGE_REVISION and update this expectation
         // together; if nothing about coverage moved, leave both alone.
         assert_eq!(
-            HISTORY_VALIDATION_VERSION, 1_504,
-            "envelope schema 5 and coverage revision 4 compose to 1504"
+            HISTORY_VALIDATION_VERSION, 1_505,
+            "envelope schema 5 and coverage revision 5 compose to 1505"
         );
         // That literal is the whole test. The rest of this comment exists so
         // nobody reads the test as stronger than it is, or pads it with
@@ -18818,6 +19116,7 @@ mod tests {
                     spec_link: None,
                     evidence: Vec::new(),
                     risk_summary: None,
+                    resolution_record_deltas: Vec::new(),
                 };
                 change.id = compute_semantic_change_id(&change).unwrap();
                 change
@@ -19939,12 +20238,14 @@ mod tests {
             external_references,
             materialized_graph,
             verified_binding_history,
+            resolution_records,
         } = served;
         assert_eq!(
             *verified_binding_history, fresh.verified_binding_history,
             "binding history capability"
         );
         assert_eq!(*version, fresh.version);
+        assert_eq!(*resolution_records, fresh.resolution_records);
         // `ResolvedGraphState` carries no `PartialEq`, so the two sections are
         // compared through the exact MessagePack form they persist in.
         assert_eq!(
@@ -21185,6 +21486,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         let next_target = RefTarget::change(change.id);
@@ -21468,6 +21770,167 @@ mod tests {
         read_authority_json(directory.path())["acknowledged_deltas"]
             .as_array()
             .map_or(0, Vec::len)
+    }
+
+    fn authority_record_bytes(directory: &TempDir) -> Vec<u8> {
+        std::fs::read(authority_json_path(directory.path())).unwrap()
+    }
+
+    /// [`framed_local_repository`] whose first publication also went through
+    /// the binding-history commit, as a daemon's store does, so the commits
+    /// after it qualify their predecessor.
+    fn binding_history_framed_repository(
+        directory: &TempDir,
+    ) -> (
+        Arc<LocalFileBackend>,
+        RepositoryAuthorityManager<LocalFileBackend>,
+    ) {
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction_with_binding_history(
+                arbitrary_repository_transaction(&manager),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        (backend, manager)
+    }
+
+    /// The held-authority reuse in a daemon rests on this answer, through the
+    /// commit method its enrichment publication calls: the record a manager's
+    /// own commit installed qualifies, and no record anyone else wrote does,
+    /// including a rewrite of the same head that an open would judge
+    /// differently.
+    #[test]
+    fn a_binding_history_commit_names_only_the_record_it_installed() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = binding_history_framed_repository(&directory);
+        let opened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(
+            !opened.publication_record_is_own_commit(&authority_record_bytes(&directory)),
+            "an open installs no record of its own"
+        );
+        drop(opened);
+
+        manager
+            .commit_repository_transaction_with_binding_history(
+                binding_history_followup(&manager, 0x0e3b_0001),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        assert_eq!(record_version(&directory), 4, "the commit appended a frame");
+        let own = authority_record_bytes(&directory);
+        assert!(
+            manager.publication_record_is_own_commit(&own),
+            "the record the manager's own frame commit installed qualifies"
+        );
+        assert!(!manager.publication_record_is_own_commit(b"not a record"));
+
+        // Same head, rewritten by someone else. A newer Kin's version is one
+        // an open refuses, and a record without its history proof is one an
+        // open accepts only by revalidating; neither is this commit's record.
+        let mut newer = read_authority_json(directory.path());
+        newer["version"] = serde_json::json!(6);
+        write_authority_json(directory.path(), &newer);
+        assert!(!manager.publication_record_is_own_commit(&authority_record_bytes(&directory)));
+        let refused = RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend));
+        assert!(
+            refused.is_err(),
+            "an open refuses the same head under a version it does not know"
+        );
+        let mut unproven: serde_json::Value = serde_json::from_slice(&own).unwrap();
+        unproven
+            .as_object_mut()
+            .unwrap()
+            .remove("history_validation")
+            .expect("the frame commit recorded a history proof for its head");
+        write_authority_json(directory.path(), &unproven);
+        assert!(!manager.publication_record_is_own_commit(&authority_record_bytes(&directory)));
+
+        // The exact bytes are the exact record again, and they carry the proof
+        // the commit wrote, so a reopen of them trusts it.
+        std::fs::write(authority_json_path(directory.path()), &own).unwrap();
+        assert!(manager.publication_record_is_own_commit(&own));
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(
+            reopened.opened_by_history_validation(),
+            "a frame commit leaves a history proof for its head, so the next open does not \
+             replay history"
+        );
+        assert_eq!(
+            authority_record_bytes(&directory),
+            own,
+            "an open that trusted the proof rewrites nothing"
+        );
+
+        reopened
+            .commit_repository_transaction_with_binding_history(
+                binding_history_followup(&reopened, 0x0e3b_0002),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        let theirs = authority_record_bytes(&directory);
+        assert!(reopened.publication_record_is_own_commit(&theirs));
+        assert!(
+            !manager.publication_record_is_own_commit(&theirs),
+            "a head another writer committed is not the one this manager holds"
+        );
+    }
+
+    /// The same answer where a commit promotes the journal into a full
+    /// snapshot: the record the promotion installed, retiring every frame,
+    /// qualifies, and still carries a history proof the next open trusts.
+    #[test]
+    fn a_full_snapshot_promotion_names_the_record_it_installed() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = binding_history_framed_repository(&directory);
+        manager.persistence().set_max_journal_frames_for_test(1);
+        manager
+            .commit_repository_transaction_with_binding_history(
+                binding_history_followup(&manager, 0x0e3c_0001),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+        assert!(manager.publication_record_is_own_commit(&authority_record_bytes(&directory)));
+
+        manager
+            .commit_repository_transaction_with_binding_history(
+                binding_history_followup(&manager, 0x0e3c_0002),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        assert_eq!(
+            acknowledged_frame_count(&directory),
+            0,
+            "the frame bound forced a full snapshot promotion"
+        );
+        assert_eq!(record_version(&directory), 3);
+        let promoted = authority_record_bytes(&directory);
+        assert!(
+            manager.publication_record_is_own_commit(&promoted),
+            "the record the promotion installed qualifies, and its retired-frame cleanup \
+             left it as installed"
+        );
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(
+            reopened.opened_by_history_validation(),
+            "a promotion records a history proof for its head, so the next open does not replay \
+             history"
+        );
+        assert!(!reopened.publication_record_is_own_commit(&promoted));
+        assert_eq!(
+            reopened.read_authority().roots(),
+            manager.read_authority().roots()
+        );
     }
 
     fn record_version(directory: &TempDir) -> u64 {
@@ -24325,6 +24788,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
 
@@ -24909,6 +25373,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         }
     }
 
@@ -25684,6 +26149,7 @@ mod tests {
                 spec_link: None,
                 evidence: Vec::new(),
                 risk_summary: None,
+                resolution_record_deltas: Vec::new(),
             };
             change.id = compute_semantic_change_id(&change).unwrap();
             change
@@ -26154,6 +26620,7 @@ mod replaywall_measurements {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).expect("change id computes");
         change
@@ -26487,6 +26954,7 @@ mod clockhalf_whole_history {
                 spec_link: None,
                 evidence: Vec::new(),
                 risk_summary: None,
+                resolution_record_deltas: Vec::new(),
             };
             change.id = compute_semantic_change_id(&change).expect("change id computes");
             // A flat forest keeps the change COUNT and drops the lineage DEPTH,
@@ -26775,6 +27243,7 @@ mod clockhalf_git_origin {
                 spec_link: None,
                 evidence: Vec::new(),
                 risk_summary: None,
+                resolution_record_deltas: Vec::new(),
             };
             change.id = compute_semantic_change_id(&change).expect("change id computes");
             let raw_tree_oid = if index == 0 || index % 2 == 0 {
@@ -27014,6 +27483,7 @@ mod native_admission_lineage {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).expect("change id computes");
         change
@@ -27050,6 +27520,7 @@ mod native_admission_lineage {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).expect("change id computes");
         change

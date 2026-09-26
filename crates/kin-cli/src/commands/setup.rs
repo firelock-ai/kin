@@ -3465,8 +3465,22 @@ fn is_managed_install(exe: Option<&Path>, kin_home: &Path) -> bool {
 /// one-liner has neither a checkout nor cargo, so naming a cargo build sends
 /// them to a command they cannot run; the installer that ships the shim is
 /// their route back, and it is the same remedy `kin doctor` already gives.
-fn missing_shim_guidance(exe: Option<&Path>, kin_home: &Path) -> (&'static str, &'static str) {
-    if is_managed_install(exe, kin_home) {
+///
+/// `None` when this install carries no projection driver either. The
+/// installer ships the driver and its shim together or not at all, and it had
+/// just told the user projection was not bundled and not needed; setup then
+/// printed "VFS shim not found. Reinstall Kin to restore it", which
+/// contradicted it and sent them to a reinstall that restores nothing.
+/// `kin doctor` reads the same state as "nothing is missing".
+fn missing_shim_guidance(
+    exe: Option<&Path>,
+    kin_home: &Path,
+    driver_present: bool,
+) -> Option<(&'static str, &'static str)> {
+    if !driver_present {
+        return None;
+    }
+    Some(if is_managed_install(exe, kin_home) {
         (
             "VFS shim not found. Reinstall Kin to restore it:",
             crate::daemon_client::KIN_INSTALL_COMMAND,
@@ -3476,8 +3490,26 @@ fn missing_shim_guidance(exe: Option<&Path>, kin_home: &Path) -> (&'static str, 
             "VFS shim not found. Build it with:",
             "cargo build --release -p kin-vfs-shim",
         )
-    }
+    })
 }
+
+/// Whether this install ships no projection at all: no driver, no shim, and
+/// no mode this host can run.
+///
+/// The installer's own words for that state are "not bundled in this archive,
+/// and the core CLI and daemon are fully functional without it", so setup
+/// says one neutral line instead of three red rows.
+pub(crate) fn projection_not_shipped(
+    driver: &crate::commands::projection::DriverProbe,
+    shim: &crate::commands::projection::ShimPresence,
+    modes: &[crate::commands::projection::ModeProbe],
+) -> bool {
+    driver.path.is_none() && !shim.installed && !modes.iter().any(|probe| probe.available)
+}
+
+/// The one line setup prints when no projection ships with this install.
+const PROJECTION_NOT_SHIPPED_LINE: &str =
+    "Filesystem projection: not part of this install. Kin works fully without it.";
 
 /// Install the shell hook, and the PATH line when `allow_path` permits it.
 ///
@@ -3519,10 +3551,16 @@ fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, St
             }
         }
     } else {
-        let (headline, command) =
-            missing_shim_guidance(env::current_exe().ok().as_deref(), &kin_home);
-        println!("  {headline}");
-        println!("    {command}");
+        let exe = env::current_exe().ok();
+        let driver_present = crate::commands::projection::probe_driver(&kin_home, exe.as_deref())
+            .path
+            .is_some();
+        if let Some((headline, command)) =
+            missing_shim_guidance(exe.as_deref(), &kin_home, driver_present)
+        {
+            println!("  {headline}");
+            println!("    {command}");
+        }
     }
 
     let source_line = rc_source_line(shell_name, &hook_file);
@@ -13255,6 +13293,15 @@ fn record_projection_choice() -> Result<()> {
     let modes = projection::probe_modes(&driver, &shim);
     let (_, chosen) = projection::choose_mode(None, projection::recorded_mode(&kin_home), &modes);
 
+    // Nothing shipped, so nothing is missing: one neutral line, the same
+    // verdict the installer just gave, rather than a heading and a red row per
+    // mode. Nothing is recorded, for the reason given at the end below.
+    if projection_not_shipped(&driver, &shim, &modes) {
+        println!("{PROJECTION_NOT_SHIPPED_LINE}");
+        println!();
+        return Ok(());
+    }
+
     println!("Filesystem projection:");
     for probe in &modes {
         let mark = if probe.available {
@@ -13291,13 +13338,15 @@ fn record_projection_choice() -> Result<()> {
                     println!("  Change it with `kin vfs on --mode <shim|nfs|fuse>`.");
                 } else {
                     println!(
-                        "  {chosen} is available: engage it with `kin vfs on --mode {chosen}`,                          which records it once it is actually running."
+                        "  {chosen} is available: engage it with `kin vfs on --mode {chosen}`, \
+                         which records it once it is actually running."
                     );
                 }
             }
             None => {
                 println!(
-                    "  {chosen} is available but needs `kin vfs on --mode {chosen}` to engage;                      nothing is recorded until a projection is actually running."
+                    "  {chosen} is available but needs `kin vfs on --mode {chosen}` to engage; \
+                     nothing is recorded until a projection is actually running."
                 );
             }
         }
@@ -13984,7 +14033,11 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     // before: the adapter was wired, no server was installed, the daemon logged
     // the failed start at debug level, and every cross-file call fell back to
     // matching names.
-    provision_language_servers_in_wizard(&opts, interactive).await;
+    // Which languages matter, decided once: the offer below and the closing
+    // next step have to name the same set.
+    let language_scope =
+        language_servers::language_scope(&env::current_dir().unwrap_or_default(), None);
+    provision_language_servers_in_wizard(&opts, interactive, &language_scope).await;
     record_language_tool_dirs_in_wizard();
 
     report_notification_identity(interactive);
@@ -14012,6 +14065,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         &applied.shell_integration,
         &applied.configured_assistants,
         &applied.deferred_clients,
+        &language_scope,
     );
 
     // Last, so it is the line the run ends on and the status a script reads.
@@ -14023,18 +14077,26 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
 /// Offer the missing language servers during first-run setup.
 ///
-/// Interactive runs ask per install command with the download disclosed.
+/// Only for the languages the repository setup runs in actually uses, and for
+/// every language when setup runs outside one, which the run says. Interactive
+/// runs ask per install command with the download disclosed, and the default
+/// answer is yes where the server can do its job on this machine.
 /// Non-interactive runs print the command and change nothing unless
 /// `--install-language-servers` was passed, because an unattended install
 /// should never spend a user's bandwidth on a prefix they share with the rest
 /// of their toolchain.
-async fn provision_language_servers_in_wizard(opts: &WizardOptions, interactive: bool) {
-    let missing = language_servers::missing_enrichable_languages();
+async fn provision_language_servers_in_wizard(
+    opts: &WizardOptions,
+    interactive: bool,
+    scope: &language_servers::LanguageScope,
+) {
+    let missing = scope.select(&language_servers::missing_enrichable_languages());
     if missing.is_empty() {
         return;
     }
     println!();
-    println!("Language servers (cross-file reference edges):");
+    println!("Language servers (cross-file references):");
+    println!("  {}", scope.describe());
     let consent = language_servers::InstallConsent::resolve(
         opts.install_language_servers,
         interactive && !opts.install_language_servers,
@@ -15115,6 +15177,7 @@ fn print_next_steps(
     shell_integration: &ShellIntegration,
     configured_assistants: &[(String, Option<PathBuf>)],
     deferred_clients: &[String],
+    language_scope: &language_servers::LanguageScope,
 ) {
     println!();
     match shell_integration {
@@ -15160,11 +15223,20 @@ fn print_next_steps(
     // reference edges are the answer Kin is sold on and they need a server per
     // language, so a host missing one is owed the command rather than the
     // discovery that `find_references` returns nothing.
-    let missing_servers: Vec<String> = language_servers::missing_enrichable_languages()
+    //
+    // Scoped the way `kin doctor --fix --install-language-servers` scopes its
+    // own install, so the line never promises servers the command it names
+    // will leave alone.
+    let missing_servers: Vec<String> = language_scope
+        .select(&language_servers::missing_enrichable_languages())
         .iter()
         .map(|language| language.to_string())
         .collect();
-    for line in next_step_block(&missing_servers) {
+    let scoped = matches!(
+        language_scope,
+        language_servers::LanguageScope::Repository(_)
+    );
+    for line in next_step_block(&missing_servers, scoped) {
         println!("{line}");
     }
 
@@ -15222,15 +15294,24 @@ fn aftercare_block() -> Vec<String> {
 /// does not and the reader can check it in the source. The closing block used
 /// to be `kin init` and four maintenance commands, so a first run ended with no
 /// question at all.
-fn next_step_block(missing_servers: &[String]) -> Vec<String> {
+///
+/// `scoped` says the list is the languages of the repository setup ran in.
+/// Otherwise it is every server this host lacks, and the line says the command
+/// installs only what the repository it runs in uses.
+fn next_step_block(missing_servers: &[String], scoped: bool) -> Vec<String> {
     let servers = if missing_servers.is_empty() {
         None
-    } else {
+    } else if scoped {
         Some(format!(
-            "install the {} language server{} this host is missing, which cross-file \
-             references need",
+            "install the {} language server{} this repository needs for cross-file references",
             missing_servers.join(", "),
             if missing_servers.len() == 1 { "" } else { "s" }
+        ))
+    } else {
+        Some(format!(
+            "in your repository, install the servers it needs for cross-file references (this \
+             host has none for {})",
+            missing_servers.join(", ")
         ))
     };
     let mut steps: Vec<(&str, &str)> = vec![(
@@ -15797,33 +15878,18 @@ async fn apply_language_server_provisioning(
     }
 
     if consent == InstallConsent::Withheld {
-        // Nobody to ask and no flag. Say what is missing and what closes it,
-        // and change nothing. Printing the command is the whole value here: the
-        // gap was already reported, the command was not.
-        println!(
-            "  {} no language server for {}; cross-file reference edges are unavailable for {}",
-            style("!").yellow(),
-            missing
-                .iter()
-                .map(|language| language.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            if missing.len() == 1 { "it" } else { "them" }
-        );
-        // The ROUTE's command, not the recipe's. On a host with no rustup the
-        // recipe's line is `rustup component add rust-analyzer`, which is the
-        // exact sentence that ended a cold walkthrough on 2026-08-28: a reader
-        // who is not a Rust developer sees an instruction to install a
-        // toolchain and stops. What Kin would actually do here is fetch a
-        // pinned, checksummed release binary, and that is what has to be on the
-        // line.
-        for command in language_servers::route_commands_for(missing) {
-            println!("      {command}");
+        // Nobody to ask and no flag. Say what is missing and the one command
+        // that closes it, and change nothing. Kin's own command rather than
+        // each route's line: on a host with no rustup the route's line is a
+        // pinned download described in words, and a first run printed "run
+        // `download rust-analyzer 2026-08-24 ...`" as though it were a command.
+        let lines = language_servers::withheld_lines(missing);
+        if let Some((first, rest)) = lines.split_first() {
+            println!("  {} {first}", style("!").yellow());
+            for line in rest {
+                println!("      {line}");
+            }
         }
-        println!(
-            "      or re-run with --install-language-servers to have Kin do {}",
-            if missing.len() == 1 { "it" } else { "them" }
-        );
         return ProvisioningOutcome::default();
     }
 
@@ -15833,20 +15899,47 @@ async fn apply_language_server_provisioning(
         |recipe| recipe.installed(),
         language_servers::resolve_route,
         |recipe, route| {
+            // Yes by default wherever the server can do its job here, so a
+            // person pressing Enter through setup ends with cross-file
+            // references. Every prompt used to default to no, and a first run
+            // that accepted every default finished with none.
+            let default_yes = language_servers::install_by_default(recipe, |program| {
+                which::which(program).is_ok()
+            });
             println!();
             println!(
-                "  Kin can enrich {} with cross-file reference edges, but its language server is \
-                 not installed.",
+                "  Kin can resolve {} references across files, but its language server is not \
+                 installed.",
                 recipe.language
             );
-            println!("    Command:    {}", recipe.route_command_line(route));
+            if language_servers::route_is_a_command(route) {
+                println!("    Command:    {}", recipe.route_command_line(route));
+            }
             println!(
                 "    This will:  {}",
                 language_servers::route_disclosure(recipe, route)
             );
-            prompt_yn("  Install it now?", false, true)
+            if !default_yes {
+                if let Some(reason) = language_servers::default_no_reason(recipe) {
+                    println!("    Note:       {reason}");
+                }
+            }
+            prompt_yn("  Install it now?", default_yes, true)
         },
-        language_servers::run_install,
+        move |recipe, route| {
+            // Said before anything runs, whoever consented. A run that took
+            // `--install-language-servers` used to print nothing until the
+            // installers' own output, and one of them had already written into
+            // the Homebrew prefix by then.
+            println!("  Installing the {} language server...", recipe.language);
+            if consent == InstallConsent::Granted {
+                println!(
+                    "    This will:  {}",
+                    language_servers::route_disclosure(recipe, route)
+                );
+            }
+            language_servers::run_install(recipe, route)
+        },
     )
     .await;
     let reports = match reports {
@@ -15874,6 +15967,30 @@ async fn apply_language_server_provisioning(
     let mut installed_any = false;
     for report in reports {
         let recipe = language_servers::recipe_for(report.language);
+        // No route, and the installer IS here, outside the user's own PATH.
+        // Kin did not run it: its install writes into that tool's global
+        // prefix, and the user never pointed Kin at it.
+        let off_path = match (&report.outcome, recipe) {
+            (InstallOutcome::NoInstaller { .. }, Some(recipe)) => {
+                language_servers::installer_found_off_path(recipe).map(|found| (recipe, found))
+            }
+            _ => None,
+        };
+        if let Some((recipe, found)) = off_path {
+            let (reason, remediation) = language_servers::off_path_installer_lines(recipe, &found);
+            println!(
+                "  {} did not install the {} language server: {reason}",
+                style("✗").red(),
+                report.language
+            );
+            unfinished.push(UnfinishedRepair {
+                what: format!("install the {} language server", report.language),
+                reason,
+                remediation,
+                requested: consent == InstallConsent::Granted,
+            });
+            continue;
+        }
         match report.outcome {
             InstallOutcome::AlreadyPresent => {}
             InstallOutcome::Installed { command, evidence } => {
@@ -15990,10 +16107,10 @@ async fn apply_language_server_provisioning(
                     requested: true,
                 });
             }
-            InstallOutcome::Declined { command } => println!(
-                "  {} skipped the {} language server; run `{command}` to install it later",
+            InstallOutcome::Declined { .. } => println!(
+                "  {} {}",
                 style("-").dim(),
-                report.language
+                language_servers::declined_line(report.language)
             ),
             // Reached only when this host leaves NO route open: the recipe's
             // installer is absent AND Kin's own fallback cannot serve it. For
@@ -16114,6 +16231,30 @@ pub(crate) struct LanguageServerRequest {
     /// install would actually change. The gate above it is repository-scoped,
     /// and every message below keeps the two apart on purpose.
     pub(crate) missing_on_host: Vec<kin_model::LanguageId>,
+    /// The languages this repository uses, from the graph's census or its
+    /// files, or `None` when that could not be told.
+    ///
+    /// Only these get a server. A Go-only repository used to get rust-analyzer
+    /// and a global pyright too, and a Rust-only one exited 1 over four
+    /// languages it does not use. `None` keeps every missing server in scope,
+    /// which the run says before it installs.
+    pub(crate) repository_languages: Option<Vec<kin_model::LanguageId>>,
+}
+
+impl LanguageServerRequest {
+    /// The servers this run would install: the host's missing ones, narrowed
+    /// to the repository's languages when those are known.
+    fn wanted(&self) -> Vec<kin_model::LanguageId> {
+        match &self.repository_languages {
+            Some(languages) => self
+                .missing_on_host
+                .iter()
+                .copied()
+                .filter(|language| languages.contains(language))
+                .collect(),
+            None => self.missing_on_host.clone(),
+        }
+    }
 }
 
 /// What the run should do about the request.
@@ -16207,8 +16348,9 @@ pub(crate) fn decide_language_server_request(
         ]);
     }
 
-    if coverage_was_read && !request.missing_on_host.is_empty() {
-        return LanguageServerDecision::Install(request.missing_on_host.clone());
+    let wanted = request.wanted();
+    if coverage_was_read && !wanted.is_empty() {
+        return LanguageServerDecision::Install(wanted);
     }
 
     // Nothing is going to be installed. Explain that only to a run that asked
@@ -16252,6 +16394,38 @@ pub(crate) fn decide_language_server_request(
         return LanguageServerDecision::Explain(lines);
     }
 
+    // Servers are missing from the host, and none of them is for a language
+    // this repository uses. Nothing to install, and nothing that fails: a
+    // server this repository would never start is not a repair it needs.
+    if wanted.is_empty() {
+        let used = request.repository_languages.clone().unwrap_or_default();
+        let headline = if used.is_empty() {
+            format!(
+                "Nothing to install. This repository uses none of the languages Kin has language \
+                 servers for ({}).",
+                language_list(&language_servers::enrichable_languages())
+            )
+        } else {
+            format!(
+                "Nothing to install. This repository uses {}, and this host already has {}.",
+                language_list(&used),
+                if used.len() == 1 {
+                    "its language server"
+                } else {
+                    "their language servers"
+                }
+            )
+        };
+        return LanguageServerDecision::Explain(vec![
+            headline,
+            format!(
+                "This host has no server for {}, which this repository does not use, so Kin \
+                 leaves them alone.",
+                language_list(&request.missing_on_host)
+            ),
+        ]);
+    }
+
     // In a repository, servers missing from the host, and no gap to close. The
     // two ways that happens read differently and are kept apart, because only
     // one of them means the graph was actually consulted.
@@ -16277,11 +16451,9 @@ pub(crate) fn decide_language_server_request(
     // servers missing. The stranger who found the loop called printing them the
     // saving grace, because it made the detour cost a minute rather than an
     // afternoon; they used to live on the no-gap branch, which now installs.
-    if !request.missing_on_host.is_empty() {
-        lines.push("Install them by hand with:".to_string());
-        for command in language_servers::install_commands_for(&request.missing_on_host) {
-            lines.push(format!("  {command}"));
-        }
+    lines.push("Install them by hand with:".to_string());
+    for command in language_servers::install_commands_for(&wanted) {
+        lines.push(format!("  {command}"));
     }
     LanguageServerDecision::Explain(lines)
 }
@@ -16305,6 +16477,7 @@ fn observe_language_server_request(
     fix: bool,
     install_language_servers: bool,
     report: &crate::commands::health::HealthReport,
+    scope: &language_servers::LanguageScope,
 ) -> LanguageServerRequest {
     let cwd = env::current_dir().unwrap_or_default();
     LanguageServerRequest {
@@ -16317,24 +16490,41 @@ fn observe_language_server_request(
             .find(|check| check.id == "reference_edge_coverage")
             .map(|check| check.status.clone()),
         missing_on_host: language_servers::missing_enrichable_languages(),
+        repository_languages: match scope {
+            language_servers::LanguageScope::Repository(languages) => Some(languages.clone()),
+            language_servers::LanguageScope::Unknown(_) => None,
+        },
     }
 }
 
 pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Result<()> {
-    let report = crate::commands::health::run_health_checks().await;
+    // The run's one graph status, kept so the language census below reads the
+    // answer the report already fetched rather than asking the daemon again.
+    let graph_status = crate::commands::health::RunGraphStatus::for_run();
+    let report = crate::commands::health::run_health_checks_sharing(&graph_status).await;
 
     // Decided once, before the report is printed, so the one rule that governs
     // `--install-language-servers` sees the same facts on both sides of the
     // `--fix` branch. Skipped entirely when neither flag is present, so a plain
     // `kin doctor` still probes nothing it does not need (FIR-2502).
-    let language_server_decision = if fix || install_language_servers {
-        decide_language_server_request(&observe_language_server_request(
+    let (language_server_decision, language_scope) = if fix || install_language_servers {
+        // The graph's census when it answered, and the repository's files
+        // when it did not, so a repository with no daemon running is still
+        // scoped to its own languages.
+        let census = crate::commands::health::graph_language_census(&graph_status).await;
+        let scope = language_servers::language_scope(
+            &env::current_dir().unwrap_or_default(),
+            census.as_deref(),
+        );
+        let decision = decide_language_server_request(&observe_language_server_request(
             fix,
             install_language_servers,
             &report,
-        ))
+            &scope,
+        ));
+        (decision, Some(scope))
     } else {
-        LanguageServerDecision::Silent
+        (LanguageServerDecision::Silent, None)
     };
 
     if !fix {
@@ -16577,6 +16767,10 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                 install_language_servers,
                 !install_language_servers && is_tty(),
             );
+            // Which languages this covers, said before anything installs.
+            if let Some(scope) = &language_scope {
+                println!("  {}", scope.describe());
+            }
             let outcome = apply_language_server_provisioning(missing, consent).await;
             applied.extend(outcome.applied);
             unfinished.extend(outcome.unfinished);
@@ -21495,7 +21689,9 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let managed_bin = kin_home.join("bin");
         fs::create_dir_all(&managed_bin).unwrap();
 
-        let (headline, command) = missing_shim_guidance(Some(&managed_bin.join("kin")), &kin_home);
+        let (headline, command) =
+            missing_shim_guidance(Some(&managed_bin.join("kin")), &kin_home, true)
+                .expect("a driver without its shim is a broken install with a remedy");
         assert_eq!(command, crate::daemon_client::KIN_INSTALL_COMMAND);
         assert!(
             !headline.contains("cargo") && !command.contains("cargo"),
@@ -21512,7 +21708,8 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         fs::create_dir_all(&checkout_bin).unwrap();
 
         let (_headline, command) =
-            missing_shim_guidance(Some(&checkout_bin.join("kin")), &kin_home);
+            missing_shim_guidance(Some(&checkout_bin.join("kin")), &kin_home, true)
+                .expect("a source build with a driver and no shim is told how to build it");
         assert_eq!(command, "cargo build --release -p kin-vfs-shim");
     }
 
@@ -21520,8 +21717,70 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     fn missing_shim_guidance_without_a_resolvable_exe_does_not_claim_a_managed_install() {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
-        let (_headline, command) = missing_shim_guidance(None, &kin_home);
+        let (_headline, command) = missing_shim_guidance(None, &kin_home, true)
+            .expect("a driver without its shim has a remedy");
         assert_eq!(command, "cargo build --release -p kin-vfs-shim");
+    }
+
+    /// An install that ships no projection is not told its shim is missing.
+    ///
+    /// The installer said "Filesystem projection (kin-vfs) not bundled in this
+    /// archive. The core CLI and daemon are fully functional without it", and
+    /// setup then printed "VFS shim not found. Reinstall Kin to restore it"
+    /// and three red rows. The 0.8.0 archives ship kin, kin-daemon and the
+    /// macOS notifier app, and nothing else.
+    #[test]
+    fn an_install_that_ships_no_projection_is_not_told_its_shim_is_missing() {
+        use crate::commands::projection::{DriverProbe, ModeProbe, ProjectionMode, ShimPresence};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let managed_bin = kin_home.join("bin");
+        fs::create_dir_all(&managed_bin).unwrap();
+        assert_eq!(
+            missing_shim_guidance(Some(&managed_bin.join("kin")), &kin_home, false),
+            None,
+            "no driver and no shim is an archive without projection, not a broken one"
+        );
+
+        let no_driver = DriverProbe {
+            path: None,
+            refusal: None,
+            subcommands: None,
+        };
+        let no_shim = ShimPresence {
+            path: kin_home.join("lib").join("libkin_vfs_shim.dylib"),
+            installed: false,
+            engaged: false,
+        };
+        let unavailable = |mode| ModeProbe {
+            mode,
+            available: false,
+            evidence: "no kin-vfs driver was found".to_string(),
+            remedy: None,
+        };
+        let modes = vec![
+            unavailable(ProjectionMode::Nfs),
+            unavailable(ProjectionMode::Fuse),
+            unavailable(ProjectionMode::Shim),
+        ];
+        assert!(projection_not_shipped(&no_driver, &no_shim, &modes));
+        assert!(!PROJECTION_NOT_SHIPPED_LINE.contains("Reinstall"));
+        assert!(!PROJECTION_NOT_SHIPPED_LINE.contains('\u{2014}'));
+
+        // Controls: any piece of projection present is a real install whose
+        // state setup still reports in full.
+        let driver = DriverProbe {
+            path: Some(managed_bin.join("kin-vfs")),
+            refusal: None,
+            subcommands: None,
+        };
+        assert!(!projection_not_shipped(&driver, &no_shim, &modes));
+        let shim = ShimPresence {
+            installed: true,
+            ..no_shim.clone()
+        };
+        assert!(!projection_not_shipped(&no_driver, &shim, &modes));
     }
 
     /// `applied` is the exact set of claims that become true only when the rc
@@ -23578,12 +23837,22 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     /// and remove Kin, and says nothing a reader cannot run.
     #[test]
     fn the_closing_output_ends_on_the_first_question_and_names_aftercare() {
-        let next = next_step_block(&["go".to_string()]);
+        let next = next_step_block(&["go".to_string()], true);
         assert_eq!(next[0], "Next steps:");
         assert!(next[1].contains("kin init"), "{next:?}");
         assert!(
             next[2].contains("kin doctor --fix --install-language-servers")
                 && next[2].contains("go")
+                && next[2].contains("this repository needs"),
+            "{next:?}"
+        );
+        // Outside a repository the list is the host's, and the line must not
+        // promise the command installs all of it: the command installs only
+        // what the repository it runs in uses.
+        let unscoped = next_step_block(&["rust".to_string(), "go".to_string()], false);
+        assert!(
+            unscoped[2].contains("in your repository") && unscoped[2].contains("rust, go"),
+            "{unscoped:?}"
         );
         assert!(
             next.last()
@@ -23591,7 +23860,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "{next:?}"
         );
         assert_eq!(
-            next_step_block(&[]).len(),
+            next_step_block(&[], true).len(),
             3,
             "no server line when none is missing"
         );
@@ -27773,6 +28042,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             in_repository: true,
             coverage_status: Some(HealthStatus::Healthy),
             missing_on_host: Vec::new(),
+            repository_languages: None,
         }
     }
 
@@ -28004,6 +28274,83 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         }
     }
 
+    /// A repository gets servers for its own languages and no others.
+    ///
+    /// A first run in a Go-only repository installed rust-analyzer and ran a
+    /// global `npm install -g pyright` as well, and a Rust-only fixture tried
+    /// Python, TypeScript, JavaScript and Go and exited 1 with "4 requested
+    /// repairs did not complete".
+    #[test]
+    fn a_repository_gets_servers_only_for_the_languages_it_uses() {
+        let everything = vec![
+            LanguageId::Rust,
+            LanguageId::Python,
+            LanguageId::TypeScript,
+            LanguageId::JavaScript,
+            LanguageId::Go,
+        ];
+        assert_eq!(
+            super::decide_language_server_request(&super::LanguageServerRequest {
+                coverage_status: Some(HealthStatus::Pending),
+                missing_on_host: vec![LanguageId::Rust, LanguageId::Python, LanguageId::Go],
+                repository_languages: Some(vec![LanguageId::Go]),
+                ..request(true, true)
+            }),
+            super::LanguageServerDecision::Install(vec![LanguageId::Go]),
+            "a Go-only repository gets gopls and nothing else"
+        );
+        assert_eq!(
+            super::decide_language_server_request(&super::LanguageServerRequest {
+                coverage_status: Some(HealthStatus::Stale),
+                missing_on_host: everything.clone(),
+                repository_languages: Some(vec![LanguageId::Rust]),
+                ..request(true, true)
+            }),
+            super::LanguageServerDecision::Install(vec![LanguageId::Rust]),
+            "a Rust-only repository is not handed four other languages to fail on"
+        );
+        // Unknown languages keep every missing server, as before the scope
+        // existed; the run says so before it installs.
+        assert_eq!(
+            super::decide_language_server_request(&super::LanguageServerRequest {
+                coverage_status: Some(HealthStatus::Pending),
+                missing_on_host: everything.clone(),
+                repository_languages: None,
+                ..request(true, true)
+            }),
+            super::LanguageServerDecision::Install(everything)
+        );
+    }
+
+    /// Servers missing only for languages the repository does not use leave
+    /// nothing to install and nothing to fail, and the run says which way
+    /// round that is.
+    #[test]
+    fn servers_the_repository_does_not_use_are_left_alone_and_said_so() {
+        let request = super::LanguageServerRequest {
+            coverage_status: Some(HealthStatus::Pending),
+            missing_on_host: vec![LanguageId::Rust, LanguageId::Python],
+            repository_languages: Some(vec![LanguageId::Go]),
+            ..request(true, true)
+        };
+        let text = explained(&request).join("\n");
+        assert!(text.contains("Nothing to install."), "{text}");
+        assert!(text.contains("This repository uses go"), "{text}");
+        assert!(
+            text.contains("no server for rust, python") && text.contains("leaves them alone"),
+            "{text}"
+        );
+        let none_used = explained(&super::LanguageServerRequest {
+            repository_languages: Some(Vec::new()),
+            ..request
+        })
+        .join("\n");
+        assert!(
+            none_used.contains("uses none of the languages Kin has language servers for"),
+            "{none_used}"
+        );
+    }
+
     /// The empty block at the heart of hole two: a real gap that no install
     /// closes, because the host already has every server. It used to be a
     /// comment and nothing else.
@@ -28048,20 +28395,25 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                         LanguageId::JavaScript,
                     ],
                 ] {
-                    for status in &statuses {
-                        let decision =
-                            super::decide_language_server_request(&super::LanguageServerRequest {
-                                requested: true,
-                                fixing,
-                                in_repository,
-                                coverage_status: status.clone(),
-                                missing_on_host: missing.clone(),
-                            });
-                        if let super::LanguageServerDecision::Explain(lines) = decision {
-                            seen += 1;
-                            for line in lines {
-                                assert!(!line.contains('\u{2014}'), "em dash in: {line}");
-                                assert!(!line.is_empty(), "an empty line explains nothing");
+                    for repository_languages in [None, Some(Vec::new()), Some(vec![LanguageId::Go])]
+                    {
+                        for status in &statuses {
+                            let decision = super::decide_language_server_request(
+                                &super::LanguageServerRequest {
+                                    requested: true,
+                                    fixing,
+                                    in_repository,
+                                    coverage_status: status.clone(),
+                                    missing_on_host: missing.clone(),
+                                    repository_languages: repository_languages.clone(),
+                                },
+                            );
+                            if let super::LanguageServerDecision::Explain(lines) = decision {
+                                seen += 1;
+                                for line in lines {
+                                    assert!(!line.contains('\u{2014}'), "em dash in: {line}");
+                                    assert!(!line.is_empty(), "an empty line explains nothing");
+                                }
                             }
                         }
                     }

@@ -80,6 +80,13 @@ pub struct RefsResponse {
     /// (FIR-3071). The same text stays in `lines` for an older client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The call sites of every caller in the files that import the focal's
+    /// file, the `call_sites` block `find_references` serves over the same
+    /// files, so the two surfaces say the same thing about one store. Absent
+    /// when the focal did not resolve or those files could not be
+    /// established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_sites: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +234,30 @@ pub fn build_refs_response_with_spine(
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
     let want_dispatch = strip_dispatch_modifier(&request.kind).1;
+    // A symbol outside the repository, by the address every surface serves for
+    // it or by its bare id: its callers are the entities with an edge into it.
+    // Asked before the entity resolver, which would report it absent and send
+    // the caller to `kin xref`, a name lookup that cannot find it.
+    if let Some(node) = crate::commands::external_symbols::lookup(graph, &request.entity)? {
+        return build_external_refs_response(
+            layout,
+            graph,
+            request,
+            &node,
+            &relation_kinds,
+            want_dispatch,
+            envelope,
+        );
+    }
+    if crate::commands::external_symbols::is_address(&request.entity) {
+        let lines = crate::commands::external_symbols::unknown_address_lines(&request.entity);
+        return Ok(RefsResponse {
+            error: Some(lines.join("\n")),
+            lines,
+            negative: None,
+            call_sites: None,
+        });
+    }
     // The one resolver every read command shares (FIR-3505). The ranker this
     // replaced tied every twin on name, kind and callers, so it answered about
     // whichever one the store listed first, and nothing said a choice was made.
@@ -275,6 +306,7 @@ pub fn build_refs_response_with_spine(
             error: Some(lines.join("\n")),
             lines,
             negative: None,
+            call_sites: None,
         });
     }
     let target = resolution.chosen().cloned().ok_or_else(|| {
@@ -291,6 +323,22 @@ pub fn build_refs_response_with_spine(
         Some(resolution.reference.name.as_str())
     };
     let target = &target;
+    // The call sites of every caller in the files that import the focal's
+    // file, tallied as `find_references` tallies them, so both surfaces say
+    // the same thing about one store. Absent when those files could not be
+    // established, which the arrival reading says on its own.
+    // Qualified by the owed callers outside those files, since a caller can
+    // reach the focal without importing its file.
+    let arrival = kin_mcp::caller_arrival::observe_caller_arrival(graph, target);
+    let call_sites = arrival
+        .call_sites
+        .as_ref()
+        .map(|tally| kin_mcp::call_sites::family_block(tally, arrival.owed_outside.as_deref()));
+    let call_site_lines = |lines: &mut Vec<String>| {
+        if let Some(block) = call_sites.as_ref() {
+            lines.extend(kin_mcp::call_sites::text_lines(block));
+        }
+    };
 
     let refs = collect_references(graph, target, &relation_kinds)?;
     let target_path = declaration_neighbors::entity_location(graph, target)
@@ -353,6 +401,7 @@ pub fn build_refs_response_with_spine(
         if want_dispatch {
             lines.extend(dispatch_candidate_lines(layout, graph, target));
         }
+        call_site_lines(&mut lines);
         if let Some(note) = crate::entity_identity::stale_span_note(&lines) {
             lines.push(note);
         }
@@ -360,6 +409,7 @@ pub fn build_refs_response_with_spine(
             lines,
             negative,
             error: None,
+            call_sites,
         });
     }
 
@@ -505,6 +555,7 @@ pub fn build_refs_response_with_spine(
     if want_dispatch {
         lines.extend(dispatch_candidate_lines(layout, graph, target));
     }
+    call_site_lines(&mut lines);
 
     // No verdict on this path, and that is decided rather than skipped. The walk
     // returned rows, so there is no absence to qualify. That includes the
@@ -521,6 +572,7 @@ pub fn build_refs_response_with_spine(
         lines,
         negative: None,
         error: None,
+        call_sites,
     })
 }
 
@@ -605,7 +657,161 @@ fn build_shared_member_refs_response(
         lines,
         negative: None,
         error: None,
+        call_sites: None,
     })
+}
+
+/// `kin refs` for a symbol outside the repository: the symbol, then one row per
+/// entity with an edge into it, each with its sites inside that entity and the
+/// proof.
+///
+/// Rendered from the answer `find_references` gives for the same symbol, built
+/// by the same function over the same edges, so the two surfaces list the same
+/// callers with the same sites and proof. That answer's own floor note is
+/// printed as it stands. The text at each site is not quoted here: this
+/// command holds no body reader, and a site's `+N` already places it inside a
+/// caller whose body `kin context` or `kin graph source` prints.
+fn build_external_refs_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &RefsRequest,
+    node: &kin_mcp::handlers::external_symbols::ExternalSymbolNode,
+    relation_kinds: &[RelationKind],
+    want_dispatch: bool,
+    envelope: &kin_mcp::Envelope,
+) -> Result<RefsResponse> {
+    use crate::commands::external_symbols as external;
+    // The floor `find_references` applies by default, so a caller held there
+    // is held here.
+    let payload = kin_mcp::handlers::external_symbols::external_references_reply(
+        graph,
+        node,
+        relation_kinds,
+        false,
+        RelationResolution::ImportScoped,
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("read the callers of {}: {error}", node.address()))?;
+    let references = payload["references"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let candidates = payload["candidates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let render = |row: &serde_json::Value| -> String {
+        let location = row["entity_id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .and_then(|uuid| graph.get_entity(&EntityId(uuid)).ok().flatten())
+            .map(|caller| {
+                let mut pointer = crate::entity_identity::entity_pointer(graph, &caller);
+                pointer.path = pointer.path.map(|path| display_read_path(layout, &path));
+                pointer.render()
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let kinds = row["relation_kinds"]
+            .as_array()
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(reference_kind_label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        format!(
+            "  {} @ {} [{}] ({}) {} {}",
+            row["name"].as_str().unwrap_or("?"),
+            location,
+            kinds,
+            row["resolution"].as_str().unwrap_or("unresolved"),
+            external::sites_label(&row["sites"]),
+            external::proof_label(row),
+        )
+    };
+
+    let mut lines = vec![format!(
+        "References to '{}' -> {}",
+        request.entity.trim(),
+        external::node_label(node)
+    )];
+    let unconfirmed = if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", plus {} unconfirmed candidate{} not in that count",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        )
+    };
+    if references.is_empty() {
+        lines.push(format!(
+            "No incoming {} relations{unconfirmed}.",
+            relation_kinds_label(relation_kinds)
+        ));
+    } else {
+        lines.push(format!(
+            "referenced by {} entit{}{unconfirmed}:",
+            references.len(),
+            if references.len() == 1 { "y" } else { "ies" }
+        ));
+        lines.extend(references.iter().map(render));
+    }
+    if !candidates.is_empty() {
+        lines.push(format!(
+            "{} caller{} below import_scoped not counted above:",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        ));
+        lines.extend(candidates.iter().map(render));
+    }
+    if references.iter().chain(&candidates).any(|row| {
+        row["sites"]
+            .as_array()
+            .is_some_and(|sites| !sites.is_empty())
+    }) {
+        lines.push(external::SITE_OFFSET_NOTE.to_string());
+    }
+    for degradation in payload["degradations"].as_array().into_iter().flatten() {
+        if let Some(detail) = degradation["detail"].as_str() {
+            lines.push(format!("note: {detail}"));
+        }
+    }
+    if want_dispatch {
+        lines.push(format!(
+            "No interface-dispatch candidates: they are computed for Go methods, and '{}' is a \
+             symbol outside this repository.",
+            node.display_name()
+        ));
+    }
+    // Only an empty answer carries the verdict, as for an entity, and it is
+    // the one `find_references` reaches on this same payload.
+    let negative = if references.is_empty() {
+        kin_mcp::negative::negative_for("find_references", &payload, envelope, &[])
+    } else {
+        None
+    };
+    Ok(RefsResponse {
+        lines,
+        negative,
+        error: None,
+        call_sites: None,
+    })
+}
+
+/// A relation kind as `find_references` names it (`calls`), spelled as this
+/// command's rows spell it (`Calls`).
+fn reference_kind_label(name: &str) -> String {
+    match name {
+        "calls" => "Calls".to_string(),
+        "imports" => "Imports".to_string(),
+        "references" => "References".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// The line a refs answer leads with when a language server this host lacks
@@ -1059,6 +1265,40 @@ pub fn build_bulk_refs_response(
     let mut incomplete_verdict_count = 0usize;
 
     for raw_id in &request.entity_ids {
+        // Reachability is a question about repository entities. A symbol
+        // outside the repository is not one, so its row says what it is and
+        // which command answers about it, instead of reading as a miss.
+        if let Some(node) = crate::commands::external_symbols::lookup(graph, raw_id)? {
+            error_count += 1;
+            let mut row = bulk_refs_error_row(
+                raw_id,
+                kin_mcp::handlers::external_symbols::EXTERNAL_SYMBOL_NOT_SERVED,
+                request.compact,
+            );
+            row["symbol"] =
+                kin_mcp::handlers::external_symbols::external_symbol_record_json(graph, &node)
+                    .map_err(|error| {
+                        anyhow::anyhow!("read external symbol {}: {error}", node.address())
+                    })?;
+            row["detail"] = serde_json::json!(format!(
+                "{} names {}, declared outside this repository; `kin refs {}` lists the \
+                 entities that call it.",
+                node.address(),
+                crate::commands::external_symbols::node_label(&node),
+                node.address()
+            ));
+            results.push(row);
+            continue;
+        }
+        if crate::commands::external_symbols::is_address(raw_id) {
+            error_count += 1;
+            results.push(bulk_refs_error_row(
+                raw_id,
+                "external symbol not found",
+                request.compact,
+            ));
+            continue;
+        }
         let parsed = uuid::Uuid::parse_str(raw_id.trim());
         let Ok(uuid) = parsed else {
             error_count += 1;
@@ -3683,6 +3923,82 @@ mod tests {
         );
     }
 
+    /// `kin refs` prints the call sites of the callers in the files that
+    /// import the focal's file, the block `find_references` tallies over the
+    /// same files, so the two say the same thing about one store.
+    #[test]
+    fn refs_prints_the_call_sites_find_references_tallies() {
+        use crate::commands::call_site_fixture::{admit, spanned};
+        use kin_model::EntityStore as _;
+        let graph = kin_db::InMemoryGraph::new();
+        let mut target = spanned("find_note", "pkg/storage.py", 200, "def find_note():\n");
+        target.file_origin = Some(kin_model::FilePathId::new("pkg/storage.py"));
+        target.span = None;
+        let mut target_module = spanned("storage", "pkg/storage.py", 0, "import db\n");
+        target_module.kind = kin_model::EntityKind::Module;
+        target_module.file_origin = Some(kin_model::FilePathId::new("pkg/storage.py"));
+        target_module.span = None;
+        let caller_body = "def test_it(db):\n    print(db)\n";
+        let mut caller = spanned("test_it", "tests/test_storage.py", 20, caller_body);
+        caller.file_origin = Some(kin_model::FilePathId::new("tests/test_storage.py"));
+        let mut caller_module = spanned(
+            "test_storage",
+            "tests/test_storage.py",
+            0,
+            "import storage\n",
+        );
+        caller_module.kind = kin_model::EntityKind::Module;
+        caller_module.file_origin = Some(kin_model::FilePathId::new("tests/test_storage.py"));
+        admit(
+            &graph,
+            &[&target, &target_module, &caller, &caller_module],
+            vec![(
+                &caller,
+                caller_body,
+                vec![("print", kin_model::CallSiteState::ProvenOutside)],
+            )],
+        );
+        graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Imports,
+                src: kin_model::GraphNodeId::Entity(caller_module.id),
+                dst: kin_model::GraphNodeId::Entity(target_module.id),
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        let layout = kin_core::KinLayout::new(tempfile::tempdir().unwrap().path().join(".kin"));
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: target.id.to_string(),
+                kind: "all".to_string(),
+            },
+            &refs_test_envelope(),
+        )
+        .unwrap();
+        let block = response
+            .call_sites
+            .as_ref()
+            .expect("refs carries the block");
+        assert_eq!(block["scope"], kin_mcp::call_sites::FAMILY_SCOPE, "{block}");
+        assert_eq!(block["callers_owed_enrichment"], 1, "{block}");
+        let text = response.lines.join("\n");
+        assert!(
+            text.contains(
+                "Call sites in the files that import the focal's file: 1 across 2 caller(s), \
+                 1 caller(s) owed"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("  not settled: call_sites_owed: "), "{text}");
+    }
+
     #[test]
     fn request_level_bulk_failures_return_no_classification_response() {
         let graph = kin_db::InMemoryGraph::new();
@@ -3839,6 +4155,147 @@ mod tests {
             !joined.contains("spanless.rs:0"),
             "line 0 exists in no editor: {joined}"
         );
+    }
+
+    /// `kin refs` answers for a symbol outside the repository by the address
+    /// the MCP tools serve for it, and by its bare id: the symbol's name,
+    /// package, version and whether it is a standard library, then one row per
+    /// caller with its sites addressed inside the caller and the proof. A site
+    /// is never a file line, and the answer says its list is a floor.
+    #[test]
+    fn refs_lists_the_callers_of_an_external_symbol_with_their_sites_and_proof() {
+        let store = crate::commands::external_symbols::fixture::external_store(true);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        for entity in [store.address(), store.node.id.to_string()] {
+            let response = build_refs_response(
+                &layout,
+                &store.graph,
+                &RefsRequest {
+                    entity: entity.clone(),
+                    kind: "all".to_string(),
+                },
+                &refs_test_envelope(),
+            )
+            .expect("refs response");
+            assert!(response.error.is_none(), "{entity}: {:?}", response.error);
+            assert!(
+                response.negative.is_none(),
+                "an answer with callers claims no absence"
+            );
+            let text = response.lines.join("\n");
+            assert!(
+                response.lines[0].contains(
+                    "Array.map (external symbol, npm typescript 5.6.3, standard library)"
+                ),
+                "{text}"
+            );
+            assert!(text.contains("referenced by 1 entity:"), "{text}");
+            let row = response
+                .lines
+                .iter()
+                .find(|line| line.trim_start().starts_with("render @"))
+                .unwrap_or_else(|| panic!("no caller row: {text}"));
+            assert_eq!(
+                row.trim(),
+                "render @ src/app.ts:11 [Calls] (type_resolved) sites +2, +5 proven_external \
+                 by lsp:tsserver 5.6.3 (lsp_definition)",
+                "{text}"
+            );
+            assert!(text.contains("a site is +N"), "{text}");
+            assert!(text.contains("this list is a floor"), "{text}");
+            assert!(!text.contains("not found"), "{text}");
+            assert!(!text.contains("kin xref"), "{text}");
+        }
+    }
+
+    /// With no caller of the asked kind, the answer says so about the symbol
+    /// and carries the verdict `find_references` reaches on the same payload,
+    /// which cannot certify an absence the resolver's proofs only floor.
+    #[test]
+    fn refs_on_an_external_symbol_with_no_caller_of_the_kind_carries_the_verdict() {
+        let store = crate::commands::external_symbols::fixture::external_store(true);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_refs_response(
+            &layout,
+            &store.graph,
+            &RefsRequest {
+                entity: store.address(),
+                kind: "imports".to_string(),
+            },
+            &refs_test_envelope(),
+        )
+        .expect("refs response");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let text = response.lines.join("\n");
+        assert!(text.contains("No incoming Imports relations"), "{text}");
+        assert!(text.contains("this list is a floor"), "{text}");
+        let verdict = response
+            .negative
+            .as_ref()
+            .expect("an empty answer's verdict");
+        assert_eq!(verdict["safe_to_conclude_absent"], false, "{verdict}");
+    }
+
+    /// An address this graph holds no symbol under is refused as that, not as
+    /// an entity miss whose `kin xref` hint cannot find a symbol outside every
+    /// repository.
+    #[test]
+    fn refs_refuses_an_unknown_external_address_precisely() {
+        let store = crate::commands::external_symbols::fixture::external_store(true);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let address = "external_reference:00000000-0000-8000-8000-000000000000";
+        let response = build_refs_response(
+            &layout,
+            &store.graph,
+            &RefsRequest {
+                entity: address.to_string(),
+                kind: "all".to_string(),
+            },
+            &refs_test_envelope(),
+        )
+        .expect("refs response");
+        let error = response.error.expect("a refusal");
+        assert!(
+            error.contains("names no symbol outside the repository"),
+            "{error}"
+        );
+        assert!(!error.contains("kin xref"), "{error}");
+    }
+
+    /// Bulk mode classifies repository entities by reachability, which says
+    /// nothing about a symbol outside the repository, so such a row is an
+    /// error row naming what it is and the command that answers about it.
+    #[test]
+    fn bulk_refs_names_an_external_symbol_row_instead_of_a_miss() {
+        let store = crate::commands::external_symbols::fixture::external_store(true);
+        let response = build_bulk_refs_response(
+            &store.graph,
+            &BulkRefsRequest {
+                entity_ids: vec![
+                    store.address(),
+                    store.node.id.to_string(),
+                    store.caller.id.to_string(),
+                ],
+                kind: "Any".to_string(),
+                compact: true,
+            },
+        )
+        .expect("bulk refs");
+        assert_eq!(response.error_count, 2, "{:?}", response.results);
+        for row in &response.results[..2] {
+            assert_bulk_error_row(row, true, "external_symbol_not_served");
+            assert_eq!(row["symbol"]["name"], "Array.map", "{row}");
+            assert_eq!(row["symbol"]["id"], store.address(), "{row}");
+            let detail = row["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains(&format!("kin refs {}", store.address())),
+                "{row}"
+            );
+        }
+        assert!(response.results[2].get("error").is_none());
     }
 
     fn assert_bulk_error_row(row: &serde_json::Value, compact: bool, expected_error: &str) {

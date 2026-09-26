@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-26
+
+### Added
+
+- Language-server sweeps prove each call at its callee token. The definition
+  answer at a call site proves that call, and call hierarchy is judged per
+  call instead of per caller, so one unprovable call no longer discards its
+  caller's proven ones. A call through a value slot, such as an interface
+  member, a property or a parameter, proves nothing and retires nothing. A
+  name-only guess the server contradicts is retired, and an answer outside
+  the repository refutes the guess at that site. What counts as inside the
+  repository is decided by what the graph holds, so a symlinked workspace
+  package is inside and `node_modules` is not. Python decorator calls bind
+  through their receiver instead of by bare name.
+- A call that resolves outside the repository gets a proven edge to an
+  external symbol, named by package, version and symbol in the SCIP symbol
+  grammar, so the same symbol has the same id in every repository. Call rows
+  in MCP and the CLI show external targets, `get_entity`, `find_references`
+  and `graph_neighborhood` accept external ids, and `trace_data_flow` stops
+  at the symbol as a leaf. Every other tool answers an external id by what it
+  is, never as a missing entity, and reads no file for it.
+- Analysis environments, on by default. Kin fetches the dependencies a
+  repository's lockfile pins (Python wheels, npm, pnpm and yarn tarballs,
+  crates and Go modules), checks each against its hash before unpacking it,
+  and keeps them in a store shared across repositories under
+  `KIN_HOME/cache`, so language servers can resolve calls into them. For
+  Python it also fetches a standalone CPython build of the pinned version,
+  and for Rust the `rust-src` component when the pinned toolchain lacks it.
+  Kin never runs an installer, a build script, an install script or any
+  repository or dependency code. The user's own environment wins when it
+  matches the lockfile. `KIN_ANALYSIS_ENVIRONMENTS=0` turns fetching off,
+  and a repository without a matching environment of its own then reports
+  its environment missing.
+- `kin init --json` reports the generation the store ended at in a new
+  `authority_as_of` field.
+
+### Changed
+
+- Language servers load all of a repository's code: every workspace folder,
+  rust-analyzer's linked projects with all features, pyright's settings
+  through `workspace/configuration`, TypeScript workspace packages resolved
+  to their source even when build output exists, and gopls build tags and
+  `go.work`. Proc macros and build scripts stay off. A TypeScript server is
+  judged ready per document instead of after a fixed wait.
+- The store format steps to new versions: repository snapshots 21 to 26,
+  authority frames 6 to 8 and graph deltas 6 and 7. A store records a
+  completion mark for each file a language-server sweep finishes, resolution
+  records, calls proven into named symbols outside the repository, and one
+  call-site ledger per caller, with one state for each call site. Each version
+  is written only by a store that carries what it adds, so a store this
+  version has not enriched keeps its bytes. Existing stores are swept again
+  once on the first start, since nothing an earlier version finished recorded
+  these states. An older Kin refuses a store this version has written at its
+  header, naming the version it cannot read, instead of misreading it.
+
+### Fixed
+
+- Call guesses a language server had already refuted and retired no longer
+  come back after a commit to an unrelated file. An edit now re-derives the
+  files that depend on the edited one only when something they bind against
+  moved: a declaration, a signature, an import or a structural relation.
+- A watcher round that finds only bytes Kin already holds no longer moves the
+  graph epoch, so the enrichment a pass finished in the meantime is kept
+  instead of being discarded and asked again.
+- Incremental enrichment after an edit proves calls the way the full sweep
+  does: each call at its callee token, guesses the answers contradict
+  retired, calls into symbols outside the repository named, and every caller
+  in the file given its call-site ledger, so the file keeps its completion
+  mark.
+- Answers carry the call-site state of the callers they read. `kin refs`,
+  `find_references`, `get_context_pack`, `graph_neighborhood`,
+  `kin_graph_status` and `kin context` report each caller's sites as proven,
+  unresolved, failed, outside any build or still owed a sweep, over the
+  focal's own body, the callers in the files that import the focal's file,
+  or the whole store. While a caller in that scope has sites a sweep has not
+  settled, the verdict is inconclusive under `call_sites_owed` and the
+  terminal output prints a `not settled:` line. A caller no resolver can
+  prove on this host, because enrichment is switched off, no language server
+  serves its language or the one that does cannot start, reads
+  `call_sites_unproven_no_resolver` instead, with the reason. A caller can
+  also reach the focal without importing its file, such as a method called
+  through another object, so `kin refs`, `find_references`,
+  `get_context_pack` and `impact_analysis` also read the focal's language
+  outside that scope: while a caller there is still owed its sites, the
+  answer names those files, says it may be missing a caller, and its verdict
+  is inconclusive under `call_sites_owed` until `kin daemon sweep` settles
+  them. `kin init` waits for the sweep by default.
+- An interrupted sweep resumes from per-file completion marks kept in the
+  store's authority instead of starting over. Sweep checkpoints no longer
+  grow with the store and are spaced to cost about 5% of a sweep.
+- A language server's deterministic refusal settles its call sites as
+  unprovable instead of leaving them owed on every sweep. A request Kin stops
+  waiting for is cancelled, and a TypeScript backend that exits is noticed.
+- `kin setup` defaults to installing a language server when the runtime it
+  needs is present, and asks only about the languages the repository
+  contains. When a sweep skips or cannot serve a language for want of a
+  server, `kin init` names `kin doctor --fix --install-language-servers`,
+  and a skipped server's line prints that command rather than a version
+  string.
+- `kin doctor --fix --install-language-servers` installs servers only for the
+  repository's languages. It keeps installer output for a failed install,
+  says so before it writes outside Kin's directory, and refuses an installer
+  it found only outside `PATH`, printing the command to run instead. A server
+  missing for a language the repository does not use no longer fails the
+  command.
+- Setup no longer warns that the VFS shim is missing on an install that ships
+  no filesystem projection. It prints one line saying projection is not part
+  of the install.
+
 ## [0.8.0] - 2026-09-26
 
 ### Added

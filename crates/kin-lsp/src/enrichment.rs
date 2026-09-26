@@ -93,8 +93,39 @@ impl EntityRef {
 pub struct EntityIndex {
     /// Repository-relative file path → that file's entities, by start line.
     by_file: HashMap<String, Vec<EntityRef>>,
+    /// Every indexed file's package directory and file stem, as
+    /// [`module_tail`] spells them, for recognizing an installed copy.
+    module_tails: std::collections::HashSet<String>,
     /// The workspace root, spelled as a `file:` URI decodes on this host.
     root: PathBuf,
+    /// The workspace root's real path, spelled the same way, when the root is
+    /// on this host's disk.
+    real_root: Option<PathBuf>,
+    /// The real path of each path an answer named outside the files this
+    /// index holds, resolved once (see [`Self::held_file`]).
+    real_paths: std::sync::Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+}
+
+/// A path's last directory and its file name without extensions, with a
+/// stub package's `-stubs` suffix dropped: `requests/models` for
+/// `src/requests/models.py`, for `site-packages/requests/models.py`, and for
+/// `requests-stubs/models.pyi`. `None` for a path with no directory.
+fn module_tail(path: &str) -> Option<String> {
+    let mut parts = path.rsplit(['/', '\\']);
+    let name = parts.next()?;
+    let parent = parts.next().filter(|parent| !parent.is_empty())?;
+    let stem = name.split('.').next().filter(|stem| !stem.is_empty())?;
+    let parent = parent.strip_suffix("-stubs").unwrap_or(parent);
+    Some(format!("{parent}/{stem}").to_lowercase())
+}
+
+/// A path respelled the way a server's answer decodes, so the two compare in
+/// the one spelling `require_source_uri` compares them in. On Windows
+/// `std::fs::canonicalize` returns `\\?\C:\repo`, and a server answers
+/// `file:///c%3A/repo/...`, which decodes to `C:/repo/...`. On Unix an
+/// absolute path comes back byte for byte.
+fn host_spelling(path: &Path) -> PathBuf {
+    protocol::uri_to_path(&protocol::path_to_uri(path)).unwrap_or_else(|| path.to_path_buf())
 }
 
 impl EntityIndex {
@@ -112,14 +143,77 @@ impl EntityIndex {
         for entries in by_file.values_mut() {
             entries.sort_by_key(|e| e.start_line);
         }
-        // Respelled the way a server's answer decodes, so the two compare in
-        // the one spelling `require_source_uri` compares them in. On Windows
-        // `std::fs::canonicalize` returns `\\?\C:\repo`, and a server answers
-        // `file:///c%3A/repo/...`, which decodes to `C:/repo/...`. On Unix an
-        // absolute root comes back byte for byte.
-        let root = protocol::uri_to_path(&protocol::path_to_uri(workspace_root))
-            .unwrap_or_else(|| workspace_root.to_path_buf());
-        Self { by_file, root }
+        let module_tails = by_file
+            .keys()
+            .filter_map(|file| module_tail(file))
+            .collect();
+        let root = host_spelling(workspace_root);
+        let real_root = crate::call_sites::real_path(workspace_root)
+            .map(|real| host_spelling(&real))
+            .filter(|real| *real != root);
+        Self {
+            by_file,
+            module_tails,
+            root,
+            real_root,
+            real_paths: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The repository-relative path of an absolute `path` below the workspace
+    /// root or the root's real path, `/`-separated as the graph spells paths.
+    fn relative_file(&self, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(&self.root).ok().or_else(|| {
+            self.real_root
+                .as_deref()
+                .and_then(|real| path.strip_prefix(real).ok())
+        })?;
+        let mut file = String::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(part) = component else {
+                return None;
+            };
+            if !file.is_empty() {
+                file.push('/');
+            }
+            file.push_str(part.to_str()?);
+        }
+        (!file.is_empty()).then_some(file)
+    }
+
+    /// The real path of `path`, spelled as the root is, looked up once.
+    fn real_path_of(&self, path: &Path) -> Option<PathBuf> {
+        let resolve = || crate::call_sites::real_path(path).map(|real| host_spelling(&real));
+        let Ok(mut held) = self.real_paths.lock() else {
+            return resolve();
+        };
+        held.entry(path.to_path_buf())
+            .or_insert_with(resolve)
+            .clone()
+    }
+
+    /// The file this index holds that a `file:` URI names: the one at its
+    /// path below the workspace root, or, when the index holds no file there,
+    /// the one at its real path.
+    ///
+    /// A package manager links a workspace package into a dependency
+    /// directory by a symbolic link to the package's own directory, as pnpm
+    /// does with `node_modules/<package>`, and Kin's analysis environment
+    /// does from its layout outside the repository. A file reached through
+    /// such a link is the repository's source it links to.
+    pub fn held_file(&self, uri: &str) -> Option<String> {
+        if let Some(file) = self
+            .repository_file(uri)
+            .filter(|file| self.by_file.contains_key(file))
+        {
+            return Some(file);
+        }
+        let path = protocol::uri_to_path(uri)?;
+        if !path.is_absolute() {
+            return None;
+        }
+        let file = self.relative_file(&self.real_path_of(&path)?)?;
+        self.by_file.contains_key(&file).then_some(file)
     }
 
     /// The repository-relative path a `file:` URI names: its path below the
@@ -220,8 +314,10 @@ impl EntityIndex {
     /// not hold it, which wrote false edges and, once sources were checked,
     /// refused the whole answer. A dependency's source in a module cache ended
     /// in a repository path just as well, and matched a file that is not it.
+    /// A path through a workspace package's symbolic link names the file at
+    /// its real path (see [`Self::held_file`]), which is exact too.
     pub fn find_at(&self, uri: &str, line: u32) -> Option<&EntityRef> {
-        let entries = self.by_file.get(&self.repository_file(uri)?)?;
+        let entries = self.by_file.get(&self.held_file(uri)?)?;
 
         entries
             .iter()
@@ -235,6 +331,78 @@ impl EntityIndex {
                     u32::MAX - e.start_line,
                 )
             })
+    }
+
+    /// Whether a file this URI names may be a copy of one the index holds.
+    ///
+    /// A definition answer outside the workspace can land in an installed
+    /// copy of this very repository: a `src/` layout package whose tests
+    /// import it by name resolve to the copy in `site-packages`, and a stub
+    /// package ships `.pyi` twins of its modules. Such an answer names the
+    /// repository's own declaration under another path, so it proves nothing
+    /// about where the call goes. Matched the way [`Self::find_at`] matches a
+    /// path, and then by package directory and file stem, which can only
+    /// call more answers copies than there are.
+    pub fn may_hold_file(&self, uri: &str) -> bool {
+        if self
+            .repository_file(uri)
+            .is_some_and(|file| self.by_file.contains_key(&file))
+        {
+            return true;
+        }
+        protocol::uri_to_path(uri).is_some_and(|path| {
+            let parts: Vec<&str> = path
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(part) => part.to_str(),
+                    _ => None,
+                })
+                .collect();
+            (0..parts.len()).any(|start| self.by_file.contains_key(&parts[start..].join("/")))
+                || module_tail(path.to_string_lossy().as_ref())
+                    .is_some_and(|tail| self.module_tails.contains(&tail))
+        })
+    }
+
+    /// Whether a declaration the server placed at `uri` lies outside the
+    /// repository, decided by what the graph holds rather than by where the
+    /// file sits relative to the workspace root.
+    ///
+    /// - A file this index holds is the repository's, including one reached
+    ///   through a symbolic link (see [`Self::held_file`]).
+    /// - A file that may be an installed copy of one it holds is the
+    ///   repository's own code under another path, and refutes nothing (see
+    ///   [`Self::may_hold_file`]).
+    /// - Otherwise the file's real path decides. Outside the workspace root it
+    ///   is a toolchain's, a dependency's or another checkout's. Inside the
+    ///   root it is outside only in a dependency directory, such as the
+    ///   repository's own `node_modules` holding the TypeScript it runs, or a
+    ///   virtual environment in the checkout. Any other file inside the root
+    ///   may be the repository's own, such as its build output or a
+    ///   generated file, and is undecided.
+    ///
+    /// Only a `file:` URI with an absolute path can be outside; any other
+    /// scheme is undecided.
+    pub fn outside_repository(&self, uri: &str) -> bool {
+        let Some(path) = protocol::uri_to_path(uri) else {
+            return false;
+        };
+        if !path.is_absolute() || !self.root.is_absolute() {
+            return false;
+        }
+        if self.held_file(uri).is_some() || self.may_hold_file(uri) {
+            return false;
+        }
+        let judged = self.real_path_of(&path).unwrap_or(path);
+        let below = crate::call_sites::directories_below(&judged, &self.root).or_else(|| {
+            self.real_root
+                .as_deref()
+                .and_then(|real| crate::call_sites::directories_below(&judged, real))
+        });
+        match below {
+            None => true,
+            Some(directories) => crate::call_sites::in_dependency_directory(&directories),
+        }
     }
 
     /// Return every entity in the file at repository-relative `file_path`.
@@ -288,6 +456,241 @@ fn admitted_text(documents: Option<DocumentProvider<'_>>, file: &str) -> Result<
     documents
         .and_then(|provider| provider(file))
         .ok_or_else(|| LspError::Protocol(format!("repository source unavailable for LSP: {file}")))
+}
+
+#[cfg(test)]
+mod installed_copy_tests {
+    use super::*;
+
+    fn index_of(files: &[&str]) -> EntityIndex {
+        EntityIndex::new(
+            files
+                .iter()
+                .map(|file| EntityRef {
+                    id: kin_model::EntityId::new(),
+                    name: "f".into(),
+                    file_path: (*file).into(),
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 0,
+                    name_line: 0,
+                    name_col: 0,
+                    declares_name: true,
+                    kind: kin_model::EntityKind::Function,
+                })
+                .collect(),
+            Path::new("/repo"),
+        )
+    }
+
+    /// A `src/` layout package installed into an environment is the
+    /// repository's own code under another path, and so is its stub package.
+    #[test]
+    fn an_installed_copy_of_a_repository_module_is_recognized() {
+        let index = index_of(&["src/requests/models.py", "tests/test_requests.py"]);
+        for copy in [
+            "file:///venv/lib/python3.12/site-packages/requests/models.py",
+            "file:///venv/lib/python3.12/site-packages/requests-stubs/models.pyi",
+            "file:///venv/lib/python3.12/site-packages/Requests/Models.py",
+        ] {
+            assert!(index.may_hold_file(copy), "{copy}");
+        }
+        for foreign in [
+            "file:///usr/lib/python3.12/json/__init__.py",
+            "file:///venv/lib/python3.12/site-packages/httpx/models.py",
+            "file:///opt/typeshed/stdlib/builtins.pyi",
+        ] {
+            assert!(!index.may_hold_file(foreign), "{foreign}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod outside_repository_tests {
+    use super::*;
+
+    fn index_at(root: &Path, files: &[&str]) -> EntityIndex {
+        EntityIndex::new(
+            files
+                .iter()
+                .map(|file| EntityRef {
+                    id: kin_model::EntityId::new(),
+                    name: "helper".into(),
+                    file_path: (*file).into(),
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 2,
+                    name_line: 1,
+                    name_col: 16,
+                    declares_name: true,
+                    kind: kin_model::EntityKind::Function,
+                })
+                .collect(),
+            root,
+        )
+    }
+
+    /// A dependency directory inside the workspace root holds no repository
+    /// source, so an answer there leaves the repository: a repository's own
+    /// TypeScript under `node_modules`, a package in pnpm's store, and a
+    /// virtual environment inside the checkout.
+    #[test]
+    fn a_dependency_directory_inside_the_root_is_outside() {
+        let index = index_at(Path::new("/repo"), &["src/index.ts", "app/main.py"]);
+        for outside in [
+            "file:///repo/node_modules/typescript/lib/lib.es5.d.ts",
+            "file:///repo/node_modules/.pnpm/vitest@1.6.0/node_modules/vitest/dist/index.d.ts",
+            "file:///repo/packages/web/node_modules/@types/node/globals.d.ts",
+            "file:///repo/.venv/lib/python3.12/site-packages/httpx/_client.py",
+            "file:///usr/lib/python3.12/json/__init__.py",
+        ] {
+            assert!(index.outside_repository(outside), "{outside}");
+        }
+    }
+
+    /// A root whose tree holds a toolchain's or a package manager's caches
+    /// still reads their files as outside: a Cargo registry, the Go module
+    /// cache, rustup's toolchains, and Kin's own analysis environments.
+    #[test]
+    fn dependency_caches_under_the_root_are_outside() {
+        let index = index_at(Path::new("/home/dev"), &["project/engine/plan.rs"]);
+        for outside in [
+            "file:///home/dev/.cargo/registry/src/index.crates.io-6f17d22bba15001f/serde-1.0.219/src/lib.rs",
+            "file:///home/dev/go/pkg/mod/github.com/gin-gonic/gin@v1.10.0/gin.go",
+            "file:///home/dev/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/option.rs",
+            "file:///home/dev/.kin/cache/analysis-environments/python/cp311/site/httpx/_client.py",
+        ] {
+            assert!(index.outside_repository(outside), "{outside}");
+        }
+    }
+
+    /// Inside the root, only a dependency directory is outside. A file the
+    /// graph holds is the repository's, and so may be a file it does not
+    /// hold, such as its own build output or a generated file, so neither
+    /// refutes anything.
+    #[test]
+    fn repository_files_the_graph_does_not_hold_are_not_outside() {
+        let index = index_at(Path::new("/repo"), &["src/index.ts"]);
+        for inside in [
+            "file:///repo/src/index.ts",
+            "file:///repo/dist/index.d.ts",
+            "file:///repo/src/generated/schema.ts",
+            "file:///repo/pkg/mod/local.go",
+            "jdt://contents/rt.jar/java.util/List.class",
+        ] {
+            assert!(!index.outside_repository(inside), "{inside}");
+        }
+    }
+
+    /// An installed copy of a package the workspace itself provides is the
+    /// repository's own code under another path, wherever it is installed.
+    #[test]
+    fn an_installed_copy_in_a_dependency_directory_is_not_outside() {
+        let index = index_at(
+            Path::new("/repo"),
+            &["src/requests/models.py", "src/driver/Driver.ts"],
+        );
+        for copy in [
+            "file:///repo/.venv/lib/python3.12/site-packages/requests/models.py",
+            "file:///repo/node_modules/typeorm/driver/Driver.d.ts",
+            "file:///repo/node_modules/.pnpm/typeorm@0.3.20/node_modules/typeorm/driver/Driver.d.ts",
+        ] {
+            assert!(!index.outside_repository(copy), "{copy}");
+        }
+    }
+
+    /// A temporary directory, removed when it is dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "kin-lsp-outside-{label}-{}",
+                kin_model::EntityId::new()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            // The root as a server answers it: its real path.
+            Self(std::fs::canonicalize(&dir).unwrap())
+        }
+
+        fn file(&self, relative: &str) {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "export function helper() {}\n").unwrap();
+        }
+
+        fn link(&self, relative: &str, target: &Path) {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, path).unwrap();
+        }
+
+        fn uri(&self, relative: &str) -> String {
+            protocol::path_to_uri(&self.0.join(relative))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// pnpm links a workspace package into `node_modules` by a symbolic link
+    /// to its directory. A file reached through that link is the repository's
+    /// source it links to: placed in that source when the graph holds it, and
+    /// never outside even when the graph does not, as with the package's own
+    /// build output. A dependency pnpm links from its store stays outside.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workspace_package_is_the_source_it_links_to() {
+        let root = Scratch::new("pnpm");
+        root.file("packages/pkg/src/lib.ts");
+        root.file("packages/pkg/dist/lib.d.ts");
+        root.link("node_modules/pkg", Path::new("../packages/pkg"));
+        root.file("node_modules/.pnpm/dep@1.0.0/node_modules/dep/index.d.ts");
+        root.link(
+            "node_modules/dep",
+            Path::new(".pnpm/dep@1.0.0/node_modules/dep"),
+        );
+        let index = index_at(&root.0, &["packages/pkg/src/lib.ts"]);
+
+        let linked = root.uri("node_modules/pkg/src/lib.ts");
+        assert_eq!(
+            index
+                .find_at(&linked, 1)
+                .map(|entity| entity.file_path.as_str()),
+            Some("packages/pkg/src/lib.ts")
+        );
+        assert!(!index.outside_repository(&linked));
+        assert!(!index.outside_repository(&root.uri("node_modules/pkg/dist/lib.d.ts")));
+        assert!(index.outside_repository(&root.uri("node_modules/dep/index.d.ts")));
+        assert!(index.outside_repository(
+            &root.uri("node_modules/.pnpm/dep@1.0.0/node_modules/dep/index.d.ts")
+        ));
+    }
+
+    /// A workspace package linked from a layout outside the repository, as
+    /// Kin's analysis environment lays one out, is the repository's source
+    /// all the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_package_linked_from_outside_the_root_is_its_source() {
+        let root = Scratch::new("root");
+        let layout = Scratch::new("layout");
+        root.file("packages/pkg/src/lib.ts");
+        layout.link("node_modules/pkg", &root.0.join("packages/pkg"));
+        let index = index_at(&root.0, &["packages/pkg/src/lib.ts"]);
+
+        let linked = layout.uri("node_modules/pkg/src/lib.ts");
+        assert_eq!(
+            index
+                .find_at(&linked, 1)
+                .map(|entity| entity.file_path.as_str()),
+            Some("packages/pkg/src/lib.ts")
+        );
+        assert!(!index.outside_repository(&linked));
+    }
 }
 
 /// Refuse an answer whose URI names a file other than the admitted one.
@@ -412,16 +815,53 @@ pub(crate) fn deterministic_relation_id(
     RelationId::from_bytes(bytes)
 }
 
+/// What one caller's call hierarchy proved, and how much of the server's
+/// answer it could not.
+#[derive(Debug, Default)]
+pub struct EntityCalls {
+    /// One `Calls` edge per target the server placed at least one call site of
+    /// inside the caller, carrying those sites and no others.
+    pub relations: Vec<Relation>,
+    /// Outgoing calls the server reported without a single site inside the
+    /// caller's lines. None of them became an edge. The answer that reported
+    /// them was not proven whole, so a pass that reports completeness counts
+    /// the query as one that did not finish.
+    pub unproven_calls: usize,
+    /// Call ranges inside the caller whose call the server resolved to a
+    /// declaration outside the repository, in a file the graph holds no twin
+    /// of. Each refutes an in-repository guess at that range.
+    pub outside_sites: Vec<crate::call_sites::SiteAnswer>,
+}
+
 /// Query outgoing calls from a specific entity and produce Relations.
+///
+/// The caller is proven call by call. A call counts only at the sites the
+/// server placed inside the caller's own lines: its other sites are dropped,
+/// and a call left with none is dropped whole and counted in
+/// [`EntityCalls::unproven_calls`]. The caller's other calls stand.
+///
+/// Each site belongs to the entity that makes the call, the innermost one
+/// whose lines hold it. A class's call hierarchy lists the calls its
+/// property decorators and initializers make, and on typeorm 6,612 such
+/// sites were recorded as the class calling when the parser, and the
+/// definition at the same token, name the property. A call the server
+/// resolved outside the repository mints no edge and is kept in
+/// [`EntityCalls::outside_sites`] as the refutation it is.
+///
+/// One call without a site in the caller used to refuse the whole caller, and
+/// the file pass then counted that caller as a failed query, so every edge it
+/// had proven went with the one it had not. A malformed position anywhere in
+/// the answer still refuses all of it: it means the server holds text other
+/// than the admitted document, and then none of its positions is proven.
 pub async fn enrich_entity_calls(
     server: &LspServer,
     caller: &EntityRef,
     index: &EntityIndex,
     workspace_root: &Path,
     documents: Option<DocumentProvider<'_>>,
-) -> Result<Vec<Relation>> {
+) -> Result<EntityCalls> {
     if !server.has_call_hierarchy() {
-        return Ok(Vec::new());
+        return Ok(EntityCalls::default());
     }
 
     let file_path = workspace_root.join(&caller.file_path);
@@ -430,7 +870,7 @@ pub async fn enrich_entity_calls(
     let text = admitted_text(documents, &caller.file_path)?;
     let positions = crate::source_positions::SourcePositions::new(&caller.file_path, &text);
     let Some(request_position) = positions.name_position(caller)? else {
-        return Ok(Vec::new());
+        return Ok(EntityCalls::default());
     };
 
     // Step 1: Prepare call hierarchy at the entity's position.
@@ -448,44 +888,27 @@ pub async fn enrich_entity_calls(
     let items: Vec<CallHierarchyItem> = decode_optional_array(prepare_result?)?;
 
     if items.is_empty() {
-        return Ok(Vec::new());
+        return Ok(EntityCalls::default());
     }
 
-    // Step 2: Require one prepared source matching the queried entity.
-    if items.len() != 1 {
-        return Err(LspError::Protocol(
-            "ambiguous prepared call hierarchy source".into(),
-        ));
-    }
-    let item = &items[0];
-    require_source_uri(&item.uri, &caller.file_path, workspace_root)?;
+    // Step 2: The prepared source that is the queried entity.
+    let item = prepared_source(
+        &items,
+        server.typescript_grammars(),
+        caller,
+        index,
+        &positions,
+        &text,
+        workspace_root,
+        &request_position,
+    )?;
+    // A TypeScript binding's initializer is prepared with its selection, the
+    // binding's name, outside its enclosing range, the initializer.
+    // `prepared_source` admits one only once it is proven.
     let enclosing = positions.range(&item.range)?;
     let selection = positions.range(&item.selection_range)?;
     let binding_initializer =
         selection.start_byte < enclosing.start_byte || selection.end_byte > enclosing.end_byte;
-    if binding_initializer
-        && !crate::typescript_call_hierarchy::proves_binding_initializer(
-            server.typescript_grammars(),
-            caller,
-            &text,
-            &request_position,
-            &selection,
-            &enclosing,
-        )
-    {
-        return Err(LspError::Protocol(
-            "prepared call hierarchy selection is outside its source range".into(),
-        ));
-    }
-    if index
-        .find_at(&item.uri, item.selection_range.start.line)
-        .map(|e| e.id)
-        != Some(caller.id)
-    {
-        return Err(LspError::Protocol(
-            "prepared call hierarchy source is not the queried entity".into(),
-        ));
-    }
     let outgoing_result = server
         .client
         .request(
@@ -498,16 +921,16 @@ pub async fn enrich_entity_calls(
         decode_optional_array(outgoing_result?)?;
 
     // Step 3: Match each outgoing call target to a graph entity.
-    let mut relations = Vec::new();
+    let mut calls = EntityCalls::default();
     for call in &outgoing {
-        if call.from_ranges.is_empty()
-            || call.from_ranges.iter().any(|range| {
-                range.start.line < caller.start_line || range.end.line > caller.end_line
-            })
-        {
-            return Err(LspError::Protocol(
-                "outgoing call has no proven site within queried caller lines".into(),
-            ));
+        let mut inside = Vec::with_capacity(call.from_ranges.len());
+        for range in &call.from_ranges {
+            // Checked whether or not the site is kept, so a malformed site
+            // cannot hide behind the caller-lines test below.
+            positions.range(range)?;
+            if range.start.line >= caller.start_line && range.end.line <= caller.end_line {
+                inside.push(range.clone());
+            }
         }
         // A binding's initializer is narrower than its declaration line. A
         // second declarator may share that line, so its call sites must not be
@@ -523,13 +946,38 @@ pub async fn enrich_entity_calls(
                 }
             }
         }
-        let evidence = query_positions_evidence(
-            "lsp_call_hierarchy",
-            &positions,
-            call.from_ranges.iter().cloned(),
-        )?;
+        if inside.is_empty() {
+            // No site the server named lies in the caller, so nothing proves
+            // this caller makes the call. It is counted, not minted.
+            calls.unproven_calls += 1;
+            debug!(
+                caller = %caller.name,
+                target = %call.to.name,
+                sites = call.from_ranges.len(),
+                "LSP outgoing call has no site inside the queried caller; dropped"
+            );
+            continue;
+        }
+        if inside.len() < call.from_ranges.len() {
+            debug!(
+                caller = %caller.name,
+                target = %call.to.name,
+                dropped = call.from_ranges.len() - inside.len(),
+                "LSP outgoing call sites outside the queried caller were dropped"
+            );
+        }
         let target_line = call.to.selection_range.start.line;
         let target_uri = &call.to.uri;
+
+        // The entity that makes each call: the innermost one holding its site.
+        let mut by_owner: Vec<(&EntityRef, Vec<protocol::Range>)> = Vec::new();
+        for range in inside {
+            let owner = site_owner(index, &uri, caller, range.start.line);
+            match by_owner.iter_mut().find(|(held, _)| held.id == owner.id) {
+                Some((_, ranges)) => ranges.push(range),
+                None => by_owner.push((owner, vec![range])),
+            }
+        }
 
         // Position only. The name fallback matched the FIRST entity whose name
         // ended with the target's, which for `send` was the caller itself, so
@@ -539,26 +987,55 @@ pub async fn enrich_entity_calls(
         // which reads `type_resolved`, a fabricated edge wearing the strongest
         // resolution there is. A position that maps to nothing now produces no
         // edge, which is the honest answer and a reportable gap.
-        let target = index.find_at(target_uri, target_line);
+        let target = index
+            .find_at(target_uri, target_line)
+            .and_then(|found| call_target(index, found, &call.to, documents));
 
         match target {
             Some(target_ref) => {
-                relations.push(Relation {
-                    id: deterministic_relation_id(RelationKind::Calls, caller.id, target_ref.id),
-                    kind: RelationKind::Calls,
-                    src: GraphNodeId::Entity(caller.id),
-                    dst: GraphNodeId::Entity(target_ref.id),
-                    confidence: 0.95,
-                    origin: RelationOrigin::Lsp,
-                    created_in: None,
-                    import_source: None,
-                    // Every call SITE inside the caller, which is what a reader
-                    // needs and what `reference_lines` publishes. The server
-                    // answers with one range per call it saw, and taking only
-                    // the head reported a caller that calls the target five
-                    // times as calling it once.
-                    evidence,
-                });
+                for (owner, ranges) in by_owner {
+                    calls.relations.push(Relation {
+                        id: deterministic_relation_id(RelationKind::Calls, owner.id, target_ref.id),
+                        kind: RelationKind::Calls,
+                        src: GraphNodeId::Entity(owner.id),
+                        dst: GraphNodeId::Entity(target_ref.id),
+                        confidence: 0.95,
+                        origin: RelationOrigin::Lsp,
+                        created_in: None,
+                        import_source: None,
+                        // Every call SITE the owner makes, which is what a
+                        // reader needs and what `reference_lines` publishes.
+                        // The server answers with one range per call it saw,
+                        // and taking only the head reported a caller that
+                        // calls the target five times as calling it once.
+                        evidence: query_positions_evidence(
+                            crate::call_sites::CALL_HIERARCHY_RULE,
+                            &positions,
+                            ranges,
+                        )?,
+                    });
+                }
+            }
+            // A declaration outside the workspace, in no file the graph could
+            // hold a twin of: the call leaves the repository, which refutes
+            // any in-repository guess at its site. An installed copy of a
+            // module the workspace provides is the repository's own code
+            // under another path and refutes nothing.
+            None if index.outside_repository(target_uri) => {
+                let outside = crate::call_sites::OutsideLocation {
+                    uri: target_uri.clone(),
+                    range: crate::call_sites::LocationRange::from(&call.to.selection_range),
+                };
+                for (owner, ranges) in by_owner {
+                    for range in ranges {
+                        calls.outside_sites.push(crate::call_sites::SiteAnswer {
+                            source: owner.id,
+                            site: positions.range(&range)?,
+                            target: crate::call_sites::SiteTarget::Outside(outside.clone()),
+                            rule: crate::call_sites::CALL_HIERARCHY_RULE,
+                        });
+                    }
+                }
             }
             None => {
                 debug!(
@@ -570,7 +1047,152 @@ pub async fn enrich_entity_calls(
         }
     }
 
-    Ok(relations)
+    Ok(calls)
+}
+
+/// The entity a call hierarchy item names, given the entity `find_at`
+/// placed its name in.
+///
+/// An item named on its entity's own declaration line is that entity. One
+/// named elsewhere inside it names something that entity holds: a TypeScript
+/// overload signature, which belongs to the implementation Kin keeps for the
+/// function, or a declaration the graph has no entity for. Inside a module
+/// surface, which declares no name, the latter is no call target at all:
+/// axum's `get` is generated by `top_level_handler_fn!(get, GET)` at the top
+/// of `method_routing.rs`, and its calls were recorded as calls of that
+/// module, as typeorm's calls of the overloaded `@Column()` were recorded as
+/// calls of `Column.ts`. Inside a named entity the item stays with that
+/// entity, as it always has, since a decorated declaration's recorded line
+/// can lie above its name.
+fn call_target<'i>(
+    index: &'i EntityIndex,
+    found: &'i EntityRef,
+    item: &CallHierarchyItem,
+    documents: Option<DocumentProvider<'_>>,
+) -> Option<&'i EntityRef> {
+    if found.declares_name && item.selection_range.start.line == found.name_line {
+        return Some(found);
+    }
+    if crate::file_enrichment::is_script_source(&found.file_path) {
+        let signature = protocol::Location {
+            uri: item.uri.clone(),
+            range: item.selection_range.clone(),
+        };
+        let implementation = documents
+            .and_then(|provider| provider(&found.file_path))
+            .and_then(|text| {
+                crate::file_enrichment::overload_implementation(index, found, &text, &signature)
+            });
+        if implementation.is_some() {
+            return implementation;
+        }
+    }
+    found.declares_name.then_some(found)
+}
+
+/// The entity that makes a call the server reported on `line` of `caller`.
+///
+/// The innermost entity holding that line, when its lines lie inside the
+/// caller's and are fewer; otherwise the caller itself. Entities are placed by
+/// line, so two declarations sharing the caller's lines cannot be told apart
+/// and the site stays with the caller the server was asked about.
+fn site_owner<'a>(
+    index: &'a EntityIndex,
+    uri: &str,
+    caller: &'a EntityRef,
+    line: u32,
+) -> &'a EntityRef {
+    match index.find_at(uri, line) {
+        Some(owner)
+            if owner.id != caller.id
+                && owner.file_path == caller.file_path
+                && owner.start_line >= caller.start_line
+                && owner.end_line <= caller.end_line
+                && owner.end_line - owner.start_line < caller.end_line - caller.start_line =>
+        {
+            owner
+        }
+        _ => caller,
+    }
+}
+
+/// The prepared call hierarchy item that is the queried caller.
+///
+/// An item is the caller when it names the admitted file, its ranges are real
+/// positions there with the selection inside the enclosing range (or outside
+/// it only as a TypeScript binding initializer proven with `grammars`), and
+/// its selection starts on a line where the caller is the innermost entity. A
+/// lone item that is not the caller refuses the query.
+///
+/// A server can prepare several items at one position. Refusing every such
+/// answer threw away the caller's calls even when one item was plainly the
+/// caller, so the item that is the caller AND whose selection holds the
+/// position that was asked is chosen, when exactly one is. An item in another
+/// file is not the caller and is passed over. None, or more than one, is still
+/// ambiguous and refused: choosing between them would be a guess.
+#[allow(clippy::too_many_arguments)]
+fn prepared_source<'a>(
+    items: &'a [CallHierarchyItem],
+    grammars: Option<&crate::typescript_call_hierarchy::TypeScriptGrammars>,
+    caller: &EntityRef,
+    index: &EntityIndex,
+    positions: &crate::source_positions::SourcePositions<'_>,
+    text: &str,
+    workspace_root: &Path,
+    asked: &Position,
+) -> Result<&'a CallHierarchyItem> {
+    let well_formed = |item: &CallHierarchyItem| -> Result<()> {
+        let enclosing = positions.range(&item.range)?;
+        let selection = positions.range(&item.selection_range)?;
+        if (selection.start_byte < enclosing.start_byte || selection.end_byte > enclosing.end_byte)
+            && !crate::typescript_call_hierarchy::proves_binding_initializer(
+                grammars, caller, text, asked, &selection, &enclosing,
+            )
+        {
+            return Err(LspError::Protocol(
+                "prepared call hierarchy selection is outside its source range".into(),
+            ));
+        }
+        Ok(())
+    };
+    let is_caller = |item: &CallHierarchyItem| {
+        index
+            .find_at(&item.uri, item.selection_range.start.line)
+            .map(|e| e.id)
+            == Some(caller.id)
+    };
+    if let [item] = items {
+        require_source_uri(&item.uri, &caller.file_path, workspace_root)?;
+        well_formed(item)?;
+        if !is_caller(item) {
+            return Err(LspError::Protocol(
+                "prepared call hierarchy source is not the queried entity".into(),
+            ));
+        }
+        return Ok(item);
+    }
+    let mut chosen = Vec::new();
+    for item in items {
+        if require_source_uri(&item.uri, &caller.file_path, workspace_root).is_err() {
+            continue;
+        }
+        well_formed(item)?;
+        if is_caller(item) && holds(&item.selection_range, asked) {
+            chosen.push(item);
+        }
+    }
+    match chosen.as_slice() {
+        [item] => Ok(item),
+        _ => Err(LspError::Protocol(
+            "ambiguous prepared call hierarchy source".into(),
+        )),
+    }
+}
+
+/// Whether `position` lies in the half-open `range`.
+fn holds(range: &protocol::Range, position: &Position) -> bool {
+    let at = |p: &Position| (p.line, p.character);
+    at(&range.start) <= at(position) && at(position) < at(&range.end)
 }
 
 /// Query type hierarchy supertypes for a method entity to detect Overrides relations.

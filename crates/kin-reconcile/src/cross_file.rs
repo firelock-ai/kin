@@ -67,6 +67,27 @@ use tracing::{debug, info, warn};
 /// publication rather than silently losing dependent files.
 const MAX_PENDING_FILES: usize = 20_000;
 
+/// Whether an edit can change how the files that depend on it bind.
+///
+/// A file binds its calls, imports and inheritance against the declarations,
+/// imports and structural relations of the files it names. An edit that leaves
+/// all of those exactly as they were, such as a change inside a function body,
+/// cannot change a single binding anywhere else, so re-deriving the files that
+/// wait on its names would reproduce what they already hold. Worse, it would
+/// reproduce what they held before anything refined it: a name-only guess a
+/// language server contradicted at its call site and retired comes back from a
+/// re-derivation as if nothing had settled it. See
+/// [`crate::linker_surface::edit_moves_linker_surface`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dependents {
+    /// The edit changed what other files bind against: re-derive every file
+    /// waiting on a name it defines or importing it.
+    Rebind,
+    /// The edit changed nothing another file binds against: resolve only the
+    /// edited file.
+    Unaffected,
+}
+
 /// One file's retained dependency fragment.
 #[derive(Debug, Clone)]
 struct PendingFile {
@@ -1305,6 +1326,7 @@ impl LiveCrossFileLinker {
         extracted: &[ExtractedRelation],
         imports: &[FileImport],
         completeness: ParseCompleteness,
+        dependents: Dependents,
     ) -> crate::error::Result<CrossFilePass> {
         self.restore_dependencies(graph, blobs, Some(file_path))?;
         if self.needs_dependency_entry(extracted, imports, entities)
@@ -1316,10 +1338,11 @@ impl LiveCrossFileLinker {
             ));
         }
         let mut sources = Vec::new();
-        let (paths, absent) = self.partition_admitted_sources(
-            graph,
-            self.files_waiting_on_names_of(file_path, entities),
-        )?;
+        let nominated = match dependents {
+            Dependents::Rebind => self.files_waiting_on_names_of(file_path, entities),
+            Dependents::Unaffected => Vec::new(),
+        };
+        let (paths, absent) = self.partition_admitted_sources(graph, nominated)?;
         for path in paths {
             if let Some(indexed) =
                 crate::admitted_source::load(graph, blobs, &kin_model::FilePathId::new(path))?

@@ -515,7 +515,8 @@ async fn prepared_session_plan_captures_late_fresh_lsp_call_into_durable_unknown
         Some(&|path| inputs.document(path)),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .relations;
     server.shutdown().await.unwrap();
     assert_eq!(generated.len(), 1);
     let prior = generated[0].clone();

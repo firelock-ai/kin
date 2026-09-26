@@ -4073,6 +4073,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -5156,6 +5157,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         let relation = Relation {
             id: RelationId::new(),
@@ -5240,6 +5242,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
 
         let calls = Relation {
@@ -5435,6 +5438,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         let mut snapshot = crate::storage::format::LocateGraphSnapshot::from(
             crate::storage::GraphSnapshot::empty(),
@@ -5646,6 +5650,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
 
@@ -6083,6 +6088,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         assert_ne!(before_authority, graph.retrieval_authority_hash());
@@ -6153,6 +6159,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(
@@ -6991,6 +6998,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
         let head = graph
@@ -7097,6 +7105,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
         let first_head = graph
@@ -7142,6 +7151,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         replacement.create_change(&second).unwrap();
         let second_head = replacement
@@ -7211,6 +7221,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         graph.create_change(&first).unwrap();
         let keeper_head = graph
@@ -7268,6 +7279,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         replacement.create_change(&second).unwrap();
         assert_ne!(
@@ -8702,6 +8714,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
 

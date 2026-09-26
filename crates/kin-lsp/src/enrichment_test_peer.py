@@ -33,8 +33,13 @@ while True:
         uri = params.get("textDocument", {}).get("uri", "")
         column = params.get("position", {}).get("character", "")
         reply = responses.get(f"{method}@{uri}#{column}", responses.get(method, {"result": None}))
+    for notice in reply.get("before", []):
+        body = json.dumps({"jsonrpc": "2.0", **notice}).encode()
+        sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        sys.stdout.buffer.flush()
     if reply.get("hold"):
         continue
+    reply = {key: value for key, value in reply.items() if key != "before"}
     payload = json.dumps({"jsonrpc": "2.0", "id": message["id"], **reply}).encode()
     sys.stdout.buffer.write(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
     sys.stdout.buffer.flush()

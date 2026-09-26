@@ -28,6 +28,13 @@
 //! An empty ledger is reported as exactly that, never as "nothing owed". Work
 //! an earlier build recorded outside authority, or enrichment that is still
 //! incomplete, is not something an empty ledger rules out.
+//!
+//! Beside the ledger it reports owed enrichment: every file of this store's
+//! workspace graph holding a caller no current call-site ledger describes,
+//! with how many, read through the one site-state reading every Kin surface
+//! shares. The graph is derived state, so this half validates authority in
+//! full, still read-only and within the same lock budget, and materializes the
+//! workspace graph from it after releasing the lock.
 
 use std::time::{Duration, Instant};
 
@@ -57,6 +64,146 @@ pub struct OwedDerivationsReport {
     pub generation: u64,
     /// Every workspace authority holds, in authority's order.
     pub workspaces: Vec<WorkspaceOwedDerivations>,
+    /// The callers this store's workspace graph holds with no current
+    /// call-site ledger, by file. Absent only from a report built without
+    /// reading the graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owed_enrichment: Option<OwedEnrichmentReport>,
+}
+
+/// The callers whose enrichment is owed, read from one workspace's graph.
+///
+/// A caller is an entity with source text, and its enrichment is owed while no
+/// current call-site ledger describes it: its sites are then not accounted
+/// for, whatever the owed derivation ledger above holds. Each is read through
+/// the one site-state reading every Kin surface shares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OwedEnrichmentReport {
+    /// The workspace whose graph was read.
+    pub workspace_id: String,
+    /// Entities with source text the graph holds.
+    pub callers: u64,
+    /// Of those, the ones no current ledger describes.
+    pub callers_owed: u64,
+    /// Every file holding such a caller, in path order, with how many.
+    pub files: Vec<kin_mcp::call_sites::OwedFile>,
+    /// Why the graph could not be read, when it could not. The derivation
+    /// ledger above is reported either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+impl OwedEnrichmentReport {
+    /// The report for a graph already in hand.
+    pub fn from_graph<G: kin_model::GraphStore>(workspace_id: String, graph: &G) -> Result<Self> {
+        let entities = graph
+            .list_all_entities()
+            .map_err(|error| anyhow!("list the workspace graph's entities: {error}"))?;
+        let files = kin_mcp::call_sites::owed_files(graph, &entities);
+        Ok(Self {
+            workspace_id,
+            callers: entities
+                .iter()
+                .filter(|entity| entity.span.is_some())
+                .count() as u64,
+            callers_owed: files.iter().map(|file| file.callers).sum(),
+            files,
+            unavailable: None,
+        })
+    }
+
+    /// The report for a graph that could not be read, saying why.
+    fn unavailable(workspace_id: String, reason: String) -> Self {
+        Self {
+            workspace_id,
+            callers: 0,
+            callers_owed: 0,
+            files: Vec::new(),
+            unavailable: Some(reason),
+        }
+    }
+
+    /// The human rendering: one line for the workspace, then one per file.
+    /// A graph that could not be read says so, and never reads as owing
+    /// nothing.
+    pub fn human_lines(&self) -> Vec<String> {
+        if let Some(reason) = &self.unavailable {
+            return vec![format!(
+                "owed enrichment in workspace {}: not read, because {reason}",
+                self.workspace_id
+            )];
+        }
+        if self.callers_owed == 0 {
+            return vec![format!(
+                "owed enrichment in workspace {}: every one of the {} callers with source text \
+                 holds a current call-site ledger or sits in a file with no call",
+                self.workspace_id, self.callers
+            )];
+        }
+        let mut lines = vec![format!(
+            "owed enrichment in workspace {}: {} of the {} callers with source text hold no \
+             current call-site ledger, in {} file(s)",
+            self.workspace_id,
+            self.callers_owed,
+            self.callers,
+            self.files.len()
+        )];
+        lines.extend(
+            self.files
+                .iter()
+                .map(|file| format!("  {}: {} caller(s)", file.file, file.callers)),
+        );
+        lines
+    }
+}
+
+/// Read the callers this store's own workspace graph holds with no current
+/// call-site ledger.
+///
+/// The graph is derived state, so it is materialized from repository
+/// authority validated in full and read-only, under the lock, the way the
+/// derivation ledger's fallback read is. The lock is released before the
+/// graph is read. Anything that stops the read is reported in the report's
+/// `unavailable` rather than failing the command, because the derivation
+/// ledger beside it was read on its own.
+pub fn read_owed_enrichment(layout: &kin_core::KinLayout, wait: Duration) -> OwedEnrichmentReport {
+    let binding = match kin_core::LocalRepositoryAuthorityBinding::from_layout(layout) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return OwedEnrichmentReport::unavailable(
+                String::new(),
+                format!("this store's repository authority could not be bound: {error:#}"),
+            )
+        }
+    };
+    let workspace_id = binding.workspace_id();
+    let snapshot = binding
+        .freeze_existing_read_only(wait)
+        .map_err(|error| format!("repository authority could not be validated read-only: {error}"))
+        .and_then(|freeze| {
+            freeze
+                .authority()
+                .workspace_graph_snapshot(&workspace_id)
+                .map_err(|error| format!("the workspace graph could not be read: {error}"))
+        });
+    let workspace = workspace_id.to_string();
+    let snapshot = match snapshot {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return OwedEnrichmentReport::unavailable(
+                workspace,
+                "repository authority holds no such workspace".to_string(),
+            )
+        }
+        Err(reason) => return OwedEnrichmentReport::unavailable(workspace, reason),
+    };
+    match kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)
+        .map_err(|error| anyhow!("materialize the workspace graph: {error}"))
+        .and_then(|graph| OwedEnrichmentReport::from_graph(workspace.clone(), &graph))
+    {
+        Ok(report) => report,
+        Err(error) => OwedEnrichmentReport::unavailable(workspace, format!("{error:#}")),
+    }
 }
 
 /// One workspace's records and the payment it last recorded.
@@ -164,6 +311,7 @@ fn report(
                 }),
             })
             .collect(),
+        owed_enrichment: None,
     }
 }
 
@@ -206,6 +354,9 @@ impl OwedDerivationsReport {
                 ));
             }
         }
+        if let Some(enrichment) = &self.owed_enrichment {
+            lines.extend(enrichment.human_lines());
+        }
         lines
     }
 }
@@ -213,12 +364,19 @@ impl OwedDerivationsReport {
 /// `kin graph owed [--json]`.
 pub async fn owed(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    let report = read_owed_derivations(&layout).map_err(|error| {
+    let started = Instant::now();
+    let mut report = read_owed_derivations(&layout).map_err(|error| {
         anyhow!(
             "kin graph owed: could not read the owed derivation ledger from repository \
              authority: {error:#}"
         )
     })?;
+    // What remains of the one lock budget, so the command as a whole waits no
+    // longer than it says it does.
+    report.owed_enrichment = Some(read_owed_enrichment(
+        &layout,
+        AUTHORITY_LOCK_WAIT.saturating_sub(started.elapsed()),
+    ));
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -249,6 +407,7 @@ mod tests {
             repository_id: "repository".to_string(),
             generation: 9,
             workspaces,
+            owed_enrichment: None,
         }
     }
 
@@ -290,5 +449,54 @@ mod tests {
         let value = serde_json::to_value(record(None, "ff2e7079")).unwrap();
         assert!(value["path"].is_null());
         assert_eq!(value["path_hex"], "ff2e7079");
+    }
+
+    /// Owed enrichment names each file holding a caller no current call-site
+    /// ledger describes, with how many, read from the graph through the one
+    /// site-state reading; a caller whose ledger is current is not listed.
+    #[test]
+    fn owed_enrichment_names_each_file_holding_callers_with_no_ledger() {
+        use crate::commands::call_site_fixture::{admit, spanned};
+        let graph = kin_db::InMemoryGraph::new();
+        let done_body = "def done():\n    go()\n";
+        let done = spanned("done", "app.py", 0, done_body);
+        let first = spanned("first", "lib/tools.py", 0, "def first():\n    a()\n");
+        let second = spanned("second", "lib/tools.py", 40, "def second():\n    b()\n");
+        let third = spanned("third", "pkg/io.py", 0, "def third():\n    c()\n");
+        admit(
+            &graph,
+            &[&done, &first, &second, &third],
+            vec![(
+                &done,
+                done_body,
+                vec![("go", kin_model::CallSiteState::ProvenOutside)],
+            )],
+        );
+        let report = OwedEnrichmentReport::from_graph("w".to_string(), &graph).unwrap();
+        assert_eq!(report.callers, 4);
+        assert_eq!(report.callers_owed, 3);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value["files"],
+            serde_json::json!([
+                {"file": "lib/tools.py", "callers": 2},
+                {"file": "pkg/io.py", "callers": 1},
+            ]),
+            "{value}"
+        );
+        let lines = report.human_lines();
+        assert_eq!(
+            lines[0],
+            "owed enrichment in workspace w: 3 of the 4 callers with source text hold no \
+             current call-site ledger, in 2 file(s)"
+        );
+        assert!(
+            lines.contains(&"  lib/tools.py: 2 caller(s)".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  pkg/io.py: 1 caller(s)".to_string()),
+            "{lines:?}"
+        );
     }
 }

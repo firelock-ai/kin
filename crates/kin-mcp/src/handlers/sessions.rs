@@ -1383,6 +1383,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         tree_deltas: Vec::new(),
         admission_policy_delta: None,
         external_reference_deltas: Vec::new(),
+        resolution_record_deltas: Vec::new(),
     };
 
     if let Err(err) = store.apply_transaction_delta(&delta) {

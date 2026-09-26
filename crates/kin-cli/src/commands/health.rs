@@ -272,6 +272,16 @@ impl HealthReport {
 /// hosted UI. Every check reflects real probed state — nothing is assumed
 /// healthy.
 pub async fn run_health_checks() -> HealthReport {
+    run_health_checks_sharing(&RunGraphStatus::for_run()).await
+}
+
+/// [`run_health_checks`] over a graph status the caller keeps.
+///
+/// `kin doctor --fix` reads the graph's language census after the report, to
+/// install servers only for the languages the repository uses. Handing it the
+/// run's own fetch is what keeps that read free: `graph status` is the slowest
+/// surface Kin has on a real store.
+pub(crate) async fn run_health_checks_sharing(graph_status: &RunGraphStatus) -> HealthReport {
     let mut checks = vec![
         check_kin_binary(),
         check_kin_daemon_binary(),
@@ -302,12 +312,11 @@ pub async fn run_health_checks() -> HealthReport {
     // and it was fetched per row, so each row answering from graph truth added a
     // whole one to the wall time of a doctor run on exactly the stores where an
     // operator is most likely to be running doctor because something is wrong.
-    let graph_status = RunGraphStatus::for_run();
-    checks.push(check_reference_edge_coverage(&graph_status).await);
-    checks.push(check_relation_census(&graph_status).await);
+    checks.push(check_reference_edge_coverage(graph_status).await);
+    checks.push(check_relation_census(graph_status).await);
     checks.push(check_hydration_semantics());
-    checks.push(check_parse_coverage(&graph_status).await);
-    checks.push(check_graph_section(&graph_status).await);
+    checks.push(check_parse_coverage(graph_status).await);
+    checks.push(check_graph_section(graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_memory_floor());
@@ -4142,6 +4151,30 @@ impl RunGraphStatus {
     }
 }
 
+/// The languages the graph holds entities in, when this run's graph status
+/// answered with a measurement.
+///
+/// `None` for every state that did not read the graph, and for a graph with no
+/// language entities yet, so a caller never mistakes "nothing read" for "no
+/// languages".
+pub(crate) async fn graph_language_census(graph_status: &RunGraphStatus) -> Option<Vec<String>> {
+    graph_language_census_from(graph_status.get().await)
+}
+
+fn graph_language_census_from(status: &GraphStatusForRun) -> Option<Vec<String>> {
+    let GraphStatusForRun::Answered(response) = status else {
+        return None;
+    };
+    let languages: Vec<String> = response
+        .reference_edge_coverage
+        .as_ref()?
+        .languages
+        .iter()
+        .map(|language| language.language.clone())
+        .collect();
+    (!languages.is_empty()).then_some(languages)
+}
+
 /// Take the run's one `graph status` round trip.
 ///
 /// Every way this can fail to produce a response is a named variant rather than
@@ -4403,19 +4436,22 @@ pub(crate) fn reference_edge_coverage_health(
     // language the build wires. `unsupportable_absence_reasons` covers gaps a
     // host cannot install its way out of; offering an install for those would
     // be a fix that changes nothing.
+    //
+    // The install line used to be set here and then overwritten by the
+    // generic sentence below, so a first run's doctor said "install the
+    // servers" and never named the command that does.
     if missing_servers.is_empty() {
-        check
+        check.with_manual_fix(
+            "install the servers, then stop this daemon (`kin daemon stop`) because a daemon \
+             discovers language servers once at startup and the next command starts one that \
+             finds them, then ask it to enrich (`kin daemon sweep`), and treat any \"unused\" \
+             answer as unverified until cross-file edges resolve",
+        )
     } else {
         check.with_manual_fix(crate::commands::language_servers::install_fix_line(
             &missing_servers,
         ))
     }
-    .with_manual_fix(
-        "install the servers, then stop this daemon (`kin daemon stop`) because a daemon \
-         discovers language servers once at startup and the next command starts one that finds \
-         them, then ask it to enrich (`kin daemon sweep`), and treat any \"unused\" answer as \
-         unverified until cross-file edges resolve",
-    )
 }
 
 /// Semantic readiness when no daemon is running to ask.
@@ -7845,6 +7881,7 @@ mod tests {
             relation_census: Some(census_pair(&[], &[], Vec::new())),
             graph_section: Some(serving_section_state()),
             conversion_source: None,
+            call_sites: None,
         }))
     }
 
@@ -8140,6 +8177,7 @@ mod tests {
                         relation_census: None,
                         graph_section: None,
                         conversion_source: None,
+                        call_sites: None,
                     },
                 ))
             })
@@ -10401,6 +10439,61 @@ mod tests {
                 .collect(),
             totals: None,
         }
+    }
+
+    /// A row that reports a missing server names the command that installs it.
+    ///
+    /// The install line used to be set and then overwritten by a generic
+    /// "install the servers" sentence, so a first run's `kin doctor` reported
+    /// gopls missing and never named the command that installs it.
+    #[test]
+    fn a_missing_server_row_names_the_install_command() {
+        use kin_core::reference_coverage::ReferenceEnrichment;
+
+        let check = reference_edge_coverage_health(&coverage_of(&[(
+            "go",
+            ReferenceEnrichment::NoLanguageServer,
+        )]));
+        let fix = check
+            .manual_fix
+            .expect("a missing server is a gap with a fix");
+        assert!(
+            fix.contains("kin doctor --fix --install-language-servers"),
+            "{fix}"
+        );
+        assert!(fix.contains("kin daemon stop"), "{fix}");
+    }
+
+    /// Doctor scopes its install by the graph's own list of languages, and
+    /// only when the graph was actually read.
+    #[test]
+    fn the_language_census_comes_only_from_a_graph_that_answered() {
+        use kin_core::reference_coverage::ReferenceEnrichment;
+
+        let mut status = answered_graph_status();
+        if let GraphStatusForRun::Answered(response) = &mut status {
+            response.reference_edge_coverage = Some(coverage_of(&[(
+                "go",
+                ReferenceEnrichment::NoLanguageServer,
+            )]));
+        }
+        assert_eq!(
+            graph_language_census_from(&status),
+            Some(vec!["go".to_string()])
+        );
+        assert_eq!(
+            graph_language_census_from(&answered_graph_status()),
+            None,
+            "a graph with no language entities yet names no languages, rather than an empty set"
+        );
+        assert_eq!(
+            graph_language_census_from(&GraphStatusForRun::NoDaemon),
+            None
+        );
+        assert_eq!(
+            graph_language_census_from(&GraphStatusForRun::NotInRepository),
+            None
+        );
     }
 
     /// An executable stub for each of `names` in `dir`, so a lookup resolves

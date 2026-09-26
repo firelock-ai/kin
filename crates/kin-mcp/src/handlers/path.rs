@@ -80,6 +80,10 @@ const DEFAULT_TIME_BUDGET: Duration = Duration::from_secs(10);
 const CONTAINMENT_DEPTH: usize = 4;
 const CONTAINMENT_CAP: usize = 5_000;
 const OTHER_CANDIDATES_SHOWN: usize = 5;
+/// Why a route cannot end on a symbol outside the repository, in the words
+/// that finish its refusal.
+const EXTERNAL_END_WHY: &str = "routes between repository entities and cannot start or end \
+     a route on it; a route to one of its callers ends one call short of it";
 /// Shortest routes counted before the count itself is reported as a floor.
 const ROUTE_COUNT_CEILING: usize = 1_000;
 
@@ -718,6 +722,30 @@ fn resolve_end<G: GraphStore>(
         return Err(PathError::InvalidRequest(format!(
             "{which} must name an entity"
         )));
+    }
+    // A symbol outside the repository is the wrong kind of end rather than a
+    // missing one, so it is refused as a request rather than as a miss the
+    // daemon would wait out. The MCP tool answers it before this with the
+    // structured refusal; this is the sentence `kin path` prints.
+    if let Some(node) = crate::handlers::external_symbols::lookup_external_symbol(store, spec)
+        .map_err(graph_error)?
+    {
+        return Err(PathError::InvalidRequest(format!(
+            "{which}: {} On the command line, `kin refs {}` lists them.",
+            crate::handlers::external_symbols::external_not_served_message(
+                &node,
+                TOOL_NAME,
+                EXTERNAL_END_WHY
+            ),
+            node.address()
+        )));
+    }
+    if crate::handlers::external_symbols::is_external_address(spec) {
+        return Err(PathError::EndpointNotFound {
+            which,
+            spec: spec.to_string(),
+            detail: "no symbol outside the repository is held under this id".to_string(),
+        });
     }
     if let Ok(uuid) = uuid::Uuid::parse_str(spec) {
         let entity = store
@@ -1784,6 +1812,20 @@ pub fn handle_trace_path<G: GraphStore>(
     store: &G,
 ) -> Result<ToolCallResult> {
     let request = request_from_args(args)?;
+    // Either end naming a symbol outside the repository is refused by what it
+    // is, in the one shape every tool refuses such a symbol with.
+    for (which, spec) in [("from", &request.from), ("to", &request.to)] {
+        if let Some(node) = crate::handlers::external_symbols::lookup_external_symbol(store, spec)?
+        {
+            return crate::handlers::external_symbols::external_not_served(
+                store,
+                &node,
+                TOOL_NAME,
+                which,
+                EXTERNAL_END_WHY,
+            );
+        }
+    }
     match build_path_response(store, &request) {
         Ok(response) => {
             let mut value = serde_json::to_value(&response).map_err(McpError::Json)?;

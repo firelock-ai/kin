@@ -43,3 +43,76 @@ fn decorated_class_and_method_keep_their_own_syntax_and_declaration_identity() {
         );
     }
 }
+
+#[test]
+fn a_decorator_written_through_an_object_carries_its_receiver() {
+    // `@app.post("/items/")` is a call to the member `post` of `app`, so it
+    // arrives exactly as the same call written in a body would: the leaf name
+    // plus the receiver as written. A bare decorator names the function itself
+    // and carries none.
+    let source = "\
+import pytest
+from registry import register
+
+app = FastAPI()
+
+
+@app.post(\"/items/\")
+@register
+async def create_item(item):
+    return item
+
+
+@pytest.mark.parametrize(\"value\", [1])
+def test_value(value):
+    assert value
+
+
+class Box:
+    @property
+    def size(self):
+        return self._size
+
+    @size.setter
+    def size(self, value):
+        self._size = value
+";
+    let adapter = PythonAdapter;
+    let file = FilePathId::new("routes.py");
+    let tree = adapter.parse(source.as_bytes()).unwrap();
+    let output = adapter.extract(&tree, source.as_bytes(), &file).unwrap();
+    let decorator_call = |src: &str, dst: &str| {
+        output
+            .relations
+            .iter()
+            .find(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.src_name == src
+                    && relation.dst_name == dst
+            })
+            .unwrap_or_else(|| panic!("no decorator call {src} -> {dst}"))
+    };
+    for (src, dst, receiver) in [
+        ("create_item", "post", Some("app")),
+        ("create_item", "register", None),
+        ("test_value", "parametrize", Some("pytest.mark")),
+        ("Box.size", "property", None),
+        ("Box.size", "setter", Some("size")),
+    ] {
+        let call = decorator_call(src, dst);
+        assert_eq!(call.receiver.as_deref(), receiver, "{src} -> {dst}");
+        if receiver.is_some() {
+            assert_eq!(
+                call.import_source, None,
+                "a member call is not the local binding an import introduced"
+            );
+        }
+    }
+    assert_eq!(
+        decorator_call("create_item", "register")
+            .import_source
+            .as_deref(),
+        Some("registry"),
+        "a bare decorator keeps the import it names"
+    );
+}

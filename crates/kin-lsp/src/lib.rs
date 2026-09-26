@@ -7,14 +7,18 @@
 //! to produce type-resolved relations that tree-sitter cannot provide.
 
 pub mod adapters;
+pub mod analysis_env;
 pub mod cache;
+pub mod call_sites;
 pub mod client;
 pub mod discovery;
 pub mod enrichment;
 pub mod error;
+pub mod external_symbols;
 pub mod file_enrichment;
 pub mod lifecycle;
 pub mod proof;
+pub mod proof_context;
 pub mod protocol;
 pub mod registry;
 mod server_process;

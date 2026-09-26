@@ -791,6 +791,72 @@ while True:
         );
     }
 
+    /// The result reports the generation the store ended at, not the one
+    /// admission left. The sweep publishes after admission, and a result that
+    /// printed admission's values disagreed with `kin status` a second later:
+    /// on fastapi it said generation 1 over a store at generation 7.
+    #[test]
+    fn the_result_reports_the_generation_its_sweep_published() {
+        let (fixture, bin, _record) = go_fixture("record");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        command.fixture_path_prefix(bin.path());
+        let (output, _) = fixture.init_json(&mut command, &[]);
+        let field = enrichment_field(&output);
+        assert_eq!(
+            field["state"],
+            "produced",
+            "the sweep must finish for its publication to be reported: {field}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = daemon_log(&fixture);
+        assert!(
+            log.contains(PUBLISHED),
+            "the fixture must give the sweep relations to publish; daemon.log:\n{log}"
+        );
+        let payload: Value =
+            serde_json::from_slice(&output.stdout).expect("kin init --json stdout is JSON");
+        assert_eq!(payload["authority_as_of"], "enrichment_end", "{payload}");
+        assert!(
+            payload["authority_generation"]
+                .as_u64()
+                .is_some_and(|generation| generation > 1),
+            "the sweep published past admission's generation 1, and the result says so: {payload}"
+        );
+
+        let status = Command::new(env!("CARGO_BIN_EXE_kin"))
+            .args(["status", "--json"])
+            .env("HOME", &fixture.home)
+            .env("KIN_HOME", &fixture.kin_home)
+            .env_remove("KIN_DAEMON_URL")
+            .current_dir(&fixture.repo)
+            .output()
+            .expect("run kin status");
+        // No daemon holds the store once init returns, so status may answer 9
+        // beside a report that is complete about durable authority.
+        assert!(
+            matches!(status.status.code(), Some(0) | Some(9)),
+            "status answered {:?}: stdout={} stderr={}",
+            status.status.code(),
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let reported: Value =
+            serde_json::from_slice(&status.stdout).expect("kin status --json stdout is JSON");
+        assert_eq!(
+            payload["authority_generation"], reported["repository"]["generation"],
+            "init and status name the same authority generation"
+        );
+        assert_eq!(
+            payload["workspace_generation"],
+            reported["workspace"]["generation"]
+        );
+        assert_eq!(payload["roots"], reported["repository"]["roots"]);
+        assert_eq!(
+            payload["semantic_enrichment"],
+            reported["semantic_enrichment"]
+        );
+    }
+
     /// A daemon told to shut down while the sweep waits for its server to stop
     /// still publishes the sweep's work and finishes the pass, instead of
     /// spending its shutdown budget on the stop.

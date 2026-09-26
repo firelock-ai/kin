@@ -10,6 +10,7 @@ pub mod common;
 // two from drifting apart.
 pub mod bench;
 pub mod entities;
+pub mod external_symbols;
 pub mod file_entities;
 pub mod lexical;
 pub mod path;
@@ -22,7 +23,11 @@ pub mod verification;
 pub mod work;
 
 #[cfg(test)]
+mod call_sites_tests;
+#[cfg(test)]
 mod confirmed_sites_tests;
+#[cfg(test)]
+mod external_symbols_tests;
 
 pub use repository_authority::{
     ActiveRepositoryAuthority, LocalRepositoryAuthorityBinding, RequestRepositoryAuthority,
@@ -170,7 +175,11 @@ async fn dispatch_tool_call<G: GraphStore>(
         }
         "dead_code" => entities::handle_dead_code(arguments, store),
         "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
-        "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
+        "graph_neighborhood" => entities::handle_graph_neighborhood_with_authority(
+            arguments,
+            store,
+            repository_authority,
+        ),
         lexical::TOOL_NAME => {
             lexical::handle_lexical_lookup(arguments, store, repository_authority)
         }
@@ -318,6 +327,7 @@ mod tests {
         changes_by_id: HashMap<SemanticChangeId, SemanticChange>,
         actors_by_id: HashMap<kin_model::provenance::ActorId, kin_model::provenance::Actor>,
         approvals_by_change: HashMap<SemanticChangeId, Vec<kin_model::provenance::Approval>>,
+        resolution_records: HashMap<kin_model::ResolutionRecordId, kin_model::ResolutionRecord>,
     }
 
     impl EmptyStore {
@@ -474,6 +484,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change
@@ -978,6 +989,13 @@ mod tests {
 
     impl kin_model::graph::EntityStore for EmptyStore {
         type Error = KinDbError;
+
+        fn lookup_resolution_record(
+            &self,
+            id: &kin_model::ResolutionRecordId,
+        ) -> std::result::Result<Option<kin_model::ResolutionRecord>, Self::Error> {
+            Ok(self.resolution_records.get(id).cloned())
+        }
 
         fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
             Ok(self.entities_by_id.get(id).cloned())
@@ -2589,6 +2607,7 @@ mod tests {
                     tree_deltas: change.tree_deltas.clone(),
                     admission_policy_delta: None,
                     external_reference_deltas: Vec::new(),
+                    resolution_record_deltas: Vec::new(),
                 })
                 .unwrap();
             store.create_change(&change).unwrap();
@@ -2786,6 +2805,179 @@ mod tests {
         assert!(excerpt.contains("return value <= maxVal;"));
         assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
         assert_eq!(object.get("start_line").unwrap(), 1);
+    }
+
+    /// A site of a call into a symbol outside the repository quotes the text it
+    /// names from the caller's own graph-owned body, addressed inside the
+    /// caller. The external declaration itself is never read: it has no body
+    /// in this graph, and the text comes from the caller.
+    #[test]
+    fn an_external_call_site_quotes_its_callee_from_the_callers_graph_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  const clamped = [value].map(Number);\n  return clamped[0] <= maxVal;\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        let symbol = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("npm", "typescript", "5.6.3").unwrap(),
+            vec![
+                kin_model::ScipDescriptor::namespace("lib.es5.d.ts"),
+                kin_model::ScipDescriptor::type_("Array"),
+                kin_model::ScipDescriptor::method("map"),
+            ],
+        )
+        .unwrap();
+        let node = symbol.to_reference().unwrap();
+        let span = entity.span.clone().unwrap();
+        let at = content.find(".map(").unwrap() + 1;
+        let site = kin_model::entity::SourceSpan {
+            file: span.file.clone(),
+            start_byte: span.start_byte + at,
+            end_byte: span.start_byte + at + 3,
+            start_line: span.start_line + 1,
+            start_col: 29,
+            end_line: span.start_line + 1,
+            end_col: 32,
+        };
+        let src = kin_model::GraphNodeId::Entity(entity.id);
+        let dst = kin_model::GraphNodeId::ExternalReference(node.id);
+        let edge = kin_context::ExternalEdge {
+            relation: Relation {
+                id: RelationId::resolver(RelationKind::Calls, &src, &dst),
+                kind: RelationKind::Calls,
+                src,
+                dst,
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: vec![kin_model::RelationEvidence {
+                    source_span: Some(site),
+                    parser_rule: Some("lsp_definition".to_string()),
+                    occurrence_count: 1,
+                    ..kin_model::RelationEvidence::default()
+                }],
+            },
+            entity: entity.id,
+            target: node.id,
+            reference: Some(node),
+            proof: None,
+        };
+
+        let held = HeldSourceAuthority::new(&store, Some(&authority));
+        let text = external_symbols::CalleeText::new(&held);
+        let row = external_symbols::external_call_row(&edge, entity, &text);
+        assert_eq!(
+            row["sites"],
+            serde_json::json!([{"line_in_entity": 1, "callee": "map"}]),
+            "{row:#}"
+        );
+        assert_eq!(row["name"], "Array.map", "{row:#}");
+
+        // Without authority the site keeps its place and says why it has no text.
+        let unheld = HeldSourceAuthority::new(&store, None);
+        let text = external_symbols::CalleeText::new(&unheld);
+        let row = external_symbols::external_call_row(&edge, entity, &text);
+        assert_eq!(
+            row["sites"],
+            serde_json::json!([{
+                "line_in_entity": 1,
+                "callee": null,
+                "callee_unavailable": "caller_source_unavailable",
+            }]),
+            "{row:#}"
+        );
+    }
+
+    /// A focal's own call sites, served by the pack and the neighborhood with
+    /// the text at each site cut from the focal's graph-owned body and its line
+    /// counted inside the focal, never as a file line.
+    #[test]
+    fn a_focal_s_call_sites_quote_their_callees_from_the_focal_s_graph_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  const clamped = [value].map(Number);\n  return check(clamped[0], maxVal);\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        let context = crate::call_sites::fixture::proof_context(LanguageId::TypeScript, "5.6.3");
+        let context_id = crate::call_sites::fixture::id_of(&context);
+        let ledger = crate::call_sites::fixture::ledger(
+            entity,
+            content,
+            context_id,
+            vec![
+                ("map", kin_model::CallSiteState::ProvenOutside),
+                (
+                    "check",
+                    kin_model::CallSiteState::Unresolved {
+                        reason: kin_model::UnresolvedReason::NoAnswer,
+                    },
+                ),
+            ],
+        );
+        store.resolution_records.insert(context_id, context);
+        store.resolution_records.insert(ledger.id(), ledger);
+
+        let expected = serde_json::json!([
+            {
+                "line_in_entity": 1,
+                "callee": "map",
+                "state": "proven_outside",
+                "reason": null,
+                "target": null,
+            },
+            {
+                "line_in_entity": 2,
+                "callee": "check",
+                "state": "unresolved",
+                "reason": "no_answer",
+                "target": null,
+            },
+        ]);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(entity.id.to_string()),
+        )]);
+        let pack = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+        assert_eq!(
+            pack[crate::call_sites::CALL_SITES_KEY]["rows"],
+            expected,
+            "{pack:#}"
+        );
+        let neighborhood = tool_result_json(
+            entities::handle_graph_neighborhood_with_authority(&args, &store, Some(&authority))
+                .unwrap(),
+        );
+        assert_eq!(
+            neighborhood[crate::call_sites::CALL_SITES_KEY]["rows"],
+            expected,
+            "{neighborhood:#}"
+        );
     }
 
     #[test]
@@ -4680,11 +4872,27 @@ mod tests {
             store.insert_test_calls_relation(&caller, entity);
         }
         install_empty_store_exact_tree(&mut store, source._dir.path());
+        // The focal as a finished sweep leaves it: a ledger holding its thirty
+        // calls, settled outside the repository. Its site rows are evidence
+        // the budget cuts before the neighbours and the focal's own body.
+        let context = crate::call_sites::fixture::proof_context(LanguageId::TypeScript, "5.6.3");
+        let context_id = crate::call_sites::fixture::id_of(&context);
+        let ledger = crate::call_sites::fixture::ledger(
+            entity,
+            &body,
+            context_id,
+            vec![("validate_range", kin_model::CallSiteState::ProvenOutside); 30],
+        );
+        store.resolution_records.insert(context_id, context);
+        store.resolution_records.insert(ledger.id(), ledger);
         let authority = test_repository_authority(source._dir.path());
         let sessions = crate::session::SessionRegistry::empty_for_test();
+        // The budget leaves room for the focal's body beside the fixed blocks
+        // every pack carries, the call-site tally among them, and for fewer
+        // than all forty callers.
         let mut args = HashMap::from([
             ("entity_id".into(), serde_json::json!(entity.id.to_string())),
-            ("token_budget".into(), serde_json::json!(2500)),
+            ("token_budget".into(), serde_json::json!(2800)),
         ]);
         crate::agent_belt::apply_belt_defaults("get_context_pack", &mut args);
         let raw =
@@ -4698,11 +4906,21 @@ mod tests {
         assert_ne!(result.is_error, Some(true), "{result:?}");
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         let value: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(value["token_budget"], 2500);
+        assert_eq!(value["token_budget"], 2800);
         assert_eq!(value["tokens_used"], kin_context::estimate_tokens(text));
-        assert!(kin_context::estimate_tokens(text) <= 2500);
+        assert!(kin_context::estimate_tokens(text) <= 2800);
         assert_eq!(value["focal_entity"]["body"], body);
         assert_eq!(value["focal_entity"]["body_complete"], true);
+        let site_rows = value["call_sites"]["rows"].as_array().unwrap().len();
+        assert_eq!(
+            site_rows + value["call_sites"]["rows_withheld"].as_u64().unwrap_or(0) as usize,
+            30,
+            "every site is a row or counted as withheld: {text}"
+        );
+        assert_eq!(
+            value["call_sites"]["sites"], 30,
+            "the tally is never cut: {text}"
+        );
         let kept = value["dependents"].as_array().unwrap().len();
         let withheld = value["dependents_withheld"].as_u64().unwrap() as usize;
         assert!(kept < 40, "{text}");
@@ -10763,6 +10981,7 @@ mod tests {
                 )
             }),
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

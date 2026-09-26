@@ -585,7 +585,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "entity_id": { "type": "string", "description": "Entity UUID" }
+                        "entity_id": { "type": "string", "description": "Entity UUID, or external_reference:<uuid> for a symbol outside the repository" }
                     },
                     "required": ["entity_id"]
                 }),
@@ -767,7 +767,7 @@ fn registered_tools() -> ToolsListResult {
                         "answer_only": { "type": "boolean", "description": "Return reference rows and trust limits. False restores detailed coverage and candidates.", "default": false },
                         "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
-                        "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query is provided." },
+                        "entity_id": { "type": "string", "description": "Exact entity UUID, or external_reference:<uuid> for a symbol outside the repository. Optional if query is provided." },
                         "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided. Alone it is ranked, not exact. When several declarations share the name, the ranking prefers the most referenced one, and `focal_resolution` reports the rest. An owner-qualified name (`Receiver.method` in Go, `Owner.member` in TypeScript, and the same shape in other languages where the graph names members that way) is exact. An exact whole name answers first. With none, a bare member name (`get` for the method `Scaffold.get`, a field, or an enum variant) reaches the owners' members: one answers directly, and several are each answered in their own section under `candidates_by_owner`. An `entity_id` from semantic_locate or semantic_search is exact too." },
                         "relation_kinds": {
                             "type": "array",
@@ -955,7 +955,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
-                        "entity_id": { "type": "string", "description": "Entity UUID" },
+                        "entity_id": { "type": "string", "description": "Entity UUID, or external_reference:<uuid> for a symbol outside the repository" },
                         "depth": { "type": "integer", "description": "Traversal depth", "default": 2 },
                         "limit": { "type": "integer", "description": "Max entities to return (default 30)", "default": 30 },
                         "direction": { "type": "string", "description": "Direction of traversal: 'out' walks what the focal depends on, 'in' walks what depends on the focal (dependents / blast radius), 'both' merges. Default 'both'.", "default": "both" }

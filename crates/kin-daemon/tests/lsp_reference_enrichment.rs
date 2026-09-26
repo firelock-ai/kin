@@ -43,7 +43,9 @@ const GO_LANGUAGE_SERVER_PROVISIONED: &str = "KIN_CI_GO_LANGUAGE_SERVER_INSTALLE
 
 /// Resolve the server for `language`, or explain the skip and return `None`.
 fn server_command_or_skip(language: LanguageId, test: &str) -> Option<(String, Vec<String>)> {
-    let root = Path::new("/");
+    // Only the command is read here. A root with nothing under it keeps the
+    // adapters' workspace discovery from reading a real tree.
+    let root = Path::new("/nonexistent-kin-workspace");
     let Some((command, args, _)) = lsp_adapter_for(language, root) else {
         panic!(
             "{test}: {language} has no adapter in this build, which contradicts \
@@ -149,18 +151,21 @@ async fn start_server(
     root: &Path,
     language: LanguageId,
 ) -> kin_lsp::lifecycle::LspServer {
-    let (_, _, init_opts) = lsp_adapter_for(language, root).expect("adapter must exist");
+    let (_, _, launch) = lsp_adapter_for(language, root).expect("adapter must exist");
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let grammars = kin_lsp::TypeScriptGrammars {
         typescript: kin_grammar_typescript::LANGUAGE_TYPESCRIPT,
         tsx: kin_grammar_typescript::LANGUAGE_TSX,
     };
-    let server =
-        kin_lsp::lifecycle::LspServer::start(command, &arg_refs, root, init_opts, Some(grammars))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("could not start `{command}` against the fixture: {error}")
-            });
+    let server = kin_lsp::lifecycle::LspServer::launch_settled(
+        command,
+        &arg_refs,
+        root,
+        &launch,
+        Some(grammars),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("could not start `{command}` against the fixture: {error}"));
 
     // Poll the same way the daemon does rather than sleeping a fixed amount:
     // an unindexed server answers prepareCallHierarchy with an empty list, and
@@ -333,7 +338,8 @@ async fn python_resolves_a_call_through_an_attribute_that_a_name_match_cannot() 
     let relations =
         kin_lsp::enrichment::enrich_entity_calls(&server, &caller, &index, root, Some(&documents))
             .await
-            .expect("enrichment must not error");
+            .expect("enrichment must not error")
+            .relations;
 
     let targets: Vec<GraphNodeId> = relations.iter().map(|relation| relation.dst).collect();
     assert!(
@@ -437,7 +443,8 @@ async fn javascript_resolves_a_require_chain_that_a_name_match_cannot() {
     let relations =
         kin_lsp::enrichment::enrich_entity_calls(&server, &caller, &index, root, Some(&documents))
             .await
-            .expect("enrichment must not error");
+            .expect("enrichment must not error")
+            .relations;
 
     let targets: Vec<GraphNodeId> = relations.iter().map(|relation| relation.dst).collect();
     assert!(
@@ -997,7 +1004,8 @@ async fn python_decorated_views_keep_their_file_and_imported_values_are_referenc
         Some(&documents),
     )
     .await
-    .expect("the view's own call hierarchy answers");
+    .expect("the view's own call hierarchy answers")
+    .relations;
     assert!(
         calls
             .iter()
@@ -1180,7 +1188,7 @@ async fn go_calls_through_an_interface_are_not_callers_of_the_concrete_method() 
             kin_lsp::enrichment::enrich_entity_calls(&server, entity, &index, &root, documents)
                 .await
         {
-            relations.extend(found);
+            relations.extend(found.relations);
         }
         if let Ok(found) =
             kin_lsp::enrichment::enrich_entity_overrides(&server, entity, &index, &root, documents)

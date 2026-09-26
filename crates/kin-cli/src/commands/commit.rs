@@ -112,9 +112,9 @@ fn pending_enrichment_line(running: bool, done: u64, total: u64) -> Option<Strin
     Some(format!(
         "Cross-file enrichment is still catching up ({done} of {total} files). The counts above \
          are this change's own deltas, so edges the sweep has not reached are not in it; they \
-         reach durable authority at your next commit. Until then they live only in this daemon, \
-         and a daemon that exits loses them from its live graph; its next start resumes the sweep \
-         from where it stopped."
+         reach durable authority as the sweep commits its progress, or at your next commit. A \
+         daemon that exits first resumes the sweep at its next start, skipping the files already \
+         recorded as finished."
     ))
 }
 

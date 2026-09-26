@@ -952,26 +952,17 @@ fn switch(
         .context("hash the exact tree this branch transition lands on")?;
     let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &desired_tree)
         .context("plan exact branch workspace transition")?;
-    let semantic_delta = kin_core::diff_workspace_semantics(
-        &current_workspace_graph.entities,
-        &current_workspace_graph.relations,
-        &desired_state.entities,
-        &desired_state.relations,
+    let semantic_delta = crate::local_repository_authority::plan_workspace_graph_transition(
+        crate::local_repository_authority::TargetGraph::of_snapshot(&current_workspace_graph),
+        crate::local_repository_authority::TargetGraph::of_state(&desired_state),
     )
     .context("plan exact branch semantic transition")?;
-    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+    let mut daemon_delta = crate::local_repository_authority::plan_daemon_graph_transition(
         state,
-        &desired_state.entities,
-        &desired_state.relations,
+        crate::local_repository_authority::TargetGraph::of_state(&desired_state),
     )
     .context("plan the branch semantic transition for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: tree_deltas.clone(),
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+    daemon_delta.tree_deltas = tree_deltas.clone();
     preflight_switch_delta(state, &workspace.tree, &desired_state, &daemon_delta)?;
     let already_active = matches!(
         &workspace.head,
@@ -1408,19 +1399,12 @@ fn replay_switch(
                 workspace.workspace_id
             )
         })?;
-    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+    let mut daemon_delta = crate::local_repository_authority::plan_daemon_graph_transition(
         state,
-        &target_graph.entities,
-        &target_graph.relations,
+        crate::local_repository_authority::TargetGraph::of_snapshot(&target_graph),
     )
     .context("plan the replayed branch semantic transition for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: mutation.tree_deltas.clone(),
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+    daemon_delta.tree_deltas = mutation.tree_deltas.clone();
     drop(lease);
     let (replayed, authority_freeze) =
         kin_core::tree::replay_repository_workspace_transaction_and_recover_projection(

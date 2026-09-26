@@ -316,7 +316,8 @@ async fn enrich_call_hierarchy_produces_relations() {
     .await;
 
     match result {
-        Ok(Ok(relations)) => {
+        Ok(Ok(calls)) => {
+            let relations = calls.relations;
             eprintln!(
                 "enrichment produced {} relations from init()",
                 relations.len()

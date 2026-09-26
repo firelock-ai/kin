@@ -5,6 +5,7 @@
 
 pub mod builder;
 pub mod error;
+pub mod external;
 pub mod multi;
 pub mod tokens;
 mod traffic;
@@ -20,6 +21,7 @@ pub use builder::{
     NO_FOCAL_EDGE_RANK, SAME_FILE_FALLBACK_MAX, SERVED_BODY_PROJECTION_NAME,
 };
 pub use error::{ContextError, Result};
+pub use external::{focal_external_calls, ExternalEdge, ExternalEdgeProof, ExternalEdgeReader};
 pub use multi::{
     build_multi_focal_pack, build_multi_focal_pack_with_provider, method_line,
     neighborhood_depth_for, render_multi_focal_lines, water_fill, FocalContribution,

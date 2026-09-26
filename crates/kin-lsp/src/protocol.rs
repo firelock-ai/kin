@@ -41,9 +41,9 @@ impl InitializeParams {
     /// sees the same root. `rootPath` is left out: it is deprecated in favour
     /// of `rootUri`, and pyright, the only server here known to fall back to
     /// it, reads `workspaceFolders` first. The client does not declare the
-    /// `workspace.workspaceFolders` capability. The root never changes during
-    /// a session, and this client answers no server request, so it could not
-    /// serve `workspace/workspaceFolders` if a server asked for it.
+    /// `workspace.workspaceFolders` capability, because the root never changes
+    /// during a session. It claims no workspace capability at all here; a
+    /// server that needs settings is started through [`Self::for_launch`].
     pub fn for_workspace(
         workspace_root: &std::path::Path,
         initialization_options: Option<serde_json::Value>,
@@ -56,6 +56,33 @@ impl InitializeParams {
             capabilities: kin_capabilities(),
             initialization_options,
         }
+    }
+
+    /// The parameters for one adapter's launch: [`Self::for_workspace`] with
+    /// the launch's initialization options, plus the two capabilities a launch
+    /// can need.
+    ///
+    /// - `workspace.configuration`, only when the launch carries settings. A
+    ///   server that sees it asks for its settings with
+    ///   `workspace/configuration`, and the client answers from them. pyright
+    ///   reads its settings no other way: it ignores `initializationOptions`
+    ///   apart from one flag.
+    /// - `experimental.serverStatusNotification`, only when the launch waits
+    ///   for the server to report its project loaded. rust-analyzer then says
+    ///   when it has finished loading and whether that load failed.
+    pub fn for_launch(
+        workspace_root: &std::path::Path,
+        launch: &crate::adapters::ServerLaunch,
+    ) -> Self {
+        let mut params = Self::for_workspace(workspace_root, launch.initialization_options.clone());
+        if launch.settings.is_some() {
+            params.capabilities.workspace = Some(serde_json::json!({ "configuration": true }));
+        }
+        if launch.load_check == Some(crate::adapters::LoadCheck::ServerStatus) {
+            params.capabilities.experimental =
+                Some(serde_json::json!({ "serverStatusNotification": true }));
+        }
+        params
     }
 }
 
@@ -84,6 +111,12 @@ impl WorkspaceFolder {
 pub struct ClientCapabilities {
     pub general: serde_json::Value,
     pub text_document: Option<TextDocumentClientCapabilities>,
+    /// Claimed only by a launch that answers `workspace/configuration`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<serde_json::Value>,
+    /// Claimed only by a launch that waits for rust-analyzer's server status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,12 +127,27 @@ pub struct TextDocumentClientCapabilities {
     pub references: Option<serde_json::Value>,
     pub type_hierarchy: Option<serde_json::Value>,
     pub type_definition: Option<serde_json::Value>,
+    /// Hierarchical symbols, which name a declaration by the whole chain of
+    /// declarations that holds it (see [`crate::external_symbols`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_symbol: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     pub capabilities: ServerCapabilities,
+    /// The server's own name and version, when it reports them.
+    #[serde(default)]
+    pub server_info: Option<ServerInfo>,
+}
+
+/// What a server says it is, in its initialize answer.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct ServerInfo {
+    pub name: String,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -527,7 +575,13 @@ pub fn kin_capabilities() -> ClientCapabilities {
             references: Some(serde_json::json!({"dynamicRegistration": false})),
             type_hierarchy: Some(serde_json::json!({"dynamicRegistration": false})),
             type_definition: Some(serde_json::json!({"dynamicRegistration": false})),
+            document_symbol: Some(serde_json::json!({
+                "dynamicRegistration": false,
+                "hierarchicalDocumentSymbolSupport": true
+            })),
         }),
+        workspace: None,
+        experimental: None,
     }
 }
 
@@ -804,7 +858,7 @@ mod initialize_params_tests {
         assert!(sent.get("rootPath").is_none(), "{sent}");
         assert!(
             sent["capabilities"].get("workspace").is_none(),
-            "no workspace capability is claimed: this client answers no server request\n{sent}"
+            "no workspace capability is claimed by a start that carries no settings\n{sent}"
         );
         assert_eq!(
             uri_to_path(sent["workspaceFolders"][0]["uri"].as_str().unwrap()).as_deref(),
@@ -833,5 +887,53 @@ mod initialize_params_tests {
         let root = std::path::Path::new("/");
         let folder = WorkspaceFolder::for_root(root);
         assert_eq!(folder.name, folder.uri);
+    }
+
+    /// A launch with settings claims `workspace.configuration`, so the server
+    /// asks for them; one that waits for server status claims rust-analyzer's
+    /// status notification. A launch with neither claims neither, and its
+    /// payload is exactly the plain workspace start.
+    #[test]
+    fn a_launch_claims_only_the_capabilities_it_serves() {
+        use crate::adapters::{LoadCheck, ServerLaunch};
+        let root = std::env::temp_dir().join("repo");
+
+        let plain = serde_json::to_value(InitializeParams::for_launch(
+            &root,
+            &ServerLaunch::with_initialization_options(Some(serde_json::json!({"a": 1}))),
+        ))
+        .unwrap();
+        assert_eq!(
+            plain,
+            serde_json::to_value(InitializeParams::for_workspace(
+                &root,
+                Some(serde_json::json!({"a": 1}))
+            ))
+            .unwrap()
+        );
+        assert!(plain["capabilities"].get("workspace").is_none(), "{plain}");
+        assert!(
+            plain["capabilities"].get("experimental").is_none(),
+            "{plain}"
+        );
+
+        let launch = ServerLaunch {
+            settings: Some(serde_json::json!({"python": {"pythonPath": "/env/bin/python"}})),
+            load_check: Some(LoadCheck::ServerStatus),
+            ..ServerLaunch::default()
+        };
+        let sent = serde_json::to_value(InitializeParams::for_launch(&root, &launch)).unwrap();
+        assert_eq!(
+            sent["capabilities"]["workspace"],
+            serde_json::json!({"configuration": true})
+        );
+        assert_eq!(
+            sent["capabilities"]["experimental"],
+            serde_json::json!({"serverStatusNotification": true})
+        );
+        assert!(
+            sent.get("initializationOptions").is_none(),
+            "settings travel by request, not in the initialize payload: {sent}"
+        );
     }
 }

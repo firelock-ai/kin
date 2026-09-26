@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "kin-grammar-typescript"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "kin-grammar-typescript",
  "kin-model",

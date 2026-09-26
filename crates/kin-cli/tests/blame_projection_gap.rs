@@ -89,6 +89,7 @@ fn change(
         evidence: Vec::new(),
         risk_summary: None,
         external_reference_deltas: Vec::new(),
+        resolution_record_deltas: Vec::new(),
     };
     change.id = kin_core::compute_semantic_change_id(&change).expect("derive change identity");
     change

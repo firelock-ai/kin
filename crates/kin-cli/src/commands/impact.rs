@@ -172,6 +172,35 @@ pub async fn build_impact_response(
     request: &ImpactRequest,
     envelope: &kin_mcp::Envelope,
 ) -> Result<ImpactResponse> {
+    // A symbol outside the repository has no dependents of its own to walk
+    // here. What a change to it reaches is its callers, which `kin refs` lists,
+    // so it is refused by what it is rather than reported missing.
+    if let Some(argument) = crate::commands::external_symbols::external_argument(
+        graph,
+        &request.entity,
+        "`kin impact` has no entity of its own here to walk from",
+    )? {
+        let resolution = if argument.is_absent() {
+            "not_found"
+        } else {
+            "external_symbol"
+        };
+        return Ok(ImpactResponse {
+            lines: argument.into_lines(),
+            schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
+            resolution: resolution.to_string(),
+            query: ImpactQuery {
+                entity: request.entity.clone(),
+                file: request.file.clone(),
+                kind: request.kind.clone(),
+                signature: request.signature.clone(),
+                match_count: 0,
+                name_candidates: Vec::new(),
+            },
+            ranked: None,
+            negative: None,
+        });
+    }
     // One resolver for every read command (FIR-3505): the typed qualifiers and
     // any `Name#kind@path:line` suffix merge into one pin, and the answer is the
     // entity the shared ranking puts first.
@@ -2826,5 +2855,51 @@ mod tests {
             rendered.contains(&format!("--depth {over} was reduced")),
             "the reduction is stated rather than applied silently: {rendered}"
         );
+    }
+
+    /// `kin impact` analyses a repository entity. A symbol outside the
+    /// repository is refused by what it is, with the command that lists the
+    /// entities a change to it reaches, never reported as a missing entity.
+    #[tokio::test]
+    async fn impact_refuses_an_external_symbol_and_names_kin_refs() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let envelope = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 2,
+            "graph_generation": 1,
+        }));
+        for entity in [store.address(), store.node.id.to_string()] {
+            let response = build_impact_response(
+                &layout,
+                &store.graph,
+                &ImpactRequest {
+                    entity: entity.clone(),
+                    depth: 3,
+                    file: None,
+                    kind: None,
+                    signature: None,
+                    require_unique: false,
+                    dispatch_candidates: false,
+                },
+                &envelope,
+            )
+            .await
+            .expect("impact response");
+            assert_eq!(
+                response.resolution, "external_symbol",
+                "{:?}",
+                response.lines
+            );
+            let text = response.lines.join("\n");
+            assert!(text.contains("Array.map"), "{text}");
+            assert!(
+                text.contains(&format!("kin refs {}", store.address())),
+                "{text}"
+            );
+            assert!(!text.contains("not found"), "{text}");
+        }
     }
 }
