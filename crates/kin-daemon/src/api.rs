@@ -15885,7 +15885,10 @@ fn hosted_view_hydration_budget(_repo_id: &str) -> Duration {
 /// Everything that reads storage, the cursor probes included, runs inside the
 /// supervised worker, so the admission budget bounds it all; what follows the
 /// worker is an in-memory install. The retirement guard is the task's first
-/// binding, so it drops last and on every path.
+/// binding, so it drops on every path, and the task drops it before it answers:
+/// a caller that has its answer never finds this flight still registered, so
+/// its retry starts a fresh hydration rather than joining a finished one and
+/// being handed the same answer again.
 fn spawn_hosted_view_hydration(
     state: Arc<DaemonState>,
     backend: Arc<dyn StorageBackend>,
@@ -15901,7 +15904,7 @@ fn spawn_hosted_view_hydration(
         "hosted view cold; hydration started"
     );
     tokio::spawn(async move {
-        let _retirement = retirement;
+        let retirement = retirement;
         let started = Instant::now();
         let worker_repo_id = repo_id.clone();
         let hydrated = run_hosted_repository_hydration_within(
@@ -15969,7 +15972,13 @@ fn spawn_hosted_view_hydration(
                 "hosted view hydration did not install a view"
             ),
         }
+        // Retire before answering, as the supervisor releases its slot before
+        // answering. This flight installed any view it produced, so its absence
+        // still means that view is readable.
+        drop(retirement);
         let _ = sender.send(Some(outcome));
+        #[cfg(test)]
+        hosted_view_hydration_test_hooks::after_answer(&repo_id).await;
     });
 }
 
@@ -16056,6 +16065,8 @@ mod hosted_view_hydration_test_hooks {
         join_gate: Option<tokio::sync::watch::Receiver<bool>>,
         join_opener: Option<tokio::sync::watch::Sender<bool>>,
         join_arrivals: usize,
+        answer_gate: Option<tokio::sync::watch::Receiver<bool>>,
+        answer_opener: Option<tokio::sync::watch::Sender<bool>>,
         budget: Option<Duration>,
     }
 
@@ -16102,6 +16113,34 @@ mod hosted_view_hydration_test_hooks {
         });
         if let Some(mut gate) = gate {
             let _ = gate.wait_for(|open| *open).await;
+        }
+    }
+
+    /// Called by a flight's task once it has answered, before the task ends.
+    pub(super) async fn after_answer(repo_id: &str) {
+        let gate = with(repo_id, |hook| hook.answer_gate.clone());
+        if let Some(mut gate) = gate {
+            let _ = gate.wait_for(|open| *open).await;
+        }
+    }
+
+    /// Hold every flight task of `repo_id` after it answers, until
+    /// [`open_answer_gate`], as a loaded host holds a task it has just woken
+    /// a caller from.
+    pub(super) fn close_answer_gate(repo_id: &str) {
+        let (opener, gate) = tokio::sync::watch::channel(false);
+        with(repo_id, |hook| {
+            hook.answer_gate = Some(gate);
+            hook.answer_opener = Some(opener);
+        });
+    }
+
+    pub(super) fn open_answer_gate(repo_id: &str) {
+        if let Some(opener) = with(repo_id, |hook| {
+            hook.answer_gate = None;
+            hook.answer_opener.take()
+        }) {
+            let _ = opener.send(true);
         }
     }
 
@@ -32534,6 +32573,10 @@ pub(crate) mod tests {
             );
             calls.store(0, Ordering::SeqCst);
             fail_on_call.store(failure_call, Ordering::SeqCst);
+            // Each flight's task is held once it has answered, as a loaded
+            // host holds it, so the recovery pass below meets the same
+            // registry a descheduled task would leave.
+            hosted_view_hydration_test_hooks::close_answer_gate(&repo_id);
             let mut progress = HostedViewPrewarmState::default();
             let failed = run_prewarm_pass(&state, unbounded_prewarm(), &mut progress).await;
             assert!(matches!(
@@ -32546,8 +32589,79 @@ pub(crate) mod tests {
                 "completed errors must not quarantine"
             );
             let recovered = run_prewarm_pass(&state, unbounded_prewarm(), &mut progress).await;
+            hosted_view_hydration_test_hooks::open_answer_gate(&repo_id);
             assert_eq!(recovered, vec![(repo_id, HostedViewPrewarmOutcome::Warmed)]);
         }
+    }
+
+    /// A caller answered with a flight's completed failure retries at once,
+    /// before the flight's task has ended, as happens on a loaded host. The
+    /// retry must start a fresh hydration. Were the flight still registered,
+    /// the retry would join it and be handed the same failure again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_after_a_completed_flight_failure_starts_a_fresh_hydration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        install_test_registry_override();
+        let repo_id = format!("repo-flight-retry-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on_call = Arc::new(AtomicUsize::new(usize::MAX));
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(crate::storage_delegate::DelegatingBackend::new(
+                    StallingCursorBackend {
+                        inner: kin_db::LocalFileBackend::new(storage.path().to_path_buf()),
+                        allowed: Arc::new(AtomicUsize::new(usize::MAX)),
+                        calls: Arc::clone(&calls),
+                        fail_on_call: Arc::clone(&fail_on_call),
+                        release: Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
+                    },
+                )),
+                &repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8f0a,
+            "publish flight retry fixture",
+            &[("retry_symbol", "src/retry.rs", "fn retry_symbol() {}\n")],
+        );
+        // The caller's own probe answers; the flight's first probe fails.
+        calls.store(0, Ordering::SeqCst);
+        fail_on_call.store(2, Ordering::SeqCst);
+        hosted_view_hydration_test_hooks::close_answer_gate(&repo_id);
+        let failed =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(10)).await;
+        let registered_after_answer =
+            hosted_view_hydration_test_hooks::flight_registered(&state, &repo_id);
+        let retried =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_secs(10)).await;
+        // Release the held tasks before asserting, so a red run leaves none.
+        hosted_view_hydration_test_hooks::open_answer_gate(&repo_id);
+        assert_eq!(
+            failed.err().map(|failure| failure.code),
+            Some("repo_authority_unavailable"),
+            "the flight's own probe failure is the caller's answer"
+        );
+        assert!(
+            !registered_after_answer,
+            "a flight that has answered must not stay registered"
+        );
+        assert!(
+            retried.is_ok(),
+            "the retry must start a fresh hydration, not replay the finished \
+             flight's answer: {:?}",
+            retried.err()
+        );
+        assert_eq!(hosted_view_hydration_test_hooks::hydrations(&repo_id), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -13102,8 +13102,8 @@ def main() -> None:
         (
             "a first-run capture reverts to a relative redirect",
             "the first-run proof",
-            'kin status --json > "$captures/kin-status.json" 2>&1',
-            "kin status --json > kin-status.json 2>&1",
+            'kin status --json > "$captures/kin-status.json" 2> "$captures/kin-status-json.stderr.txt"',
+            'kin status --json > kin-status.json 2> "$captures/kin-status-json.stderr.txt"',
         ),
         (
             "a graph-query capture reverts to a relative tee",

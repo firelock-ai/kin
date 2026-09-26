@@ -536,8 +536,9 @@ step_first_run() {
   cat "$captures/kin-status.txt"
   if [ "$status_txt_rc" -ne 0 ] && [ "$status_txt_rc" -ne 9 ]; then exit "$status_txt_rc"; fi
   status_json_rc=0
-  kin status --json > "$captures/kin-status.json" 2>&1 || status_json_rc=$?
+  kin status --json > "$captures/kin-status.json" 2> "$captures/kin-status-json.stderr.txt" || status_json_rc=$?
   cat "$captures/kin-status.json"
+  cat "$captures/kin-status-json.stderr.txt" >&2
   if [ "$status_json_rc" -ne 0 ] && [ "$status_json_rc" -ne 9 ]; then exit "$status_json_rc"; fi
   kin bench-meta --json > "$captures/kin-build-meta.json"
   cat "$captures/kin-build-meta.json"
