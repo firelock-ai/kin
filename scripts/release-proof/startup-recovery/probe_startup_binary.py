@@ -96,11 +96,17 @@ if args.require_orphan_debt:
             or owes_orphan(result['owed_before_start'])), 'fixture owes exact orphan semantics'
     result['expected_orphan_body'] = args.orphan_body
 
+# Each observation joins two readings through the candidate CLI, since file
+# catalogs are not on the agent surface. Whether the named entity is in the live
+# graph comes from `kin graph inspect`, an exact lookup by name rather than a
+# ranked search, so an edit is seen as soon as the graph holds it. The file's
+# coverage and entity count come from `kin doctor --conversion-source`, which
+# reads the same coverage the retired enumeration certified and lists no entity.
 def certified_empty(answer):
-    return answer.get('entities') == [] and answer['file_coverage']['certifies_enumeration'] is True
+    return answer['total'] == 0 and answer['file_coverage']['certifies_enumeration'] is True
 
 def recovered(answer):
-    return (any(e.get('name') == 'orphan' for e in answer.get('entities', []))
+    return ('orphan' in answer['names'] and answer['total'] >= 1
             and answer['file_coverage']['certifies_enumeration'] is True)
 
 with (output / 'daemon.log').open('w') as log:
@@ -119,18 +125,33 @@ with (output / 'daemon.log').open('w') as log:
         result['readiness_observations'] = []
         wait_ready(port, token, process, deadline, result['readiness_observations'])
 
-        def tool(path):
-            payload = json.dumps({'name': 'list_file_entities', 'arguments': {'path': path}}).encode()
-            request = urllib.request.Request(
-                f'http://127.0.0.1:{port}/mcp/tools/call', data=payload,
-                headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
-            with urllib.request.urlopen(request, timeout=5) as response:
-                outer = json.load(response)
-            assert not outer.get('isError'), outer
-            return json.loads(outer['content'][0]['text'])
+        def cli(*arguments):
+            # Pinned to this probe's own daemon, so the CLI neither resolves nor
+            # starts another one.
+            completed = subprocess.run(
+                [str(kin), *arguments], cwd=fixture,
+                env=dict(env, KIN_DAEMON_URL=f'http://127.0.0.1:{port}'),
+                capture_output=True, text=True, timeout=60)
+            assert completed.returncode == 0, ' '.join(arguments) + ' refused: ' + completed.stderr
+            return json.loads(completed.stdout)
+
+        def inspect(name):
+            answer = cli('graph', 'inspect', name, '--json')
+            found = answer.get('error') is None and any(name in line for line in answer.get('lines', []))
+            return found, answer
+
+        def conversion_source(path):
+            return cli('doctor', '--conversion-source', path, '--json')
+
+        def tool(path, name=None):
+            report = conversion_source(path)
+            found, answer = inspect(name) if name else (False, None)
+            return {'path': path, 'names': [name] if found else [], 'total': report['total'],
+                    'file_coverage': report['file_coverage'], 'inspect': answer,
+                    'conversion_source': report}
 
         def observe():
-            answer = tool('orphan.py')
+            answer = tool('orphan.py', 'orphan')
             result['orphan_observations'].append(answer)
             if args.expect == 'recovered':
                 assert not certified_empty(answer), 'known admitted function was certified empty'
@@ -149,13 +170,16 @@ with (output / 'daemon.log').open('w') as log:
         attempt = 0
         control_name = 'sentinel_ready_' + uuid.uuid4().hex[:8]
         result['sentinel_control_name'] = control_name
+        # One edit, then poll. The coverage reading also compares the working
+        # copy with graph truth, so an edit repeated on every poll would keep
+        # the file permanently newer than anything the daemon has admitted.
+        (fixture / 'sentinel.py').write_text(f'def {control_name}():\n    return 1\n')
         while True:
             attempt += 1
-            (fixture / 'sentinel.py').write_text(f'def {control_name}():\n    return {attempt}\n')
             time.sleep(.1)
-            sentinel = tool('sentinel.py')
+            sentinel = tool('sentinel.py', control_name)
             observe()
-            if (any(e.get('name') == control_name for e in sentinel.get('entities', []))
+            if (control_name in sentinel['names'] and sentinel['total'] >= 1
                     and sentinel['file_coverage']['certifies_enumeration'] is True):
                 break
             assert process.poll() is None, 'owned daemon exited during sentinel control'

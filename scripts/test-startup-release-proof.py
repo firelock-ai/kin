@@ -59,7 +59,10 @@ for sequence in ([(503, False)], [(200, False)], [(503, True)]):
 # The same negative scenario passes when the readiness predicate is removed.
 assert readiness([(503, False)], mutate=True)[-1]['status'] == 503
 source = (ROOT / 'probe_startup_binary.py').read_text()
-assert source.index("wait_ready(port, token, process, deadline, result['readiness_observations'])") < source.index('        def tool(path):')
+ready_at = source.index("wait_ready(port, token, process, deadline, result['readiness_observations'])")
+for helper in ('        def cli(*arguments):', '        def inspect(name):', '        def conversion_source(path):', '        def tool(path, name=None):'):
+    assert ready_at < source.index(helper), helper
+assert "'list_file_entities'" not in source, 'the probe must not ask the agent surface for a file catalog'
 
 ns = {'hashlib': __import__('hashlib'), 'json': json}
 profile = load_function(ROOT / 'run.py', 'assert_fixture_profile', ns)
