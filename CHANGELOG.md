@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-26
+
+### Added
+
+- `lexical_lookup` finds exact literals, including punctuation, in stored
+  graph fields: names, signatures, summaries, body previews and file context.
+  It reports the matching field and verified source line when available.
+  Stable content-bound pagination retains hits withheld by response limits.
+  Each page scans the scoped graph; previews can be bounded, so a miss does
+  not prove repository absence. Literal hits are distinct from resolved calls
+  and references.
+
 ### Changed
 
 - **Breaking for MCP clients:** every whole-entity replacement now carries the
@@ -37,23 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-integer `offset`, `limit` or `max_chars` is refused with a structured
   error instead of clamped. The daemon's raw route returns the same paging
   object, so a client of it reads `result[]` rather than a bare array.
-
-### Thanks
-
-- Thanks to Emre K. (@kocaemre) for the fix that lets top-level `kin --help`,
-  `kin -h`, `kin --version` and `kin -V` print without a nested-repository
-  parent-store warning (#1778), and to Vikas (@vikas-kushwaha-dev) for an
-  independent fix of the same bug (#1779).
-
-### Added
-
-- `lexical_lookup` finds exact literals, including punctuation, in stored
-  graph fields: names, signatures, summaries, body previews and file context.
-  It reports the matching field and verified source line when available.
-  Stable content-bound pagination retains hits withheld by response limits.
-  Each page scans the scoped graph; previews can be bounded, so a miss does
-  not prove repository absence. Literal hits are distinct from resolved calls
-  and references.
+- Advance hydration semantics so stored derived graphs are re-evaluated using
+  the corrected Rust import and call extraction rules.
 
 ### Fixed
 
@@ -389,14 +386,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   focal's `name_only` rows exactly as it would for any other, and the
   disclosure now names the store rather than the focal as the reason a row
   was kept.
-
-## [0.8.0]
-
-Release preparation. Final archive, upgrade, install and client qualification is
-pending; this entry does not announce publication.
-
-### Fixed
-
 - Rust import edges use the declaring file's module coordinate, including after
   incremental indexing and checkpoint reopen. A child module or same-named
   function no longer replaces that file module as the import owner.
@@ -404,10 +393,12 @@ pending; this entry does not announce publication.
   `macro_rules!` metavariables, are excluded from call extraction. Calls in
   macro bodies remain eligible for extraction.
 
-### Changed
+### Thanks
 
-- Advance hydration semantics so stored derived graphs are re-evaluated using
-  the corrected Rust import and call extraction rules.
+- Thanks to Emre K. (@kocaemre) for the fix that lets top-level `kin --help`,
+  `kin -h`, `kin --version` and `kin -V` print without a nested-repository
+  parent-store warning (#1778), and to Vikas (@vikas-kushwaha-dev) for an
+  independent fix of the same bug (#1779).
 
 ## [0.7.21] - 2026-09-18
 
